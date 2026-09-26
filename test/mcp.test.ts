@@ -9,7 +9,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { z } from "zod";
 import { MbxNode } from "../src/node.ts";
 
-const BIN = join(import.meta.dirname, "../bin/mbx.js");
+const BIN = join(import.meta.dirname, "../bin/agentmbx.js");
 const textOf = (r: unknown) => ((r as { content: { text: string }[] }).content[0].text);
 
 async function client(home: string, agent: string, extra: Record<string, string> = {}) {

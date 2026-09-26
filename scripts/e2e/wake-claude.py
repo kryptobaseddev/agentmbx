@@ -5,7 +5,7 @@ reads the message with the mbx tools, and replies through mbx. Throwaway MBX_HOM
 import fcntl, json, os, pty, re, select, struct, subprocess, sys, tempfile, termios, threading, time, uuid
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-MBX = os.path.join(ROOT, "bin", "mbx.js")
+MBX = os.path.join(ROOT, "bin", "agentmbx.js")
 home = tempfile.mkdtemp(prefix="mbx-e2e-home-"); work = os.path.realpath(tempfile.mkdtemp(prefix="cl-agent-"))
 env = dict(os.environ, MBX_HOME=home, MBX_NO_DESKTOP="1"); agent = "cl-agent"; token = "PONG-" + uuid.uuid4().hex[:6]
 cfg = os.path.join(work, ".mcp-test.json")

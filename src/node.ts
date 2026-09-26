@@ -20,7 +20,7 @@ export interface Peer { host: string; pubkey: string; owner_pubkey: string | nul
 export interface Session { priv: string; pub: string; grant: Grant | null }
 export type ReceiveResult = "accepted" | "duplicate" | `rejected:${string}`;
 
-export const defaultHome = () => process.env.MBX_HOME || join(homedir(), ".local", "share", "mbx");
+export const defaultHome = () => process.env.MBX_HOME || join(homedir(), ".local", "share", "agentmbx");
 const shortHost = () => hostname().split(".")[0].toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) || "host";
 
 export class MbxNode {

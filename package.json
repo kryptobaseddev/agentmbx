@@ -1,19 +1,21 @@
 {
-  "name": "@kryptobaseddev/mbx",
+  "name": "agentmbx",
   "version": "0.1.0",
-  "description": "Agent mailbox: signed messages between AI coding agents (Claude, Codex, Kimi, OpenCode, Hermes) on one machine and across a LAN, with wake-up adapters and an owner-authority master agent.",
+  "description": "AgentMBX: signed messages between AI coding agents (Claude, Codex, Kimi, OpenCode, Hermes) on one machine and across a LAN, with wake-up adapters and an owner-authority master agent.",
   "type": "module",
   "bin": {
-    "mbx": "bin/mbx.js"
+    "agentmbx": "bin/agentmbx.js"
   },
   "engines": {
     "node": ">=24"
   },
   "scripts": {
-    "test": "node --test --test-concurrency=1 'test/*.test.ts'",
-    "typecheck": "tsc --noEmit"
+    "test": "AGENTMBX_DEV=1 node --test --test-concurrency=1 'test/*.test.ts'",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "tsc -p tsconfig.build.json"
   },
-  "license": "MIT",
+  "license": "BUSL-1.1",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.1",
     "zod": "^4.6.5"
@@ -21,5 +23,34 @@
   "devDependencies": {
     "@types/node": "^24.19.0",
     "typescript": "^7.0.2"
-  }
+  },
+  "homepage": "https://agentmbx.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kryptobaseddev/agentmbx.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kryptobaseddev/agentmbx/issues"
+  },
+  "author": "Keaton Hoskins",
+  "keywords": [
+    "mcp",
+    "ai-agents",
+    "claude-code",
+    "codex",
+    "opencode",
+    "kimi",
+    "hermes",
+    "agent-messaging",
+    "multi-agent"
+  ],
+  "files": [
+    "bin",
+    "dist",
+    "src",
+    "docs",
+    "LICENSE",
+    "README.md",
+    "NOTICE"
+  ]
 }

@@ -1,4 +1,4 @@
-# mbx v3 — agent mailbox (draft spec for council review)
+# AgentMBX — design spec (protocol "mbx v3")
 
 One small tool that lets AI coding agents (Claude Code, Codex, Kimi, OpenCode, Hermes, and any MCP-capable CLI) send each other messages on one machine and between paired machines on a LAN. It wakes the recipient when it can, signs every message, and gives the owner a verified way to speak through a designated master agent.
 
@@ -80,7 +80,7 @@ Storage is exactly-once (dedupe on `id`). Notification and agent action are at-l
 
 ### Owner key
 - `mbx owner init`: an Ed25519 key encrypted with a passphrase the owner chooses (scrypt N=2^17 → AES-256-GCM) and stored in `owner.key` (0600).
-- It can only be unlocked by `mbx owner …` commands that read the passphrase from **`/dev/tty` with echo off**, and those commands refuse to run without a controlling terminal. Agent tool calls (Bash tools have no TTY) cannot use it, and the passphrase lives only in the owner's head and Bitwarden.
+- It can only be unlocked by `mbx owner …` commands that read the passphrase from **`/dev/tty` with echo off**, and those commands refuse to run without a controlling terminal. Agent tool calls (Bash tools have no TTY) cannot use it, and the passphrase lives only in the owner's head and password manager.
 - There is no Keychain dependency in v1. Touch ID or Secure Enclave signing can come later as a second backend.
 
 ### Master session and grants

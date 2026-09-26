@@ -4,7 +4,7 @@ mbx MCP tools, and replies through mbx. Uses a throwaway MBX_HOME and working di
 import fcntl, json, os, pty, re, select, struct, subprocess, sys, tempfile, termios, threading, time, uuid
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-MBX = os.path.join(ROOT, "bin", "mbx.js")
+MBX = os.path.join(ROOT, "bin", "agentmbx.js")
 home = tempfile.mkdtemp(prefix="mbx-e2e-home-"); work = os.path.realpath(tempfile.mkdtemp(prefix="cx-agent-"))
 env = dict(os.environ, MBX_HOME=home, MBX_NO_DESKTOP="1")
 agent = "cx-agent"; token = "PONG-" + uuid.uuid4().hex[:6]

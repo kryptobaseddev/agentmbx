@@ -74,7 +74,7 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
         const n = newNonce();
         const code = acceptOffer(node, offer, n);
         node.store.audit("pair.request", { from: offer.host, addr: offer.addr, code });
-        process.stderr.write(`\n[mbx] pairing request from ${offer.host} (${offer.addr}). Code ${code}. Approve with: mbx pair approve ${offer.host} ${code}\n`);
+        process.stderr.write(`\n[agentmbx] pairing request from ${offer.host} (${offer.addr}). Code ${code}. Approve with: agentmbx pair approve ${offer.host} ${code}\n`);
         return send(200, localParty(node, n));
       }
       const peer = verifyHop(node, req.headers, req.method ?? "GET", url.pathname, body);

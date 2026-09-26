@@ -12,33 +12,33 @@ import { defaultHome, formatMessage, MbxNode, summaryLine, trustLabel } from "./
 import { createOwnerKey, ownerPath, readPassphraseFromTTY, unlockOwnerKey } from "./owner.ts";
 import { dispatchWakes, opencodeSessionFor } from "./wake.ts";
 
-const HELP = `mbx — signed messages between AI coding agents, on this machine and across paired machines
+const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
 
 Messages
-  mbx send --as <agent> --to <a,b,role:x,*,owner> --subject "…" [-m "body" | --body-file f | stdin]
+  agentmbx send --as <agent> --to <a,b,role:x,*,owner> --subject "…" [-m "body" | --body-file f | stdin]
            [--kind message|request|reply|status|decision|alert|task] [--reply-to <id>] [--needs-reply] [--ref path]…
-  mbx inbox --as <agent> [--all] [--json]      mbx read <id> --as <agent>      mbx ack <id> --as <agent> [--note "…"]
-  mbx thread <id>        mbx search "<words>"        mbx agents        mbx status
+  agentmbx inbox --as <agent> [--all] [--json]      mbx read <id> --as <agent>      mbx ack <id> --as <agent> [--note "…"]
+  agentmbx thread <id>        mbx search "<words>"        mbx agents        mbx status
 
-Machines (pairing: run 'mbx pair <addr>' on one host, compare the 6-digit code, approve on BOTH hosts)
-  mbx init [--host <name>] [--port 7373]       mbx pair <host:port>       mbx pair approve <host> <code>
-  mbx peers                                    mbx peers remove <host>
-  mbx daemon                                   mbx daemon install | uninstall      (launchd / systemd user service)
+Machines (pairing: run 'agentmbx pair <addr>' on one host, compare the 6-digit code, approve on BOTH hosts)
+  agentmbx init [--host <name>] [--port 7373]       mbx pair <host:port>       mbx pair approve <host> <code>
+  agentmbx peers                                    mbx peers remove <host>
+  agentmbx daemon                                   mbx daemon install | uninstall      (launchd / systemd user service)
 
 Owner (run these yourself in a terminal; they ask for the owner passphrase and refuse to run without one)
-  mbx owner init        mbx owner show
-  mbx owner grant <agent> [--session <fingerprint>] [--caps ${CAPS.join(",")}] [--ttl 12h]
-  mbx owner revoke <grant-id>
+  agentmbx owner init        mbx owner show
+  agentmbx owner grant <agent> [--session <fingerprint>] [--caps ${CAPS.join(",")}] [--ttl 12h]
+  agentmbx owner revoke <grant-id>
 
 Agent integration
-  mbx mcp                                  stdio MCP server (add to Claude/Codex/OpenCode/Kimi/Hermes MCP config)
-  mbx hook session-start --cli <codex|kimi|claude|opencode>   bind the running session (reads the hook JSON on stdin)
-  mbx hook prompt --cli <…>                adds "N unread mbx messages" to the next turn when there is mail
-  mbx import-v2 <MAILBOX/v2 dir>           import the old NAS mailbox as unsigned 'legacy' messages
+  agentmbx mcp                                  stdio MCP server (add to Claude/Codex/OpenCode/Kimi/Hermes MCP config)
+  agentmbx hook session-start --cli <codex|kimi|claude|opencode>   bind the running session (reads the hook JSON on stdin)
+  agentmbx hook prompt --cli <…>                adds "N unread mbx messages" to the next turn when there is mail
+  agentmbx import-v2 <MAILBOX/v2 dir>           import the old NAS mailbox as unsigned 'legacy' messages
 
-Env: MBX_HOME (default ~/.local/share/mbx), MBX_AGENT (agent name for mcp/hooks), MBX_ADVERTISE (host:port others use)`;
+Env: MBX_HOME (default ~/.local/share/agentmbx), MBX_AGENT (agent name for mcp/hooks), MBX_ADVERTISE (host:port others use)`;
 
-const die = (msg: string): never => { process.stderr.write(`mbx: ${msg}\n`); process.exit(1); };
+const die = (msg: string): never => { process.stderr.write(`agentmbx: ${msg}\n`); process.exit(1); };
 const readStdin = () => { try { return readFileSync(0, "utf8"); } catch { return ""; } };
 
 export async function main(argv = process.argv.slice(2)) {
@@ -56,7 +56,7 @@ export async function main(argv = process.argv.slice(2)) {
   if (cmd === "init") {
     const n = new MbxNode(defaultHome(), { host: str("host"), port: str("port") ? Number(str("port")) : undefined, bind: str("bind") });
     console.log(`mbx home: ${n.home}\nhost: ${n.host}  key: ${fingerprint(n.key.publicKey)}  listens on ${n.config.bind}:${n.config.port}  advertised as ${advertisedAddr(n)}`);
-    console.log(n.ownerPub ? `owner key: ${fingerprint(n.ownerPub)}` : "owner key: none yet (run: mbx owner init)");
+    console.log(n.ownerPub ? `owner key: ${fingerprint(n.ownerPub)}` : "owner key: none yet (run: agentmbx owner init)");
     return;
   }
   const node = new MbxNode();
@@ -103,9 +103,9 @@ peers ${node.peers().map((p) => `${p.host}(${p.state})`).join(" ") || "none"}  a
       }
       const r = await pairWith(node, pos[0] ?? die("pair <host:port>"));
       console.log(`Pairing with ${r.host}\n  its host key:  ${r.key}\n  its owner key: ${r.owner ?? "none"}\n\n  CODE: ${r.code}\n
-Check that ${r.host} shows the SAME code (its daemon log, or 'mbx peers' there). If it matches, run on BOTH hosts:
-  here:       mbx pair approve ${r.host} ${r.code}
-  on ${r.host}:  mbx pair approve ${node.host} ${r.code}
+Check that ${r.host} shows the SAME code (its daemon log, or 'agentmbx peers' there). If it matches, run on BOTH hosts:
+  here:       agentmbx pair approve ${r.host} ${r.code}
+  on ${r.host}:  agentmbx pair approve ${node.host} ${r.code}
 If the codes differ, do not approve: someone is in the middle.`);
       return;
     }
@@ -118,7 +118,7 @@ If the codes differ, do not approve: someone is in the middle.`);
         try { await flushOutbox(node); await dispatchWakes(node); } catch (e) { process.stderr.write(`[mbx] ${(e as Error).message}\n`); } finally { busy = false; }
       };
       await startServer(node, node.config.port, node.config.bind, () => void tick());
-      console.log(`[mbx] daemon for ${node.host} listening on ${node.config.bind}:${node.config.port}`);
+      console.log(`[agentmbx] daemon for ${node.host} listening on ${node.config.bind}:${node.config.port}`);
       setInterval(tick, 2000);
       setInterval(() => void refreshDirectory(node), 60_000); void refreshDirectory(node);
       return;
@@ -126,7 +126,7 @@ If the codes differ, do not approve: someone is in the middle.`);
     case "owner": return owner(node, pos, str);
     case "hook": return hook(node, pos[0], str("cli") ?? "unknown");
     case "import-v2": return importV2(node, pos[0] ?? die("import-v2 <dir>"));
-    default: die(`unknown command "${cmd}" (mbx help)`);
+    default: die(`unknown command "${cmd}" (agentmbx help)`);
   }
 }
 
@@ -136,7 +136,7 @@ function owner(node: MbxNode, pos: string[], str: (k: string) => string | undefi
   if (sub === "show") return console.log(node.ownerPub ? `owner key ${fingerprint(node.ownerPub)} (${ownerPath(node.home)})` : "no owner key on this host");
   if (sub === "init") {
     if (existsSync(ownerPath(node.home))) die("an owner key already exists on this host");
-    const p1 = readPassphraseFromTTY("New owner passphrase (save it in Bitwarden): "), p2 = readPassphraseFromTTY("Again: ");
+    const p1 = readPassphraseFromTTY("New owner passphrase (save it in your password manager): "), p2 = readPassphraseFromTTY("Again: ");
     if (p1 !== p2) die("passphrases differ");
     const pub = createOwnerKey(node.home, p1);
     console.log(`owner key created: ${fingerprint(pub)}\nPair (or re-pair) your other hosts so they pin this key.`);
@@ -149,7 +149,7 @@ function owner(node: MbxNode, pos: string[], str: (k: string) => string | undefi
     const hours = Number(m[1]) * (m[2] === "d" ? 24 : 1);
     const live = node.sessionsFor(agent).filter((s) => s.session_key && (!s.pid || (() => { try { process.kill(s.pid!, 0); return true; } catch { return false; } })()));
     const pick = str("session") ? live.filter((s) => fingerprint(s.session_key!).startsWith(str("session")!)) : live;
-    if (!pick.length) die(`no live mbx session for ${agent} on this host (start the agent's CLI with mbx configured first)`);
+    if (!pick.length) die(`no live mbx session for ${agent} on this host (start the agent's CLI with the mbx MCP server configured first)`);
     if (pick.length > 1) die(`several live sessions for ${agent}; choose one with --session:\n${pick.map((s) => `  ${fingerprint(s.session_key!)}  ${s.cli} pid ${s.pid} ${s.cwd} (since ${s.updated_at})`).join("\n")}`);
     const s = pick[0];
     console.log(`Grant OWNER authority to:\n  agent ${agent}@${node.host}  (${s.cli}, pid ${s.pid}, ${s.cwd})\n  session key ${fingerprint(s.session_key!)}\n  caps ${caps.join(", ")}  for ${hours} h\nOnly that running session can use it; it ends when the session ends.`);
@@ -218,7 +218,7 @@ function importV2(node: MbxNode, dir: string) {
 }
 
 // ---- service install -------------------------------------------------------------------------
-const LABEL = "dev.mbx.daemon";
+const LABEL = "com.agentmbx.daemon";
 function installService(node: MbxNode) {
   const bin = process.argv[1];
   if (process.platform === "darwin") {
@@ -237,15 +237,15 @@ function installService(node: MbxNode) {
     execFileSync("launchctl", ["bootstrap", `gui/${process.getuid!()}`, plist]);
     return console.log(`installed ${plist}; log: ${join(node.home, "daemon.log")}`);
   }
-  const unit = join(homedir(), ".config/systemd/user/mbx.service");
+  const unit = join(homedir(), ".config/systemd/user/agentmbx.service");
   mkdirSync(join(homedir(), ".config/systemd/user"), { recursive: true });
-  writeFileSync(unit, `[Unit]\nDescription=mbx agent mailbox daemon\n\n[Service]\nEnvironment=MBX_HOME=${node.home}\nExecStart=${process.execPath} ${bin} daemon\nRestart=always\n\n[Install]\nWantedBy=default.target\n`);
-  execFileSync("systemctl", ["--user", "daemon-reload"]); execFileSync("systemctl", ["--user", "enable", "--now", "mbx.service"]);
+  writeFileSync(unit, `[Unit]\nDescription=AgentMBX daemon\n\n[Service]\nEnvironment=MBX_HOME=${node.home}\nExecStart=${process.execPath} ${bin} daemon\nRestart=always\n\n[Install]\nWantedBy=default.target\n`);
+  execFileSync("systemctl", ["--user", "daemon-reload"]); execFileSync("systemctl", ["--user", "enable", "--now", "agentmbx.service"]);
   console.log(`installed ${unit}`);
 }
 function uninstallService() {
   if (process.platform === "darwin") { try { execFileSync("launchctl", ["bootout", `gui/${process.getuid!()}/${LABEL}`]); } catch { /* */ } return console.log("stopped"); }
-  execFileSync("systemctl", ["--user", "disable", "--now", "mbx.service"]); console.log("stopped");
+  execFileSync("systemctl", ["--user", "disable", "--now", "agentmbx.service"]); console.log("stopped");
 }
 
 export type { Grant };

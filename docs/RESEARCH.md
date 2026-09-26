@@ -12,7 +12,7 @@ No existing tool both works across machines on a LAN and wakes an idle agent in 
 | Claude cross-session messaging | Wakes idle sessions, with strong labelling that a message is not the user | Claude-only; cross-machine goes through Anthropic via Remote Control |
 | A2A / SLIM | Enterprise agent protocols | None of our CLIs speaks them |
 
-`mbx` v2 (our own 58-line bash + jq tool, one JSON file per message on the NAS, written to a temp file and renamed) has worked in production for the Fedora → Mac migration.
+The predecessor, `mbx` v2 (a 58-line bash + jq tool: one JSON file per message on a shared network folder, written to a temp file and renamed), coordinated agents on two machines during a real workstation migration.
 
 ## SignalDock: what to keep
 SignalDock was a hosted, multi-tenant platform: about 22k lines of Rust, with payments, a leaderboard, auth, five transports, S3 and two databases. Its local delivery still ended up as "write a JSON file". Despite all that it was at-most-once, had no signatures, and its owner model was a claim code.
@@ -34,7 +34,7 @@ What's worth keeping:
 | **Codex 0.156** | Stop hook `additionalContext`/`block`; app-server `turn/steer` | **`codex queue --thread <id> --message <text>`**: woke an idle TUI in about 1 s; messages queued while the thread is closed run on the next open | `codex exec resume`, app-server | **verified** |
 | **OpenCode 2.0.15** | `POST /api/session/{id}/synthetic {text, delivery:"queue"\|"steer"}` | same call: woke an idle session with no human present | same + SSE `/api/event` | **verified** |
 | **Kimi Code 2.1** | UserPromptSubmit hook adds context; one Stop continuation per turn | no push into the TUI; the agent's own CronCreate polls; or run under `kimi web` → `POST /api/v1/sessions/{id}/prompts` | `kimi web` REST, `kimi acp`, `kimi -S <id> -p` | source-read; the model isn't logged in |
-| **Hermes** | plugin `ctx.inject_message(session_key=…)` (with `allow_gateway_injection`) | same, or a plugin that registers an "mbx" gateway platform; webhook with `mirror_to_session` | `POST /v1/runs` with `X-Hermes-Session-Id`, `hermes -z` | docs; not installed on the Mac |
+| **Hermes** | plugin `ctx.inject_message(session_key=…)` (with `allow_gateway_injection`) | same, or a plugin that registers an "mbx" gateway platform; webhook with `mirror_to_session` | `POST /v1/runs` with `X-Hermes-Session-Id`, `hermes -z` | docs; not installed on the test Mac |
 
 Every CLI has a SessionStart-style hook that reports its session or thread id, which is how the server binds an agent to a live session.
 

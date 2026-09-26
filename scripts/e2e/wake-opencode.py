@@ -4,7 +4,7 @@ reads the message through the mbx MCP tools (configured per-project in a scratch
 import base64, json, os, subprocess, sys, tempfile, time, urllib.request, uuid
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-MBX = os.path.join(ROOT, "bin", "mbx.js")
+MBX = os.path.join(ROOT, "bin", "agentmbx.js")
 home = tempfile.mkdtemp(prefix="mbx-e2e-home-"); work = os.path.realpath(tempfile.mkdtemp(prefix="oc-agent-"))
 env = dict(os.environ, MBX_HOME=home, MBX_NO_DESKTOP="1"); agent = "oc-agent"; token = "PONG-" + uuid.uuid4().hex[:6]
 MODEL = {"providerID": "opencode", "id": os.environ.get("OC_MODEL", "mimo-v2.6-flash-free")}
