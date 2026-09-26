@@ -10,7 +10,9 @@ import { flushOutbox, pairWith, refreshDirectory, startServer, advertisedAddr } 
 import { agentName, runMcp } from "./mcp.js";
 import { defaultHome, formatMessage, MbxNode, summaryLine, trustLabel } from "./node.js";
 import { createOwnerKey, ownerPath, readPassphraseFromTTY, unlockOwnerKey } from "./owner.js";
-import { dispatchWakes, opencodeSessionFor } from "./wake.js";
+import { SERVICE_LABEL as LABEL, periodicUpdateCheck, updateAvailable, updateCommand } from "./update.js";
+import { installKind, version } from "./version.js";
+import { dispatchWakes, notifyDesktop, opencodeSessionFor } from "./wake.js";
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
 
 Messages
@@ -29,13 +31,18 @@ Owner (run these yourself in a terminal; they ask for the owner passphrase and r
   agentmbx owner grant <agent> [--session <fingerprint>] [--caps ${CAPS.join(",")}] [--ttl 12h]
   agentmbx owner revoke <grant-id>
 
+Install
+  agentmbx version [--check]                    version, install kind (sea|npm|dev); --check asks the release server
+  agentmbx update [--check] [--yes]             verify the signed release manifest and replace this binary (npm/dev: prints the command)
+
 Agent integration
   agentmbx mcp                                  stdio MCP server (add to Claude/Codex/OpenCode/Kimi/Hermes MCP config)
   agentmbx hook session-start --cli <codex|kimi|claude|opencode>   bind the running session (reads the hook JSON on stdin)
   agentmbx hook prompt --cli <…>                adds "N unread mbx messages" to the next turn when there is mail
   agentmbx import-v2 <MAILBOX/v2 dir>           import the old NAS mailbox as unsigned 'legacy' messages
 
-Env: MBX_HOME (default ~/.local/share/agentmbx), MBX_AGENT (agent name for mcp/hooks), MBX_ADVERTISE (host:port others use)`;
+Env: MBX_HOME (default ~/.local/share/agentmbx), MBX_AGENT (agent name for mcp/hooks), MBX_ADVERTISE (host:port others use),
+     MBX_UPDATE_URL (release download base), MBX_NO_UPDATE_CHECK (daemon skips its daily update check)`;
 const die = (msg) => { process.stderr.write(`agentmbx: ${msg}\n`); process.exit(1); };
 const readStdin = () => { try {
     return readFileSync(0, "utf8");
@@ -52,11 +59,21 @@ export async function main(argv = process.argv.slice(2)) {
             "body-file": { type: "string" }, kind: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" },
             ref: { type: "string", multiple: true }, all: { type: "boolean" }, json: { type: "boolean" }, note: { type: "string" },
             host: { type: "string" }, port: { type: "string" }, cli: { type: "string" }, session: { type: "string" }, caps: { type: "string" },
-            ttl: { type: "string" }, bind: { type: "string" }
+            ttl: { type: "string" }, bind: { type: "string" }, check: { type: "boolean" }, yes: { type: "boolean", short: "y" }
         } });
     const str = (k) => (typeof o[k] === "string" ? o[k] : undefined);
     if (cmd === "mcp")
         return runMcp();
+    if (cmd === "version" || cmd === "--version" || cmd === "-v") {
+        console.log(`agentmbx ${version()} (${installKind()}, node ${process.versions.node}, ${process.platform}-${process.arch})`);
+        if (o.check)
+            process.exitCode = await updateCommand({ check: true });
+        return;
+    }
+    if (cmd === "update") {
+        process.exitCode = await updateCommand({ check: !!o.check, yes: !!o.yes });
+        return;
+    }
     if (cmd === "init") {
         const n = new MbxNode(defaultHome(), { host: str("host"), port: str("port") ? Number(str("port")) : undefined, bind: str("bind") });
         console.log(`mbx home: ${n.home}\nhost: ${n.host}  key: ${fingerprint(n.key.publicKey)}  listens on ${n.config.bind}:${n.config.port}  advertised as ${advertisedAddr(n)}`);
@@ -96,7 +113,11 @@ export async function main(argv = process.argv.slice(2)) {
             const q = (sql) => node.store.db.prepare(sql).get().n;
             console.log(`host ${node.host} (${fingerprint(node.key.publicKey)})  owner ${node.ownerPub ? fingerprint(node.ownerPub) : "none"}
 messages ${q("SELECT count(*) n FROM messages")}  unacked ${q("SELECT count(*) n FROM deliveries WHERE state <> 'acked'")}  outbox ${q("SELECT count(*) n FROM outbox")}
-peers ${node.peers().map((p) => `${p.host}(${p.state})`).join(" ") || "none"}  active grants ${q(`SELECT count(*) n FROM grants WHERE revoked=0 AND exp>'${new Date().toISOString()}'`)}`);
+peers ${node.peers().map((p) => `${p.host}(${p.state})`).join(" ") || "none"}  active grants ${q(`SELECT count(*) n FROM grants WHERE revoked=0 AND exp>'${new Date().toISOString()}'`)}
+version ${version()} (${installKind()})`);
+            const upd = updateAvailable(node.store);
+            if (upd)
+                console.log(`update available: ${upd} (run: agentmbx update)`);
             return;
         }
         case "peers": {
@@ -146,6 +167,9 @@ If the codes differ, do not approve: someone is in the middle.`);
             setInterval(tick, 2000);
             setInterval(() => void refreshDirectory(node), 60_000);
             void refreshDirectory(node);
+            const updCheck = () => void periodicUpdateCheck(node.store, notifyDesktop); // gated to once per 24 h via kv
+            setInterval(updCheck, 3600_000).unref();
+            updCheck();
             return;
         }
         case "owner": return owner(node, pos, str);
@@ -267,12 +291,13 @@ function importV2(node, dir) {
     console.log(`imported ${n} v2 message(s) as legacy`);
 }
 // ---- service install -------------------------------------------------------------------------
-const LABEL = "com.agentmbx.daemon";
 function installService(node) {
-    const bin = realpathSync(process.argv[1]);
-    // prefer a stable node path (mise/asdf/volta shims survive Node upgrades) over the versioned execPath
+    // standalone binary: run itself. npm/dev: prefer a stable node path (mise/asdf/volta shims survive Node upgrades)
+    const sea = installKind() === "sea";
+    const bin = sea ? "" : realpathSync(process.argv[1]);
     const shims = [join(homedir(), ".local/share/mise/shims/node"), join(homedir(), ".asdf/shims/node"), join(homedir(), ".volta/bin/node")];
-    const nodeBin = shims.find((p) => existsSync(p)) ?? process.execPath;
+    const nodeBin = sea ? realpathSync(process.execPath) : shims.find((p) => existsSync(p)) ?? process.execPath;
+    const argv = sea ? [nodeBin, "daemon"] : [nodeBin, bin, "daemon"];
     if (process.platform === "darwin") {
         const plist = join(homedir(), "Library/LaunchAgents", `${LABEL}.plist`);
         mkdirSync(join(homedir(), "Library/LaunchAgents"), { recursive: true });
@@ -280,7 +305,7 @@ function installService(node) {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>${LABEL}</string>
-  <key>ProgramArguments</key><array><string>${nodeBin}</string><string>${bin}</string><string>daemon</string></array>
+  <key>ProgramArguments</key><array>${argv.map((a) => `<string>${a}</string>`).join("")}</array>
   <key>EnvironmentVariables</key><dict><key>MBX_HOME</key><string>${node.home}</string><key>PATH</key><string>${join(homedir(), ".local/bin")}:${join(homedir(), ".local/share/mise/shims")}:${join(homedir(), ".opencode/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>${join(node.home, "daemon.log")}</string><key>StandardErrorPath</key><string>${join(node.home, "daemon.log")}</string>
@@ -294,7 +319,7 @@ function installService(node) {
     }
     const unit = join(homedir(), ".config/systemd/user/agentmbx.service");
     mkdirSync(join(homedir(), ".config/systemd/user"), { recursive: true });
-    writeFileSync(unit, `[Unit]\nDescription=AgentMBX daemon\n\n[Service]\nEnvironment=MBX_HOME=${node.home}\nExecStart=${nodeBin} ${bin} daemon\nRestart=always\n\n[Install]\nWantedBy=default.target\n`);
+    writeFileSync(unit, `[Unit]\nDescription=AgentMBX daemon\n\n[Service]\nEnvironment=MBX_HOME=${node.home}\nExecStart=${argv.join(" ")}\nRestart=always\n\n[Install]\nWantedBy=default.target\n`);
     execFileSync("systemctl", ["--user", "daemon-reload"]);
     execFileSync("systemctl", ["--user", "enable", "--now", "agentmbx.service"]);
     console.log(`installed ${unit}`);

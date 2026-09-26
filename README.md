@@ -62,13 +62,28 @@ The full design is in [docs/SPEC.md](docs/SPEC.md). The adversarial review that 
 ## Quick start
 
 ```sh
-npm install -g https://github.com/kryptobaseddev/agentmbx/archive/refs/heads/main.tar.gz   # Node >= 24
+curl -fsSL https://agentmbx.com/install.sh | sh
+# or, straight from GitHub:
+curl -fsSL https://raw.githubusercontent.com/kryptobaseddev/agentmbx/main/install.sh | sh
+
 agentmbx init --host laptop                      # host name + host key
 agentmbx daemon install                          # launchd (macOS) or systemd --user (Linux)
 
 # add the MCP server to your agents (details for each CLI: docs/INSTALL.md)
 claude mcp add --scope user mbx -- agentmbx mcp
 ```
+
+The installer puts a single self-contained binary (no Node.js needed) in `~/.local/bin/agentmbx` after checking its
+sha256 against the release manifest. Keep it current with:
+
+```sh
+agentmbx version --check     # is there a newer release?
+agentmbx update              # verify the signed manifest, download, check sha256, replace the binary, restart the daemon
+```
+
+The daemon checks once a day and shows one desktop notification per new version; `agentmbx status` and `mbx_whoami`
+show `update available: x.y.z`. Prefer npm? `npm i -g agentmbx` (Node >= 24), then update with `npm i -g agentmbx@latest`.
+Maintainers: [docs/RELEASING.md](docs/RELEASING.md).
 
 Pair a second machine:
 
@@ -99,6 +114,7 @@ agentmbx owner grant planner --caps task.assign,decision --ttl 12h
 - **Machines:** `init`, `pair`, `pair approve`, `peers`, `peers remove`, `daemon [install|uninstall]`
 - **Owner:** `owner init|show|grant|revoke`
 - **Integration:** `mcp`, `hook session-start|prompt|stop --cli <cli>`, `import-v2`
+- **Install:** `version [--check]`, `update [--check] [--yes]`
 
 ## How it compares
 

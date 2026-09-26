@@ -28,12 +28,14 @@ export function generateKeyPair(): KeyPair {
 const pubObj = (b64: string) => createPublicKey({ key: Buffer.concat([SPKI_PREFIX, Buffer.from(b64, "base64")]), format: "der", type: "spki" });
 const privObj = (b64: string) => createPrivateKey({ key: Buffer.concat([PKCS8_PREFIX, Buffer.from(b64, "base64")]), format: "der", type: "pkcs8" });
 
-export function signData(privateKey: string, data: string): string {
-  return sign(null, Buffer.from(data), privObj(privateKey)).toString("base64");
+const bytes = (data: string | Uint8Array) => (typeof data === "string" ? Buffer.from(data) : data);
+
+export function signData(privateKey: string, data: string | Uint8Array): string {
+  return sign(null, bytes(data), privObj(privateKey)).toString("base64");
 }
 
-export function verifyData(publicKey: string, data: string, signature: string): boolean {
-  try { return verify(null, Buffer.from(data), pubObj(publicKey), Buffer.from(signature, "base64")); }
+export function verifyData(publicKey: string, data: string | Uint8Array, signature: string): boolean {
+  try { return verify(null, bytes(data), pubObj(publicKey), Buffer.from(signature, "base64")); }
   catch { return false; }
 }
 
