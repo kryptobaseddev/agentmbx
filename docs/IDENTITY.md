@@ -29,7 +29,7 @@ The portfolio (SignalDock, CLEO conduit, AgentMBX, CLEO Nexus) never had a proto
 
 **Where each project lands:**
 - **CLEO conduit stays the application layer, above the kernel.** It keeps topics (`epic-<T>.wave-<n>`), conversations and orchestration. `MbxTransport` implements CLEO's `Transport` (push/poll/ack) and replaces its HTTP transport to `api.signaldock.io`. The kernel gets no topic primitive unless the conformance test shows conduit needs cross-host topics.
-- **SignalDock is frozen now:** rotate the committed keys, close unauthenticated registration, no new features. It retires after `MbxTransport` carries CLEO's remote traffic. Its poll/SSE/webhook, ack and dead-letter *semantics* become §0.1; its code is kept for reference only.
+- **SignalDock: under review (Keaton, 2026-09-26).** The security freeze stands now: rotate the committed keys and close unauthenticated registration. Whether its Rust backend and web UI become the **AgentMBX Cloud** (the untrusted relay + owner web app) rather than being retired is decided after the salvage audit (docs/research/SIGNALDOCK-SALVAGE.md). The council's objection was to its trust model (server-held authority, bearer keys), not its code or product.
 - **CLEO Nexus** is the account plane only (Better Auth). It is never consulted for authority.
 
 ### 0.1 Delivery semantics (identical on LAN and relay)
