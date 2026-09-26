@@ -13,7 +13,7 @@
     "test": "AGENTMBX_DEV=1 node --test --test-concurrency=1 'test/*.test.ts'",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
-    "prepare": "tsc -p tsconfig.build.json"
+    "check-dist": "npm run build && git diff --exit-code -- dist"
   },
   "license": "BUSL-1.1",
   "dependencies": {
