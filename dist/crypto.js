@@ -23,12 +23,13 @@ export function generateKeyPair() {
 }
 const pubObj = (b64) => createPublicKey({ key: Buffer.concat([SPKI_PREFIX, Buffer.from(b64, "base64")]), format: "der", type: "spki" });
 const privObj = (b64) => createPrivateKey({ key: Buffer.concat([PKCS8_PREFIX, Buffer.from(b64, "base64")]), format: "der", type: "pkcs8" });
+const bytes = (data) => (typeof data === "string" ? Buffer.from(data) : data);
 export function signData(privateKey, data) {
-    return sign(null, Buffer.from(data), privObj(privateKey)).toString("base64");
+    return sign(null, bytes(data), privObj(privateKey)).toString("base64");
 }
 export function verifyData(publicKey, data, signature) {
     try {
-        return verify(null, Buffer.from(data), pubObj(publicKey), Buffer.from(signature, "base64"));
+        return verify(null, bytes(data), pubObj(publicKey), Buffer.from(signature, "base64"));
     }
     catch {
         return false;

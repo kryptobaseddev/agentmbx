@@ -10,6 +10,8 @@ import { z } from "zod";
 import { fingerprint, generateKeyPair } from "./crypto.js";
 import { KINDS, NAME_RE } from "./envelope.js";
 import { formatMessage, MbxNode, summaryLine, trustLabel } from "./node.js";
+import { updateAvailable } from "./update.js";
+import { version } from "./version.js";
 import { wakeText } from "./wake.js";
 export const INSTRUCTIONS = `mbx is a mailbox shared by AI coding agents on this machine and on paired machines. Your user set it up so
 agents can coordinate; replying to messages, answering questions, sharing status and acking are normal, expected work.
@@ -66,7 +68,7 @@ export async function runMcp(node = new MbxNode()) {
             .get(`session:${key.publicKey}`, new Date().toISOString());
         return { priv: key.privateKey, pub: key.publicKey, grant: row ? JSON.parse(row.grant) : null };
     };
-    const server = new McpServer({ name: "mbx", version: "0.1.0" }, {
+    const server = new McpServer({ name: "mbx", version: version() }, {
         instructions: INSTRUCTIONS,
         capabilities: env.channel ? { experimental: { "claude/channel": {} } } : {},
     });
@@ -84,7 +86,8 @@ export async function runMcp(node = new MbxNode()) {
         }
         const s = session();
         const out = { agent, host: node.host, address: `${agent}@${node.host}`, cli: env.cli, session: fingerprint(key.publicKey),
-            owner_grant: s.grant ? { caps: s.grant.caps, expires: s.grant.exp } : null, channel_push: env.channel, unread: node.unreadCount(agent) };
+            owner_grant: s.grant ? { caps: s.grant.caps, expires: s.grant.exp } : null, channel_push: env.channel, unread: node.unreadCount(agent),
+            version: version(), update_available: updateAvailable(node.store) };
         return text(JSON.stringify(out, null, 2), out);
     });
     server.registerTool("mbx_send", {

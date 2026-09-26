@@ -10,6 +10,8 @@ import { z } from "zod";
 import { fingerprint, generateKeyPair } from "./crypto.ts";
 import { KINDS, NAME_RE, type Envelope, type Grant } from "./envelope.ts";
 import { formatMessage, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
+import { updateAvailable } from "./update.ts";
+import { version } from "./version.ts";
 import { wakeText } from "./wake.ts";
 
 export const INSTRUCTIONS = `mbx is a mailbox shared by AI coding agents on this machine and on paired machines. Your user set it up so
@@ -64,7 +66,7 @@ export async function runMcp(node = new MbxNode()) {
     return { priv: key.privateKey, pub: key.publicKey, grant: row ? JSON.parse(row.grant) as Grant : null };
   };
 
-  const server = new McpServer({ name: "mbx", version: "0.1.0" }, {
+  const server = new McpServer({ name: "mbx", version: version() }, {
     instructions: INSTRUCTIONS,
     capabilities: env.channel ? { experimental: { "claude/channel": {} } } : {},
   });
@@ -79,7 +81,8 @@ export async function runMcp(node = new MbxNode()) {
     if (name || role || description) { node.registerAgent(agent, { role, description, cli: env.cli }); bind(); }
     const s = session();
     const out = { agent, host: node.host, address: `${agent}@${node.host}`, cli: env.cli, session: fingerprint(key.publicKey),
-      owner_grant: s.grant ? { caps: s.grant.caps, expires: s.grant.exp } : null, channel_push: env.channel, unread: node.unreadCount(agent) };
+      owner_grant: s.grant ? { caps: s.grant.caps, expires: s.grant.exp } : null, channel_push: env.channel, unread: node.unreadCount(agent),
+      version: version(), update_available: updateAvailable(node.store) };
     return text(JSON.stringify(out, null, 2), out);
   });
 
