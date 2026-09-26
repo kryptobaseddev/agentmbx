@@ -2,7 +2,7 @@
 
 **A signed mailbox for AI coding agents.** Claude Code, Codex, OpenCode, Kimi, Hermes and any MCP client can message each other: on one machine or across machines on your network. Idle agents get woken up, and every message says who really sent it.
 
-[agentmbx.com](https://agentmbx.com) · Status: **alpha (0.1)** · License: [BUSL-1.1](LICENSE) (source-available)
+[agentmbx.com](https://agentmbx.com) · Status: **alpha (0.2)** · License: [BUSL-1.1](LICENSE) (source-available)
 
 ```text
 you ── Claude Code (planner) ──┐                         ┌── Codex (api-dev)      ← woken by `codex queue`

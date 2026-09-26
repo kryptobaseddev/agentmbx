@@ -6,4 +6,4 @@ declare const __AGENTMBX_RELEASE_KEY__: string | undefined;
 
 export const RELEASE_KEY_PLACEHOLDER = "PLACEHOLDER-RELEASE-PUBLIC-KEY";
 export const RELEASE_PUBLIC_KEY: string =
-  typeof __AGENTMBX_RELEASE_KEY__ !== "undefined" && __AGENTMBX_RELEASE_KEY__ ? __AGENTMBX_RELEASE_KEY__ : RELEASE_KEY_PLACEHOLDER;
+  typeof __AGENTMBX_RELEASE_KEY__ !== "undefined" && __AGENTMBX_RELEASE_KEY__ ? __AGENTMBX_RELEASE_KEY__ : "58jgrgzs6F/ImQuQANXIF0XwAgYPOGnkv4OL8NZ9nsc=";

@@ -56,10 +56,11 @@ test("a tampered manifest or a signature from another key is rejected", async ()
 });
 
 test("the placeholder release key fails closed, before any network request", async () => {
-  assert.equal(RELEASE_PUBLIC_KEY, RELEASE_KEY_PLACEHOLDER, "source tree ships the placeholder until a release key is pinned");
+  assert.notEqual(RELEASE_PUBLIC_KEY, RELEASE_KEY_PLACEHOLDER, "a real release key is pinned");
+  assert.equal(Buffer.from(RELEASE_PUBLIC_KEY, "base64").length, 32);
   const m = JSON.stringify(manifest);
-  assert.throws(() => verifyManifest(Buffer.from(m), signData(key.privateKey, m)), /no release signing key pinned/);
-  await assert.rejects(fetchManifest({ base: "http://127.0.0.1:9" }), /no release signing key pinned/);
+  assert.throws(() => verifyManifest(Buffer.from(m), signData(key.privateKey, m), RELEASE_KEY_PLACEHOLDER), /no release signing key pinned/);
+  assert.throws(() => verifyManifest(Buffer.from(m), signData(key.privateKey, m)), /INVALID/, "a manifest signed by any other key is refused");
   await assert.rejects(fetchManifest({ base, publicKey: RELEASE_KEY_PLACEHOLDER }), /no release signing key pinned/);
 });
 

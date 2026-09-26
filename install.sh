@@ -81,6 +81,20 @@ mv -f "$tmp/agentmbx" "$INSTALL_DIR/.agentmbx.new.$$"
 mv -f "$INSTALL_DIR/.agentmbx.new.$$" "$INSTALL_DIR/agentmbx"
 say "installed $INSTALL_DIR/agentmbx ($("$INSTALL_DIR/agentmbx" version 2>/dev/null || echo "agentmbx $version"))"
 
+# macOS: the AgentMBX.app notifier (branded notifications; Login Items shows "AgentMBX"), same checksum rules
+if [ "$os" = darwin ]; then
+  ablock="$(awk -v key='"macos-app"' 'index($0, key ":") { on = 1; next } on && /}/ { exit } on { print }' "$tmp/manifest.json")"
+  afile="$(printf '%s\n' "$ablock" | sed -n 's/.*"file":[[:space:]]*"\([^"]*\)".*/\1/p')"
+  awant="$(printf '%s\n' "$ablock" | sed -n 's/.*"sha256":[[:space:]]*"\([0-9a-fA-F]*\)".*/\1/p' | tr 'A-F' 'a-f')"
+  if [ -n "$afile" ] && [ "${#awant}" -eq 64 ]; then
+    case "$afile" in *[!A-Za-z0-9._-]*) die "unexpected asset name in manifest: $afile" ;; esac
+    fetch "$base/$afile" "$tmp/app.zip" || die "could not download $base/$afile"
+    [ "$(sha256 "$tmp/app.zip")" = "$awant" ] || die "CHECKSUM MISMATCH for $afile. The app was not installed."
+    mkdir -p "$HOME/Applications" && rm -rf "$HOME/Applications/AgentMBX.app"
+    ditto -x -k "$tmp/app.zip" "$HOME/Applications" && say "installed $HOME/Applications/AgentMBX.app (notifications)"
+  fi
+fi
+
 case ":${PATH:-}:" in
   *":$INSTALL_DIR:"*) ;;
   *) say "WARNING: $INSTALL_DIR is not on your PATH. Add it, e.g.:"

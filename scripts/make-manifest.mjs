@@ -20,6 +20,14 @@ for (const file of files) {
   assets[file.replace(/^agentmbx-/, "")] = { file, sha256, size: statSync(join(dir, file)).size };
   sums.push(`${sha256}  ${file}`);
 }
+// optional: the macOS notifier app (universal), installed into ~/Applications by install.sh on macOS
+const app = "AgentMBX-macos.zip";
+try {
+  const data = readFileSync(join(dir, app));
+  const sha256 = createHash("sha256").update(data).digest("hex");
+  assets["macos-app"] = { file: app, sha256, size: data.length };
+  sums.push(`${sha256}  ${app}`);
+} catch { /* not built for this release */ }
 writeFileSync(join(dir, "SHA256SUMS"), sums.join("\n") + "\n");
 const manifest = { name: "agentmbx", version, released_at: new Date().toISOString(), assets };
 writeFileSync(join(dir, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
