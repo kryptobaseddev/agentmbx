@@ -115,7 +115,7 @@ export async function main(argv = process.argv.slice(2)) {
             if (str("reply-to") && !reply)
                 die(`no message ${str("reply-to")}`);
             const r = node.send({ from: as(), to: (str("to") ?? die("--to is required")).split(",").map((s) => s.trim()).filter(Boolean),
-                subject: str("subject") ?? die("--subject is required"), body, kind: (str("kind") ?? "message"),
+                subject: str("subject") ?? (reply ? (reply.subject.startsWith("Re: ") ? reply.subject : `Re: ${reply.subject}`) : die("--subject is required")), body, kind: (str("kind") ?? "message"),
                 reply_to: reply?.id ?? null, thread: reply?.thread, needs_reply: !!o["needs-reply"], refs: o.ref ?? [] });
             r.warnings.forEach((w) => process.stderr.write(`warning: ${w}\n`));
             console.log(r.envelope.id);
