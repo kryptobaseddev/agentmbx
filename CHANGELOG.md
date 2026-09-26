@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1 (2026-09-26)
+- **Kimi web wake-up:** Kimi sessions hosted by `kimi web`, the Kimi desktop app or `kimi rc` are woken directly through the local server's prompts API, with no self-check job needed. A busy session is retried, never interrupted. Terminal Kimi keeps the `[mbx-watch]` self-check. Built and verified live by kimi.
+- **Broadcasts** (`*`, `role:`) reach only agents with a live session. Shell senders (`--as`) still get mail addressed to them by name.
+- **Setup** defaults to the `collaborate` policy (POLICY.md ratified).
+- **Release signing:** the macOS app is signed with a stable identity, so the Keychain keeps trusting the owner-key helper across updates. `daemon install` never replaces a stably signed app with an ad-hoc local build.
+- Policy sync audits only changes of state, so an offline peer doesn't log every minute.
+
 ## 0.3.0 (2026-09-26)
 - **Owner-signed collaboration policies:** choose `ask`, `collaborate`, `autonomous` or `yolo`, with explicit `read`, `edit`, `outward` and `permissions` classes. Scope delegation by agent, host and project; inspect it with `agentmbx policy list`. Renew with `policy renew <id>`, revoke one policy or use `policy revoke --all` as the kill switch. The daemon reminds the owner 48 hours before expiry.
 - **Owner identity:** a Touch ID-protected owner key on macOS signs policies and device records. Explicitly approve paired machines with `agentmbx owner add-device`; unpairing removes trust learned through that peer. Signing shows complete security values and refuses summaries too long to display safely.

@@ -28,7 +28,7 @@ Legend: ✅ verified, 🟡 works with a documented limit, ❌ gap (tracked).
 | Codex | ✅ | ✅ same four (Codex asks to trust new hooks once) | ✅ `codex queue` (needs a codex that has `queue`) | ✅ same Stop schema (verified in 0.157.1) | ✅ `PermissionRequest` (0.157.1) |
 | OpenCode | ✅ | none | ✅ service API (`opencode service` must run) | n/a | ✅ daemon answers via the service API |
 | Kimi Code (terminal) | ✅ (MCP server instructions don't reach the model: guidance ships in the skill and hook notes) | ✅ SessionStart, UserPromptSubmit, PermissionRequest, Stop | 🟡 `[mbx-watch]` CronCreate self-check (under a policy) | ✅ Stop hook, exit 2 + reason on stderr (verified by kimi) | ❌ unsupported: Kimi's PermissionRequest hook is observation-only. Use `kimi --yolo` yourself |
-| Kimi (`kimi web`) | ✅ | ✅ | ❌ push via `POST /api/v1/sessions/{id}/prompts`, not built yet (T049) | ❌ | ✅ approvals API |
+| Kimi (`kimi web` / desktop / `kimi rc`) | ✅ | ✅ (hooks run per hosted session) | ✅ push via `POST /api/v1/sessions/{id}/prompts`, waits while busy, sends the default model when the session has none (T049, verified live by kimi) | ✅ Stop hook | ✅ approvals API |
 | Hermes | ✅ | none | ❌ cron now, plugin planned | ❌ | ❌ |
 | Anything else with MCP | ✅ (manual config) | none | desktop notification | none | none |
 
