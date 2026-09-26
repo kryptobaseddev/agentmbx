@@ -27,8 +27,9 @@ Start here
 Messages
   agentmbx send --as <agent> --to <a,b,role:x,*,owner> --subject "…" [-m "body" | --body-file f | stdin]
            [--kind message|request|reply|status|decision|alert|task] [--reply-to <id>] [--needs-reply] [--ref path]…
-  agentmbx inbox --as <agent> [--all] [--json]      mbx read <id> --as <agent>      mbx ack <id> --as <agent> [--note "…"]
-  agentmbx thread <id>        mbx search "<words>"        mbx agents        mbx status
+  agentmbx inbox --as <agent> [--all] [--json] [--needs-reply] [--from <agent>]      agentmbx read <id> --as <agent>      agentmbx ack <id>… | --all | --thread <id>  --as <agent> [--note "…"]
+  agentmbx whoami --as <agent> [--role r] [--description "…"]    register/describe yourself (shell sessions)
+  agentmbx thread <id>        agentmbx search "<words>"   agentmbx agents   agentmbx status
 
 Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …' line it prints on the other)
   agentmbx init [--host <name>] [--port 7373]       agentmbx discover            (hosts on the LAN, via mDNS)
@@ -41,9 +42,10 @@ Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …'
   agentmbx notify-test [--as <agent>]               send a sample desktop notification the way wake-ups do
 
 Owner (run these yourself in a terminal; they ask for the owner passphrase and refuse to run without one)
-  agentmbx owner init        mbx owner show
+  agentmbx owner init        agentmbx owner show
   agentmbx owner grant <agent> [--session <fingerprint>] [--caps ${CAPS.join(",")}] [--ttl 12h]
   agentmbx owner revoke <grant-id>
+  agentmbx owner send --to <agents> --subject "…" -m "…" [--kind task] [--needs-reply]   one message signed by you (OWNER)
 
 Install
   agentmbx version [--check]                    version, install kind (sea|npm|dev); --check asks the release server
@@ -57,23 +59,44 @@ Agent integration
 
 Env: MBX_HOME (default ~/.local/share/agentmbx), MBX_AGENT (agent name for mcp/hooks), MBX_ADVERTISE (host:port others use),
      MBX_UPDATE_URL (release download base), MBX_NO_UPDATE_CHECK (daemon skips its daily update check)`;
-const die = (msg) => { process.stderr.write(`agentmbx: ${msg}\n`); process.exit(1); };
+const die = (msg) => { throw Object.assign(new Error(msg), { code: "USAGE_ERROR" }); };
 const readStdin = () => { try {
     return readFileSync(0, "utf8");
 }
 catch {
     return "";
 } };
+const EXIT = { USAGE: 2, NOT_FOUND: 3, AMBIGUOUS: 4 };
+/** Help lines for one command (`agentmbx <cmd> --help`). */
+function commandHelp(cmd) {
+    const lines = HELP.split("\n").filter((l) => new RegExp(`agentmbx ${cmd}(\\s|$)`).test(l));
+    return lines.length ? lines.map((l) => l.trim()).join("\n") : HELP;
+}
 export async function main(argv = process.argv.slice(2)) {
+    try {
+        await run(argv);
+    }
+    catch (e) {
+        const err = e;
+        const usage = err.code === "ERR_PARSE_ARGS_UNKNOWN_OPTION" || err.code === "ERR_PARSE_ARGS_INVALID_OPTION_VALUE" || err.code === "ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL";
+        process.stderr.write(`agentmbx: ${err.message.replace(/\. To specify a positional argument.*$/s, "")}${usage ? ` (see: agentmbx ${argv[0] ?? ""} --help)` : ""}\n`);
+        if (process.env.MBX_DEBUG)
+            process.stderr.write(`${err.stack}\n`);
+        process.exitCode = usage ? EXIT.USAGE : EXIT[err.code ?? ""] ?? 1;
+    }
+}
+async function run(argv) {
     const [cmd, ...rest] = argv;
     if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h")
         return console.log(HELP);
-    const { values: o, positionals: pos } = parseArgs({ args: rest, allowPositionals: true, strict: false, options: {
+    if (rest.includes("--help") || rest.includes("-h"))
+        return console.log(commandHelp(cmd));
+    const { values: o, positionals: pos } = parseArgs({ args: rest, allowPositionals: true, strict: cmd !== "hook" && cmd !== "mcp", options: {
             as: { type: "string" }, to: { type: "string" }, subject: { type: "string" }, m: { type: "string", short: "m" },
             "body-file": { type: "string" }, kind: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" },
             ref: { type: "string", multiple: true }, all: { type: "boolean" }, json: { type: "boolean" }, note: { type: "string" },
             host: { type: "string" }, port: { type: "string" }, cli: { type: "string" }, session: { type: "string" }, caps: { type: "string" },
-            ttl: { type: "string" }, bind: { type: "string" }, check: { type: "boolean" }, yes: { type: "boolean", short: "y" },
+            ttl: { type: "string" }, bind: { type: "string" }, role: { type: "string" }, description: { type: "string" }, thread: { type: "string" }, from: { type: "string" }, check: { type: "boolean" }, yes: { type: "boolean", short: "y" },
             compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" }
         } });
     const str = (k) => (typeof o[k] === "string" ? o[k] : undefined);
@@ -110,6 +133,11 @@ export async function main(argv = process.argv.slice(2)) {
     const as = () => str("as") ?? process.env.MBX_AGENT ?? die("--as <agent> is required");
     switch (cmd) {
         case "send": {
+            // a shell sender is a real participant: register it so it shows in `agents` and can be addressed back
+            try {
+                node.registerAgent(as().split("@")[0], { cli: "cli" });
+            }
+            catch { /* invalid names are rejected by send below */ }
             const body = str("m") ?? (str("body-file") ? readFileSync(str("body-file"), "utf8") : process.stdin.isTTY ? "" : readStdin());
             const reply = str("reply-to") ? node.message(str("reply-to")) : undefined;
             if (str("reply-to") && !reply)
@@ -118,22 +146,67 @@ export async function main(argv = process.argv.slice(2)) {
                 subject: str("subject") ?? (reply ? (reply.subject.startsWith("Re: ") ? reply.subject : `Re: ${reply.subject}`) : die("--subject is required")), body, kind: (str("kind") ?? "message"),
                 reply_to: reply?.id ?? null, thread: reply?.thread, needs_reply: !!o["needs-reply"], refs: o.ref ?? [] });
             r.warnings.forEach((w) => process.stderr.write(`warning: ${w}\n`));
+            if (o.json)
+                return console.log(JSON.stringify({ id: r.envelope.id, thread: r.envelope.thread, ref: `mbx:${r.envelope.id}@${node.host}`, local: r.local, remote: r.remote, warnings: r.warnings }));
             console.log(r.envelope.id);
             return;
         }
         case "inbox": {
-            const rows = node.inbox(as(), { all: !!o.all, limit: 200 });
+            const me = as().split("@")[0];
+            const known = node.agents().filter((a) => a.host === node.host).map((a) => a.name);
+            if (!known.includes(me) && !node.unreadCount(me))
+                process.stderr.write(`warning: "${me}" is not a known agent here (known: ${known.join(", ") || "none"}). Typo? Register with: agentmbx whoami --as ${me}\n`);
+            let rows = node.inbox(me, { all: !!o.all, limit: 500 });
+            if (o["needs-reply"])
+                rows = rows.filter((m) => JSON.parse(m.envelope).needs_reply);
+            if (str("from"))
+                rows = rows.filter((m) => m.from_addr === str("from") || m.from_addr.split("@")[0] === str("from"));
             if (o.json)
-                return console.log(JSON.stringify(rows.map((m) => ({ id: m.id, ts: m.ts, from: m.from_addr, subject: m.subject, kind: m.kind, state: m.state, trust: trustLabel(m) })), null, 2));
+                return console.log(JSON.stringify(rows.map((m) => {
+                    const e = JSON.parse(m.envelope);
+                    return { id: m.id, ts: m.ts, from: m.from_addr, to: e.to, subject: m.subject, kind: m.kind, thread: m.thread, reply_to: m.reply_to,
+                        needs_reply: e.needs_reply, refs: e.refs, state: m.state, trust: trustLabel(m) };
+                }), null, 2));
             return rows.forEach((m) => console.log(summaryLine(m)));
         }
         case "read": return console.log(formatMessage(node.read(pos[0] ?? die("read <id>"), as())));
-        case "ack": return console.log(`acked ${node.ack(pos[0] ?? die("ack <id>"), as(), str("note") ?? null)}`);
+        case "ack": {
+            const me = as().split("@")[0];
+            let ids = pos;
+            if (o.all)
+                ids = node.inbox(me, { limit: 5000 }).map((m) => m.id);
+            else if (str("thread")) {
+                const t = node.message(str("thread"));
+                ids = node.inbox(me, { limit: 5000 }).filter((m) => m.thread === (t?.thread ?? str("thread"))).map((m) => m.id);
+            }
+            if (!ids.length)
+                die("ack <id>… | --all | --thread <id>");
+            let failed = 0;
+            for (const id of ids) {
+                try {
+                    console.log(`acked ${node.ack(id, me, str("note") ?? null)}`);
+                }
+                catch (e) {
+                    failed++;
+                    process.stderr.write(`agentmbx: ${e.message}\n`);
+                }
+            }
+            if (failed)
+                process.exitCode = EXIT.NOT_FOUND;
+            return;
+        }
         case "thread": {
             const m = node.message(pos[0] ?? die("thread <id>"));
             return node.thread(m ? m.thread : pos[0]).forEach((r) => console.log(formatMessage(r) + "\n"));
         }
         case "search": return node.search(pos.join(" ")).forEach((m) => console.log(summaryLine(m)));
+        case "whoami": {
+            const name = as().split("@")[0];
+            node.registerAgent(name, { cli: str("cli") ?? "cli", role: str("role"), description: str("description") });
+            const a = node.agents().find((x) => x.name === name && x.host === node.host);
+            console.log(`${a.name}@${a.host}${a.role ? `  role:${a.role}` : ""}  (${a.cli ?? "?"})  unacked: ${node.unreadCount(name)}${a.description ? `\n${a.description}` : ""}`);
+            return;
+        }
         case "agents": return node.agents().forEach((a) => console.log(`${a.name}@${a.host}\t${a.role ?? ""}\t${a.cli ?? ""}\t${a.last_seen ?? ""}\t${a.description ?? ""}`));
         case "status": {
             const q = (sql) => node.store.db.prepare(sql).get().n;
@@ -234,7 +307,7 @@ If the codes differ, do not approve: someone is in the middle.`);
             updCheck();
             return;
         }
-        case "owner": return owner(node, pos, str);
+        case "owner": return owner(node, pos, str, o);
         case "hook": return hook(node, pos[0], str("cli") ?? "unknown");
         case "import-v2": return importV2(node, pos[0] ?? die("import-v2 <dir>"));
         default: die(`unknown command "${cmd}" (agentmbx help)`);
@@ -301,7 +374,7 @@ async function notifyTest(agent) {
     console.log(`sent via ${r.via}`);
 }
 // ---- owner commands --------------------------------------------------------------------------
-function owner(node, pos, str) {
+function owner(node, pos, str, o) {
     const sub = pos[0];
     if (sub === "show")
         return console.log(node.ownerPub ? `owner key ${fingerprint(node.ownerPub)} (${ownerPath(node.home)})` : "no owner key on this host");
@@ -341,6 +414,16 @@ function owner(node, pos, str) {
         node.store.audit("owner.grant", { id: g.id, agent, session: fingerprint(s.session_key), caps, exp: g.exp });
         return console.log(`granted ${g.id} (expires ${g.exp})`);
     }
+    if (sub === "send") {
+        // one message signed by the owner directly: recipients see "authority: OWNER (signed by the owner directly)"
+        const to = (str("to") ?? die("owner send --to <agents> --subject … -m …")).split(",").map((x) => x.trim()).filter(Boolean);
+        const body = str("m") ?? (str("body-file") ? readFileSync(str("body-file"), "utf8") : die("-m or --body-file is required"));
+        const kind = (str("kind") ?? "task");
+        const kp = unlockOwnerKey(node.home, readPassphraseFromTTY("Owner passphrase: "));
+        const r = node.send({ from: "owner", to, subject: str("subject") ?? die("--subject is required"), body, kind, needs_reply: !!o["needs-reply"] }, undefined, { pub: kp.publicKey, priv: kp.privateKey });
+        r.warnings.forEach((w) => process.stderr.write(`warning: ${w}\n`));
+        return console.log(`${r.envelope.id}  (owner-signed; delivered to ${[...r.local, ...r.remote].join(", ")})`);
+    }
     if (sub === "revoke") {
         const id = pos[1] ?? die("owner revoke <grant-id>");
         unlockOwnerKey(node.home, readPassphraseFromTTY("Owner passphrase: "));
@@ -351,7 +434,7 @@ function owner(node, pos, str) {
         node.store.audit("owner.revoke", { id });
         return console.log(`revoked ${id} on this host (grants also expire on their own; messages already sent keep their original label)`);
     }
-    die("owner init | show | grant <agent> | revoke <id>");
+    die("owner init | show | grant <agent> | revoke <id> | send --to …");
 }
 // ---- hooks -----------------------------------------------------------------------------------
 async function hook(node, event, cli) {

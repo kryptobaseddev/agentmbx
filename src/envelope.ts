@@ -14,7 +14,8 @@ export interface Grant {
   v: 2; id: string; iss: string /* owner key fingerprint */; sub: string /* "session:" + base64 session pubkey */;
   agent: string; host: string; caps: string[]; iat: string; exp: string; nonce: string; sig: string;
 }
-export interface Authority { grant: Grant; session_sig: string }
+/** Either a master session acting under an owner grant, or the owner signing one message directly (passphrase on a TTY). */
+export type Authority = { grant: Grant; session_sig: string; owner_sig?: undefined; owner_fp?: undefined } | { owner_sig: string; owner_fp: string; grant?: undefined; session_sig?: undefined };
 
 export interface Envelope {
   v: 3; id: string; ts: string; from: string; to: string[]; thread: string; reply_to: string | null;
@@ -95,8 +96,18 @@ export function makeGrant(ownerPub: string, ownerPriv: string, sessionPub: strin
 /** What the session key signs: the envelope without its host signature and without the session signature itself. */
 const sessionPayload = (e: Envelope) => {
   const { sig: _s, authority, ...rest } = e;
-  return canonical({ ...rest, authority: authority ? { grant: authority.grant } : null });
+  return canonical({ ...rest, authority: authority?.grant ? { grant: authority.grant } : null });
 };
+const ownerPayload = (e: Envelope) => {
+  const { sig: _s, authority, ...rest } = e;
+  return canonical({ ...rest, authority: { owner_fp: authority?.owner_fp ?? null } });
+};
+
+/** The owner signs one envelope directly with the owner key (unlocked with the passphrase on a terminal). */
+export function ownerSign(e: Envelope, ownerPub: string, ownerPriv: string): Envelope {
+  const withFp: Envelope = { ...e, authority: { owner_sig: "", owner_fp: fingerprint(ownerPub) } };
+  return { ...withFp, authority: { owner_sig: signData(ownerPriv, ownerPayload(withFp)), owner_fp: fingerprint(ownerPub) } };
+}
 
 /** Called by the master session's MCP server, which holds the session private key in memory only. */
 export function attachAuthority(e: Envelope, grant: Grant, sessionPriv: string): Envelope {
@@ -122,6 +133,11 @@ export function checkAuthority(e: Envelope, ownerPub: string | null, revoked: Se
   const a = e.authority;
   if (!a) return { ok: false, reason: "no authority" };
   if (!ownerPub) return { ok: false, reason: "no owner key pinned for the sending host" };
+  if (a.owner_sig !== undefined) {
+    if (a.owner_fp !== fingerprint(ownerPub)) return { ok: false, reason: "signed by an owner key other than the one pinned for that host" };
+    if (!verifyData(ownerPub, ownerPayload(e), a.owner_sig)) return { ok: false, reason: "owner signature invalid" };
+    return { ok: true, caps: [...CAPS], grant_id: "direct", session: "signed by the owner" };
+  }
   const { sig, ...rest } = a.grant;
   if (a.grant.v !== 2) return { ok: false, reason: "unsupported grant version" };
   if (a.grant.iss !== fingerprint(ownerPub)) return { ok: false, reason: "grant not issued by the pinned owner key" };

@@ -74,8 +74,17 @@ export function makeGrant(ownerPub, ownerPriv, sessionPub, agent, host, caps, ho
 /** What the session key signs: the envelope without its host signature and without the session signature itself. */
 const sessionPayload = (e) => {
     const { sig: _s, authority, ...rest } = e;
-    return canonical({ ...rest, authority: authority ? { grant: authority.grant } : null });
+    return canonical({ ...rest, authority: authority?.grant ? { grant: authority.grant } : null });
 };
+const ownerPayload = (e) => {
+    const { sig: _s, authority, ...rest } = e;
+    return canonical({ ...rest, authority: { owner_fp: authority?.owner_fp ?? null } });
+};
+/** The owner signs one envelope directly with the owner key (unlocked with the passphrase on a terminal). */
+export function ownerSign(e, ownerPub, ownerPriv) {
+    const withFp = { ...e, authority: { owner_sig: "", owner_fp: fingerprint(ownerPub) } };
+    return { ...withFp, authority: { owner_sig: signData(ownerPriv, ownerPayload(withFp)), owner_fp: fingerprint(ownerPub) } };
+}
 /** Called by the master session's MCP server, which holds the session private key in memory only. */
 export function attachAuthority(e, grant, sessionPriv) {
     const withGrant = { ...e, authority: { grant, session_sig: "" } };
@@ -103,6 +112,13 @@ export function checkAuthority(e, ownerPub, revoked, now = new Date()) {
         return { ok: false, reason: "no authority" };
     if (!ownerPub)
         return { ok: false, reason: "no owner key pinned for the sending host" };
+    if (a.owner_sig !== undefined) {
+        if (a.owner_fp !== fingerprint(ownerPub))
+            return { ok: false, reason: "signed by an owner key other than the one pinned for that host" };
+        if (!verifyData(ownerPub, ownerPayload(e), a.owner_sig))
+            return { ok: false, reason: "owner signature invalid" };
+        return { ok: true, caps: [...CAPS], grant_id: "direct", session: "signed by the owner" };
+    }
     const { sig, ...rest } = a.grant;
     if (a.grant.v !== 2)
         return { ok: false, reason: "unsupported grant version" };

@@ -151,3 +151,20 @@ test("owner key: wrong passphrase fails, file is not plaintext", () => {
   assert.throws(() => unlockOwnerKey(h, "wrong passphrase!!"), /wrong passphrase/);
   assert.throws(() => createOwnerKey(tmp(), "short"), /12 characters/);
 });
+
+test("owner-signed direct message: verified on the paired host, forgery and tampering rejected", () => {
+  const { a, b } = twoHosts();
+  const owner = unlockOwnerKey(a.home, PASS);
+  a.send({ from: "owner", to: ["worker@beta"], subject: "do it", body: "owner says go", kind: "task" }, undefined, { pub: owner.publicKey, priv: owner.privateKey });
+  const mallory = generateKeyPair();
+  a.send({ from: "owner", to: ["worker@beta"], subject: "fake", body: "x", kind: "task" }, undefined, { pub: mallory.publicKey, priv: mallory.privateKey });
+  deliverOutbox(a, b);
+  const got = Object.fromEntries(b.inbox("worker").map((m) => [m.subject, JSON.parse(m.authority!)]));
+  assert.equal(got["do it"].ok, true);
+  assert.equal(got["do it"].session, "signed by the owner");
+  assert.equal(got.fake.ok, false);
+  // local recipients on the owner's own host see it too
+  a.registerAgent("helper");
+  a.send({ from: "owner", to: ["helper"], subject: "local", body: "y", kind: "task" }, undefined, { pub: owner.publicKey, priv: owner.privateKey });
+  assert.equal(JSON.parse(a.inbox("helper")[0].authority!).ok, true);
+});

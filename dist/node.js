@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { hostname, homedir } from "node:os";
 import { join } from "node:path";
 import { fingerprint, generateKeyPair, newPairToken, pairTokenKey, sha256 } from "./crypto.js";
-import { attachAuthority, buildEnvelope, checkAuthority, checkShape, NAME_RE, signEnvelope, verifyEnvelope, } from "./envelope.js";
+import { attachAuthority, buildEnvelope, ownerSign, checkAuthority, checkShape, NAME_RE, signEnvelope, verifyEnvelope, } from "./envelope.js";
 import { ownerPublicKey } from "./owner.js";
 import { Store } from "./store.js";
 export const DEFAULT_PORT = 7373;
@@ -184,12 +184,14 @@ export class MbxNode {
     }
     // ---- send / receive ----------------------------------------------------------------------
     revoked() { return new Set(this.store.db.prepare("SELECT id FROM grants WHERE revoked=1").all().map((r) => r.id)); }
-    send(d, session) {
+    send(d, session, owner) {
         const fromName = d.from.includes("@") ? d.from.split("@")[0] : d.from;
         if (!NAME_RE.test(fromName) && fromName !== "owner")
             throw new Error(`invalid sender name "${fromName}"`);
         let e = buildEnvelope({ ...d, from: `${fromName}@${this.host}` });
-        if (session?.grant)
+        if (owner)
+            e = ownerSign(e, owner.pub, owner.priv);
+        else if (session?.grant)
             e = attachAuthority(e, session.grant, session.priv);
         e = signEnvelope(e, this.host, this.key.publicKey, this.key.privateKey);
         const r = this.route(e.to);
@@ -243,22 +245,22 @@ export class MbxNode {
         return this.store.db.prepare("SELECT count(*) n FROM deliveries WHERE agent=? AND state <> 'acked'").get(agent).n;
     }
     message(id) {
-        const rows = this.store.db.prepare("SELECT * FROM messages WHERE id LIKE ? LIMIT 2").all(`${id}%`);
+        const rows = this.store.db.prepare("SELECT * FROM messages WHERE id LIKE ? LIMIT 6").all(`${id}%`);
         if (rows.length > 1)
-            throw new Error(`id prefix ${id} is ambiguous`);
+            throw Object.assign(new Error(`id prefix ${id} matches ${rows.length === 6 ? "6+" : rows.length} messages (${rows.slice(0, 3).map((r) => r.id).join(", ")}…); use more characters`), { code: "AMBIGUOUS" });
         return rows[0];
     }
     /** Read-only: fetching a message changes nothing (so every CLI can auto-allow it). "Unread" means "not acked". */
     read(id, _agent) {
         const m = this.message(id);
         if (!m)
-            throw new Error(`no message ${id}`);
+            throw Object.assign(new Error(`no message ${id} (list yours with: agentmbx inbox --as <you> --all)`), { code: "NOT_FOUND" });
         return m;
     }
     ack(id, agent, note = null) {
         const m = this.message(id);
         if (!m)
-            throw new Error(`no message ${id}`);
+            throw Object.assign(new Error(`no message ${id}`), { code: "NOT_FOUND" });
         this.store.setDelivery(m.id, agent, "read");
         this.store.setDelivery(m.id, agent, "acked", note);
         return m.id;
@@ -296,7 +298,7 @@ export function trustLabel(m) {
     const t = m.trust === "local" ? "local (same user on this host)" : m.trust === "verified" ? `verified (paired host ${m.origin})` : "legacy (unsigned v2)";
     const a = m.authority ? JSON.parse(m.authority) : null;
     const auth = !a ? "authority: none"
-        : a.ok ? `authority: OWNER via ${m.from_addr} session ${a.session} (caps: ${a.caps.join(", ")})`
+        : a.ok ? (a.session === "signed by the owner" ? "authority: OWNER (signed by the owner directly)" : `authority: OWNER via ${m.from_addr} session ${a.session} (caps: ${a.caps.join(", ")})`)
             : `authority: none (owner authority claimed but rejected: ${a.reason})`;
     return `${t} · ${auth}`;
 }
