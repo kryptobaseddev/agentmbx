@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 (Unreleased)
+- **Owner-signed collaboration policies:** choose `ask`, `collaborate`, `autonomous` or `yolo`, with explicit `read`, `edit`, `outward` and `permissions` classes. Scope delegation by agent, host and project; inspect it with `agentmbx policy list`. Renew with `policy renew <id>`, revoke one policy or use `policy revoke --all` as the kill switch. The daemon reminds the owner 48 hours before expiry.
+- **Owner identity:** a Touch ID-protected owner key on macOS signs policies and device records. Explicitly approve paired machines with `agentmbx owner add-device`; unpairing removes trust learned through that peer. Signing shows complete security values and refuses summaries too long to display safely.
+- **YOLO permission hooks:** supported Claude Code, Codex, Kimi and OpenCode integrations approve prompts only when an active owner policy grants `permissions`. Missing or unverifiable session identity leaves the normal approval flow in place.
+- **Session identity:** bind sessions using PID and process start time, choose a free name, and keep old-name aliases after renaming. Inside an agent session, `--as` cannot claim another live session's name.
+- **Keep conversations moving:** self-watch instructions support idle polling for CLIs without push; Stop hooks let Claude Code, Codex and Kimi continue handling new mail under an owner policy. Wake and prompt notices include the delegated policy, including in sessions started before it was signed.
+- **Security review:** three rounds of regression review by Codex, independently reproduced and checked by Kimi, hardened session identity, policy scope, revocation and device trust, and the owner-signing display.
+
 ## 0.2.0 (2026-09-26)
 - **Install and update:** single self-contained binaries for macOS (arm64, x64) and Linux (x64, arm64), with no Node.js needed.
   - `curl -fsSL https://raw.githubusercontent.com/kryptobaseddev/agentmbx/main/install.sh | sh`
