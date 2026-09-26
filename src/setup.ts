@@ -33,7 +33,17 @@ export interface Edit {
   viaCli?: (ctx: SetupCtx, mode: "install" | "uninstall", cur: string | null) => boolean; // true = done by the CLI itself
 }
 
-export const SKILL_SRC = fileURLToPath(new URL("../skill", import.meta.url));
+/** The bundled skill as {relative path: content}: embedded in the single executable (SEA asset), else read from ../skill. */
+export function skillFiles(): Record<string, string> {
+  if (isSea()) {
+    const sea = createRequire(__filename_or_url())("node:sea") as { getAsset(k: string, enc: string): string };
+    return { "SKILL.md": sea.getAsset("SKILL.md", "utf8") };
+  }
+  const dir = fileURLToPath(new URL("../skill", import.meta.url));
+  return Object.fromEntries(filesIn(dir).map((f) => [f, readFileSync(join(dir, f), "utf8")]));
+}
+const __filename_or_url = () => (typeof __filename !== "undefined" ? __filename : import.meta.url);
+declare const __filename: string | undefined;
 
 // ---- helpers ---------------------------------------------------------------------------------
 const shq = (s: string) => /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
@@ -391,16 +401,17 @@ function filesIn(dir: string, rel = ""): string[] {
 
 export function skillStatus(home: string): { installed: boolean; links: { path: string; ok: boolean }[] } {
   const dest = skillDest(home);
-  const installed = existsSync(SKILL_SRC) && filesIn(SKILL_SRC).every((f) => read(join(dest, f)) === read(join(SKILL_SRC, f)));
+  const src = skillFiles();
+  const installed = Object.entries(src).every(([f, c]) => read(join(dest, f)) === c);
   return { installed, links: skillLinks(home).map((p) => { let ok = false; try { ok = readlinkSync(p) === dest; } catch { /* missing */ } return { path: p, ok }; }) };
 }
 
 function skill(ctx: SetupCtx, mode: "install" | "uninstall", dryRun: boolean): Row[] {
   const rows: Row[] = []; const dest = skillDest(ctx.home);
   if (mode === "install") {
-    const files = filesIn(SKILL_SRC);
-    const diff = files.filter((f) => read(join(dest, f)) !== read(join(SKILL_SRC, f)));
-    if (diff.length && !dryRun) for (const f of diff) { mkdirSync(dirname(join(dest, f)), { recursive: true }); copyFileSync(join(SKILL_SRC, f), join(dest, f)); }
+    const src = skillFiles();
+    const diff = Object.keys(src).filter((f) => read(join(dest, f)) !== src[f]);
+    if (diff.length && !dryRun) for (const f of diff) { mkdirSync(dirname(join(dest, f)), { recursive: true }); writeFileSync(join(dest, f), src[f]); }
     rows.push({ cli: "skill", item: "agentmbx skill", path: dest, action: !diff.length ? "unchanged" : existsSync(join(dest, "SKILL.md")) || dryRun && existsSync(dest) ? "updated" : "added" });
   }
   for (const link of skillLinks(ctx.home)) {

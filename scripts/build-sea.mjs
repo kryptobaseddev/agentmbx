@@ -36,7 +36,10 @@ main().catch((e) => { process.stderr.write("agentmbx: " + (e && e.stack || e) + 
     resolveDir: root, sourcefile: "sea-entry.cjs", loader: "js",
   },
   bundle: true, platform: "node", target: "node24", format: "cjs", outfile: bundle, minify: false, legalComments: "inline",
+  // give import.meta.url a real value inside the CJS bundle (path lookups near the binary then fail softly, never crash)
+  banner: { js: 'const __agentmbx_import_meta_url = require("node:url").pathToFileURL(process.execPath).href;' },
   define: {
+    "import.meta.url": "__agentmbx_import_meta_url",
     __AGENTMBX_VERSION__: JSON.stringify(version),
     __AGENTMBX_RELEASE_KEY__: JSON.stringify(process.env.AGENTMBX_RELEASE_PUBKEY || ""),
   },
@@ -48,7 +51,8 @@ main().catch((e) => { process.stderr.write("agentmbx: " + (e && e.stack || e) + 
 // 2. SEA preparation blob
 const blob = join(work, "sea-prep.blob");
 const seaConfig = join(work, "sea-config.json");
-writeFileSync(seaConfig, JSON.stringify({ main: bundle, output: blob, disableExperimentalSEAWarning: true, useSnapshot: false, useCodeCache: false }, null, 2));
+writeFileSync(seaConfig, JSON.stringify({ main: bundle, output: blob, disableExperimentalSEAWarning: true, useSnapshot: false, useCodeCache: false,
+  assets: { "SKILL.md": join(root, "skill", "SKILL.md") } }, null, 2));
 run(process.execPath, ["--experimental-sea-config", seaConfig]);
 
 // 3. copy node, inject, sign

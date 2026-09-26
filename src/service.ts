@@ -78,6 +78,10 @@ export function stableNode(home = homedir()): string {
 }
 
 export function installService(mbxHome: string): void {
+  // a HOME that isn't the account's real home (tests, sandboxes) must never replace the real background job
+  const realHome = (() => { try { return execFileSync("/usr/bin/id", ["-P"], { encoding: "utf8" }).split(":")[8] || null; } catch { return null; } })();
+  if (process.platform === "darwin" && realHome && resolve(homedir()) !== resolve(realHome) && !process.env.MBX_SERVICE_LABEL)
+    throw new Error(`HOME (${homedir()}) is not this account's home (${realHome}); set MBX_SERVICE_LABEL to install a separate test job`);
   // standalone (SEA) binary: the service runs the binary itself; npm/dev: a stable node + the script
   let sea = false; try { sea = (createRequire(import.meta.url)("node:sea") as { isSea(): boolean }).isSea(); } catch { /* older node */ }
   const bin = sea ? "" : realpathSync(process.argv[1]);

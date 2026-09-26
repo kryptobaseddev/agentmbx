@@ -419,12 +419,13 @@ const setupCtx = (home = homedir()) => ({ home, cmd: resolveCommand(home), which
 async function setup(o, str) {
     const dryRun = !!o["dry-run"], uninstall = !!o.uninstall, mode = uninstall ? "uninstall" : "install";
     const only = str("only")?.split(",").map((s) => s.trim()).filter(Boolean);
-    const bad = only?.filter((c) => ![...CLIS, "skill"].includes(c));
+    const bad = only?.filter((c) => ![...CLIS, "skill", "daemon"].includes(c));
     if (bad?.length)
-        die(`--only: unknown ${bad.join(", ")} (use ${[...CLIS, "skill"].join(",")})`);
+        die(`--only: unknown ${bad.join(", ")} (use ${[...CLIS, "skill", "daemon"].join(",")})`);
     const ctx = setupCtx();
     console.log(`agents will run: ${shJoin(ctx.cmd)} mcp`);
-    if (!uninstall) {
+    const wantDaemon = !only || only.includes("daemon");
+    if (!uninstall && wantDaemon) {
         const home = defaultHome();
         if (!existsSync(join(home, "config.json"))) {
             const host = str("host") ?? defaultHostName();

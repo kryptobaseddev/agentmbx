@@ -10,7 +10,16 @@ import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { insertMember, member, parseJsonc, removeMember, replaceValue, valueOf } from "./jsonc.js";
 export const CLIS = ["claude", "codex", "opencode", "kimi", "hermes"];
-export const SKILL_SRC = fileURLToPath(new URL("../skill", import.meta.url));
+/** The bundled skill as {relative path: content}: embedded in the single executable (SEA asset), else read from ../skill. */
+export function skillFiles() {
+    if (isSea()) {
+        const sea = createRequire(__filename_or_url())("node:sea");
+        return { "SKILL.md": sea.getAsset("SKILL.md", "utf8") };
+    }
+    const dir = fileURLToPath(new URL("../skill", import.meta.url));
+    return Object.fromEntries(filesIn(dir).map((f) => [f, readFileSync(join(dir, f), "utf8")]));
+}
+const __filename_or_url = () => (typeof __filename !== "undefined" ? __filename : import.meta.url);
 // ---- helpers ---------------------------------------------------------------------------------
 const shq = (s) => /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
 export const shJoin = (argv) => argv.map(shq).join(" ");
@@ -444,7 +453,8 @@ function filesIn(dir, rel = "") {
 }
 export function skillStatus(home) {
     const dest = skillDest(home);
-    const installed = existsSync(SKILL_SRC) && filesIn(SKILL_SRC).every((f) => read(join(dest, f)) === read(join(SKILL_SRC, f)));
+    const src = skillFiles();
+    const installed = Object.entries(src).every(([f, c]) => read(join(dest, f)) === c);
     return { installed, links: skillLinks(home).map((p) => { let ok = false; try {
             ok = readlinkSync(p) === dest;
         }
@@ -454,12 +464,12 @@ function skill(ctx, mode, dryRun) {
     const rows = [];
     const dest = skillDest(ctx.home);
     if (mode === "install") {
-        const files = filesIn(SKILL_SRC);
-        const diff = files.filter((f) => read(join(dest, f)) !== read(join(SKILL_SRC, f)));
+        const src = skillFiles();
+        const diff = Object.keys(src).filter((f) => read(join(dest, f)) !== src[f]);
         if (diff.length && !dryRun)
             for (const f of diff) {
                 mkdirSync(dirname(join(dest, f)), { recursive: true });
-                copyFileSync(join(SKILL_SRC, f), join(dest, f));
+                writeFileSync(join(dest, f), src[f]);
             }
         rows.push({ cli: "skill", item: "agentmbx skill", path: dest, action: !diff.length ? "unchanged" : existsSync(join(dest, "SKILL.md")) || dryRun && existsSync(dest) ? "updated" : "added" });
     }
