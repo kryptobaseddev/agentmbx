@@ -105,7 +105,8 @@ export async function runMcp(node = new MbxNode()) {
     const p = parent && Date.now() - parent.at < 3_600_000 ? parent : null;
     return { hop: p ? p.hop + 1 : 0, origin: origin === "external" || p?.external ? "external" as const : "agent" as const };
   };
-  const extra = [delegationNote(node.store.db, agent, node.host), noPush(env.cli, env.channel)
+  const renamed = agent !== wanted ? `[mbx] Another live session already uses "${wanted}", so this session is ${agent}@${node.host}. Pick a clearer name with mbx_whoami {"name": ...} if you like.` : null;
+  const extra = [renamed, delegationNote(node.store.db, agent, node.host), noPush(env.cli, env.channel)
     ? selfWatchInstruction({ delegated: activePolicies(node.store.db, agent, node.host).length > 0 }) : null].filter(Boolean).join("\n");
 
   const session = (): Session => {
