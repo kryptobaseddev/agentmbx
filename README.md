@@ -22,7 +22,8 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
 
 ## What you get
 
-- **8 MCP tools** that work in any MCP client: `mbx_send`, `mbx_inbox`, `mbx_read`, `mbx_ack`, `mbx_thread`, `mbx_search`, `mbx_agents`, `mbx_whoami`.
+- **9 MCP tools** that work in any MCP client: `mbx_inbox`, `mbx_read`, `mbx_reply`, `mbx_ack`, `mbx_send`, `mbx_thread`, `mbx_search`, `mbx_agents`, `mbx_whoami`.
+- **One-command setup:** `agentmbx setup` finds Claude Code, Codex, OpenCode, Kimi and Hermes and wires each one (MCP server, hooks, and a bundled skill that teaches agents the mailbox loop). `agentmbx doctor` checks it all.
 - **Addressing:** `agent`, `agent@host`, `role:reviewer`, `*` (broadcast), or `owner` (you).
 - **Threads, replies, and requests that need a reply.** `@mentions`, `/claim` / `/done` directives and task refs (`T123`) are parsed from the body.
 - **Wake-ups for idle sessions**, one adapter per CLI. The wake text never contains the message itself, only a pointer to the inbox tool.
@@ -63,12 +64,11 @@ The full design is in [docs/SPEC.md](docs/SPEC.md). The adversarial review that 
 
 ```sh
 npm install -g https://github.com/kryptobaseddev/agentmbx/archive/refs/heads/main.tar.gz   # Node >= 24
-agentmbx init --host laptop                      # host name + host key
-agentmbx daemon install                          # launchd (macOS) or systemd --user (Linux)
-
-# add the MCP server to your agents (details for each CLI: docs/INSTALL.md)
-claude mcp add --scope user mbx -- agentmbx mcp
+agentmbx setup      # host key, daemon, and every agent CLI it finds (MCP + hooks + skill); backs up each file it edits
+agentmbx doctor     # ✔/✗ checklist with a one-line fix for each problem
 ```
+
+Restart your agent sessions and they have the `mbx_*` tools. `agentmbx setup --dry-run` previews, `--only codex` limits it, `--uninstall` undoes it. What it writes for each CLI (and how to do it by hand): [docs/INSTALL.md](docs/INSTALL.md).
 
 Pair a second machine:
 
@@ -96,6 +96,7 @@ agentmbx owner grant planner --caps task.assign,decision --ttl 12h
 
 `agentmbx help` lists everything:
 - **Messages:** `send`, `inbox`, `read`, `ack`, `thread`, `search`, `agents`, `status`
+- **Setup:** `setup [--dry-run] [--only …] [--uninstall]`, `doctor`
 - **Machines:** `init`, `pair`, `pair approve`, `peers`, `peers remove`, `daemon [install|uninstall]`
 - **Owner:** `owner init|show|grant|revoke`
 - **Integration:** `mcp`, `hook session-start|prompt|stop --cli <cli>`, `import-v2`
@@ -116,7 +117,7 @@ agentmbx owner grant planner --caps task.assign,decision --ttl 12h
 
 ```sh
 git clone https://github.com/kryptobaseddev/agentmbx && cd agentmbx && npm install
-npm test            # 19 tests: crypto, trust (incl. the council's four), two-host HTTP, MCP client, channel push
+npm test            # 25 tests: crypto, trust (incl. the council's four), two-host HTTP, MCP client, channel push, setup/doctor on a fake HOME
 npm run typecheck
 python3 scripts/e2e/wake-codex.py      # live: wakes a real idle Codex TUI (see docs/TESTING.md)
 ```

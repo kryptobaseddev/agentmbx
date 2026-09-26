@@ -7,11 +7,18 @@ import { execFileSync } from "node:child_process";
 import { fingerprint } from "./crypto.js";
 import { CAPS, makeGrant } from "./envelope.js";
 import { flushOutbox, pairWith, refreshDirectory, startServer, advertisedAddr } from "./http.js";
+import { daemonAnswers, doctor, failed, formatChecks } from "./doctor.js";
 import { agentName, runMcp } from "./mcp.js";
 import { defaultHome, formatMessage, MbxNode, summaryLine, trustLabel } from "./node.js";
 import { createOwnerKey, ownerPath, readPassphraseFromTTY, unlockOwnerKey } from "./owner.js";
+import { CLIS, defaultHostName, defaultWhich, formatRows, isSea, resolveCommand, runSetup, shJoin } from "./setup.js";
 import { dispatchWakes, opencodeSessionFor } from "./wake.js";
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
+
+Start here
+  agentmbx setup [--yes] [--dry-run] [--only claude,codex,opencode,kimi,hermes,skill] [--host <name>] [--uninstall]
+                  init this host, install the daemon, wire every detected agent CLI (MCP + hooks + skill)
+  agentmbx doctor   checklist: host, daemon, each CLI's wiring, skill, peers, pending pairings
 
 Messages
   agentmbx send --as <agent> --to <a,b,role:x,*,owner> --subject "…" [-m "body" | --body-file f | stdin]
@@ -52,11 +59,21 @@ export async function main(argv = process.argv.slice(2)) {
             "body-file": { type: "string" }, kind: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" },
             ref: { type: "string", multiple: true }, all: { type: "boolean" }, json: { type: "boolean" }, note: { type: "string" },
             host: { type: "string" }, port: { type: "string" }, cli: { type: "string" }, session: { type: "string" }, caps: { type: "string" },
-            ttl: { type: "string" }, bind: { type: "string" }
+            ttl: { type: "string" }, bind: { type: "string" }, yes: { type: "boolean", short: "y" }, "dry-run": { type: "boolean" },
+            uninstall: { type: "boolean" }, only: { type: "string" }
         } });
     const str = (k) => (typeof o[k] === "string" ? o[k] : undefined);
     if (cmd === "mcp")
         return runMcp();
+    if (cmd === "setup")
+        return setup(o, str);
+    if (cmd === "doctor") {
+        const checks = await doctor(setupCtx(), defaultHome());
+        console.log(formatChecks(checks));
+        if (failed(checks))
+            process.exitCode = 1;
+        return;
+    }
     if (cmd === "init") {
         const n = new MbxNode(defaultHome(), { host: str("host"), port: str("port") ? Number(str("port")) : undefined, bind: str("bind") });
         console.log(`mbx home: ${n.home}\nhost: ${n.host}  key: ${fingerprint(n.key.publicKey)}  listens on ${n.config.bind}:${n.config.port}  advertised as ${advertisedAddr(n)}`);
@@ -122,7 +139,7 @@ If the codes differ, do not approve: someone is in the middle.`);
         }
         case "daemon": {
             if (pos[0] === "install")
-                return installService(node);
+                return console.log(installService(node));
             if (pos[0] === "uninstall")
                 return uninstallService();
             let busy = false;
@@ -268,20 +285,22 @@ function importV2(node, dir) {
 }
 // ---- service install -------------------------------------------------------------------------
 const LABEL = "com.agentmbx.daemon";
-function installService(node) {
-    const bin = realpathSync(process.argv[1]);
+export const servicePath = (home = homedir()) => process.platform === "darwin"
+    ? join(home, "Library/LaunchAgents", `${LABEL}.plist`) : join(home, ".config/systemd/user/agentmbx.service");
+/** Install and start the daemon as a launchd agent (macOS) or systemd --user service. Returns a one-line summary. */
+export function installService(node, home = homedir()) {
     // prefer a stable node path (mise/asdf/volta shims survive Node upgrades) over the versioned execPath
-    const shims = [join(homedir(), ".local/share/mise/shims/node"), join(homedir(), ".asdf/shims/node"), join(homedir(), ".volta/bin/node")];
-    const nodeBin = shims.find((p) => existsSync(p)) ?? process.execPath;
+    const shims = [join(home, ".local/share/mise/shims/node"), join(home, ".asdf/shims/node"), join(home, ".volta/bin/node")];
+    const argv = isSea() ? [process.execPath] : [shims.find((p) => existsSync(p)) ?? process.execPath, realpathSync(process.argv[1])];
     if (process.platform === "darwin") {
-        const plist = join(homedir(), "Library/LaunchAgents", `${LABEL}.plist`);
-        mkdirSync(join(homedir(), "Library/LaunchAgents"), { recursive: true });
+        const plist = servicePath(home);
+        mkdirSync(join(home, "Library/LaunchAgents"), { recursive: true });
         writeFileSync(plist, `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>${LABEL}</string>
-  <key>ProgramArguments</key><array><string>${nodeBin}</string><string>${bin}</string><string>daemon</string></array>
-  <key>EnvironmentVariables</key><dict><key>MBX_HOME</key><string>${node.home}</string><key>PATH</key><string>${join(homedir(), ".local/bin")}:${join(homedir(), ".local/share/mise/shims")}:${join(homedir(), ".opencode/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <key>ProgramArguments</key><array>${[...argv, "daemon"].map((a) => `<string>${a}</string>`).join("")}</array>
+  <key>EnvironmentVariables</key><dict><key>MBX_HOME</key><string>${node.home}</string><key>PATH</key><string>${join(home, ".local/bin")}:${join(home, ".local/share/mise/shims")}:${join(home, ".opencode/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>${join(node.home, "daemon.log")}</string><key>StandardErrorPath</key><string>${join(node.home, "daemon.log")}</string>
 </dict></plist>\n`);
@@ -290,14 +309,14 @@ function installService(node) {
         }
         catch { /* not loaded */ }
         execFileSync("launchctl", ["bootstrap", `gui/${process.getuid()}`, plist]);
-        return console.log(`installed ${plist}; log: ${join(node.home, "daemon.log")}`);
+        return `installed ${plist}; log: ${join(node.home, "daemon.log")}`;
     }
-    const unit = join(homedir(), ".config/systemd/user/agentmbx.service");
-    mkdirSync(join(homedir(), ".config/systemd/user"), { recursive: true });
-    writeFileSync(unit, `[Unit]\nDescription=AgentMBX daemon\n\n[Service]\nEnvironment=MBX_HOME=${node.home}\nExecStart=${nodeBin} ${bin} daemon\nRestart=always\n\n[Install]\nWantedBy=default.target\n`);
+    const unit = servicePath(home);
+    mkdirSync(join(home, ".config/systemd/user"), { recursive: true });
+    writeFileSync(unit, `[Unit]\nDescription=AgentMBX daemon\n\n[Service]\nEnvironment=MBX_HOME=${node.home}\nExecStart=${shJoin([...argv, "daemon"])}\nRestart=always\n\n[Install]\nWantedBy=default.target\n`);
     execFileSync("systemctl", ["--user", "daemon-reload"]);
     execFileSync("systemctl", ["--user", "enable", "--now", "agentmbx.service"]);
-    console.log(`installed ${unit}`);
+    return `installed ${unit}`;
 }
 function uninstallService() {
     if (process.platform === "darwin") {
@@ -309,4 +328,70 @@ function uninstallService() {
     }
     execFileSync("systemctl", ["--user", "disable", "--now", "agentmbx.service"]);
     console.log("stopped");
+}
+// ---- setup -----------------------------------------------------------------------------------
+const setupCtx = (home = homedir()) => ({ home, cmd: resolveCommand(home), which: defaultWhich, useClis: true });
+async function setup(o, str) {
+    const dryRun = !!o["dry-run"], uninstall = !!o.uninstall, mode = uninstall ? "uninstall" : "install";
+    const only = str("only")?.split(",").map((s) => s.trim()).filter(Boolean);
+    const bad = only?.filter((c) => ![...CLIS, "skill"].includes(c));
+    if (bad?.length)
+        die(`--only: unknown ${bad.join(", ")} (use ${[...CLIS, "skill"].join(",")})`);
+    const ctx = setupCtx();
+    console.log(`agents will run: ${shJoin(ctx.cmd)} mcp`);
+    if (!uninstall) {
+        const home = defaultHome();
+        if (!existsSync(join(home, "config.json"))) {
+            const host = str("host") ?? defaultHostName();
+            if (dryRun)
+                console.log(`would initialize host "${host}" in ${home}`);
+            else {
+                const n = new MbxNode(home, { host });
+                console.log(`initialized host ${n.host} (key ${fingerprint(n.key.publicKey)}) in ${home}`);
+                n.close();
+            }
+        }
+        else if (str("host"))
+            console.log(`host already initialized; --host ignored (edit ${join(home, "config.json")} to rename)`);
+        if (existsSync(join(home, "config.json"))) {
+            const node = new MbxNode(home);
+            const up = await daemonAnswers(node.config.port);
+            if (up && existsSync(servicePath()))
+                console.log(`daemon: already running on port ${node.config.port}`);
+            else if (dryRun)
+                console.log("would install and start the daemon service");
+            else {
+                try {
+                    console.log(`daemon: ${installService(node)}`);
+                }
+                catch (e) {
+                    console.log(`daemon: install failed (${e.message}); run 'agentmbx daemon install' later`);
+                }
+            }
+            node.close();
+        }
+    }
+    const plan = runSetup(ctx, { mode, only, dryRun: true });
+    const pending = plan.filter((r) => ["added", "updated", "removed"].includes(r.action));
+    if (dryRun || !pending.length) {
+        console.log(`\n${formatRows(plan)}\n\n${dryRun ? "dry run: nothing was written" : "nothing to change"}`);
+        return;
+    }
+    if (!o.yes && process.stdin.isTTY) {
+        console.log(`\n${formatRows(plan)}\n`);
+        const { createInterface } = await import("node:readline/promises");
+        const rl = createInterface({ input: process.stdin, output: process.stdout });
+        const answer = (await rl.question(`${uninstall ? "Remove" : "Apply"} these ${pending.length} change(s)? Every edited file is backed up first. [Y/n] `)).trim().toLowerCase();
+        rl.close();
+        if (answer && answer !== "y" && answer !== "yes")
+            return console.log("nothing changed");
+    }
+    const rows = runSetup(ctx, { mode, only });
+    console.log(`\n${formatRows(rows)}\n`);
+    if (rows.some((r) => r.action === "error"))
+        process.exitCode = 1;
+    if (uninstall)
+        console.log("The daemon keeps running (messages and keys stay). Stop it with: agentmbx daemon uninstall");
+    else
+        console.log("Restart your agent sessions so they load mbx, then run: agentmbx doctor");
 }
