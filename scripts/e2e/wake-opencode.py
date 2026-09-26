@@ -29,10 +29,13 @@ sent = mbx("send", "--as", "tester", "--to", agent, "--kind", "request", "--need
 mid = sent.stdout.strip(); print("sent", mid)
 d = subprocess.run(["node", "--input-type=module", "-e", f"const {{MbxNode}}=await import('{ROOT}/src/node.ts');const {{dispatchWakes}}=await import('{ROOT}/src/wake.ts');console.log(JSON.stringify(await dispatchWakes(new MbxNode())));"], env=env, capture_output=True, text=True)
 print("dispatch:", d.stdout.strip(), d.stderr.strip()[-300:])
+def replied():   # a reply from the agent, in the request's thread, carrying the token
+    th = mbx("thread", mid).stdout
+    return any(f"from: {agent}@" in part and token in part for part in th.split("\n# ")[1:])
 t0 = time.time(); ok = False
 seen = set()
 while time.time() - t0 < 180:
-    if token in mbx("search", token).stdout: ok = True; break
+    if replied(): ok = True; break
     try:   # a user would be asked here; approve only requests that are about the mbx tools, and log every one
         reqs = api("GET", f"/api/session/{sid}/permission"); reqs = reqs.get("data", reqs) if isinstance(reqs, dict) else reqs
         for r in reqs or []:

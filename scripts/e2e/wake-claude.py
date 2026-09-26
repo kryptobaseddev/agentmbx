@@ -44,9 +44,12 @@ print("session idle; sending", flush=True)
 sent = mbx("send", "--as", "tester", "--to", agent, "--kind", "request", "--needs-reply", "--subject", "ping from tester",
            "-m", f"Please answer this with the mbx_send tool: to [\"tester\"], kind reply, reply_to this message's id, body exactly {token}. Then call mbx_ack on it.")
 mid = sent.stdout.strip(); print("sent", mid, sent.stderr.strip(), flush=True)
+def replied():   # a reply from the agent, in the request's thread, carrying the token
+    th = mbx("thread", mid).stdout
+    return any(f"from: {agent}@" in part and token in part for part in th.split("\n# ")[1:])
 t0 = time.time(); ok = False
 while time.time() - t0 < 180:
-    if token in mbx("search", token).stdout: ok = True; break
+    if replied(): ok = True; break
     time.sleep(3)
 print("REPLY RECEIVED" if ok else "NO REPLY", f"after {time.time()-t0:.0f}s", flush=True)
 print(mbx("thread", mid).stdout[-1500:])

@@ -51,10 +51,13 @@ wake = subprocess.run(["node", "--input-type=module", "-e",
   f"const {{MbxNode}}=await import('{ROOT}/src/node.ts');const {{dispatchWakes}}=await import('{ROOT}/src/wake.ts');"
   "const n=new MbxNode();console.log(JSON.stringify(await dispatchWakes(n)));"], env=env, capture_output=True, text=True)
 print("dispatch:", wake.stdout.strip(), wake.stderr.strip()[-300:])
+def replied():   # a reply from the agent, in the request's thread, carrying the token
+    th = mbx("thread", mid).stdout
+    return any(f"from: {agent}@" in part and token in part for part in th.split("\n# ")[1:])
 t0 = time.time(); ok = False
 while time.time() - t0 < 150:
     inbox = mbx("inbox", "--as", "tester", "--json").stdout
-    if token in mbx("search", token).stdout or token in inbox:
+    if replied():
         ok = True; break
     time.sleep(3); print(f"  waiting {time.time()-t0:.0f}s", flush=True)
 print("reply received" if ok else "NO REPLY", f"after {time.time()-t0:.0f}s")
