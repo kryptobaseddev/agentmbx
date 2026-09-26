@@ -109,8 +109,9 @@ test("kimiServer finds a live instance and its token", () => {
 
 test("opencode daemon pass: replies once for covered agents only, and makes no request without a policy", async () => {
   const n = node();
-  n.bindSession({ agent: "yolo", cli: "opencode", session_id: "ses_A" });
-  n.bindSession({ agent: "careful", cli: "opencode", session_id: "ses_B" });
+  // bindings proven to be live OpenCode processes (pid + start time), as the MCP server records them
+  n.bindSession({ agent: "yolo", cli: "opencode", session_id: "ses_A", pid: process.pid });
+  n.bindSession({ agent: "careful", cli: "opencode", session_id: "ses_B", pid: process.pid });
   const calls: { url: string; method: string; body?: string }[] = [];
   const fake = (async (url: string, init: RequestInit = {}) => {
     calls.push({ url, method: init.method ?? "GET", body: init.body as string });
@@ -129,7 +130,7 @@ test("opencode daemon pass: replies once for covered agents only, and makes no r
 
 test("opencode daemon pass: an MCP-only binding uses its folder's pending list and skips other agents' sessions", async () => {
   const n = node();
-  n.bindSession({ agent: "web", cli: "opencode", session_id: "mcp-123", cwd: "/work/web", pid: 55, session_key: "k" });
+  n.bindSession({ agent: "web", cli: "opencode", session_id: "mcp-123", cwd: "/work/web", pid: process.pid, session_key: "k" });
   n.bindSession({ agent: "other", cli: "opencode", session_id: "ses_other", cwd: "/work/web" });
   const posts: string[] = []; let listUrl = "";
   const fake = (async (url: string, init: RequestInit = {}) => {

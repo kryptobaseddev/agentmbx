@@ -12,7 +12,7 @@ import { daemonAnswers, doctor, failed, formatChecks } from "./doctor.js";
 import { agentName, detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
 import { ancestors } from "./proc.js";
 import { DEFAULT_PORT, defaultHome, formatFor, formatMessage, MbxNode, summaryLine, trustLabel } from "./node.js";
-import { activePolicies, issueSigned, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary } from "./policy.js";
+import { activePolicies, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary } from "./policy.js";
 import { authHelperPath, createKeychainOwner, createOwnerKey, defaultOwnerBackend, ownerInfo, ownerSignCanonical, readPassphraseFromTTY } from "./owner.js";
 import { periodicUpdateCheck, updateAvailable, updateCommand } from "./update.js";
 import { installKind, version } from "./version.js";
@@ -37,7 +37,7 @@ Messages
 Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …' line it prints on the other)
   agentmbx init [--host <name>] [--port 7373]       agentmbx discover            (hosts on the LAN, via mDNS)
   agentmbx pair [--ttl 10m]                         one-time pairing token (single use, default 10 min)
-  agentmbx join <host|host:port> <TOKEN> [--adopt-owner]   pair with the host that printed the token (--adopt-owner: your owner key there sets policies here)
+  agentmbx join <host|host:port> <TOKEN>            pair with the host that printed the token
   agentmbx pair --compare <host:port>               manual alternative: compare a 6-digit code, then on BOTH hosts
   agentmbx pair approve <host> <code>
   agentmbx peers                                    agentmbx peers remove <host>
@@ -45,7 +45,8 @@ Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …'
   agentmbx notify-test [--as <agent>]               send a sample desktop notification the way wake-ups do
 
 Owner (each signature needs you: a Touch ID / password prompt on macOS with AgentMBX.app, else the passphrase on a terminal)
-  agentmbx owner init [--backend keychain|file]   agentmbx owner show   agentmbx owner adopt <paired-host>  (this host takes policies from your owner key there)
+  agentmbx owner init [--backend keychain|file]   agentmbx owner show
+  agentmbx owner add-device <paired-host>        certify a paired machine as yours: it then takes the policies you sign
   agentmbx owner grant <agent> [--session <fingerprint>] [--caps ${CAPS.join(",")}] [--ttl 12h]
   agentmbx owner revoke <grant-id>
   agentmbx owner send --to <agents> --subject "…" -m "…" [--kind task] [--needs-reply]   one message signed by you (OWNER)
@@ -107,7 +108,7 @@ async function run(argv) {
             host: { type: "string" }, port: { type: "string" }, cli: { type: "string" }, session: { type: "string" }, caps: { type: "string" },
             ttl: { type: "string" }, bind: { type: "string" }, role: { type: "string" }, description: { type: "string" }, thread: { type: "string" }, from: { type: "string" }, check: { type: "boolean" }, yes: { type: "boolean", short: "y" },
             compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" },
-            backend: { type: "string" }, "no-owner": { type: "boolean" }, "adopt-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
+            backend: { type: "string" }, "no-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
             project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }
         } });
     const str = (k) => (typeof o[k] === "string" ? o[k] : undefined);
@@ -285,12 +286,8 @@ If the codes differ, do not approve: someone is in the middle.`);
             const addr = await resolveJoinAddr(node, target);
             const r = await pairJoin(node, addr, token).catch((e) => die(e.message));
             console.log(`paired with ${r.host} (${addr})\n  its host key:  ${r.key}\n  its owner key: ${r.owner ?? "none"}\nBoth hosts now accept each other's messages. Try: agentmbx agents`);
-            if (r.owner && !node.ownerPub) {
-                if (o["adopt-owner"])
-                    console.log(`owner: this host now takes policies signed by ${node.adoptOwner(r.host)} (your owner key on ${r.host})`);
-                else
-                    console.log(`owner: to let your owner key on ${r.host} (${r.owner}) set policies here, run: agentmbx owner adopt ${r.host}`);
-            }
+            if (r.owner && !node.ownerPub)
+                console.log(`owner: to let your owner key (${r.owner}) set policies here, run on ${r.host}: agentmbx owner add-device ${node.host}   (one Touch ID / passphrase approval)`);
             await notifyDesktop({ body: `Paired with ${r.host}` });
             return;
         }
@@ -455,10 +452,19 @@ async function owner(node, pos, str, o) {
         const info = ownerInfo(node.home);
         return console.log(info ? `owner key ${fingerprint(info.public_key)} (${info.backend === "keychain" ? "macOS Keychain, Touch ID" : "passphrase file"}: ${info.path})` : "no owner key on this host");
     }
-    if (sub === "adopt") {
-        const host = pos[1] ?? die("owner adopt <paired-host>");
-        const fp = node.adoptOwner(host);
-        return console.log(`this host now takes policies and revocations signed by owner key ${fp} (from ${host}). Undo: agentmbx peers remove ${host}`);
+    if (sub === "add-device") {
+        // on the machine that holds the owner key: certify a paired machine as yours (Touch ID); it then takes your policies
+        const host = pos[1] ?? die("owner add-device <paired-host>");
+        const peer = node.approvedPeer(host) ?? die(`${host} is not paired with this host (pair first: agentmbx pair)`);
+        const ownerPub = node.ownerPub ?? die("no owner key on this machine: run this where your owner key is ('agentmbx owner show')");
+        const rec = makeDevice(host, peer.pubkey, ownerPub);
+        const { sig } = await ownerSignCanonical(node.home, canonical(rec), policySummary(rec));
+        const err = issueSigned(node.store.db, { rec, sig }, node.host);
+        if (err)
+            die(err);
+        const [r] = await pushPolicy(node, [{ rec, sig }]);
+        node.store.audit("owner.add_device", { host, key: fingerprint(peer.pubkey), device: rec.id });
+        return console.log(`${host} is now one of your machines: it takes policies you sign. ${r?.ok ? "Applied there." : `Not reachable yet (${r?.error ?? "offline"}); it picks this up within a minute of coming back.`}`);
     }
     if (sub === "init") {
         const b = str("backend");

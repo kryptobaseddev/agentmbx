@@ -11,8 +11,8 @@ import { pairWith, pullPolicies, pushPolicy, startServer } from "../src/http.ts"
 import { formatFor, MbxNode } from "../src/node.ts";
 import { createOwnerKey, unlockOwnerKey } from "../src/owner.ts";
 import {
-  acceptSigned, activePolicies, delegationNote, effectivePolicy, hasClass, makePolicy, makeRevocation, parseTtl, policyLine, policySummary,
-  type PolicyRecord, type Revocation,
+  acceptSigned, activePolicies, delegationNote, effectivePolicy, hasClass, issueSigned, makeDevice, makePolicy, makeRevocation, parseTtl, policyLine, policySummary,
+  type AnyRecord, type PolicyRecord,
 } from "../src/policy.ts";
 
 process.env.MBX_NO_DESKTOP = "1";
@@ -24,7 +24,7 @@ function ownerHost(host: string, opts: { bind?: string; port?: number } = {}) {
   createOwnerKey(home, PASS);
   const n = new MbxNode(home, { host, ...opts });
   const kp = unlockOwnerKey(home, PASS);
-  const sign = (rec: PolicyRecord | Revocation) => ({ rec, sig: signData(kp.privateKey, canonical(rec)) });
+  const sign = (rec: AnyRecord) => ({ rec, sig: signData(kp.privateKey, canonical(rec)) });
   return { n, kp, sign };
 }
 
@@ -121,8 +121,17 @@ test("across hosts: the paired host adopts the owner, policies push and pull, re
     // pairing alone records alpha's owner as a peer-owner with no authority here; adopting it is explicit
     const role = () => (B.store.db.prepare("SELECT role, via FROM principals").all() as { role: string; via: string }[]).map((o) => `${o.role}:${o.via}`);
     assert.deepEqual(role(), ["peer-owner:pair:alpha"]);
-    assert.equal(B.adoptOwner("alpha"), fingerprint(A.kp.publicKey));
-    assert.deepEqual(role(), ["owner:adopt:alpha"]);
+    // the owner certifies beta as their device (signed on alpha, Touch ID in real life) and pushes it
+    const dev = A.sign(makeDevice("beta", B.key.publicKey, A.kp.publicKey));
+    const wrongKey = A.sign(makeDevice("beta", A.n.key.publicKey, A.kp.publicKey));
+    assert.equal(acceptSigned(B.store.db, wrongKey, "beta", { hostPub: B.key.publicKey }), "device record is for beta, not this host");
+    assert.equal(issueSigned(A.n.store.db, dev, "alpha"), null);
+    assert.deepEqual(await pushPolicy(A.n, [dev]), [{ host: "beta", ok: true }]);
+    assert.match(role()[0], /^owner:device:/);
+    // a stranger's device record for beta is refused (unknown owner key)
+    const S = ownerHost("stranger");
+    assert.match(acceptSigned(B.store.db, S.sign(makeDevice("beta", B.key.publicKey, S.kp.publicKey)), "beta", { hostPub: B.key.publicKey })!, /doesn't know/);
+    S.n.close();
     const pol = A.sign(makePolicy({ level: "collaborate", agents: ["worker"], hosts: ["beta"], from: ["alpha"], ownerPub: A.kp.publicKey }));
     assert.match(acceptSigned(A.n.store.db, pol, "alpha")!, /not alpha/, "a receiver rejects policies for other hosts");
     assert.equal(acceptSigned(A.n.store.db, pol, "alpha", { issuer: true }), null, "the issuer keeps it to serve pulls");
@@ -136,10 +145,11 @@ test("across hosts: the paired host adopts the owner, policies push and pull, re
     await pullPolicies(B);
     assert.equal(activePolicies(B.store.db, "worker", "beta").length, 0);
     // a paired host whose owner is someone else can't set policies here
-    // unpairing drops the adopted owner, and with it every policy it signed
-    B.removePeer("alpha");
-    const again = A.sign(makePolicy({ level: "yolo", agents: ["worker"], hosts: ["beta"], from: ["alpha"], ownerPub: A.kp.publicKey, now: new Date(Date.now() + 2000) }));
-    assert.equal(acceptSigned(B.store.db, again, "beta"), "not signed by this host's owner");
+    // a machine with its own owner key never adopts another owner, even one it knows from pairing
+    const C = ownerHost("gamma");
+    C.n.store.db.prepare("INSERT INTO principals VALUES (?,?,'peer-owner',NULL,'pair:alpha',?)").run(fingerprint(A.kp.publicKey), A.kp.publicKey, new Date().toISOString());
+    assert.match(acceptSigned(C.n.store.db, A.sign(makeDevice("gamma", C.n.key.publicKey, A.kp.publicKey)), "gamma", { hostPub: C.n.key.publicKey })!, /its own owner key/);
+    C.n.close();
     const M = ownerHost("mallory");
     const evil = M.sign(makePolicy({ level: "yolo", agents: ["*"], hosts: ["beta"], ownerPub: M.kp.publicKey }));
     assert.equal(acceptSigned(B.store.db, evil, "beta"), "not signed by this host's owner");

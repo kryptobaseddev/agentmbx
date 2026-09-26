@@ -58,7 +58,11 @@ It is stored with `owner_sig`.
   - `yolo` defaults to 8 hours, 7 days at most.
   - An expired or unverifiable policy fails closed to `ask`.
 - **Resolution.** For a message from `S@H` to agent `A` on this host, take every unrevoked, unexpired policy that matches `A` and `S@H`. Each policy's classes apply only within that policy's own projects, so scopes never mix across policies. The header lists each grant separately.
-- **Owner on other machines.** A machine takes policies only from its own owner key, or from an owner key it adopted explicitly (`join … --adopt-owner` / `owner adopt <host>`). Pairing alone records the peer's owner key as `peer-owner`, with no authority. Unpairing removes an adoption, and with it every policy that owner signed.
+- **Owner on other machines.** A machine takes policies only from its own owner key, or from the owner key that signed a *device record* for it. You create that record on your owner machine with `agentmbx owner add-device <host>`, which needs one Touch ID / passphrase approval.
+  - The record names the host and its host key.
+  - It only counts from an owner key the machine learned by pairing.
+  - A machine with its own owner key never adopts another one.
+  - Pairing alone records the peer's owner key as `peer-owner`, with no authority.
 - **`meta.project`** (the sender's project path) is a signed *label* for people and agents to read. It's never a trust input: project scope is checked against the receiving session's own folder.
 
 ### Downgrades (always applied, even under yolo)
@@ -116,6 +120,7 @@ Rules for the `permissions` class:
 - A policy with projects grants it only while the session works inside them.
 - The session must be verified: bound to this very CLI process (pid + start time). There's no guessing from folder names.
 - Every approval re-checks the policy just before it's sent, so a revocation wins.
+- Limit: project scope decides *which sessions* get automatic approval. It doesn't confine what an approved command then does on disk. For hard confinement, use the CLI's own sandbox (Codex sandbox modes, Claude permission rules).
 
 While any yolo policy is active, it's visible everywhere:
 - the status line shows `YOLO` and when it expires;

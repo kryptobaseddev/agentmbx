@@ -26,8 +26,12 @@ export function sameProcess(pid: number | null | undefined, start: string | null
   if (!pid) return false;
   const t = procTable();
   if (t.size) { const p = t.get(pid); return !!p && (!start || p.start === start); }
+  if (start) return false; // can't inspect processes: a recorded start time can't be confirmed, so it isn't
   try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
 }
+
+/** For authorization: the row must carry a start time and the live process must match it. Unknown = no. */
+export const provenProcess = (pid: number | null | undefined, start: string | null | undefined) => !!pid && !!start && procTable().size > 0 && sameProcess(pid, start);
 
 /** This process's ancestors, nearest first (the shell, the agent CLI, its parents …). */
 export function ancestors(pid = process.pid, max = 16): number[] {

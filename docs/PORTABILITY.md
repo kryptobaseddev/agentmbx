@@ -44,7 +44,7 @@ Rules that keep this portable:
 | Owner key | ✅ Keychain via `agentmbx-auth`; every signature needs Touch ID or the account password. An agent can run `owner init`, and the human approves. | 🟡 passphrase file, unlocked on `/dev/tty` (proves someone knows the passphrase, not that a human is present) |
 | Macs without Touch ID | ✅ account-password prompt | n/a |
 | No GUI session (SSH) | ✅ the helper exits right away, and setup prints the command instead of waiting | ✅ |
-| Second machine | ✅ explicit: `agentmbx join <host> <token> --adopt-owner` (or `agentmbx owner adopt <host>`); unpairing removes it | ✅ same |
+| Second machine | ✅ pair, then on the owner machine `agentmbx owner add-device <host>` (one Touch ID tap): a signed device record | ✅ same (passphrase on the owner machine) |
 | Accounts, members, cloud | spec only (docs/POLICY.md §7, T053, T007) | |
 
 ## 4. Policy and collaboration

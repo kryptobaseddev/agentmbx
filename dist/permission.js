@@ -17,10 +17,10 @@ export function resolveAgent(node, cli, sessionId, _cwd, pid) {
         return null;
     if (sessionId) {
         const r = node.store.db.prepare("SELECT agent, pid, pid_start, updated_at FROM sessions WHERE cli=? AND session_id=?").get(cli, sessionId);
-        if (r && r.pid === pid && node.sameSession(pid, r))
+        if (r && r.pid === pid && node.sameSession(pid, r, { proof: true }))
             return r.agent;
     }
-    return node.agentFor(cli, pid);
+    return node.agentFor(cli, pid, { proof: true });
 }
 /** Hook-side decision for `agentmbx hook permission --cli <cli>`. `output` is what the hook prints on stdout. */
 export function decidePermission(input, cli, lookup, o) {
@@ -128,7 +128,8 @@ export async function approveKimi(node, d, o = {}) {
  */
 export async function opencodePermissionPass(node, lookup, svc, f = fetch) {
     const db = node.store.db;
-    const rows = db.prepare("SELECT agent, session_id, cwd FROM sessions WHERE cli='opencode' ORDER BY updated_at DESC LIMIT 50").all();
+    const rows = db.prepare("SELECT agent, session_id, cwd, pid, pid_start, updated_at FROM sessions WHERE cli='opencode' ORDER BY updated_at DESC LIMIT 50").all()
+        .filter((r) => r.pid && node.sameSession(r.pid, r, { proof: true })); // only bindings proven to be a live OpenCode process
     const covered = rows.map((r) => ({ ...r, p: safeLookup(lookup, r.agent, r.cwd) })).filter((r) => r.p.ok && (r.session_id.startsWith("ses") || r.cwd));
     if (!covered.length)
         return 0;

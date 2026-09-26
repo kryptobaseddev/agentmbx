@@ -8,7 +8,7 @@ import {
 import { NAME_RE, type Envelope } from "./envelope.ts";
 import { MbxNode, RETRY_HOURS } from "./node.ts";
 import { notifyDesktop } from "./wake.ts";
-import { acceptSigned, type PolicyRecord, type Revocation, type Signed } from "./policy.ts";
+import { acceptSigned, type AnyRecord, type Signed } from "./policy.ts";
 
 export const HOP_SKEW_MS = 5 * 60_000;
 const MAX_REQ = 4 * 1024 * 1024;
@@ -169,11 +169,14 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
         return send(200, { results });
       }
       if (req.method === "POST" && url.pathname === "/v1/policy") {
-        const { items } = JSON.parse(body) as { items: Signed<PolicyRecord | Revocation>[] };
+        const { items } = JSON.parse(body) as { items: Signed<AnyRecord>[] };
         if (!Array.isArray(items) || items.length > 200) return send(400, { error: "bad batch" });
-        return send(200, { results: items.map((it) => ({ id: it?.rec?.id, error: acceptSigned(node.store.db, it, node.host) })) });
+        return send(200, { results: items.map((it) => ({ id: it?.rec?.id, error: acceptSigned(node.store.db, it, node.host, { hostPub: node.key.publicKey }) })) });
       }
-      if (req.method === "GET" && url.pathname === "/v1/policies") return send(200, { items: signedRecords(node) });
+      if (req.method === "GET" && url.pathname === "/v1/policies") {
+        const all = signedRecords(node), offset = Math.max(0, Number(url.searchParams.get("offset")) || 0), limit = Math.min(1000, Math.max(1, Number(url.searchParams.get("limit")) || 1000));
+        return send(200, { items: all.slice(offset, offset + limit), total: all.length });
+      }
       if (req.method === "GET" && url.pathname === "/v1/agents") {
         return send(200, { host: node.host, agents: node.agents().filter((a) => a.host === node.host).map(({ name, role, cli, description, last_seen }) => ({ name, role, cli, description, last_seen })) });
       }
@@ -248,18 +251,20 @@ export async function refreshDirectory(node: MbxNode) {
 
 // ---- policies: push on set/revoke, pull every minute so offline hosts catch up ----------------------------
 /** Everything a peer may need: unexpired policies and revocations from the last 30 days, as signed records. */
-export function signedRecords(node: MbxNode): Signed<PolicyRecord | Revocation>[] {
+/** Revocations first (so a kill switch never loses to the policy it kills), then devices, then policies, oldest first. */
+export function signedRecords(node: MbxNode): Signed<AnyRecord>[] {
   const db = node.store.db, now = new Date().toISOString(), since = new Date(Date.now() - 30 * 86_400_000).toISOString();
-  const ps = db.prepare("SELECT record, sig FROM policies WHERE exp > ?").all(now) as { record: string; sig: string }[];
-  const rs = db.prepare("SELECT record, sig FROM policy_revocations WHERE iat > ?").all(since) as { record: string; sig: string }[];
-  return [...rs, ...ps].map((r) => ({ rec: JSON.parse(r.record), sig: r.sig }));
+  const rs = db.prepare("SELECT record, sig FROM policy_revocations WHERE iat > ? ORDER BY iat").all(since) as { record: string; sig: string }[];
+  const ds = db.prepare("SELECT record, sig FROM devices ORDER BY received_at").all() as { record: string; sig: string }[];
+  const ps = db.prepare("SELECT record, sig FROM policies WHERE exp > ? ORDER BY iat").all(now) as { record: string; sig: string }[];
+  return [...rs, ...ds, ...ps].map((r) => ({ rec: JSON.parse(r.record), sig: r.sig }));
 }
 
 /** Send signed records to the paired hosts they concern. Returns per-host results; offline hosts get them on their next pull. */
-export async function pushPolicy(node: MbxNode, items: Signed<PolicyRecord | Revocation>[]): Promise<{ host: string; ok: boolean; error?: string }[]> {
+export async function pushPolicy(node: MbxNode, items: Signed<AnyRecord>[]): Promise<{ host: string; ok: boolean; error?: string }[]> {
   const out: { host: string; ok: boolean; error?: string }[] = [];
   for (const p of node.peers().filter((x) => x.state === "approved")) {
-    const mine = items.filter((it) => it.rec.type === "revocation" || it.rec.to.hosts.includes("*") || it.rec.to.hosts.includes(p.host));
+    const mine = items.filter((it) => it.rec.type === "revocation" || (it.rec.type === "device" ? it.rec.host === p.host : it.rec.to.hosts.includes("*") || it.rec.to.hosts.includes(p.host)));
     if (!mine.length) continue;
     try {
       const { results } = await post(node, p.addr, "/v1/policy", { items: mine }) as { results: { id: string; error: string | null }[] };
@@ -273,14 +278,19 @@ export async function pushPolicy(node: MbxNode, items: Signed<PolicyRecord | Rev
 export async function pullPolicies(node: MbxNode) {
   for (const p of node.peers().filter((x) => x.state === "approved")) {
     try {
-      const path = "/v1/policies";
-      const res = await fetch(`http://${p.addr}${path}`, { headers: signHop(node, "GET", path, ""), signal: AbortSignal.timeout(5_000) });
-      if (!res.ok) continue;
-      const { items } = await res.json() as { items: Signed<PolicyRecord | Revocation>[] };
-      // revocations first, so a kill switch is never beaten by the policy it kills
-      for (const it of [...items].sort((a, b) => (a.rec.type === "revocation" ? -1 : 0) - (b.rec.type === "revocation" ? -1 : 0)).slice(0, 10_000)) {
-        if (it?.rec?.type === "policy" && !it.rec.to.hosts.includes("*") && !it.rec.to.hosts.includes(node.host)) continue;
-        acceptSigned(node.store.db, it, node.host);
+      // page through everything the peer serves (revocations come first in its order)
+      for (let offset = 0; offset < 100_000;) {
+        const path = "/v1/policies";
+        const res = await fetch(`http://${p.addr}${path}?offset=${offset}&limit=1000`, { headers: signHop(node, "GET", path, ""), signal: AbortSignal.timeout(5_000) });
+        if (!res.ok) break;
+        const { items, total } = await res.json() as { items: Signed<AnyRecord>[]; total?: number };
+        for (const it of items) {
+          if (it?.rec?.type === "policy" && !it.rec.to.hosts.includes("*") && !it.rec.to.hosts.includes(node.host)) continue;
+          if (it?.rec?.type === "device" && it.rec.host !== node.host) continue;
+          acceptSigned(node.store.db, it, node.host, { hostPub: node.key.publicKey });
+        }
+        offset += items.length;
+        if (!items.length || total === undefined || offset >= total) break;
       }
     } catch { /* peer offline */ }
   }

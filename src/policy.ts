@@ -1,7 +1,7 @@
 // Owner-signed collaboration policies (docs/POLICY.md): which action classes an agent may take on requests from
 // other agents, verified on the receiving host. The policy line agents see is computed here, never taken from a body.
 import { realpathSync } from "node:fs";
-import { resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { canonical, fingerprint, ulid, verifyData } from "./crypto.ts";
 import type { Envelope } from "./envelope.ts";
@@ -22,8 +22,11 @@ export interface PolicyRecord {
   from: { hosts: string[]; agents: string[] };        // senders: "local" = the receiving host itself
   projects?: string[]; iat: string; exp: string; owner_fp: string;
 }
-export interface Revocation { v: 1; type: "revocation"; id: string; target: string /* policy id or "*" */; iat: string; owner_fp: string }
+export interface Revocation { v: 1; type: "revocation"; id: string; target: string /* policy id or "*" */; all?: true; iat: string; owner_fp: string }
+/** The owner certifies a machine as theirs (signed on the owner's machine, Touch ID): that machine then takes the owner's policies. */
+export interface DeviceRecord { v: 1; type: "device"; id: string; host: string; host_pub: string; iat: string; owner_fp: string }
 export type Signed<T> = { rec: T; sig: string };
+export type AnyRecord = PolicyRecord | Revocation | DeviceRecord;
 
 export function parseTtl(s: string): number {
   const m = /^(\d+)\s*(m|h|d)$/.exec(s.trim());
@@ -50,14 +53,19 @@ export function makePolicy(o: { level: Level; classes?: PolicyClass[]; agents: s
 }
 
 export function makeRevocation(target: string, ownerPub: string, now = new Date()): Revocation {
-  return { v: 1, type: "revocation", id: ulid(now.getTime()), target, iat: now.toISOString(), owner_fp: fingerprint(ownerPub) };
+  return { v: 1, type: "revocation", id: ulid(now.getTime()), target, ...(target === "*" ? { all: true as const } : {}), iat: now.toISOString(), owner_fp: fingerprint(ownerPub) };
+}
+
+export function makeDevice(host: string, hostPub: string, ownerPub: string, now = new Date()): DeviceRecord {
+  return { v: 1, type: "device", id: ulid(now.getTime()), host, host_pub: hostPub, iat: now.toISOString(), owner_fp: fingerprint(ownerPub) };
 }
 
 const dur = (ms: number) => ms >= 48 * H ? `${Math.round(ms / (24 * H))} days` : ms >= H ? `${Math.round(ms / H)} h` : `${Math.round(ms / 60_000)} min`;
 const list = (xs: string[]) => xs.map((x) => (x === "*" ? "any" : x)).join(", ");
 
 /** One human line: what the owner is approving. Shown before signing and in `policy list`. */
-export function policySummary(r: PolicyRecord | Revocation): string {
+export function policySummary(r: AnyRecord): string {
+  if (r.type === "device") return `Approve device ${r.host} (host key ${fingerprint(r.host_pub)}) as one of your machines`;
   if (r.type === "revocation") return r.target === "*" ? "Revoke ALL AgentMBX policies (kill switch)" : `Revoke AgentMBX policy ${r.target}`;
   const name = r.level === "yolo" ? "YOLO (agents approve their own permission prompts)" : r.level;
   return `Allow ${name} [${r.classes.join(", ") || "reply only"}] for agent ${list(r.to.agents)} on ${list(r.to.hosts)}`
@@ -65,7 +73,7 @@ export function policySummary(r: PolicyRecord | Revocation): string {
     + `${r.projects?.length ? ` within ${r.projects.join(", ")}` : ""} for ${dur(Date.parse(r.exp) - Date.parse(r.iat))}`;
 }
 
-export const verifySigned = (s: Signed<PolicyRecord | Revocation>, ownerPub: string) =>
+export const verifySigned = (s: Signed<AnyRecord>, ownerPub: string) =>
   s.rec.owner_fp === fingerprint(ownerPub) && verifyData(ownerPub, canonical(s.rec), s.sig);
 
 function checkRecord(r: PolicyRecord): string | null {
@@ -88,7 +96,8 @@ export function ownerKeys(db: DatabaseSync): string[] {
  * `issuer`: the owner's own machine keeps policies it issued for other hosts too, so offline hosts can pull them later
  * (a stored policy only applies where its `to.hosts` names the host).
  */
-export function acceptSigned(db: DatabaseSync, s: Signed<PolicyRecord | Revocation>, host: string, o: { issuer?: boolean } = {}): string | null {
+export function acceptSigned(db: DatabaseSync, s: Signed<AnyRecord>, host: string, o: { issuer?: boolean; hostPub?: string } = {}): string | null {
+  if (s?.rec?.type === "device") return acceptDevice(db, s as Signed<DeviceRecord>, host, o);
   const key = ownerKeys(db).find((k) => fingerprint(k) === s?.rec?.owner_fp);
   if (!key) return "not signed by this host's owner";
   if (!verifySigned(s, key)) return "bad owner signature";
@@ -113,8 +122,30 @@ export function acceptSigned(db: DatabaseSync, s: Signed<PolicyRecord | Revocati
   return null;
 }
 
+/**
+ * A device record adopts its signer as this host's owner, but only when it names this host AND this host's own key, and
+ * the signer is an owner key this host learned by pairing (or already has). The owner machine keeps its own copy (issuer).
+ */
+function acceptDevice(db: DatabaseSync, s: Signed<DeviceRecord>, host: string, o: { issuer?: boolean; hostPub?: string }): string | null {
+  const r = s.rec;
+  if (r?.v !== 1 || typeof r.host !== "string" || typeof r.host_pub !== "string" || typeof r.id !== "string") return "not a device record";
+  const known = (db.prepare("SELECT pub, role, via FROM principals").all() as { pub: string; role: string; via: string }[]).find((p) => fingerprint(p.pub) === r.owner_fp);
+  if (!known) return "signed by an owner key this host doesn't know (pair with that owner's machine first)";
+  if (!verifySigned(s, known.pub)) return "bad owner signature";
+  const now = new Date().toISOString();
+  db.prepare("INSERT OR IGNORE INTO devices (id,record,sig,received_at) VALUES (?,?,?,?)").run(r.id, JSON.stringify(r), s.sig, now);
+  if (o.issuer) return null;
+  if (r.host !== host || (o.hostPub && r.host_pub !== o.hostPub)) return `device record is for ${r.host}, not this host`;
+  if (known.role === "owner" && known.via === "local") return null; // this is the owner's own machine
+  if (db.prepare("SELECT 1 FROM principals WHERE role='owner' AND via='local'").get()) return "this host has its own owner key; it only takes policies from that key";
+  db.prepare("DELETE FROM principals WHERE role='owner' AND via<>'local' AND fp<>?").run(r.owner_fp);
+  db.prepare("UPDATE principals SET role='owner', via=? WHERE fp=?").run(`device:${r.id}`, r.owner_fp);
+  db.prepare("INSERT INTO audit VALUES (?,?,?)").run(now, "principal.owner_adopted", JSON.stringify({ owner: r.owner_fp, device: r.id }));
+  return null;
+}
+
 /** The issuing machine's local step: keep every record the owner signs, also those for other hosts (served to their pulls). */
-export const issueSigned = (db: DatabaseSync, s: Signed<PolicyRecord | Revocation>, host: string) => acceptSigned(db, s, host, { issuer: true });
+export const issueSigned = (db: DatabaseSync, s: Signed<AnyRecord>, host: string) => acceptSigned(db, s, host, { issuer: true });
 
 type Row = { id: string; record: string; sig: string; exp: string };
 const matches = (xs: string[], x: string) => xs.includes("*") || xs.includes(x);
@@ -157,9 +188,21 @@ export function effectivePolicy(db: DatabaseSync, o: { agent: string; host: stri
   return { level, classes, ids: ps.map((p) => p.id), exp: ps.map((p) => p.exp).sort()[0], projects: [...new Set(grants.flatMap((g) => g.projects))], grants, notes };
 }
 
-const real = (p: string) => { try { return realpathSync(resolve(p)); } catch { return resolve(p); } };
-/** Is `dir` one of `roots` or inside one? (canonical paths, so symlinks can't escape) */
-export const within = (dir: string, roots: string[]) => { const d = real(dir); return roots.some((r) => d === r || d.startsWith(r.endsWith(sep) ? r : r + sep)); };
+/** Canonical path; a path that doesn't exist yet resolves through its nearest existing ancestor (symlinks included). */
+function real(p: string): string | null {
+  const abs = resolve(p);
+  try { return realpathSync(abs); } catch { /* not there yet */ }
+  const parent = dirname(abs);
+  if (parent === abs) return null;
+  const base = real(parent);
+  return base === null ? null : join(base, basename(abs));
+}
+/** Is `dir` one of `roots` or inside one? Canonical paths on both sides, so symlinks can't escape; unresolvable = no. */
+export const within = (dir: string, roots: string[]) => {
+  const d = real(dir);
+  if (d === null) return false;
+  return roots.some((root) => { const r = real(root); return r !== null && (d === r || d.startsWith(r.endsWith(sep) ? r : r + sep)); });
+};
 
 /**
  * Receiver-side check with no message in hand (the YOLO permission hook: a prompt isn't tied to one sender). Only a policy

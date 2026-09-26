@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS policies (     -- owner-signed collaboration policies
   id TEXT PRIMARY KEY, record TEXT NOT NULL, sig TEXT NOT NULL, owner_fp TEXT NOT NULL, iat TEXT NOT NULL, exp TEXT NOT NULL,
   revoked INTEGER NOT NULL DEFAULT 0, received_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS policy_revocations (id TEXT PRIMARY KEY, target TEXT NOT NULL, iat TEXT NOT NULL, record TEXT NOT NULL, sig TEXT NOT NULL, received_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, record TEXT NOT NULL, sig TEXT NOT NULL, received_at TEXT NOT NULL); -- owner-signed device records
 CREATE TABLE IF NOT EXISTS principals (   -- humans by owner key. role: owner (this host takes policies from it) | member | guest | peer-owner
   fp TEXT PRIMARY KEY, pub TEXT NOT NULL, role TEXT NOT NULL, label TEXT, via TEXT NOT NULL, added_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pair_tokens (  -- one-time pairing tokens (agentmbx pair); only scrypt(token) is stored

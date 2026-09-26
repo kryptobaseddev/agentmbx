@@ -9,7 +9,7 @@ import {
 } from "./envelope.ts";
 import { ownerPublicKey } from "./owner.ts";
 import { effectivePolicy, policyLine } from "./policy.ts";
-import { procStart, sameProcess } from "./proc.ts";
+import { procStart, provenProcess, sameProcess } from "./proc.ts";
 import { Store, type DeliveryState, type MessageRow } from "./store.ts";
 
 export const DEFAULT_PORT = 7373;
@@ -117,7 +117,7 @@ export class MbxNode {
       db.prepare("UPDATE sessions SET agent=? WHERE cli=? AND pid=? AND session_key IS NULL AND (pid_start IS ? OR pid_start IS NULL)").run(s.agent, s.cli, s.pid, start);
     else if (s.pid) {
       const mcp = (db.prepare("SELECT agent, pid_start, updated_at FROM sessions WHERE cli=? AND pid=? AND session_key IS NOT NULL ORDER BY updated_at DESC")
-        .all(s.cli, s.pid) as { agent: string; pid_start: string | null; updated_at: string }[]).find((r) => this.sameSession(s.pid!, r));
+        .all(s.cli, s.pid) as { agent: string; pid_start: string | null; updated_at: string }[]).find((r) => this.sameSession(s.pid!, r, { proof: true }));
       if (mcp) s = { ...s, agent: mcp.agent };
       else { const kept = this.store.get(`name:${s.cli}:${s.session_id}`); if (kept) s = { ...s, agent: kept }; } // resumed session keeps its name
     }
@@ -134,15 +134,20 @@ export class MbxNode {
   }
 
   /** The agent name the MCP server of this CLI process uses (fresh binding of a live pid), if any. */
-  agentFor(cli: string | null, pid: number): string | null {
+  agentFor(cli: string | null, pid: number, o: { proof?: boolean } = {}): string | null {
     const rows = this.store.db.prepare(`SELECT agent, pid_start, updated_at, session_key FROM sessions WHERE pid=? ${cli ? "AND cli=?" : ""} ORDER BY (session_key IS NOT NULL) DESC, updated_at DESC`)
       .all(...(cli ? [pid, cli] : [pid])) as { agent: string; pid_start: string | null; updated_at: string }[];
-    return rows.find((r) => this.sameSession(pid, r))?.agent ?? null;
+    return rows.find((r) => this.sameSession(pid, r, o))?.agent ?? null;
   }
 
-  /** A session row still belongs to the live process it was recorded for (pid + start time; legacy rows: fresh + alive). */
-  sameSession(pid: number, r: { pid_start: string | null; updated_at: string }): boolean {
+  /**
+   * A session row still belongs to the live process it was recorded for. `proof` (anything that authorizes: YOLO,
+   * adopting a name) needs a recorded start time that the live process matches; otherwise (liveness, routing) rows from
+   * before start times were recorded count while fresh and alive.
+   */
+  sameSession(pid: number, r: { pid_start: string | null; updated_at: string }, o: { proof?: boolean } = {}): boolean {
     if (Date.now() - Date.parse(r.updated_at) > LIVE_AGENT_MS) return false; // live sessions rebind every minute
+    if (o.proof) return provenProcess(pid, r.pid_start);
     if (r.pid_start) return sameProcess(pid, r.pid_start);
     return Date.now() - Date.parse(r.updated_at) < SESSION_FRESH_MS && alive(pid);
   }
