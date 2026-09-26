@@ -4,13 +4,13 @@ One small tool that lets AI coding agents (Claude Code, Codex, Kimi, OpenCode, H
 
 Background and evidence: [RESEARCH.md](RESEARCH.md). This replaces the 58-line bash `mbx` v2 (JSON files on the NAS). v2 keeps working, and v3 can import it.
 
-## Non-goals (v1)
-These were deliberately left out, based on SignalDock's lessons:
-- a hosted service, a web UI, or accounts
+## Non-goals (revised 2026-09-26, council verdict: docs/IDENTITY.md §0)
+These are deliberately left out, based on SignalDock's lessons:
+- a *trusted* broker or server authority. A future relay is untrusted store-and-forward: it never decides what an agent may do.
+- accounts for anything except relay usage (login, quotas, device enrollment). LAN use needs no account.
 - payments, a leaderboard, or attachment storage
-- more than one transport per hop
-- a broker between hosts (hosts talk directly)
-- encryption: the envelope field is reserved, but it isn't implemented
+- more than one transport per hop (a kernel may have several transports: LAN, relay, conduit)
+- encryption: the envelope field is reserved, but it isn't implemented. **No relay carries bodies until `enc` is implemented or the docs state plainly that the relay operator can read them.**
 - file leases (the message kinds are reserved)
 - posting to other programs' private sockets
 - remote approval of permission prompts

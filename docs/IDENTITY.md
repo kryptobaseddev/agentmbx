@@ -14,6 +14,42 @@ Sources:
   - Contacts use a hybrid: the owner inbox, policies, named agents, and pre-approved contributors.
   - Plan the cloud with Better Auth (including agent-auth) while AgentMBX stays provider-agnostic.
 
+## 0. The kernel is a protocol (council verdict, adopted by Keaton 2026-09-26)
+
+Council run: `.cleo/council-runs/20260926T203615Z-bd8c2ac3/verdict.md`.
+
+The portfolio (SignalDock, CLEO conduit, AgentMBX, CLEO Nexus) never had a protocol, only implementations, and they drifted apart. So the **kernel is a versioned wire protocol**, the *AgentMBX Protocol*. AgentMBX is its reference implementation, packaged in layers:
+
+| Layer | Contents | Consumers |
+|---|---|---|
+| **protocol + verify library** | key-derived immutable ids; the signed envelope; owner-signed records (policy, grant, role, device, contact, revocation) with a freshness bound; delivery semantics (§0.1). Pure functions, no I/O (`envelope`, `crypto`, `policy`, `owner`). | anything that must verify authority offline: CLEO, the relay, third parties (a public A2A extension later, once immutable ids and freshness are in the signed bytes) |
+| **core library** (package `exports`) | store and delivery state machine, routing, identity, wake brake | the daemon, CLEO's `MbxTransport`, tests |
+| **transports** | LAN (paired hosts, now), relay (v0.5, untrusted), `MbxTransport` for CLEO conduit | |
+| **adapters** | MCP server, CLI, hooks, per-CLI wake adapters (Claude, Codex, OpenCode, Kimi terminal and web) | agent CLIs; the node core never imports a specific CLI |
+
+**Where each project lands:**
+- **CLEO conduit stays the application layer, above the kernel.** It keeps topics (`epic-<T>.wave-<n>`), conversations and orchestration. `MbxTransport` implements CLEO's `Transport` (push/poll/ack) and replaces its HTTP transport to `api.signaldock.io`. The kernel gets no topic primitive unless the conformance test shows conduit needs cross-host topics.
+- **SignalDock is frozen now:** rotate the committed keys, close unauthenticated registration, no new features. It retires after `MbxTransport` carries CLEO's remote traffic. Its poll/SSE/webhook, ack and dead-letter *semantics* become §0.1; its code is kept for reference only.
+- **CLEO Nexus** is the account plane only (Better Auth). It is never consulted for authority.
+
+### 0.1 Delivery semantics (identical on LAN and relay)
+- Message ids are ULIDs. Delivery is at-least-once, with explicit ack and a dead-letter after bounded retries (72 h today).
+- Dedupe keys on a **persistent per-sender sequence high-water mark** that survives restarts and outlives the relay's longest retention. A duplicate wakes an agent, so a time-window id cache is not enough.
+
+### 0.2 Per-session attribution (prerequisite for CLEO orchestration traffic)
+Today envelopes are signed per *host*, and agent names are labels (SPEC.md "Envelope"). So a second process on the same host can send as another agent's name, and the message still verifies. Owner-authority messages are already safe (they need the session key).
+
+Required fix:
+- Every MCP session signs every envelope with its in-memory session key (`session_sig`, which already exists for grants), bound to the agent's immutable id.
+- A receiver shows a sender as `attributed` only when that signature verifies, and as `unattributed (name only)` otherwise; that covers CLI `--as` senders.
+- CLEO orchestration directives (wave complete, reassign) move onto the kernel only after this ships and is tested.
+
+### 0.3 Orchestration-scale authority
+One Touch ID tap per worker doesn't scale to N workers:
+- An orchestrator session receives an owner **grant with a delegation budget**: it may issue sub-grants to sessions it spawns, narrower and shorter than its own, audited, and revoked with it.
+- Headless or CI machines use a device-held owner-delegated key (a device record plus a scoped policy), never the owner key itself.
+- Both are v0.4 design items; nothing ships before per-session attribution.
+
 ## 1. Four planes, one rule
 
 | Plane | What it answers | Who is the authority |
@@ -139,15 +175,15 @@ Policies already carry the `from` scope. `from.principals` (contacts) is the one
 
 **Shared or separate cloud with CLEO Nexus:** one Better Auth deployment would give one login for both. The alternative is agentmbx.com standing alone, which keeps BUSL and hosting simple. That's an owner decision (§9).
 
-**CLEO conduit:** its remote transport still targets `api.signaldock.io`. AgentMBX can be that transport, as the LAN link now and the relay later. That's an owner decision (§9).
+**CLEO conduit:** decided (§0). Conduit stays above the kernel; `MbxTransport` replaces its SignalDock HTTP transport, as the LAN link now and the relay later.
 
 ## 8. Phasing
 
-| Release | Scope |
-|---|---|
-| **v0.4 local identity** | immutable agent ids; signed cards and signed directory; rank and function fields, and the `fn:`/`rank:`/`project:` selectors; attested role records; CLEO pre-fill (`CLEO_AGENT_ID`, `CLEO_AGENT_ROLE`, `.cleo/project-id`); card export to A2A |
-| **v0.5 contacts + relay** | contact cards and safety numbers; tiers 0–2; relay with Better Auth accounts and host enrollment; per-audience keys |
-| **v0.6 teams** | members and org teams; CLEO registry adds device + session and shares the owner key |
+| Release | Scope | Hard prerequisites |
+|---|---|---|
+| **v0.4 kernel + local identity** | protocol spec v1 (§0); the verify library and core library as package `exports`; immutable agent ids; per-session envelope signing (§0.2); signed cards and signed directory (legacy unsigned rows are ineligible for selectors); rank and function fields with `fn:`, `rank:` and `project:` selectors; attested role records; orchestrator delegation grants (§0.3); CLEO pre-fill; `MbxTransport` for CLEO conduit behind the conformance test | nothing ships on `(name, host)` keying |
+| **v0.5 contacts + relay** | contact cards and safety numbers; tiers 0–2; the untrusted relay with Better Auth accounts and host enrollment; per-audience keys | revocation-freshness bound (fail closed for privileged actions), signed directory, `enc` or an explicit "relay reads bodies" statement, persistent per-sender dedupe (§0.1) |
+| **v0.6 teams** | members and org teams; CLEO's registry adopts key-derived ids and the shared owner key; SignalDock decommissioned after conduit cutover | conduit traffic proven over `MbxTransport` |
 
 ## 9. Owner decisions
 
@@ -155,4 +191,5 @@ Policies already carry the `from` scope. `from.principals` (contacts) is the one
 2. Function list in §4: add or remove any?
 3. Contact tier 0: owner inbox + frontdesk (proposed), or owner inbox only?
 4. Cloud: shared Better Auth with CLEO Nexus, or a separate agentmbx.com?
-5. Should AgentMBX become CLEO conduit's remote transport (replacing SignalDock)?
+5. ~~Should AgentMBX become CLEO conduit's remote transport?~~ **Decided: yes (§0).**
+6. When does SignalDock shut down? After conduit cutover. It is live today (api.signaldock.io and api.clawmsgr.com both answer), so rotate its committed keys now.
