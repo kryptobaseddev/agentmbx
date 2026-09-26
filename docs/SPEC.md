@@ -18,12 +18,12 @@ These were deliberately left out, based on SignalDock's lessons:
 ## Pieces
 | Piece | What it is |
 |---|---|
-| `mbx` CLI | For humans, hooks and scripts: `init`, `whoami`, `send`, `inbox`, `read`, `ack`, `thread`, `search`, `agents`, `peers`, `pair`, `owner`, `hook`, `daemon`, `mcp` |
+| `mbx` CLI | For humans, hooks and scripts: `init`, `whoami`, `send`, `inbox`, `read`, `ack`, `thread`, `search`, `agents`, `peers`, `pair`, `join`, `discover`, `owner`, `hook`, `daemon`, `mcp` |
 | `mbx mcp` | MCP server (stdio), one per agent session. It reads and writes the local store directly, and pushes Claude channel events for its own agent |
 | `mbx daemon` | One per host (launchd/systemd). It runs the LAN HTTP endpoint, the outbound retry queue, inbound verification, and the wake adapters for sessions that have no live channel |
 | Store | `~/.local/share/mbx/` (or `$MBX_HOME`): `mbx.db` (SQLite in WAL mode: messages, per-recipient delivery state, FTS5, agents, sessions, peers, grants, audit), `host.key` (Ed25519, 0600), `config.json` |
 
-Stack: Node ≥ 24, TypeScript run through Node's native type stripping (no build step), `@modelcontextprotocol/sdk` and `zod`. Crypto is `node:crypto` Ed25519 and the database is `node:sqlite`. Nothing else.
+Stack: Node ≥ 24, TypeScript run through Node's native type stripping (no build step), `@modelcontextprotocol/sdk`, `zod` and `multicast-dns` (pure JS, for LAN discovery). Crypto is `node:crypto` Ed25519 and the database is `node:sqlite`. Nothing else.
 
 ## Addresses
 - **Agent:** `name@host`, where `name` is `[a-z0-9-]{2,40}` and `host` is the host's short name. A bare `name` resolves on the local host first, then across paired hosts; an ambiguous name is an error.
@@ -62,7 +62,7 @@ Delivery between hosts is **at-least-once**: the outbox retries with backoff for
 | Label shown to agents | Means | Does not mean |
 |---|---|---|
 | `local` | Written by some process running as the same OS user on this host | that the named agent wrote it (agent names are labels) |
-| `verified (paired host X)` | Signed by host X's key, which a human approved through the SAS | which agent on X wrote it |
+| `verified (paired host X)` | Signed by host X's key, which a human approved by pairing (token or SAS) | which agent on X wrote it |
 | `authority: owner via <agent> session <fp>` | A live session holding an in-memory key that the owner approved with their passphrase sent it, within the listed caps and before expiry | that the content is safe to execute, or that permission prompts may be skipped |
 | `legacy` | imported from v2, unsigned | anything |
 
@@ -72,11 +72,16 @@ Storage is exactly-once (dedupe on `id`). Notification and agent action are at-l
 - Envelope ids are deduped **permanently**; the `messages` table is the dedupe set. Envelopes have no freshness window, so a message retried after 3 days is still accepted exactly once.
 - Freshness applies to the **hop** only. Every host-to-host HTTP request carries `X-Mbx-Host`, `X-Mbx-Ts` and `X-Mbx-Sig`, a signature over `method\npath\nts\nsha256(body)`. The receiver rejects anything more than ±5 min off or from an unpaired host. Retries re-sign the hop and never the envelope.
 
-### Host pairing (Syncthing-style mutual approval plus a SAS)
-1. `mbx pair <addr>` on host A POSTs `{host, host_pubkey, owner_pubkey, nonce, addr}` to B. B stores it as pending and replies with its own.
-2. Both sides compute the **SAS** over the full transcript: `SHA-256("mbx-pair-v2" ‖ sorted[(host, host_pubkey, owner_pubkey, nonce)])` mod 10⁶. Swapping any host key, owner key or host name changes the digits.
-3. The human checks that both terminals show the same 6 digits, then runs `mbx pair approve <host>` on **each** host. Until then, the only thing that peer can send is the pairing exchange.
-4. `mbx peers remove <host>` revokes a peer. The peer's owner key stays pinned from pairing, and changing it means pairing again.
+### Host pairing (primary: one-time token, like Bluetooth passkey entry or a Tailscale auth key)
+1. `agentmbx pair [--ttl 10m]` on host A creates a **single-use token**: 60 random bits as Crockford base32 `XXXX-XXXX-XXXX`, valid 10 min (max 1 h). A stores only `K = scrypt(token, N=2^15)`, never the token, and prints `agentmbx join <A>.local:<port> <TOKEN>` (plus LAN-IP and mDNS host-name variants).
+2. `agentmbx join <addr|host> <TOKEN>` on B: `GET /v1/pair/hello` returns A's `{host, host_pubkey, owner_pubkey, nonce_a}` (nonce single-use, 2 min). B POSTs `/v1/pair/join` with its own `{host, host_pubkey, owner_pubkey, nonce_b, addr}`, `nonce_a` and `mac_b = HMAC-SHA256(HKDF(K,"mac:join"), transcript)`. The transcript is the canonical JSON of both parties (host names, both host keys, **both owner keys**, both nonces, B's addr).
+3. A recomputes the transcript from **its own** party and the MAC against each live token. On a match it approves B, marks the token used, and returns `mac_a` under `HKDF(K,"mac:accept")`; B checks `mac_a` before approving A. Both sides audit `pair.joined`; the daemon shows "Paired with <host>".
+4. Security: a MITM who swaps any key, name, nonce or address changes the transcript and needs the token to re-MAC it. Online guessing gets 5 wrong MACs before the token is burned (P ≈ 5·2⁻⁶⁰), and hello/join are rate-limited to 30/min. Offline guessing from an observed MAC costs one scrypt per guess over 2⁶⁰ tokens, far beyond the TTL, and a used token is worthless anyway. Replays fail because `nonce_a` and the token are single-use. The token is as strong as the SAS compare (which a hurried human may skip) and needs no comparison; anyone who sees the token within its TTL can pair, so it is shown only to the person running the command.
+5. **Manual alternative (SAS):** `agentmbx pair --compare <addr>` POSTs `{host, host_pubkey, owner_pubkey, nonce, addr}` to B, which stores it as pending and replies with its own. Both compute `SHA-256("mbx-pair-v2" ‖ sorted[(host, host_pubkey, owner_pubkey, nonce)])` mod 10⁶; the human checks both screens show the same 6 digits and runs `agentmbx pair approve <host> <code>` on **each** host.
+6. `agentmbx peers remove <host>` revokes a peer. The peer's host and owner keys stay pinned from pairing; changing the host key means removing the peer and pairing again.
+
+### LAN discovery (addresses only, never trust)
+The daemon advertises `_agentmbx._tcp` over mDNS/DNS-SD (`multicast-dns`, pure JS) with TXT `v`, `host`, `fp` (host key fingerprint). `agentmbx discover` lists what answers within 3 s, marking paired/pending/key-mismatch; `join <host>` resolves a bare name the same way, then falls back to `<host>.local:7373`. mDNS answers are unauthenticated, so they only pick an address; the token (or pinned key) decides trust. UDP 5353 is shared with `reuseAddr` (mDNSResponder on macOS, avahi on Linux). If multicast is blocked, explicit addresses work unchanged. `MBX_NO_MDNS=1` disables advertising.
 
 ### Owner key
 - `mbx owner init`: an Ed25519 key encrypted with a passphrase the owner chooses (scrypt N=2^17 → AES-256-GCM) and stored in `owner.key` (0600).
@@ -155,10 +160,11 @@ Wake adapters are chosen by the recipient's session binding:
 ## LAN protocol
 - **Endpoint:** HTTP on `:7373` (configurable).
 - **POST /v1/envelopes:** the body is `{envelopes:[…]}`, and every envelope must carry a valid signature from a *paired* host. The response per id is `accepted | duplicate | rejected:<reason>`.
-- **POST /v1/pair:** pairing exchange. Rate-limited, and pending requests expire after 10 min.
+- **GET /v1/pair/hello, POST /v1/pair/join:** token pairing (see Host pairing). Unsigned, rate-limited to 30/min.
+- **POST /v1/pair:** SAS pairing exchange (`pair --compare`). Rate-limited, and pending requests expire after 10 min.
 - **GET /v1/agents:** the directory of the host's agents. Request headers are signed: host, ts, and a signature over method, path, ts and body hash.
 - **Plain HTTP on the LAN:** integrity comes from the signatures. Bodies are readable on the wire until `enc` lands; the docs say so plainly.
-- **Discovery:** manual address in v1; `_mbx._tcp` mDNS later.
+- **Discovery:** `_agentmbx._tcp` mDNS/DNS-SD (see LAN discovery); explicit addresses always work.
 
 ## Compatibility
 `mbx import-v2 <dir>` imports the NAS v2 messages as unsigned, `legacy`-labelled records. There is no live v2 bridge in v1 (a council scope cut).
@@ -171,7 +177,8 @@ Wake adapters are chosen by the recipient's session binding:
    - A message that exceeds its caps arrives with `authority: none`.
 2. **Unit tests:** canonical JSON, sign/verify, tamper detection, grant chain (valid, expired, revoked, forged, wrong subject), metadata parser, owner-key encryption round trip, hop-signature freshness.
 3. **Two hosts on one Mac** (separate `MBX_HOME` values and ports):
-   - Pair with the SAS, then send A→B and B→A.
+   - Pair with a token (and, separately, with the SAS), then send A→B and B→A.
+   - Token pairing rejects a wrong token (burned after 5), an expired or reused token, a replayed hello nonce, and a join whose owner key, host key, host name or addr was swapped.
    - An unpaired host is rejected, a replay is stored once, a tampered body is rejected, and an offline peer gets the message after it comes back.
 4. **MCP server driven by an MCP SDK client:** send, inbox, read, ack, search, and the framing header. A channel notification is emitted for a new message.
 5. **Real wake:** a Codex scratch thread is woken through `codex queue`, and an OpenCode scratch session through `synthetic`. A Claude wake is claimed only if a real session started with the channel flag responds.

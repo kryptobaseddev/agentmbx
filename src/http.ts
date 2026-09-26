@@ -1,13 +1,18 @@
-// Host-to-host HTTP: pairing, envelope exchange, agent directory. Every request except /v1/pair carries a
+// Host-to-host HTTP: pairing, envelope exchange, agent directory. Every request except /v1/pair* carries a
 // signed hop (X-Mbx-Host / -Ts / -Sig over method, path, ts, sha256(body)); freshness is checked on the hop only.
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { hostname } from "node:os";
-import { fingerprint, nonce as newNonce, pairingCode, sha256, signData, verifyData, type PairParty } from "./crypto.ts";
+import {
+  fingerprint, joinTranscript, nonce as newNonce, pairingCode, pairMac, pairTokenKey, safeEqual, sha256, signData, verifyData, type PairParty,
+} from "./crypto.ts";
 import { NAME_RE, type Envelope } from "./envelope.ts";
 import { MbxNode, RETRY_HOURS } from "./node.ts";
+import { notifyDesktop } from "./wake.ts";
 
 export const HOP_SKEW_MS = 5 * 60_000;
 const MAX_REQ = 4 * 1024 * 1024;
+const HELLO_TTL_MS = 2 * 60_000;
+const TOKEN_REQS_PER_MIN = 30;
 
 const hopPayload = (method: string, path: string, ts: string, body: string) => `${method}\n${path}\n${ts}\n${sha256(body)}`;
 
@@ -59,13 +64,90 @@ export async function pairWith(node: MbxNode, addr: string): Promise<{ host: str
   return { host: remote.host, code, key: fingerprint(remote.host_pubkey), owner: remote.owner_pubkey ? fingerprint(remote.owner_pubkey) : null };
 }
 
+// ---- token pairing (agentmbx pair  →  agentmbx join <addr> <token>) --------------------------
+/** GET /v1/pair/hello: this host's public party plus a fresh single-use nonce (nonce_a). */
+export interface PairHello extends PairParty { v: 1 }
+/** POST /v1/pair/join: the joiner's party, the hello nonce it answers, and HMAC(token, transcript). */
+export interface JoinRequest extends PairParty { v: 1; addr: string; nonce_a: string; mac: string }
+
+const isStr = (x: unknown, max = 256) => typeof x === "string" && x.length > 0 && x.length <= max;
+const validParty = (p: Partial<PairParty> | null | undefined) => !!p && isStr(p.host, 40) && NAME_RE.test(p.host!) && isStr(p.host_pubkey, 64)
+  && (p.owner_pubkey === null || isStr(p.owner_pubkey, 64)) && isStr(p.nonce, 64);
+
+/** Joiner side of `agentmbx join <addr> <token>`: prove the token to A, check A's proof, then trust A. */
+export async function pairJoin(node: MbxNode, addr: string, token: string): Promise<{ host: string; key: string; owner: string | null }> {
+  const key = pairTokenKey(token);
+  const h = await fetch(`http://${addr}/v1/pair/hello`, { signal: AbortSignal.timeout(10_000) });
+  if (!h.ok) throw new Error(`${addr} refused pairing: ${await h.text()}`);
+  const hello = await h.json() as PairHello;
+  if (hello?.v !== 1 || !validParty(hello)) throw new Error(`${addr} sent a malformed pairing hello`);
+  if (hello.host === node.host) throw new Error("peer has the same host name as this host; rename one (config.json)");
+  const cur = node.approvedPeer(hello.host);
+  if (cur && cur.pubkey !== hello.host_pubkey) throw new Error(`host ${hello.host} is already paired with a different key; remove it first (agentmbx peers remove ${hello.host})`);
+  const me = { host: node.host, host_pubkey: node.key.publicKey, owner_pubkey: node.ownerPub, nonce: newNonce(), addr: advertisedAddr(node) };
+  const transcript = joinTranscript(hello, me);
+  const req: JoinRequest = { v: 1, ...me, nonce_a: hello.nonce, mac: pairMac(key, "join", transcript) };
+  const res = await fetch(`http://${addr}/v1/pair/join`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(req), signal: AbortSignal.timeout(10_000) });
+  if (!res.ok) throw new Error(`${hello.host} (${addr}) refused the join: ${((await res.json().catch(() => ({}))) as { error?: string }).error ?? res.status}`);
+  const r = await res.json() as { mac?: unknown };
+  if (typeof r.mac !== "string" || !safeEqual(pairMac(key, "accept", transcript), r.mac)) {
+    node.store.audit("pair.join.failed", { host: hello.host, addr, why: "peer could not prove the token" });
+    throw new Error(`${addr} did not prove it knows the token. NOT paired: something may be intercepting the connection.`);
+  }
+  node.addApprovedPeer({ host: hello.host, pubkey: hello.host_pubkey, owner_pubkey: hello.owner_pubkey, addr }, "token");
+  node.store.audit("pair.joined", { host: hello.host, addr, role: "joiner" });
+  return { host: hello.host, key: fingerprint(hello.host_pubkey), owner: hello.owner_pubkey ? fingerprint(hello.owner_pubkey) : null };
+}
+
+/** Token-holder side: verify a join and, if the MAC checks out against a live token, approve the joiner. */
+function handleJoin(node: MbxNode, j: JoinRequest, hellos: Map<string, number>, remote: string): { code: number; body: Record<string, unknown> } {
+  if (j?.v !== 1 || !validParty(j) || !isStr(j.addr) || !isStr(j.nonce_a, 64) || !isStr(j.mac, 128)) return { code: 400, body: { error: "bad join request" } };
+  const exp = hellos.get(j.nonce_a); hellos.delete(j.nonce_a); // each hello nonce answers at most one join
+  if (!exp || exp < Date.now()) return { code: 401, body: { error: "unknown or expired hello nonce; run join again" } };
+  const tokens = node.livePairTokens();
+  if (!tokens.length) return { code: 401, body: { error: `no live pairing token on ${node.host} (expired, used or burned); run 'agentmbx pair' there again` } };
+  const transcript = joinTranscript(localParty(node, j.nonce_a), j);
+  const match = tokens.find((t) => safeEqual(pairMac(t.key, "join", transcript), j.mac));
+  if (!match) {
+    node.pairTokenFailure(tokens.map((t) => t.id));
+    node.store.audit("pair.join.failed", { from: j.host, addr: j.addr, remote, why: "token or transcript does not verify" });
+    return { code: 401, body: { error: "pairing token or transcript does not verify" } };
+  }
+  if (j.host === node.host) return { code: 409, body: { error: "peer has the same host name as this host; rename one (config.json)" } };
+  const cur = node.approvedPeer(j.host);
+  if (cur && cur.pubkey !== j.host_pubkey) return { code: 409, body: { error: `${node.host} already has ${j.host} paired with a different key; run 'agentmbx peers remove ${j.host}' there first` } };
+  if (!node.consumePairToken(match.id, j.host)) return { code: 401, body: { error: "pairing token was just used" } };
+  node.addApprovedPeer({ host: j.host, pubkey: j.host_pubkey, owner_pubkey: j.owner_pubkey, addr: j.addr }, "token");
+  node.store.audit("pair.joined", { host: j.host, addr: j.addr, remote, role: "token-holder", token: match.id });
+  process.stderr.write(`\n[agentmbx] paired with ${j.host} (${j.addr}) using pairing token ${match.id}\n`);
+  void notifyDesktop("AgentMBX", `Paired with ${j.host}`);
+  return { code: 200, body: { v: 1, host: node.host, mac: pairMac(match.key, "accept", transcript) } };
+}
+
 // ---- server ----------------------------------------------------------------------------------
 export function startServer(node: MbxNode, port = node.config.port, bind = node.config.bind, onEnvelope?: () => void): Promise<Server> {
-  let pairAttempts: number[] = [];
+  let pairAttempts: number[] = [], tokenAttempts: number[] = [];
+  const hellos = new Map<string, number>(); // hello nonce → expiry
   const server = createServer(async (req, res) => {
     const send = (code: number, obj: unknown) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
     try {
       const url = new URL(req.url ?? "/", "http://x"); const body = await readBody(req);
+      if (url.pathname === "/v1/pair/hello" || url.pathname === "/v1/pair/join") {
+        tokenAttempts = tokenAttempts.filter((t) => Date.now() - t < 60_000);
+        if (tokenAttempts.push(Date.now()) > TOKEN_REQS_PER_MIN) return send(429, { error: "too many pairing attempts; wait a minute" });
+        if (req.method === "GET" && url.pathname === "/v1/pair/hello") {
+          const now = Date.now();
+          for (const [n, exp] of hellos) if (exp < now || hellos.size > 256) hellos.delete(n);
+          const n = newNonce(); hellos.set(n, now + HELLO_TTL_MS);
+          const { addr: _addr, ...party } = localParty(node, n);
+          return send(200, party satisfies PairHello);
+        }
+        if (req.method === "POST") {
+          const r = handleJoin(node, JSON.parse(body) as JoinRequest, hellos, req.socket.remoteAddress ?? "?");
+          return send(r.code, r.body);
+        }
+        return send(405, { error: "method not allowed" });
+      }
       if (req.method === "POST" && url.pathname === "/v1/pair") {
         pairAttempts = pairAttempts.filter((t) => Date.now() - t < 60_000);
         if (pairAttempts.push(Date.now()) > 5) return send(429, { error: "too many pairing attempts" });

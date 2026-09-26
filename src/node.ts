@@ -2,7 +2,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { hostname, homedir } from "node:os";
 import { join } from "node:path";
-import { fingerprint, generateKeyPair, type KeyPair } from "./crypto.ts";
+import { fingerprint, generateKeyPair, newPairToken, pairTokenKey, sha256, type KeyPair } from "./crypto.ts";
 import {
   attachAuthority, buildEnvelope, checkAuthority, checkShape, NAME_RE, signEnvelope, verifyEnvelope,
   type Draft, type Envelope, type Grant,
@@ -12,6 +12,9 @@ import { Store, type DeliveryState, type MessageRow } from "./store.ts";
 
 export const DEFAULT_PORT = 7373;
 export const RETRY_HOURS = 72;
+export const PAIR_TOKEN_TTL_MS = 10 * 60_000;
+export const PAIR_TOKEN_MAX_TTL_MS = 60 * 60_000;
+export const PAIR_TOKEN_MAX_FAILURES = 5;
 export const WAKE_KINDS = new Set(["request", "task", "decision", "alert"]);
 export const WAKE_LIMITS = { perAgentSeconds: 30, perThreadHour: 6, perAgentDay: 60 };
 
@@ -98,6 +101,47 @@ export class MbxNode {
     this.store.db.prepare("DELETE FROM peers WHERE host=?").run(host);
     this.store.db.prepare("DELETE FROM agents WHERE host=?").run(host);
     this.store.audit("pair.removed", { host });
+  }
+
+  /** Approve a peer directly (token pairing: the peer already proved it holds the token). */
+  addApprovedPeer(p: { host: string; pubkey: string; owner_pubkey: string | null; addr: string }, via: string) {
+    if (p.host === this.host) throw new Error("peer has the same host name as this host; rename one (config.json)");
+    const cur = this.peer(p.host);
+    if (cur && cur.state === "approved" && cur.pubkey !== p.pubkey) throw new Error(`host ${p.host} is already paired with a different key; remove it first`);
+    const now = new Date().toISOString();
+    this.store.db.prepare(`INSERT INTO peers (host,pubkey,owner_pubkey,addr,state,code,nonce_local,nonce_remote,created_at,approved_at)
+      VALUES (?,?,?,?,'approved',NULL,NULL,NULL,?,?) ON CONFLICT(host) DO UPDATE SET pubkey=excluded.pubkey, owner_pubkey=excluded.owner_pubkey,
+      addr=excluded.addr, state='approved', code=NULL, approved_at=excluded.approved_at`).run(p.host, p.pubkey, p.owner_pubkey, p.addr, now, now);
+    this.store.audit("pair.approved", { host: p.host, key: fingerprint(p.pubkey), owner: p.owner_pubkey ? fingerprint(p.owner_pubkey) : null, via });
+  }
+
+  // ---- pairing tokens ----------------------------------------------------------------------
+  /** Create a one-time pairing token. Only scrypt(token) is stored; the token itself is returned once, for display. */
+  createPairToken(ttlMs = PAIR_TOKEN_TTL_MS): { token: string; expires_at: string } {
+    if (!(ttlMs > 0) || ttlMs > PAIR_TOKEN_MAX_TTL_MS) throw new Error("pairing token TTL must be between 1 s and 1 h");
+    const token = newPairToken(), key = pairTokenKey(token), now = Date.now();
+    const id = sha256(key).slice(0, 12), expires_at = new Date(now + ttlMs).toISOString();
+    this.store.db.prepare("INSERT INTO pair_tokens (id,key,created_at,expires_at,state) VALUES (?,?,?,?,'live')").run(id, key, new Date(now).toISOString(), expires_at);
+    this.store.audit("pair.token", { id, expires_at });
+    return { token, expires_at };
+  }
+
+  /** Tokens that can still be used: not used, not burned, not expired. */
+  livePairTokens(now = Date.now()): { id: string; key: string; expires_at: string; failures: number }[] {
+    return this.store.db.prepare("SELECT id,key,expires_at,failures FROM pair_tokens WHERE state='live' AND expires_at > ?").all(new Date(now).toISOString()) as never;
+  }
+
+  /** Mark a token used. Returns false if another request consumed it first. */
+  consumePairToken(id: string, by: string): boolean {
+    return this.store.db.prepare("UPDATE pair_tokens SET state='used', used_by=? WHERE id=? AND state='live'").run(by, id).changes > 0;
+  }
+
+  /** Record a failed join against every live token; burn those that reach the limit. */
+  pairTokenFailure(ids: string[]) {
+    for (const id of ids) {
+      this.store.db.prepare(`UPDATE pair_tokens SET failures=failures+1, state=CASE WHEN failures+1 >= ? THEN 'burned' ELSE state END
+        WHERE id=? AND state='live'`).run(PAIR_TOKEN_MAX_FAILURES, id);
+    }
   }
 
   // ---- addressing --------------------------------------------------------------------------
