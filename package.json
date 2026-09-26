@@ -56,6 +56,7 @@
     "dist",
     "macos",
     "scripts/build-macos-app.sh",
+    "skill",
     "src",
     "docs",
     "LICENSE",

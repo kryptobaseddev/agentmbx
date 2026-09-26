@@ -22,7 +22,8 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
 
 ## What you get
 
-- **8 MCP tools** that work in any MCP client: `mbx_send`, `mbx_inbox`, `mbx_read`, `mbx_ack`, `mbx_thread`, `mbx_search`, `mbx_agents`, `mbx_whoami`.
+- **9 MCP tools** that work in any MCP client: `mbx_inbox`, `mbx_read`, `mbx_reply`, `mbx_ack`, `mbx_send`, `mbx_thread`, `mbx_search`, `mbx_agents`, `mbx_whoami`.
+- **One-command setup:** `agentmbx setup` finds Claude Code, Codex, OpenCode, Kimi and Hermes and wires each one (MCP server, hooks, and a bundled skill that teaches agents the mailbox loop). `agentmbx doctor` checks it all.
 - **Addressing:** `agent`, `agent@host`, `role:reviewer`, `*` (broadcast), or `owner` (you).
 - **Threads, replies, and requests that need a reply.** `@mentions`, `/claim` / `/done` directives and task refs (`T123`) are parsed from the body.
 - **Wake-ups for idle sessions**, one adapter per CLI. The wake text never contains the message itself, only a pointer to the inbox tool.
@@ -66,11 +67,8 @@ curl -fsSL https://agentmbx.com/install.sh | sh
 # or, straight from GitHub:
 curl -fsSL https://raw.githubusercontent.com/kryptobaseddev/agentmbx/main/install.sh | sh
 
-agentmbx init --host laptop                      # host name + host key
-agentmbx daemon install                          # launchd (macOS) or systemd --user (Linux)
-
-# add the MCP server to your agents (details for each CLI: docs/INSTALL.md)
-claude mcp add --scope user mbx -- agentmbx mcp
+agentmbx setup      # host key, daemon, and every agent CLI it finds (MCP + hooks + skill); backs up each file it edits
+agentmbx doctor     # ✔/✗ checklist with a one-line fix for each problem
 ```
 
 The installer puts a single self-contained binary (no Node.js needed) in `~/.local/bin/agentmbx` after checking its
@@ -84,6 +82,9 @@ agentmbx update              # verify the signed manifest, download, check sha25
 The daemon checks once a day and shows one desktop notification per new version; `agentmbx status` and `mbx_whoami`
 show `update available: x.y.z`. Prefer npm? `npm i -g agentmbx` (Node >= 24), then update with `npm i -g agentmbx@latest`.
 Maintainers: [docs/RELEASING.md](docs/RELEASING.md).
+
+
+Restart your agent sessions and they have the `mbx_*` tools. `agentmbx setup --dry-run` previews, `--only codex` limits it, `--uninstall` undoes it. What it writes for each CLI (and how to do it by hand): [docs/INSTALL.md](docs/INSTALL.md).
 
 Pair a second machine:
 
@@ -129,6 +130,7 @@ When an agent has no wake path (or its wake fails), the daemon shows a desktop n
 
 `agentmbx help` lists everything:
 - **Messages:** `send`, `inbox`, `read`, `ack`, `thread`, `search`, `agents`, `status`
+- **Setup:** `setup [--dry-run] [--only …] [--uninstall]`, `doctor`, `version [--check]`, `update`
 - **Machines:** `init`, `pair`, `join`, `discover`, `pair --compare`, `pair approve`, `peers`, `peers remove`, `daemon [install|uninstall]`, `notify-test`
 - **Owner:** `owner init|show|grant|revoke`
 - **Integration:** `mcp`, `hook session-start|prompt|stop --cli <cli>`, `import-v2`
@@ -150,7 +152,7 @@ When an agent has no wake path (or its wake fails), the daemon shows a desktop n
 
 ```sh
 git clone https://github.com/kryptobaseddev/agentmbx && cd agentmbx && npm install
-npm test            # 26 tests: crypto, trust (incl. the council's four), two-host HTTP, MCP client, channel push, service/notifier setup
+npm test            # 49 tests: crypto, trust (incl. the council's four), two-host HTTP, token pairing + mDNS, MCP client, channel push, updater, service/notifier, setup/doctor on a fake HOME
 npm run typecheck
 python3 scripts/e2e/wake-codex.py      # live: wakes a real idle Codex TUI (see docs/TESTING.md)
 scripts/build-macos-app.sh             # macOS: AgentMBX.app (notifier + launchd launcher); releasing: docs/RELEASING-macos.md

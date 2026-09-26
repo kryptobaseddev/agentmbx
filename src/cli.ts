@@ -1,5 +1,6 @@
 // mbx command line. Humans, hooks and scripts use this; agents use the MCP tools (mbx mcp).
 import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { execFileSync } from "node:child_process";
@@ -7,15 +8,22 @@ import { fingerprint } from "./crypto.ts";
 import { CAPS, makeGrant, type Envelope, type Grant } from "./envelope.ts";
 import { advertise, browse, lanIPv4 } from "./discovery.ts";
 import { flushOutbox, pairJoin, pairWith, refreshDirectory, startServer, advertisedAddr } from "./http.ts";
+import { daemonAnswers, doctor, failed, formatChecks } from "./doctor.ts";
 import { agentName, runMcp } from "./mcp.ts";
 import { DEFAULT_PORT, defaultHome, formatMessage, MbxNode, summaryLine, trustLabel } from "./node.ts";
 import { createOwnerKey, ownerPath, readPassphraseFromTTY, unlockOwnerKey } from "./owner.ts";
 import { periodicUpdateCheck, updateAvailable, updateCommand } from "./update.ts";
 import { installKind, version } from "./version.ts";
-import { installService, uninstallService } from "./service.ts";
+import { installService, serviceLabel, uninstallService } from "./service.ts";
+import { CLIS, defaultHostName, defaultWhich, formatRows, resolveCommand, runSetup, shJoin, type SetupCtx } from "./setup.ts";
 import { dispatchWakes, inboxCommand, macNotifierPath, notifyDesktop, opencodeSessionFor } from "./wake.ts";
 
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
+
+Start here
+  agentmbx setup [--yes] [--dry-run] [--only claude,codex,opencode,kimi,hermes,skill] [--host <name>] [--uninstall]
+                  init this host, install the daemon, wire every detected agent CLI (MCP + hooks + skill)
+  agentmbx doctor   checklist: host, daemon, each CLI's wiring, skill, peers, pending pairings
 
 Messages
   agentmbx send --as <agent> --to <a,b,role:x,*,owner> --subject "…" [-m "body" | --body-file f | stdin]
@@ -63,7 +71,7 @@ export async function main(argv = process.argv.slice(2)) {
     ref: { type: "string", multiple: true }, all: { type: "boolean" }, json: { type: "boolean" }, note: { type: "string" },
     host: { type: "string" }, port: { type: "string" }, cli: { type: "string" }, session: { type: "string" }, caps: { type: "string" },
     ttl: { type: "string" }, bind: { type: "string" }, check: { type: "boolean" }, yes: { type: "boolean", short: "y" },
-    compare: { type: "string" } } });
+    compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" } } });
   const str = (k: string) => (typeof o[k] === "string" ? o[k] as string : undefined);
 
   if (cmd === "mcp") return runMcp();
@@ -73,6 +81,13 @@ export async function main(argv = process.argv.slice(2)) {
     return;
   }
   if (cmd === "update") { process.exitCode = await updateCommand({ check: !!o.check, yes: !!o.yes }); return; }
+  if (cmd === "setup") return setup(o, str);
+  if (cmd === "doctor") {
+    const checks = await doctor(setupCtx(), defaultHome());
+    console.log(formatChecks(checks));
+    if (failed(checks)) process.exitCode = 1;
+    return;
+  }
   if (cmd === "init") {
     const n = new MbxNode(defaultHome(), { host: str("host"), port: str("port") ? Number(str("port")) : undefined, bind: str("bind") });
     console.log(`mbx home: ${n.home}\nhost: ${n.host}  key: ${fingerprint(n.key.publicKey)}  listens on ${n.config.bind}:${n.config.port}  advertised as ${advertisedAddr(n)}`);
@@ -328,6 +343,58 @@ function importV2(node: MbxNode, dir: string) {
     n++;
   }
   console.log(`imported ${n} v2 message(s) as legacy`);
+}
+
+// ---- setup -----------------------------------------------------------------------------------
+const servicePath = (home = homedir()) => process.platform === "darwin"
+  ? join(home, "Library/LaunchAgents", `${serviceLabel()}.plist`) : join(home, ".config/systemd/user/agentmbx.service");
+
+const setupCtx = (home = homedir()): SetupCtx => ({ home, cmd: resolveCommand(home), which: defaultWhich, useClis: true });
+
+async function setup(o: Record<string, unknown>, str: (k: string) => string | undefined) {
+  const dryRun = !!o["dry-run"], uninstall = !!o.uninstall, mode = uninstall ? "uninstall" as const : "install" as const;
+  const only = str("only")?.split(",").map((s) => s.trim()).filter(Boolean);
+  const bad = only?.filter((c) => ![...CLIS, "skill"].includes(c));
+  if (bad?.length) die(`--only: unknown ${bad.join(", ")} (use ${[...CLIS, "skill"].join(",")})`);
+  const ctx = setupCtx();
+  console.log(`agents will run: ${shJoin(ctx.cmd)} mcp`);
+
+  if (!uninstall) {
+    const home = defaultHome();
+    if (!existsSync(join(home, "config.json"))) {
+      const host = str("host") ?? defaultHostName();
+      if (dryRun) console.log(`would initialize host "${host}" in ${home}`);
+      else { const n = new MbxNode(home, { host }); console.log(`initialized host ${n.host} (key ${fingerprint(n.key.publicKey)}) in ${home}`); n.close(); }
+    } else if (str("host")) console.log(`host already initialized; --host ignored (edit ${join(home, "config.json")} to rename)`);
+    if (existsSync(join(home, "config.json"))) {
+      const node = new MbxNode(home);
+      const up = await daemonAnswers(node.config.port);
+      if (up && existsSync(servicePath())) console.log(`daemon: already running on port ${node.config.port}`);
+      else if (dryRun) console.log("would install and start the daemon service");
+      else { try { installService(node.home); } catch (e) { console.log(`daemon: install failed (${(e as Error).message}); run 'agentmbx daemon install' later`); } }
+      node.close();
+    }
+  }
+
+  const plan = runSetup(ctx, { mode, only, dryRun: true });
+  const pending = plan.filter((r) => ["added", "updated", "removed"].includes(r.action));
+  if (dryRun || !pending.length) {
+    console.log(`\n${formatRows(plan)}\n\n${dryRun ? "dry run: nothing was written" : "nothing to change"}`);
+    return;
+  }
+  if (!o.yes && process.stdin.isTTY) {
+    console.log(`\n${formatRows(plan)}\n`);
+    const { createInterface } = await import("node:readline/promises");
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const answer = (await rl.question(`${uninstall ? "Remove" : "Apply"} these ${pending.length} change(s)? Every edited file is backed up first. [Y/n] `)).trim().toLowerCase();
+    rl.close();
+    if (answer && answer !== "y" && answer !== "yes") return console.log("nothing changed");
+  }
+  const rows = runSetup(ctx, { mode, only });
+  console.log(`\n${formatRows(rows)}\n`);
+  if (rows.some((r) => r.action === "error")) process.exitCode = 1;
+  if (uninstall) console.log("The daemon keeps running (messages and keys stay). Stop it with: agentmbx daemon uninstall");
+  else console.log("Restart your agent sessions so they load mbx, then run: agentmbx doctor");
 }
 
 export type { Grant };

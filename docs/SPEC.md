@@ -134,6 +134,7 @@ All tools are prefixed `mbx_` and return text plus `structuredContent`.
 |---|---|---|
 | `mbx_whoami` | Show or set this session's agent name, role and description | idempotent |
 | `mbx_send` | Send to agent/role/`*`/`owner`; supports `thread`, `reply_to`, `kind`, `needs_reply`, `refs`, and an `idempotency_key` | not read-only |
+| `mbx_reply` | Answer a message: goes to its sender, same thread, `reply_to` set; `kind` defaults to `reply`, optional `needs_reply` | not read-only |
 | `mbx_inbox` | Unread (or `all`) messages for me: summaries with the verification label, plus action items | read-only |
 | `mbx_read` | Full message(s) by id, framed; marks them read | not read-only |
 | `mbx_ack` | Mark done, with an optional note | idempotent |
