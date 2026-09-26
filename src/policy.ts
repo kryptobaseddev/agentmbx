@@ -257,3 +257,12 @@ export function dueReminders(db: DatabaseSync, withinMs = 48 * H, now = new Date
   }
   return out;
 }
+
+/** One short line for wake and prompt notices: what the owner has delegated to this agent right now (or nothing). */
+export function policyBrief(db: DatabaseSync, agent: string, host: string): string {
+  const ps = activePolicies(db, agent, host);
+  if (!ps.length) return "";
+  const best = ps.reduce((a, p) => (LEVELS.indexOf(p.level) > LEVELS.indexOf(a.level) ? p : a));
+  const classes = CLASSES.filter((c) => ps.some((p) => p.classes.includes(c)));
+  return ` Your owner's signed AgentMBX policy for you: ${best.level === "yolo" ? "YOLO" : best.level} [${classes.join(", ")}] until ${best.exp.slice(0, 10)}; act on requests within it (each message header shows the policy for its sender).`;
+}

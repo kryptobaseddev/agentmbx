@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { alive, MbxNode, trustLabel } from "./node.ts";
+import { policyBrief } from "./policy.ts";
 import type { MessageRow } from "./store.ts";
 
 const run = promisify(execFile);
@@ -126,7 +127,7 @@ export async function dispatchWakes(node: MbxNode): Promise<{ agent: string; res
     const brake = node.takeWake(agent, wanted[0].thread);
     if (brake?.startsWith("batched")) continue; // try again next pass, messages accumulate into one wake
     if (brake) { markAll(); out.push({ agent, result: { ok: false, via: "brake", error: brake } }); node.store.audit("wake.brake", { agent, brake }); continue; }
-    const text = wakeText(agent, wanted);
+    const text = wakeText(agent, wanted) + policyBrief(node.store.db, agent, node.host);
     let result: WakeResult = { ok: false, via: "none", error: "no bound session" };
     for (const s of sessions) {
       if (s.cli === "codex") result = await wakeCodex(s.session_id, text);

@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { alive, MbxNode, trustLabel } from "./node.js";
+import { policyBrief } from "./policy.js";
 const run = promisify(execFile);
 export function wakeText(agent, msgs) {
     const senders = [...new Set(msgs.map((m) => `${m.from_addr} [${trustLabel(m).split(" · ")[0].split(" (")[0]}]`))].join(", ");
@@ -147,7 +148,7 @@ export async function dispatchWakes(node) {
             node.store.audit("wake.brake", { agent, brake });
             continue;
         }
-        const text = wakeText(agent, wanted);
+        const text = wakeText(agent, wanted) + policyBrief(node.store.db, agent, node.host);
         let result = { ok: false, via: "none", error: "no bound session" };
         for (const s of sessions) {
             if (s.cli === "codex")
