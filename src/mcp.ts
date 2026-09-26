@@ -9,6 +9,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { fingerprint, generateKeyPair } from "./crypto.ts";
 import { KINDS, NAME_RE, type Envelope, type Grant } from "./envelope.ts";
+import { kimiHostedServer } from "./kimi-web.ts";
 import { formatFor, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
 import { activePolicies, delegationNote } from "./policy.ts";
 import { updateAvailable } from "./update.ts";
@@ -54,7 +55,7 @@ export function selfWatchInstruction(opts: { delegated: boolean; env?: NodeJS.Pr
 }
 
 /** No push delivery into this session from outside? */
-export const noPush = (cli: string, channel: boolean) => !channel && !["codex", "opencode"].includes(cli);
+export const noPush = (cli: string, channel: boolean, hosted = false) => !channel && !hosted && !["codex", "opencode"].includes(cli);
 
 const sh = (cmd: string, args: string[]) => { try { return execFileSync(cmd, args, { encoding: "utf8" }).trim(); } catch { return ""; } };
 
@@ -108,7 +109,7 @@ export async function runMcp(node = new MbxNode()) {
     return { hop: p ? p.hop + 1 : 0, origin: origin === "external" || p?.external ? "external" as const : "agent" as const, project };
   };
   const renamed = agent !== wanted ? `[mbx] Another live session already uses "${wanted}", so this session is ${agent}@${node.host}. Pick a clearer name with mbx_whoami {"name": ...} if you like.` : null;
-  const extra = [renamed, delegationNote(node.store.db, agent, node.host), noPush(env.cli, env.channel)
+  const extra = [renamed, delegationNote(node.store.db, agent, node.host), noPush(env.cli, env.channel, env.cli === "kimi" && !!kimiHostedServer(env.ppid))
     ? selfWatchInstruction({ delegated: activePolicies(node.store.db, agent, node.host).length > 0 }) : null].filter(Boolean).join("\n");
 
   const session = (): Session => {

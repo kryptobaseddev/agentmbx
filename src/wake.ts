@@ -5,12 +5,15 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { kimiHostedServer, type KimiServer } from "./kimi-web.ts";
 import { alive, MbxNode, trustLabel } from "./node.ts";
 import { policyBrief } from "./policy.ts";
 import type { MessageRow } from "./store.ts";
 
 const run = promisify(execFile);
-export type WakeResult = { ok: true; via: string } | { ok: false; via: string; error: string };
+export type WakeResult = { ok: true; via: string } | { ok: false; via: string; error: string; retry?: boolean };
+type Fetch = typeof fetch;
+const isRetry = (r: WakeResult): boolean => !r.ok && r.retry === true;
 
 export function wakeText(agent: string, msgs: MessageRow[]): string {
   const senders = [...new Set(msgs.map((m) => `${m.from_addr} [${trustLabel(m).split(" · ")[0].split(" (")[0]}]`))].join(", ");
@@ -59,6 +62,72 @@ export async function opencodeSessionFor(dir: string): Promise<string | null> {
     const j = await res.json() as { data?: { id: string }[] };
     return j.data?.[0]?.id ?? null;
   } catch { return null; }
+}
+
+// ---- kimi web -----------------------------------------------------------------------------------
+/** One bound session row as the kimi adapter needs it. */
+export interface KimiSessionRef { session_id: string; pid: number | null }
+
+/** True when the newest hosted kimi session of this agent is mid-turn. Waking a busy session would spend the
+ *  wake brake (WAKE_LIMITS) for nothing, so dispatchWakes skips the agent instead and retries on its next pass. */
+async function kimiBusyNow(sessions: KimiSessionRef[], f: Fetch): Promise<boolean> {
+  for (const s of sessions) {
+    const srv = kimiHostedServer(s.pid);
+    if (!srv) continue;
+    try {
+      const res = await f(`${srv.url}/api/v1/sessions/${encodeURIComponent(s.session_id)}/status`, { headers: { authorization: `Bearer ${srv.token}` }, signal: AbortSignal.timeout(3_000) });
+      const j = await res.json().catch(() => null) as { code?: number; data?: { busy?: boolean } } | null;
+      return res.ok && j?.code === 0 && j.data?.busy === true;
+    } catch { return false; }
+  }
+  return false;
+}
+
+/** The server's configured default model alias (GET /api/v1/config), used when the session has none bound. */
+async function kimiDefaultModel(srv: KimiServer, f: Fetch): Promise<string | null> {
+  try {
+    const res = await f(`${srv.url}/api/v1/config`, { headers: { authorization: `Bearer ${srv.token}` }, signal: AbortSignal.timeout(5_000) });
+    const j = await res.json().catch(() => null) as { code?: number; data?: { default_model?: string } } | null;
+    return res.ok && j?.code === 0 && typeof j.data?.default_model === "string" && j.data.default_model ? j.data.default_model : null;
+  } catch { return null; }
+}
+
+/** Is this hosted session mid-turn right now? */
+async function kimiSessionStatus(srv: KimiServer, sessionId: string, f: Fetch): Promise<{ busy?: boolean; model?: string } | { error: string }> {
+  const res = await f(`${srv.url}/api/v1/sessions/${encodeURIComponent(sessionId)}/status`, { headers: { authorization: `Bearer ${srv.token}` }, signal: AbortSignal.timeout(5_000) });
+  const j = await res.json().catch(() => null) as { code?: number; data?: { busy?: boolean; model?: string }; message?: string } | null;
+  if (!res.ok || j?.code !== 0) return { error: `status ${res.status}: ${(j?.message ?? JSON.stringify(j)).slice(0, 200)}` };
+  return j.data ?? {};
+}
+
+/**
+ * Wake a kimi web-hosted session by submitting the wake text as a user prompt through the server's REST API
+ * (POST /api/v1/sessions/{id}/prompts, bearer server.token). A binding counts as hosted only when its pid is a live
+ * `kimi web` server instance ($KIMI_CODE_HOME/server/instances); terminal TUI sessions have no instances row and
+ * are never woken. A hosted session that is busy returns `retry: true` so the dispatcher leaves the mail queued
+ * for its next pass instead of spending wake budget (its Stop hook also surfaces new mail mid-turn).
+ */
+export async function wakeKimi(s: KimiSessionRef, text: string, o: { server?: KimiServer | null; fetch?: Fetch; model?: string | null } = {}): Promise<WakeResult> {
+  const srv = o.server === undefined ? kimiHostedServer(s.pid) : o.server;
+  if (!srv) return { ok: false, via: "kimi web", error: "not a kimi web-hosted session" };
+  const f = o.fetch ?? fetch, base = `${srv.url}/api/v1/sessions/${encodeURIComponent(s.session_id)}`;
+  const headers = { authorization: `Bearer ${srv.token}`, "content-type": "application/json" };
+  try {
+    const st = await kimiSessionStatus(srv, s.session_id, f);
+    if ("error" in st) return { ok: false, via: "kimi web", error: st.error };
+    if (st.busy) return { ok: false, via: "kimi web", error: "session busy", retry: true };
+    // A freshly created hosted session has no model bound: submitting a prompt then fails with "Model not set"
+    // (ErrorCodes.MODEL_NOT_CONFIGURED, from the profile's model getter). The prompts endpoint accepts an optional
+    // model alias and binds it before the prompt runs, so send one only when the session has none (the server's
+    // configured default), and an explicit o.model always wins.
+    const model = o.model !== undefined ? o.model : st.model ? null : await kimiDefaultModel(srv, f);
+    const body: { content: { type: "text"; text: string }[]; model?: string } = { content: [{ type: "text", text }] };
+    if (model) body.model = model;
+    const res = await f(`${base}/prompts`, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) });
+    const j = await res.json().catch(() => null) as { code?: number; data?: { prompt_id?: string; status?: string }; message?: string } | null;
+    if (!res.ok || j?.code !== 0) return { ok: false, via: "kimi web", error: `prompts ${res.status}: ${(j?.message ?? JSON.stringify(j)).slice(0, 200)}` };
+    return { ok: true, via: "kimi web" };
+  } catch (e) { return { ok: false, via: "kimi web", error: (e as Error).message }; }
 }
 
 // ---- desktop notifications -------------------------------------------------------------------
@@ -124,6 +193,13 @@ export async function dispatchWakes(node: MbxNode): Promise<{ agent: string; res
     const wanted = rows.filter((r) => node.wantsWake(agent, r));
     const markAll = () => rows.forEach((r) => node.setDelivery(r.id, agent, "notified"));
     if (!wanted.length) { markAll(); continue; }
+    // a hosted kimi session that is mid-turn is working already: leave the mail queued (its Stop hook also
+    // surfaces new mail) and retry on the next pass, without spending any of the wake brake below
+    if (await kimiBusyNow(sessions, fetch)) {
+      node.store.audit("wake", { agent, via: "kimi web", ok: false, busy: true, count: wanted.length });
+      out.push({ agent, result: { ok: false, via: "kimi web", error: "session busy (retrying next pass)" } });
+      continue;
+    }
     const brake = node.takeWake(agent, wanted[0].thread);
     if (brake?.startsWith("batched")) continue; // try again next pass, messages accumulate into one wake
     if (brake) { markAll(); out.push({ agent, result: { ok: false, via: "brake", error: brake } }); node.store.audit("wake.brake", { agent, brake }); continue; }
@@ -132,8 +208,14 @@ export async function dispatchWakes(node: MbxNode): Promise<{ agent: string; res
     for (const s of sessions) {
       if (s.cli === "codex") result = await wakeCodex(s.session_id, text);
       else if (s.cli === "opencode") result = await wakeOpencode(s.session_id, text);
+      else if (s.cli === "kimi") result = await wakeKimi(s, text);
       else continue;
-      if (result.ok) break;
+      if (result.ok || isRetry(result)) break; // a busy hosted session retries next pass instead of a desktop notice
+    }
+    if (isRetry(result)) { // hosted but busy again (race): mail stays delivered, next pass retries
+      node.store.audit("wake", { agent, via: result.via, ok: false, busy: true, count: wanted.length });
+      out.push({ agent, result });
+      continue;
     }
     let desktop = false;
     if (!result.ok) result = await notifyDesktop({ subtitle: agent, body: text, openCmd: inboxCommand(agent) }).then((r) => { desktop = r.ok; return r.ok ? r : result; });
