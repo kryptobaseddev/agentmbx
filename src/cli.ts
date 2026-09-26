@@ -304,7 +304,7 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
   const raw = process.stdin.isTTY ? "{}" : readStdin();
   let input: Record<string, unknown> = {}; try { input = JSON.parse(raw || "{}"); } catch { /* not JSON */ }
   const cwd = (input.cwd as string) || process.cwd();
-  const agent = agentName(cwd);
+  const agent = agentName(cwd, cli);
   if (event === "session-start") {
     let id = (input.session_id ?? input.sessionId ?? input.thread_id) as string | undefined;
     if (!id && cli === "opencode") id = (await opencodeSessionFor(cwd)) ?? undefined;

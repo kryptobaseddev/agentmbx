@@ -362,7 +362,7 @@ async function hook(node, event, cli) {
     }
     catch { /* not JSON */ }
     const cwd = input.cwd || process.cwd();
-    const agent = agentName(cwd);
+    const agent = agentName(cwd, cli);
     if (event === "session-start") {
         let id = (input.session_id ?? input.sessionId ?? input.thread_id);
         if (!id && cli === "opencode")

@@ -3,7 +3,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -45,8 +45,12 @@ export function detectHost(ppid = process.ppid) {
   return { cli, channel, sessionId, ppid };
 }
 
-export function agentName(cwd = process.cwd()) {
-  const n = (process.env.MBX_AGENT || basename(cwd)).toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+/** Default agent name: $MBX_AGENT, else the project folder; a session started in the home folder (or /) is named after
+ *  its CLI ("claude", "codex", "kimi", "opencode"), because "keatonhoskins" says nothing about which agent it is. */
+export function agentName(cwd = process.cwd(), cli?: string) {
+  const inHome = resolve(cwd) === resolve(homedir()) || resolve(cwd) === "/";
+  const raw = process.env.MBX_AGENT || (inHome && cli && cli !== "unknown" ? cli : basename(cwd));
+  const n = raw.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
   return NAME_RE.test(n) ? n : "agent";
 }
 
@@ -54,7 +58,7 @@ const text = (s: string, structured?: Record<string, unknown>) => ({ content: [{
 
 export async function runMcp(node = new MbxNode()) {
   const env = detectHost();
-  let agent = agentName();
+  let agent = agentName(process.cwd(), env.cli);
   const key = generateKeyPair(); // never written anywhere
   const bind = () => {
     node.registerAgent(agent, { cli: env.cli, role: process.env.MBX_ROLE, description: process.env.MBX_DESCRIPTION });

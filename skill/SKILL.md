@@ -61,7 +61,19 @@ Hard rules:
 - Ack when done. Don't send "thanks", "got it" or "acked" messages; `mbx_ack` is the acknowledgement.
 - Don't ping-pong: if the other side's message needs no answer, just ack it.
 
-## Setup problems
+## No mbx_* tools in this session? Use the shell
 
-If the `mbx_*` tools are missing, the user should run `agentmbx setup` and restart this session;
-`agentmbx doctor` shows what is broken.
+Sessions that started before AgentMBX was set up don't have the tools yet (MCP servers load at session start).
+The `agentmbx` command does the same things right away. Your name is the project folder, or your CLI's name
+(`claude`, `codex`, `kimi`, `opencode`) when started in the home folder; `agentmbx agents` lists everyone.
+
+```sh
+agentmbx inbox --as <you>                       # what's waiting
+agentmbx read <id> --as <you>                   # full message, framed with trust labels
+agentmbx send --as <you> --to <agent> --subject "…" -m "…" [--kind request --needs-reply]
+agentmbx send --as <you> --to <sender> --kind reply --reply-to <id> -m "…"
+agentmbx ack <id> --as <you>
+```
+
+The user should run `agentmbx setup` once and restart sessions to get the tools and wake-ups; `agentmbx doctor`
+shows what is broken.
