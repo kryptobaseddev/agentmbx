@@ -302,6 +302,12 @@ export async function pullPolicies(node: MbxNode) {
         after = recordKey(items[items.length - 1]);
       }
     } catch { /* peer offline: reported below */ }
-    if (rejected.length || !complete) node.store.audit("policy.sync", { host: p.host, received, complete, rejected: rejected.slice(0, 20) });
+    // audit problems once per change of state, not every minute while a peer stays offline
+    const state = JSON.stringify({ complete, rejected: rejected.map((r) => r.id).slice(0, 20) }), key = `policy-sync:${p.host}`;
+    if (node.store.get(key) !== state) {
+      node.store.set(key, state);
+      if (rejected.length || !complete) node.store.audit("policy.sync", { host: p.host, received, complete, rejected: rejected.slice(0, 20) });
+      else node.store.audit("policy.sync", { host: p.host, received, complete });
+    }
   }
 }
