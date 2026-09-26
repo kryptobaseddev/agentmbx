@@ -95,7 +95,31 @@ export function installService(mbxHome) {
             execFileSync("launchctl", ["bootout", `${target}/${label}`], { stdio: "ignore" });
         }
         catch { /* not loaded */ }
-        execFileSync("launchctl", ["bootstrap", target, plist]);
+        // bootout returns before the old job is gone; bootstrapping too early fails with "5: Input/output error"
+        const loaded = () => { try {
+            execFileSync("launchctl", ["print", `${target}/${label}`], { stdio: "ignore" });
+            return true;
+        }
+        catch {
+            return false;
+        } };
+        const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+        for (let i = 0; i < 50 && loaded(); i++)
+            sleep(100);
+        for (let attempt = 1;; attempt++) {
+            try {
+                execFileSync("launchctl", ["bootstrap", target, plist], { stdio: ["ignore", "ignore", "pipe"] });
+                break;
+            }
+            catch (e) {
+                if (attempt >= 5 || loaded()) {
+                    if (loaded())
+                        break;
+                    throw e;
+                }
+                sleep(500 * attempt);
+            }
+        }
         console.log(`installed ${plist}; log: ${join(mbxHome, "daemon.log")}`);
         console.log(app ? `app: ${app} (branded notifications; Login Items shows AgentMBX)`
             : "app: AgentMBX.app not found, so notifications use osascript. Build it with scripts/build-macos-app.sh and re-run 'agentmbx daemon install'.");
