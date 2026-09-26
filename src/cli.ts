@@ -1,5 +1,5 @@
 // mbx command line. Humans, hooks and scripts use this; agents use the MCP tools (mbx mcp).
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
@@ -220,7 +220,10 @@ function importV2(node: MbxNode, dir: string) {
 // ---- service install -------------------------------------------------------------------------
 const LABEL = "com.agentmbx.daemon";
 function installService(node: MbxNode) {
-  const bin = process.argv[1];
+  const bin = realpathSync(process.argv[1]);
+  // prefer a stable node path (mise/asdf/volta shims survive Node upgrades) over the versioned execPath
+  const shims = [join(homedir(), ".local/share/mise/shims/node"), join(homedir(), ".asdf/shims/node"), join(homedir(), ".volta/bin/node")];
+  const nodeBin = shims.find((p) => existsSync(p)) ?? process.execPath;
   if (process.platform === "darwin") {
     const plist = join(homedir(), "Library/LaunchAgents", `${LABEL}.plist`);
     mkdirSync(join(homedir(), "Library/LaunchAgents"), { recursive: true });
@@ -228,8 +231,8 @@ function installService(node: MbxNode) {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>${LABEL}</string>
-  <key>ProgramArguments</key><array><string>${process.execPath}</string><string>${bin}</string><string>daemon</string></array>
-  <key>EnvironmentVariables</key><dict><key>MBX_HOME</key><string>${node.home}</string><key>PATH</key><string>${join(homedir(), ".local/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <key>ProgramArguments</key><array><string>${nodeBin}</string><string>${bin}</string><string>daemon</string></array>
+  <key>EnvironmentVariables</key><dict><key>MBX_HOME</key><string>${node.home}</string><key>PATH</key><string>${join(homedir(), ".local/bin")}:${join(homedir(), ".local/share/mise/shims")}:${join(homedir(), ".opencode/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>${join(node.home, "daemon.log")}</string><key>StandardErrorPath</key><string>${join(node.home, "daemon.log")}</string>
 </dict></plist>\n`);
@@ -239,7 +242,7 @@ function installService(node: MbxNode) {
   }
   const unit = join(homedir(), ".config/systemd/user/agentmbx.service");
   mkdirSync(join(homedir(), ".config/systemd/user"), { recursive: true });
-  writeFileSync(unit, `[Unit]\nDescription=AgentMBX daemon\n\n[Service]\nEnvironment=MBX_HOME=${node.home}\nExecStart=${process.execPath} ${bin} daemon\nRestart=always\n\n[Install]\nWantedBy=default.target\n`);
+  writeFileSync(unit, `[Unit]\nDescription=AgentMBX daemon\n\n[Service]\nEnvironment=MBX_HOME=${node.home}\nExecStart=${nodeBin} ${bin} daemon\nRestart=always\n\n[Install]\nWantedBy=default.target\n`);
   execFileSync("systemctl", ["--user", "daemon-reload"]); execFileSync("systemctl", ["--user", "enable", "--now", "agentmbx.service"]);
   console.log(`installed ${unit}`);
 }
