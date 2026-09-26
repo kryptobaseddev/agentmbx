@@ -4,7 +4,7 @@ import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "node:
 import { existsSync, openSync, readFileSync, readSync, closeSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
-import { fingerprint, generateKeyPair } from "./crypto.js";
+import { fingerprint, generateKeyPair, signData } from "./crypto.js";
 const SCRYPT = { N: 1 << 17, r: 8, p: 1, maxmem: 256 * 1024 * 1024 };
 export const ownerPath = (home) => join(home, "owner.key");
 export function ownerPublicKey(home) {
@@ -72,3 +72,16 @@ export function readPassphraseFromTTY(prompt) {
     }
 }
 export const ownerFingerprint = (home) => { const p = ownerPublicKey(home); return p ? fingerprint(p) : null; };
+/**
+ * The one way to get an owner signature: sign `canonicalJson` (the exact bytes receivers verify) after the human
+ * approves. The file backend asks for the passphrase on /dev/tty; the macOS keychain backend (T052) shows a
+ * Touch ID / password prompt whose text is derived from `canonicalJson`. `summary` is shown on the terminal
+ * (file backend) so the human knows what they are signing.
+ */
+export async function ownerSignCanonical(home, canonicalJson, summary) {
+    const pub = ownerPublicKey(home);
+    if (!pub)
+        throw new Error("no owner key on this machine: run 'agentmbx owner init'");
+    const kp = unlockOwnerKey(home, readPassphraseFromTTY(`${summary}\nOwner passphrase: `));
+    return { sig: signData(kp.privateKey, canonicalJson), pub, fp: fingerprint(pub) };
+}
