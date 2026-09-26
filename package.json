@@ -13,7 +13,9 @@
     "test": "AGENTMBX_DEV=1 node --test --test-concurrency=1 'test/*.test.ts'",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
-    "check-dist": "npm run build && git diff --exit-code -- dist"
+    "check-dist": "npm run build && git diff --exit-code -- dist",
+    "build:sea": "node scripts/build-sea.mjs",
+    "smoke:sea": "node scripts/smoke-sea.mjs"
   },
   "license": "BUSL-1.1",
   "dependencies": {
@@ -22,6 +24,8 @@
   },
   "devDependencies": {
     "@types/node": "^24.19.0",
+    "esbuild": "^0.28.2",
+    "postject": "^1.0.0-alpha.6",
     "typescript": "^7.0.2"
   },
   "homepage": "https://agentmbx.com",
