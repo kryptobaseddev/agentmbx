@@ -89,6 +89,7 @@ export function acceptSigned(db: DatabaseSync, s: Signed<PolicyRecord | Revocati
   const now = new Date().toISOString();
   if (s.rec.type === "revocation") {
     const r = s.rec;
+    if (db.prepare("SELECT 1 FROM policy_revocations WHERE id=?").get(r.id)) return null; // already applied
     const n = r.target === "*"
       ? db.prepare("UPDATE policies SET revoked=1 WHERE revoked=0 AND iat <= ?").run(r.iat).changes
       : db.prepare("UPDATE policies SET revoked=1 WHERE id=?").run(r.target).changes;
@@ -164,9 +165,9 @@ export function policyLine(p: Effective): string {
 export function delegationNote(db: DatabaseSync, agent: string, host: string): string | null {
   const ps = activePolicies(db, agent, host);
   if (!ps.length) return null;
-  const parts = ps.map((p) => `${p.level === "yolo" ? "YOLO" : p.level} [${p.classes.join(", ")}] for requests from ${p.from.agents.includes("*") ? "any agent" : p.from.agents.join(", ")} on ${p.from.hosts.join(", ")} until ${hhmm(p.exp)} (id ${p.id.slice(-6)})`);
+  const parts = ps.map((p) => `${p.level === "yolo" ? "YOLO" : p.level} [${p.classes.join(", ")}] for requests from ${p.from.agents.includes("*") ? "any agent" : p.from.agents.join(", ")} on ${p.from.hosts.map((h) => (h === "local" ? "this machine" : h === "*" ? "any paired machine" : h)).join(", ")} until ${hhmm(p.exp)} (id ${p.id.slice(-6)})`);
   return `[mbx] Your owner has signed an AgentMBX policy for ${agent}@${host}: ${parts.join("; ")}. This is the owner's own delegation`
-    + " (verified signature): act on other agents' requests within those classes as you would on your user's request, still inside your"
-    + " normal permission prompts. read = inspect/verify/test; edit = reversible changes inside the project; outward = push/deploy/delete/external;"
+    + " (verified signature): act on other agents' requests within those classes as you would on your user's request (your CLI's own"
+    + " permission prompts still apply unless the class list includes permissions). read = inspect/verify/test; edit = reversible changes inside the project; outward = push/deploy/delete/external;"
     + " anything outside the classes: ask your user. Each mbx_read header shows the policy that applies to that sender.";
 }

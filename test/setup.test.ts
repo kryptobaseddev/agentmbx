@@ -84,7 +84,8 @@ test("setup wires every CLI, backs files up, leaves other hook groups alone, and
   assert.deepEqual(s.hooks.SessionStart[0], orcaGroups(["SessionStart"]).SessionStart[0]);
   assert.equal(s.hooks.SessionStart[1].hooks[0].command, "/opt/bin/agentmbx hook session-start --cli claude");
   assert.equal(s.hooks.UserPromptSubmit[1].hooks[0].command, "/opt/bin/agentmbx hook prompt --cli claude");
-  assert.equal(s.hooks.Stop.length, 1); assert.equal(s.hooks.PreToolUse.length, 1);
+  assert.equal(s.hooks.Stop.length, 2); assert.equal(s.hooks.Stop[1].hooks[0].command, "/opt/bin/agentmbx hook stop --cli claude");
+  assert.equal(s.hooks.PreToolUse.length, 1);
 
   // Codex
   assert.match(rd(home, ".codex/config.toml"), /\[mcp_servers\.mbx\]\ncommand = "\/opt\/bin\/agentmbx"\nargs = \["mcp"\]\ndefault_tools_approval_mode = "approve"\n$/);
@@ -181,10 +182,13 @@ test("jsonc: insert and remove keep surrounding text byte-for-byte", () => {
   assert.deepEqual(JSON.parse(empty), { k: 1 });
 });
 
-test("kimi watch instruction: default 15 min, configurable, can be turned off", async () => {
-  const { kimiWatchInstruction } = await import("../src/cli.ts");
-  assert.match(kimiWatchInstruction({})!, /CronCreate: cron "\*\/15 \* \* \* \*"/);
-  assert.match(kimiWatchInstruction({ MBX_KIMI_WATCH: "5" })!, /\*\/5 /);
-  assert.equal(kimiWatchInstruction({ MBX_KIMI_WATCH: "0" }), null);
-  assert.equal(kimiWatchInstruction({ MBX_KIMI_WATCH: "banana" }), null);
+test("self-watch: only when delegated or forced, even intervals, off removes the job", async () => {
+  const { selfWatchInstruction, watchCron } = await import("../src/mcp.ts");
+  assert.equal(selfWatchInstruction({ delegated: false, env: {} }), null);
+  assert.match(selfWatchInstruction({ delegated: true, env: {} })!, /cron "\*\/15 \* \* \* \*"/);
+  assert.match(selfWatchInstruction({ delegated: false, env: { MBX_SELF_WATCH: "5" } })!, /\*\/5 /);
+  assert.equal(selfWatchInstruction({ delegated: true, env: { MBX_SELF_WATCH: "7" } }), null); // not a divisor of 60
+  assert.match(selfWatchInstruction({ delegated: true, env: { MBX_SELF_WATCH: "0" } })!, /CronDelete/);
+  assert.match(selfWatchInstruction({ delegated: true, env: { MBX_KIMI_WATCH: "off" } })!, /CronDelete/);
+  assert.equal(watchCron(60), "0 * * * *");
 });

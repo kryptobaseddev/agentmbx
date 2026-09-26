@@ -6,6 +6,7 @@ import { fingerprint, joinTranscript, nonce as newNonce, pairingCode, pairMac, p
 import { NAME_RE } from "./envelope.js";
 import { MbxNode, RETRY_HOURS } from "./node.js";
 import { notifyDesktop } from "./wake.js";
+import { acceptSigned } from "./policy.js";
 export const HOP_SKEW_MS = 5 * 60_000;
 const MAX_REQ = 4 * 1024 * 1024;
 const HELLO_TTL_MS = 2 * 60_000;
@@ -176,6 +177,14 @@ export function startServer(node, port = node.config.port, bind = node.config.bi
                     onEnvelope?.();
                 return send(200, { results });
             }
+            if (req.method === "POST" && url.pathname === "/v1/policy") {
+                const { items } = JSON.parse(body);
+                if (!Array.isArray(items) || items.length > 200)
+                    return send(400, { error: "bad batch" });
+                return send(200, { results: items.map((it) => ({ id: it?.rec?.id, error: acceptSigned(node.store.db, it, node.host) })) });
+            }
+            if (req.method === "GET" && url.pathname === "/v1/policies")
+                return send(200, { items: signedRecords(node) });
             if (req.method === "GET" && url.pathname === "/v1/agents") {
                 return send(200, { host: node.host, agents: node.agents().filter((a) => a.host === node.host).map(({ name, role, cli, description, last_seen }) => ({ name, role, cli, description, last_seen })) });
             }
@@ -260,5 +269,49 @@ export async function refreshDirectory(node) {
             }
         }
         catch { /* peer offline; try next time */ }
+    }
+}
+// ---- policies: push on set/revoke, pull every minute so offline hosts catch up ----------------------------
+/** Everything a peer may need: unexpired policies and revocations from the last 30 days, as signed records. */
+export function signedRecords(node) {
+    const db = node.store.db, now = new Date().toISOString(), since = new Date(Date.now() - 30 * 86_400_000).toISOString();
+    const ps = db.prepare("SELECT record, sig FROM policies WHERE exp > ?").all(now);
+    const rs = db.prepare("SELECT record, sig FROM policy_revocations WHERE iat > ?").all(since);
+    return [...rs, ...ps].map((r) => ({ rec: JSON.parse(r.record), sig: r.sig }));
+}
+/** Send signed records to the paired hosts they concern. Returns per-host results; offline hosts get them on their next pull. */
+export async function pushPolicy(node, items) {
+    const out = [];
+    for (const p of node.peers().filter((x) => x.state === "approved")) {
+        const mine = items.filter((it) => it.rec.type === "revocation" || it.rec.to.hosts.includes("*") || it.rec.to.hosts.includes(p.host));
+        if (!mine.length)
+            continue;
+        try {
+            const { results } = await post(node, p.addr, "/v1/policy", { items: mine });
+            const bad = results.filter((r) => r.error);
+            out.push({ host: p.host, ok: !bad.length, ...(bad.length ? { error: bad.map((b) => b.error).join("; ") } : {}) });
+        }
+        catch (e) {
+            out.push({ host: p.host, ok: false, error: e.message });
+        }
+    }
+    return out;
+}
+export async function pullPolicies(node) {
+    for (const p of node.peers().filter((x) => x.state === "approved")) {
+        try {
+            const path = "/v1/policies";
+            const res = await fetch(`http://${p.addr}${path}`, { headers: signHop(node, "GET", path, ""), signal: AbortSignal.timeout(5_000) });
+            if (!res.ok)
+                continue;
+            const { items } = await res.json();
+            // revocations first, so a kill switch is never beaten by the policy it kills
+            for (const it of [...items].sort((a, b) => (a.rec.type === "revocation" ? -1 : 0) - (b.rec.type === "revocation" ? -1 : 0)).slice(0, 500)) {
+                if (it?.rec?.type === "policy" && !it.rec.to.hosts.includes("*") && !it.rec.to.hosts.includes(node.host))
+                    continue;
+                acceptSigned(node.store.db, it, node.host);
+            }
+        }
+        catch { /* peer offline */ }
     }
 }

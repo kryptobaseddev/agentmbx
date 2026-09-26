@@ -113,6 +113,22 @@ export class MbxNode {
     return s.agent;
   }
 
+  /** The agent name the MCP server of this CLI process uses (fresh binding of a live pid), if any. */
+  agentFor(cli: string, pid: number): string | null {
+    const r = this.store.db.prepare("SELECT agent FROM sessions WHERE cli=? AND pid=? AND session_key IS NOT NULL AND updated_at > ? ORDER BY updated_at DESC LIMIT 1")
+      .get(cli, pid, new Date(Date.now() - SESSION_FRESH_MS).toISOString()) as { agent: string } | undefined;
+    return r && alive(pid) ? r.agent : null;
+  }
+
+  /** Stop-hook continuation budget: the thread and daily wake caps also bound "keep going" turns. Records one when allowed. */
+  allowContinue(agent: string, thread: string | null, now = Date.now()): boolean {
+    const q = (sql: string, ...a: (string | null)[]) => (this.store.db.prepare(sql).get(...a) as { n: number }).n;
+    if (thread && q("SELECT count(*) n FROM wakes WHERE agent=? AND thread=? AND at>?", agent, thread, new Date(now - 3_600_000).toISOString()) >= WAKE_LIMITS.perThreadHour) return false;
+    if (q("SELECT count(*) n FROM wakes WHERE agent=? AND at>?", agent, new Date(now - 86_400_000).toISOString()) >= WAKE_LIMITS.perAgentDay) return false;
+    this.store.db.prepare("INSERT INTO wakes VALUES (?,?,?)").run(agent, thread, new Date(now).toISOString());
+    return true;
+  }
+
   /** Remember a chosen name for a CLI session id, so resuming that session keeps it. */
   keepName(cli: string, sessionId: string, agent: string) { this.store.set(`name:${cli}:${sessionId}`, agent); }
 
