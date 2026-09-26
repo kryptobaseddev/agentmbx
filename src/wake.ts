@@ -5,7 +5,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { MbxNode, trustLabel } from "./node.ts";
+import { alive, MbxNode, trustLabel } from "./node.ts";
 import type { MessageRow } from "./store.ts";
 
 const run = promisify(execFile);
@@ -109,7 +109,6 @@ export async function notifyDesktop(n: DesktopNote): Promise<WakeResult> {
   return last;
 }
 
-const alive = (pid: number | null) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch { return false; } };
 
 /** One pass of the wake dispatcher: every delivered-but-not-notified message is either woken, batched or skipped. */
 export async function dispatchWakes(node: MbxNode): Promise<{ agent: string; result: WakeResult | { ok: false; via: "brake"; error: string } }[]> {
@@ -135,8 +134,10 @@ export async function dispatchWakes(node: MbxNode): Promise<{ agent: string; res
       else continue;
       if (result.ok) break;
     }
-    if (!result.ok) result = await notifyDesktop({ subtitle: agent, body: text, openCmd: inboxCommand(agent) }).then((r) => (r.ok ? r : result));
-    markAll();
+    let desktop = false;
+    if (!result.ok) result = await notifyDesktop({ subtitle: agent, body: text, openCmd: inboxCommand(agent) }).then((r) => { desktop = r.ok; return r.ok ? r : result; });
+    // mail that only reached the desktop gets another wake when a wakeable session binds (node.bindSession)
+    rows.forEach((r) => node.setDelivery(r.id, agent, "notified", desktop || !result.ok ? "desktop" : null));
     node.store.audit("wake", { agent, via: result.via, ok: result.ok, count: wanted.length });
     out.push({ agent, result });
   }

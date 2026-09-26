@@ -98,6 +98,8 @@ const parseObj = (cur: string | null): Record<string, unknown> => {
 
 /** [CLI event, `agentmbx hook` subcommand]. PermissionRequest is YOLO (docs/POLICY.md §5): it answers only under an active policy. */
 const HOOK_EVENTS: [string, string][] = [["SessionStart", "session-start"], ["UserPromptSubmit", "prompt"], ["PermissionRequest", "permission"]];
+/** Claude and Codex also take a Stop hook that can keep the turn going ({"decision":"block"}) when mail arrived mid-turn. */
+const STOP_EVENTS: [string, string][] = [...HOOK_EVENTS, ["Stop", "stop"]];
 
 type HookGroup = { matcher?: string; hooks?: { type?: string; command?: string; timeout?: number }[] };
 
@@ -363,15 +365,15 @@ export function edits(ctx: SetupCtx, cli: CliId): Edit[] {
               return true;
             } catch { return false; }
           } },
-        { cli, kind: "hooks", item: "hooks SessionStart + UserPromptSubmit + PermissionRequest", path: join(home, ".claude/settings.json"),
-          ...jsonHooks(HOOK_EVENTS, "claude", cmd) },
+        { cli, kind: "hooks", item: "hooks SessionStart + UserPromptSubmit + PermissionRequest + Stop", path: join(home, ".claude/settings.json"),
+          ...jsonHooks(STOP_EVENTS, "claude", cmd) },
       ];
     }
     case "codex":
       return [
         { cli, kind: "mcp", item: "[mcp_servers.mbx]", path: join(home, ".codex/config.toml"), ...codexServer(cmd) },
-        { cli, kind: "hooks", item: "hooks SessionStart + UserPromptSubmit + PermissionRequest", path: join(home, ".codex/hooks.json"),
-          ...jsonHooks(HOOK_EVENTS, "codex", cmd) },
+        { cli, kind: "hooks", item: "hooks SessionStart + UserPromptSubmit + PermissionRequest + Stop", path: join(home, ".codex/hooks.json"),
+          ...jsonHooks(STOP_EVENTS, "codex", cmd) },
       ];
     case "opencode":
       return [{ cli, kind: "mcp", item: "mcp.servers.mbx", path: opencodeConfig(home), ...opencodeServer(cmd) }];
