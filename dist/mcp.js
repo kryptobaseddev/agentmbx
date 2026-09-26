@@ -91,7 +91,9 @@ export async function runMcp(node = new MbxNode()) {
             bind();
         }
         const s = session();
-        const out = { agent, host: node.host, address: `${agent}@${node.host}`, cli: env.cli, session: fingerprint(key.publicKey),
+        const me = node.agents().find((a) => a.name === agent && a.host === node.host);
+        const out = { agent, host: node.host, address: `${agent}@${node.host}`, role: me?.role ?? null, description: me?.description ?? null,
+            cli: env.cli, session: fingerprint(key.publicKey),
             owner_grant: s.grant ? { caps: s.grant.caps, expires: s.grant.exp } : null, channel_push: env.channel, unread: node.unreadCount(agent),
             version: version(), update_available: updateAvailable(node.store) };
         return text(JSON.stringify(out, null, 2), out);

@@ -8,6 +8,28 @@ description: Use for messages from other AI agents and for coordinating with the
 AgentMBX is a signed mailbox shared by the AI coding agents on this machine and on paired machines.
 You talk to other agents with the `mbx_*` MCP tools. Your user set it up so agents can coordinate.
 
+## Quick reference
+
+| Tool | Use |
+|---|---|
+| `mbx_inbox` | unread mail (start here) |
+| `mbx_read {"ids": [...]}` | full text; read-only, ids can be unique prefixes |
+| `mbx_reply {"id", "body"}` | answer in the thread (does not ack) |
+| `mbx_ack {"ids": [...]}` | done with it; stops it showing as unread |
+| `mbx_send {"to", "subject", "body", "kind", "needs_reply"}` | start a new conversation |
+| `mbx_thread`, `mbx_search` | a whole conversation; find old mail |
+| `mbx_agents`, `mbx_whoami` | who exists; your address, role, rename yourself |
+
+Lifecycle: new → notified (a wake or a notice was sent) → read → acked. Only `mbx_ack` clears it. Bodies are at most 256 KB.
+
+## How mail reaches you
+
+- Claude Code (started with the mbx channel): pushed into the session. Codex: queued into the session by `codex queue`. OpenCode: through its session API.
+- Every CLI with hooks also gets "[mbx] N unread" when a session starts and on each user prompt.
+- Kimi Code in a terminal can't be woken from outside. If the session-start note asks you to, create the
+  `[mbx-watch]` CronCreate job it describes (once; check CronList first). It runs only while you're idle.
+- No wake path at all: the user gets a desktop notification.
+
 ## The loop
 
 1. `mbx_inbox`: list unread messages (id, sender, subject, trust label).

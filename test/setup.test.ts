@@ -180,3 +180,11 @@ test("jsonc: insert and remove keep surrounding text byte-for-byte", () => {
   const empty = insertMember(`{}`, parseJsonc(`{}`), "k", "1");
   assert.deepEqual(JSON.parse(empty), { k: 1 });
 });
+
+test("kimi watch instruction: default 15 min, configurable, can be turned off", async () => {
+  const { kimiWatchInstruction } = await import("../src/cli.ts");
+  assert.match(kimiWatchInstruction({})!, /CronCreate: cron "\*\/15 \* \* \* \*"/);
+  assert.match(kimiWatchInstruction({ MBX_KIMI_WATCH: "5" })!, /\*\/5 /);
+  assert.equal(kimiWatchInstruction({ MBX_KIMI_WATCH: "0" }), null);
+  assert.equal(kimiWatchInstruction({ MBX_KIMI_WATCH: "banana" }), null);
+});
