@@ -205,7 +205,9 @@ export async function dispatchWakes(node) {
         byAgent.set(r.agent, [...(byAgent.get(r.agent) ?? []), r]);
     const out = [];
     for (const [agent, rows] of byAgent) {
-        const sessions = node.sessionsFor(agent);
+        // a name used only through the CLI from inside a session (linkIdentity) is woken through that session
+        const owner = node.sessionsFor(agent).length ? null : node.identityOwner(agent);
+        const sessions = node.sessionsFor(owner ?? agent);
         // a live Claude session with the mbx channel enabled pushes for itself (see mcp.ts); leave its rows alone
         if (sessions.some((s) => s.channel && alive(s.pid)))
             continue;
@@ -231,7 +233,7 @@ export async function dispatchWakes(node) {
             node.store.audit("wake.brake", { agent, brake });
             continue;
         }
-        const text = wakeText(agent, wanted) + policyBrief(node.store.db, agent, node.host);
+        const text = wakeText(agent, wanted) + (owner ? ` (${agent} is a name your session ${owner} sent as: read it with agentmbx inbox --as ${agent})` : "") + policyBrief(node.store.db, owner ?? agent, node.host);
         let result = { ok: false, via: "none", error: "no bound session" };
         for (const s of sessions) {
             if (s.cli === "codex")

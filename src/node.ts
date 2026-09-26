@@ -169,6 +169,25 @@ export class MbxNode {
       { pid: number; pid_start: string | null; updated_at: string }[]).some((r) => this.sameSession(r.pid, r));
   }
 
+  /** A name a shell sender (`agentmbx send --as`, no session) used in the last 2 h: new sessions don't take it. */
+  shellHeld(name: string): boolean {
+    const r = this.store.db.prepare("SELECT cli, last_seen FROM agents WHERE name=? AND host=?").get(name, this.host) as { cli: string | null; last_seen: string | null } | undefined;
+    if (!r || r.cli !== "cli" || !r.last_seen || Date.now() - Date.parse(r.last_seen) > SHELL_AGENT_MS) return false;
+    return !this.store.db.prepare("SELECT 1 FROM sessions WHERE agent=?").get(name);
+  }
+
+  /**
+   * A session that sends as another name through the CLI (`--as mac-dev` from inside session `claude`) owns that name
+   * too: mail to it shows in the session's notices and wakes the session.
+   */
+  linkIdentity(name: string, sessionAgent: string) { if (name !== sessionAgent) this.store.set(`ident:${name}`, sessionAgent); }
+  /** Names linked to this session agent (see linkIdentity). */
+  linkedNames(sessionAgent: string): string[] {
+    return (this.store.db.prepare("SELECT k FROM kv WHERE k LIKE 'ident:%' AND v=?").all(sessionAgent) as { k: string }[]).map((r) => r.k.slice(6));
+  }
+  /** The session agent a linked name belongs to, if any. */
+  identityOwner(name: string): string | null { return this.store.get(`ident:${name}`) ?? null; }
+
   /** After a rename, mail for the old name follows the session (until a live session takes the old name again). */
   addAlias(oldName: string, newName: string, pid: number) {
     if (oldName === newName || this.heldByOther(oldName, pid)) return;
@@ -201,7 +220,7 @@ export class MbxNode {
   pickName(wanted: string, cli: string, pid: number, sessionId?: string): string {
     const kept = sessionId && this.store.get(`name:${cli}:${sessionId}`);
     if (kept) return kept;
-    const held = (n: string) => this.heldByOther(n, pid);
+    const held = (n: string) => this.heldByOther(n, pid) || this.shellHeld(n);
     const cands = [wanted, ...(wanted !== cli && !wanted.endsWith(`-${cli}`) ? [`${wanted}-${cli}`] : []), ...[2, 3, 4, 5, 6, 7, 8, 9].map((i) => `${wanted}-${i}`)];
     return cands.map((c) => c.slice(0, 40)).find((c) => NAME_RE.test(c) && !held(c)) ?? `${wanted.slice(0, 30)}-${process.pid}`;
   }

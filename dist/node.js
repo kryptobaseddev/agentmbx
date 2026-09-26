@@ -173,6 +173,25 @@ export class MbxNode {
     heldByOther(name, exceptPid) {
         return this.store.db.prepare("SELECT pid, pid_start, updated_at FROM sessions WHERE agent=? AND pid IS NOT NULL AND pid<>?").all(name, exceptPid).some((r) => this.sameSession(r.pid, r));
     }
+    /** A name a shell sender (`agentmbx send --as`, no session) used in the last 2 h: new sessions don't take it. */
+    shellHeld(name) {
+        const r = this.store.db.prepare("SELECT cli, last_seen FROM agents WHERE name=? AND host=?").get(name, this.host);
+        if (!r || r.cli !== "cli" || !r.last_seen || Date.now() - Date.parse(r.last_seen) > SHELL_AGENT_MS)
+            return false;
+        return !this.store.db.prepare("SELECT 1 FROM sessions WHERE agent=?").get(name);
+    }
+    /**
+     * A session that sends as another name through the CLI (`--as mac-dev` from inside session `claude`) owns that name
+     * too: mail to it shows in the session's notices and wakes the session.
+     */
+    linkIdentity(name, sessionAgent) { if (name !== sessionAgent)
+        this.store.set(`ident:${name}`, sessionAgent); }
+    /** Names linked to this session agent (see linkIdentity). */
+    linkedNames(sessionAgent) {
+        return this.store.db.prepare("SELECT k FROM kv WHERE k LIKE 'ident:%' AND v=?").all(sessionAgent).map((r) => r.k.slice(6));
+    }
+    /** The session agent a linked name belongs to, if any. */
+    identityOwner(name) { return this.store.get(`ident:${name}`) ?? null; }
     /** After a rename, mail for the old name follows the session (until a live session takes the old name again). */
     addAlias(oldName, newName, pid) {
         if (oldName === newName || this.heldByOther(oldName, pid))
@@ -210,7 +229,7 @@ export class MbxNode {
         const kept = sessionId && this.store.get(`name:${cli}:${sessionId}`);
         if (kept)
             return kept;
-        const held = (n) => this.heldByOther(n, pid);
+        const held = (n) => this.heldByOther(n, pid) || this.shellHeld(n);
         const cands = [wanted, ...(wanted !== cli && !wanted.endsWith(`-${cli}`) ? [`${wanted}-${cli}`] : []), ...[2, 3, 4, 5, 6, 7, 8, 9].map((i) => `${wanted}-${i}`)];
         return cands.map((c) => c.slice(0, 40)).find((c) => NAME_RE.test(c) && !held(c)) ?? `${wanted.slice(0, 30)}-${process.pid}`;
     }

@@ -263,3 +263,16 @@ test("broadcasts reach live sessions only; a shell sender gets mail addressed by
   assert.deepEqual(n.send({ from: "live-one", to: ["shell-only"], subject: "direct", body: "x" }).local, ["shell-only"]);
   n.close();
 });
+
+test("a new session never takes a live or recently used shell name; CLI names link to the session that used them", () => {
+  const n = new MbxNode(tmp(), { host: "alpha" });
+  n.registerAgent("claude", { cli: "cli" }); // someone ran: agentmbx send --as claude (no session)
+  assert.equal(n.pickName("claude", "claude", 999_999), "claude-2", "recent shell name is held");
+  n.store.db.prepare("UPDATE agents SET last_seen=? WHERE name='claude'").run(new Date(Date.now() - 3 * 3_600_000).toISOString());
+  assert.equal(n.pickName("claude", "claude", 999_999), "claude", "an old shell name is free again");
+  n.bindSession({ agent: "agentmbx", cli: "claude", session_id: "c1", pid: process.pid, session_key: "k" });
+  n.linkIdentity("mac-dev", "agentmbx");
+  assert.deepEqual(n.linkedNames("agentmbx"), ["mac-dev"]);
+  assert.equal(n.identityOwner("mac-dev"), "agentmbx");
+  n.close();
+});

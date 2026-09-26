@@ -187,7 +187,9 @@ export async function dispatchWakes(node: MbxNode): Promise<{ agent: string; res
   for (const r of pending) byAgent.set(r.agent, [...(byAgent.get(r.agent) ?? []), r]);
   const out: { agent: string; result: WakeResult | { ok: false; via: "brake"; error: string } }[] = [];
   for (const [agent, rows] of byAgent) {
-    const sessions = node.sessionsFor(agent);
+    // a name used only through the CLI from inside a session (linkIdentity) is woken through that session
+    const owner = node.sessionsFor(agent).length ? null : node.identityOwner(agent);
+    const sessions = node.sessionsFor(owner ?? agent);
     // a live Claude session with the mbx channel enabled pushes for itself (see mcp.ts); leave its rows alone
     if (sessions.some((s) => s.channel && alive(s.pid))) continue;
     const wanted = rows.filter((r) => node.wantsWake(agent, r));
@@ -203,7 +205,7 @@ export async function dispatchWakes(node: MbxNode): Promise<{ agent: string; res
     const brake = node.takeWake(agent, wanted[0].thread);
     if (brake?.startsWith("batched")) continue; // try again next pass, messages accumulate into one wake
     if (brake) { markAll(); out.push({ agent, result: { ok: false, via: "brake", error: brake } }); node.store.audit("wake.brake", { agent, brake }); continue; }
-    const text = wakeText(agent, wanted) + policyBrief(node.store.db, agent, node.host);
+    const text = wakeText(agent, wanted) + (owner ? ` (${agent} is a name your session ${owner} sent as: read it with agentmbx inbox --as ${agent})` : "") + policyBrief(node.store.db, owner ?? agent, node.host);
     let result: WakeResult = { ok: false, via: "none", error: "no bound session" };
     for (const s of sessions) {
       if (s.cli === "codex") result = await wakeCodex(s.session_id, text);
