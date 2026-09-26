@@ -54,6 +54,14 @@ test("app bundle discovery and install into ~/Applications", () => {
   assert.deepEqual(copied, [join(pkg, "build/AgentMBX.app")]);
   // already installed and no source: keeps using the installed copy
   assert.equal(installAppBundle({ home, pkgRoot: tmp(), env: {}, copy: () => assert.fail("no copy") }), installedAppPath(home));
+  // a stably signed installed app is never replaced by an ad-hoc local build (the Keychain trusts its signature)
+  const installed = installedAppPath(home);
+  const signed = (app: string) => app === installed;
+  assert.equal(installAppBundle({ home, pkgRoot: pkg, env: {}, signed, copy: () => assert.fail("must keep the signed app") }), installed);
+  // …unless the source is explicitly chosen
+  const picks: string[] = [];
+  installAppBundle({ home, pkgRoot: pkg, env: { MBX_APP_BUNDLE: join(pkg, "build/AgentMBX.app") }, signed, copy: (s2, d) => { picks.push(s2); cpSync(s2, d, { recursive: true }); } });
+  assert.equal(picks.length, 1);
 });
 
 test("notifier selection: AgentMBX.app first, osascript fallback, notify-send on Linux", () => {

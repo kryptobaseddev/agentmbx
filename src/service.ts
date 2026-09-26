@@ -33,10 +33,23 @@ export function findAppSource(pkgRoot = packageRoot(), env = process.env): strin
  * Copy the app bundle into ~/Applications (ditto keeps the code signature intact) and register it with
  * LaunchServices. Returns the installed path, or null when no bundle is available.
  */
-export function installAppBundle(opts: { home?: string; pkgRoot?: string; env?: NodeJS.ProcessEnv; copy?: (src: string, dst: string) => void } = {}): string | null {
+/** True when the app's auth helper is signed with a certificate (a stable identity), not ad-hoc (cdhash only). */
+export function stablySigned(app: string): boolean {
+  try {
+    const out = execFileSync("/usr/bin/codesign", ["-d", "-r-", join(app, "Contents/MacOS/agentmbx-auth")], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    return /certificate/.test(out);
+  } catch (e) { return /certificate/.test(String((e as { stderr?: string }).stderr ?? "")); }
+}
+
+export function installAppBundle(opts: { home?: string; pkgRoot?: string; env?: NodeJS.ProcessEnv; copy?: (src: string, dst: string) => void; signed?: (app: string) => boolean } = {}): string | null {
   const dst = installedAppPath(opts.home);
   const src = findAppSource(opts.pkgRoot, opts.env);
-  if (src && resolve(src) !== resolve(dst)) {
+  const signed = opts.signed ?? stablySigned;
+  // never trade a stably signed installed app for an ad-hoc local build: the Keychain would stop trusting the owner-key
+  // helper. An explicit MBX_APP_BUNDLE still wins.
+  const keep = !!src && !(opts.env ?? process.env).MBX_APP_BUNDLE && isApp(dst) && signed(dst) && !signed(src);
+  if (keep) console.log(`app: keeping the stably signed ${dst} (the local build at ${src} is ad-hoc signed)`);
+  if (src && !keep && resolve(src) !== resolve(dst)) {
     mkdirSync(dirname(dst), { recursive: true });
     rmSync(dst, { recursive: true, force: true });
     (opts.copy ?? ((s, d) => execFileSync("/usr/bin/ditto", [s, d])))(src, dst);
