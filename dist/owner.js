@@ -1,19 +1,152 @@
-// The owner key: Ed25519, encrypted at rest with a passphrase (scrypt + AES-256-GCM).
-// Unlocking needs the passphrase typed on a real terminal (/dev/tty), which agent tool calls do not have.
+// The owner key: Ed25519. Two backends:
+// - "keychain" (macOS with AgentMBX.app): the private key lives in the login Keychain, readable only by
+//   AgentMBX.app/Contents/MacOS/agentmbx-auth, which signs after a Touch ID / password prompt whose text it derives from
+//   the bytes it signs. owner.json records the backend and the public key.
+// - "file": owner.key, encrypted at rest with a passphrase (scrypt + AES-256-GCM). Unlocking needs the passphrase typed
+//   on a real terminal (/dev/tty), which agent tool calls do not have.
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "node:crypto";
-import { existsSync, openSync, readFileSync, readSync, closeSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { fingerprint, generateKeyPair, signData } from "./crypto.js";
+import { fingerprint, generateKeyPair, signData, verifyData } from "./crypto.js";
+import { installedAppPath } from "./service.js";
 const SCRYPT = { N: 1 << 17, r: 8, p: 1, maxmem: 256 * 1024 * 1024 };
+/** File backend: the encrypted key. */
 export const ownerPath = (home) => join(home, "owner.key");
-export function ownerPublicKey(home) {
-    if (!existsSync(ownerPath(home)))
-        return null;
-    return JSON.parse(readFileSync(ownerPath(home), "utf8")).public_key;
-}
-export function createOwnerKey(home, passphrase) {
+/** Keychain backend: the backend and the public key only (the private key never leaves the Keychain helper). */
+export const ownerJsonPath = (home) => join(home, "owner.json");
+export function ownerInfo(home) {
     if (existsSync(ownerPath(home)))
+        return { backend: "file", public_key: JSON.parse(readFileSync(ownerPath(home), "utf8")).public_key, path: ownerPath(home) };
+    if (existsSync(ownerJsonPath(home))) {
+        const f = JSON.parse(readFileSync(ownerJsonPath(home), "utf8"));
+        if (f.backend !== "keychain")
+            throw new Error(`${ownerJsonPath(home)}: unknown owner backend "${String(f.backend)}"`);
+        return { backend: "keychain", public_key: f.public_key, path: ownerJsonPath(home) };
+    }
+    return null;
+}
+export function ownerPublicKey(home) { return ownerInfo(home)?.public_key ?? null; }
+// ---- keychain backend (macOS helper) ----------------------------------------------------------------------------
+export const AUTH_HELPER = "agentmbx-auth";
+/** The Keychain helper inside the installed AgentMBX.app (MBX_AUTH_HELPER overrides it, e.g. for tests), or null. */
+export function authHelperPath(env = process.env, home = homedir(), platform = process.platform) {
+    if (env.MBX_AUTH_HELPER)
+        return existsSync(env.MBX_AUTH_HELPER) ? env.MBX_AUTH_HELPER : null;
+    if (platform !== "darwin")
+        return null;
+    return [join(installedAppPath(home), "Contents/MacOS", AUTH_HELPER), join("/Applications/AgentMBX.app/Contents/MacOS", AUTH_HELPER)]
+        .find((p) => existsSync(p)) ?? null;
+}
+/** Keychain when the helper is available (macOS with AgentMBX.app, or MBX_AUTH_HELPER), otherwise the passphrase file. */
+export const defaultOwnerBackend = (env = process.env, home = homedir(), platform = process.platform) => authHelperPath(env, home, platform) ? "keychain" : "file";
+// helper exit codes (macos/Auth/main.swift)
+const HELPER_EXIT = {
+    2: "bad arguments", 3: "no owner key in the Keychain", 4: "an owner key already exists in the Keychain", 5: "the helper refused to sign this payload",
+    6: "not approved (the Touch ID / password prompt was cancelled or failed, or Keychain access was denied)", 7: "Keychain error",
+    8: "the Keychain holds a different owner key than this payload names",
+    9: "no Touch ID / password prompt can be shown in this session (SSH or no GUI); run it at the Mac, or use: agentmbx owner init --backend file",
+    124: "timed out waiting for the Touch ID / password prompt to be approved",
+};
+export const HELPER_NO_GUI = 9;
+/** Run the Keychain helper. It may wait for the human at a Touch ID / password prompt, hence the long timeout.
+ *  Never throws for a helper failure: a cancel, a Keychain denial or a timeout comes back as a nonzero `code`. */
+export function runAuthHelper(helper, args, timeoutMs = 5 * 60_000) {
+    return new Promise((resolve) => {
+        let p;
+        try {
+            p = spawn(helper, args, { stdio: ["ignore", "pipe", "pipe"] });
+        }
+        catch (e) {
+            resolve({ code: 127, stdout: "", stderr: `cannot run ${helper}: ${e.message}` });
+            return;
+        }
+        let stdout = "", stderr = "", timedOut = false, done = false;
+        const finish = (r) => { if (!done) {
+            done = true;
+            clearTimeout(t);
+            resolve(r);
+        } };
+        p.stdout.on("data", (d) => { stdout += d.toString("utf8"); });
+        p.stderr.on("data", (d) => { stderr += d.toString("utf8"); });
+        const t = setTimeout(() => { timedOut = true; p.kill("SIGTERM"); }, timeoutMs);
+        p.on("error", (e) => finish({ code: 127, stdout, stderr: `cannot run ${helper}: ${e.message}` }));
+        p.on("close", (code, signal) => finish(timedOut ? { code: 124, stdout, stderr: "" } : { code: code ?? (signal ? 128 : 1), stdout, stderr }));
+    });
+}
+/** A helper failure as an Error with `helperExit` set (e.g. HELPER_NO_GUI), so callers can suggest the file backend. */
+export const helperError = (what, r) => Object.assign(new Error(`${what}: ${r.stderr.trim().replace(/^agentmbx-auth: /, "") || HELPER_EXIT[r.code] || `exit ${r.code}`}`), { helperExit: r.code });
+const isRawKey = (b64) => /^[A-Za-z0-9+/]{43}=$/.test(b64) && Buffer.from(b64, "base64").length === 32;
+/**
+ * Create (or adopt) the owner key in the macOS Keychain through the helper, and record it in owner.json. When the Keychain
+ * already holds an AgentMBX owner key (e.g. a second MBX_HOME on this Mac), it is adopted without a prompt; otherwise the
+ * helper shows a Touch ID / password prompt and creates it.
+ */
+export async function createKeychainOwner(home, helper = authHelperPath(), initTimeoutMs = 5 * 60_000) {
+    if (ownerInfo(home))
+        throw new Error("an owner key already exists on this host");
+    if (!helper)
+        throw new Error("the AgentMBX Keychain helper (AgentMBX.app/Contents/MacOS/agentmbx-auth) was not found");
+    let adopted = true;
+    let r = await runAuthHelper(helper, ["pubkey"], 30_000);
+    if (r.code === 3) {
+        adopted = false;
+        r = await runAuthHelper(helper, ["init"], initTimeoutMs);
+    }
+    if (r.code !== 0)
+        throw helperError(adopted ? "reading the Keychain owner key failed" : "creating the owner key failed", r);
+    const pub = r.stdout.trim();
+    if (!isRawKey(pub))
+        throw new Error(`the Keychain helper returned a malformed public key: ${JSON.stringify(pub.slice(0, 80))}`);
+    const f = { v: 1, backend: "keychain", public_key: pub, created_at: new Date().toISOString() };
+    writeFileSync(ownerJsonPath(home), JSON.stringify(f, null, 1) + "\n", { mode: 0o600, flag: "wx" });
+    return { publicKey: pub, adopted };
+}
+/** Can the helper show a Touch ID / password prompt in this session? False over SSH or without a GUI login. No prompt. */
+export async function canPrompt(helper) {
+    const r = await runAuthHelper(helper, ["check"], 10_000);
+    return r.code === 0 ? { ok: true, reason: "" } : { ok: false, reason: helperError("no prompt possible", r).message.replace(/^no prompt possible: /, "") };
+}
+/** Doctor check for the keychain backend: is the helper there, and does its key match owner.json? (No prompt.) */
+export async function keychainOwnerStatus(home, helper = authHelperPath()) {
+    const info = ownerInfo(home);
+    if (info?.backend !== "keychain")
+        return { ok: false, detail: "not a keychain owner" };
+    if (!helper)
+        return { ok: false, detail: "the Keychain helper (AgentMBX.app/Contents/MacOS/agentmbx-auth) is missing" };
+    const r = await runAuthHelper(helper, ["pubkey"], 10_000);
+    if (r.code !== 0)
+        return { ok: false, detail: helperError("the Keychain helper", r).message };
+    const got = r.stdout.trim();
+    if (got !== info.public_key)
+        return { ok: false, detail: `the Keychain holds owner key ${isRawKey(got) ? fingerprint(got) : "?"}, not ${fingerprint(info.public_key)}` };
+    return { ok: true, detail: helper };
+}
+async function keychainSign(home, pub, canonicalJson, summary) {
+    const helper = authHelperPath();
+    if (!helper)
+        throw new Error("the owner key is in the macOS Keychain, but AgentMBX.app's agentmbx-auth helper was not found (reinstall the app: agentmbx daemon install)");
+    const dir = mkdtempSync(join(tmpdir(), "agentmbx-sign-"));
+    try {
+        const file = join(dir, "payload.json");
+        writeFileSync(file, canonicalJson, { mode: 0o600 });
+        process.stderr.write(`${summary}\nApprove the Touch ID / password prompt to sign this (the prompt describes the same request).\n`);
+        const r = await runAuthHelper(helper, ["sign", file]);
+        if (r.code !== 0)
+            throw helperError("owner signature not made", r);
+        const sig = r.stdout.trim();
+        if (!verifyData(pub, canonicalJson, sig))
+            throw new Error(`the Keychain helper's signature does not verify against owner key ${fingerprint(pub)} (${ownerJsonPath(home)}); run: agentmbx doctor`);
+        return sig;
+    }
+    finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+}
+// ---- file backend -----------------------------------------------------------------------------------------------
+export function createOwnerKey(home, passphrase) {
+    if (ownerInfo(home))
         throw new Error("owner key already exists");
     if (passphrase.length < 12)
         throw new Error("use a passphrase of at least 12 characters");
@@ -22,7 +155,7 @@ export function createOwnerKey(home, passphrase) {
     const key = scryptSync(passphrase, salt, 32, SCRYPT);
     const c = createCipheriv("aes-256-gcm", key, iv);
     const ct = Buffer.concat([c.update(kp.privateKey, "utf8"), c.final()]);
-    const f = { v: 1, public_key: kp.publicKey, kdf: "scrypt", salt: salt.toString("base64"), iv: iv.toString("base64"),
+    const f = { v: 1, backend: "file", public_key: kp.publicKey, kdf: "scrypt", salt: salt.toString("base64"), iv: iv.toString("base64"),
         tag: c.getAuthTag().toString("base64"), ciphertext: ct.toString("base64") };
     writeFileSync(ownerPath(home), JSON.stringify(f, null, 1) + "\n", { mode: 0o600, flag: "wx" });
     return kp.publicKey;
@@ -74,14 +207,17 @@ export function readPassphraseFromTTY(prompt) {
 export const ownerFingerprint = (home) => { const p = ownerPublicKey(home); return p ? fingerprint(p) : null; };
 /**
  * The one way to get an owner signature: sign `canonicalJson` (the exact bytes receivers verify) after the human
- * approves. The file backend asks for the passphrase on /dev/tty; the macOS keychain backend (T052) shows a
- * Touch ID / password prompt whose text is derived from `canonicalJson`. `summary` is shown on the terminal
- * (file backend) so the human knows what they are signing.
+ * approves. The file backend asks for the passphrase on /dev/tty; the macOS keychain backend shows a Touch ID / password
+ * prompt whose text the helper derives from `canonicalJson` itself. `summary` is shown on the terminal so the human
+ * knows what they are signing.
  */
 export async function ownerSignCanonical(home, canonicalJson, summary) {
-    const pub = ownerPublicKey(home);
-    if (!pub)
+    const info = ownerInfo(home);
+    if (!info)
         throw new Error("no owner key on this machine: run 'agentmbx owner init'");
+    const pub = info.public_key;
+    if (info.backend === "keychain")
+        return { sig: await keychainSign(home, pub, canonicalJson, summary), pub, fp: fingerprint(pub) };
     const kp = unlockOwnerKey(home, readPassphraseFromTTY(`${summary}\nOwner passphrase: `));
     return { sig: signData(kp.privateKey, canonicalJson), pub, fp: fingerprint(pub) };
 }

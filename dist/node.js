@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { hostname, homedir } from "node:os";
 import { join } from "node:path";
 import { fingerprint, generateKeyPair, newPairToken, pairTokenKey, sha256 } from "./crypto.js";
-import { attachAuthority, buildEnvelope, ownerSign, checkAuthority, checkShape, NAME_RE, signEnvelope, verifyEnvelope, } from "./envelope.js";
+import { attachAuthority, buildEnvelope, ownerSign, ownerSignRequest, withOwnerSig, checkAuthority, checkShape, NAME_RE, signEnvelope, verifyEnvelope, } from "./envelope.js";
 import { ownerPublicKey } from "./owner.js";
 import { Store } from "./store.js";
 export const DEFAULT_PORT = 7373;
@@ -194,11 +194,19 @@ export class MbxNode {
     }
     // ---- send / receive ----------------------------------------------------------------------
     revoked() { return new Set(this.store.db.prepare("SELECT id FROM grants WHERE revoked=1").all().map((r) => r.id)); }
-    send(d, session, owner) {
+    /** One message signed by the owner key. `sign` gets the exact canonical bytes: pass ownerSignCanonical. */
+    async sendAsOwner(d, sign) {
+        const pub = this.ownerPub;
+        if (!pub)
+            throw new Error("no owner key on this machine: run 'agentmbx owner init'");
+        const req = ownerSignRequest(buildEnvelope({ ...d, from: `owner@${this.host}` }), pub);
+        return this.send({ ...d, from: "owner" }, undefined, undefined, withOwnerSig(req.envelope, (await sign(req.payload)).sig));
+    }
+    send(d, session, owner, prebuilt) {
         const fromName = d.from.includes("@") ? d.from.split("@")[0] : d.from;
         if (!NAME_RE.test(fromName) && fromName !== "owner")
             throw new Error(`invalid sender name "${fromName}"`);
-        let e = buildEnvelope({ ...d, from: `${fromName}@${this.host}` });
+        let e = prebuilt ?? buildEnvelope({ ...d, from: `${fromName}@${this.host}` });
         if (owner)
             e = ownerSign(e, owner.pub, owner.priv);
         else if (session?.grant)

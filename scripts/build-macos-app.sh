@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
-# Builds build/AgentMBX.app (branded notifier + launchd launcher) and build/AgentMBX-macos.zip.
+# Builds build/AgentMBX.app (branded notifier + launchd launcher + Touch ID owner-key helper) and build/AgentMBX-macos.zip.
 #   scripts/build-macos-app.sh                                   # ad-hoc signed (works on this Mac)
-#   AGENTMBX_CODESIGN_IDENTITY="Developer ID Application: …" scripts/build-macos-app.sh   # hardened runtime
-# Notarization for release builds: docs/RELEASING-macos.md
+#   MBX_CODESIGN_IDENTITY="AgentMBX Code Signing" scripts/build-macos-app.sh            # stable self-signed identity
+#   MBX_CODESIGN_IDENTITY="Developer ID Application: …" scripts/build-macos-app.sh      # Developer ID (notarizable)
+# (AGENTMBX_CODESIGN_IDENTITY is accepted as an older name; MBX_CODESIGN_KEYCHAIN picks the keychain holding the identity.)
+# Why a stable identity matters: the owner key's Keychain item trusts agentmbx-auth by its code signature. An ad-hoc
+# signature is only a hash of the binary, so every rebuilt or updated app asks "allow access?" once; a certificate
+# signature keeps the same designated requirement across releases. Details: docs/RELEASING-macos.md
 set -euo pipefail
+IDENTITY="${MBX_CODESIGN_IDENTITY:-${AGENTMBX_CODESIGN_IDENTITY:-}}"
 [[ "$(uname)" == Darwin ]] || { echo "build-macos-app: macOS only" >&2; exit 1; }
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -34,6 +39,7 @@ compile() { # <output> <swift files…>
 echo "==> compiling"
 compile "$APP/Contents/MacOS/agentmbx-notify" "$ROOT/macos/Notifier/main.swift"
 compile "$APP/Contents/MacOS/agentmbx-daemon" "$ROOT/macos/Launcher/main.swift"
+compile "$APP/Contents/MacOS/agentmbx-auth" "$ROOT/macos/Auth/main.swift"
 
 echo "==> icon"
 swiftc -O "$ROOT/macos/Icon/make-icon.swift" -o "$TMP/make-icon"
@@ -45,16 +51,23 @@ plutil -lint "$APP/Contents/Info.plist" >/dev/null
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 echo "==> signing"
-if [[ -n "${AGENTMBX_CODESIGN_IDENTITY:-}" ]]; then
-  # Developer ID: hardened runtime + secure timestamp, inner executables first, then the bundle
-  sign=(codesign --force --options runtime --timestamp --sign "$AGENTMBX_CODESIGN_IDENTITY")
+if [[ -n "$IDENTITY" ]]; then
+  # certificate identity: hardened runtime, inner executables first, then the bundle. A secure timestamp needs an
+  # Apple-issued certificate, so only Developer ID builds ask for one.
+  sign=(codesign --force --options runtime --sign "$IDENTITY")
+  [[ "$IDENTITY" == "Developer ID Application"* ]] && sign+=(--timestamp)
+  [[ -n "${MBX_CODESIGN_KEYCHAIN:-}" ]] && sign+=(--keychain "$MBX_CODESIGN_KEYCHAIN")
   "${sign[@]}" "$APP/Contents/MacOS/agentmbx-daemon"
+  # the owner key's Keychain item trusts this helper by its designated requirement (identifier + certificate):
+  # keep the identifier fixed so every release signed with the same certificate is trusted without a dialog
+  "${sign[@]}" --identifier com.agentmbx.auth "$APP/Contents/MacOS/agentmbx-auth"
   "${sign[@]}" "$APP"
-  echo "signed with: $AGENTMBX_CODESIGN_IDENTITY"
+  echo "signed with: $IDENTITY"
+  codesign -d -r- "$APP/Contents/MacOS/agentmbx-auth" 2>&1 | sed -n 's/^designated => /    agentmbx-auth designated requirement: /p'
 else
   codesign --force --sign - "$APP/Contents/MacOS/agentmbx-daemon"
   codesign --force --deep --sign - "$APP"
-  echo "ad-hoc signed (set AGENTMBX_CODESIGN_IDENTITY for a Developer ID signature)"
+  echo "ad-hoc signed (set MBX_CODESIGN_IDENTITY for a stable signature; ad-hoc updates ask once for Keychain access)"
 fi
 codesign --verify --deep --strict "$APP"
 

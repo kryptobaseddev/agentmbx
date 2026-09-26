@@ -4,7 +4,7 @@ import { hostname, homedir } from "node:os";
 import { join } from "node:path";
 import { fingerprint, generateKeyPair, newPairToken, pairTokenKey, sha256, type KeyPair } from "./crypto.ts";
 import {
-  attachAuthority, buildEnvelope, ownerSign, checkAuthority, checkShape, NAME_RE, signEnvelope, verifyEnvelope,
+  attachAuthority, buildEnvelope, ownerSign, ownerSignRequest, withOwnerSig, checkAuthority, checkShape, NAME_RE, signEnvelope, verifyEnvelope,
   type Draft, type Envelope, type Grant,
 } from "./envelope.ts";
 import { ownerPublicKey } from "./owner.ts";
@@ -187,10 +187,18 @@ export class MbxNode {
   // ---- send / receive ----------------------------------------------------------------------
   revoked(): Set<string> { return new Set((this.store.db.prepare("SELECT id FROM grants WHERE revoked=1").all() as { id: string }[]).map((r) => r.id)); }
 
-  send(d: Draft & { from: string }, session?: Session, owner?: { pub: string; priv: string }): { envelope: Envelope; local: string[]; remote: string[]; warnings: string[] } {
+  /** One message signed by the owner key. `sign` gets the exact canonical bytes: pass ownerSignCanonical. */
+  async sendAsOwner(d: Draft, sign: (canonicalJson: string) => Promise<{ sig: string }>): Promise<ReturnType<MbxNode["send"]>> {
+    const pub = this.ownerPub;
+    if (!pub) throw new Error("no owner key on this machine: run 'agentmbx owner init'");
+    const req = ownerSignRequest(buildEnvelope({ ...d, from: `owner@${this.host}` }), pub);
+    return this.send({ ...d, from: "owner" }, undefined, undefined, withOwnerSig(req.envelope, (await sign(req.payload)).sig));
+  }
+
+  send(d: Draft & { from: string }, session?: Session, owner?: { pub: string; priv: string }, prebuilt?: Envelope): { envelope: Envelope; local: string[]; remote: string[]; warnings: string[] } {
     const fromName = d.from.includes("@") ? d.from.split("@")[0] : d.from;
     if (!NAME_RE.test(fromName) && fromName !== "owner") throw new Error(`invalid sender name "${fromName}"`);
-    let e = buildEnvelope({ ...d, from: `${fromName}@${this.host}` });
+    let e = prebuilt ?? buildEnvelope({ ...d, from: `${fromName}@${this.host}` });
     if (owner) e = ownerSign(e, owner.pub, owner.priv);
     else if (session?.grant) e = attachAuthority(e, session.grant, session.priv);
     e = signEnvelope(e, this.host, this.key.publicKey, this.key.privateKey);

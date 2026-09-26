@@ -12,6 +12,8 @@ import { homedir, hostname } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { insertMember, member, parseJsonc, removeMember, replaceValue, valueOf, type JNode } from "./jsonc.ts";
+import { fingerprint } from "./crypto.ts";
+import { authHelperPath, canPrompt, createKeychainOwner, ownerInfo } from "./owner.ts";
 
 export const CLIS = ["claude", "codex", "opencode", "kimi", "hermes"] as const;
 export type CliId = (typeof CLIS)[number];
@@ -489,3 +491,45 @@ export const MANUAL_HINTS: Record<CliId, string> = {
   kimi: "add {\"mcpServers\":{\"mbx\":{\"command\":\"agentmbx\",\"args\":[\"mcp\"]}}} to ~/.kimi-code/mcp.json",
   hermes: "add mcp_servers: { mbx: { command: agentmbx, args: [mcp] } } to ~/.hermes/config.yaml",
 };
+
+// ---- owner step ------------------------------------------------------------------------------
+export interface OwnerStepOpts {
+  mbxHome: string; cmd: string[]; dryRun?: boolean;
+  helper?: string | null;                                   // Keychain helper (default: authHelperPath())
+  create?: (home: string, helper: string) => Promise<{ publicKey: string; adopted: boolean }>;
+  canPrompt?: (helper: string) => Promise<{ ok: boolean; reason: string }>;
+  log?: (line: string) => void;
+}
+
+/**
+ * The owner step of `agentmbx setup`. An agent may run it: with the macOS Keychain helper, creating the key only needs the
+ * human to approve a Touch ID / password prompt. Without the helper (Linux, SSH, no AgentMBX.app) the passphrase must be
+ * typed on a terminal, so it prints the exact command for the human instead. Never fails setup.
+ */
+export async function ownerStep(o: OwnerStepOpts): Promise<"present" | "created" | "manual" | "failed" | "dry-run"> {
+  const log = o.log ?? ((l: string) => console.log(l));
+  const info = ownerInfo(o.mbxHome);
+  if (info) { log(`owner: key ${fingerprint(info.public_key)} (${info.backend === "keychain" ? "macOS Keychain, Touch ID" : "passphrase file"})`); return "present"; }
+  const helper = o.helper === undefined ? authHelperPath() : o.helper;
+  const cmd = `${shJoin(o.cmd)} owner init`;
+  if (!helper) {
+    log(`owner: no owner key yet. It is how you (not an agent) approve grants and policies. Run this yourself in a terminal;\n  it asks for a new passphrase (an agent can't type it for you):\n    ${cmd}`);
+    return "manual";
+  }
+  if (o.dryRun) { log("owner: would create your owner key in the macOS Keychain (a Touch ID / password prompt appears)"); return "dry-run"; }
+  // never wait on a prompt that can't appear (SSH, no GUI login): print the commands instead
+  const can = await (o.canPrompt ?? canPrompt)(helper);
+  if (!can.ok) {
+    log(`owner: no owner key yet, and ${can.reason.replace(/[.;].*$/s, "")}.\n  At the Mac, run: ${cmd}    (Touch ID)\n  Or here, with a passphrase: ${cmd} --backend file`);
+    return "manual";
+  }
+  log(`owner: creating your owner key in the macOS Keychain.\n  A Touch ID / password prompt will appear: approve it. (Not at the Mac? Cancel it and run later: ${cmd})`);
+  try {
+    const r = await (o.create ?? ((h: string, hp: string) => createKeychainOwner(h, hp, 120_000)))(o.mbxHome, helper);
+    log(`owner: key ${fingerprint(r.publicKey)} ${r.adopted ? "(already in the Keychain; now used here)" : "created"} (macOS Keychain, Touch ID)`);
+    return "created";
+  } catch (e) {
+    log(`owner: not created (${(e as Error).message}).\n  Run later: ${cmd}`);
+    return "failed";
+  }
+}
