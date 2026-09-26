@@ -1,7 +1,7 @@
 # Testing
 
 ## Automated (`npm test`)
-30 tests, runs in about ten seconds, and needs no network or model (the mDNS test uses loopback multicast and skips itself if that is blocked):
+Runs in about ten seconds, and needs no network or model (the mDNS test uses loopback multicast and skips itself if that is blocked):
 
 | File | What it covers |
 |---|---|
@@ -9,6 +9,7 @@
 | `test/trust.test.ts` | the council's four trust tests, plus forged, expired and revoked grants, spoofing, local delivery, the wake brake, and the owner-key file |
 | `test/lan.test.ts` | two hosts over real HTTP: pairing code on both sides, approval, both directions, directory sync, an offline peer catching up, stale or forged hops rejected |
 | `test/pair.test.ts` | token pairing both ways with messages flowing; wrong token (burned after 5), expired, reused, replayed hello, tampered transcript (owner key, host key, name, addr, rewritten hello), a fake token holder; SAS still works; mDNS TXT round-trip and a loopback advertise + browse |
+| `test/desktop.test.ts` | launchd plist (in-app launcher + `AssociatedBundleIdentifiers` when AgentMBX.app is present), systemd unit, app bundle discovery/install, notifier selection (AgentMBX.app, osascript, notify-send). The Swift build is not part of `npm test` |
 | `test/mcp.test.ts` | the real MCP client over stdio: every tool, framing, idempotency, and the Claude channel push (without the message body) |
 
 The four trust tests come from the council's review:

@@ -108,11 +108,28 @@ agentmbx owner init                                            # choose a passph
 agentmbx owner grant planner --caps task.assign,decision --ttl 12h
 ```
 
+## Notifications
+
+When an agent has no wake path (or its wake fails), the daemon shows a desktop notification instead.
+
+- **macOS:** build the small menu-less app once, then (re)install the daemon:
+  ```sh
+  scripts/build-macos-app.sh        # needs Xcode command line tools; writes build/AgentMBX.app
+  agentmbx daemon install           # copies it to ~/Applications/AgentMBX.app
+  agentmbx notify-test --as planner # sample notification through the same path wake-ups use
+  ```
+  - Notifications then come from **AgentMBX** with its own icon, not Script Editor. The first one asks for permission. Manage it in System Settings > Notifications > AgentMBX.
+  - Clicking a notification opens a Terminal window running `agentmbx inbox --as <agent>`.
+  - The launchd agent starts through `AgentMBX.app/Contents/MacOS/agentmbx-daemon`, a tiny launcher that execs Node. Background Task Management names the job after that binary, so the Login Items entry reads "AgentMBX" instead of "node".
+  - Without the app, AgentMBX falls back to `osascript` notifications.
+- **Linux:** `notify-send -a AgentMBX -i mail-message-new`.
+- Set `MBX_NO_DESKTOP=1` to turn desktop notifications off.
+
 ## Command reference
 
 `agentmbx help` lists everything:
 - **Messages:** `send`, `inbox`, `read`, `ack`, `thread`, `search`, `agents`, `status`
-- **Machines:** `init`, `pair`, `join`, `discover`, `pair --compare`, `pair approve`, `peers`, `peers remove`, `daemon [install|uninstall]`
+- **Machines:** `init`, `pair`, `join`, `discover`, `pair --compare`, `pair approve`, `peers`, `peers remove`, `daemon [install|uninstall]`, `notify-test`
 - **Owner:** `owner init|show|grant|revoke`
 - **Integration:** `mcp`, `hook session-start|prompt|stop --cli <cli>`, `import-v2`
 - **Install:** `version [--check]`, `update [--check] [--yes]`
@@ -133,12 +150,13 @@ agentmbx owner grant planner --caps task.assign,decision --ttl 12h
 
 ```sh
 git clone https://github.com/kryptobaseddev/agentmbx && cd agentmbx && npm install
-npm test            # 19 tests: crypto, trust (incl. the council's four), two-host HTTP, MCP client, channel push
+npm test            # 26 tests: crypto, trust (incl. the council's four), two-host HTTP, MCP client, channel push, service/notifier setup
 npm run typecheck
 python3 scripts/e2e/wake-codex.py      # live: wakes a real idle Codex TUI (see docs/TESTING.md)
+scripts/build-macos-app.sh             # macOS: AgentMBX.app (notifier + launchd launcher); releasing: docs/RELEASING-macos.md
 ```
 
-- Docs: [SPEC](docs/SPEC.md) · [INSTALL](docs/INSTALL.md) · [RESEARCH](docs/RESEARCH.md) · [TESTING](docs/TESTING.md)
+- Docs: [SPEC](docs/SPEC.md) · [INSTALL](docs/INSTALL.md) · [RESEARCH](docs/RESEARCH.md) · [TESTING](docs/TESTING.md) · [RELEASING-macos](docs/RELEASING-macos.md)
 - Contributions: issues are welcome. Pull requests need agreement that the Licensor may license contributions under the terms in [LICENSE](LICENSE).
 
 ## License

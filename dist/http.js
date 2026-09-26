@@ -121,7 +121,7 @@ function handleJoin(node, j, hellos, remote) {
     node.addApprovedPeer({ host: j.host, pubkey: j.host_pubkey, owner_pubkey: j.owner_pubkey, addr: j.addr }, "token");
     node.store.audit("pair.joined", { host: j.host, addr: j.addr, remote, role: "token-holder", token: match.id });
     process.stderr.write(`\n[agentmbx] paired with ${j.host} (${j.addr}) using pairing token ${match.id}\n`);
-    void notifyDesktop("AgentMBX", `Paired with ${j.host}`);
+    void notifyDesktop({ body: `Paired with ${j.host}` });
     return { code: 200, body: { v: 1, host: node.host, mac: pairMac(match.key, "accept", transcript) } };
 }
 // ---- server ----------------------------------------------------------------------------------

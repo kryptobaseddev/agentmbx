@@ -73,20 +73,52 @@ export async function opencodeSessionFor(dir) {
         return null;
     }
 }
-export async function notifyDesktop(title, text) {
+/** The branded notifier inside AgentMBX.app, if installed (MBX_NOTIFIER overrides, e.g. for tests). */
+export function macNotifierPath(home = homedir(), env = process.env) {
+    const candidates = [env.MBX_NOTIFIER, join(home, "Applications/AgentMBX.app/Contents/MacOS/agentmbx-notify"),
+        "/Applications/AgentMBX.app/Contents/MacOS/agentmbx-notify"].filter((p) => !!p);
+    return candidates.find((p) => existsSync(p)) ?? null;
+}
+const shq = (s) => `'${s.replace(/'/g, `'\\''`)}'`;
+/** Shell command a click on a wake notification runs (in a new Terminal window): this agent's inbox. */
+export function inboxCommand(agent, node = process.execPath, bin = process.argv[1]) {
+    return bin ? `${shq(node)} ${shq(bin)} inbox --as ${shq(agent)}` : `agentmbx inbox --as ${shq(agent)}`;
+}
+/** Ordered notification commands for this platform: the first that succeeds wins. Pure, so it is testable. */
+export function desktopCommands(n, o = {}) {
+    const platform = o.platform ?? process.platform, title = n.title ?? "AgentMBX", body = n.body.slice(0, 400);
+    if (platform === "darwin") {
+        const out = [];
+        const notifier = macNotifierPath(o.home, o.env);
+        if (notifier)
+            out.push({ via: "desktop (AgentMBX.app)", file: notifier, timeout: 45_000, // first run may wait on the permission prompt
+                args: ["--title", title, "--body", body, ...(n.subtitle ? ["--subtitle", n.subtitle] : []), ...(n.id ? ["--id", n.id] : []), ...(n.openCmd ? ["--open-cmd", n.openCmd] : [])] });
+        const q = (s) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+        out.push({ via: "desktop (osascript)", file: "/usr/bin/osascript", timeout: 5_000,
+            args: ["-e", `display notification "${q(body.slice(0, 200))}" with title "${q(title)}"${n.subtitle ? ` subtitle "${q(n.subtitle)}"` : ""}`] });
+        return out;
+    }
+    return [{ via: "desktop (notify-send)", file: "notify-send", timeout: 5_000,
+            args: ["-a", "AgentMBX", "-i", "mail-message-new", n.subtitle ? `${title}: ${n.subtitle}` : title, body] }];
+}
+export async function notifyDesktop(n) {
     if (process.env.MBX_NO_DESKTOP)
         return { ok: false, via: "desktop", error: "disabled" };
-    const q = (s) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-    try {
-        if (process.platform === "darwin")
-            await run("/usr/bin/osascript", ["-e", `display notification "${q(text.slice(0, 200))}" with title "${q(title)}"`], { timeout: 5_000 });
-        else
-            await run("notify-send", [title, text.slice(0, 200)], { timeout: 5_000 });
-        return { ok: true, via: "desktop" };
+    let last = { ok: false, via: "desktop", error: "no notifier" };
+    for (const c of desktopCommands(n)) {
+        try {
+            await run(c.file, c.args, { timeout: c.timeout });
+            return { ok: true, via: c.via };
+        }
+        catch (e) {
+            const err = e;
+            // exit 3: the user turned AgentMBX notifications off. Respect that instead of falling back to osascript.
+            if (err.code === 3)
+                return { ok: false, via: c.via, error: "notifications for AgentMBX are turned off (System Settings > Notifications > AgentMBX)" };
+            last = { ok: false, via: c.via, error: (err.stderr?.trim() || err.message).slice(0, 300) };
+        }
     }
-    catch (e) {
-        return { ok: false, via: "desktop", error: e.message };
-    }
+    return last;
 }
 const alive = (pid) => { if (!pid)
     return false; try {
@@ -136,7 +168,7 @@ export async function dispatchWakes(node) {
                 break;
         }
         if (!result.ok)
-            result = await notifyDesktop(`mbx: ${agent}`, text).then((r) => (r.ok ? r : result));
+            result = await notifyDesktop({ subtitle: agent, body: text, openCmd: inboxCommand(agent) }).then((r) => (r.ok ? r : result));
         markAll();
         node.store.audit("wake", { agent, via: result.via, ok: result.ok, count: wanted.length });
         out.push({ agent, result });
