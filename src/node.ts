@@ -62,6 +62,15 @@ export class MbxNode {
   }
 
   bindSession(s: { agent: string; cli: string; session_id: string; cwd?: string; pid?: number; session_key?: string; channel?: boolean }) {
+    // The hook binding (wake target) and the MCP binding (session key) come from the same CLI process. The MCP
+    // server owns the name (mbx_whoami can rename it), so keep both under one agent or wakes miss the session.
+    if (s.pid && s.session_key)
+      this.store.db.prepare("UPDATE sessions SET agent=? WHERE cli=? AND pid=? AND session_key IS NULL").run(s.agent, s.cli, s.pid);
+    else if (s.pid) {
+      const mcp = this.store.db.prepare("SELECT agent FROM sessions WHERE cli=? AND pid=? AND session_key IS NOT NULL ORDER BY updated_at DESC LIMIT 1")
+        .get(s.cli, s.pid) as { agent: string } | undefined;
+      if (mcp) s = { ...s, agent: mcp.agent };
+    }
     this.store.db.prepare(`INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(cli,session_id) DO UPDATE SET
       agent=excluded.agent, cwd=excluded.cwd, pid=excluded.pid, session_key=COALESCE(excluded.session_key,session_key),
       channel=excluded.channel, updated_at=excluded.updated_at`)

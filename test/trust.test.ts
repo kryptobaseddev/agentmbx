@@ -168,3 +168,14 @@ test("owner-signed direct message: verified on the paired host, forgery and tamp
   a.send({ from: "owner", to: ["helper"], subject: "local", body: "y", kind: "task" }, undefined, { pub: owner.publicKey, priv: owner.privateKey });
   assert.equal(JSON.parse(a.inbox("helper")[0].authority!).ok, true);
 });
+
+test("hook and MCP bindings from one CLI process share the MCP server's agent name", () => {
+  const node = new MbxNode(mkdtempSync(join(tmpdir(), "mbx-bind-")), { host: "h1" });
+  // hook binds first under the folder name, then the MCP server (renamed) binds from the same process
+  node.bindSession({ agent: "keatonhoskins", cli: "codex", session_id: "thread-1", pid: 4242 });
+  node.bindSession({ agent: "codex", cli: "codex", session_id: "mcp-1", pid: 4242, session_key: "k" });
+  assert.deepEqual(node.sessionsFor("codex").map((s) => s.session_id).sort(), ["mcp-1", "thread-1"]);
+  // a later hook run (resume) adopts the MCP name too
+  node.bindSession({ agent: "keatonhoskins", cli: "codex", session_id: "thread-2", pid: 4242 });
+  assert.equal(node.sessionsFor("keatonhoskins").length, 0);
+});
