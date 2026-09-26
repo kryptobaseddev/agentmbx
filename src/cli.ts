@@ -1,6 +1,5 @@
 // mbx command line. Humans, hooks and scripts use this; agents use the MCP tools (mbx mcp).
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { execFileSync } from "node:child_process";
@@ -10,7 +9,8 @@ import { flushOutbox, pairWith, refreshDirectory, startServer, advertisedAddr } 
 import { agentName, runMcp } from "./mcp.ts";
 import { defaultHome, formatMessage, MbxNode, summaryLine, trustLabel } from "./node.ts";
 import { createOwnerKey, ownerPath, readPassphraseFromTTY, unlockOwnerKey } from "./owner.ts";
-import { dispatchWakes, opencodeSessionFor } from "./wake.ts";
+import { installService, uninstallService } from "./service.ts";
+import { dispatchWakes, inboxCommand, macNotifierPath, notifyDesktop, opencodeSessionFor } from "./wake.ts";
 
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
 
@@ -24,6 +24,7 @@ Machines (pairing: run 'agentmbx pair <addr>' on one host, compare the 6-digit c
   agentmbx init [--host <name>] [--port 7373]       mbx pair <host:port>       mbx pair approve <host> <code>
   agentmbx peers                                    mbx peers remove <host>
   agentmbx daemon                                   mbx daemon install | uninstall      (launchd / systemd user service)
+  agentmbx notify-test [--as <agent>]               send a sample desktop notification the way wake-ups do
 
 Owner (run these yourself in a terminal; they ask for the owner passphrase and refuse to run without one)
   agentmbx owner init        mbx owner show
@@ -59,6 +60,7 @@ export async function main(argv = process.argv.slice(2)) {
     console.log(n.ownerPub ? `owner key: ${fingerprint(n.ownerPub)}` : "owner key: none yet (run: agentmbx owner init)");
     return;
   }
+  if (cmd === "notify-test") return notifyTest(str("as") ?? process.env.MBX_AGENT ?? "notify-test");
   const node = new MbxNode();
   const as = () => str("as") ?? process.env.MBX_AGENT ?? die("--as <agent> is required");
 
@@ -110,7 +112,7 @@ If the codes differ, do not approve: someone is in the middle.`);
       return;
     }
     case "daemon": {
-      if (pos[0] === "install") return installService(node);
+      if (pos[0] === "install") return installService(node.home);
       if (pos[0] === "uninstall") return uninstallService();
       let busy = false;
       const tick = async () => {
@@ -128,6 +130,22 @@ If the codes differ, do not approve: someone is in the middle.`);
     case "import-v2": return importV2(node, pos[0] ?? die("import-v2 <dir>"));
     default: die(`unknown command "${cmd}" (agentmbx help)`);
   }
+}
+
+// ---- notify-test -----------------------------------------------------------------------------
+async function notifyTest(agent: string) {
+  if (process.platform === "darwin") {
+    const notifier = macNotifierPath();
+    if (notifier) {
+      let status = "";
+      try { status = execFileSync(notifier, ["--status"], { encoding: "utf8", timeout: 10_000 }).trim(); } catch { /* older build */ }
+      console.log(`notifier: ${notifier}${status ? `  (${status})` : ""}`);
+    } else console.log("notifier: AgentMBX.app not installed, using osascript (build it: scripts/build-macos-app.sh, then 'agentmbx daemon install')");
+  }
+  const r = await notifyDesktop({ subtitle: agent, id: `agentmbx-notify-test`, openCmd: inboxCommand(agent),
+    body: `Test notification for ${agent}. Wake-ups for idle agents look like this; clicking one opens that agent's inbox in Terminal.` });
+  if (!r.ok) die(`${r.via}: ${r.error}`);
+  console.log(`sent via ${r.via}`);
 }
 
 // ---- owner commands --------------------------------------------------------------------------
@@ -215,40 +233,6 @@ function importV2(node: MbxNode, dir: string) {
     n++;
   }
   console.log(`imported ${n} v2 message(s) as legacy`);
-}
-
-// ---- service install -------------------------------------------------------------------------
-const LABEL = "com.agentmbx.daemon";
-function installService(node: MbxNode) {
-  const bin = realpathSync(process.argv[1]);
-  // prefer a stable node path (mise/asdf/volta shims survive Node upgrades) over the versioned execPath
-  const shims = [join(homedir(), ".local/share/mise/shims/node"), join(homedir(), ".asdf/shims/node"), join(homedir(), ".volta/bin/node")];
-  const nodeBin = shims.find((p) => existsSync(p)) ?? process.execPath;
-  if (process.platform === "darwin") {
-    const plist = join(homedir(), "Library/LaunchAgents", `${LABEL}.plist`);
-    mkdirSync(join(homedir(), "Library/LaunchAgents"), { recursive: true });
-    writeFileSync(plist, `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>${LABEL}</string>
-  <key>ProgramArguments</key><array><string>${nodeBin}</string><string>${bin}</string><string>daemon</string></array>
-  <key>EnvironmentVariables</key><dict><key>MBX_HOME</key><string>${node.home}</string><key>PATH</key><string>${join(homedir(), ".local/bin")}:${join(homedir(), ".local/share/mise/shims")}:${join(homedir(), ".opencode/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
-  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>${join(node.home, "daemon.log")}</string><key>StandardErrorPath</key><string>${join(node.home, "daemon.log")}</string>
-</dict></plist>\n`);
-    try { execFileSync("launchctl", ["bootout", `gui/${process.getuid!()}/${LABEL}`], { stdio: "ignore" }); } catch { /* not loaded */ }
-    execFileSync("launchctl", ["bootstrap", `gui/${process.getuid!()}`, plist]);
-    return console.log(`installed ${plist}; log: ${join(node.home, "daemon.log")}`);
-  }
-  const unit = join(homedir(), ".config/systemd/user/agentmbx.service");
-  mkdirSync(join(homedir(), ".config/systemd/user"), { recursive: true });
-  writeFileSync(unit, `[Unit]\nDescription=AgentMBX daemon\n\n[Service]\nEnvironment=MBX_HOME=${node.home}\nExecStart=${nodeBin} ${bin} daemon\nRestart=always\n\n[Install]\nWantedBy=default.target\n`);
-  execFileSync("systemctl", ["--user", "daemon-reload"]); execFileSync("systemctl", ["--user", "enable", "--now", "agentmbx.service"]);
-  console.log(`installed ${unit}`);
-}
-function uninstallService() {
-  if (process.platform === "darwin") { try { execFileSync("launchctl", ["bootout", `gui/${process.getuid!()}/${LABEL}`]); } catch { /* */ } return console.log("stopped"); }
-  execFileSync("systemctl", ["--user", "disable", "--now", "agentmbx.service"]); console.log("stopped");
 }
 
 export type { Grant };

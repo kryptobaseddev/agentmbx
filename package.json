@@ -13,6 +13,7 @@
     "test": "AGENTMBX_DEV=1 node --test --test-concurrency=1 'test/*.test.ts'",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
+    "build:macos": "bash scripts/build-macos-app.sh",
     "check-dist": "npm run build && git diff --exit-code -- dist"
   },
   "license": "BUSL-1.1",
@@ -47,6 +48,8 @@
   "files": [
     "bin",
     "dist",
+    "macos",
+    "scripts/build-macos-app.sh",
     "src",
     "docs",
     "LICENSE",

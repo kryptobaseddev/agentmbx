@@ -9,6 +9,18 @@ agentmbx owner init                              # ONLY on the machine the owner
 agentmbx daemon install                          # launchd (macOS) or systemd --user (Linux): LAN endpoint, retries, wake-ups
 ```
 
+On macOS, build the notifier app first if you want branded notifications (a clone or unpacked tarball; needs Xcode command line tools):
+```sh
+scripts/build-macos-app.sh      # build/AgentMBX.app; 'agentmbx daemon install' copies it to ~/Applications
+agentmbx notify-test            # the first notification asks for permission
+```
+- With the app, notifications show "AgentMBX" and its icon. The launchd job runs through a launcher inside the app, so System Settings > General > Login Items lists it as AgentMBX instead of "node".
+- Without it, `daemon install` still works and notifications use `osascript`.
+- Re-run `agentmbx daemon install` after rebuilding or moving the app. `agentmbx daemon uninstall` stops the job and removes its plist.
+- The build is ad-hoc signed, which is fine on the machine that built it. For distribution, see [RELEASING-macos.md](RELEASING-macos.md).
+
+On Linux, notifications use `notify-send` (package `libnotify-bin` / `libnotify`).
+
 On Linux with a firewall, open TCP 7373 to the LAN (e.g. `sudo firewall-cmd --add-port=7373/tcp --permanent && sudo firewall-cmd --reload`).
 
 ## Pairing two machines
