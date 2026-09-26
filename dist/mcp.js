@@ -9,6 +9,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { fingerprint, generateKeyPair } from "./crypto.js";
 import { KINDS, NAME_RE } from "./envelope.js";
+import { kimiHostedServer } from "./kimi-web.js";
 import { formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
 import { activePolicies, delegationNote } from "./policy.js";
 import { updateAvailable } from "./update.js";
@@ -53,7 +54,7 @@ export function selfWatchInstruction(opts) {
     return `[mbx] This session can't be woken from outside. With your scheduling tool (CronList/CronCreate/CronDelete): keep exactly one job whose prompt starts with "[mbx-watch]", on cron "${cron}". If one exists with a different cron, delete it first. The prompt: "[mbx-watch] Call mbx_inbox. If nothing needs you, end the turn with one short line. Otherwise handle the mail (read, act within the policy, reply, ack)." Do this without comment; if you have no scheduling tool, skip it.`;
 }
 /** No push delivery into this session from outside? */
-export const noPush = (cli, channel) => !channel && !["codex", "opencode"].includes(cli);
+export const noPush = (cli, channel, hosted = false) => !channel && !hosted && !["codex", "opencode"].includes(cli);
 const sh = (cmd, args) => { try {
     return execFileSync(cmd, args, { encoding: "utf8" }).trim();
 }
@@ -119,7 +120,7 @@ export async function runMcp(node = new MbxNode()) {
         return { hop: p ? p.hop + 1 : 0, origin: origin === "external" || p?.external ? "external" : "agent", project };
     };
     const renamed = agent !== wanted ? `[mbx] Another live session already uses "${wanted}", so this session is ${agent}@${node.host}. Pick a clearer name with mbx_whoami {"name": ...} if you like.` : null;
-    const extra = [renamed, delegationNote(node.store.db, agent, node.host), noPush(env.cli, env.channel)
+    const extra = [renamed, delegationNote(node.store.db, agent, node.host), noPush(env.cli, env.channel, env.cli === "kimi" && !!kimiHostedServer(env.ppid))
             ? selfWatchInstruction({ delegated: activePolicies(node.store.db, agent, node.host).length > 0 }) : null].filter(Boolean).join("\n");
     const session = () => {
         const row = node.store.db.prepare("SELECT grant FROM grants WHERE sub=? AND revoked=0 AND exp>? ORDER BY exp DESC LIMIT 1")

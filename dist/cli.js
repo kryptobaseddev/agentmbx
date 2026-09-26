@@ -19,6 +19,7 @@ import { installKind, version } from "./version.js";
 import { installService, serviceLabel, uninstallService } from "./service.js";
 import { CLIS, defaultHostName, defaultWhich, formatRows, ownerStep, resolveCommand, runSetup, shJoin } from "./setup.js";
 import { dispatchWakes, inboxCommand, macNotifierPath, notifyDesktop, opencodeService, opencodeSessionFor } from "./wake.js";
+import { kimiHostedServer } from "./kimi-web.js";
 import { approveKimi, decidePermission, opencodePermissionPass } from "./permission.js";
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
 
@@ -649,7 +650,7 @@ async function hook(node, event, cli) {
         const note = delegationNote(node.store.db, agent, node.host);
         if (note)
             lines.push(note);
-        if (noPush(cli, cli === "claude" && detectHost(process.ppid).channel)) {
+        if (noPush(cli, cli === "claude" && detectHost(process.ppid).channel, cli === "kimi" && !!kimiHostedServer(process.ppid))) {
             const w = selfWatchInstruction({ delegated: !!note });
             if (w)
                 lines.push(w);

@@ -7,6 +7,7 @@ import {
   attachAuthority, buildEnvelope, ownerSign, ownerSignRequest, withOwnerSig, checkAuthority, checkShape, NAME_RE, signEnvelope, verifyEnvelope,
   type Draft, type Envelope, type Grant,
 } from "./envelope.ts";
+import { kimiHostedServer } from "./kimi-web.ts";
 import { ownerPublicKey } from "./owner.ts";
 import { effectivePolicy, policyLine } from "./policy.ts";
 import { procStart, provenProcess, sameProcess } from "./proc.ts";
@@ -32,6 +33,10 @@ export const LIVE_AGENT_MS = 24 * 3_600_000;
 export const SHELL_AGENT_MS = 2 * 3_600_000;
 export const alive = (pid: number | null | undefined) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; } };
 const WAKEABLE = new Set(["codex", "opencode"]);
+/** A session row can be woken when its CLI has a wake adapter and the row is a real (non-MCP) session; kimi rows
+ *  only count when the binding's pid is a live `kimi web` server instance — terminal TUI sessions are never woken. */
+const sessionWakeable = (x: { cli: string; session_id: string; pid?: number | null; channel?: number | boolean }): boolean =>
+  !!x.channel || ((WAKEABLE.has(x.cli) || (x.cli === "kimi" && !!kimiHostedServer(x.pid))) && !x.session_id.startsWith("mcp-"));
 
 export const defaultHome = () => process.env.MBX_HOME || join(homedir(), ".local", "share", "agentmbx");
 const shortHost = () => hostname().split(".")[0].toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) || "host";
@@ -128,8 +133,7 @@ export class MbxNode {
       session_key=COALESCE(excluded.session_key,session_key), channel=excluded.channel, updated_at=excluded.updated_at, pid_start=excluded.pid_start`)
       .run(s.agent, s.cli, s.session_id, s.cwd ?? null, s.pid ?? null, s.session_key ?? null, s.channel ? 1 : 0, new Date().toISOString(), start);
     // a session that can now be woken for real gets another try at mail that only produced a desktop notice
-    const wakeable = s.channel || (WAKEABLE.has(s.cli) && !s.session_id.startsWith("mcp-"));
-    if (wakeable)
+    if (sessionWakeable(s))
       db.prepare("UPDATE deliveries SET state='delivered', note=NULL WHERE agent=? AND state='notified' AND note='desktop'").run(s.agent);
     return s.agent;
   }
@@ -220,8 +224,8 @@ export class MbxNode {
   deliveryMode(agent: string): string {
     const ss = this.sessionsFor(agent).filter((x) => x.pid && this.sameSession(x.pid, x));
     if (ss.some((x) => x.channel)) return "push (Claude channel)";
-    const w = ss.find((x) => WAKEABLE.has(x.cli) && !x.session_id.startsWith("mcp-"));
-    if (w) return w.cli === "codex" ? "push (codex queue)" : "push (opencode service)";
+    const w = ss.find((x) => sessionWakeable(x));
+    if (w) return w.cli === "codex" ? "push (codex queue)" : w.cli === "kimi" ? "push (kimi web)" : "push (opencode service)";
     return "no push: new mail shows on your user's next prompt, or when your [mbx-watch] self-check runs";
   }
 

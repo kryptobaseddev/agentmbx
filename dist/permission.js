@@ -1,10 +1,9 @@
 // YOLO (docs/POLICY.md §5): a CLI session auto-approves its own permission prompts while an owner policy grants its
 // agent the `permissions` class. Anything else (no policy, unknown agent, malformed input, any error) returns no
 // decision, so the CLI shows its normal prompt. Per-CLI mechanisms and evidence: docs/RESEARCH.md "Permission hooks per CLI".
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { agentName } from "./mcp.js";
+import { kimiServer } from "./kimi-web.js";
+export { kimiServer } from "./kimi-web.js";
 /** Tools that collect an answer from the user rather than ask for permission: never auto-approved. */
 const INTERACTIVE = new Set(["AskUserQuestion", "ExitPlanMode"]);
 const NONE = { allow: false, output: "" };
@@ -56,30 +55,7 @@ export function decidePermission(input, cli, lookup, o) {
         return NONE;
     }
 }
-const alive = (pid) => { try {
-    process.kill(pid, 0);
-    return true;
-}
-catch {
-    return false;
-} };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-/** A live local Kimi server (kimi web / kimi rc / desktop) from $KIMI_CODE_HOME/server/instances, with its bearer token. */
-export function kimiServer(kimiHome = process.env.KIMI_CODE_HOME || join(homedir(), ".kimi-code"), isAlive = alive) {
-    try {
-        const dir = join(kimiHome, "server/instances"), tokenFile = join(kimiHome, "server.token");
-        if (!existsSync(dir) || !existsSync(tokenFile))
-            return null;
-        const token = readFileSync(tokenFile, "utf8").trim();
-        for (const f of readdirSync(dir).filter((f) => f.endsWith(".json"))) {
-            const j = JSON.parse(readFileSync(join(dir, f), "utf8"));
-            if (typeof j.pid === "number" && typeof j.port === "number" && isAlive(j.pid))
-                return { url: `http://${j.host || "127.0.0.1"}:${j.port}`, token };
-        }
-    }
-    catch { /* none */ }
-    return null;
-}
 /**
  * Approve one Kimi approval through the server that hosts the session. Kimi fires the PermissionRequest hook just before it
  * registers the approval, so poll the pending list briefly. A session the server doesn't host (a plain TUI) answers with an

@@ -1,11 +1,11 @@
 // YOLO (docs/POLICY.md §5): a CLI session auto-approves its own permission prompts while an owner policy grants its
 // agent the `permissions` class. Anything else (no policy, unknown agent, malformed input, any error) returns no
 // decision, so the CLI shows its normal prompt. Per-CLI mechanisms and evidence: docs/RESEARCH.md "Permission hooks per CLI".
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { agentName } from "./mcp.ts";
+import { kimiServer } from "./kimi-web.ts";
 import type { MbxNode } from "./node.ts";
+
+export { kimiServer } from "./kimi-web.ts";
 
 /** Is the permissions class granted to `agent` for a session working in `ctx.cwd`? (see policy.ts hasClass) */
 export type Lookup = (agent: string, ctx?: { cwd?: string | null }) => { ok: boolean; policy_id?: string; exp?: string };
@@ -57,22 +57,7 @@ export function decidePermission(input: unknown, cli: string, lookup: Lookup, o:
 
 // ---- Kimi: `kimi web` approvals API ------------------------------------------------------------
 type Fetch = typeof fetch;
-const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-/** A live local Kimi server (kimi web / kimi rc / desktop) from $KIMI_CODE_HOME/server/instances, with its bearer token. */
-export function kimiServer(kimiHome = process.env.KIMI_CODE_HOME || join(homedir(), ".kimi-code"), isAlive = alive): { url: string; token: string } | null {
-  try {
-    const dir = join(kimiHome, "server/instances"), tokenFile = join(kimiHome, "server.token");
-    if (!existsSync(dir) || !existsSync(tokenFile)) return null;
-    const token = readFileSync(tokenFile, "utf8").trim();
-    for (const f of readdirSync(dir).filter((f) => f.endsWith(".json"))) {
-      const j = JSON.parse(readFileSync(join(dir, f), "utf8")) as { pid?: number; host?: string; port?: number };
-      if (typeof j.pid === "number" && typeof j.port === "number" && isAlive(j.pid)) return { url: `http://${j.host || "127.0.0.1"}:${j.port}`, token };
-    }
-  } catch { /* none */ }
-  return null;
-}
 
 /**
  * Approve one Kimi approval through the server that hosts the session. Kimi fires the PermissionRequest hook just before it
