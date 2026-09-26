@@ -177,11 +177,11 @@ export class MbxNode {
   // ---- reading -----------------------------------------------------------------------------
   inbox(agent: string, opts: { all?: boolean; limit?: number } = {}): MessageRow[] {
     return this.store.db.prepare(`SELECT m.*, d.state FROM deliveries d JOIN messages m ON m.id=d.msg_id
-      WHERE d.agent=? ${opts.all ? "" : "AND d.state NOT IN ('read','acked')"} ORDER BY m.ts LIMIT ?`).all(agent, opts.limit ?? 50) as never;
+      WHERE d.agent=? ${opts.all ? "" : "AND d.state <> 'acked'"} ORDER BY m.ts LIMIT ?`).all(agent, opts.limit ?? 50) as never;
   }
 
   unreadCount(agent: string): number {
-    return (this.store.db.prepare("SELECT count(*) n FROM deliveries WHERE agent=? AND state NOT IN ('read','acked')").get(agent) as { n: number }).n;
+    return (this.store.db.prepare("SELECT count(*) n FROM deliveries WHERE agent=? AND state <> 'acked'").get(agent) as { n: number }).n;
   }
 
   message(id: string): MessageRow | undefined {
@@ -190,10 +190,10 @@ export class MbxNode {
     return rows[0];
   }
 
-  read(id: string, agent: string): MessageRow {
+  /** Read-only: fetching a message changes nothing (so every CLI can auto-allow it). "Unread" means "not acked". */
+  read(id: string, _agent?: string): MessageRow {
     const m = this.message(id);
     if (!m) throw new Error(`no message ${id}`);
-    this.store.setDelivery(m.id, agent, "read");
     return m;
   }
 

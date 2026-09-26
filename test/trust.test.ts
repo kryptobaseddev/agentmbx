@@ -123,8 +123,9 @@ test("local delivery, labels, inbox/read/ack, threads and search", () => {
   assert.equal(inbox[0].trust, "local");
   assert.equal(a.unreadCount("helper"), 1);
   a.read(envelope.id, "helper");
-  assert.equal(a.unreadCount("helper"), 0);
+  assert.equal(a.unreadCount("helper"), 1, "reading is read-only; only ack clears it");
   a.ack(envelope.id, "helper", "done");
+  assert.equal(a.unreadCount("helper"), 0);
   assert.equal(a.inbox("helper", { all: true })[0].state, "acked");
   assert.equal(a.thread(envelope.thread).length, 2);
   assert.equal(a.search("deploy")[0].id, envelope.id);

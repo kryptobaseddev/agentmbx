@@ -1,6 +1,6 @@
 // SQLite store (node:sqlite, WAL). One per host; every mbx process on the host opens it.
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Envelope } from "./envelope.ts";
 
@@ -48,6 +48,7 @@ export class Store {
     mkdirSync(home, { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(join(home, "mbx.db"));
     this.db.exec(SCHEMA);
+    for (const f of ["mbx.db", "mbx.db-wal", "mbx.db-shm"]) { try { chmodSync(join(home, f), 0o600); } catch { /* not created yet */ } }
   }
   close() { this.db.close(); }
 

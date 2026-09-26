@@ -87,7 +87,7 @@ export async function main(argv = process.argv.slice(2)) {
     case "status": {
       const q = (sql: string) => (node.store.db.prepare(sql).get() as { n: number }).n;
       console.log(`host ${node.host} (${fingerprint(node.key.publicKey)})  owner ${node.ownerPub ? fingerprint(node.ownerPub) : "none"}
-messages ${q("SELECT count(*) n FROM messages")}  unread ${q("SELECT count(*) n FROM deliveries WHERE state NOT IN ('read','acked')")}  outbox ${q("SELECT count(*) n FROM outbox")}
+messages ${q("SELECT count(*) n FROM messages")}  unacked ${q("SELECT count(*) n FROM deliveries WHERE state <> 'acked'")}  outbox ${q("SELECT count(*) n FROM outbox")}
 peers ${node.peers().map((p) => `${p.host}(${p.state})`).join(" ") || "none"}  active grants ${q(`SELECT count(*) n FROM grants WHERE revoked=0 AND exp>'${new Date().toISOString()}'`)}`);
       return;
     }
