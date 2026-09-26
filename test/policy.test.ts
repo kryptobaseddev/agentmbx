@@ -215,6 +215,30 @@ test("rename alias: mail for the old name follows the session until a live sessi
   n.close();
 });
 
+test("rename alias: a rename never takes the mail of a name a shell sender still uses", () => {
+  const n = new MbxNode(tmp(), { host: "alpha" });
+  n.registerAgent("claude", { cli: "cli" });
+  n.store.db.prepare("UPDATE agents SET last_seen=? WHERE name='claude'").run(new Date().toISOString());
+  n.bindSession({ agent: "mac-dev", cli: "claude", session_id: "c9", pid: process.pid, session_key: "k" });
+  n.addAlias("claude", "mac-dev", process.pid); // refused: claude is in use by a shell sender
+  assert.deepEqual(n.send({ from: "codex", to: ["claude"], subject: "s", body: "b" }).local, ["claude"]);
+  n.store.set("alias:claude", "mac-dev"); // a stale alias from before the fix stops redirecting too
+  assert.deepEqual(n.send({ from: "codex", to: ["claude"], subject: "s", body: "b" }).local, ["claude"]);
+  n.close();
+});
+
+test("message ids leak nothing: read, ack, thread and search only show an agent its own mail", () => {
+  const n = new MbxNode(tmp(), { host: "alpha" });
+  const id = n.send({ from: "claude", to: ["kimi-home-mbx"], subject: "private", body: "for kimi only" }).envelope.id;
+  assert.throws(() => n.read(id, "vidapeps-lead"), /no message/);
+  assert.throws(() => n.ack(id, "vidapeps-lead"), /no message/);
+  assert.deepEqual(n.thread(id, "vidapeps-lead"), []);
+  assert.deepEqual(n.search("private", 10, "vidapeps-lead"), []);
+  assert.equal(n.read(id, "kimi-home-mbx").id, id); assert.equal(n.read(id, "claude").id, id);
+  assert.equal(n.search("private", 10, "kimi-home-mbx").length, 1);
+  n.close();
+});
+
 test("--as rule: a session can't claim a name another live session holds; callerAgent walks up the process tree", () => {
   const n = new MbxNode(tmp(), { host: "alpha" });
   n.bindSession({ agent: "me", cli: "claude", session_id: "c1", pid: process.pid, session_key: "k" });

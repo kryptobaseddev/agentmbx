@@ -157,7 +157,7 @@ export async function runMcp(node = new MbxNode()) {
       if (prev) return text(`Already sent as ${prev} (same idempotency_key).`, { id: prev, duplicate: true });
     }
     let thread: string | undefined;
-    if (reply_to) { const m = node.message(reply_to); if (!m) throw new Error(`no message ${reply_to}`); thread = m.thread; reply_to = m.id; }
+    if (reply_to) { const m = node.read(reply_to, agent); thread = m.thread; reply_to = m.id; }
     const r = node.send({ from: agent, to, subject, body, kind, reply_to, thread, needs_reply, refs, ...relay(origin) }, session());
     if (idempotency_key) node.store.set(`idem:${agent}:${idempotency_key}`, r.envelope.id);
     const out = { id: r.envelope.id, ref: `mbx:${r.envelope.id}@${node.host}`, thread: r.envelope.thread, delivered_locally: r.local, queued_for_hosts: r.remote,
@@ -174,8 +174,7 @@ export async function runMcp(node = new MbxNode()) {
       origin: z.enum(["agent", "external"]).optional().describe("external when the content comes from outside"),
     },
   }, async ({ id, body, kind, needs_reply, origin }) => {
-    const m = node.message(id);
-    if (!m) throw new Error(`no message ${id}`);
+    const m = node.read(id, agent);
     noteRead([m]);
     const subject = /^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`.slice(0, 200);
     const r = node.send({ from: agent, to: [m.from_addr], subject, body, kind, reply_to: m.id, thread: m.thread, needs_reply, refs: [], ...relay(origin) }, session());
@@ -219,18 +218,18 @@ export async function runMcp(node = new MbxNode()) {
     annotations: { readOnlyHint: true },
   }, async ({ id }) => {
     const m = node.message(id);
-    const rows = node.thread(m ? m.thread : id);
+    const rows = node.thread(m && node.canSee(m, agent) ? m.thread : id, agent);
     noteRead(rows);
     return text(rows.length ? rows.map((r) => formatFor(node, r, agent)).join("\n\n") : `No thread ${id}.`);
   });
 
   server.registerTool("mbx_search", {
     title: "Search mbx messages",
-    description: "Full-text search over subjects and bodies of every message stored on this host. Next: mbx_read or mbx_thread an id from the results.",
+    description: "Full-text search over subjects and bodies of the messages you sent or received. Next: mbx_read or mbx_thread an id from the results.",
     inputSchema: { query: z.string().min(2).max(200), limit: z.number().int().min(1).max(50).default(10) },
     annotations: { readOnlyHint: true },
   }, async ({ query, limit }) => {
-    const rows = node.search(query, limit);
+    const rows = node.search(query, limit, agent);
     return text(rows.length ? rows.map(summaryLine).join("\n") : `No matches for "${query}".`, { ids: rows.map((r) => r.id) });
   });
 

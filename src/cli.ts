@@ -189,9 +189,9 @@ async function run(argv: string[]) {
     }
     case "thread": {
       const m = node.message(pos[0] ?? die("thread <id>")), me = str("as")?.split("@")[0];
-      return node.thread(m ? m.thread : pos[0]).forEach((r) => console.log((me ? formatFor(node, r, me) : formatMessage(r)) + "\n"));
+      return node.thread(m && (!me || node.canSee(m, me)) ? m.thread : pos[0], me).forEach((r) => console.log((me ? formatFor(node, r, me) : formatMessage(r)) + "\n"));
     }
-    case "search": return node.search(pos.join(" ")).forEach((m) => console.log(summaryLine(m)));
+    case "search": return node.search(pos.join(" "), 20, str("as")?.split("@")[0]).forEach((m) => console.log(summaryLine(m)));
     case "whoami": {
       const name = as().split("@")[0];
       node.registerAgent(name, { cli: str("cli") ?? "cli", role: str("role"), description: str("description") });

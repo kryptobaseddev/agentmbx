@@ -169,6 +169,16 @@ export class MbxNode {
       { pid: number; pid_start: string | null; updated_at: string }[]).some((r) => this.sameSession(r.pid, r));
   }
 
+  /**
+   * Is `name` in use by someone other than session `exceptPid`: a live session, or a shell sender (`--as`) seen in the
+   * last 2 h. A rename never takes such a name's mail, and an old alias stops redirecting once the name is in use again.
+   */
+  inUseElsewhere(name: string, exceptPid: number): boolean {
+    if (this.heldByOther(name, exceptPid)) return true;
+    const r = this.store.db.prepare("SELECT cli, last_seen FROM agents WHERE name=? AND host=?").get(name, this.host) as { cli: string | null; last_seen: string | null } | undefined;
+    return !!r && r.cli === "cli" && !!r.last_seen && Date.now() - Date.parse(r.last_seen) < SHELL_AGENT_MS;
+  }
+
   /** A name a shell sender (`agentmbx send --as`, no session) used in the last 2 h: new sessions don't take it. */
   shellHeld(name: string): boolean {
     const r = this.store.db.prepare("SELECT cli, last_seen FROM agents WHERE name=? AND host=?").get(name, this.host) as { cli: string | null; last_seen: string | null } | undefined;
@@ -190,14 +200,14 @@ export class MbxNode {
 
   /** After a rename, mail for the old name follows the session (until a live session takes the old name again). */
   addAlias(oldName: string, newName: string, pid: number) {
-    if (oldName === newName || this.heldByOther(oldName, pid)) return;
+    if (oldName === newName || this.inUseElsewhere(oldName, pid)) return;
     this.store.set(`alias:${oldName}`, newName);
     this.store.audit("agent.renamed", { from: oldName, to: newName });
   }
 
   resolveAlias(name: string): string {
     let n = name;
-    for (let i = 0; i < 5; i++) { const next = this.store.get(`alias:${n}`); if (!next || this.heldByOther(n, -1)) break; n = next; }
+    for (let i = 0; i < 5; i++) { const next = this.store.get(`alias:${n}`); if (!next || this.inUseElsewhere(n, -1)) break; n = next; }
     return n;
   }
 
@@ -439,17 +449,28 @@ export class MbxNode {
     return rows[0];
   }
 
+  /**
+   * Can `agent` (or a name linked to its session) see this message: it sent it or it was delivered to it. Everything
+   * that takes a message id for an agent checks this and answers "not found" otherwise, so ids leak nothing.
+   */
+  canSee(m: MessageRow, agent: string): boolean {
+    const names = [agent, ...this.linkedNames(agent)];
+    const [fa, fh] = m.from_addr.split("@");
+    if ((m.origin === "local" || fh === this.host) && names.includes(fa)) return true;
+    return names.some((n) => this.store.db.prepare("SELECT 1 FROM deliveries WHERE msg_id=? AND agent=?").get(m.id, n));
+  }
+
   /** Read-only: fetching a message changes nothing (so every CLI can auto-allow it). "Unread" means "not acked". */
-  read(id: string, _agent?: string): MessageRow {
+  read(id: string, agent?: string): MessageRow {
     const m = this.message(id);
-    if (!m) throw Object.assign(new Error(`no message ${id} (list yours with: agentmbx inbox --as <you> --all)`), { code: "NOT_FOUND" });
+    if (!m || (agent && !this.canSee(m, agent))) throw Object.assign(new Error(`no message ${id} (list yours with: agentmbx inbox --as <you> --all)`), { code: "NOT_FOUND" });
     return m;
   }
 
   /** `did`: what the agent did on this message's request; recorded in the audit log with the policy that allowed it. */
   ack(id: string, agent: string, note: string | null = null, did?: string) {
     const m = this.message(id);
-    if (!m) throw Object.assign(new Error(`no message ${id}`), { code: "NOT_FOUND" });
+    if (!m || !this.canSee(m, agent)) throw Object.assign(new Error(`no message ${id}`), { code: "NOT_FOUND" });
     this.store.setDelivery(m.id, agent, "read");
     this.store.setDelivery(m.id, agent, "acked", note);
     if (did) {
@@ -465,9 +486,15 @@ export class MbxNode {
     return effectivePolicy(this.store.db, { agent, host: this.host, fromAgent, fromHost: m.origin === "local" ? this.host : fromHost, envelope: JSON.parse(m.envelope) as Envelope });
   }
 
-  thread(thread: string): MessageRow[] { return this.store.db.prepare("SELECT * FROM messages WHERE thread=? ORDER BY ts").all(thread) as never; }
+  /** A thread's messages, oldest first; with `agent`, only the ones that agent can see. */
+  thread(thread: string, agent?: string): MessageRow[] {
+    const rows = this.store.db.prepare("SELECT * FROM messages WHERE thread=? ORDER BY ts").all(thread) as unknown as MessageRow[];
+    return agent ? rows.filter((m) => this.canSee(m, agent)) : rows;
+  }
 
-  search(q: string, limit = 20): MessageRow[] {
+  /** Full-text search; with `agent`, only messages that agent can see. */
+  search(q: string, limit = 20, agent?: string): MessageRow[] {
+    if (agent) return this.search(q, limit * 20).filter((m) => this.canSee(m, agent)).slice(0, limit);
     const fts = q.replace(/["']/g, " ").split(/\s+/).filter(Boolean).map((w) => `"${w}"`).join(" ");
     if (!fts) return [];
     return this.store.db.prepare(`SELECT m.* FROM messages_fts f JOIN messages m ON m.rowid=f.rowid WHERE messages_fts MATCH ?
