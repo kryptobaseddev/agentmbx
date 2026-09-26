@@ -192,3 +192,13 @@ test("self-watch: only when delegated or forced, even intervals, off removes the
   assert.match(selfWatchInstruction({ delegated: true, env: { MBX_KIMI_WATCH: "off" } })!, /CronDelete/);
   assert.equal(watchCron(60), "0 * * * *");
 });
+
+test("setup policy default: collaborate (ratified), explicit wins, no terminal + passphrase backend signs nothing", async () => {
+  const { setupPolicyLevel } = await import("../src/cli.ts");
+  assert.equal(setupPolicyLevel({ answer: "", keychain: true }), "collaborate");
+  assert.equal(setupPolicyLevel({ answer: "1", keychain: true }), "ask");
+  assert.equal(setupPolicyLevel({ answer: "4", keychain: false }), "yolo");
+  assert.equal(setupPolicyLevel({ keychain: true }), "collaborate");
+  assert.equal(setupPolicyLevel({ keychain: false }), undefined);
+  assert.equal(setupPolicyLevel({ explicit: "ask", keychain: true }), "ask");
+});

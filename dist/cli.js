@@ -792,9 +792,21 @@ async function setup(o, str) {
 }
 /**
  * Onboarding: how much may this machine's agents do for each other? One owner-signed policy for every local agent
- * (`*`, from this machine only). --policy <level> answers it up front (an agent may pass it: the human still approves the
- * exact text in the Touch ID / passphrase prompt). Without an answer nothing is signed and agents ask first.
+ * (`*`, from this machine only). The default is `collaborate` (POLICY.md, ratified 2026-09-26): read, test and reversible
+ * edits in the project; outward actions still ask. --policy <level> answers up front, `--policy ask` signs nothing. The
+ * human always approves the exact text in the Touch ID / passphrase prompt, so an agent running setup can't widen it.
  */
+/**
+ * The level onboarding signs: an explicit --policy wins; a menu answer 1-4 (empty = 2, collaborate); with no answer
+ * collaborate where the human approves with Touch ID (keychain backend), nothing where a passphrase would need a terminal.
+ */
+export function setupPolicyLevel(o) {
+    if (o.explicit)
+        return o.explicit;
+    if (o.answer !== undefined)
+        return { "1": "ask", "3": "autonomous", "4": "yolo" }[o.answer.trim()] ?? "collaborate";
+    return o.keychain ? "collaborate" : undefined;
+}
 async function policyStep(level, yes) {
     const node = new MbxNode();
     try {
@@ -803,20 +815,24 @@ async function policyStep(level, yes) {
         const active = node.store.db.prepare("SELECT count(*) n FROM policies WHERE revoked=0 AND exp > ?").get(new Date().toISOString());
         if (active.n && !level)
             return console.log(`policy: ${active.n} active (agentmbx policy list)`);
+        const keychain = ownerInfo(node.home)?.backend === "keychain";
         if (!level && process.stdin.isTTY && !yes) {
             const { createInterface } = await import("node:readline/promises");
             const rl = createInterface({ input: process.stdin, output: process.stdout });
             const a = (await rl.question(`\nHow much may the agents on this machine do for each other?
-  1) ask          they answer each other; anything else waits for you (default)
-  2) collaborate  read, test and make reversible edits in their project; push/deploy/delete still ask you   [recommended]
+  1) ask          they answer each other; anything else waits for you
+  2) collaborate  read, test and make reversible edits in their project; push/deploy/delete still ask you   [default]
   3) autonomous   same classes, no check-ins until done
   4) yolo         everything, including approving their own permission prompts (8 hours)
-Choose 1-4: `)).trim();
+Choose 1-4 [2]: `)).trim();
             rl.close();
-            level = { "2": "collaborate", "3": "autonomous", "4": "yolo" }[a] ?? "ask";
+            level = setupPolicyLevel({ answer: a, keychain });
         }
-        if (!level || level === "ask")
-            return console.log("policy: none. Agents ask you before acting on each other's requests. Later: agentmbx policy set '*' collaborate");
+        level = setupPolicyLevel({ explicit: level, keychain });
+        if (!level)
+            return console.log("policy: not set (it needs your passphrase on a terminal). To let agents work together: agentmbx policy set '*' collaborate --ttl 30d");
+        if (level === "ask")
+            return console.log("policy: none. Agents ask you before acting on each other's requests. Later: agentmbx policy set '*' collaborate --ttl 30d");
         await policy(node, ["set", "*", level], (k) => (k === "ttl" ? (level === "yolo" ? "8h" : "30d") : undefined), {});
     }
     finally {

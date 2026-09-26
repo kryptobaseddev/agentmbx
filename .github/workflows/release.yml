@@ -55,7 +55,7 @@ jobs:
           printf '%s' "$MBX_CODESIGN_P12" | base64 --decode > "$RUNNER_TEMP/agentmbx-signing.p12"
           security import "$RUNNER_TEMP/agentmbx-signing.p12" -k "$KC" -P "$MBX_CODESIGN_P12_PASSWORD" -T /usr/bin/codesign
           rm -f "$RUNNER_TEMP/agentmbx-signing.p12"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KCPASS" "$KC" >/dev/null
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPASS" "$KC" >/dev/null
           security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
           echo "MBX_CODESIGN_IDENTITY=${MBX_CODESIGN_IDENTITY_NAME:-AgentMBX Code Signing}" >> "$GITHUB_ENV"
           echo "MBX_CODESIGN_KEYCHAIN=$KC" >> "$GITHUB_ENV"
