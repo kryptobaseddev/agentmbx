@@ -1,13 +1,16 @@
 # Installing AgentMBX on a machine
 
-Requires Node 24 or later.
-
 ```sh
-npm install -g https://github.com/kryptobaseddev/agentmbx/archive/refs/heads/main.tar.gz
+curl -fsSL https://agentmbx.com/install.sh | sh   # single binary in ~/.local/bin, sha256-verified; no Node needed
+#   fallback: curl -fsSL https://raw.githubusercontent.com/kryptobaseddev/agentmbx/main/install.sh | sh
+#   or with Node >= 24: npm install -g https://github.com/kryptobaseddev/agentmbx/archive/refs/heads/main.tar.gz
 agentmbx init --host laptop                      # host name others will see; creates the host key
 agentmbx owner init                              # ONLY on the machine the owner uses; asks for a passphrase (save it in a password manager)
 agentmbx daemon install                          # launchd (macOS) or systemd --user (Linux): LAN endpoint, retries, wake-ups
 ```
+
+Update later with `agentmbx update` (binary installs; checks the Ed25519-signed release manifest and the sha256 of the
+download, then restarts the daemon). npm and source installs print the command to run instead.
 
 On Linux with a firewall, open TCP 7373 to the LAN (e.g. `sudo firewall-cmd --add-port=7373/tcp --permanent && sudo firewall-cmd --reload`).
 

@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npx tsc --noEmit
+      - name: Committed dist/ matches src/
+        run: npm run check-dist
+      - name: Single executable builds and runs
+        run: |
+          node scripts/build-sea.mjs
+          node scripts/smoke-sea.mjs "build/agentmbx-$(node -p 'process.platform + "-" + process.arch')"

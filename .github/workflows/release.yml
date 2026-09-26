@@ -1,0 +1,108 @@
+name: release
+
+# Cut a release by pushing a tag vX.Y.Z that matches package.json (see docs/RELEASING.md).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.platform }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: macos-14, platform: darwin-arm64 }
+          # GitHub retired the macos-13 image; macos-15-intel is the x64 macOS runner
+          - { os: macos-15-intel, platform: darwin-x64 }
+          - { os: ubuntu-24.04, platform: linux-x64 }
+          - { os: ubuntu-24.04-arm, platform: linux-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Tag matches package.json version
+        run: |
+          want="v$(node -p 'require("./package.json").version')"
+          [ "$want" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match package.json ($want)"; exit 1; }
+      - run: npm ci
+      - run: npm test
+      - run: npx tsc --noEmit
+      - name: Build single executable
+        run: node scripts/build-sea.mjs
+      - name: Check the build is for ${{ matrix.platform }}
+        run: test -f "build/agentmbx-${{ matrix.platform }}"
+      - name: Smoke test (init, send, inbox, MCP over stdio)
+        run: node scripts/smoke-sea.mjs "build/agentmbx-${{ matrix.platform }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentmbx-${{ matrix.platform }}
+          path: build/agentmbx-${{ matrix.platform }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          pattern: agentmbx-*
+          merge-multiple: true
+      - name: SHA256SUMS + manifest.json
+        run: node scripts/make-manifest.mjs release "$GITHUB_REF_NAME"
+      - name: Sign manifest.json (Ed25519)
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          # set only for the one release that rotates the key (docs/RELEASING.md)
+          RELEASE_ROTATION_PREVIOUS_KEY: ${{ vars.RELEASE_ROTATION_PREVIOUS_KEY }}
+        run: node scripts/sign-manifest.mjs release/manifest.json
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp install.sh release/install.sh
+          chmod +x release/agentmbx-*
+          (cd release && sha256sum -c SHA256SUMS)
+          pre=""; case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" $pre --verify-tag --generate-notes --title "AgentMBX $GITHUB_REF_NAME" \
+            release/agentmbx-* release/SHA256SUMS release/manifest.json release/manifest.json.sig release/install.sh
+
+  npm:
+    # Optional: runs only when the NPM_TOKEN secret exists.
+    needs: release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.NPM_TOKEN != ''
+      - uses: actions/setup-node@v4
+        if: env.NPM_TOKEN != ''
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: npm publish
+        if: env.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          tag=latest; case "$GITHUB_REF_NAME" in *-*) tag=next ;; esac
+          npm publish --provenance --access public --tag "$tag"
+      - if: env.NPM_TOKEN == ''
+        run: echo "NPM_TOKEN not set; skipping npm publish"
