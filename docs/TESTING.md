@@ -1,13 +1,14 @@
 # Testing
 
 ## Automated (`npm test`)
-19 tests, runs in a few seconds, and needs no network or model:
+30 tests, runs in about ten seconds, and needs no network or model (the mDNS test uses loopback multicast and skips itself if that is blocked):
 
 | File | What it covers |
 |---|---|
 | `test/envelope.test.ts` | canonical JSON, ULIDs, signatures and tamper detection, the body metadata parser, size limits |
 | `test/trust.test.ts` | the council's four trust tests, plus forged, expired and revoked grants, spoofing, local delivery, the wake brake, and the owner-key file |
 | `test/lan.test.ts` | two hosts over real HTTP: pairing code on both sides, approval, both directions, directory sync, an offline peer catching up, stale or forged hops rejected |
+| `test/pair.test.ts` | token pairing both ways with messages flowing; wrong token (burned after 5), expired, reused, replayed hello, tampered transcript (owner key, host key, name, addr, rewritten hello), a fake token holder; SAS still works; mDNS TXT round-trip and a loopback advertise + browse |
 | `test/mcp.test.ts` | the real MCP client over stdio: every tool, framing, idempotency, and the Claude channel push (without the message body) |
 
 The four trust tests come from the council's review:
@@ -26,5 +27,5 @@ Run them on a machine that stays awake. A laptop on battery with the lid closed 
 
 ## Cross-machine
 1. Install on both machines and `agentmbx daemon install` on each.
-2. `agentmbx pair <other>.local:7373`, compare the code, then approve on both.
+2. `agentmbx pair` on one, then the printed `agentmbx join …` line on the other (or `pair --compare <other>.local:7373` and approve on both).
 3. `agentmbx send --as a --to b@<other> --kind request --needs-reply …`, then `agentmbx inbox --as b` on the other machine.

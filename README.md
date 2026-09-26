@@ -36,17 +36,17 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
   | Hermes | cron now; plugin planned | not tested live |
   | anything else | desktop notification | |
 
-- **Across machines:** a small daemon per host. Hosts pair with a 6-digit code that you compare on both screens. Every hop is signed. Messages to a sleeping machine wait in an outbox and retry for 72 h, and each is stored exactly once.
+- **Across machines:** a small daemon per host. Hosts pair with one command each: `agentmbx pair` prints a one-time token, `agentmbx join <host> <token>` on the other machine finishes it (or compare a 6-digit code instead). Hosts find each other on the LAN over mDNS. Every hop is signed. Messages to a sleeping machine wait in an outbox and retry for 72 h, and each is stored exactly once.
 - **A wake brake:** at most 1 wake per agent per 30 s, 6 per thread per hour, 60 per agent per day. Plain status messages never wake anyone, so two chatty agents can't burn your tokens overnight.
 - **Full-text search** (SQLite FTS5) and an audit log. `mbx:<id>@<host>` references can be cited from tickets and notes.
-- **Zero infrastructure:** Node 24, SQLite built into Node, and two dependencies (the MCP SDK and zod). No broker, no cloud, no accounts.
+- **Zero infrastructure:** Node 24, SQLite built into Node, and three small dependencies (the MCP SDK, zod, and multicast-dns for LAN discovery). No broker, no cloud, no accounts.
 
 ## Trust model (the short version)
 
 | The recipient sees | It means | It does not mean |
 |---|---|---|
 | `local (same user on this host)` | written by a process running as your OS user on this machine | that the named agent wrote it (names are labels) |
-| `verified (paired host X)` | signed by machine X's key, which you approved by comparing the pairing code | which agent on X wrote it |
+| `verified (paired host X)` | signed by machine X's key, which you approved by pairing (one-time token or compared code) | which agent on X wrote it |
 | `authority: OWNER via <agent> session <fp>` | a live session that **you** approved with your owner passphrase sent it, within the capabilities you granted, before the grant expired | that the content is safe, or that permission prompts can be skipped |
 
 - **Owner authority belongs to one running session.** You run `agentmbx owner grant` in your own terminal, pick the live session, and type your passphrase. The grant is bound to a key that exists only in that session's memory, for 12 h by default. Another process using the same agent name gets nothing.
@@ -73,10 +73,11 @@ claude mcp add --scope user mbx -- agentmbx mcp
 Pair a second machine:
 
 ```sh
-laptop$  agentmbx pair desktop.local:7373          # prints a 6-digit code
-desktop$ agentmbx peers                            # shows the same code?
-both$    agentmbx pair approve <other-host> <code>
+desktop$ agentmbx pair                             # prints a one-time token and the exact line to run on the other machine
+laptop$  agentmbx join desktop 7K3M-QX9D-4HTR      # or: agentmbx join desktop.local:7373 7K3M-QX9D-4HTR
 ```
+
+That's it: both machines are paired, no codes to compare. The token is single use and expires after 10 minutes (`--ttl`). Both sides prove they know it with an HMAC over both machines' host and owner keys, so a machine in the middle can't substitute its own keys. `agentmbx discover` lists AgentMBX hosts on the LAN (mDNS). If multicast is blocked, use the `host:port` form. Prefer comparing codes by eye? `agentmbx pair --compare desktop.local:7373`, then `agentmbx pair approve <other-host> <code>` on both machines.
 
 Then from any agent: *"send api-dev@desktop a request to run the migration tests and reply with the result"*. Or from a shell:
 
@@ -96,7 +97,7 @@ agentmbx owner grant planner --caps task.assign,decision --ttl 12h
 
 `agentmbx help` lists everything:
 - **Messages:** `send`, `inbox`, `read`, `ack`, `thread`, `search`, `agents`, `status`
-- **Machines:** `init`, `pair`, `pair approve`, `peers`, `peers remove`, `daemon [install|uninstall]`
+- **Machines:** `init`, `pair`, `join`, `discover`, `pair --compare`, `pair approve`, `peers`, `peers remove`, `daemon [install|uninstall]`
 - **Owner:** `owner init|show|grant|revoke`
 - **Integration:** `mcp`, `hook session-start|prompt|stop --cli <cli>`, `import-v2`
 

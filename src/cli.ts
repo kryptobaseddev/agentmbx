@@ -6,11 +6,12 @@ import { parseArgs } from "node:util";
 import { execFileSync } from "node:child_process";
 import { fingerprint } from "./crypto.ts";
 import { CAPS, makeGrant, type Envelope, type Grant } from "./envelope.ts";
-import { flushOutbox, pairWith, refreshDirectory, startServer, advertisedAddr } from "./http.ts";
+import { advertise, browse, lanIPv4 } from "./discovery.ts";
+import { flushOutbox, pairJoin, pairWith, refreshDirectory, startServer, advertisedAddr } from "./http.ts";
 import { agentName, runMcp } from "./mcp.ts";
-import { defaultHome, formatMessage, MbxNode, summaryLine, trustLabel } from "./node.ts";
+import { DEFAULT_PORT, defaultHome, formatMessage, MbxNode, summaryLine, trustLabel } from "./node.ts";
 import { createOwnerKey, ownerPath, readPassphraseFromTTY, unlockOwnerKey } from "./owner.ts";
-import { dispatchWakes, opencodeSessionFor } from "./wake.ts";
+import { dispatchWakes, notifyDesktop, opencodeSessionFor } from "./wake.ts";
 
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
 
@@ -20,10 +21,14 @@ Messages
   agentmbx inbox --as <agent> [--all] [--json]      mbx read <id> --as <agent>      mbx ack <id> --as <agent> [--note "…"]
   agentmbx thread <id>        mbx search "<words>"        mbx agents        mbx status
 
-Machines (pairing: run 'agentmbx pair <addr>' on one host, compare the 6-digit code, approve on BOTH hosts)
-  agentmbx init [--host <name>] [--port 7373]       mbx pair <host:port>       mbx pair approve <host> <code>
-  agentmbx peers                                    mbx peers remove <host>
-  agentmbx daemon                                   mbx daemon install | uninstall      (launchd / systemd user service)
+Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …' line it prints on the other)
+  agentmbx init [--host <name>] [--port 7373]       agentmbx discover            (hosts on the LAN, via mDNS)
+  agentmbx pair [--ttl 10m]                         one-time pairing token (single use, default 10 min)
+  agentmbx join <host|host:port> <TOKEN>            pair with the host that printed the token
+  agentmbx pair --compare <host:port>               manual alternative: compare a 6-digit code, then on BOTH hosts
+  agentmbx pair approve <host> <code>
+  agentmbx peers                                    agentmbx peers remove <host>
+  agentmbx daemon                                   agentmbx daemon install | uninstall   (launchd / systemd user service)
 
 Owner (run these yourself in a terminal; they ask for the owner passphrase and refuse to run without one)
   agentmbx owner init        mbx owner show
@@ -49,7 +54,7 @@ export async function main(argv = process.argv.slice(2)) {
     "body-file": { type: "string" }, kind: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" },
     ref: { type: "string", multiple: true }, all: { type: "boolean" }, json: { type: "boolean" }, note: { type: "string" },
     host: { type: "string" }, port: { type: "string" }, cli: { type: "string" }, session: { type: "string" }, caps: { type: "string" },
-    ttl: { type: "string" }, bind: { type: "string" } } });
+    ttl: { type: "string" }, bind: { type: "string" }, compare: { type: "string" } } });
   const str = (k: string) => (typeof o[k] === "string" ? o[k] as string : undefined);
 
   if (cmd === "mcp") return runMcp();
@@ -101,12 +106,37 @@ peers ${node.peers().map((p) => `${p.host}(${p.state})`).join(" ") || "none"}  a
         node.approvePeer(host, pos[2] ?? die("give the 6-digit code you compared: pair approve <host> <code>"));
         return console.log(`paired with ${host}. Messages from ${host} are now accepted on this host. Approve on ${host} too.`);
       }
-      const r = await pairWith(node, pos[0] ?? die("pair <host:port>"));
+      const compareAddr = str("compare") ?? pos[0];
+      if (!compareAddr) return pairToken(node, str("ttl"));
+      if (!str("compare")) process.stderr.write("note: 'pair <addr>' is the manual code-compare flow ('pair --compare <addr>'); plain 'agentmbx pair' prints a one-time token instead\n");
+      const r = await pairWith(node, withPort(compareAddr));
       console.log(`Pairing with ${r.host}\n  its host key:  ${r.key}\n  its owner key: ${r.owner ?? "none"}\n\n  CODE: ${r.code}\n
 Check that ${r.host} shows the SAME code (its daemon log, or 'agentmbx peers' there). If it matches, run on BOTH hosts:
   here:       agentmbx pair approve ${r.host} ${r.code}
   on ${r.host}:  agentmbx pair approve ${node.host} ${r.code}
 If the codes differ, do not approve: someone is in the middle.`);
+      return;
+    }
+    case "join": {
+      const target = pos[0] ?? die("join <host|host:port> <TOKEN>");
+      const token = pos.slice(1).join("") || die("join <host|host:port> <TOKEN>   (the token 'agentmbx pair' printed on the other machine)");
+      const addr = await resolveJoinAddr(node, target);
+      const r = await pairJoin(node, addr, token).catch((e: Error) => die(e.message));
+      console.log(`paired with ${r.host} (${addr})\n  its host key:  ${r.key}\n  its owner key: ${r.owner ?? "none"}\nBoth hosts now accept each other's messages. Try: agentmbx agents`);
+      await notifyDesktop("AgentMBX", `Paired with ${r.host}`);
+      return;
+    }
+    case "discover": {
+      const seen = await browse(3_000);
+      if (!seen.length) return console.log("no AgentMBX hosts answered within 3 s (the daemon advertises over mDNS; if multicast is blocked, use explicit addresses)");
+      for (const s of seen.sort((a, b) => a.host.localeCompare(b.host))) {
+        const p = node.peer(s.host);
+        const status = s.host === node.host && s.fp === fingerprint(node.key.publicKey) ? "this host"
+          : !p ? "not paired"
+          : fingerprint(p.pubkey) !== s.fp ? `${p.state}, KEY MISMATCH (advertised ${s.fp}, pinned ${fingerprint(p.pubkey)})`
+          : p.state === "approved" ? "paired" : "pending";
+        console.log(`${s.host}\t${s.addr}\tkey ${s.fp || "?"}\t${status}`);
+      }
       return;
     }
     case "daemon": {
@@ -119,6 +149,13 @@ If the codes differ, do not approve: someone is in the middle.`);
       };
       await startServer(node, node.config.port, node.config.bind, () => void tick());
       console.log(`[agentmbx] daemon for ${node.host} listening on ${node.config.bind}:${node.config.port}`);
+      if (!process.env.MBX_NO_MDNS && node.config.bind !== "127.0.0.1") {
+        let warned = false;
+        advertise({ host: node.host, fp: fingerprint(node.key.publicKey), v: "1", port: node.config.port }, (e) => {
+          if (!warned) process.stderr.write(`[agentmbx] mDNS advertising unavailable (${e.message}); peers can still join by address\n`);
+          warned = true;
+        });
+      }
       setInterval(tick, 2000);
       setInterval(() => void refreshDirectory(node), 60_000); void refreshDirectory(node);
       return;
@@ -128,6 +165,45 @@ If the codes differ, do not approve: someone is in the middle.`);
     case "import-v2": return importV2(node, pos[0] ?? die("import-v2 <dir>"));
     default: die(`unknown command "${cmd}" (agentmbx help)`);
   }
+}
+
+// ---- token pairing ---------------------------------------------------------------------------
+const withPort = (a: string) => (/:\d+$/.test(a) ? a : `${a}:${DEFAULT_PORT}`);
+
+async function pairToken(node: MbxNode, ttl = "10m") {
+  const m = /^(\d+)(s|m|h)?$/.exec(ttl) ?? die("--ttl like 10m, 90s or 1h (at most 1h)");
+  const ms = Number(m[1]) * ({ s: 1_000, m: 60_000, h: 3_600_000 } as const)[(m[2] ?? "m") as "s" | "m" | "h"];
+  const { token, expires_at } = node.createPairToken(ms);
+  const port = node.config.port;
+  // warn early if nothing here will answer the join
+  const local = node.config.bind === "0.0.0.0" ? "127.0.0.1" : node.config.bind;
+  const up = await fetch(`http://${local}:${port}/v1/pair/hello`, { signal: AbortSignal.timeout(1_500) }).then((r) => r.ok, () => false);
+  const lines = [`agentmbx join ${withPort(advertisedAddr(node))} ${token}`, ...lanIPv4().map((ip) => `agentmbx join ${ip}:${port} ${token}`)];
+  console.log(`Pairing token for ${node.host} (single use, expires ${new Date(expires_at).toLocaleTimeString()}):
+
+    ${token}
+
+On the other machine run ONE of:
+${[...new Set(lines)].map((l) => `  ${l}`).join("\n")}
+  agentmbx join ${node.host} ${token}      (finds this host on the LAN via mDNS)
+
+Whoever holds this token can pair with ${node.host} until it is used or expires. Don't paste it anywhere shared.`);
+  if (!up) process.stderr.write(`\nwarning: no AgentMBX daemon answered on ${local}:${port}; start it (agentmbx daemon install) or the join will fail\n`);
+}
+
+/** host:port and IPs are used as given (default port 7373); a bare host name is looked up with mDNS, then <name>.local. */
+async function resolveJoinAddr(node: MbxNode, target: string): Promise<string> {
+  if (/[.:]/.test(target)) return withPort(target);
+  const name = target.toLowerCase();
+  const hit = (await browse(3_000)).find((s) => s.host === name);
+  if (hit) {
+    const p = node.approvedPeer(name);
+    if (p && fingerprint(p.pubkey) !== hit.fp) process.stderr.write(`warning: ${name} advertises key ${hit.fp}, but the pinned key is ${fingerprint(p.pubkey)}\n`);
+    process.stderr.write(`found ${name} at ${hit.addr} (key ${hit.fp})\n`);
+    return hit.addr;
+  }
+  process.stderr.write(`${name} did not answer on mDNS; trying ${name}.local:${DEFAULT_PORT}\n`);
+  return `${name}.local:${DEFAULT_PORT}`;
 }
 
 // ---- owner commands --------------------------------------------------------------------------

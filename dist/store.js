@@ -36,6 +36,11 @@ CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, sub TEXT NOT NULL, grant
 CREATE TABLE IF NOT EXISTS wakes (agent TEXT NOT NULL, thread TEXT, at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (at TEXT NOT NULL, event TEXT NOT NULL, detail TEXT);
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS pair_tokens (  -- one-time pairing tokens (agentmbx pair); only scrypt(token) is stored
+  id TEXT PRIMARY KEY, key TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+  failures INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL,           -- 'live' | 'used' | 'burned'
+  used_by TEXT);
 `;
 export class Store {
     db;

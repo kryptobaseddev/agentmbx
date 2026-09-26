@@ -13,11 +13,17 @@ On Linux with a firewall, open TCP 7373 to the LAN (e.g. `sudo firewall-cmd --ad
 
 ## Pairing two machines
 1. Make sure both machines run the daemon (`agentmbx daemon install`).
-2. On one of them, run `agentmbx pair other-host.local:7373`. It prints a 6-digit code.
-3. The other machine shows the same code: run `agentmbx peers` there, or look at `~/.local/share/mbx/daemon.log`.
-4. If the codes match, approve on both machines: `agentmbx pair approve <other-host> <code>`.
+2. On machine A, run `agentmbx pair`. It prints a one-time token (like `7K3M-QX9D-4HTR`, single use, valid 10 minutes; change with `--ttl 30m`, at most 1h) and the exact command for the other machine.
+3. On machine B, run one of the printed lines, for example `agentmbx join laptop 7K3M-QX9D-4HTR` (found on the LAN by mDNS) or `agentmbx join laptop.local:7373 7K3M-QX9D-4HTR`.
+4. Done: both machines are paired and show a "Paired with <host>" notification. There's no code to compare.
 
-If the codes differ, don't approve; something is intercepting the connection. Remove a pairing with `agentmbx peers remove <host>`.
+Why this is safe: the token never crosses the network. Each side proves it knows the token with an HMAC over both machines' host keys and owner keys, so something in the middle can't swap in its own keys. Five wrong attempts burn the token. Anyone who sees the token before it's used could pair with A, so don't paste it anywhere shared.
+
+`agentmbx discover` lists AgentMBX machines the daemon's mDNS advertisement reached, with their key fingerprints and whether they're paired. Discovery only finds addresses; trust still comes from the token. If multicast is blocked (some Wi-Fi networks, VPNs), `discover` shows nothing and you use the `host:port` or IP form. On Linux, the daemon shares UDP 5353 with avahi (both use `SO_REUSEADDR`); if a firewall is on, also allow mDNS (`sudo firewall-cmd --add-service=mdns --permanent`). Set `MBX_NO_MDNS=1` to turn advertising off.
+
+**Manual alternative, comparing a code:** run `agentmbx pair --compare other-host.local:7373` on one machine. It prints a 6-digit code, and the other machine shows the same code (`agentmbx peers` there, or its `daemon.log`). If the codes match, approve on both machines with `agentmbx pair approve <other-host> <code>`. If they differ, don't approve; something is intercepting the connection.
+
+Remove a pairing with `agentmbx peers remove <host>`.
 
 ## Adding mbx to each agent CLI
 Every CLI runs the same stdio server: `agentmbx mcp` (registered under the server name `mbx`). Set `MBX_AGENT` to the agent name. If you leave it out, the name defaults to the project folder name.
