@@ -43,10 +43,13 @@ export function fingerprint(publicKey: string): string {
   return h.match(/.{4}/g)!.join("-");
 }
 
-/** 6-digit short authentication string both sides of a pairing display; order-independent. */
-export function pairingCode(pubA: string, nonceA: string, pubB: string, nonceB: string): string {
-  const [x, y] = [[pubA, nonceA], [pubB, nonceB]].sort((a, b) => a[0].localeCompare(b[0]));
-  const h = createHash("sha256").update(`mbx-pair-v1|${x[0]}|${x[1]}|${y[0]}|${y[1]}`).digest();
+export interface PairParty { host: string; host_pubkey: string; owner_pubkey: string | null; nonce: string }
+
+/** 6-digit short authentication string over the whole pairing transcript (host names, host keys, owner keys, nonces).
+ *  Order-independent, so both sides compute the same digits. */
+export function pairingCode(a: PairParty, b: PairParty): string {
+  const parts = [a, b].map((p) => [p.host, p.host_pubkey, p.owner_pubkey ?? "-", p.nonce].join("|")).sort();
+  const h = createHash("sha256").update(`mbx-pair-v2\n${parts.join("\n")}`).digest();
   return String(h.readUInt32BE(0) % 1_000_000).padStart(6, "0");
 }
 

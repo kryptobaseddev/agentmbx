@@ -8,16 +8,18 @@ export const NAME_RE = /^[a-z0-9][a-z0-9-]{1,39}$/;
 
 export interface Meta { mentions: string[]; directives: string[]; tags: string[]; task_refs: string[] }
 
-/** Owner-signed delegation: the owner lets one agent speak with owner authority for a limited time. */
+/** Owner-signed delegation to ONE live session: `sub` is that session's in-memory key, so nothing else on the
+ *  host (even a process using the same agent name) can use it. */
 export interface Grant {
-  v: 1; id: string; iss: string /* owner key fingerprint */; sub: string /* agent@host */;
-  caps: string[]; iat: string; exp: string; nonce: string; sig: string;
+  v: 2; id: string; iss: string /* owner key fingerprint */; sub: string /* "session:" + base64 session pubkey */;
+  agent: string; host: string; caps: string[]; iat: string; exp: string; nonce: string; sig: string;
 }
+export interface Authority { grant: Grant; session_sig: string }
 
 export interface Envelope {
   v: 3; id: string; ts: string; from: string; to: string[]; thread: string; reply_to: string | null;
   kind: Kind; subject: string; body: string; needs_reply: boolean; refs: string[]; meta: Meta;
-  authority: { grant: Grant } | null; enc: null;
+  authority: Authority | null; enc: null;
   sig?: { alg: "ed25519"; host: string; key: string; value: string };
 }
 
@@ -34,7 +36,7 @@ export function parseMeta(body: string): Meta {
 
 export interface Draft {
   from: string; to: string[]; subject: string; body: string; kind?: Kind; thread?: string;
-  reply_to?: string | null; needs_reply?: boolean; refs?: string[]; grant?: Grant | null;
+  reply_to?: string | null; needs_reply?: boolean; refs?: string[];
 }
 
 export function buildEnvelope(d: Draft, now = new Date()): Envelope {
@@ -45,7 +47,7 @@ export function buildEnvelope(d: Draft, now = new Date()): Envelope {
   return {
     v: 3, id, ts: now.toISOString(), from: d.from, to: d.to, thread: d.thread ?? id, reply_to: d.reply_to ?? null,
     kind: d.kind ?? "message", subject: d.subject.slice(0, 200), body: d.body, needs_reply: d.needs_reply ?? false,
-    refs: d.refs ?? [], meta: parseMeta(d.body), authority: d.grant ? { grant: d.grant } : null, enc: null,
+    refs: d.refs ?? [], meta: parseMeta(d.body), authority: null, enc: null,
   };
 }
 
@@ -75,25 +77,64 @@ export function checkShape(x: unknown): string | null {
 }
 
 // ---- owner grants ----------------------------------------------------------------------------
+export const CAPS = ["task.assign", "decision", "broadcast", "alert"] as const;
+export const MAX_GRANT_HOURS = 24 * 7;
+
 const grantPayload = (g: Omit<Grant, "sig">) => canonical(g);
 
-export function makeGrant(ownerPub: string, ownerPriv: string, sub: string, caps: string[], days: number, now = new Date()): Grant {
-  const g = { v: 1 as const, id: ulid(now.getTime()), iss: fingerprint(ownerPub), sub, caps: [...caps].sort(),
-    iat: now.toISOString(), exp: new Date(now.getTime() + days * 86_400_000).toISOString(), nonce: nonce() };
+export function makeGrant(ownerPub: string, ownerPriv: string, sessionPub: string, agent: string, host: string,
+  caps: string[], hours = 12, now = new Date()): Grant {
+  if (hours <= 0 || hours > MAX_GRANT_HOURS) throw new Error(`grant lifetime must be 1..${MAX_GRANT_HOURS} hours`);
+  const bad = caps.filter((c) => !(CAPS as readonly string[]).includes(c));
+  if (bad.length) throw new Error(`unknown caps: ${bad.join(", ")} (known: ${CAPS.join(", ")})`);
+  const g = { v: 2 as const, id: ulid(now.getTime()), iss: fingerprint(ownerPub), sub: `session:${sessionPub}`, agent, host,
+    caps: [...new Set(caps)].sort(), iat: now.toISOString(), exp: new Date(now.getTime() + hours * 3_600_000).toISOString(), nonce: nonce() };
   return { ...g, sig: signData(ownerPriv, grantPayload(g)) };
 }
 
-export type GrantCheck = { ok: true; caps: string[] } | { ok: false; reason: string };
+/** What the session key signs: the envelope without its host signature and without the session signature itself. */
+const sessionPayload = (e: Envelope) => {
+  const { sig: _s, authority, ...rest } = e;
+  return canonical({ ...rest, authority: authority ? { grant: authority.grant } : null });
+};
 
-/** Verify an owner grant attached to an envelope sent by `from`. `revoked` holds revoked grant ids. */
-export function checkGrant(g: Grant, ownerPub: string, from: string, revoked: Set<string>, now = new Date()): GrantCheck {
-  const { sig, ...rest } = g;
-  if (g.iss !== fingerprint(ownerPub)) return { ok: false, reason: "grant not issued by the pinned owner key" };
+/** Called by the master session's MCP server, which holds the session private key in memory only. */
+export function attachAuthority(e: Envelope, grant: Grant, sessionPriv: string): Envelope {
+  const withGrant: Envelope = { ...e, authority: { grant, session_sig: "" } };
+  return { ...withGrant, authority: { grant, session_sig: signData(sessionPriv, sessionPayload(withGrant)) } };
+}
+
+/** Which caps does this envelope need for its authority to count? */
+export function capsNeeded(e: Envelope): string[] {
+  const need: string[] = [];
+  if (e.kind === "task" || e.kind === "request") need.push("task.assign");
+  else if (e.kind === "decision") need.push("decision");
+  else if (e.kind === "alert") need.push("alert");
+  else need.push(`kind:${e.kind}`); // status/message/reply never carry owner authority
+  if (e.to.some((t) => t === "*" || t.startsWith("role:"))) need.push("broadcast");
+  return need;
+}
+
+export type AuthorityCheck = { ok: true; caps: string[]; grant_id: string; session: string } | { ok: false; reason: string };
+
+/** Verify owner authority on an envelope. `ownerPub` is the owner key pinned for the sending host. */
+export function checkAuthority(e: Envelope, ownerPub: string | null, revoked: Set<string>, now = new Date()): AuthorityCheck {
+  const a = e.authority;
+  if (!a) return { ok: false, reason: "no authority" };
+  if (!ownerPub) return { ok: false, reason: "no owner key pinned for the sending host" };
+  const { sig, ...rest } = a.grant;
+  if (a.grant.v !== 2) return { ok: false, reason: "unsupported grant version" };
+  if (a.grant.iss !== fingerprint(ownerPub)) return { ok: false, reason: "grant not issued by the pinned owner key" };
   if (!verifyData(ownerPub, grantPayload(rest), sig)) return { ok: false, reason: "grant signature invalid" };
-  if (g.sub !== from) return { ok: false, reason: `grant is for ${g.sub}, not ${from}` };
-  if (Date.parse(g.exp) < now.getTime()) return { ok: false, reason: "grant expired" };
-  if (revoked.has(g.id)) return { ok: false, reason: "grant revoked" };
-  return { ok: true, caps: g.caps };
+  if (`${a.grant.agent}@${a.grant.host}` !== e.from) return { ok: false, reason: `grant is for ${a.grant.agent}@${a.grant.host}, not ${e.from}` };
+  if (!a.grant.sub.startsWith("session:")) return { ok: false, reason: "grant subject is not a session key" };
+  const sessionPub = a.grant.sub.slice(8);
+  if (!verifyData(sessionPub, sessionPayload(e), a.session_sig)) return { ok: false, reason: "not sent by the granted session (session signature invalid)" };
+  if (Date.parse(a.grant.exp) < now.getTime()) return { ok: false, reason: "grant expired" };
+  if (revoked.has(a.grant.id)) return { ok: false, reason: "grant revoked" };
+  const missing = capsNeeded(e).filter((c) => !a.grant.caps.includes(c));
+  if (missing.length) return { ok: false, reason: `outside the grant's caps (needs ${missing.join(", ")})` };
+  return { ok: true, caps: a.grant.caps, grant_id: a.grant.id, session: fingerprint(sessionPub) };
 }
 
 export const bodyHash = (e: Envelope) => sha256(e.body);
