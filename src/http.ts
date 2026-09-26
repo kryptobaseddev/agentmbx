@@ -174,8 +174,10 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
         return send(200, { results: items.map((it) => ({ id: it?.rec?.id, error: acceptSigned(node.store.db, it, node.host, { hostPub: node.key.publicKey }) })) });
       }
       if (req.method === "GET" && url.pathname === "/v1/policies") {
-        const all = signedRecords(node), offset = Math.max(0, Number(url.searchParams.get("offset")) || 0), limit = Math.min(1000, Math.max(1, Number(url.searchParams.get("limit")) || 1000));
-        return send(200, { items: all.slice(offset, offset + limit), total: all.length });
+        // stable cursor (kind rank + ULID), so records added between pages never shift or hide others
+        const after = url.searchParams.get("after") ?? "", limit = Math.min(1000, Math.max(1, Number(url.searchParams.get("limit")) || 1000));
+        const rest = signedRecords(node).filter((r) => recordKey(r) > after);
+        return send(200, { items: rest.slice(0, limit), more: rest.length > limit });
       }
       if (req.method === "GET" && url.pathname === "/v1/agents") {
         return send(200, { host: node.host, agents: node.agents().filter((a) => a.host === node.host).map(({ name, role, cli, description, last_seen }) => ({ name, role, cli, description, last_seen })) });
@@ -251,13 +253,16 @@ export async function refreshDirectory(node: MbxNode) {
 
 // ---- policies: push on set/revoke, pull every minute so offline hosts catch up ----------------------------
 /** Everything a peer may need: unexpired policies and revocations from the last 30 days, as signed records. */
-/** Revocations first (so a kill switch never loses to the policy it kills), then devices, then policies, oldest first. */
+const RANK: Record<string, number> = { device: 0, revocation: 1, policy: 2 };
+/** Sync order: devices (trust first), then revocations (a kill switch never loses to the policy it kills), then policies. */
+export const recordKey = (s: Signed<AnyRecord>) => `${RANK[s.rec.type] ?? 9}:${s.rec.id}`;
+
 export function signedRecords(node: MbxNode): Signed<AnyRecord>[] {
   const db = node.store.db, now = new Date().toISOString(), since = new Date(Date.now() - 30 * 86_400_000).toISOString();
-  const rs = db.prepare("SELECT record, sig FROM policy_revocations WHERE iat > ? ORDER BY iat").all(since) as { record: string; sig: string }[];
-  const ds = db.prepare("SELECT record, sig FROM devices ORDER BY received_at").all() as { record: string; sig: string }[];
-  const ps = db.prepare("SELECT record, sig FROM policies WHERE exp > ? ORDER BY iat").all(now) as { record: string; sig: string }[];
-  return [...rs, ...ds, ...ps].map((r) => ({ rec: JSON.parse(r.record), sig: r.sig }));
+  const rs = db.prepare("SELECT record, sig FROM policy_revocations WHERE iat > ?").all(since) as { record: string; sig: string }[];
+  const ds = db.prepare("SELECT record, sig FROM devices").all() as { record: string; sig: string }[];
+  const ps = db.prepare("SELECT record, sig FROM policies WHERE exp > ?").all(now) as { record: string; sig: string }[];
+  return [...rs, ...ds, ...ps].map((r) => ({ rec: JSON.parse(r.record) as AnyRecord, sig: r.sig })).sort((a, b) => (recordKey(a) < recordKey(b) ? -1 : 1));
 }
 
 /** Send signed records to the paired hosts they concern. Returns per-host results; offline hosts get them on their next pull. */
@@ -275,23 +280,28 @@ export async function pushPolicy(node: MbxNode, items: Signed<AnyRecord>[]): Pro
   return out;
 }
 
+/** Pull every record a paired host serves, in sync order; rejected records and incomplete syncs go to the audit log. */
 export async function pullPolicies(node: MbxNode) {
   for (const p of node.peers().filter((x) => x.state === "approved")) {
+    let received = 0, complete = false;
+    const rejected: { id: string; error: string }[] = [];
     try {
-      // page through everything the peer serves (revocations come first in its order)
-      for (let offset = 0; offset < 100_000;) {
+      for (let after = "", pages = 0; pages < 200; pages++) {
         const path = "/v1/policies";
-        const res = await fetch(`http://${p.addr}${path}?offset=${offset}&limit=1000`, { headers: signHop(node, "GET", path, ""), signal: AbortSignal.timeout(5_000) });
+        const res = await fetch(`http://${p.addr}${path}?after=${encodeURIComponent(after)}&limit=1000`, { headers: signHop(node, "GET", path, ""), signal: AbortSignal.timeout(5_000) });
         if (!res.ok) break;
-        const { items, total } = await res.json() as { items: Signed<AnyRecord>[]; total?: number };
+        const { items, more } = await res.json() as { items: Signed<AnyRecord>[]; more?: boolean };
         for (const it of items) {
+          received++;
           if (it?.rec?.type === "policy" && !it.rec.to.hosts.includes("*") && !it.rec.to.hosts.includes(node.host)) continue;
           if (it?.rec?.type === "device" && it.rec.host !== node.host) continue;
-          acceptSigned(node.store.db, it, node.host, { hostPub: node.key.publicKey });
+          const err = acceptSigned(node.store.db, it, node.host, { hostPub: node.key.publicKey });
+          if (err) rejected.push({ id: it?.rec?.id, error: err });
         }
-        offset += items.length;
-        if (!items.length || total === undefined || offset >= total) break;
+        if (!items.length || !more) { complete = true; break; }
+        after = recordKey(items[items.length - 1]);
       }
-    } catch { /* peer offline */ }
+    } catch { /* peer offline: reported below */ }
+    if (rejected.length || !complete) node.store.audit("policy.sync", { host: p.host, received, complete, rejected: rejected.slice(0, 20) });
   }
 }

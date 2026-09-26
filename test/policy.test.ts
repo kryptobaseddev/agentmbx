@@ -147,7 +147,7 @@ test("across hosts: the paired host adopts the owner, policies push and pull, re
     // a paired host whose owner is someone else can't set policies here
     // a machine with its own owner key never adopts another owner, even one it knows from pairing
     const C = ownerHost("gamma");
-    C.n.store.db.prepare("INSERT INTO principals VALUES (?,?,'peer-owner',NULL,'pair:alpha',?)").run(fingerprint(A.kp.publicKey), A.kp.publicKey, new Date().toISOString());
+    C.n.store.db.prepare("INSERT INTO principals (fp,pub,role,label,via,added_at,peer) VALUES (?,?,'peer-owner',NULL,'pair:alpha',?,'alpha')").run(fingerprint(A.kp.publicKey), A.kp.publicKey, new Date().toISOString());
     assert.match(acceptSigned(C.n.store.db, A.sign(makeDevice("gamma", C.n.key.publicKey, A.kp.publicKey)), "gamma", { hostPub: C.n.key.publicKey })!, /its own owner key/);
     C.n.close();
     const M = ownerHost("mallory");

@@ -96,15 +96,24 @@ func clean(_ s: String, _ max: Int = 80) -> String {
 }
 
 func str(_ v: Any?) -> String? { (v as? String).map { clean($0) } }
+/** Security-bearing values (names, hosts, paths) are never shortened: the human must see exactly what is granted. */
 func strs(_ v: Any?) -> [String] {
-  if let s = v as? String { return [clean(s)] }
-  return (v as? [Any] ?? []).compactMap { $0 as? String }.map { clean($0) }
+  if let s = v as? String { return [clean(s, 400)] }
+  return (v as? [Any] ?? []).compactMap { $0 as? String }.map { clean($0, 400) }
 }
+/** Every entry, never "and N more"; a wildcard anywhere means ALL and is shown first. */
 func list(_ v: Any?, _ empty: String = "(none)") -> String {
   let xs = strs(v)
   if xs.isEmpty { return empty }
-  let shown = xs.prefix(8).joined(separator: ", ")
-  return xs.count > 8 ? "\(shown) and \(xs.count - 8) more" : shown
+  if xs.contains("*") { return "ALL (*)" + (xs.count > 1 ? " [also named: \(xs.filter { $0 != "*" }.joined(separator: ", "))]" : "") }
+  return xs.joined(separator: ", ")
+}
+/** Text too long to read in one confirmation is refused, never cut: split the request instead. */
+let maxPromptText = 900
+func summarize(_ o: [String: Any]) throws -> String {
+  let text = try summarizeRaw(o)
+  if text.count > maxPromptText { throw Refusal(reason: "too much to show in one approval (\(text.count) characters); split it into smaller requests") }
+  return text
 }
 
 func parseDate(_ s: String?) -> Date? {
@@ -144,7 +153,7 @@ func claimedOwner(_ o: [String: Any]) -> String? {
 }
 
 /** What the human is asked to approve. Throws Refusal for anything this helper does not understand. */
-func summarize(_ o: [String: Any]) throws -> String {
+func summarizeRaw(_ o: [String: Any]) throws -> String {
   let type = o["type"] as? String
   if type == "policy" {
     let level = (o["level"] as? String ?? "custom").uppercased()

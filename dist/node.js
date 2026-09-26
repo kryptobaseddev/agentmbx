@@ -59,7 +59,7 @@ export class MbxNode {
         if (!pub)
             return;
         this.store.db.prepare("DELETE FROM principals WHERE role='owner' AND via<>'local' AND fp<>?").run(fingerprint(pub)); // a local owner key wins
-        this.store.db.prepare("INSERT OR IGNORE INTO principals VALUES (?,?,'owner',NULL,'local',?)").run(fingerprint(pub), pub, new Date().toISOString());
+        this.store.db.prepare("INSERT OR IGNORE INTO principals (fp,pub,role,label,via,added_at,peer) VALUES (?,?,'owner',NULL,'local',?,NULL)").run(fingerprint(pub), pub, new Date().toISOString());
     }
     /** A paired host's owner key is recorded as a peer-owner: it gets no authority here until adopted explicitly. */
     notePeerOwner(host, ownerPub) {
@@ -68,7 +68,7 @@ export class MbxNode {
         const fp = fingerprint(ownerPub), db = this.store.db;
         if (db.prepare("SELECT 1 FROM principals WHERE fp=?").get(fp))
             return;
-        db.prepare("INSERT INTO principals VALUES (?,?,'peer-owner',NULL,?,?)").run(fp, ownerPub, `pair:${host}`, new Date().toISOString());
+        db.prepare("INSERT INTO principals (fp,pub,role,label,via,added_at,peer) VALUES (?,?,'peer-owner',NULL,?,?,?)").run(fp, ownerPub, `pair:${host}`, new Date().toISOString(), host);
         this.store.audit("principal.peer_owner", { host, owner: fp });
     }
     /**
@@ -86,7 +86,8 @@ export class MbxNode {
             throw new Error(`${host} has no owner key (run 'agentmbx owner init' there, then pair again)`);
         const fp = fingerprint(p.owner_pubkey), db = this.store.db;
         db.prepare("DELETE FROM principals WHERE role='owner' AND via<>'local'").run();
-        db.prepare("INSERT INTO principals VALUES (?,?,'owner',NULL,?,?) ON CONFLICT(fp) DO UPDATE SET role='owner', via=excluded.via").run(fp, p.owner_pubkey, `adopt:${host}`, new Date().toISOString());
+        db.prepare("INSERT INTO principals (fp,pub,role,label,via,added_at,peer) VALUES (?,?,'owner',NULL,?,?,?) ON CONFLICT(fp) DO UPDATE SET role='owner', via=excluded.via, peer=excluded.peer")
+            .run(fp, p.owner_pubkey, `adopt:${host}`, new Date().toISOString(), host);
         this.store.audit("principal.owner_adopted", { host, owner: fp });
         return fp;
     }
@@ -268,7 +269,8 @@ export class MbxNode {
         this.store.db.prepare("DELETE FROM peers WHERE host=?").run(host);
         this.store.db.prepare("DELETE FROM agents WHERE host=?").run(host);
         // an owner adopted through this host stops counting here (its policies go inactive: activePolicies checks owner keys)
-        this.store.db.prepare("DELETE FROM principals WHERE via IN (?,?)").run(`pair:${host}`, `adopt:${host}`);
+        // every trust learned through this host goes with it (including an owner adopted by a device record it vouched for)
+        this.store.db.prepare("DELETE FROM principals WHERE via<>'local' AND (peer=? OR via IN (?,?))").run(host, `pair:${host}`, `adopt:${host}`);
         this.store.audit("pair.removed", { host });
     }
     /** Approve a peer directly (token pairing: the peer already proved it holds the token). */

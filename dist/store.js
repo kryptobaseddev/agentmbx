@@ -56,7 +56,7 @@ export class Store {
         this.db = new DatabaseSync(join(home, "mbx.db"));
         this.db.exec(SCHEMA);
         // columns added after 0.2 (CREATE TABLE IF NOT EXISTS doesn't add them to existing databases)
-        for (const ddl of ["ALTER TABLE sessions ADD COLUMN pid_start TEXT"]) {
+        for (const ddl of ["ALTER TABLE sessions ADD COLUMN pid_start TEXT", "ALTER TABLE principals ADD COLUMN peer TEXT", "ALTER TABLE policy_revocations ADD COLUMN owner_fp TEXT"]) {
             try {
                 this.db.exec(ddl);
             }

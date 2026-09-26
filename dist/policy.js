@@ -83,30 +83,37 @@ export function ownerKeys(db) {
 export function acceptSigned(db, s, host, o = {}) {
     if (s?.rec?.type === "device")
         return acceptDevice(db, s, host, o);
+    const now = new Date().toISOString();
+    if (s?.rec?.type === "revocation") {
+        // Revocations only take authority away, and only from their own signer's policies, so they're kept from any owner
+        // key this host knows (even one it hasn't adopted yet): a kill switch seen before the device record still counts.
+        const r = s.rec;
+        const key = db.prepare("SELECT pub FROM principals").all().map((x) => x.pub).find((k) => fingerprint(k) === r.owner_fp);
+        if (!key)
+            return "not signed by an owner key this host knows";
+        if (!verifySigned(s, key))
+            return "bad owner signature";
+        if (db.prepare("SELECT 1 FROM policy_revocations WHERE id=?").get(r.id))
+            return null; // already applied
+        const n = r.target === "*"
+            ? db.prepare("UPDATE policies SET revoked=1 WHERE revoked=0 AND owner_fp=? AND iat <= ?").run(r.owner_fp, r.iat).changes
+            : db.prepare("UPDATE policies SET revoked=1 WHERE id=? AND owner_fp=?").run(r.target, r.owner_fp).changes;
+        db.prepare("INSERT OR IGNORE INTO policy_revocations (id,target,iat,record,sig,received_at,owner_fp) VALUES (?,?,?,?,?,?,?)").run(r.id, r.target, r.iat, JSON.stringify(r), s.sig, now, r.owner_fp);
+        db.prepare("INSERT INTO audit VALUES (?,?,?)").run(now, "policy.revoked", JSON.stringify({ target: r.target, owner: r.owner_fp, count: n }));
+        return null;
+    }
     const key = ownerKeys(db).find((k) => fingerprint(k) === s?.rec?.owner_fp);
     if (!key)
         return "not signed by this host's owner";
     if (!verifySigned(s, key))
         return "bad owner signature";
-    const now = new Date().toISOString();
-    if (s.rec.type === "revocation") {
-        const r = s.rec;
-        if (db.prepare("SELECT 1 FROM policy_revocations WHERE id=?").get(r.id))
-            return null; // already applied
-        const n = r.target === "*"
-            ? db.prepare("UPDATE policies SET revoked=1 WHERE revoked=0 AND iat <= ?").run(r.iat).changes
-            : db.prepare("UPDATE policies SET revoked=1 WHERE id=?").run(r.target).changes;
-        db.prepare("INSERT OR IGNORE INTO policy_revocations (id,target,iat,record,sig,received_at) VALUES (?,?,?,?,?,?)").run(r.id, r.target, r.iat, JSON.stringify(r), s.sig, now);
-        db.prepare("INSERT INTO audit VALUES (?,?,?)").run(now, "policy.revoked", JSON.stringify({ target: r.target, count: n }));
-        return null;
-    }
     const r = s.rec, bad = checkRecord(r);
     if (bad)
         return bad;
     if (!o.issuer && !r.to.hosts.includes("*") && !r.to.hosts.includes(host))
         return `policy is for ${r.to.hosts.join(", ")}, not ${host}`;
     // a policy issued before a kill switch it hasn't seen stays revoked
-    const killed = db.prepare("SELECT 1 FROM policy_revocations WHERE (target='*' AND iat >= ?) OR target=?").get(r.iat, r.id);
+    const killed = db.prepare("SELECT 1 FROM policy_revocations WHERE owner_fp=? AND ((target='*' AND iat >= ?) OR target=?)").get(r.owner_fp, r.iat, r.id);
     db.prepare(`INSERT OR IGNORE INTO policies (id,record,sig,owner_fp,iat,exp,revoked,received_at) VALUES (?,?,?,?,?,?,?,?)`)
         .run(r.id, JSON.stringify(r), s.sig, r.owner_fp, r.iat, r.exp, killed ? 1 : 0, now);
     return null;
@@ -120,6 +127,7 @@ function acceptDevice(db, s, host, o) {
     if (r?.v !== 1 || typeof r.host !== "string" || typeof r.host_pub !== "string" || typeof r.id !== "string")
         return "not a device record";
     const known = db.prepare("SELECT pub, role, via FROM principals").all().find((p) => fingerprint(p.pub) === r.owner_fp);
+    // (the principal keeps its `peer` link: unpairing the machine it was learned from removes this trust again)
     if (!known)
         return "signed by an owner key this host doesn't know (pair with that owner's machine first)";
     if (!verifySigned(s, known.pub))
@@ -130,11 +138,13 @@ function acceptDevice(db, s, host, o) {
         return null;
     if (r.host !== host || (o.hostPub && r.host_pub !== o.hostPub))
         return `device record is for ${r.host}, not this host`;
-    if (known.role === "owner" && known.via === "local")
-        return null; // this is the owner's own machine
+    if (known.role === "owner")
+        return null; // already this host's owner (its own key, or adopted before)
     if (db.prepare("SELECT 1 FROM principals WHERE role='owner' AND via='local'").get())
         return "this host has its own owner key; it only takes policies from that key";
-    db.prepare("DELETE FROM principals WHERE role='owner' AND via<>'local' AND fp<>?").run(r.owner_fp);
+    const current = db.prepare("SELECT fp FROM principals WHERE role='owner'").get();
+    if (current)
+        return `this host already has an owner (key ${current.fp}); unpair that owner's machine first to change it`;
     db.prepare("UPDATE principals SET role='owner', via=? WHERE fp=?").run(`device:${r.id}`, r.owner_fp);
     db.prepare("INSERT INTO audit VALUES (?,?,?)").run(now, "principal.owner_adopted", JSON.stringify({ owner: r.owner_fp, device: r.id }));
     return null;
