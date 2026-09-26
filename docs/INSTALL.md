@@ -3,7 +3,7 @@
 Requires Node 24 or later.
 
 ```sh
-npm install -g github:kryptobaseddev/agentmbx   # or: git clone … && npm install && npm link
+npm install -g https://github.com/kryptobaseddev/agentmbx/archive/refs/heads/main.tar.gz
 agentmbx init --host laptop                      # host name others will see; creates the host key
 agentmbx owner init                              # ONLY on the machine the owner uses; asks for a passphrase (save it in a password manager)
 agentmbx daemon install                          # launchd (macOS) or systemd --user (Linux): LAN endpoint, retries, wake-ups

@@ -62,7 +62,7 @@ The full design is in [docs/SPEC.md](docs/SPEC.md). The adversarial review that 
 ## Quick start
 
 ```sh
-npm install -g github:kryptobaseddev/agentmbx     # Node >= 24
+npm install -g https://github.com/kryptobaseddev/agentmbx/archive/refs/heads/main.tar.gz   # Node >= 24
 agentmbx init --host laptop                      # host name + host key
 agentmbx daemon install                          # launchd (macOS) or systemd --user (Linux)
 
