@@ -21,6 +21,7 @@ function twoHosts() {
     x.approvePeer(y.host);
   }
   a.registerAgent("master"); a.registerAgent("helper"); b.registerAgent("worker", { role: "dev" });
+  b.bindSession({ agent: "worker", cli: "codex", session_id: "mcp-worker", pid: process.pid, session_key: "k" }); // a live session: role: and * reach it
   return { a, b };
 }
 

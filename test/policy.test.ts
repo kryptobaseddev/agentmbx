@@ -254,3 +254,12 @@ test("expiry reminder: once per policy, only within 48 h of expiry", () => {
   assert.deepEqual(dueReminders(n.store.db, 48 * 3_600_000, new Date(Date.now() + 29 * 86_400_000)).map((p) => p.id), [later.id]);
   n.close();
 });
+
+test("broadcasts reach live sessions only; a shell sender gets mail addressed by name", () => {
+  const n = new MbxNode(tmp(), { host: "alpha" });
+  n.registerAgent("live-one", { cli: "codex" }); n.bindSession({ agent: "live-one", cli: "codex", session_id: "mcp-1", pid: process.pid, session_key: "k" });
+  n.registerAgent("shell-only", { cli: "cli" }); // agentmbx send --as shell-only: no session
+  assert.deepEqual(n.send({ from: "live-one", to: ["*"], subject: "all", body: "x" }).local.sort(), ["live-one"]);
+  assert.deepEqual(n.send({ from: "live-one", to: ["shell-only"], subject: "direct", body: "x" }).local, ["shell-only"]);
+  n.close();
+});

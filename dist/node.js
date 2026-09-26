@@ -211,7 +211,15 @@ export class MbxNode {
         const cands = [wanted, ...(wanted !== cli && !wanted.endsWith(`-${cli}`) ? [`${wanted}-${cli}`] : []), ...[2, 3, 4, 5, 6, 7, 8, 9].map((i) => `${wanted}-${i}`)];
         return cands.map((c) => c.slice(0, 40)).find((c) => NAME_RE.test(c) && !held(c)) ?? `${wanted.slice(0, 30)}-${process.pid}`;
     }
-    /** Local agents with a live session, or seen in the last 24 h. */
+    /** Local agents with a live, tracked CLI session: the audience of `*` and `role:` (Keaton, 2026-09-26). */
+    sessionAgents() {
+        const out = new Set();
+        for (const r of this.store.db.prepare("SELECT agent, pid, pid_start, updated_at FROM sessions").all())
+            if (r.pid && this.sameSession(r.pid, r))
+                out.add(r.agent);
+        return out;
+    }
+    /** For display: agents with a live session, plus shell senders (--as, no session) active in the last 2 h. */
     liveAgents() {
         const out = new Set(), bound = new Set();
         for (const r of this.store.db.prepare("SELECT agent, pid, pid_start, updated_at FROM sessions").all()) {
@@ -318,7 +326,7 @@ export class MbxNode {
     route(to, forReceive = false) {
         const local = new Set(), remote = new Set(), warnings = [];
         const localAgents = new Set(this.agents().filter((a) => a.host === this.host).map((a) => a.name));
-        const live = this.liveAgents();
+        const live = this.sessionAgents(); // broadcasts reach tracked sessions only; shell senders get mail addressed by name
         const approved = this.peers().filter((p) => p.state === "approved").map((p) => p.host);
         for (const t of to) {
             if (t === "*") {
