@@ -31,7 +31,7 @@ export async function wakeCodex(threadId, text) {
         return { ok: false, via: "codex queue", error: e.message.slice(0, 300) };
     }
 }
-async function opencodeService() {
+export async function opencodeService() {
     try {
         const url = process.env.MBX_OPENCODE_URL || (await run(OPENCODE(), ["service", "status"], { timeout: 10_000 })).stdout.trim().split(/\s+/).find((w) => w.startsWith("http"));
         const cfg = join(homedir(), ".config/opencode/service.json");

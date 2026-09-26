@@ -28,7 +28,7 @@ export async function wakeCodex(threadId: string, text: string): Promise<WakeRes
   catch (e) { return { ok: false, via: "codex queue", error: (e as Error).message.slice(0, 300) }; }
 }
 
-async function opencodeService(): Promise<{ url: string; auth: string } | null> {
+export async function opencodeService(): Promise<{ url: string; auth: string } | null> {
   try {
     const url = process.env.MBX_OPENCODE_URL || (await run(OPENCODE(), ["service", "status"], { timeout: 10_000 })).stdout.trim().split(/\s+/).find((w) => w.startsWith("http"));
     const cfg = join(homedir(), ".config/opencode/service.json");

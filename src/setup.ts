@@ -96,6 +96,9 @@ const parseObj = (cur: string | null): Record<string, unknown> => {
   return v as Record<string, unknown>;
 };
 
+/** [CLI event, `agentmbx hook` subcommand]. PermissionRequest is YOLO (docs/POLICY.md §5): it answers only under an active policy. */
+const HOOK_EVENTS: [string, string][] = [["SessionStart", "session-start"], ["UserPromptSubmit", "prompt"], ["PermissionRequest", "permission"]];
+
 type HookGroup = { matcher?: string; hooks?: { type?: string; command?: string; timeout?: number }[] };
 
 /** Hooks in the Claude/Codex shape: { hooks: { Event: [ { hooks: [ {type, command} ] } ] } }. Appends groups; never edits others. */
@@ -214,7 +217,7 @@ const KIMI_BEGIN = "# >>> agentmbx (managed by agentmbx setup; remove with: agen
 const KIMI_END = "# <<< agentmbx <<<";
 function kimiHooks(cmd: string[]) {
   const block = [KIMI_BEGIN,
-    ...[["SessionStart", "session-start"], ["UserPromptSubmit", "prompt"]].flatMap(([ev, sub]) =>
+    ...HOOK_EVENTS.flatMap(([ev, sub]) =>
       ["[[hooks]]", `event = "${ev}"`, `command = ${JSON.stringify(hookCommand(cmd, sub, "kimi"))}`, "timeout = 10"]),
     KIMI_END];
   const find = (lines: string[]): [number, number] | null => {
@@ -360,15 +363,15 @@ export function edits(ctx: SetupCtx, cli: CliId): Edit[] {
               return true;
             } catch { return false; }
           } },
-        { cli, kind: "hooks", item: "hooks SessionStart + UserPromptSubmit", path: join(home, ".claude/settings.json"),
-          ...jsonHooks([["SessionStart", "session-start"], ["UserPromptSubmit", "prompt"]], "claude", cmd) },
+        { cli, kind: "hooks", item: "hooks SessionStart + UserPromptSubmit + PermissionRequest", path: join(home, ".claude/settings.json"),
+          ...jsonHooks(HOOK_EVENTS, "claude", cmd) },
       ];
     }
     case "codex":
       return [
         { cli, kind: "mcp", item: "[mcp_servers.mbx]", path: join(home, ".codex/config.toml"), ...codexServer(cmd) },
-        { cli, kind: "hooks", item: "hooks SessionStart + UserPromptSubmit", path: join(home, ".codex/hooks.json"),
-          ...jsonHooks([["SessionStart", "session-start"], ["UserPromptSubmit", "prompt"]], "codex", cmd) },
+        { cli, kind: "hooks", item: "hooks SessionStart + UserPromptSubmit + PermissionRequest", path: join(home, ".codex/hooks.json"),
+          ...jsonHooks(HOOK_EVENTS, "codex", cmd) },
       ];
     case "opencode":
       return [{ cli, kind: "mcp", item: "mcp.servers.mbx", path: opencodeConfig(home), ...opencodeServer(cmd) }];
@@ -377,7 +380,7 @@ export function edits(ctx: SetupCtx, cli: CliId): Edit[] {
       const srv = jsonServer("mcpServers", { command: cmd[0], args: mcpArgs }, (e) => e.command === cmd[0] && same(e.args ?? [], mcpArgs), true);
       return [
         { cli, kind: "mcp", item: "mcpServers.mbx", path: join(kimi, "mcp.json"), ...srv },
-        { cli, kind: "hooks", item: "[[hooks]] SessionStart + UserPromptSubmit", path: join(kimi, "config.toml"), ...kimiHooks(cmd) },
+        { cli, kind: "hooks", item: "[[hooks]] SessionStart + UserPromptSubmit + PermissionRequest", path: join(kimi, "config.toml"), ...kimiHooks(cmd) },
       ];
     }
     case "hermes":

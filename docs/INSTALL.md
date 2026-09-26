@@ -87,9 +87,11 @@ Setup appends its own hook groups and never modifies or removes hook groups that
 ```json
 "hooks": {
   "SessionStart":     [{ "hooks": [{ "type": "command", "command": "agentmbx hook session-start --cli claude", "timeout": 10 }] }],
-  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "agentmbx hook prompt --cli claude", "timeout": 10 }] }]
+  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "agentmbx hook prompt --cli claude", "timeout": 10 }] }],
+  "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "agentmbx hook permission --cli claude", "timeout": 10 }] }]
 }
 ```
+- The `PermissionRequest` hook is YOLO (see [YOLO](#yolo-auto-approving-permission-prompts) below). Without an active policy it prints nothing and you see the usual prompt.
 - **To let messages wake an idle session**, start Claude with the mbx channel:
   `claude --dangerously-load-development-channels server:mbx`
   - Claude asks for confirmation at startup.
@@ -104,7 +106,7 @@ command = "agentmbx"
 args = ["mcp"]
 default_tools_approval_mode = "approve"   # mbx tools only send/read mail; otherwise every send asks for approval
 ```
-In `~/.codex/hooks.json`, a SessionStart group running `agentmbx hook session-start --cli codex` and a UserPromptSubmit group running `agentmbx hook prompt --cli codex` (same JSON shape as Claude's).
+In `~/.codex/hooks.json`, a SessionStart group running `agentmbx hook session-start --cli codex`, a UserPromptSubmit group running `agentmbx hook prompt --cli codex`, and a PermissionRequest group running `agentmbx hook permission --cli codex` (same JSON shape as Claude's).
 - The SessionStart hook binds the session's thread id, which is what lets the daemon wake an idle Codex session through `codex queue`.
 - Codex may ask you to review and trust new hooks the next time it starts.
 
@@ -134,6 +136,10 @@ timeout = 10
 event = "UserPromptSubmit"
 command = "agentmbx hook prompt --cli kimi"
 timeout = 10
+[[hooks]]
+event = "PermissionRequest"
+command = "agentmbx hook permission --cli kimi"
+timeout = 10
 # <<< agentmbx <<<
 ```
 - Kimi's TUI accepts no push from outside, so an idle Kimi session only sees mail when its user next types.
@@ -149,6 +155,12 @@ mcp_servers:
 ```
 Restart Hermes to load it. Its tools then appear as `mcp_mbx_*`.
 - For wake-ups, the plan is a small Hermes plugin that calls `ctx.inject_message`. Until that exists, use a Hermes cron job that checks `mbx_inbox`.
+
+### YOLO: auto-approving permission prompts
+When an owner policy gives an agent the `permissions` class ([POLICY.md](POLICY.md) §5), that agent's sessions approve their own permission prompts until the policy expires. With no such policy nothing changes. Every approval is written to the audit log as `yolo_allow`. How each CLI does it (evidence in [RESEARCH.md](RESEARCH.md), "Permission hooks per CLI"):
+- **Claude Code** and **Codex**: the `PermissionRequest` hook above answers `allow`. Deny rules still win. Claude never auto-answers `AskUserQuestion` or `ExitPlanMode`, since those are questions for you. Codex asks you to trust the new hook once.
+- **OpenCode**: no hook; the daemon answers the session's pending requests through the local `opencode service` (`once`). It needs the session bound (the mbx MCP server does that; its requests are matched by project folder) and the service running.
+- **Kimi Code**: Kimi's hooks can't approve. The `PermissionRequest` hook approves through the `kimi web` server, so it only works for sessions that server runs (`kimi web`, `kimi rc`, the Kimi desktop app). A plain `kimi` terminal session keeps prompting. For a hands-off Kimi agent there, start it with Kimi's own flag instead: `kimi --yolo` (routine edits and commands run; risky actions still ask) or `kimi --auto` (never asks). These flags ignore mbx policies, so use them only where you'd accept that.
 
 ### The skill
 Setup copies `skill/` from the package to `~/.agents/skills/agentmbx/` and symlinks it into `~/.claude/skills/` and `~/.codex/skills/` when those folders exist. Other CLIs that read Agent Skills can point at the same folder.
