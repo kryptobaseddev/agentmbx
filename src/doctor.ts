@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { fingerprint } from "./crypto.ts";
 import { signHop } from "./http.ts";
 import { MbxNode } from "./node.ts";
-import { ownerPath } from "./owner.ts";
+import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
 import { detect, edits, skillStatus, wired, type SetupCtx } from "./setup.ts";
 
 export type Level = "ok" | "fail" | "warn" | "info";
@@ -52,7 +52,14 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
   for (const l of sk.links) if (!l.ok) add("warn", `skill not linked at ${l.path.replace(ctx.home, "~")}`, "agentmbx setup --only skill");
 
   if (node) {
-    add("info", existsSync(ownerPath(node.home)) ? `owner key present (${node.ownerPub ? fingerprint(node.ownerPub) : "?"})` : "no owner key on this host (optional: agentmbx owner init)");
+    const owner = ownerInfo(node.home);
+    if (!owner) add("info", `no owner key on this host (optional: agentmbx owner init${authHelperPath() ? ", approve the Touch ID prompt" : ", in a terminal"})`);
+    else if (owner.backend === "file") add("ok", `owner key ${fingerprint(owner.public_key)} (passphrase file ${owner.path})`);
+    else {
+      const st = await keychainOwnerStatus(node.home);
+      add(st.ok ? "ok" : "fail", `owner key ${fingerprint(owner.public_key)} (macOS Keychain, Touch ID)${st.ok ? "" : `: ${st.detail}`}`,
+        st.ok ? undefined : "reinstall AgentMBX.app (agentmbx daemon install); if the Keychain key is gone, move owner.json aside and run agentmbx owner init");
+    }
     const peers = node.peers();
     const approved = peers.filter((p) => p.state === "approved");
     if (!approved.length) add("info", "no paired hosts (optional: agentmbx pair <host>:7373)");

@@ -24,7 +24,8 @@ export function buildEnvelope(d, now = new Date()) {
     return {
         v: 3, id, ts: now.toISOString(), from: d.from, to: d.to, thread: d.thread ?? id, reply_to: d.reply_to ?? null,
         kind: d.kind ?? "message", subject: d.subject.slice(0, 200), body: d.body, needs_reply: d.needs_reply ?? false,
-        refs: d.refs ?? [], meta: parseMeta(d.body), authority: null, enc: null,
+        refs: d.refs ?? [], meta: { ...parseMeta(d.body), ...(d.origin === "external" ? { origin: "external" } : {}), ...(d.hop ? { hop: d.hop } : {}) },
+        authority: null, enc: null,
     };
 }
 const unsigned = (e) => { const { sig: _s, ...rest } = e; return canonical(rest); };
@@ -55,20 +56,30 @@ export function checkShape(x) {
         return "bad subject";
     if (Number.isNaN(Date.parse(e.ts)))
         return "bad ts";
+    const m = e.meta;
+    if (m?.hop !== undefined && !(Number.isInteger(m.hop) && m.hop >= 0 && m.hop <= 1000))
+        return "bad hop";
+    if (m?.origin !== undefined && m.origin !== "agent" && m.origin !== "external")
+        return "bad origin";
     return null;
 }
 // ---- owner grants ----------------------------------------------------------------------------
 export const CAPS = ["task.assign", "decision", "broadcast", "alert"];
 export const MAX_GRANT_HOURS = 24 * 7;
-const grantPayload = (g) => canonical(g);
-export function makeGrant(ownerPub, ownerPriv, sessionPub, agent, host, caps, hours = 12, now = new Date()) {
+/** The exact bytes the owner key signs for a grant (what ownerSignCanonical is given). */
+export const grantPayload = (g) => canonical(g);
+/** An unsigned grant; sign `grantPayload(g)` with the owner key (ownerSignCanonical) and add it as `sig`. */
+export function buildGrant(ownerPub, sessionPub, agent, host, caps, hours = 12, now = new Date()) {
     if (hours <= 0 || hours > MAX_GRANT_HOURS)
         throw new Error(`grant lifetime must be 1..${MAX_GRANT_HOURS} hours`);
     const bad = caps.filter((c) => !CAPS.includes(c));
     if (bad.length)
         throw new Error(`unknown caps: ${bad.join(", ")} (known: ${CAPS.join(", ")})`);
-    const g = { v: 2, id: ulid(now.getTime()), iss: fingerprint(ownerPub), sub: `session:${sessionPub}`, agent, host,
+    return { v: 2, id: ulid(now.getTime()), iss: fingerprint(ownerPub), sub: `session:${sessionPub}`, agent, host,
         caps: [...new Set(caps)].sort(), iat: now.toISOString(), exp: new Date(now.getTime() + hours * 3_600_000).toISOString(), nonce: nonce() };
+}
+export function makeGrant(ownerPub, ownerPriv, sessionPub, agent, host, caps, hours = 12, now = new Date()) {
+    const g = buildGrant(ownerPub, sessionPub, agent, host, caps, hours, now);
     return { ...g, sig: signData(ownerPriv, grantPayload(g)) };
 }
 /** What the session key signs: the envelope without its host signature and without the session signature itself. */
@@ -80,10 +91,17 @@ const ownerPayload = (e) => {
     const { sig: _s, authority, ...rest } = e;
     return canonical({ ...rest, authority: { owner_fp: authority?.owner_fp ?? null } });
 };
-/** The owner signs one envelope directly with the owner key (unlocked with the passphrase on a terminal). */
-export function ownerSign(e, ownerPub, ownerPriv) {
+/** Step 1 of an owner-signed envelope: `payload` is the exact bytes the owner key signs (via ownerSignCanonical). */
+export function ownerSignRequest(e, ownerPub) {
     const withFp = { ...e, authority: { owner_sig: "", owner_fp: fingerprint(ownerPub) } };
-    return { ...withFp, authority: { owner_sig: signData(ownerPriv, ownerPayload(withFp)), owner_fp: fingerprint(ownerPub) } };
+    return { envelope: withFp, payload: ownerPayload(withFp) };
+}
+/** Step 2: attach the owner signature over `ownerSignRequest(...).payload`. */
+export const withOwnerSig = (e, sig) => ({ ...e, authority: { owner_sig: sig, owner_fp: e.authority.owner_fp } });
+/** The owner signs one envelope directly with an unlocked owner key (tests; the CLI goes through ownerSignCanonical). */
+export function ownerSign(e, ownerPub, ownerPriv) {
+    const r = ownerSignRequest(e, ownerPub);
+    return withOwnerSig(r.envelope, signData(ownerPriv, r.payload));
 }
 /** Called by the master session's MCP server, which holds the session private key in memory only. */
 export function attachAuthority(e, grant, sessionPriv) {

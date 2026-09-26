@@ -9,6 +9,8 @@ import { homedir, hostname } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { insertMember, member, parseJsonc, removeMember, replaceValue, valueOf } from "./jsonc.js";
+import { fingerprint } from "./crypto.js";
+import { authHelperPath, canPrompt, createKeychainOwner, ownerInfo } from "./owner.js";
 export const CLIS = ["claude", "codex", "opencode", "kimi", "hermes"];
 /** The bundled skill as {relative path: content}: embedded in the single executable (SEA asset), else read from ../skill. */
 export function skillFiles() {
@@ -86,6 +88,8 @@ const parseObj = (cur) => {
 };
 /** [CLI event, `agentmbx hook` subcommand]. PermissionRequest is YOLO (docs/POLICY.md §5): it answers only under an active policy. */
 const HOOK_EVENTS = [["SessionStart", "session-start"], ["UserPromptSubmit", "prompt"], ["PermissionRequest", "permission"]];
+/** Claude and Codex also take a Stop hook that can keep the turn going ({"decision":"block"}) when mail arrived mid-turn. */
+const STOP_EVENTS = [...HOOK_EVENTS, ["Stop", "stop"]];
 /** Hooks in the Claude/Codex shape: { hooks: { Event: [ { hooks: [ {type, command} ] } ] } }. Appends groups; never edits others. */
 function jsonHooks(events, cli, cmd) {
     const install = (cur) => {
@@ -413,15 +417,15 @@ export function edits(ctx, cli) {
                             return false;
                         }
                     } },
-                { cli, kind: "hooks", item: "hooks SessionStart + UserPromptSubmit + PermissionRequest", path: join(home, ".claude/settings.json"),
-                    ...jsonHooks(HOOK_EVENTS, "claude", cmd) },
+                { cli, kind: "hooks", item: "hooks SessionStart + UserPromptSubmit + PermissionRequest + Stop", path: join(home, ".claude/settings.json"),
+                    ...jsonHooks(STOP_EVENTS, "claude", cmd) },
             ];
         }
         case "codex":
             return [
                 { cli, kind: "mcp", item: "[mcp_servers.mbx]", path: join(home, ".codex/config.toml"), ...codexServer(cmd) },
-                { cli, kind: "hooks", item: "hooks SessionStart + UserPromptSubmit + PermissionRequest", path: join(home, ".codex/hooks.json"),
-                    ...jsonHooks(HOOK_EVENTS, "codex", cmd) },
+                { cli, kind: "hooks", item: "hooks SessionStart + UserPromptSubmit + PermissionRequest + Stop", path: join(home, ".codex/hooks.json"),
+                    ...jsonHooks(STOP_EVENTS, "codex", cmd) },
             ];
         case "opencode":
             return [{ cli, kind: "mcp", item: "mcp.servers.mbx", path: opencodeConfig(home), ...opencodeServer(cmd) }];
@@ -585,3 +589,42 @@ export const MANUAL_HINTS = {
     kimi: "add {\"mcpServers\":{\"mbx\":{\"command\":\"agentmbx\",\"args\":[\"mcp\"]}}} to ~/.kimi-code/mcp.json",
     hermes: "add mcp_servers: { mbx: { command: agentmbx, args: [mcp] } } to ~/.hermes/config.yaml",
 };
+/**
+ * The owner step of `agentmbx setup`. An agent may run it: with the macOS Keychain helper, creating the key only needs the
+ * human to approve a Touch ID / password prompt. Without the helper (Linux, SSH, no AgentMBX.app) the passphrase must be
+ * typed on a terminal, so it prints the exact command for the human instead. Never fails setup.
+ */
+export async function ownerStep(o) {
+    const log = o.log ?? ((l) => console.log(l));
+    const info = ownerInfo(o.mbxHome);
+    if (info) {
+        log(`owner: key ${fingerprint(info.public_key)} (${info.backend === "keychain" ? "macOS Keychain, Touch ID" : "passphrase file"})`);
+        return "present";
+    }
+    const helper = o.helper === undefined ? authHelperPath() : o.helper;
+    const cmd = `${shJoin(o.cmd)} owner init`;
+    if (!helper) {
+        log(`owner: no owner key yet. It is how you (not an agent) approve grants and policies. Run this yourself in a terminal;\n  it asks for a new passphrase (an agent can't type it for you):\n    ${cmd}`);
+        return "manual";
+    }
+    if (o.dryRun) {
+        log("owner: would create your owner key in the macOS Keychain (a Touch ID / password prompt appears)");
+        return "dry-run";
+    }
+    // never wait on a prompt that can't appear (SSH, no GUI login): print the commands instead
+    const can = await (o.canPrompt ?? canPrompt)(helper);
+    if (!can.ok) {
+        log(`owner: no owner key yet, and ${can.reason.replace(/[.;].*$/s, "")}.\n  At the Mac, run: ${cmd}    (Touch ID)\n  Or here, with a passphrase: ${cmd} --backend file`);
+        return "manual";
+    }
+    log(`owner: creating your owner key in the macOS Keychain.\n  A Touch ID / password prompt will appear: approve it. (Not at the Mac? Cancel it and run later: ${cmd})`);
+    try {
+        const r = await (o.create ?? ((h, hp) => createKeychainOwner(h, hp, 120_000)))(o.mbxHome, helper);
+        log(`owner: key ${fingerprint(r.publicKey)} ${r.adopted ? "(already in the Keychain; now used here)" : "created"} (macOS Keychain, Touch ID)`);
+        return "created";
+    }
+    catch (e) {
+        log(`owner: not created (${e.message}).\n  Run later: ${cmd}`);
+        return "failed";
+    }
+}

@@ -4,25 +4,25 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { execFileSync } from "node:child_process";
-import { fingerprint } from "./crypto.js";
-import { CAPS, makeGrant } from "./envelope.js";
+import { canonical, fingerprint, ulid } from "./crypto.js";
+import { buildGrant, CAPS, grantPayload } from "./envelope.js";
 import { advertise, browse, lanIPv4 } from "./discovery.js";
 import { flushOutbox, pairJoin, pairWith, refreshDirectory, startServer, advertisedAddr } from "./http.js";
 import { daemonAnswers, doctor, failed, formatChecks } from "./doctor.js";
 import { agentName, runMcp } from "./mcp.js";
 import { DEFAULT_PORT, defaultHome, formatMessage, MbxNode, summaryLine, trustLabel } from "./node.js";
-import { createOwnerKey, ownerPath, readPassphraseFromTTY, unlockOwnerKey } from "./owner.js";
+import { authHelperPath, createKeychainOwner, createOwnerKey, defaultOwnerBackend, ownerInfo, ownerSignCanonical, readPassphraseFromTTY } from "./owner.js";
 import { periodicUpdateCheck, updateAvailable, updateCommand } from "./update.js";
 import { installKind, version } from "./version.js";
 import { installService, serviceLabel, uninstallService } from "./service.js";
-import { CLIS, defaultHostName, defaultWhich, formatRows, resolveCommand, runSetup, shJoin } from "./setup.js";
+import { CLIS, defaultHostName, defaultWhich, formatRows, ownerStep, resolveCommand, runSetup, shJoin } from "./setup.js";
 import { dispatchWakes, inboxCommand, macNotifierPath, notifyDesktop, opencodeService, opencodeSessionFor } from "./wake.js";
 import { approveKimi, decidePermission, opencodePermissionPass } from "./permission.js";
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
 
 Start here
-  agentmbx setup [--yes] [--dry-run] [--only claude,codex,opencode,kimi,hermes,skill] [--host <name>] [--uninstall]
-                  init this host, install the daemon, wire every detected agent CLI (MCP + hooks + skill)
+  agentmbx setup [--yes] [--dry-run] [--only claude,codex,opencode,kimi,hermes,skill,owner] [--host <name>] [--no-owner] [--uninstall]
+                  init this host, install the daemon, wire every detected agent CLI (MCP + hooks + skill), create the owner key
   agentmbx doctor   checklist: host, daemon, each CLI's wiring, skill, peers, pending pairings
 
 Messages
@@ -42,8 +42,8 @@ Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …'
   agentmbx daemon                                   agentmbx daemon install | uninstall   (launchd / systemd user service)
   agentmbx notify-test [--as <agent>]               send a sample desktop notification the way wake-ups do
 
-Owner (run these yourself in a terminal; they ask for the owner passphrase and refuse to run without one)
-  agentmbx owner init        agentmbx owner show
+Owner (each signature needs you: a Touch ID / password prompt on macOS with AgentMBX.app, else the passphrase on a terminal)
+  agentmbx owner init [--backend keychain|file]   agentmbx owner show
   agentmbx owner grant <agent> [--session <fingerprint>] [--caps ${CAPS.join(",")}] [--ttl 12h]
   agentmbx owner revoke <grant-id>
   agentmbx owner send --to <agents> --subject "…" -m "…" [--kind task] [--needs-reply]   one message signed by you (OWNER)
@@ -99,7 +99,8 @@ async function run(argv) {
             ref: { type: "string", multiple: true }, all: { type: "boolean" }, json: { type: "boolean" }, note: { type: "string" },
             host: { type: "string" }, port: { type: "string" }, cli: { type: "string" }, session: { type: "string" }, caps: { type: "string" },
             ttl: { type: "string" }, bind: { type: "string" }, role: { type: "string" }, description: { type: "string" }, thread: { type: "string" }, from: { type: "string" }, check: { type: "boolean" }, yes: { type: "boolean", short: "y" },
-            compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" }
+            compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" },
+            backend: { type: "string" }, "no-owner": { type: "boolean" }
         } });
     const str = (k) => (typeof o[k] === "string" ? o[k] : undefined);
     if (cmd === "mcp")
@@ -377,18 +378,39 @@ async function notifyTest(agent) {
     console.log(`sent via ${r.via}`);
 }
 // ---- owner commands --------------------------------------------------------------------------
-function owner(node, pos, str, o) {
-    const sub = pos[0];
-    if (sub === "show")
-        return console.log(node.ownerPub ? `owner key ${fingerprint(node.ownerPub)} (${ownerPath(node.home)})` : "no owner key on this host");
-    if (sub === "init") {
-        if (existsSync(ownerPath(node.home)))
-            die("an owner key already exists on this host");
+/** `agentmbx owner init`: keychain (Touch ID; an agent may run it, the human approves the prompt) or passphrase file. */
+export async function ownerInit(home, backend = defaultOwnerBackend(), log = (s) => console.log(s)) {
+    const have = ownerInfo(home);
+    if (have)
+        die(`an owner key already exists on this host (${have.backend}: ${fingerprint(have.public_key)})`);
+    let pub;
+    if (backend === "keychain") {
+        log("Creating your AgentMBX owner key in the macOS Keychain.\nA Touch ID / password prompt will appear: approve it. (Nothing else is needed: no passphrase to remember.)");
+        const r = await createKeychainOwner(home, authHelperPath() ?? die("the Keychain helper (AgentMBX.app/Contents/MacOS/agentmbx-auth) was not found; install the app (agentmbx daemon install) or use --backend file"));
+        pub = r.publicKey;
+        if (r.adopted)
+            log("(the Keychain already held an AgentMBX owner key; using it)");
+    }
+    else {
         const p1 = readPassphraseFromTTY("New owner passphrase (save it in your password manager): "), p2 = readPassphraseFromTTY("Again: ");
         if (p1 !== p2)
             die("passphrases differ");
-        const pub = createOwnerKey(node.home, p1);
-        console.log(`owner key created: ${fingerprint(pub)}\nPair (or re-pair) your other hosts so they pin this key.`);
+        pub = createOwnerKey(home, p1);
+    }
+    log(`owner key created: ${fingerprint(pub)} (${backend})\nPair (or re-pair) your other hosts so they pin this key.`);
+    return pub;
+}
+async function owner(node, pos, str, o) {
+    const sub = pos[0];
+    if (sub === "show") {
+        const info = ownerInfo(node.home);
+        return console.log(info ? `owner key ${fingerprint(info.public_key)} (${info.backend === "keychain" ? "macOS Keychain, Touch ID" : "passphrase file"}: ${info.path})` : "no owner key on this host");
+    }
+    if (sub === "init") {
+        const b = str("backend");
+        if (b && b !== "keychain" && b !== "file")
+            die("--backend keychain|file");
+        await ownerInit(node.home, b ?? defaultOwnerBackend());
         return;
     }
     if (sub === "grant") {
@@ -410,9 +432,10 @@ function owner(node, pos, str, o) {
         if (pick.length > 1)
             die(`several live sessions for ${agent}; choose one with --session:\n${pick.map((s) => `  ${fingerprint(s.session_key)}  ${s.cli} pid ${s.pid} ${s.cwd} (since ${s.updated_at})`).join("\n")}`);
         const s = pick[0];
-        console.log(`Grant OWNER authority to:\n  agent ${agent}@${node.host}  (${s.cli}, pid ${s.pid}, ${s.cwd})\n  session key ${fingerprint(s.session_key)}\n  caps ${caps.join(", ")}  for ${hours} h\nOnly that running session can use it; it ends when the session ends.`);
-        const kp = unlockOwnerKey(node.home, readPassphraseFromTTY("Owner passphrase: "));
-        const g = makeGrant(kp.publicKey, kp.privateKey, s.session_key, agent, node.host, caps, hours);
+        const ownerPub = node.ownerPub ?? die("no owner key on this machine: run 'agentmbx owner init'");
+        const unsigned = buildGrant(ownerPub, s.session_key, agent, node.host, caps, hours);
+        const summary = `Grant OWNER authority to:\n  agent ${agent}@${node.host}  (${s.cli}, pid ${s.pid}, ${s.cwd})\n  session key ${fingerprint(s.session_key)}\n  caps ${unsigned.caps.join(", ")}  for ${hours} h\nOnly that running session can use it; it ends when the session ends.`;
+        const g = { ...unsigned, sig: (await ownerSignCanonical(node.home, grantPayload(unsigned), summary)).sig };
         node.store.db.prepare("INSERT INTO grants VALUES (?,?,?,?,0)").run(g.id, g.sub, JSON.stringify(g), g.exp);
         node.store.audit("owner.grant", { id: g.id, agent, session: fingerprint(s.session_key), caps, exp: g.exp });
         return console.log(`granted ${g.id} (expires ${g.exp})`);
@@ -422,19 +445,22 @@ function owner(node, pos, str, o) {
         const to = (str("to") ?? die("owner send --to <agents> --subject … -m …")).split(",").map((x) => x.trim()).filter(Boolean);
         const body = str("m") ?? (str("body-file") ? readFileSync(str("body-file"), "utf8") : die("-m or --body-file is required"));
         const kind = (str("kind") ?? "task");
-        const kp = unlockOwnerKey(node.home, readPassphraseFromTTY("Owner passphrase: "));
-        const r = node.send({ from: "owner", to, subject: str("subject") ?? die("--subject is required"), body, kind, needs_reply: !!o["needs-reply"] }, undefined, { pub: kp.publicKey, priv: kp.privateKey });
+        const subject = str("subject") ?? die("--subject is required");
+        const r = await node.sendAsOwner({ from: "owner", to, subject, body, kind, needs_reply: !!o["needs-reply"] }, (payload) => ownerSignCanonical(node.home, payload, `Send as OWNER to ${to.join(", ")}: ${subject} (${kind}, ${Buffer.byteLength(body)} bytes)`));
         r.warnings.forEach((w) => process.stderr.write(`warning: ${w}\n`));
         return console.log(`${r.envelope.id}  (owner-signed; delivered to ${[...r.local, ...r.remote].join(", ")})`);
     }
     if (sub === "revoke") {
         const id = pos[1] ?? die("owner revoke <grant-id>");
-        unlockOwnerKey(node.home, readPassphraseFromTTY("Owner passphrase: "));
         const g = node.store.db.prepare("SELECT grant FROM grants WHERE id=?").get(id);
         if (!g)
             die(`no grant ${id} on this host`);
+        // an owner-signed revocation record: proves the human approved it (and is the shape policy revocations use)
+        const ownerPub = node.ownerPub ?? die("no owner key on this machine: run 'agentmbx owner init'");
+        const rec = { v: 1, type: "revocation", id: ulid(), kind: "grant", revokes: [id], iat: new Date().toISOString(), owner_fp: fingerprint(ownerPub) };
+        const { sig } = await ownerSignCanonical(node.home, canonical(rec), `Revoke grant ${id}`);
         node.store.db.prepare("UPDATE grants SET revoked=1 WHERE id=?").run(id);
-        node.store.audit("owner.revoke", { id });
+        node.store.audit("owner.revoke", { id, record: rec, owner_sig: sig });
         return console.log(`revoked ${id} on this host (grants also expire on their own; messages already sent keep their original label)`);
     }
     die("owner init | show | grant <agent> | revoke <id> | send --to …");
@@ -539,9 +565,9 @@ const setupCtx = (home = homedir()) => ({ home, cmd: resolveCommand(home), which
 async function setup(o, str) {
     const dryRun = !!o["dry-run"], uninstall = !!o.uninstall, mode = uninstall ? "uninstall" : "install";
     const only = str("only")?.split(",").map((s) => s.trim()).filter(Boolean);
-    const bad = only?.filter((c) => ![...CLIS, "skill", "daemon"].includes(c));
+    const bad = only?.filter((c) => ![...CLIS, "skill", "daemon", "owner"].includes(c));
     if (bad?.length)
-        die(`--only: unknown ${bad.join(", ")} (use ${[...CLIS, "skill", "daemon"].join(",")})`);
+        die(`--only: unknown ${bad.join(", ")} (use ${[...CLIS, "skill", "daemon", "owner"].join(",")})`);
     const ctx = setupCtx();
     console.log(`agents will run: ${shJoin(ctx.cmd)} mcp`);
     const wantDaemon = !only || only.includes("daemon");
@@ -577,6 +603,9 @@ async function setup(o, str) {
             node.close();
         }
     }
+    // owner key: Touch ID on macOS (an agent may run this; the human approves the prompt), else print the command
+    if (!uninstall && !o["no-owner"] && (!only || only.includes("owner")) && existsSync(join(defaultHome(), "config.json")))
+        await ownerStep({ mbxHome: defaultHome(), cmd: ctx.cmd, dryRun });
     const plan = runSetup(ctx, { mode, only, dryRun: true });
     const pending = plan.filter((r) => ["added", "updated", "removed"].includes(r.action));
     if (dryRun || !pending.length) {

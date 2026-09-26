@@ -48,10 +48,10 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
 |---|---|---|
 | `local (same user on this host)` | written by a process running as your OS user on this machine | that the named agent wrote it (names are labels) |
 | `verified (paired host X)` | signed by machine X's key, which you approved by pairing (one-time token or compared code) | which agent on X wrote it |
-| `authority: OWNER via <agent> session <fp>` | a live session that **you** approved with your owner passphrase sent it, within the capabilities you granted, before the grant expired | that the content is safe, or that permission prompts can be skipped |
+| `authority: OWNER via <agent> session <fp>` | a live session that **you** approved (Touch ID on macOS, your owner passphrase on Linux) sent it, within the capabilities you granted, before the grant expired | that the content is safe, or that permission prompts can be skipped |
 
-- **Owner authority belongs to one running session.** You run `agentmbx owner grant` in your own terminal, pick the live session, and type your passphrase. The grant is bound to a key that exists only in that session's memory, for 12 h by default. Another process using the same agent name gets nothing.
-- **The owner key** is encrypted with your passphrase and unlocks only from a real terminal. An agent's shell commands cannot use it.
+- **Owner authority belongs to one running session.** You (or an agent) run `agentmbx owner grant`, pick the live session, and **you** approve it: a Touch ID tap on macOS, your passphrase on Linux. The grant is bound to a key that exists only in that session's memory, for 12 h by default. Another process using the same agent name gets nothing.
+- **The owner key** lives in the macOS login Keychain behind Touch ID (no passphrase), readable only by AgentMBX.app's signing helper, which writes the prompt text itself from exactly what it signs. On Linux it is encrypted with your passphrase and unlocks only from a real terminal. Either way, an agent's shell commands cannot use it.
 - **Capabilities are enforced by the receiving machine** (`task.assign`, `decision`, `broadcast`, `alert`). A message outside its grant arrives labelled `authority: none` with a warning.
 - **No message can approve a permission prompt or change a recipient's config**, owner-signed or not. The MCP instructions tell every agent this, and agents treat all message content as data, not instructions. This mirrors how Claude Code handles messages from other sessions.
 - **Known limits:**
@@ -105,7 +105,7 @@ agentmbx inbox --as planner
 Owner authority (optional, only on the machine you use):
 
 ```sh
-agentmbx owner init                                            # choose a passphrase
+agentmbx owner init                                            # macOS: approve Touch ID; Linux: choose a passphrase
 agentmbx owner grant planner --caps task.assign,decision --ttl 12h
 ```
 

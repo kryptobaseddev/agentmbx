@@ -21,11 +21,17 @@ It prints a table of every change. Every file it edits is first copied to `<file
 | Flag | Effect |
 |---|---|
 | `--dry-run` | show what would change, write nothing |
-| `--only claude,codex,opencode,kimi,hermes,skill` | limit it to some CLIs |
+| `--only claude,codex,opencode,kimi,hermes,skill,owner` | limit it to some CLIs (or just the owner step) |
+| `--no-owner` | skip the owner-key step |
 | `--yes` | don't ask before writing |
 | `--uninstall` | remove exactly what setup added (the daemon keeps running; `agentmbx daemon uninstall` stops it) |
 
-The owner key is separate, and only belongs on the machine the owner uses: `agentmbx owner init` asks for a passphrase (save it in a password manager).
+### The owner key
+The owner key is how **you**, not an agent, approve grants and policies. It only belongs on the machine you use. `agentmbx setup` has an owner step, and `agentmbx owner init` does the same on its own:
+- **macOS with AgentMBX.app (the default there):** the key is created in your login Keychain by `AgentMBX.app/Contents/MacOS/agentmbx-auth`, and only that helper can read it. There is no passphrase. An agent may run `agentmbx setup` or `agentmbx owner init` for you: it tells you a Touch ID / password prompt is coming, and you approve it. Every owner signature after that (`owner grant`, `owner send`, `owner revoke`, policies) is one Touch ID tap, and the prompt text is written by the helper from exactly what is being signed, e.g. `Grant OWNER authority (task.assign) to planner@macbook, session 3f2a-…, for 12 hours`. An agent can start a request, but only you can approve it.
+- **Linux, SSH sessions, or macOS without the app:** `agentmbx owner init` asks for a passphrase on the terminal (save it in a password manager), and each owner command asks for it again. Agents can't type it, so setup prints the exact command for you to run instead of failing. Force this backend on macOS with `agentmbx owner init --backend file`.
+
+`agentmbx owner show` and `agentmbx doctor` show which backend holds the key. Macs without Touch ID (a Mac mini without a Touch ID keyboard, a VM) get the account-password prompt instead. Over SSH no prompt can appear, so the helper fails at once, setup prints the commands instead of waiting, and you can use `--backend file` there. With an ad-hoc signed app (a local build, or a release built without the signing certificate), rebuilding or updating the app changes its signature, and the next owner signature first shows a Keychain dialog asking to let `agentmbx-auth` use the item: choose Always Allow (once per update; denying it just means nothing is signed). To reset a Keychain owner key: `~/Applications/AgentMBX.app/Contents/MacOS/agentmbx-auth delete` (Touch ID), then remove `owner.json` from the mbx home.
 
 Update later with `agentmbx update` (binary installs; checks the Ed25519-signed release manifest and the sha256 of the
 download, then restarts the daemon). npm and source installs print the command to run instead.
@@ -62,16 +68,17 @@ Remove a pairing with `agentmbx peers remove <host>`.
 
 ## The master agent (owner authority)
 1. Start the session you want as master, with mbx configured.
-2. In your own terminal (not through an agent), run:
+2. Run (on macOS an agent may run it for you; the Touch ID prompt is yours to approve):
    `agentmbx owner grant <agent> --caps task.assign,decision --ttl 12h`
-3. It lists the live sessions for that agent. Pick one, type the owner passphrase, and that session's messages carry `authority: OWNER` for 12 hours or until it exits.
+3. It lists the live sessions for that agent (pick one with `--session <fp>` if there are several). Approve the Touch ID prompt, or type the owner passphrase on Linux, and that session's messages carry `authority: OWNER` for 12 hours or until it exits.
 4. Other sessions, even ones using the same agent name, cannot use the grant.
 
 ## Files
 `~/.local/share/agentmbx/` (override with `MBX_HOME`) contains:
 - `config.json`: host name, port, bind address
 - `host.key`: the host's signing key (0600)
-- `owner.key`: the owner key, encrypted with the passphrase. Only on the owner's machine.
+- `owner.json` (macOS Keychain backend): the backend and the owner public key; the private key stays in the login Keychain. Only on the owner's machine.
+- `owner.key` (file backend): the owner key, encrypted with the passphrase. Only on the owner's machine.
 - `mbx.db`: messages, deliveries, peers, grants, audit log
 - `daemon.log`
 

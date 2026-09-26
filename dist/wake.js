@@ -5,7 +5,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { MbxNode, trustLabel } from "./node.js";
+import { alive, MbxNode, trustLabel } from "./node.js";
 const run = promisify(execFile);
 export function wakeText(agent, msgs) {
     const senders = [...new Set(msgs.map((m) => `${m.from_addr} [${trustLabel(m).split(" · ")[0].split(" (")[0]}]`))].join(", ");
@@ -120,14 +120,6 @@ export async function notifyDesktop(n) {
     }
     return last;
 }
-const alive = (pid) => { if (!pid)
-    return false; try {
-    process.kill(pid, 0);
-    return true;
-}
-catch {
-    return false;
-} };
 /** One pass of the wake dispatcher: every delivered-but-not-notified message is either woken, batched or skipped. */
 export async function dispatchWakes(node) {
     const pending = node.store.db.prepare(`SELECT d.agent, m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.state='delivered' ORDER BY m.ts`).all();
@@ -167,9 +159,11 @@ export async function dispatchWakes(node) {
             if (result.ok)
                 break;
         }
+        let desktop = false;
         if (!result.ok)
-            result = await notifyDesktop({ subtitle: agent, body: text, openCmd: inboxCommand(agent) }).then((r) => (r.ok ? r : result));
-        markAll();
+            result = await notifyDesktop({ subtitle: agent, body: text, openCmd: inboxCommand(agent) }).then((r) => { desktop = r.ok; return r.ok ? r : result; });
+        // mail that only reached the desktop gets another wake when a wakeable session binds (node.bindSession)
+        rows.forEach((r) => node.setDelivery(r.id, agent, "notified", desktop || !result.ok ? "desktop" : null));
         node.store.audit("wake", { agent, via: result.via, ok: result.ok, count: wanted.length });
         out.push({ agent, result });
     }

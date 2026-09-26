@@ -84,13 +84,20 @@ Storage is exactly-once (dedupe on `id`). Notification and agent action are at-l
 The daemon advertises `_agentmbx._tcp` over mDNS/DNS-SD (`multicast-dns`, pure JS) with TXT `v`, `host`, `fp` (host key fingerprint). `agentmbx discover` lists what answers within 3 s, marking paired/pending/key-mismatch; `join <host>` resolves a bare name the same way, then falls back to `<host>.local:7373`. mDNS answers are unauthenticated, so they only pick an address; the token (or pinned key) decides trust. UDP 5353 is shared with `reuseAddr` (mDNSResponder on macOS, avahi on Linux). If multicast is blocked, explicit addresses work unchanged. `MBX_NO_MDNS=1` disables advertising.
 
 ### Owner key
-- `mbx owner init`: an Ed25519 key encrypted with a passphrase the owner chooses (scrypt N=2^17 → AES-256-GCM) and stored in `owner.key` (0600).
-- It can only be unlocked by `mbx owner …` commands that read the passphrase from **`/dev/tty` with echo off**, and those commands refuse to run without a controlling terminal. Agent tool calls (Bash tools have no TTY) cannot use it, and the passphrase lives only in the owner's head and password manager.
-- There is no Keychain dependency in v1. Touch ID or Secure Enclave signing can come later as a second backend.
+An Ed25519 key with two backends (docs/POLICY.md §6). Every owner signature goes through one function, `ownerSignCanonical(home, canonicalJson, summary)` in `src/owner.ts`, which signs the exact canonical bytes receivers verify. Receivers can't tell the backends apart.
+- **`keychain` (macOS default when AgentMBX.app is installed):** `mbx owner init` runs `AgentMBX.app/Contents/MacOS/agentmbx-auth init`, which shows a LocalAuthentication prompt (Touch ID or the account password), creates the key with CryptoKit and stores it as a login-Keychain generic password (service `com.agentmbx.owner`, account `owner`) created by the helper, so its access list trusts only the helper. `owner.json` records `{backend: "keychain", public_key}`. To sign, Node writes the canonical JSON to a 0600 temp file and runs `agentmbx-auth sign <file>`. The helper refuses anything that isn't canonical JSON (so the object it describes is exactly the object it signs), renders the prompt text itself from the content (policy, grant, revocation, owner message, device, member; anything else is refused; never from argv or env), checks that any owner fingerprint in the payload is its own key, asks for Touch ID with that text, and prints the signature. Node verifies it against `owner.json` before using it. `agentmbx-auth summary <file>` prints the text without prompting (tests use it).
+- **`file` (Linux, or `--backend file`):** an Ed25519 key encrypted with a passphrase the owner chooses (scrypt N=2^17 → AES-256-GCM) and stored in `owner.key` (0600). It can only be unlocked by `mbx owner …` commands that read the passphrase from **`/dev/tty` with echo off**, and those commands refuse to run without a controlling terminal. Agent tool calls (Bash tools have no TTY) cannot use it. This proves someone knows the passphrase, not that a human is present.
+- An agent may *start* `owner init`, `owner grant` or `owner send` on macOS (setup does this for the owner step), but only the human can approve the prompt.
+
+### Devices and members (forward-compatible, not built yet; docs/POLICY.md §7)
+- The owner key is the only principal identity. A second machine of the same owner does not get a second owner key: after pairing, the owner approves it once with an owner-signed `device` record `{v, type: "device", host, host_pub, owner_fp, iat}` (prompt: "Approve device <host> (host key <fp>) as one of your machines").
+- Another human is added with an owner-signed `member` record `{v, type: "member", role: "member"|"guest", label, owner_pub, owner_fp, iat}` (prompt: "Add <role> <label> (owner key <fp>) to your AgentMBX"). Policies may then name `principal:<fp>` in `from`.
+- Revocations are owner-signed `{v, type: "revocation", id, kind?: "grant"|"policy", revokes: [ids] | all: true, iat, owner_fp}`. `mbx owner revoke` already signs one for grants.
+- The Keychain helper already renders and signs these record types, so adding them later needs no helper change.
 
 ### Master session and grants
 1. Every `mbx mcp` process creates an **ephemeral Ed25519 session key at startup** and keeps it **only in memory**. It registers `{agent, cli, pid, cwd, session_pubkey}` in `sessions`. The key is gone when the session ends.
-2. On the machine, the owner runs `mbx owner grant <agent> [--session <fp>] --caps task.assign,broadcast --ttl 12h`. It lists the matching live sessions (pid, CLI, cwd, start time, key fingerprint), the owner confirms one, and the owner then types the passphrase. The signed grant `{v, id, iss: owner_fp, sub: "session:<fp>", agent, host, caps, iat, exp, nonce}` is stored. The default TTL is 12 h and the maximum 7 d.
+2. On the machine, the owner runs `mbx owner grant <agent> [--session <fp>] --caps task.assign,broadcast --ttl 12h`. It lists the matching live sessions (pid, CLI, cwd, start time, key fingerprint), the owner confirms one, and then approves the Touch ID prompt (keychain backend) or types the passphrase (file backend). The signed grant `{v, id, iss: owner_fp, sub: "session:<fp>", agent, host, caps, iat, exp, nonce}` is stored. The default TTL is 12 h and the maximum 7 d.
 3. The master's MCP server attaches the grant only if its own in-memory key matches `sub`, and it adds `authority.session_sig`: the session key's signature over the envelope's canonical JSON (without `sig` and without `session_sig`).
 4. Any other process on the host, even one that calls itself the same agent name, has neither the key nor a valid `session_sig`. Its messages carry `authority: none`.
 5. The receiver checks, in order:
@@ -102,7 +109,7 @@ The daemon advertises `_agentmbx._tcp` over mDNS/DNS-SD (`multicast-dns`, pure J
    - the cap check against the envelope.
 
    Any failure delivers the message with `authority: none` and a warning line. It is never dropped silently.
-6. Revocation: `mbx owner revoke <grant-id>` (a TTY command). It records the revocation and sends an owner-signed `revoke` notice to paired hosts.
+6. Revocation: `mbx owner revoke <grant-id>` (needs the owner's approval, like a grant). It records the revocation and sends an owner-signed `revoke` notice to paired hosts.
 
 ### Capabilities (enforced by the receiving server)
 | Cap | Allows the message to carry owner authority when… |
