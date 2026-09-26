@@ -47,3 +47,38 @@ Claude's session sockets (`/tmp/cc-socks`) use a private wire format. Don't post
 - Pairing: Syncthing-style mutual approval plus a 6-digit short authentication string (a fingerprint of both keys and nonces), confirmed by a human on both sides.
 - Owner delegation: the owner key signs a grant `{sub, caps, exp}` for a master agent, one level only. Recipients see a verified label; the server checks capabilities.
 - Later: X25519 sealed-box encryption (the `enc` field is reserved), mDNS `_mbx._tcp` discovery, advisory file leases with a TTL.
+
+## Permission hooks per CLI (2026-09-26)
+T051, for YOLO (`docs/POLICY.md` §5). Checked against the binaries installed on the test Mac: Claude Code 2.1.283, Codex 0.157.1, Kimi Code 2.1.1, OpenCode 2.0.15. Nothing was approved in a real session; the Kimi and OpenCode APIs were only read (`openapi.json`, pending lists).
+
+| CLI | Mechanism | Verdict |
+|---|---|---|
+| Claude Code | `PermissionRequest` command hook returns `decision.behavior: "allow"` | **verified** (docs + binary schema) |
+| Codex | `PermissionRequest` command hook, same output shape | **verified** (docs + binary strings) |
+| Kimi Code | hooks can't allow. `PermissionRequest` is fire-and-forget; the hook posts the approval to the `kimi web` server, which works only for sessions that server hosts | **source-read**; plain TUI sessions have no mechanism |
+| OpenCode | daemon polls `GET /api/session/{id}/permission`, answers `POST …/permission/{requestID}/reply {"decision":"once"}` | **verified** endpoints (live openapi); a plugin `permission` `evaluate` hook also exists |
+
+### Claude Code
+- Docs: https://code.claude.com/docs/en/hooks.md, "PermissionRequest" and "PermissionRequest decision control". Input carries the common fields (`session_id`, `transcript_path`, `cwd`, `permission_mode`, `hook_event_name`) plus `tool_name`, `tool_input`, optional `permission_suggestions`, and no `tool_use_id`. Allow:
+  `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}`
+- Binary schema (`strings ~/.local/share/claude/versions/2.1.283`): `hookEventName:R("PermissionRequest"),decision:$e([u({behavior:R("allow"),updatedInput:…optional(),updatedPermissions:…optional()}),u({behavior:R("deny"),message:…,interrupt:…})])`.
+- It runs only when Claude is about to prompt, or would auto-deny a call that can't prompt. Deny and ask rules still apply after an allow. Exit code 2 is ignored for this event. Background subagents in headless mode also run it; when no hook decides, the call is denied.
+- `PreToolUse` with `permissionDecision: "allow"` also skips the prompt, but it runs before every tool call, and needs `updatedInput` for `AskUserQuestion`/`ExitPlanMode`. `PermissionRequest` fires only when a prompt would appear, so it's cheaper and the better fit. We never auto-allow `AskUserQuestion` or `ExitPlanMode`: they collect an answer from the user.
+
+### Codex
+- Docs: https://developers.openai.com/codex/hooks.md, "PermissionRequest". It runs "when Codex is about to ask for approval, such as a shell escalation or managed-network approval", and not for commands that need no approval. Input: common fields (`session_id`, `cwd`, `transcript_path`, `hook_event_name`, `model`, `permission_mode`), `turn_id`, `tool_name` (`Bash`, `apply_patch`, `mcp__server__tool`), `tool_input`. Output is identical to Claude's: `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}`. Any `deny` wins; when nobody decides, the normal approval prompt appears. `updatedInput`, `updatedPermissions` and `interrupt` fail closed today, so we don't send them.
+- Binary strings (0.157.1): `PermissionRequestHookSpecificOutputWire`, `PermissionRequestDecisionWire`, `PermissionRequestBehaviorWire…behavior updatedInput updatedPermissions`. `codex features list` shows `hooks stable true`.
+- Non-managed hooks need a one-time review/trust in Codex before they run (already noted for the other hooks).
+
+### Kimi Code 2.1.1
+Read from the bundled JS in `~/.kimi-code/bin/kimi` (`strings`):
+- `registerPermissionHooks()` subscribes to `PermissionApprovalRequested` and calls `this.fireAndForget("PermissionRequest", inputData, e.toolName)`. The hook result is ignored, so it can't approve.
+- `PreToolUse` goes through `runner.triggerBlock`, and the parser only reads `if (hookSpecificOutput?.permissionDecision !== "deny") return result;`. A hook can veto, never allow.
+- The hook's stdin is the approval request with keys snake-cased (`toHookInputData`): `hook_event_name`, `session_id`, `cwd`, `id` (`approval_<uuid>`), `agent_id`, `turn_id`, `tool_call_id`, `tool_name`, `action`, `display`, `tool_input`. The event is dispatched just before `interactions.request({ id: approvalRequest.id, kind: "approval" … })` registers the approval.
+- `kimi web` API (`GET http://127.0.0.1:<port>/openapi.json`, bearer `~/.kimi-code/server.token`; the port is in `~/.kimi-code/server/instances/<id>.json`): `GET /api/v1/sessions/{session_id}/approvals?status=pending` → `{code:0, data:{items:[{approval_id, session_id, tool_name, action, …}]}}`, and `POST /api/v1/sessions/{session_id}/approvals/{approval_id}` with `{"decision":"approved"|"rejected"|"cancelled", "scope"?:"session"}`.
+- So the permission hook, when the policy allows, polls the pending list for its `id` for up to 5 s and then posts `approved`. That reaches only sessions hosted by the local server (`kimi web`, `kimi rc`, the desktop app). A plain `kimi` TUI session runs its engine in-process: on this Mac the server's `server/events/` only held the `kimi web` test sessions, not the latest TUI session. For those, the hook finds nothing and the prompt stays; the fallback is Kimi's own `--yolo` / `--auto` flags, documented in INSTALL.md. Matching the hook `id` with the API `approval_id` is source-read, not tested live.
+
+### OpenCode 2.0.15
+- Live `GET /openapi.json` on the running service ("opencode HttpApi"): `GET /api/permission/request`, `GET /api/session/{sessionID}/permission` → `{data:[Permission.Request]}` with `Permission.Request = {id:"per…", sessionID:"ses…", action, resources[], save?, metadata?, source?, message?}`, and `POST /api/session/{sessionID}/permission/{requestID}/reply` with `{"decision":"once"|"always"|"reject","message"?}` → 204. The body is `additionalProperties:false`; the older `{"reply":"once"}` in `scripts/e2e/wake-opencode.py` doesn't match 2.0.15's schema.
+- The SSE stream `GET /api/event` sends `data: {"id","type","data"}` frames; the binary defines `permission.asked` (data = `Permission.Request`) and `permission.replied`.
+- The binary also has a plugin hook: `c.trigger("permission","evaluate",{sessionID, agent, action, resources, metadata, source, effect})`, and a plugin can set `effect` (seen as `e.permission.hook("evaluate", f => { … f.effect = "deny" })`). That runs inside OpenCode and would need a JS plugin shipped into `~/.config/opencode/plugins`. We use the daemon instead, per POLICY.md: every 2 s it polls the pending requests of bound OpenCode sessions whose agent has an active policy, and replies `once`. Agents without a policy cost no request. The MCP server binds OpenCode as `mcp-<pid>`, not a `ses_…` id, so for those bindings the daemon reads `GET /api/permission/request?location[directory]=<cwd>` (checked live: it answers `{"location":{"directory":"/tmp"},"data":[]}`) and skips requests from sessions bound to another agent.
