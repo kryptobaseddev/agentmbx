@@ -303,3 +303,13 @@ test("real helper: refuses unknown, malformed and non-canonical payloads", { ski
   assert.equal(summary(canonical({ type: "revocation", all: true, v: 1.5 })).code, 5);         // non-integer number
   assert.equal(summary("[1,2]").code, 5);
 });
+
+test("real helper: long security values are shown whole or refused, never cut", { skip }, () => {
+  const exp = new Date(Date.parse(iat) + 7 * 86_400_000).toISOString();
+  const base = { v: 1, type: "policy", id: "01P", level: "collaborate", classes: ["read", "edit"], to: { agents: ["api"], hosts: ["macbook"] }, from: { hosts: ["local"], agents: ["*"] }, iat, exp, owner_fp: "x" };
+  const mid = `/Users/k/${"segment/".repeat(40)}hidden-destination`; // ~340 chars: fits, shown in full
+  assert.match(ok({ ...base, projects: [mid] }), /hidden-destination$/);
+  const long = `/Users/k/${"segment/".repeat(60)}hidden-destination`; // ~500 chars: over the cap with the rest, refused
+  const r = summary(canonical({ ...base, projects: [long, long] }));
+  assert.equal(r.code, 5); assert.match(r.err, /too much to show/);
+});

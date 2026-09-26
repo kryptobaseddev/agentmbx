@@ -98,8 +98,8 @@ func clean(_ s: String, _ max: Int = 80) -> String {
 func str(_ v: Any?) -> String? { (v as? String).map { clean($0) } }
 /** Security-bearing values (names, hosts, paths) are never shortened: the human must see exactly what is granted. */
 func strs(_ v: Any?) -> [String] {
-  if let s = v as? String { return [clean(s, 400)] }
-  return (v as? [Any] ?? []).compactMap { $0 as? String }.map { clean($0, 400) }
+  if let s = v as? String { return [clean(s, Int.max)] }
+  return (v as? [Any] ?? []).compactMap { $0 as? String }.map { clean($0, Int.max) }
 }
 /** Every entry, never "and N more"; a wildcard anywhere means ALL and is shown first. */
 func list(_ v: Any?, _ empty: String = "(none)") -> String {

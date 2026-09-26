@@ -82,6 +82,7 @@ It is stored with `owner_sig`.
 
 - `agentmbx policy set` stores the record locally. It sends the record to each host in `to.hosts` over the signed hop (`POST /v1/policy`), or queues it in the outbox.
 - `agentmbx policy revoke <id>|--all` signs a revocation and fans it out the same way. `--all` is the kill switch.
+- Timing: a revocation reaches reachable machines at once (push). A machine that was offline or missed the push gets it on its next pull, within about a minute. The pull is paged, not a snapshot, so a revocation issued mid-pull can land on the following pull. Treat the kill switch as fast, not instantaneous, across machines. On the machine where you run it, it's immediate.
 - `agentmbx policy list` shows active policies with their expiry. `mbx_whoami` shows the policies that apply to the session.
 
 ## 4. What agents see
