@@ -1,0 +1,94 @@
+// SQLite store (node:sqlite, WAL). One per host; every mbx process on the host opens it.
+import { DatabaseSync } from "node:sqlite";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
+import type { Envelope } from "./envelope.ts";
+
+export type DeliveryState = "queued" | "delivered" | "notified" | "read" | "acked";
+
+const SCHEMA = `
+PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS messages (
+  id TEXT PRIMARY KEY, ts TEXT NOT NULL, from_addr TEXT NOT NULL, thread TEXT NOT NULL, reply_to TEXT,
+  kind TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL, envelope TEXT NOT NULL,
+  origin TEXT NOT NULL,          -- 'local' or the paired host name it arrived from
+  trust TEXT NOT NULL,           -- 'local' | 'verified' | 'legacy'
+  authority TEXT,                -- JSON {caps, grant_id, session} when an owner grant verified, else NULL
+  received_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS messages_thread ON messages(thread, ts);
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(subject, body, content='messages', content_rowid='rowid');
+CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+  INSERT INTO messages_fts(rowid, subject, body) VALUES (new.rowid, new.subject, new.body); END;
+CREATE TABLE IF NOT EXISTS deliveries (   -- one row per (message, recipient agent on THIS host)
+  msg_id TEXT NOT NULL REFERENCES messages(id), agent TEXT NOT NULL, state TEXT NOT NULL,
+  updated_at TEXT NOT NULL, note TEXT, PRIMARY KEY (msg_id, agent));
+CREATE INDEX IF NOT EXISTS deliveries_agent ON deliveries(agent, state);
+CREATE TABLE IF NOT EXISTS outbox (       -- envelopes waiting to reach a paired host
+  msg_id TEXT NOT NULL, host TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at TEXT NOT NULL,
+  last_error TEXT, created_at TEXT NOT NULL, PRIMARY KEY (msg_id, host));
+CREATE TABLE IF NOT EXISTS agents (       -- agents known on this host and on paired hosts
+  name TEXT NOT NULL, host TEXT NOT NULL, role TEXT, cli TEXT, description TEXT, last_seen TEXT,
+  PRIMARY KEY (name, host));
+CREATE TABLE IF NOT EXISTS sessions (     -- live CLI sessions bound to local agents (for wake-up)
+  agent TEXT NOT NULL, cli TEXT NOT NULL, session_id TEXT NOT NULL, cwd TEXT, pid INTEGER,
+  session_key TEXT, channel INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (cli, session_id));
+CREATE TABLE IF NOT EXISTS peers (
+  host TEXT PRIMARY KEY, pubkey TEXT NOT NULL, owner_pubkey TEXT, addr TEXT NOT NULL,
+  state TEXT NOT NULL,           -- 'pending' | 'approved'
+  code TEXT, nonce_local TEXT, nonce_remote TEXT, created_at TEXT NOT NULL, approved_at TEXT);
+CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, sub TEXT NOT NULL, grant TEXT NOT NULL, exp TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS wakes (agent TEXT NOT NULL, thread TEXT, at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS audit (at TEXT NOT NULL, event TEXT NOT NULL, detail TEXT);
+CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+`;
+
+export class Store {
+  db: DatabaseSync;
+  constructor(home: string) {
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    this.db = new DatabaseSync(join(home, "mbx.db"));
+    this.db.exec(SCHEMA);
+  }
+  close() { this.db.close(); }
+
+  tx<T>(fn: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE");
+    try { const r = fn(); this.db.exec("COMMIT"); return r; } catch (e) { this.db.exec("ROLLBACK"); throw e; }
+  }
+
+  audit(event: string, detail: unknown = null) {
+    this.db.prepare("INSERT INTO audit VALUES (?,?,?)").run(new Date().toISOString(), event, detail == null ? null : JSON.stringify(detail));
+  }
+
+  get(k: string): string | undefined { return (this.db.prepare("SELECT v FROM kv WHERE k=?").get(k) as { v: string } | undefined)?.v; }
+  set(k: string, v: string) { this.db.prepare("INSERT INTO kv VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").run(k, v); }
+
+  hasMessage(id: string) { return !!this.db.prepare("SELECT 1 FROM messages WHERE id=?").get(id); }
+
+  /** Insert once (id dedupe). Returns false when the id was already stored. */
+  insertMessage(e: Envelope, origin: string, trust: string, authority: unknown | null): boolean {
+    const r = this.db.prepare(`INSERT OR IGNORE INTO messages (id,ts,from_addr,thread,reply_to,kind,subject,body,envelope,origin,trust,authority,received_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(e.id, e.ts, e.from, e.thread, e.reply_to, e.kind, e.subject, e.body,
+      JSON.stringify(e), origin, trust, authority == null ? null : JSON.stringify(authority), new Date().toISOString());
+    return r.changes > 0;
+  }
+
+  addDelivery(msgId: string, agent: string, state: DeliveryState = "delivered") {
+    this.db.prepare("INSERT OR IGNORE INTO deliveries VALUES (?,?,?,?,NULL)").run(msgId, agent, state, new Date().toISOString());
+  }
+
+  setDelivery(msgId: string, agent: string, state: DeliveryState, note: string | null = null) {
+    const order = ["queued", "delivered", "notified", "read", "acked"];
+    const cur = this.db.prepare("SELECT state FROM deliveries WHERE msg_id=? AND agent=?").get(msgId, agent) as { state: string } | undefined;
+    if (!cur || order.indexOf(cur.state) >= order.indexOf(state)) return false; // states only move forward
+    this.db.prepare("UPDATE deliveries SET state=?, updated_at=?, note=COALESCE(?,note) WHERE msg_id=? AND agent=?")
+      .run(state, new Date().toISOString(), note, msgId, agent);
+    return true;
+  }
+}
+
+export interface MessageRow {
+  id: string; ts: string; from_addr: string; thread: string; reply_to: string | null; kind: string; subject: string;
+  body: string; envelope: string; origin: string; trust: string; authority: string | null; received_at: string;
+  state?: string;
+}
