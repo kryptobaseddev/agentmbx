@@ -1,3 +1,10 @@
 node_modules/
-.cleo/
 *.log
+
+# local dev tooling (CLEO task tracking, agent worktrees, agent instruction files) — not part of the public project
+.claude/
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.worktreeinclude
+.github/ISSUE_TEMPLATE/

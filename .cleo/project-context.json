@@ -1,0 +1,36 @@
+{
+  "schemaVersion": "1.0.0",
+  "detectedAt": "2026-09-26T11:05:17.179Z",
+  "projectTypes": [
+    "node"
+  ],
+  "primaryType": "node",
+  "monorepo": false,
+  "build": {
+    "command": "npm run build",
+    "outputDir": "dist"
+  },
+  "directories": {
+    "source": "src",
+    "tests": "test",
+    "docs": "docs"
+  },
+  "conventions": {
+    "fileNaming": "kebab-case",
+    "importStyle": "esm",
+    "typeSystem": "TypeScript strict"
+  },
+  "llmHints": {
+    "typeSystem": "TypeScript strict mode",
+    "commonPatterns": [
+      "Use ES module imports (import/export)",
+      "Include .js extension in import paths (ESM convention)",
+      "Use explicit return types on exported functions",
+      "Use kebab-case for file names"
+    ],
+    "avoidPatterns": [
+      "Do not use CommonJS require()",
+      "Do not use any type — strict mode is enabled"
+    ]
+  }
+}

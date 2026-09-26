@@ -30,13 +30,17 @@ def pump():
                 if b"\x1b[6n" in d: os.write(fd, b"\x1b[1;1R")
         except OSError: return
 threading.Thread(target=pump, daemon=True).start()
-# get past startup confirmations (folder trust, development-channel warning) by accepting the default option
-answered = 0; t = time.time()
-while time.time() - t < 60:
-    time.sleep(2); screen = clean(bytes(buf[-6000:]))
-    if re.search(r"(trust this folder|Do you trust|development channel|Loading development|I am using this for local development|Enter to confirm)", screen, re.I) and answered < 4:
-        os.write(fd, b"\r"); answered += 1; buf.extend(b"\n<<answered>>\n"); time.sleep(3)
-    elif answered and time.time() - t > 25: break
+# Startup screens (verified on Claude Code 2.1.28x): folder trust defaults to "No, exit" -> Down + Enter;
+# the development-channel warning defaults to "1. I am using this for local development" -> Enter.
+def squeezed(): return re.sub(r"\s+", "", clean(bytes(buf[-8000:])))
+done_trust = done_dev = False; t = time.time()
+while time.time() - t < 60 and not done_dev:
+    time.sleep(1.5); scr = squeezed()
+    if not done_trust and "Yes,Itrustthisfolder" in scr and "Entertoconfirm" in scr:
+        os.write(fd, b"\x1b[B"); time.sleep(0.4); os.write(fd, b"\r"); done_trust = True; buf.clear(); print("menu: trusted folder", flush=True)
+    elif "Loadingdevelopmentchannels" in scr and "Entertoconfirm" in scr:
+        os.write(fd, b"\r"); done_dev = True; print("menu: accepted development channel", flush=True)
+time.sleep(8)
 s = mbx("status").stdout; print("after startup:", s.replace("\n", " | "), flush=True)
 print("agents:", mbx("agents").stdout.strip(), flush=True)
 time.sleep(15)

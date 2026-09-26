@@ -1,0 +1,4 @@
+# CLEO portable project identity (write-once; ADR-094, T12325).
+# Commit this file. Never edit or regenerate it: every checkout, clone and
+# device of this project resolves to the id below.
+071b70b3-551d-44bb-b993-1e84bfa2fe09
