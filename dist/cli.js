@@ -12,7 +12,7 @@ import { daemonAnswers, doctor, failed, formatChecks } from "./doctor.js";
 import { agentName, detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
 import { ancestors } from "./proc.js";
 import { DEFAULT_PORT, defaultHome, formatFor, formatMessage, MbxNode, summaryLine, trustLabel } from "./node.js";
-import { activePolicies, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary } from "./policy.js";
+import { activePolicies, dueReminders, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary } from "./policy.js";
 import { authHelperPath, createKeychainOwner, createOwnerKey, defaultOwnerBackend, ownerInfo, ownerSignCanonical, readPassphraseFromTTY } from "./owner.js";
 import { periodicUpdateCheck, updateAvailable, updateCommand } from "./update.js";
 import { installKind, version } from "./version.js";
@@ -341,6 +341,19 @@ If the codes differ, do not approve: someone is in the middle.`);
             setInterval(() => { void refreshDirectory(node); void pullPolicies(node); }, 60_000);
             void refreshDirectory(node);
             void pullPolicies(node);
+            // a policy about to lapse: one desktop reminder, 48 h ahead, with the renew command (only where the owner key is)
+            const remind = () => {
+                try {
+                    if (!node.ownerPub)
+                        return;
+                    for (const p of dueReminders(node.store.db))
+                        void notifyDesktop({ subtitle: "Policy expires soon",
+                            body: `${policySummary(p)} expires ${p.exp.slice(0, 16).replace("T", " ")}Z. Renew: agentmbx policy renew ${p.id.slice(-6)}` });
+                }
+                catch { /* db busy */ }
+            };
+            setInterval(remind, 3600_000).unref();
+            remind();
             const updCheck = () => void periodicUpdateCheck(node.store, (title, text) => notifyDesktop({ subtitle: title, body: text })); // gated to once per 24 h via kv
             setInterval(updCheck, 3600_000).unref();
             updCheck();

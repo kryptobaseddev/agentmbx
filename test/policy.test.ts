@@ -11,7 +11,7 @@ import { pairWith, pullPolicies, pushPolicy, startServer } from "../src/http.ts"
 import { formatFor, MbxNode } from "../src/node.ts";
 import { createOwnerKey, unlockOwnerKey } from "../src/owner.ts";
 import {
-  acceptSigned, activePolicies, delegationNote, effectivePolicy, hasClass, issueSigned, makeDevice, makePolicy, makeRevocation, parseTtl, policyLine, policySummary,
+  acceptSigned, activePolicies, delegationNote, dueReminders, effectivePolicy, hasClass, issueSigned, makeDevice, makePolicy, makeRevocation, parseTtl, policyLine, policySummary,
   type AnyRecord, type PolicyRecord,
 } from "../src/policy.ts";
 
@@ -241,5 +241,16 @@ test("stop hook (real CLI): under a policy, fresh mail keeps the turn going once
     const again = run();
     assert.deepEqual([again.status, again.stdout], [0, ""], "the same mail doesn't block twice");
   }
+  n.close();
+});
+
+test("expiry reminder: once per policy, only within 48 h of expiry", () => {
+  const { n, kp, sign } = ownerHost("alpha");
+  const soon = makePolicy({ level: "yolo", agents: ["a"], hosts: ["alpha"], ownerPub: kp.publicKey }); // 8 h
+  const later = makePolicy({ level: "collaborate", agents: ["b"], hosts: ["alpha"], ttlMs: parseTtl("30d"), ownerPub: kp.publicKey });
+  acceptSigned(n.store.db, sign(soon), "alpha"); acceptSigned(n.store.db, sign(later), "alpha");
+  assert.deepEqual(dueReminders(n.store.db).map((p) => p.id), [soon.id]);
+  assert.deepEqual(dueReminders(n.store.db), [], "only once");
+  assert.deepEqual(dueReminders(n.store.db, 48 * 3_600_000, new Date(Date.now() + 29 * 86_400_000)).map((p) => p.id), [later.id]);
   n.close();
 });

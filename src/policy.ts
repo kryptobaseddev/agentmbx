@@ -237,3 +237,16 @@ export function delegationNote(db: DatabaseSync, agent: string, host: string): s
     + " permission prompts still apply unless the class list includes permissions). read = inspect/verify/test; edit = reversible changes inside the project; outward = push/deploy/delete/external;"
     + " anything outside the classes: ask your user. Each mbx_read header shows the policy that applies to that sender.";
 }
+
+/** Active policies on this host that expire within `withinMs` and haven't been reminded about yet (marks them). */
+export function dueReminders(db: DatabaseSync, withinMs = 48 * H, now = new Date()): PolicyRecord[] {
+  const soon = new Date(now.getTime() + withinMs).toISOString();
+  const rows = db.prepare("SELECT id, record FROM policies WHERE revoked=0 AND exp > ? AND exp <= ?").all(now.toISOString(), soon) as { id: string; record: string }[];
+  const out: PolicyRecord[] = [];
+  for (const r of rows) {
+    if (db.prepare("SELECT 1 FROM kv WHERE k=?").get(`reminded:${r.id}`)) continue;
+    db.prepare("INSERT INTO kv VALUES (?,?) ON CONFLICT(k) DO NOTHING").run(`reminded:${r.id}`, now.toISOString());
+    out.push(JSON.parse(r.record) as PolicyRecord);
+  }
+  return out;
+}
