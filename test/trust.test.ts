@@ -122,7 +122,7 @@ test("local delivery, labels, inbox/read/ack, threads and search", () => {
   assert.equal(inbox.length, 1);
   assert.equal(inbox[0].trust, "local");
   assert.equal(a.unreadCount("helper"), 1);
-  a.read(envelope.id.slice(0, 20), "helper");
+  a.read(envelope.id, "helper");
   assert.equal(a.unreadCount("helper"), 0);
   a.ack(envelope.id, "helper", "done");
   assert.equal(a.inbox("helper", { all: true })[0].state, "acked");
