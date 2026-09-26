@@ -14,12 +14,15 @@ const yes: Lookup = () => ({ ok: true, policy_id: "pol_1", exp: "2099-01-01T00:0
 const no: Lookup = () => ({ ok: false });
 const audits = (n: MbxNode) => (n.store.db.prepare("SELECT event, detail FROM audit WHERE event='yolo_allow'").all() as { detail: string }[]).map((r) => JSON.parse(r.detail));
 const req = (extra: Record<string, unknown> = {}) => ({ session_id: "s1", cwd: "/work/api-dev", hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command: "ls" }, ...extra });
+/** A session bound to THIS process (pid + start time), as the MCP server of a running CLI would record it. */
+const bound = (n: MbxNode, agent: string, cli: string) => n.bindSession({ agent, cli, session_id: `mcp-${cli}`, cwd: "/work/api-dev", pid: process.pid, session_key: "k" });
 const ALLOW = { hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } };
 
 test("claude and codex: allow under an active policy, with the documented JSON and an audit line", () => {
   for (const cli of ["claude", "codex"]) {
     const n = node(); const seen: string[] = [];
-    const d = decidePermission(req(), cli, (a) => { seen.push(a); return yes(a); }, { node: n });
+    bound(n, "api-dev", cli);
+    const d = decidePermission(req(), cli, (a) => { seen.push(a); return yes(a); }, { node: n, pid: process.pid });
     assert.equal(d.allow, true);
     assert.deepEqual(JSON.parse(d.output), ALLOW);
     assert.deepEqual(seen, ["api-dev"]);
@@ -37,27 +40,35 @@ test("no policy, malformed input, interactive tools, other CLIs, a throwing look
     [req(), "claude", (() => undefined) as unknown as Lookup],
   ];
   for (const [input, cli, lookup] of cases) {
-    const d = decidePermission(input, cli, lookup, { node: n });
+    const d = decidePermission(input, cli, lookup, { node: n, pid: process.pid });
     assert.equal(d.allow, false, JSON.stringify(input)); assert.equal(d.output, "");
   }
   assert.deepEqual(audits(n), []);
 });
 
-test("the agent comes from the session binding, else the MCP binding of the same CLI process", () => {
+test("the agent comes from a binding of this very process (session, else MCP); never a guess", () => {
   const n = node();
-  n.bindSession({ agent: "renamed", cli: "claude", session_id: "s1", cwd: "/work/api-dev", pid: 4242 });
   const seen: string[] = [];
-  decidePermission(req(), "claude", (a) => { seen.push(a); return no(a); }, { node: n });
-  n.bindSession({ agent: "via-mcp", cli: "codex", session_id: "mcp-x", pid: 777, session_key: "k" });
-  decidePermission(req({ session_id: "unbound" }), "codex", (a) => { seen.push(a); return no(a); }, { node: n, pid: 777 });
+  const ask = (input: unknown, cli: string, pid?: number) => decidePermission(input, cli, (a) => { seen.push(a); return yes(a); }, { node: n, pid });
+  // no binding at all, or no pid: no decision, and the policy isn't even consulted (no folder-name guess)
+  assert.equal(ask(req(), "claude", process.pid).allow, false);
+  assert.equal(ask(req(), "claude").allow, false);
+  // a session row recorded for another process (pid 4242) is not this session
+  n.bindSession({ agent: "elsewhere", cli: "claude", session_id: "s1", cwd: "/work/api-dev", pid: 4242 });
+  assert.equal(ask(req(), "claude", process.pid).allow, false);
+  n.bindSession({ agent: "renamed", cli: "claude", session_id: "s1", cwd: "/work/api-dev", pid: process.pid });
+  ask(req(), "claude", process.pid);
+  n.bindSession({ agent: "via-mcp", cli: "codex", session_id: "mcp-x", pid: process.pid, session_key: "k" });
+  ask(req({ session_id: "unbound" }), "codex", process.pid);
   assert.deepEqual(seen, ["renamed", "via-mcp"]);
 });
 
 test("kimi: the hook prints nothing; the approval goes through the kimi web API and only then is audited", async () => {
   const n = node();
   const kimiReq = req({ id: "approval_abc", tool_name: "Shell" });
-  assert.equal(decidePermission(kimiReq, "kimi", no, { node: n }).kimi, undefined);
-  const d = decidePermission(kimiReq, "kimi", yes, { node: n });
+  bound(n, "api-dev", "kimi");
+  assert.equal(decidePermission(kimiReq, "kimi", no, { node: n, pid: process.pid }).kimi, undefined);
+  const d = decidePermission(kimiReq, "kimi", yes, { node: n, pid: process.pid });
   assert.equal(d.output, ""); assert.deepEqual(d.kimi, { session_id: "s1", approval_id: "approval_abc" });
   assert.deepEqual(audits(n), []);
 
@@ -81,6 +92,8 @@ test("kimi: the hook prints nothing; the approval goes through the kimi web API 
   const never = (async () => Response.json({ code: 0, data: { items: [] } })) as unknown as typeof fetch;
   assert.equal(await approveKimi(n, d, { server: { url: "http://x", token: "t" }, fetch: never, waitMs: 300 }), false);
   assert.equal(await approveKimi(n, d, { server: null }), false);
+  // revoked while waiting for the approval to show up: the re-check stops it
+  assert.equal(await approveKimi(n, d, { server: { url: "http://127.0.0.1:9", token: "tok" }, fetch: fake, recheck: () => false }), false);
   assert.equal(audits(n).length, 1);
 });
 

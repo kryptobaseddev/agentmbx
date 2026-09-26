@@ -26,6 +26,8 @@ Lifecycle: new → notified (a wake or a notice was sent) → read → acked. On
 
 - Claude Code (started with the mbx channel): pushed into the session. Codex: queued into the session by `codex queue`. OpenCode: through its session API.
 - Every CLI with hooks also gets "[mbx] N unread" when a session starts and on each user prompt.
+- Under an owner policy, mail that arrives while you work keeps your turn going (Stop hook: Claude, Codex, Kimi):
+  handle it before you stop.
 - Kimi Code in a terminal can't be woken from outside. If the session-start note asks you to, create the
   `[mbx-watch]` CronCreate job it describes (once; check CronList first). It runs only while you're idle.
 - No wake path at all: the user gets a desktop notification.

@@ -7,25 +7,26 @@ import { join } from "node:path";
 import { agentName } from "./mcp.ts";
 import type { MbxNode } from "./node.ts";
 
-export type Lookup = (agent: string) => { ok: boolean; policy_id?: string; exp?: string };
-export interface Decision { allow: boolean; agent?: string; tool?: string; policy_id?: string; output: string; kimi?: { session_id: string; approval_id: string } }
+/** Is the permissions class granted to `agent` for a session working in `ctx.cwd`? (see policy.ts hasClass) */
+export type Lookup = (agent: string, ctx?: { cwd?: string | null }) => { ok: boolean; policy_id?: string; exp?: string };
+export interface Decision { allow: boolean; agent?: string; tool?: string; policy_id?: string; output: string; cwd?: string | null; kimi?: { session_id: string; approval_id: string } }
 
 /** Tools that collect an answer from the user rather than ask for permission: never auto-approved. */
 const INTERACTIVE = new Set(["AskUserQuestion", "ExitPlanMode"]);
 const NONE: Decision = { allow: false, output: "" };
 
-/** The agent a hook invocation belongs to: the session's binding, else the MCP binding of the same CLI process, else agentName(). */
-export function resolveAgent(node: MbxNode, cli: string, sessionId: string | undefined, cwd: string, pid?: number): string {
-  const db = node.store.db;
+/**
+ * The agent a hook invocation belongs to: only a binding recorded for this very CLI process (pid + start time) counts.
+ * No verified binding means no decision (fail closed): a stale row, a reused PID or a guessed name never gets YOLO.
+ */
+export function resolveAgent(node: MbxNode, cli: string, sessionId: string | undefined, _cwd: string, pid?: number): string | null {
+  if (!pid) return null;
   if (sessionId) {
-    const r = db.prepare("SELECT agent FROM sessions WHERE cli=? AND session_id=?").get(cli, sessionId) as { agent: string } | undefined;
-    if (r) return r.agent;
+    const r = node.store.db.prepare("SELECT agent, pid, pid_start, updated_at FROM sessions WHERE cli=? AND session_id=?").get(cli, sessionId) as
+      { agent: string; pid: number | null; pid_start: string | null; updated_at: string } | undefined;
+    if (r && r.pid === pid && node.sameSession(pid, r)) return r.agent;
   }
-  if (pid) {
-    const r = db.prepare("SELECT agent FROM sessions WHERE cli=? AND pid=? AND session_key IS NOT NULL ORDER BY updated_at DESC LIMIT 1").get(cli, pid) as { agent: string } | undefined;
-    if (r) return r.agent;
-  }
-  return agentName(cwd, cli);
+  return node.agentFor(cli, pid);
 }
 
 /** Hook-side decision for `agentmbx hook permission --cli <cli>`. `output` is what the hook prints on stdout. */
@@ -39,12 +40,14 @@ export function decidePermission(input: unknown, cli: string, lookup: Lookup, o:
     if (!tool || INTERACTIVE.has(tool)) return NONE;
     if (cli !== "claude" && cli !== "codex" && cli !== "kimi") return NONE;
     if (s("hook_event_name") && s("hook_event_name") !== "PermissionRequest") return NONE;
-    const agent = resolveAgent(o.node, cli, sessionId, s("cwd") ?? process.cwd(), o.pid);
-    const p = lookup(agent);
+    const cwd = s("cwd") ?? null;
+    const agent = resolveAgent(o.node, cli, sessionId, cwd ?? "", o.pid);
+    if (!agent) return NONE;
+    const p = lookup(agent, { cwd });
     if (!p?.ok) return NONE;
     if (cli === "kimi") { // Kimi's hook can't decide; the approval goes through the kimi web API (approveKimi), which audits
       const approval = s("id");
-      return sessionId && approval ? { allow: true, agent, tool, policy_id: p.policy_id, output: "", kimi: { session_id: sessionId, approval_id: approval } } : NONE;
+      return sessionId && approval ? { allow: true, agent, tool, policy_id: p.policy_id, output: "", cwd, kimi: { session_id: sessionId, approval_id: approval } } : NONE;
     }
     o.node.store.audit("yolo_allow", { agent, cli, tool, policy_id: p.policy_id ?? null });
     return { allow: true, agent, tool, policy_id: p.policy_id,
@@ -76,7 +79,7 @@ export function kimiServer(kimiHome = process.env.KIMI_CODE_HOME || join(homedir
  * registers the approval, so poll the pending list briefly. A session the server doesn't host (a plain TUI) answers with an
  * error or never lists it: give up, and the user answers the prompt as usual.
  */
-export async function approveKimi(node: MbxNode, d: Decision, o: { server?: { url: string; token: string } | null; fetch?: Fetch; waitMs?: number } = {}): Promise<boolean> {
+export async function approveKimi(node: MbxNode, d: Decision, o: { server?: { url: string; token: string } | null; fetch?: Fetch; waitMs?: number; recheck?: () => boolean } = {}): Promise<boolean> {
   if (!d.allow || !d.kimi) return false;
   const srv = o.server === undefined ? kimiServer() : o.server;
   if (!srv) return false;
@@ -93,6 +96,7 @@ export async function approveKimi(node: MbxNode, d: Decision, o: { server?: { ur
       if (Date.now() >= deadline) return false;
       await sleep(250);
     }
+    if (o.recheck && !o.recheck()) return false; // revoked or expired while we waited
     const res = await f(`${base}/${encodeURIComponent(approval_id)}`, { method: "POST", headers, body: JSON.stringify({ decision: "approved" }), signal: AbortSignal.timeout(3000) });
     const j = await res.json().catch(() => null) as { code?: number } | null;
     if (!res.ok || j?.code !== 0) return false;
@@ -113,7 +117,7 @@ export interface OpencodeSvc { url: string; auth: string }
 export async function opencodePermissionPass(node: MbxNode, lookup: Lookup, svc: () => Promise<OpencodeSvc | null>, f: Fetch = fetch): Promise<number> {
   const db = node.store.db;
   const rows = db.prepare("SELECT agent, session_id, cwd FROM sessions WHERE cli='opencode' ORDER BY updated_at DESC LIMIT 50").all() as { agent: string; session_id: string; cwd: string | null }[];
-  const covered = rows.map((r) => ({ ...r, p: safeLookup(lookup, r.agent) })).filter((r) => r.p.ok && (r.session_id.startsWith("ses") || r.cwd));
+  const covered = rows.map((r) => ({ ...r, p: safeLookup(lookup, r.agent, r.cwd) })).filter((r) => r.p.ok && (r.session_id.startsWith("ses") || r.cwd));
   if (!covered.length) return 0;
   const s = await svc();
   if (!s) return 0;
@@ -133,6 +137,7 @@ export async function opencodePermissionPass(node: MbxNode, lookup: Lookup, svc:
         if (!q.id?.startsWith("per") || !q.sessionID?.startsWith("ses") || done.has(q.id)) continue;
         if (direct ? q.sessionID !== r.session_id : (owner(q.sessionID) ?? agentName(r.cwd!, "opencode")) !== r.agent) continue;
         done.add(q.id);
+        if (!safeLookup(lookup, r.agent, r.cwd).ok) break; // re-check right before approving: revocation wins
         const rep = await f(`${s.url}/api/session/${encodeURIComponent(q.sessionID)}/permission/${encodeURIComponent(q.id)}/reply`,
           { method: "POST", headers, body: JSON.stringify({ decision: "once" }), signal: AbortSignal.timeout(5000) });
         if (!rep.ok) continue;
@@ -143,4 +148,4 @@ export async function opencodePermissionPass(node: MbxNode, lookup: Lookup, svc:
   }
   return n;
 }
-const safeLookup = (lookup: Lookup, agent: string) => { try { return lookup(agent) ?? { ok: false }; } catch { return { ok: false }; } };
+const safeLookup = (lookup: Lookup, agent: string, cwd?: string | null) => { try { return lookup(agent, { cwd }) ?? { ok: false }; } catch { return { ok: false }; } };

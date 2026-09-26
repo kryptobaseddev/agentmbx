@@ -242,7 +242,7 @@ const KIMI_BEGIN = "# >>> agentmbx (managed by agentmbx setup; remove with: agen
 const KIMI_END = "# <<< agentmbx <<<";
 function kimiHooks(cmd) {
     const block = [KIMI_BEGIN,
-        ...HOOK_EVENTS.flatMap(([ev, sub]) => ["[[hooks]]", `event = "${ev}"`, `command = ${JSON.stringify(hookCommand(cmd, sub, "kimi"))}`, "timeout = 10"]),
+        ...STOP_EVENTS.flatMap(([ev, sub]) => ["[[hooks]]", `event = "${ev}"`, `command = ${JSON.stringify(hookCommand(cmd, sub, "kimi"))}`, "timeout = 10"]),
         KIMI_END];
     const find = (lines) => {
         const s = lines.indexOf(KIMI_BEGIN), e = lines.indexOf(KIMI_END, s);
@@ -434,7 +434,7 @@ export function edits(ctx, cli) {
             const srv = jsonServer("mcpServers", { command: cmd[0], args: mcpArgs }, (e) => e.command === cmd[0] && same(e.args ?? [], mcpArgs), true);
             return [
                 { cli, kind: "mcp", item: "mcpServers.mbx", path: join(kimi, "mcp.json"), ...srv },
-                { cli, kind: "hooks", item: "[[hooks]] SessionStart + UserPromptSubmit + PermissionRequest", path: join(kimi, "config.toml"), ...kimiHooks(cmd) },
+                { cli, kind: "hooks", item: "[[hooks]] SessionStart + UserPromptSubmit + PermissionRequest + Stop", path: join(kimi, "config.toml"), ...kimiHooks(cmd) },
             ];
         }
         case "hermes":

@@ -62,7 +62,12 @@ test("policy resolution: sender scope, union of classes, header line, downgrades
   assert.equal(effectivePolicy(db, { agent: "api", host: "alpha", fromAgent: "other", fromHost: "beta" }).level, "ask", "named sender only");
   assert.equal(effectivePolicy(db, { agent: "api", host: "alpha", fromAgent: "web", fromHost: "gamma" }).level, "ask", "remote hosts must be named");
   assert.equal(effectivePolicy(db, { agent: "db", host: "alpha", fromAgent: "web", fromHost: "alpha" }).level, "ask", "other agents unaffected");
-  assert.match(policyLine(local), /^policy: collaborate \[read, edit\] · owner-signed .* · expires .* · projects: your session's project$/);
+  assert.match(policyLine(local), /^policy: collaborate \[read, edit\] in your session's project · owner-signed \w{6} · expires [\d-]+ [\d:]+Z$/);
+  // each policy keeps its own project scope: a read grant for /a doesn't lend edit to /a from another policy's /b
+  acceptSigned(db, sign(makePolicy({ level: "collaborate", classes: ["read"], agents: ["docs"], hosts: ["alpha"], projects: ["/a"], ownerPub: kp.publicKey })), "alpha");
+  acceptSigned(db, sign(makePolicy({ level: "collaborate", agents: ["docs"], hosts: ["alpha"], projects: ["/b"], ownerPub: kp.publicKey })), "alpha");
+  const docs = effectivePolicy(db, { agent: "docs", host: "alpha", fromAgent: "web", fromHost: "alpha" });
+  assert.match(policyLine(docs), /collaborate \[read\] in \/a · .* ; collaborate \[read, edit\] in \/b/);
   // downgrades, through real messages
   const send = (body: string, extra: { origin?: "external"; hop?: number } = {}) =>
     n.message(n.send({ from: "web", to: ["api"], subject: "s", body, kind: "request", ...extra }).envelope.id)!;
@@ -113,13 +118,15 @@ test("across hosts: the paired host adopts the owner, policies push and pull, re
     const r = await pairWith(A.n, bAddr);
     delete process.env.MBX_ADVERTISE;
     A.n.approvePeer("beta", r.code); B.approvePeer("alpha", r.code);
-    const owners = B.store.db.prepare("SELECT fp, role, via FROM principals").all() as { fp: string; role: string; via: string }[];
-    assert.deepEqual(owners.map((o) => [o.fp, o.role, o.via]), [[fingerprint(A.kp.publicKey), "owner", "pair:alpha"]]);
+    // pairing alone records alpha's owner as a peer-owner with no authority here; adopting it is explicit
+    const role = () => (B.store.db.prepare("SELECT role, via FROM principals").all() as { role: string; via: string }[]).map((o) => `${o.role}:${o.via}`);
+    assert.deepEqual(role(), ["peer-owner:pair:alpha"]);
+    assert.equal(B.adoptOwner("alpha"), fingerprint(A.kp.publicKey));
+    assert.deepEqual(role(), ["owner:adopt:alpha"]);
     const pol = A.sign(makePolicy({ level: "collaborate", agents: ["worker"], hosts: ["beta"], from: ["alpha"], ownerPub: A.kp.publicKey }));
-    assert.match(acceptSigned(A.n.store.db, pol, "alpha")!, /not alpha/, "not for alpha itself");
-    // alpha keeps a copy to serve pulls even though the policy isn't for its own agents
-    A.n.store.db.prepare("INSERT INTO policies (id,record,sig,owner_fp,iat,exp,revoked,received_at) VALUES (?,?,?,?,?,?,0,?)")
-      .run(pol.rec.id, JSON.stringify(pol.rec), pol.sig, (pol.rec as PolicyRecord).owner_fp, pol.rec.iat, (pol.rec as PolicyRecord).exp, new Date().toISOString());
+    assert.match(acceptSigned(A.n.store.db, pol, "alpha")!, /not alpha/, "a receiver rejects policies for other hosts");
+    assert.equal(acceptSigned(A.n.store.db, pol, "alpha", { issuer: true }), null, "the issuer keeps it to serve pulls");
+    assert.equal(activePolicies(A.n.store.db, "worker", "alpha").length, 0, "but it doesn't apply on alpha");
     const pushed = await pushPolicy(A.n, [pol]);
     assert.deepEqual(pushed, [{ host: "beta", ok: true }]);
     assert.equal(effectivePolicy(B.store.db, { agent: "worker", host: "beta", fromAgent: "planner", fromHost: "alpha" }).level, "collaborate");
@@ -129,6 +136,10 @@ test("across hosts: the paired host adopts the owner, policies push and pull, re
     await pullPolicies(B);
     assert.equal(activePolicies(B.store.db, "worker", "beta").length, 0);
     // a paired host whose owner is someone else can't set policies here
+    // unpairing drops the adopted owner, and with it every policy it signed
+    B.removePeer("alpha");
+    const again = A.sign(makePolicy({ level: "yolo", agents: ["worker"], hosts: ["beta"], from: ["alpha"], ownerPub: A.kp.publicKey, now: new Date(Date.now() + 2000) }));
+    assert.equal(acceptSigned(B.store.db, again, "beta"), "not signed by this host's owner");
     const M = ownerHost("mallory");
     const evil = M.sign(makePolicy({ level: "yolo", agents: ["*"], hosts: ["beta"], ownerPub: M.kp.publicKey }));
     assert.equal(acceptSigned(B.store.db, evil, "beta"), "not signed by this host's owner");
@@ -163,8 +174,8 @@ test("identity: a second live session gets a free name; resumed sessions keep th
   // a dead pid holding the name doesn't block it
   n.bindSession({ agent: "ghost", cli: "codex", session_id: "mcp-dead", pid: 2 ** 22 + 12345, session_key: "k3" });
   assert.equal(n.pickName("ghost", "codex", 999_999), "ghost");
-  // PID reuse: an old MCP row for a pid no longer fresh is not adopted by a new hook binding
-  n.store.db.prepare("UPDATE sessions SET updated_at=? WHERE session_id='mcp-1'").run(new Date(Date.now() - 3_600_000).toISOString());
+  // PID reuse: an MCP row recorded for an earlier process with this PID (other start time) is not adopted
+  n.store.db.prepare("UPDATE sessions SET pid_start='Thu Jan  1 00:00:00 1970' WHERE session_id='mcp-1'").run();
   assert.equal(n.bindSession({ agent: "fresh", cli: "kimi", session_id: "t-new", pid: process.pid }), "fresh");
   n.close();
 });
@@ -177,5 +188,48 @@ test("re-wake: mail that only reached the desktop is retried when a wakeable ses
   assert.equal((n.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=?").get(id) as { state: string }).state, "notified");
   n.bindSession({ agent: "codex", cli: "codex", session_id: "019a-thread", pid: process.pid }); // hook row: codex queue can wake it
   assert.equal((n.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=?").get(id) as { state: string }).state, "delivered");
+  n.close();
+});
+
+test("rename alias: mail for the old name follows the session until a live session takes that name again", () => {
+  const n = new MbxNode(tmp(), { host: "alpha" });
+  n.bindSession({ agent: "kimi-home-mbx", cli: "kimi", session_id: "mcp-9", pid: process.pid, session_key: "k" });
+  n.addAlias("kimi", "kimi-home-mbx", process.pid);
+  const r = n.send({ from: "codex", to: ["kimi"], subject: "reply to your old name", body: "x", kind: "reply" });
+  assert.deepEqual(r.local, ["kimi-home-mbx"]); assert.match(r.warnings.join(), /kimi was renamed to kimi-home-mbx/);
+  // another live process binds as "kimi": the alias ends
+  n.store.db.prepare("INSERT INTO sessions (agent,cli,session_id,cwd,pid,session_key,channel,updated_at,pid_start) VALUES ('kimi','kimi','mcp-other',NULL,?,?,0,?,NULL)")
+    .run(process.ppid, "k2", new Date().toISOString());
+  n.bindSession({ agent: "kimi", cli: "kimi", session_id: "mcp-other", pid: process.ppid, session_key: "k2" });
+  assert.deepEqual(n.send({ from: "codex", to: ["kimi"], subject: "s", body: "x" }).local, ["kimi"]);
+  n.close();
+});
+
+test("--as rule: a session can't claim a name another live session holds; callerAgent walks up the process tree", () => {
+  const n = new MbxNode(tmp(), { host: "alpha" });
+  n.bindSession({ agent: "me", cli: "claude", session_id: "c1", pid: process.pid, session_key: "k" });
+  n.bindSession({ agent: "other", cli: "codex", session_id: "x1", pid: process.ppid, session_key: "k2" });
+  assert.deepEqual(n.callerAgent([999_999, process.pid]), { agent: "me", pid: process.pid });
+  assert.equal(n.heldByOther("other", process.pid), true);
+  assert.equal(n.heldByOther("me", process.pid), false);
+  assert.equal(n.heldByOther("nobody", process.pid), false);
+  n.close();
+});
+
+test("stop hook (real CLI): under a policy, fresh mail keeps the turn going once; kimi via exit 2, claude via JSON", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { n, kp, sign } = ownerHost("alpha");
+  for (const [cli, agent] of [["kimi", "k-agent"], ["claude", "c-agent"]] as const) {
+    n.bindSession({ agent, cli, session_id: `mcp-${cli}`, pid: process.pid, session_key: "k" }); // the hook's parent is this process
+    acceptSigned(n.store.db, sign(makePolicy({ level: "collaborate", agents: [agent], hosts: ["alpha"], ownerPub: kp.publicKey })), "alpha");
+    const run = () => spawnSync(process.execPath, ["bin/agentmbx.js", "hook", "stop", "--cli", cli], { input: JSON.stringify({ session_id: `s-${cli}` }), env: { ...process.env, MBX_HOME: n.home, AGENTMBX_DEV: "1" }, encoding: "utf8" });
+    assert.deepEqual([run().status, run().stdout], [0, ""], "no mail: nothing");
+    n.send({ from: "web", to: [agent], subject: "please run the tests", body: "x", kind: "request" });
+    const r = run();
+    if (cli === "kimi") { assert.equal(r.status, 2); assert.match(r.stderr, /1 new message\(s\) for k-agent from web@alpha/); }
+    else { assert.equal(r.status, 0); assert.equal(JSON.parse(r.stdout).decision, "block"); }
+    const again = run();
+    assert.deepEqual([again.status, again.stdout], [0, ""], "the same mail doesn't block twice");
+  }
   n.close();
 });

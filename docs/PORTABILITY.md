@@ -27,7 +27,7 @@ Legend: ✅ verified, 🟡 works with a documented limit, ❌ gap (tracked).
 | Claude Code | ✅ | ✅ SessionStart, UserPromptSubmit, PermissionRequest, Stop | 🟡 push only with `--dangerously-load-development-channels server:mbx`; otherwise a `[mbx-watch]` CronCreate self-check (under a policy) | ✅ Stop `{decision:block}` | ✅ `PermissionRequest` |
 | Codex | ✅ | ✅ same four (Codex asks to trust new hooks once) | ✅ `codex queue` (needs a codex that has `queue`) | ✅ same Stop schema (verified in 0.157.1) | ✅ `PermissionRequest` (0.157.1) |
 | OpenCode | ✅ | none | ✅ service API (`opencode service` must run) | n/a | ✅ daemon answers via the service API |
-| Kimi Code (terminal) | ✅ | ✅ SessionStart, UserPromptSubmit, PermissionRequest | 🟡 `[mbx-watch]` CronCreate self-check (under a policy) | ❌ no blocking Stop hook in 2.1 | 🟡 only for `kimi web` / desktop-hosted sessions; in the terminal: `kimi --yolo` |
+| Kimi Code (terminal) | ✅ (MCP server instructions don't reach the model: guidance ships in the skill and hook notes) | ✅ SessionStart, UserPromptSubmit, PermissionRequest, Stop | 🟡 `[mbx-watch]` CronCreate self-check (under a policy) | ✅ Stop hook, exit 2 + reason on stderr (verified by kimi) | ❌ unsupported: Kimi's PermissionRequest hook is observation-only. Use `kimi --yolo` yourself |
 | Kimi (`kimi web`) | ✅ | ✅ | ❌ push via `POST /api/v1/sessions/{id}/prompts`, not built yet (T049) | ❌ | ✅ approvals API |
 | Hermes | ✅ | none | ❌ cron now, plugin planned | ❌ | ❌ |
 | Anything else with MCP | ✅ (manual config) | none | desktop notification | none | none |
@@ -44,7 +44,7 @@ Rules that keep this portable:
 | Owner key | ✅ Keychain via `agentmbx-auth`; every signature needs Touch ID or the account password. An agent can run `owner init`, and the human approves. | 🟡 passphrase file, unlocked on `/dev/tty` (proves someone knows the passphrase, not that a human is present) |
 | Macs without Touch ID | ✅ account-password prompt | n/a |
 | No GUI session (SSH) | ✅ the helper exits right away, and setup prints the command instead of waiting | ✅ |
-| Second machine | ✅ adopts the owner key of the machine it pairs with (when it has none) | ✅ same |
+| Second machine | ✅ explicit: `agentmbx join <host> <token> --adopt-owner` (or `agentmbx owner adopt <host>`); unpairing removes it | ✅ same |
 | Accounts, members, cloud | spec only (docs/POLICY.md §7, T053, T007) | |
 
 ## 4. Policy and collaboration

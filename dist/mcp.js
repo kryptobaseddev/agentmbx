@@ -1,7 +1,7 @@
 // `mbx mcp`: the stdio MCP server one agent session runs. It owns an in-memory session key (the only thing that can
 // use an owner grant) and, inside a Claude session started with the mbx channel enabled, pushes wake-ups itself.
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -96,6 +96,14 @@ export async function runMcp(node = new MbxNode()) {
         node.bindSession({ agent, cli: env.cli, session_id: env.sessionId, cwd: process.cwd(), pid: env.ppid, session_key: key.publicKey, channel: env.channel });
     };
     bind();
+    // the project this session works in (not the home folder), stamped on what it sends
+    const project = (() => { const d = process.cwd(); if (resolve(d) === resolve(homedir()) || d === "/")
+        return undefined; try {
+        return realpathSync(d);
+    }
+    catch {
+        return d;
+    } })();
     // relay tracking: a message this session sends after reading one is one hop further, and inherits an external origin
     let parent = null;
     const noteRead = (rows) => {
@@ -108,7 +116,7 @@ export async function runMcp(node = new MbxNode()) {
     };
     const relay = (origin) => {
         const p = parent && Date.now() - parent.at < 3_600_000 ? parent : null;
-        return { hop: p ? p.hop + 1 : 0, origin: origin === "external" || p?.external ? "external" : "agent" };
+        return { hop: p ? p.hop + 1 : 0, origin: origin === "external" || p?.external ? "external" : "agent", project };
     };
     const renamed = agent !== wanted ? `[mbx] Another live session already uses "${wanted}", so this session is ${agent}@${node.host}. Pick a clearer name with mbx_whoami {"name": ...} if you like.` : null;
     const extra = [renamed, delegationNote(node.store.db, agent, node.host), noPush(env.cli, env.channel)
@@ -128,7 +136,8 @@ export async function runMcp(node = new MbxNode()) {
         inputSchema: { name: z.string().regex(NAME_RE).optional().describe("new agent name, e.g. vida-dev"), role: z.string().max(40).optional(), description: z.string().max(200).optional() },
         annotations: { idempotentHint: true },
     }, async ({ name, role, description }) => {
-        if (name) {
+        if (name && name !== agent) {
+            node.addAlias(agent, name, env.ppid);
             agent = name;
             node.keepName(env.cli, env.sessionId, name);
         }

@@ -57,7 +57,9 @@ It is stored with `owner_sig`.
   - `ask`, `collaborate` and `autonomous` default to 7 days, 30 days at most.
   - `yolo` defaults to 8 hours, 7 days at most.
   - An expired or unverifiable policy fails closed to `ask`.
-- **Resolution.** For a message from `S@H` to agent `A` on this host, take every unrevoked, unexpired policy that matches `A` and `S@H`. The union of their classes applies, and the highest level's cadence is used.
+- **Resolution.** For a message from `S@H` to agent `A` on this host, take every unrevoked, unexpired policy that matches `A` and `S@H`. Each policy's classes apply only within that policy's own projects, so scopes never mix across policies. The header lists each grant separately.
+- **Owner on other machines.** A machine takes policies only from its own owner key, or from an owner key it adopted explicitly (`join … --adopt-owner` / `owner adopt <host>`). Pairing alone records the peer's owner key as `peer-owner`, with no authority. Unpairing removes an adoption, and with it every policy that owner signed.
+- **`meta.project`** (the sender's project path) is a signed *label* for people and agents to read. It's never a trust input: project scope is checked against the receiving session's own folder.
 
 ### Downgrades (always applied, even under yolo)
 
@@ -104,10 +106,16 @@ The mail rules alone can't make a CLI skip its permission prompts. YOLO adds a p
 
 | CLI | Mechanism |
 |---|---|
-| Claude Code | the `PermissionRequest` hook returns allow (schema verified in T051) |
-| Codex | its permission or approval hook if it has one (T051 verifies). If it has none, documented: start with `--dangerously-bypass-approvals-and-sandbox` |
-| Kimi | its approval hook if one exists, otherwise the `kimi web` approvals API |
+| Claude Code | `PermissionRequest` hook returns allow (verified, T051) |
+| Codex | the same `PermissionRequest` hook (verified in 0.157.1) |
+| Kimi | terminal sessions: **unsupported** (its PermissionRequest hook is observation-only); `kimi web`-hosted sessions: approvals API |
 | OpenCode | the daemon answers permission requests through the service API |
+
+Rules for the `permissions` class:
+- A permission prompt isn't tied to one sender, so only a policy that covers every local sender (`from` = any agent on this machine) grants it.
+- A policy with projects grants it only while the session works inside them.
+- The session must be verified: bound to this very CLI process (pid + start time). There's no guessing from folder names.
+- Every approval re-checks the policy just before it's sent, so a revocation wins.
 
 While any yolo policy is active, it's visible everywhere:
 - the status line shows `YOLO` and when it expires;

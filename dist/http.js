@@ -306,7 +306,7 @@ export async function pullPolicies(node) {
                 continue;
             const { items } = await res.json();
             // revocations first, so a kill switch is never beaten by the policy it kills
-            for (const it of [...items].sort((a, b) => (a.rec.type === "revocation" ? -1 : 0) - (b.rec.type === "revocation" ? -1 : 0)).slice(0, 500)) {
+            for (const it of [...items].sort((a, b) => (a.rec.type === "revocation" ? -1 : 0) - (b.rec.type === "revocation" ? -1 : 0)).slice(0, 10_000)) {
                 if (it?.rec?.type === "policy" && !it.rec.to.hosts.includes("*") && !it.rec.to.hosts.includes(node.host))
                     continue;
                 acceptSigned(node.store.db, it, node.host);

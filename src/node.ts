@@ -9,6 +9,7 @@ import {
 } from "./envelope.ts";
 import { ownerPublicKey } from "./owner.ts";
 import { effectivePolicy, policyLine } from "./policy.ts";
+import { procStart, sameProcess } from "./proc.ts";
 import { Store, type DeliveryState, type MessageRow } from "./store.ts";
 
 export const DEFAULT_PORT = 7373;
@@ -27,6 +28,8 @@ export type ReceiveResult = "accepted" | "duplicate" | `rejected:${string}`;
 /** Session rows refresh every 60 s while the MCP server lives; older rows (or dead pids) are not trusted for identity. */
 export const SESSION_FRESH_MS = 3 * 60_000;
 export const LIVE_AGENT_MS = 24 * 3_600_000;
+/** Agents with no session binding at all (shell participants using --as) count as live this long after their last send. */
+export const SHELL_AGENT_MS = 2 * 3_600_000;
 export const alive = (pid: number | null | undefined) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; } };
 const WAKEABLE = new Set(["codex", "opencode"]);
 
@@ -60,14 +63,30 @@ export class MbxNode {
     this.store.db.prepare("INSERT OR IGNORE INTO principals VALUES (?,?,'owner',NULL,'local',?)").run(fingerprint(pub), pub, new Date().toISOString());
   }
 
-  /** A paired host's owner: adopted as this host's owner when this host has none (same human paired both), else a peer-owner. */
+  /** A paired host's owner key is recorded as a peer-owner: it gets no authority here until adopted explicitly. */
   private notePeerOwner(host: string, ownerPub: string | null) {
     if (!ownerPub) return;
     const fp = fingerprint(ownerPub), db = this.store.db;
     if (db.prepare("SELECT 1 FROM principals WHERE fp=?").get(fp)) return;
-    const hasOwner = !!db.prepare("SELECT 1 FROM principals WHERE role='owner'").get();
-    db.prepare("INSERT INTO principals VALUES (?,?,?,NULL,?,?)").run(fp, ownerPub, hasOwner ? "peer-owner" : "owner", `pair:${host}`, new Date().toISOString());
-    this.store.audit(hasOwner ? "principal.peer_owner" : "principal.owner_adopted", { host, owner: fp });
+    db.prepare("INSERT INTO principals VALUES (?,?,'peer-owner',NULL,?,?)").run(fp, ownerPub, `pair:${host}`, new Date().toISOString());
+    this.store.audit("principal.peer_owner", { host, owner: fp });
+  }
+
+  /**
+   * Make a paired host's owner key the owner of THIS host too (one human, several machines): its signed policies and
+   * revocations then apply here. Explicit on purpose (`agentmbx join … --adopt-owner` or `agentmbx owner adopt <host>`);
+   * a host with its own owner key keeps it. Unpairing the host removes the adoption.
+   */
+  adoptOwner(host: string): string {
+    if (this.ownerPub) throw new Error("this host has its own owner key; it only takes policies from that key");
+    const p = this.approvedPeer(host);
+    if (!p) throw new Error(`${host} is not paired with this host`);
+    if (!p.owner_pubkey) throw new Error(`${host} has no owner key (run 'agentmbx owner init' there, then pair again)`);
+    const fp = fingerprint(p.owner_pubkey), db = this.store.db;
+    db.prepare("DELETE FROM principals WHERE role='owner' AND via<>'local'").run();
+    db.prepare("INSERT INTO principals VALUES (?,?,'owner',NULL,?,?) ON CONFLICT(fp) DO UPDATE SET role='owner', via=excluded.via").run(fp, p.owner_pubkey, `adopt:${host}`, new Date().toISOString());
+    this.store.audit("principal.owner_adopted", { host, owner: fp });
+    return fp;
   }
 
   get host() { return this.config.host; }
@@ -93,19 +112,20 @@ export class MbxNode {
    * a live process count, so a reused PID can't inherit a dead session's identity. Returns the agent name actually used.
    */
   bindSession(s: { agent: string; cli: string; session_id: string; cwd?: string; pid?: number; session_key?: string; channel?: boolean }): string {
-    const db = this.store.db, fresh = new Date(Date.now() - SESSION_FRESH_MS).toISOString();
+    const db = this.store.db, start = procStart(s.pid);
     if (s.pid && s.session_key)
-      db.prepare("UPDATE sessions SET agent=? WHERE cli=? AND pid=? AND session_key IS NULL AND updated_at > ?").run(s.agent, s.cli, s.pid, new Date(Date.now() - LIVE_AGENT_MS).toISOString());
+      db.prepare("UPDATE sessions SET agent=? WHERE cli=? AND pid=? AND session_key IS NULL AND (pid_start IS ? OR pid_start IS NULL)").run(s.agent, s.cli, s.pid, start);
     else if (s.pid) {
-      const mcp = db.prepare("SELECT agent FROM sessions WHERE cli=? AND pid=? AND session_key IS NOT NULL AND updated_at > ? ORDER BY updated_at DESC LIMIT 1")
-        .get(s.cli, s.pid, fresh) as { agent: string } | undefined;
-      if (mcp && alive(s.pid)) s = { ...s, agent: mcp.agent };
+      const mcp = (db.prepare("SELECT agent, pid_start, updated_at FROM sessions WHERE cli=? AND pid=? AND session_key IS NOT NULL ORDER BY updated_at DESC")
+        .all(s.cli, s.pid) as { agent: string; pid_start: string | null; updated_at: string }[]).find((r) => this.sameSession(s.pid!, r));
+      if (mcp) s = { ...s, agent: mcp.agent };
       else { const kept = this.store.get(`name:${s.cli}:${s.session_id}`); if (kept) s = { ...s, agent: kept }; } // resumed session keeps its name
     }
-    db.prepare(`INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(cli,session_id) DO UPDATE SET
-      agent=excluded.agent, cwd=excluded.cwd, pid=excluded.pid, session_key=COALESCE(excluded.session_key,session_key),
-      channel=excluded.channel, updated_at=excluded.updated_at`)
-      .run(s.agent, s.cli, s.session_id, s.cwd ?? null, s.pid ?? null, s.session_key ?? null, s.channel ? 1 : 0, new Date().toISOString());
+    this.store.db.prepare("DELETE FROM kv WHERE k=?").run(`alias:${s.agent}`); // a live session under this name ends any alias
+    db.prepare(`INSERT INTO sessions (agent,cli,session_id,cwd,pid,session_key,channel,updated_at,pid_start) VALUES (?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(cli,session_id) DO UPDATE SET agent=excluded.agent, cwd=excluded.cwd, pid=excluded.pid,
+      session_key=COALESCE(excluded.session_key,session_key), channel=excluded.channel, updated_at=excluded.updated_at, pid_start=excluded.pid_start`)
+      .run(s.agent, s.cli, s.session_id, s.cwd ?? null, s.pid ?? null, s.session_key ?? null, s.channel ? 1 : 0, new Date().toISOString(), start);
     // a session that can now be woken for real gets another try at mail that only produced a desktop notice
     const wakeable = s.channel || (WAKEABLE.has(s.cli) && !s.session_id.startsWith("mcp-"));
     if (wakeable)
@@ -114,10 +134,42 @@ export class MbxNode {
   }
 
   /** The agent name the MCP server of this CLI process uses (fresh binding of a live pid), if any. */
-  agentFor(cli: string, pid: number): string | null {
-    const r = this.store.db.prepare("SELECT agent FROM sessions WHERE cli=? AND pid=? AND session_key IS NOT NULL AND updated_at > ? ORDER BY updated_at DESC LIMIT 1")
-      .get(cli, pid, new Date(Date.now() - SESSION_FRESH_MS).toISOString()) as { agent: string } | undefined;
-    return r && alive(pid) ? r.agent : null;
+  agentFor(cli: string | null, pid: number): string | null {
+    const rows = this.store.db.prepare(`SELECT agent, pid_start, updated_at, session_key FROM sessions WHERE pid=? ${cli ? "AND cli=?" : ""} ORDER BY (session_key IS NOT NULL) DESC, updated_at DESC`)
+      .all(...(cli ? [pid, cli] : [pid])) as { agent: string; pid_start: string | null; updated_at: string }[];
+    return rows.find((r) => this.sameSession(pid, r))?.agent ?? null;
+  }
+
+  /** A session row still belongs to the live process it was recorded for (pid + start time; legacy rows: fresh + alive). */
+  sameSession(pid: number, r: { pid_start: string | null; updated_at: string }): boolean {
+    if (Date.now() - Date.parse(r.updated_at) > LIVE_AGENT_MS) return false; // live sessions rebind every minute
+    if (r.pid_start) return sameProcess(pid, r.pid_start);
+    return Date.now() - Date.parse(r.updated_at) < SESSION_FRESH_MS && alive(pid);
+  }
+
+  /** The agent of the session this process runs inside (walks up the process tree), if any. */
+  callerAgent(ancestors: number[]): { agent: string; pid: number } | null {
+    for (const pid of ancestors) { const a = this.agentFor(null, pid); if (a) return { agent: a, pid }; }
+    return null;
+  }
+
+  /** Is `name` used by a live session of some process other than `exceptPid`? */
+  heldByOther(name: string, exceptPid: number): boolean {
+    return (this.store.db.prepare("SELECT pid, pid_start, updated_at FROM sessions WHERE agent=? AND pid IS NOT NULL AND pid<>?").all(name, exceptPid) as
+      { pid: number; pid_start: string | null; updated_at: string }[]).some((r) => this.sameSession(r.pid, r));
+  }
+
+  /** After a rename, mail for the old name follows the session (until a live session takes the old name again). */
+  addAlias(oldName: string, newName: string, pid: number) {
+    if (oldName === newName || this.heldByOther(oldName, pid)) return;
+    this.store.set(`alias:${oldName}`, newName);
+    this.store.audit("agent.renamed", { from: oldName, to: newName });
+  }
+
+  resolveAlias(name: string): string {
+    let n = name;
+    for (let i = 0; i < 5; i++) { const next = this.store.get(`alias:${n}`); if (!next || this.heldByOther(n, -1)) break; n = next; }
+    return n;
   }
 
   /** Stop-hook continuation budget: the thread and daily wake caps also bound "keep going" turns. Records one when allowed. */
@@ -139,26 +191,28 @@ export class MbxNode {
   pickName(wanted: string, cli: string, pid: number, sessionId?: string): string {
     const kept = sessionId && this.store.get(`name:${cli}:${sessionId}`);
     if (kept) return kept;
-    const fresh = new Date(Date.now() - SESSION_FRESH_MS).toISOString();
-    const held = (n: string) => (this.store.db.prepare("SELECT pid FROM sessions WHERE agent=? AND session_key IS NOT NULL AND updated_at > ? AND pid IS NOT NULL AND pid<>?")
-      .all(n, fresh, pid) as { pid: number }[]).some((r) => alive(r.pid));
+    const held = (n: string) => this.heldByOther(n, pid);
     const cands = [wanted, ...(wanted !== cli && !wanted.endsWith(`-${cli}`) ? [`${wanted}-${cli}`] : []), ...[2, 3, 4, 5, 6, 7, 8, 9].map((i) => `${wanted}-${i}`)];
     return cands.map((c) => c.slice(0, 40)).find((c) => NAME_RE.test(c) && !held(c)) ?? `${wanted.slice(0, 30)}-${process.pid}`;
   }
 
   /** Local agents with a live session, or seen in the last 24 h. */
   liveAgents(): Set<string> {
-    const out = new Set<string>();
-    for (const r of this.store.db.prepare("SELECT agent, pid, updated_at FROM sessions").all() as { agent: string; pid: number | null; updated_at: string }[])
-      if (alive(r.pid) && Date.now() - Date.parse(r.updated_at) < LIVE_AGENT_MS) out.add(r.agent);
-    const since = new Date(Date.now() - LIVE_AGENT_MS).toISOString();
-    for (const r of this.store.db.prepare("SELECT name FROM agents WHERE host=? AND last_seen > ?").all(this.host, since) as { name: string }[]) out.add(r.name);
+    const out = new Set<string>(), bound = new Set<string>();
+    for (const r of this.store.db.prepare("SELECT agent, pid, pid_start, updated_at FROM sessions").all() as { agent: string; pid: number | null; pid_start: string | null; updated_at: string }[]) {
+      bound.add(r.agent);
+      if (r.pid && this.sameSession(r.pid, r)) out.add(r.agent);
+    }
+    // shell participants (no session binding ever) count while they are active
+    const since = new Date(Date.now() - SHELL_AGENT_MS).toISOString();
+    for (const r of this.store.db.prepare("SELECT name FROM agents WHERE host=? AND last_seen > ?").all(this.host, since) as { name: string }[])
+      if (!bound.has(r.name)) out.add(r.name);
     return out;
   }
 
   /** How mail reaches this agent when its session is idle. */
   deliveryMode(agent: string): string {
-    const ss = this.sessionsFor(agent).filter((x) => alive(x.pid));
+    const ss = this.sessionsFor(agent).filter((x) => x.pid && this.sameSession(x.pid, x));
     if (ss.some((x) => x.channel)) return "push (Claude channel)";
     const w = ss.find((x) => WAKEABLE.has(x.cli) && !x.session_id.startsWith("mcp-"));
     if (w) return w.cli === "codex" ? "push (codex queue)" : "push (opencode service)";
@@ -167,7 +221,7 @@ export class MbxNode {
 
   sessionsFor(agent: string) {
     return this.store.db.prepare("SELECT * FROM sessions WHERE agent=? ORDER BY updated_at DESC").all(agent) as
-      { agent: string; cli: string; session_id: string; cwd: string | null; pid: number | null; session_key: string | null; channel: number; updated_at: string }[];
+      { agent: string; cli: string; session_id: string; cwd: string | null; pid: number | null; session_key: string | null; channel: number; updated_at: string; pid_start: string | null }[];
   }
 
   // ---- peers -------------------------------------------------------------------------------
@@ -198,6 +252,8 @@ export class MbxNode {
   removePeer(host: string) {
     this.store.db.prepare("DELETE FROM peers WHERE host=?").run(host);
     this.store.db.prepare("DELETE FROM agents WHERE host=?").run(host);
+    // an owner adopted through this host stops counting here (its policies go inactive: activePolicies checks owner keys)
+    this.store.db.prepare("DELETE FROM principals WHERE via IN (?,?)").run(`pair:${host}`, `adopt:${host}`);
     this.store.audit("pair.removed", { host });
   }
 
@@ -259,7 +315,9 @@ export class MbxNode {
         continue;
       }
       if (t === "owner") { local.add("owner"); continue; }
-      const [name, host] = t.split("@");
+      const [raw, host] = t.split("@");
+      const name = !host || host === this.host ? this.resolveAlias(raw) : raw;
+      if (name !== raw) warnings.push(`${raw} was renamed to ${name}; delivered to ${name}`);
       if (host) {
         if (host === this.host) local.add(name);
         else if (!forReceive) { if (approved.includes(host)) remote.add(host); else warnings.push(`${t}: host ${host} is not paired`); }
@@ -416,7 +474,7 @@ export function formatMessage(m: MessageRow, policy?: string): string {
   return [
     `# ${m.subject}`,
     `id: ${m.id}  ref: mbx:${m.id}@${e.sig?.host ?? "?"}  thread: ${m.thread}${m.reply_to ? `  reply_to: ${m.reply_to}` : ""}`,
-    `from: ${m.from_addr}  to: ${e.to.join(", ")}  kind: ${m.kind}${e.needs_reply ? " (needs reply)" : ""}  at: ${m.ts}`,
+    `from: ${m.from_addr}  to: ${e.to.join(", ")}  kind: ${m.kind}${e.needs_reply ? " (needs reply)" : ""}  at: ${m.ts}${e.meta.project ? `  project: ${e.meta.project}` : ""}`,
     `trust: ${trustLabel(m)}`,
     policy ?? "",
     e.refs.length ? `refs: ${e.refs.join(", ")}` : "",

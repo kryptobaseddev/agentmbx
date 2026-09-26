@@ -59,6 +59,8 @@ export class Store {
     mkdirSync(home, { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(join(home, "mbx.db"));
     this.db.exec(SCHEMA);
+    // columns added after 0.2 (CREATE TABLE IF NOT EXISTS doesn't add them to existing databases)
+    for (const ddl of ["ALTER TABLE sessions ADD COLUMN pid_start TEXT"]) { try { this.db.exec(ddl); } catch { /* already there */ } }
     for (const f of ["mbx.db", "mbx.db-wal", "mbx.db-shm"]) { try { chmodSync(join(home, f), 0o600); } catch { /* not created yet */ } }
   }
   close() { this.db.close(); }
