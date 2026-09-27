@@ -118,6 +118,39 @@ export class MbxNode {
     bindSession(s) {
         const db = this.store.db, start = procStart(s.pid);
         return this.store.tx(() => {
+            // A parent CLI can outlive a crashed MCP child. Retire only keys whose recorded child
+            // is positively gone or whose PID now belongs to a different process; unknown stays held.
+            const keys = db.prepare("SELECT DISTINCT session_key FROM sessions WHERE cli=? AND pid=? AND session_key IS NOT NULL")
+                .all(s.cli, s.pid ?? null);
+            for (const { session_key: key } of keys) {
+                const raw = this.store.get(`mcp-process:${key}`);
+                if (!raw)
+                    continue; // legacy bindings carry no child-process evidence
+                let owner;
+                try {
+                    owner = JSON.parse(raw);
+                }
+                catch {
+                    continue;
+                }
+                if (!owner || !Number.isSafeInteger(owner.pid) || owner.pid <= 0 || !(owner.start === null || typeof owner.start === "string"))
+                    continue;
+                let gone = false;
+                try {
+                    process.kill(owner.pid, 0);
+                }
+                catch (e) {
+                    gone = e.code === "ESRCH";
+                }
+                const current = gone ? null : procStart(owner.pid);
+                if (!gone && !(owner.start && current && owner.start !== current))
+                    continue;
+                db.prepare("DELETE FROM sessions WHERE cli=? AND session_key=? AND session_id GLOB 'mcp-*'").run(s.cli, key);
+                db.prepare("UPDATE sessions SET session_key=NULL, channel=0 WHERE cli=? AND session_key=?").run(s.cli, key);
+                db.prepare("DELETE FROM kv WHERE k=?").run(`mcp-process:${key}`);
+            }
+            if (s.session_key && s.mcp_pid === process.pid)
+                this.store.set(`mcp-process:${s.session_key}`, JSON.stringify({ pid: process.pid, start: procStart(process.pid) }));
             const live = s.pid ? db.prepare("SELECT agent,session_id,session_key,channel,cwd,pid_start,updated_at FROM sessions WHERE cli=? AND pid=?")
                 .all(s.cli, s.pid).filter((r) => this.sameSession(s.pid, r, { proof: true })) : [];
             const provisional = (id) => id.startsWith("mcp-");

@@ -16,8 +16,9 @@ async function client(home: string, agent: string, extra: Record<string, string>
   const c = new Client({ name: "test", version: "1" });
   const notes: unknown[] = [];
   c.setNotificationHandler(z.object({ method: z.literal("notifications/claude/channel"), params: z.any() }), (n) => { notes.push(n.params); });
-  await c.connect(new StdioClientTransport({ command: process.execPath, args: [BIN, "mcp"], env: { ...process.env, MBX_HOME: home, MBX_AGENT: agent, MBX_CLI: "claude", MBX_NO_DESKTOP: "1", ...extra } as Record<string, string> }));
-  return { c, notes };
+  const transport = new StdioClientTransport({ command: process.execPath, args: [BIN, "mcp"], env: { ...process.env, MBX_HOME: home, MBX_AGENT: agent, MBX_CLI: "claude", MBX_NO_DESKTOP: "1", ...extra } as Record<string, string> });
+  await c.connect(transport);
+  return { c, notes, transport };
 }
 
 test("MCP tools: whoami, send, inbox, read (framed), ack, thread, search, agents", async () => {
@@ -131,4 +132,26 @@ test("MCP disconnect removes only its provisional binding", async () => {
     assert.equal(n.sessionsFor("second").length, 1);
     assert.equal((await b.c.callTool({ name: "mbx_whoami", arguments: {} })).isError, undefined);
   } finally { await a.c.close(); await b.c.close(); n.close(); }
+});
+
+for (const hook of [false, true]) test(`MCP SIGKILL recovery ${hook ? "preserves the hook session" : "removes the dead placeholder"}`, async () => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-killed-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  const first = await client(home, "recover", { MBX_CLI: "codex", MBX_CHANNEL: "1" });
+  try {
+    if (hook) n.bindSession({ agent: "recover", cli: "codex", session_id: "real-thread", pid: process.pid });
+    const oldKey = n.sessionsFor("recover")[0].session_key;
+    const closed = new Promise<void>((resolve) => { first.c.onclose = resolve; });
+    process.kill(first.transport.pid!, "SIGKILL");
+    await closed;
+    const next = await client(home, "recover", { MBX_CLI: "codex" });
+    try {
+      const rows = n.sessionsFor("recover");
+      assert.equal(rows.length, 1);
+      if (hook) assert.equal(rows[0].session_id, "real-thread");
+      assert.notEqual(rows[0].session_key, oldKey);
+      assert.equal(rows[0].channel, 0);
+      assert.equal(n.store.get(`mcp-process:${oldKey}`), undefined);
+    } finally { await next.c.close(); }
+  } finally { await first.c.close(); n.close(); }
 });

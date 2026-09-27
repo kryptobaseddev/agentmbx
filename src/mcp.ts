@@ -90,7 +90,7 @@ export async function runMcp(node = new MbxNode()) {
   const key = generateKeyPair(); // never written anywhere
   const bind = () => {
     node.registerAgent(agent, { cli: env.cli, role: process.env.MBX_ROLE, description: process.env.MBX_DESCRIPTION });
-    node.bindSession({ agent, cli: env.cli, session_id: env.sessionId, cwd: process.cwd(), pid: env.ppid, session_key: key.publicKey, channel: env.channel });
+    node.bindSession({ agent, cli: env.cli, session_id: env.sessionId, cwd: process.cwd(), pid: env.ppid, session_key: key.publicKey, channel: env.channel, mcp_pid: process.pid });
   };
   bind();
   // the project this session works in (not the home folder), stamped on what it sends
@@ -259,6 +259,7 @@ export async function runMcp(node = new MbxNode()) {
     process.off("exit", retire);
     try {
       node.store.tx(() => {
+        node.store.db.prepare("DELETE FROM kv WHERE k=?").run(`mcp-process:${key.publicKey}`);
         // Key-scoped cleanup cannot erase a newer connection that replaced this binding.
         node.store.db.prepare("DELETE FROM sessions WHERE cli=? AND session_key=? AND session_id GLOB 'mcp-*'").run(env.cli, key.publicKey);
         node.store.db.prepare("UPDATE sessions SET session_key=NULL, channel=0 WHERE cli=? AND session_key=?").run(env.cli, key.publicKey);

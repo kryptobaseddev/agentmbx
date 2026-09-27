@@ -99,3 +99,28 @@ test("an unproven MCP reconnect cannot replace another live session key", () => 
     assert.equal(n.agentFor("codex", process.pid, { proof: true }), null);
   } finally { n.close(); }
 });
+
+for (const proof of ["live", "missing", "malformed", "invalid-pid", "unknown-birth", "reused-pid"]) test(`MCP child recovery handles ${proof} evidence`, () => {
+  const n = make();
+  try {
+    n.bindSession({ agent: "chosen", cli: "codex", session_id: "real-thread", pid: process.pid, session_key: "old-key", channel: true, mcp_pid: process.pid });
+    const name = "mcp-process:old-key";
+    if (proof === "missing") n.store.db.prepare("DELETE FROM kv WHERE k=?").run(name);
+    if (proof === "malformed") n.store.set(name, "{");
+    if (proof === "invalid-pid") n.store.set(name, JSON.stringify({ pid: -1, start: "old" }));
+    if (proof === "unknown-birth") n.store.set(name, JSON.stringify({ pid: process.pid, start: null }));
+    if (proof === "reused-pid") n.store.set(name, JSON.stringify({ pid: process.pid, start: "previous-process" }));
+    n.bindSession({ agent: "chosen", cli: "codex", session_id: "mcp-new", pid: process.pid, session_key: "new-key" });
+    if (proof === "reused-pid") {
+      assert.equal(rows(n).length, 1);
+      assert.equal(rows(n)[0].session_id, "real-thread");
+      assert.equal(rows(n)[0].session_key, "new-key");
+      assert.equal(rows(n)[0].channel, 0);
+      assert.equal(n.store.get(name), undefined);
+    } else {
+      assert.equal(rows(n).length, 2);
+      assert.equal(rows(n).find((r) => r.session_id === "real-thread")!.session_key, "old-key");
+      assert.equal(n.agentFor("codex", process.pid, { proof: true }), null);
+    }
+  } finally { n.close(); }
+});
