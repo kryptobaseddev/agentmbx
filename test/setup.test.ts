@@ -86,12 +86,14 @@ test("setup wires every CLI, backs files up, leaves other hook groups alone, and
   assert.equal(s.hooks.UserPromptSubmit[1].hooks[0].command, "/opt/bin/agentmbx hook prompt --cli claude");
   assert.equal(s.hooks.Stop.length, 2); assert.equal(s.hooks.Stop[1].hooks[0].command, "/opt/bin/agentmbx hook stop --cli claude");
   assert.equal(s.hooks.PreToolUse.length, 1);
+  assert.equal(s.hooks.PostToolUse[0].hooks[0].command, "/opt/bin/agentmbx hook post-tool --cli claude");
 
   // Codex
   assert.match(rd(home, ".codex/config.toml"), /\[mcp_servers\.mbx\]\ncommand = "\/opt\/bin\/agentmbx"\nargs = \["mcp"\]\ndefault_tools_approval_mode = "approve"\n$/);
   const ch = JSON.parse(rd(home, ".codex/hooks.json")).hooks;
   assert.equal(ch.SessionStart.length, 2); assert.equal(ch.SessionStart[0].hooks[0].command, ORCA);
   assert.equal(ch.UserPromptSubmit[1].hooks[0].command, "/opt/bin/agentmbx hook prompt --cli codex");
+  assert.equal(ch.PostToolUse, undefined, "only install the provider-supported hook");
 
   // OpenCode: comments survive, mbx sits under mcp.servers
   const oc = rd(home, ".config/opencode/opencode.jsonc");
