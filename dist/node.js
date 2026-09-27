@@ -117,34 +117,61 @@ export class MbxNode {
      */
     bindSession(s) {
         const db = this.store.db, start = procStart(s.pid);
-        if (s.pid && s.session_key)
-            db.prepare("UPDATE sessions SET agent=? WHERE cli=? AND pid=? AND session_key IS NULL AND (pid_start IS ? OR pid_start IS NULL)").run(s.agent, s.cli, s.pid, start);
-        else if (s.pid) {
-            const mcp = db.prepare("SELECT agent, pid_start, updated_at FROM sessions WHERE cli=? AND pid=? AND session_key IS NOT NULL ORDER BY updated_at DESC")
-                .all(s.cli, s.pid).find((r) => this.sameSession(s.pid, r, { proof: true }));
-            if (mcp)
-                s = { ...s, agent: mcp.agent };
-            else {
-                const kept = this.store.get(`name:${s.cli}:${s.session_id}`);
-                if (kept)
-                    s = { ...s, agent: kept };
-            } // resumed session keeps its name
-        }
-        this.store.db.prepare("DELETE FROM kv WHERE k=?").run(`alias:${s.agent}`); // a live session under this name ends any alias
-        db.prepare(`INSERT INTO sessions (agent,cli,session_id,cwd,pid,session_key,channel,updated_at,pid_start) VALUES (?,?,?,?,?,?,?,?,?)
-      ON CONFLICT(cli,session_id) DO UPDATE SET agent=excluded.agent, cwd=excluded.cwd, pid=excluded.pid,
-      session_key=COALESCE(excluded.session_key,session_key), channel=excluded.channel, updated_at=excluded.updated_at, pid_start=excluded.pid_start`)
-            .run(s.agent, s.cli, s.session_id, s.cwd ?? null, s.pid ?? null, s.session_key ?? null, s.channel ? 1 : 0, new Date().toISOString(), start);
-        // a session that can now be woken for real gets another try at mail that only produced a desktop notice
-        if (sessionWakeable(s))
-            db.prepare("UPDATE deliveries SET state='delivered', note=NULL WHERE agent=? AND state='notified' AND note='desktop'").run(s.agent);
-        return s.agent;
+        return this.store.tx(() => {
+            const live = s.pid ? db.prepare("SELECT agent,session_id,session_key,channel,cwd,pid_start,updated_at FROM sessions WHERE cli=? AND pid=?")
+                .all(s.cli, s.pid).filter((r) => this.sameSession(s.pid, r, { proof: true })) : [];
+            const provisional = (id) => id.startsWith("mcp-");
+            const compatibleDirectory = (r) => s.cwd === undefined || r.cwd === null || s.cwd === r.cwd;
+            const exact = live.find((r) => r.session_id === s.session_id);
+            let target = exact, source = exact;
+            if (s.session_key && provisional(s.session_id)) {
+                // Once the hook supplies the real id, an MCP heartbeat must keep that wake target. A key
+                // match is explicit; a unique hook-only row is sufficient only without competing MCP keys.
+                const sameKey = live.filter((r) => r.session_key === s.session_key && !provisional(r.session_id));
+                const hooks = live.filter((r) => !r.session_key && !provisional(r.session_id) && compatibleDirectory(r));
+                if (sameKey.length === 1)
+                    target = sameKey[0];
+                else if (!sameKey.length && hooks.length === 1 && live.every((r) => !r.session_key || r.session_key === s.session_key))
+                    target = hooks[0];
+                source = target ?? exact;
+            }
+            else if (!s.session_key) {
+                // Never infer identity from another real session sharing this PID (hosted providers).
+                const pending = live.filter((r) => r.session_key && provisional(r.session_id) && compatibleDirectory(r));
+                if (!exact?.session_key && pending.length === 1 && live.every((r) => provisional(r.session_id) || r === exact))
+                    source = pending[0];
+            }
+            const id = s.session_key && provisional(s.session_id) && target ? target.session_id : s.session_id;
+            const key = s.session_key ?? source?.session_key ?? null;
+            const agent = s.session_key ? s.agent : source?.agent ?? this.store.get(`name:${s.cli}:${id}`) ?? s.agent;
+            const channel = s.channel === undefined ? source?.channel ?? 0 : s.channel ? 1 : 0;
+            const cwd = s.cwd ?? target?.cwd ?? source?.cwd ?? null;
+            db.prepare("DELETE FROM kv WHERE k=?").run(`alias:${agent}`);
+            // Preserve metadata only from a verified binding; a reused PID must not inherit an old key.
+            db.prepare(`INSERT INTO sessions (agent,cli,session_id,cwd,pid,session_key,channel,updated_at,pid_start) VALUES (?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(cli,session_id) DO UPDATE SET agent=excluded.agent, cwd=excluded.cwd, pid=excluded.pid,
+        session_key=excluded.session_key, channel=excluded.channel, updated_at=excluded.updated_at, pid_start=excluded.pid_start`)
+                .run(agent, s.cli, id, cwd, s.pid ?? null, key, channel, new Date().toISOString(), start);
+            if (key && !provisional(id)) {
+                for (const row of live.filter((r) => r.session_key === key && provisional(r.session_id))) {
+                    db.prepare("DELETE FROM sessions WHERE cli=? AND session_id=?").run(s.cli, row.session_id);
+                    this.keepName(s.cli, row.session_id, agent);
+                }
+                this.keepName(s.cli, id, agent);
+            }
+            if (sessionWakeable({ ...s, session_id: id, channel }))
+                db.prepare("UPDATE deliveries SET state='delivered', note=NULL WHERE agent=? AND state='notified' AND note='desktop'").run(agent);
+            return agent;
+        });
     }
     /** The agent name the MCP server of this CLI process uses (fresh binding of a live pid), if any. */
     agentFor(cli, pid, o = {}) {
         const rows = this.store.db.prepare(`SELECT agent, pid_start, updated_at, session_key FROM sessions WHERE pid=? ${cli ? "AND cli=?" : ""} ORDER BY (session_key IS NOT NULL) DESC, updated_at DESC`)
             .all(...(cli ? [pid, cli] : [pid]));
-        return rows.find((r) => this.sameSession(pid, r, o))?.agent ?? null;
+        const live = rows.filter((r) => this.sameSession(pid, r, o));
+        if (new Set(live.map((r) => r.agent)).size !== 1 || new Set(live.map((r) => r.session_key).filter(Boolean)).size > 1)
+            return null;
+        return live[0]?.agent ?? null;
     }
     /**
      * A session row still belongs to the live process it was recorded for. `proof` (anything that authorizes: YOLO,
@@ -224,6 +251,8 @@ export class MbxNode {
             // Hosted providers can run multiple sessions in one process. A shared PID alone must not join
             // two different MCP session keys or let a rename enter another live mailbox on that process.
             if (new Set(owned.map((s) => s.session_key).filter(Boolean)).size > 1)
+                return;
+            if (owned.filter((s) => !s.session_id.startsWith("mcp-")).length > 1)
                 return;
             if (owned.length) {
                 if (this.inUseElsewhere(newName, -1))

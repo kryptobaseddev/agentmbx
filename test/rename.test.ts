@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { MbxNode } from "../src/node.ts";
 
 const node = () => new MbxNode(mkdtempSync(join(tmpdir(), "mbx-rename-")), { host: "alpha" });
-const bind = (n: MbxNode, agent: string, pid = process.pid) => n.bindSession({ agent, cli: "claude", session_id: `session-${pid}`, pid, session_key: `key-${pid}` });
+const bind = (n: MbxNode, agent: string, pid = process.pid) => n.bindSession({ agent, cli: "claude", session_id: `mcp-${pid}`, pid, session_key: `key-${pid}` });
 const send = (n: MbxNode, to: string[]) => n.send({ from: "sender", to, subject: "rename", body: "unchanged signed body" }).envelope.id;
 
 test("rename moves unacked mail and session bindings while preserving signed envelopes and completed history", () => {
@@ -114,4 +114,17 @@ test("rename rolls back mailbox and binding changes together if recording the re
     assert.deepEqual(n.inbox("before").map((m) => m.id), [id]);
     assert.equal(n.unreadCount("after"), 0);
   } finally { t.mock.restoreAll(); n.close(); }
+});
+
+test("distinct real sessions sharing a name and PID keep their shared mailbox on rename", () => {
+  const n = node();
+  try {
+    n.bindSession({ agent: "shared", cli: "kimi", session_id: "real-one", pid: process.pid, session_key: "key" });
+    n.bindSession({ agent: "shared", cli: "kimi", session_id: "real-two", pid: process.pid });
+    const id = send(n, ["shared"]);
+    n.addAlias("shared", "renamed", process.pid);
+    assert.equal(n.store.get("alias:shared"), undefined);
+    assert.equal(n.read(id, "shared").id, id);
+    assert.throws(() => n.read(id, "renamed"), /no message/);
+  } finally { n.close(); }
 });

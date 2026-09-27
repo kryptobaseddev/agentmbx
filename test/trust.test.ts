@@ -175,8 +175,9 @@ test("hook and MCP bindings from one CLI process share the MCP server's agent na
   // hook binds first under the folder name, then the MCP server (renamed) binds from the same process
   node.bindSession({ agent: "keatonhoskins", cli: "codex", session_id: "thread-1", pid: process.pid });
   node.bindSession({ agent: "codex", cli: "codex", session_id: "mcp-1", pid: process.pid, session_key: "k" });
-  assert.deepEqual(node.sessionsFor("codex").map((s) => s.session_id).sort(), ["mcp-1", "thread-1"]);
+  assert.deepEqual(node.sessionsFor("codex").map((s) => s.session_id), ["thread-1"]);
   // a later hook run (resume) adopts the MCP name too
-  node.bindSession({ agent: "keatonhoskins", cli: "codex", session_id: "thread-2", pid: process.pid });
+  node.bindSession({ agent: "keatonhoskins", cli: "codex", session_id: "thread-1", pid: process.pid });
   assert.equal(node.sessionsFor("keatonhoskins").length, 0);
+  node.close();
 });
