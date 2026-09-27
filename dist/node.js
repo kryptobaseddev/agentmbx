@@ -173,6 +173,16 @@ export class MbxNode {
     heldByOther(name, exceptPid) {
         return this.store.db.prepare("SELECT pid, pid_start, updated_at FROM sessions WHERE agent=? AND pid IS NOT NULL AND pid<>?").all(name, exceptPid).some((r) => this.sameSession(r.pid, r));
     }
+    /**
+     * Is `name` in use by someone other than session `exceptPid`: a live session, or a shell sender (`--as`) seen in the
+     * last 2 h. A rename never takes such a name's mail, and an old alias stops redirecting once the name is in use again.
+     */
+    inUseElsewhere(name, exceptPid) {
+        if (this.heldByOther(name, exceptPid))
+            return true;
+        const r = this.store.db.prepare("SELECT cli, last_seen FROM agents WHERE name=? AND host=?").get(name, this.host);
+        return !!r && r.cli === "cli" && !!r.last_seen && Date.now() - Date.parse(r.last_seen) < SHELL_AGENT_MS;
+    }
     /** A name a shell sender (`agentmbx send --as`, no session) used in the last 2 h: new sessions don't take it. */
     shellHeld(name) {
         const r = this.store.db.prepare("SELECT cli, last_seen FROM agents WHERE name=? AND host=?").get(name, this.host);
@@ -184,17 +194,21 @@ export class MbxNode {
      * A session that sends as another name through the CLI (`--as mac-dev` from inside session `claude`) owns that name
      * too: mail to it shows in the session's notices and wakes the session.
      */
-    linkIdentity(name, sessionAgent) { if (name !== sessionAgent)
+    linkIdentity(name, sessionAgent) { if (name !== sessionAgent && !this.hasSessions(name))
         this.store.set(`ident:${name}`, sessionAgent); }
+    /** A name some CLI session has bound (hook or MCP): its own identity, never linkable to another session. */
+    hasSessions(name) { return !!this.store.db.prepare("SELECT 1 FROM sessions WHERE agent=? LIMIT 1").get(name); }
     /** Names linked to this session agent (see linkIdentity). */
     linkedNames(sessionAgent) {
-        return this.store.db.prepare("SELECT k FROM kv WHERE k LIKE 'ident:%' AND v=?").all(sessionAgent).map((r) => r.k.slice(6));
+        // only shell-only names: a link to a name that sessions bind (made before this rule) is ignored
+        return this.store.db.prepare("SELECT k FROM kv WHERE k LIKE 'ident:%' AND v=?").all(sessionAgent).map((r) => r.k.slice(6))
+            .filter((n) => !this.hasSessions(n));
     }
     /** The session agent a linked name belongs to, if any. */
     identityOwner(name) { return this.store.get(`ident:${name}`) ?? null; }
     /** After a rename, mail for the old name follows the session (until a live session takes the old name again). */
     addAlias(oldName, newName, pid) {
-        if (oldName === newName || this.heldByOther(oldName, pid))
+        if (oldName === newName || this.inUseElsewhere(oldName, pid))
             return;
         this.store.set(`alias:${oldName}`, newName);
         this.store.audit("agent.renamed", { from: oldName, to: newName });
@@ -203,7 +217,7 @@ export class MbxNode {
         let n = name;
         for (let i = 0; i < 5; i++) {
             const next = this.store.get(`alias:${n}`);
-            if (!next || this.heldByOther(n, -1))
+            if (!next || this.inUseElsewhere(n, -1))
                 break;
             n = next;
         }
@@ -216,7 +230,7 @@ export class MbxNode {
             return false;
         if (q("SELECT count(*) n FROM wakes WHERE agent=? AND at>?", agent, new Date(now - 86_400_000).toISOString()) >= WAKE_LIMITS.perAgentDay)
             return false;
-        this.store.db.prepare("INSERT INTO wakes VALUES (?,?,?)").run(agent, thread, new Date(now).toISOString());
+        this.store.db.prepare("INSERT INTO wakes (agent,thread,at) VALUES (?,?,?)").run(agent, thread, new Date(now).toISOString());
         return true;
     }
     /** Remember a chosen name for a CLI session id, so resuming that session keeps it. */
@@ -476,17 +490,28 @@ export class MbxNode {
             throw Object.assign(new Error(`id prefix ${id} matches ${rows.length === 6 ? "6+" : rows.length} messages (${rows.slice(0, 3).map((r) => r.id).join(", ")}…); use more characters`), { code: "AMBIGUOUS" });
         return rows[0];
     }
+    /**
+     * Can `agent` (or a name linked to its session) see this message: it sent it or it was delivered to it. Everything
+     * that takes a message id for an agent checks this and answers "not found" otherwise, so ids leak nothing.
+     */
+    canSee(m, agent) {
+        const names = [agent, ...this.linkedNames(agent)];
+        const [fa, fh] = m.from_addr.split("@");
+        if ((m.origin === "local" || fh === this.host) && names.includes(fa))
+            return true;
+        return names.some((n) => this.store.db.prepare("SELECT 1 FROM deliveries WHERE msg_id=? AND agent=?").get(m.id, n));
+    }
     /** Read-only: fetching a message changes nothing (so every CLI can auto-allow it). "Unread" means "not acked". */
-    read(id, _agent) {
+    read(id, agent) {
         const m = this.message(id);
-        if (!m)
+        if (!m || (agent && !this.canSee(m, agent)))
             throw Object.assign(new Error(`no message ${id} (list yours with: agentmbx inbox --as <you> --all)`), { code: "NOT_FOUND" });
         return m;
     }
     /** `did`: what the agent did on this message's request; recorded in the audit log with the policy that allowed it. */
     ack(id, agent, note = null, did) {
         const m = this.message(id);
-        if (!m)
+        if (!m || !this.canSee(m, agent))
             throw Object.assign(new Error(`no message ${id}`), { code: "NOT_FOUND" });
         this.store.setDelivery(m.id, agent, "read");
         this.store.setDelivery(m.id, agent, "acked", note);
@@ -501,8 +526,15 @@ export class MbxNode {
         const [fromAgent, fromHost] = m.from_addr.split("@");
         return effectivePolicy(this.store.db, { agent, host: this.host, fromAgent, fromHost: m.origin === "local" ? this.host : fromHost, envelope: JSON.parse(m.envelope) });
     }
-    thread(thread) { return this.store.db.prepare("SELECT * FROM messages WHERE thread=? ORDER BY ts").all(thread); }
-    search(q, limit = 20) {
+    /** A thread's messages, oldest first; with `agent`, only the ones that agent can see. */
+    thread(thread, agent) {
+        const rows = this.store.db.prepare("SELECT * FROM messages WHERE thread=? ORDER BY ts").all(thread);
+        return agent ? rows.filter((m) => this.canSee(m, agent)) : rows;
+    }
+    /** Full-text search; with `agent`, only messages that agent can see. */
+    search(q, limit = 20, agent) {
+        if (agent)
+            return this.search(q, limit * 20).filter((m) => this.canSee(m, agent)).slice(0, limit);
         const fts = q.replace(/["']/g, " ").split(/\s+/).filter(Boolean).map((w) => `"${w}"`).join(" ");
         if (!fts)
             return [];
@@ -525,7 +557,7 @@ export class MbxNode {
             return "thread wake cap reached";
         if (q("SELECT count(*) n FROM wakes WHERE agent=? AND at>?", agent, since(86_400_000)) >= WAKE_LIMITS.perAgentDay)
             return "daily wake cap reached";
-        this.store.db.prepare("INSERT INTO wakes VALUES (?,?,?)").run(agent, thread, new Date(now).toISOString());
+        this.store.db.prepare("INSERT INTO wakes (agent,thread,at) VALUES (?,?,?)").run(agent, thread, new Date(now).toISOString());
         return null;
     }
 }

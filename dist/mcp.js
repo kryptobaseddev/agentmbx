@@ -131,6 +131,9 @@ export async function runMcp(node = new MbxNode()) {
         instructions: extra ? `${INSTRUCTIONS}\n${extra}` : INSTRUCTIONS,
         capabilities: env.channel ? { experimental: { "claude/channel": {} } } : {},
     });
+    // every tool first checks that a newer agentmbx hasn't upgraded the store under this long-running server
+    const register = server.registerTool.bind(server);
+    server.registerTool = (name, config, cb) => register(name, config, (...a) => { node.store.assertCurrent(version()); return cb(...a); });
     server.registerTool("mbx_whoami", {
         title: "Who am I on mbx",
         description: "Show this session's mbx identity (agent name, host, session key fingerprint, whether it holds an owner grant). Pass `name` to rename this session's agent (do it early if the default folder name is vague), `role`/`description` to describe it. Next: mbx_inbox for mail, mbx_agents to see who else is around.",
@@ -173,9 +176,7 @@ export async function runMcp(node = new MbxNode()) {
         }
         let thread;
         if (reply_to) {
-            const m = node.message(reply_to);
-            if (!m)
-                throw new Error(`no message ${reply_to}`);
+            const m = node.read(reply_to, agent);
             thread = m.thread;
             reply_to = m.id;
         }
@@ -195,9 +196,7 @@ export async function runMcp(node = new MbxNode()) {
             origin: z.enum(["agent", "external"]).optional().describe("external when the content comes from outside"),
         },
     }, async ({ id, body, kind, needs_reply, origin }) => {
-        const m = node.message(id);
-        if (!m)
-            throw new Error(`no message ${id}`);
+        const m = node.read(id, agent);
         noteRead([m]);
         const subject = /^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`.slice(0, 200);
         const r = node.send({ from: agent, to: [m.from_addr], subject, body, kind, reply_to: m.id, thread: m.thread, needs_reply, refs: [], ...relay(origin) }, session());
@@ -237,17 +236,17 @@ export async function runMcp(node = new MbxNode()) {
         annotations: { readOnlyHint: true },
     }, async ({ id }) => {
         const m = node.message(id);
-        const rows = node.thread(m ? m.thread : id);
+        const rows = node.thread(m && node.canSee(m, agent) ? m.thread : id, agent);
         noteRead(rows);
         return text(rows.length ? rows.map((r) => formatFor(node, r, agent)).join("\n\n") : `No thread ${id}.`);
     });
     server.registerTool("mbx_search", {
         title: "Search mbx messages",
-        description: "Full-text search over subjects and bodies of every message stored on this host. Next: mbx_read or mbx_thread an id from the results.",
+        description: "Full-text search over subjects and bodies of the messages you sent or received. Next: mbx_read or mbx_thread an id from the results.",
         inputSchema: { query: z.string().min(2).max(200), limit: z.number().int().min(1).max(50).default(10) },
         annotations: { readOnlyHint: true },
     }, async ({ query, limit }) => {
-        const rows = node.search(query, limit);
+        const rows = node.search(query, limit, agent);
         return text(rows.length ? rows.map(summaryLine).join("\n") : `No matches for "${query}".`, { ids: rows.map((r) => r.id) });
     });
     server.registerTool("mbx_agents", {

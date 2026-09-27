@@ -49,6 +49,11 @@ CREATE TABLE IF NOT EXISTS pair_tokens (  -- one-time pairing tokens (agentmbx p
   state TEXT NOT NULL,           -- 'live' | 'used' | 'burned'
   used_by TEXT);
 `;
+/**
+ * Store layout version (PRAGMA user_version). Bump it with every schema change. A process that finds a newer version
+ * (an old MCP server still running after an upgrade) refuses to write instead of failing with raw SQL errors.
+ */
+export const SCHEMA_VERSION = 1;
 export class Store {
     db;
     constructor(home) {
@@ -62,6 +67,8 @@ export class Store {
             }
             catch { /* already there */ }
         }
+        if (this.schemaVersion() < SCHEMA_VERSION)
+            this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
         for (const f of ["mbx.db", "mbx.db-wal", "mbx.db-shm"]) {
             try {
                 chmodSync(join(home, f), 0o600);
@@ -70,6 +77,13 @@ export class Store {
         }
     }
     close() { this.db.close(); }
+    schemaVersion() { return this.db.prepare("PRAGMA user_version").get().user_version; }
+    /** Throws a clear "restart" error when a newer agentmbx has upgraded the store since this process started. */
+    assertCurrent(running) {
+        const v = this.schemaVersion();
+        if (v > SCHEMA_VERSION)
+            throw Object.assign(new Error(`this mbx server (agentmbx ${running}) is older than the mailbox store (schema ${v} > ${SCHEMA_VERSION}); a newer agentmbx upgraded it. Restart your CLI session to load the current mbx tools.`), { code: "STALE_SERVER" });
+    }
     tx(fn) {
         this.db.exec("BEGIN IMMEDIATE");
         try {
@@ -83,10 +97,10 @@ export class Store {
         }
     }
     audit(event, detail = null) {
-        this.db.prepare("INSERT INTO audit VALUES (?,?,?)").run(new Date().toISOString(), event, detail == null ? null : JSON.stringify(detail));
+        this.db.prepare("INSERT INTO audit (at,event,detail) VALUES (?,?,?)").run(new Date().toISOString(), event, detail == null ? null : JSON.stringify(detail));
     }
     get(k) { return this.db.prepare("SELECT v FROM kv WHERE k=?").get(k)?.v; }
-    set(k, v) { this.db.prepare("INSERT INTO kv VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").run(k, v); }
+    set(k, v) { this.db.prepare("INSERT INTO kv (k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").run(k, v); }
     hasMessage(id) { return !!this.db.prepare("SELECT 1 FROM messages WHERE id=?").get(id); }
     /** Insert once (id dedupe). Returns false when the id was already stored. */
     insertMessage(e, origin, trust, authority) {
@@ -95,7 +109,7 @@ export class Store {
         return r.changes > 0;
     }
     addDelivery(msgId, agent, state = "delivered") {
-        this.db.prepare("INSERT OR IGNORE INTO deliveries VALUES (?,?,?,?,NULL)").run(msgId, agent, state, new Date().toISOString());
+        this.db.prepare("INSERT OR IGNORE INTO deliveries (msg_id,agent,state,updated_at,note) VALUES (?,?,?,?,NULL)").run(msgId, agent, state, new Date().toISOString());
     }
     setDelivery(msgId, agent, state, note = null) {
         const order = ["queued", "delivered", "notified", "read", "acked"];
