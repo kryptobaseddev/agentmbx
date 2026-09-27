@@ -108,11 +108,14 @@ export class Store {
 
   setDelivery(msgId: string, agent: string, state: DeliveryState, note: string | null = null) {
     const order = ["queued", "delivered", "notified", "read", "acked"];
-    const cur = this.db.prepare("SELECT state FROM deliveries WHERE msg_id=? AND agent=?").get(msgId, agent) as { state: string } | undefined;
-    if (!cur || order.indexOf(cur.state) >= order.indexOf(state)) return false; // states only move forward
-    this.db.prepare("UPDATE deliveries SET state=?, updated_at=?, note=COALESCE(?,note) WHERE msg_id=? AND agent=?")
-      .run(state, new Date().toISOString(), note, msgId, agent);
-    return true;
+    const rank = order.indexOf(state);
+    if (rank <= 0) return false;
+    const earlier = order.slice(0, rank);
+    // Check and advance in one statement: another MCP/daemon process may ack while a wake is in flight.
+    const result = this.db.prepare(`UPDATE deliveries SET state=?, updated_at=?, note=COALESCE(?,note)
+      WHERE msg_id=? AND agent=? AND state IN (${earlier.map(() => "?").join(",")})`)
+      .run(state, new Date().toISOString(), note, msgId, agent, ...earlier);
+    return result.changes > 0;
   }
 }
 
