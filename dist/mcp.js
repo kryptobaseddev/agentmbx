@@ -259,10 +259,43 @@ export async function runMcp(node = new MbxNode()) {
         return text(rows.map((a) => `${a.name}@${a.host}${a.role ? `  role:${a.role}` : ""}${a.cli ? `  (${a.cli})` : ""}  last seen ${a.last_seen ?? "never"}${a.description ? `  — ${a.description}` : ""}`).join("\n") || "No agents yet.", { agents: rows });
     });
     const transport = new StdioServerTransport();
-    await server.connect(transport);
+    const timers = [];
+    let closed = false;
+    const retire = () => {
+        if (closed)
+            return;
+        closed = true;
+        for (const timer of timers)
+            clearInterval(timer);
+        process.stdin.off("end", retire);
+        process.off("exit", retire);
+        try {
+            node.store.tx(() => {
+                // Key-scoped cleanup cannot erase a newer connection that replaced this binding.
+                node.store.db.prepare("DELETE FROM sessions WHERE cli=? AND session_key=? AND session_id GLOB 'mcp-*'").run(env.cli, key.publicKey);
+                node.store.db.prepare("UPDATE sessions SET session_key=NULL, channel=0 WHERE cli=? AND session_key=?").run(env.cli, key.publicKey);
+            });
+        }
+        catch (e) {
+            process.stderr.write(`[mbx] session cleanup failed: ${e.message}\n`);
+        }
+    };
+    server.server.onclose = retire;
+    // The SDK stdio transport does not forward stdin EOF to onclose.
+    process.stdin.once("end", retire);
+    process.once("exit", retire);
+    try {
+        await server.connect(transport);
+    }
+    catch (e) {
+        retire();
+        throw e;
+    }
+    if (closed)
+        return;
     // Channel push (Claude started with --dangerously-load-development-channels server:mbx): wake this session ourselves.
     if (env.channel) {
-        setInterval(async () => {
+        timers.push(setInterval(async () => {
             try {
                 const rows = node.store.db.prepare(`SELECT m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state='delivered' ORDER BY m.ts`).all(agent);
                 if (!rows.length)
@@ -281,11 +314,11 @@ export async function runMcp(node = new MbxNode()) {
             catch (e) {
                 process.stderr.write(`[mbx] channel push failed: ${e.message}\n`);
             }
-        }, 1500).unref();
+        }, 1500).unref());
     }
     // keep last_seen fresh while the session lives
-    setInterval(() => { try {
+    timers.push(setInterval(() => { try {
         bind();
     }
-    catch { /* db busy */ } }, 60_000).unref();
+    catch { /* db busy */ } }, 60_000).unref());
 }

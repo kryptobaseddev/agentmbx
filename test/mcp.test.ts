@@ -91,3 +91,44 @@ test("MCP rename keeps pending mail reachable and ackable under the new name", a
     assert.equal(n.unreadCount("before"), 0);
   } finally { await c.close(); n.close(); }
 });
+
+for (const replaced of [false, true]) test(`MCP disconnect ${replaced ? "preserves a replacement key" : "retires its key and reconnects to the hook session"}`, async () => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-close-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  const { c } = await client(home, "reconnect", { MBX_CHANNEL: "1", MBX_CLI: "codex" });
+  try {
+    n.bindSession({ agent: "reconnect", cli: "codex", session_id: "real-thread", pid: process.pid });
+    assert.equal(n.sessionsFor("reconnect").length, 1);
+    const original = n.sessionsFor("reconnect")[0].session_key;
+    assert.ok(original);
+    if (replaced) n.store.db.prepare("UPDATE sessions SET session_key='replacement'").run();
+    await c.close();
+    const row = n.sessionsFor("reconnect")[0];
+    assert.equal(row.session_id, "real-thread");
+    assert.equal(row.session_key, replaced ? "replacement" : null);
+    assert.equal(row.channel, replaced ? 1 : 0);
+    if (!replaced) {
+      const next = await client(home, "reconnect", { MBX_CLI: "codex" });
+      try {
+        const rows = n.sessionsFor("reconnect");
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].session_id, "real-thread");
+        assert.ok(rows[0].session_key);
+        assert.notEqual(rows[0].session_key, original);
+      } finally { await next.c.close(); }
+    }
+  } finally { await c.close(); n.close(); }
+});
+
+test("MCP disconnect removes only its provisional binding", async () => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-close-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  const a = await client(home, "first", { MBX_CLI: "codex" });
+  const b = await client(home, "second", { MBX_CLI: "codex" });
+  try {
+    await a.c.close();
+    assert.equal(n.sessionsFor("first").length, 0);
+    assert.equal(n.sessionsFor("second").length, 1);
+    assert.equal((await b.c.callTool({ name: "mbx_whoami", arguments: {} })).isError, undefined);
+  } finally { await a.c.close(); await b.c.close(); n.close(); }
+});
