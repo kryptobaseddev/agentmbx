@@ -190,10 +190,14 @@ export class MbxNode {
    * A session that sends as another name through the CLI (`--as mac-dev` from inside session `claude`) owns that name
    * too: mail to it shows in the session's notices and wakes the session.
    */
-  linkIdentity(name: string, sessionAgent: string) { if (name !== sessionAgent) this.store.set(`ident:${name}`, sessionAgent); }
+  linkIdentity(name: string, sessionAgent: string) { if (name !== sessionAgent && !this.hasSessions(name)) this.store.set(`ident:${name}`, sessionAgent); }
+  /** A name some CLI session has bound (hook or MCP): its own identity, never linkable to another session. */
+  hasSessions(name: string): boolean { return !!this.store.db.prepare("SELECT 1 FROM sessions WHERE agent=? LIMIT 1").get(name); }
   /** Names linked to this session agent (see linkIdentity). */
   linkedNames(sessionAgent: string): string[] {
-    return (this.store.db.prepare("SELECT k FROM kv WHERE k LIKE 'ident:%' AND v=?").all(sessionAgent) as { k: string }[]).map((r) => r.k.slice(6));
+    // only shell-only names: a link to a name that sessions bind (made before this rule) is ignored
+    return (this.store.db.prepare("SELECT k FROM kv WHERE k LIKE 'ident:%' AND v=?").all(sessionAgent) as { k: string }[]).map((r) => r.k.slice(6))
+      .filter((n) => !this.hasSessions(n));
   }
   /** The session agent a linked name belongs to, if any. */
   identityOwner(name: string): string | null { return this.store.get(`ident:${name}`) ?? null; }

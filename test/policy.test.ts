@@ -310,3 +310,16 @@ test("schema version: an older server refuses clearly instead of failing on SQL"
   assert.throws(() => n.store.assertCurrent("0.3.1"), /Restart your CLI session/);
   n.close();
 });
+
+test("identity links: a session can't link (or read through a link) a name that sessions bind", () => {
+  const n = new MbxNode(tmp(), { host: "alpha" });
+  n.bindSession({ agent: "kimi-home-mbx", cli: "kimi", session_id: "k1", pid: 999_999, session_key: "k" });
+  n.linkIdentity("kimi-home-mbx", "vidapeps-lead");
+  assert.equal(n.identityOwner("kimi-home-mbx"), null);
+  n.store.set("ident:kimi-home-mbx", "vidapeps-lead"); // a link from before the rule
+  assert.deepEqual(n.linkedNames("vidapeps-lead"), []);
+  const id = n.send({ from: "codex", to: ["kimi-home-mbx"], subject: "s", body: "b" }).envelope.id;
+  assert.throws(() => n.read(id, "vidapeps-lead"), /no message/);
+  n.linkIdentity("shell-only", "vidapeps-lead"); assert.deepEqual(n.linkedNames("vidapeps-lead"), ["shell-only"]);
+  n.close();
+});
