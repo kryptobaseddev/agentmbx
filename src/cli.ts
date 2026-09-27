@@ -36,6 +36,7 @@ Messages
   agentmbx inbox --as <agent> [--all] [--json] [--needs-reply] [--from <agent>]      agentmbx read <id> --as <agent>      agentmbx ack <id>… | --all | --thread <id>  --as <agent> [--note "…"]
   agentmbx whoami --as <agent> [--role r] [--description "…"]    register/describe yourself (shell sessions)
   agentmbx thread <id>        agentmbx search "<words>"   agentmbx agents   agentmbx status
+  agentmbx status --cli <provider> --session <id> --json   current session identity and mailbox counts (read-only)
 
 Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …' line it prints on the other)
   agentmbx init [--host <name>] [--port 7373]       agentmbx discover            (hosts on the LAN, via mDNS)
@@ -207,6 +208,25 @@ async function run(argv: string[]) {
       return node.agents().forEach((a) => console.log(`${a.name}@${a.host}\t${a.host === node.host ? (live.has(a.name) ? "live" : "offline") : "remote"}\t${a.role ?? ""}\t${a.cli ?? ""}\t${a.last_seen ?? ""}\t${a.description ?? ""}`));
     }
     case "status": {
+      const sid = str("session");
+      if (sid) {
+        const cli = str("cli") ?? die("status --session requires --cli <provider>");
+        const s = node.store.db.prepare("SELECT agent, pid, pid_start, updated_at FROM sessions WHERE cli=? AND session_id=?")
+          .get(cli, sid) as { agent: string; pid: number | null; pid_start: string | null; updated_at: string } | undefined;
+        if (!s?.pid || !node.sameSession(s.pid, s)) return die("no live bound session for this provider and session id");
+        const agent = node.agentFor(cli, s.pid) ?? s.agent;
+        const mailboxes = [agent, ...node.linkedNames(agent)];
+        const counts = mailboxes.map((name) => node.store.db.prepare(`SELECT count(*) unread,
+          coalesce(sum(json_extract(m.envelope, '$.needs_reply') = 1), 0) needs_reply,
+          coalesce(sum(json_extract(m.authority, '$.ok') = 1), 0) owner_authority
+          FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state <> 'acked'`).get(name) as
+          { unread: number; needs_reply: number; owner_authority: number });
+        const out = { agent, host: node.host, address: `${agent}@${node.host}`, cli, session_id: sid, mailboxes,
+          unread: counts.reduce((sum, c) => sum + c.unread, 0), needs_reply: counts.reduce((sum, c) => sum + c.needs_reply, 0),
+          owner_authority: counts.reduce((sum, c) => sum + c.owner_authority, 0),
+          outbox: (node.store.db.prepare("SELECT count(*) n FROM outbox").get() as { n: number }).n };
+        return console.log(o.json ? JSON.stringify(out) : `${out.address}: ${out.unread} unread · ${out.needs_reply} needs reply · ${out.owner_authority} owner · ${out.outbox} outbox`);
+      }
       const q = (sql: string) => (node.store.db.prepare(sql).get() as { n: number }).n;
       console.log(`host ${node.host} (${fingerprint(node.key.publicKey)})  owner ${node.ownerPub ? fingerprint(node.ownerPub) : "none"}
 messages ${q("SELECT count(*) n FROM messages")}  unacked ${q("SELECT count(*) n FROM deliveries WHERE state <> 'acked'")}  outbox ${q("SELECT count(*) n FROM outbox")}
