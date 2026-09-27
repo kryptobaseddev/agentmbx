@@ -204,9 +204,40 @@ export class MbxNode {
 
   /** After a rename, mail for the old name follows the session (until a live session takes the old name again). */
   addAlias(oldName: string, newName: string, pid: number) {
-    if (oldName === newName || this.inUseElsewhere(oldName, pid)) return;
-    this.store.set(`alias:${oldName}`, newName);
-    this.store.audit("agent.renamed", { from: oldName, to: newName });
+    if (oldName === newName) return;
+    this.store.tx(() => {
+      if (this.inUseElsewhere(newName, pid)) throw Object.assign(new Error(`agent name ${newName} is in use; choose another name`), { code: "NAME_IN_USE" });
+      if (this.inUseElsewhere(oldName, pid)) return;
+      const db = this.store.db;
+      // A routing alias alone is not proof that this process owns the old mailbox. Only transfer mail
+      // when a live binding matches the process birth identity; shared or historical names stay untouched.
+      const owned = (db.prepare("SELECT cli,session_id,session_key,pid_start,updated_at FROM sessions WHERE agent=? AND pid=?")
+        .all(oldName, pid) as { cli: string; session_id: string; session_key: string | null; pid_start: string | null; updated_at: string }[])
+        .filter((s) => this.sameSession(pid, s, { proof: true }));
+      // Hosted providers can run multiple sessions in one process. A shared PID alone must not join
+      // two different MCP session keys or let a rename enter another live mailbox on that process.
+      if (new Set(owned.map((s) => s.session_key).filter(Boolean)).size > 1) return;
+      if (owned.length) {
+        if (this.inUseElsewhere(newName, -1)) throw Object.assign(new Error(`agent name ${newName} is in use; choose another name`), { code: "NAME_IN_USE" });
+        const pending = db.prepare("SELECT msg_id,state,updated_at,note FROM deliveries WHERE agent=? AND state <> 'acked'").all(oldName) as
+          { msg_id: string; state: DeliveryState; updated_at: string; note: string | null }[];
+        for (const row of pending) {
+          db.prepare("INSERT OR IGNORE INTO deliveries (msg_id,agent,state,updated_at,note) VALUES (?,?,?,?,?)")
+            .run(row.msg_id, newName, row.state, row.updated_at, row.note);
+          // An envelope may already target both names. Merge forward, never resurrect an acked delivery.
+          this.store.setDelivery(row.msg_id, newName, row.state, row.note);
+        }
+        db.prepare("DELETE FROM deliveries WHERE agent=? AND state <> 'acked'").run(oldName);
+        for (const s of owned) {
+          db.prepare("UPDATE sessions SET agent=? WHERE cli=? AND session_id=?").run(newName, s.cli, s.session_id);
+          this.keepName(s.cli, s.session_id, newName);
+        }
+        db.prepare("UPDATE kv SET v=? WHERE k LIKE 'ident:%' AND v=?").run(newName, oldName);
+      }
+      db.prepare("DELETE FROM kv WHERE k=?").run(`alias:${newName}`);
+      this.store.set(`alias:${oldName}`, newName);
+      this.store.audit("agent.renamed", { from: oldName, to: newName });
+    });
   }
 
   resolveAlias(name: string): string {

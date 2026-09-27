@@ -72,3 +72,22 @@ test("channel mode: a new request pushes a notifications/claude/channel wake wit
   assert.equal(p.meta.count, "1");
   n.close(); await c.close();
 });
+
+test("MCP rename keeps pending mail reachable and ackable under the new name", async () => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-mcp-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  const { c } = await client(home, "before");
+  try {
+    const id = n.send({ from: "sender", to: ["before"], subject: "before rename", body: "original body" }).envelope.id;
+    const who = (await c.callTool({ name: "mbx_whoami", arguments: { name: "after" } })).structuredContent as { agent: string; unread: number };
+    assert.equal(who.agent, "after");
+    assert.equal(who.unread, 1);
+    assert.match(textOf(await c.callTool({ name: "mbx_inbox", arguments: {} })), /before rename/);
+    assert.match(textOf(await c.callTool({ name: "mbx_read", arguments: { ids: [id] } })), /original body/);
+    const reply = await c.callTool({ name: "mbx_reply", arguments: { id, body: "processed under new name" } });
+    assert.equal(reply.isError, undefined);
+    assert.match(textOf(await c.callTool({ name: "mbx_ack", arguments: { ids: [id] } })), /Acked/);
+    assert.match(textOf(await c.callTool({ name: "mbx_inbox", arguments: {} })), /No unread/);
+    assert.equal(n.unreadCount("before"), 0);
+  } finally { await c.close(); n.close(); }
+});
