@@ -10,6 +10,7 @@ import { canonical, fingerprint, signData } from "../src/crypto.ts";
 import { pairWith, pullPolicies, pushPolicy, startServer } from "../src/http.ts";
 import { formatFor, MbxNode } from "../src/node.ts";
 import { createOwnerKey, unlockOwnerKey } from "../src/owner.ts";
+import { SCHEMA_VERSION } from "../src/store.ts";
 import {
   acceptSigned, activePolicies, delegationNote, dueReminders, effectivePolicy, hasClass, issueSigned, makeDevice, makePolicy, makeRevocation, parseTtl, policyLine, policySummary,
   type AnyRecord, type PolicyRecord,
@@ -298,5 +299,14 @@ test("a new session never takes a live or recently used shell name; CLI names li
   n.linkIdentity("mac-dev", "agentmbx");
   assert.deepEqual(n.linkedNames("agentmbx"), ["mac-dev"]);
   assert.equal(n.identityOwner("mac-dev"), "agentmbx");
+  n.close();
+});
+
+test("schema version: an older server refuses clearly instead of failing on SQL", () => {
+  const n = new MbxNode(tmp(), { host: "alpha" });
+  assert.equal(n.store.schemaVersion(), SCHEMA_VERSION);
+  n.store.assertCurrent("test");
+  n.store.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`);
+  assert.throws(() => n.store.assertCurrent("0.3.1"), /Restart your CLI session/);
   n.close();
 });

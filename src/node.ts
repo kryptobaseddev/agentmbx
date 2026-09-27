@@ -216,7 +216,7 @@ export class MbxNode {
     const q = (sql: string, ...a: (string | null)[]) => (this.store.db.prepare(sql).get(...a) as { n: number }).n;
     if (thread && q("SELECT count(*) n FROM wakes WHERE agent=? AND thread=? AND at>?", agent, thread, new Date(now - 3_600_000).toISOString()) >= WAKE_LIMITS.perThreadHour) return false;
     if (q("SELECT count(*) n FROM wakes WHERE agent=? AND at>?", agent, new Date(now - 86_400_000).toISOString()) >= WAKE_LIMITS.perAgentDay) return false;
-    this.store.db.prepare("INSERT INTO wakes VALUES (?,?,?)").run(agent, thread, new Date(now).toISOString());
+    this.store.db.prepare("INSERT INTO wakes (agent,thread,at) VALUES (?,?,?)").run(agent, thread, new Date(now).toISOString());
     return true;
   }
 
@@ -516,7 +516,7 @@ export class MbxNode {
     if (q("SELECT count(*) n FROM wakes WHERE agent=? AND at>?", agent, since(WAKE_LIMITS.perAgentSeconds * 1000))) return "batched (woke recently)";
     if (thread && q("SELECT count(*) n FROM wakes WHERE agent=? AND thread=? AND at>?", agent, thread, since(3_600_000)) >= WAKE_LIMITS.perThreadHour) return "thread wake cap reached";
     if (q("SELECT count(*) n FROM wakes WHERE agent=? AND at>?", agent, since(86_400_000)) >= WAKE_LIMITS.perAgentDay) return "daily wake cap reached";
-    this.store.db.prepare("INSERT INTO wakes VALUES (?,?,?)").run(agent, thread, new Date(now).toISOString());
+    this.store.db.prepare("INSERT INTO wakes (agent,thread,at) VALUES (?,?,?)").run(agent, thread, new Date(now).toISOString());
     return null;
   }
 }

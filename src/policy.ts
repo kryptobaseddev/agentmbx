@@ -111,7 +111,7 @@ export function acceptSigned(db: DatabaseSync, s: Signed<AnyRecord>, host: strin
       ? db.prepare("UPDATE policies SET revoked=1 WHERE revoked=0 AND owner_fp=? AND iat <= ?").run(r.owner_fp, r.iat).changes
       : db.prepare("UPDATE policies SET revoked=1 WHERE id=? AND owner_fp=?").run(r.target, r.owner_fp).changes;
     db.prepare("INSERT OR IGNORE INTO policy_revocations (id,target,iat,record,sig,received_at,owner_fp) VALUES (?,?,?,?,?,?,?)").run(r.id, r.target, r.iat, JSON.stringify(r), s.sig, now, r.owner_fp);
-    db.prepare("INSERT INTO audit VALUES (?,?,?)").run(now, "policy.revoked", JSON.stringify({ target: r.target, owner: r.owner_fp, count: n }));
+    db.prepare("INSERT INTO audit (at,event,detail) VALUES (?,?,?)").run(now, "policy.revoked", JSON.stringify({ target: r.target, owner: r.owner_fp, count: n }));
     return null;
   }
   const key = ownerKeys(db).find((k) => fingerprint(k) === s?.rec?.owner_fp);
@@ -147,7 +147,7 @@ function acceptDevice(db: DatabaseSync, s: Signed<DeviceRecord>, host: string, o
   const current = db.prepare("SELECT fp FROM principals WHERE role='owner'").get() as { fp: string } | undefined;
   if (current) return `this host already has an owner (key ${current.fp}); unpair that owner's machine first to change it`;
   db.prepare("UPDATE principals SET role='owner', via=? WHERE fp=?").run(`device:${r.id}`, r.owner_fp);
-  db.prepare("INSERT INTO audit VALUES (?,?,?)").run(now, "principal.owner_adopted", JSON.stringify({ owner: r.owner_fp, device: r.id }));
+  db.prepare("INSERT INTO audit (at,event,detail) VALUES (?,?,?)").run(now, "principal.owner_adopted", JSON.stringify({ owner: r.owner_fp, device: r.id }));
   return null;
 }
 
@@ -252,7 +252,7 @@ export function dueReminders(db: DatabaseSync, withinMs = 48 * H, now = new Date
   const out: PolicyRecord[] = [];
   for (const r of rows) {
     if (db.prepare("SELECT 1 FROM kv WHERE k=?").get(`reminded:${r.id}`)) continue;
-    db.prepare("INSERT INTO kv VALUES (?,?) ON CONFLICT(k) DO NOTHING").run(`reminded:${r.id}`, now.toISOString());
+    db.prepare("INSERT INTO kv (k,v) VALUES (?,?) ON CONFLICT(k) DO NOTHING").run(`reminded:${r.id}`, now.toISOString());
     out.push(JSON.parse(r.record) as PolicyRecord);
   }
   return out;

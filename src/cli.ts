@@ -420,7 +420,7 @@ async function owner(node: MbxNode, pos: string[], str: (k: string) => string | 
     const unsigned = buildGrant(ownerPub, s.session_key!, agent, node.host, caps, hours);
     const summary = `Grant OWNER authority to:\n  agent ${agent}@${node.host}  (${s.cli}, pid ${s.pid}, ${s.cwd})\n  session key ${fingerprint(s.session_key!)}\n  caps ${unsigned.caps.join(", ")}  for ${hours} h\nOnly that running session can use it; it ends when the session ends.`;
     const g: Grant = { ...unsigned, sig: (await ownerSignCanonical(node.home, grantPayload(unsigned), summary)).sig };
-    node.store.db.prepare("INSERT INTO grants VALUES (?,?,?,?,0)").run(g.id, g.sub, JSON.stringify(g), g.exp);
+    node.store.db.prepare("INSERT INTO grants (id,sub,grant,exp,revoked) VALUES (?,?,?,?,0)").run(g.id, g.sub, JSON.stringify(g), g.exp);
     node.store.audit("owner.grant", { id: g.id, agent, session: fingerprint(s.session_key!), caps, exp: g.exp });
     return console.log(`granted ${g.id} (expires ${g.exp})`);
   }

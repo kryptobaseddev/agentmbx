@@ -122,6 +122,10 @@ export async function runMcp(node = new MbxNode()) {
     instructions: extra ? `${INSTRUCTIONS}\n${extra}` : INSTRUCTIONS,
     capabilities: env.channel ? { experimental: { "claude/channel": {} } } : {},
   });
+  // every tool first checks that a newer agentmbx hasn't upgraded the store under this long-running server
+  const register = server.registerTool.bind(server) as (...a: unknown[]) => unknown;
+  (server as { registerTool: unknown }).registerTool = (name: string, config: unknown, cb: (...a: unknown[]) => unknown) =>
+    register(name, config, (...a: unknown[]) => { node.store.assertCurrent(version()); return cb(...a); });
 
   server.registerTool("mbx_whoami", {
     title: "Who am I on mbx",
