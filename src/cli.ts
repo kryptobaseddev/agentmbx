@@ -542,11 +542,18 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
     return;
   }
   const cwd = (input.cwd as string) || process.cwd();
-  const sid = (input.session_id ?? input.sessionId ?? input.thread_id) as string | undefined;
+  const rawSid = input.session_id ?? input.sessionId ?? input.thread_id;
+  const sid = typeof rawSid === "string" && rawSid.trim() ? rawSid : undefined;
   // the name this process's MCP server uses wins (it may have been renamed), so notices and wakes use one mailbox
   let agent = node.agentFor(cli, process.ppid) ?? ((sid && node.store.get(`name:${cli}:${sid}`))
     || (event === "session-start" ? node.pickName(agentName(cwd, cli), cli, process.ppid, sid) : agentName(cwd, cli)));
   const delegated = () => activePolicies(node.store.db, agent, node.host).length > 0;
+  // A startup hook can be missed when integration is installed mid-session. The prompt payload
+  // supplies the real ID again, so recover/refresh the binding without discovering a guessed ID.
+  if (event === "prompt" && sid) {
+    agent = node.bindSession({ agent, cli, session_id: sid, cwd, pid: process.ppid });
+    node.registerAgent(agent, { cli });
+  }
   if (event === "session-start") {
     let id = sid;
     if (!id && cli === "opencode") id = (await opencodeSessionFor(cwd)) ?? undefined;

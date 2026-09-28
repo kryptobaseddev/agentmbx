@@ -45,3 +45,45 @@ test("Claude post-tool hook surfaces arrivals once, including linked names and e
     assert.match(run(), /1 unread mbx message/);
   } finally { n.close(); }
 });
+
+for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} prompt recovers missed startup and preserves MCP identity`, () => {
+  const n = new MbxNode(mkdtempSync(join(tmpdir(), "mbx-prompt-bind-")), { host: "alpha" });
+  try {
+    n.bindSession({ agent: "chosen", cli, session_id: "mcp-placeholder", pid: process.pid, session_key: "key" });
+    const run = (sid: unknown) => spawnSync(process.execPath, ["bin/agentmbx.js", "hook", "prompt", "--cli", cli], {
+      input: JSON.stringify({ session_id: sid, cwd: "/work" }), encoding: "utf8",
+      env: { ...process.env, MBX_HOME: n.home, AGENTMBX_DEV: "1" },
+    });
+    const first = run("real-session");
+    assert.equal(first.status, 0, first.stderr);
+    const rows = n.sessionsFor("chosen");
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].session_id, "real-session");
+    assert.equal(rows[0].session_key, "key");
+    n.store.db.prepare("UPDATE sessions SET updated_at='2000-01-01T00:00:00Z'").run();
+    const refresh = run("real-session");
+    assert.equal(refresh.status, 0, refresh.stderr);
+    assert.notEqual(n.sessionsFor("chosen")[0].updated_at, "2000-01-01T00:00:00Z");
+    for (const missing of [undefined]) {
+      const before = n.store.db.prepare("SELECT * FROM sessions").all();
+      const result = run(missing);
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before, "no guessed session ID");
+    }
+  } finally { n.close(); }
+});
+
+
+test("prompt hooks ignore nonstring and empty session IDs", () => {
+  const n = new MbxNode(mkdtempSync(join(tmpdir(), "mbx-prompt-invalid-")), { host: "alpha" });
+  try {
+    for (const sid of [null, "", 42, {}]) {
+      const r = spawnSync(process.execPath, ["bin/agentmbx.js", "hook", "prompt", "--cli", "kimi"], {
+        input: JSON.stringify({ session_id: sid }), encoding: "utf8",
+        env: { ...process.env, MBX_HOME: n.home, AGENTMBX_DEV: "1" },
+      });
+      assert.equal(r.status, 0, r.stderr);
+      assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), []);
+    }
+  } finally { n.close(); }
+});
