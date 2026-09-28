@@ -20,6 +20,14 @@ const UNKNOWN_PROCESS: ProcessEvidence = { alive: null, start: null };
 const EVIDENCE_MAX_AGE_MS = 5000;
 const error = (code: string, message: string) => Object.assign(new Error(message), { code });
 
+/** A point-in-time assessment, not authority to claim or operate as this holder. */
+export function identityLeaseStatus(row: IdentityLease, now: number, p: ProcessEvidence): { state: "live" | "unknown" | "expired"; reason: string | null } {
+  if (row.released_at !== null) return { state: "expired", reason: null };
+  const reason = now - row.heartbeat_at >= row.idle_ttl ? "idle"
+    : p.alive === false ? "dead" : p.start && p.start !== row.holder_start ? "pid-reused" : null;
+  return { state: reason ? "expired" : p.alive === true && p.start === row.holder_start ? "live" : "unknown", reason };
+}
+
 /** Missing ps data is unknown, not evidence that a process died. */
 export function inspectLeaseProcess(pid: number): ProcessEvidence {
   let alive: boolean | null = true;
@@ -116,10 +124,7 @@ export class IdentityLeases {
       && observed.row.holder_start === row.holder_start && performance.now() - observed.at <= EVIDENCE_MAX_AGE_MS ? observed.process : UNKNOWN_PROCESS;
   }
   private status(row: IdentityLease, now: number, p: ProcessEvidence): { state: "live" | "unknown" | "expired"; reason: string | null } {
-    if (row.released_at !== null) return { state: "expired", reason: null };
-    const reason = now - row.heartbeat_at >= row.idle_ttl ? "idle"
-      : p.alive === false ? "dead" : p.start && p.start !== row.holder_start ? "pid-reused" : null;
-    return { state: reason ? "expired" : p.alive === true && p.start === row.holder_start ? "live" : "unknown", reason };
+    return identityLeaseStatus(row, now, p);
   }
   private expire(row: IdentityLease, now: number, p: ProcessEvidence): "live" | "unknown" | "expired" {
     const { state, reason } = this.status(row, now, p);

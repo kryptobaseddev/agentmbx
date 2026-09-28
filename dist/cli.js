@@ -21,6 +21,7 @@ import { CLIS, defaultHostName, defaultWhich, formatRows, ownerStep, resolveComm
 import { dispatchWakes, inboxCommand, macNotifierPath, notifyDesktop, opencodeService, opencodeSessionFor } from "./wake.js";
 import { kimiHostedServer } from "./kimi-web.js";
 import { approveKimi, decidePermission, opencodePermissionPass } from "./permission.js";
+import { listIdentityStatus } from "./identity-status.js";
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
 
 Start here
@@ -35,6 +36,7 @@ Messages
   agentmbx whoami --as <agent> [--role r] [--description "…"]    register/describe yourself (shell sessions)
   agentmbx thread <id>        agentmbx search "<words>"   agentmbx agents   agentmbx status
   agentmbx status --cli <provider> --session <id> --json   current session identity and mailbox counts (read-only)
+  agentmbx identity list [--json]               inspect local identity holders, unread counts and recovery status (read-only)
 
 Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …' line it prints on the other)
   agentmbx init [--host <name>] [--port 7373]       agentmbx discover            (hosts on the LAN, via mDNS)
@@ -160,6 +162,19 @@ async function run(argv) {
     }
     if (cmd === "notify-test")
         return notifyTest(str("as") ?? process.env.MBX_AGENT ?? "notify-test");
+    if (cmd === "identity") {
+        if (pos.length !== 1 || pos[0] !== "list")
+            die("identity list [--json]");
+        const result = listIdentityStatus(defaultHome());
+        if (o.json)
+            return console.log(JSON.stringify(result, null, 2));
+        console.log(`Identities on ${result.host} (advisory snapshot; claims recheck ownership)`);
+        if (!result.identities.length)
+            console.log("No local identities.");
+        for (const row of result.identities)
+            console.log(`${row.name}\t${row.state}\t${row.unread} unread\t${row.last_activity ?? "no activity"}\t${row.reason}`);
+        return;
+    }
     const node = new MbxNode();
     // Inside an agent session (a hook-bound or MCP-bound CLI up the process tree) the session's own name is the default,
     // and a name held by ANOTHER live session can't be claimed from here. A human terminal may use any --as.
