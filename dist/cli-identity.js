@@ -62,7 +62,7 @@ function withIdentity(node, selection, descriptors, operation) {
     }
     // --as must not pick a different hosted session merely because it shares a provider parent.
     if (candidates.size !== 1)
-        throw Object.assign(refused(candidates.size ? "ambiguous provider sessions: specify --cli and --session" : "no current identity lease belongs to this caller; claim through the provider session first"), { code: candidates.size ? "IDENTITY_LEASE_REQUIRED" : "IDENTITY_NO_CALLER_LEASE" });
+        throw Object.assign(refused(candidates.size ? "ambiguous provider sessions: specify --cli and --session" : "no current identity lease belongs to this caller. Run mailbox commands inside the provider session that holds the lease (your agent session, through its mbx tools); inspect holders with `agentmbx identity list`. The owner can replace a live holder with `agentmbx identity takeover <name> --force --cli <provider> --session <id>`"), { code: candidates.size ? "IDENTITY_LEASE_REQUIRED" : "IDENTITY_NO_CALLER_LEASE" });
     const { descriptor, token, proof } = [...candidates.values()][0];
     const [name, host, extra] = selection.as?.split("@") ?? [descriptor.agent];
     if (name !== descriptor.agent || (host !== undefined && host !== node.host) || extra !== undefined)
