@@ -8,6 +8,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { Store, SCHEMA_VERSION } from "../src/store.ts";
 import { MbxNode } from "../src/node.ts";
+import { version } from "../src/version.ts";
+import { reloadFromDisk, storeMismatchCode } from "../src/mcp.ts";
 
 test("source SQL inserts specify columns for additive schema compatibility", () => {
   const root = join(import.meta.dirname, "../src");
@@ -127,4 +129,47 @@ for (const existed of [false, true]) test(`concurrent legacy initialization cann
     assert.equal(check.prepare("SELECT value FROM legacy_data").get()!.value, "preserve");
     assert.equal(check.prepare("SELECT name FROM sqlite_master WHERE name='identity_leases'").get(), undefined);
   } finally { check.close(); }
+});
+
+test("migration records the upgrading version and stale peers get accurate advice", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-upgrade-by-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const original = new MbxNode(home, { host: "alpha" });
+  original.store.db.exec("DROP TABLE identity_leases; DELETE FROM kv WHERE k='schema-upgraded-by'; PRAGMA user_version=1");
+  original.close();
+  const migrated = new Store(home, { allowIdentityMigration: true });
+  try {
+    assert.equal(migrated.schemaVersion(), SCHEMA_VERSION);
+    assert.equal(migrated.upgradedBy(), version());
+    migrated.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`);
+    assert.throws(() => migrated.assertCurrent("0.3.1"), (e: Error) => {
+      assert.match(e.message, new RegExp(`upgraded by agentmbx ${version()}`));
+      assert.match(e.message, /Update AgentMBX/);
+      assert.match(e.message, /mail is preserved/i);
+      return true;
+    });
+    // a session running the very build that recorded the upgrade is told to restart, not to update
+    migrated.db.prepare("UPDATE kv SET v=? WHERE k='schema-upgraded-by'").run("0.3.1");
+    assert.throws(() => migrated.assertCurrent("0.3.1"), (e: Error) => {
+      assert.match(e.message, /already running/);
+      assert.match(e.message, /Restart your CLI session/);
+      assert.doesNotMatch(e.message, /Update AgentMBX/);
+      return true;
+    });
+  } finally { migrated.close(); }
+});
+
+test("MCP self-reload fires only for store mismatches and only once", () => {
+  assert.equal(storeMismatchCode(Object.assign(new Error("x"), { code: "STALE_SERVER" })), "STALE_SERVER");
+  assert.equal(storeMismatchCode(Object.assign(new Error("x"), { code: "IDENTITY_MIGRATION_REQUIRED" })), "IDENTITY_MIGRATION_REQUIRED");
+  assert.equal(storeMismatchCode(new Error("boom")), null);
+  assert.equal(storeMismatchCode({ code: 42 }), null);
+  const had = process.env.MBX_MCP_REEXEC;
+  process.env.MBX_MCP_REEXEC = "1";
+  try {
+    reloadFromDisk(Object.assign(new Error("x"), { code: "STALE_SERVER" })); // guard set: returns without spawning
+    reloadFromDisk(new Error("unrelated")); // not a mismatch: returns without spawning
+  } finally {
+    if (had === undefined) delete process.env.MBX_MCP_REEXEC; else process.env.MBX_MCP_REEXEC = had;
+  }
 });
