@@ -82,26 +82,37 @@ const EXIT = { USAGE: 2, NOT_FOUND: 3, AMBIGUOUS: 4 } as const;
 
 /** Help lines for one command (`agentmbx <cmd> --help`). */
 function commandHelp(cmd: string): string {
-  const lines = HELP.split("\n").filter((l) => new RegExp(`agentmbx ${cmd}(\\s|$)`).test(l));
-  return lines.length ? lines.map((l) => l.trim()).join("\n") : HELP;
+  const lines: string[] = [];
+  let include = false;
+  for (const line of HELP.split("\n")) {
+    if (line.includes("agentmbx ")) include = line.includes(`agentmbx ${cmd} `) || line.endsWith(`agentmbx ${cmd}`);
+    else if (!/^\s+\S/.test(line)) include = false;
+    if (include) lines.push(line.trim());
+  }
+  return lines.length ? lines.join("\n") : HELP;
+}
+
+/** Stable exit codes and one-line diagnostics for both single and batch commands. */
+function cliError(e: unknown, cmd: string): number {
+  const err = e as Error & { code?: string };
+  const usage = err.code === "USAGE_ERROR" || err.code === "ERR_PARSE_ARGS_UNKNOWN_OPTION" || err.code === "ERR_PARSE_ARGS_INVALID_OPTION_VALUE" || err.code === "ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL";
+  const code = usage ? EXIT.USAGE : err.code === "AMBIGUOUS_RECIPIENT" ? EXIT.AMBIGUOUS : (EXIT as Record<string, number>)[err.code ?? ""] ?? 1;
+  const hint = code === EXIT.USAGE || code === EXIT.NOT_FOUND || code === EXIT.AMBIGUOUS ? ` (see: agentmbx ${cmd} --help)` : "";
+  process.stderr.write(`agentmbx: ${err.message.replace(/\. To specify a positional argument.*$/s, "")}${hint}`.replace(/\s+/g, " ") + "\n");
+  if (process.env.MBX_DEBUG) process.stderr.write(`${err.stack}\n`);
+  return code;
 }
 
 export async function main(argv = process.argv.slice(2)) {
   try { await run(argv); }
-  catch (e) {
-    const err = e as Error & { code?: string };
-    const usage = err.code === "ERR_PARSE_ARGS_UNKNOWN_OPTION" || err.code === "ERR_PARSE_ARGS_INVALID_OPTION_VALUE" || err.code === "ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL";
-    process.stderr.write(`agentmbx: ${err.message.replace(/\. To specify a positional argument.*$/s, "")}${usage ? ` (see: agentmbx ${argv[0] ?? ""} --help)` : ""}\n`);
-    if (process.env.MBX_DEBUG) process.stderr.write(`${err.stack}\n`);
-    process.exitCode = usage ? EXIT.USAGE : (EXIT as Record<string, number>)[err.code ?? ""] ?? 1;
-  }
+  catch (e) { process.exitCode = cliError(e, argv[0] ?? ""); }
 }
 
 async function run(argv: string[]) {
   const [cmd, ...rest] = argv;
   if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") return console.log(HELP);
-  if (rest.includes("--help") || rest.includes("-h")) return console.log(commandHelp(cmd));
   const { values: o, positionals: pos } = parseArgs({ args: rest, allowPositionals: true, strict: cmd !== "hook" && cmd !== "mcp", options: {
+    help: { type: "boolean", short: "h" },
     as: { type: "string" }, to: { type: "string" }, subject: { type: "string" }, m: { type: "string", short: "m" },
     "body-file": { type: "string" }, kind: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" },
     ref: { type: "string", multiple: true }, all: { type: "boolean" }, json: { type: "boolean" }, note: { type: "string" },
@@ -110,6 +121,7 @@ async function run(argv: string[]) {
     compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" },
     backend: { type: "string" }, "no-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
     project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" } } });
+  if (o.help) return console.log(commandHelp(cmd));
   const str = (k: string) => (typeof (o as Record<string, unknown>)[k] === "string" ? (o as Record<string, unknown>)[k] as string : undefined);
 
   if (cmd === "mcp") return runMcp();
@@ -181,12 +193,12 @@ async function run(argv: string[]) {
       if (o.all) ids = node.inbox(me, { limit: 5000 }).map((m) => m.id);
       else if (str("thread")) { const t = node.message(str("thread")!); ids = node.inbox(me, { limit: 5000 }).filter((m) => m.thread === (t?.thread ?? str("thread"))).map((m) => m.id); }
       if (!ids.length) die("ack <id>… | --all | --thread <id>");
-      let failed = 0;
+      let failureCode = 0;
       for (const id of ids) {
         try { console.log(`acked ${node.ack(id, me, str("note") ?? null, str("did"))}`); }
-        catch (e) { failed++; process.stderr.write(`agentmbx: ${(e as Error).message}\n`); }
+        catch (e) { failureCode = Math.max(failureCode, cliError(e, "ack")); }
       }
-      if (failed) process.exitCode = EXIT.NOT_FOUND;
+      if (failureCode) process.exitCode = failureCode;
       return;
     }
     case "thread": {
