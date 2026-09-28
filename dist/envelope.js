@@ -2,6 +2,8 @@
 import { canonical, fingerprint, nonce, sha256, signData, ulid, verifyData } from "./crypto.js";
 export const KINDS = ["message", "request", "reply", "status", "decision", "alert", "task"];
 export const MAX_BODY = 256 * 1024;
+// Saturating wire counter: this value means at least this many relay steps.
+export const MAX_RELAY_DEPTH = 1000;
 export const NAME_RE = /^[a-z0-9][a-z0-9-]{1,39}$/;
 export function parseMeta(body) {
     const uniq = (xs) => [...new Set(xs)];
@@ -65,7 +67,7 @@ export function checkShape(x) {
     }
     if (m?.sender_verification !== undefined && m.sender_verification !== "unverified" && m.sender_verification !== "leased")
         return "bad sender verification";
-    if (m?.hop !== undefined && !(Number.isInteger(m.hop) && m.hop >= 0 && m.hop <= 1000))
+    if (m?.hop !== undefined && !(Number.isInteger(m.hop) && m.hop >= 0 && m.hop <= MAX_RELAY_DEPTH))
         return "bad hop";
     if (m?.origin !== undefined && m.origin !== "agent" && m.origin !== "external")
         return "bad origin";
