@@ -54,7 +54,7 @@ Owner (each signature needs you: a Touch ID / password prompt on macOS with Agen
   agentmbx owner send --to <agents> --subject "…" -m "…" [--kind task] [--needs-reply]   one message signed by you (OWNER)
 
 Policy (what agents may do for each other; each change needs you, like the owner commands)
-  agentmbx policy set <agent[,agent]|*> <${LEVELS.join("|")}> [--from local,<host>|*] [--host <host,…>|*] [--project <dir>]… [--classes ${CLASSES.join(",")}] [--ttl 8h]
+  agentmbx policy set <agent[,agent]|*> <${LEVELS.join("|")}> [--from local,<host>,principal:<fp>|*] [--host <host,…>|*] [--project <dir>]… [--classes ${CLASSES.join(",")}] [--ttl 8h]
   agentmbx policy list [--json]      agentmbx policy renew <id> [--ttl 30d]      agentmbx policy revoke <id> | --all   (--all is the kill switch, sent to every paired host)
   agentmbx audit [--since 24h] [--json]      what agents did on peer requests, YOLO approvals, policy and owner changes
 

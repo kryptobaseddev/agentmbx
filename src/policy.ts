@@ -4,7 +4,7 @@ import { realpathSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { canonical, fingerprint, ulid, verifyData } from "./crypto.ts";
-import type { Envelope } from "./envelope.ts";
+import { verifyEnvelope, type Envelope } from "./envelope.ts";
 
 export const CLASSES = ["read", "edit", "outward", "permissions"] as const;
 export type PolicyClass = (typeof CLASSES)[number];
@@ -174,7 +174,19 @@ const ORDER = (l: Level) => LEVELS.indexOf(l);
 /** What the receiving agent may do for this message's sender. Downgrades apply even under yolo. */
 export function effectivePolicy(db: DatabaseSync, o: { agent: string; host: string; fromAgent: string; fromHost: string; envelope?: Envelope; now?: Date }): Effective {
   const isLocal = o.fromHost === o.host;
-  const hostOk = (h: string[]) => h.includes("*") || (isLocal ? h.includes("local") || h.includes(o.host) : h.includes(o.fromHost));
+  const principalOk = (selector: string): boolean => {
+    if (!/^principal:[a-f0-9]{4}(?:-[a-f0-9]{4}){3}$/.test(selector)) return false;
+    const fp = selector.slice("principal:".length);
+    if (isLocal) return ownerKeys(db).some(key => fingerprint(key) === fp);
+    // A retained principals row or a message's owner claim is not a current pairing. Recheck
+    // the envelope against the pinned host key so re-pairing cannot relabel old signed mail.
+    const peer = db.prepare("SELECT pubkey,owner_pubkey FROM peers WHERE host=? AND state='approved'").get(o.fromHost) as
+      { pubkey: string; owner_pubkey: string | null } | undefined;
+    const e = o.envelope;
+    return !!peer?.owner_pubkey && fingerprint(peer.owner_pubkey) === fp && !!e
+      && e.from === `${o.fromAgent}@${o.fromHost}` && e.sig?.host === o.fromHost && verifyEnvelope(e, peer.pubkey);
+  };
+  const hostOk = (h: string[]) => h.includes("*") || (isLocal ? h.includes("local") || h.includes(o.host) : h.includes(o.fromHost)) || h.some(principalOk);
   const ps = activePolicies(db, o.agent, o.host, o.now).filter((p) => matches(p.from.agents, o.fromAgent) && hostOk(p.from.hosts));
   const notes: string[] = [];
   if (!ps.length) return { level: "ask", classes: [], ids: [], exp: null, projects: [], grants: [], notes };

@@ -96,7 +96,13 @@ An Ed25519 key with two backends (docs/POLICY.md §6). Every owner signature goe
 - **`file` (Linux, or `--backend file`):** an Ed25519 key encrypted with a passphrase the owner chooses (scrypt N=2^17 → AES-256-GCM) and stored in `owner.key` (0600). It can only be unlocked by `mbx owner …` commands that read the passphrase from **`/dev/tty` with echo off**, and those commands refuse to run without a controlling terminal. Agent tool calls (Bash tools have no TTY) cannot use it. This proves someone knows the passphrase, not that a human is present.
 - An agent may *start* `owner init`, `owner grant` or `owner send` on macOS (setup does this for the owner step), but only the human can approve the prompt.
 
-### Devices and members (forward-compatible, not built yet; docs/POLICY.md §7)
+### Principals, devices and future members (T053)
+The principals table records the local owner and known paired owners. Device certification and owner adoption are implemented; member/guest enrollment records remain future work.
+
+A signed policy may select senders with `agentmbx policy set <recipient> <level> --from principal:<owner-fingerprint>`. The fingerprint is the existing lowercase four-group owner-key fingerprint. This selector applies to the owner of a host, not to a claim that a particular agent is a human or that an owner signed the message. Local senders match the receiving host's owner records. Remote senders require a currently approved pairing with that pinned owner key and an envelope whose sender and host signature verify under the current pinned host key. Unpaired or pending hosts, absent owner keys, unsigned legacy mail, tampered envelopes, and signatures from a replaced host key cannot match. Other sender-agent, recipient, expiry, revocation, project and relay limits still apply.
+
+The selector is stored in `from.hosts` for the v1 policy record format; it is not a new `from.principals` field. A principal-scoped permissions policy does not authorize a context-free provider permission prompt. Existing local/host/wildcard policy behavior is unchanged. AgentMBX does not create or sign such a policy automatically.
+
 - The owner key is the only principal identity. A second machine of the same owner does not get a second owner key: after pairing, the owner approves it once with an owner-signed `device` record `{v, type: "device", host, host_pub, owner_fp, iat}` (prompt: "Approve device <host> (host key <fp>) as one of your machines").
 - Another human is added with an owner-signed `member` record `{v, type: "member", role: "member"|"guest", label, owner_pub, owner_fp, iat}` (prompt: "Add <role> <label> (owner key <fp>) to your AgentMBX"). Policies may then name `principal:<fp>` in `from`.
 - Revocations are owner-signed `{v, type: "revocation", id, kind?: "grant"|"policy", revokes: [ids] | all: true, iat, owner_fp}`. `mbx owner revoke` already signs one for grants.
