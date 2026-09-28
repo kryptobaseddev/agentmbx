@@ -121,7 +121,7 @@ export function startRelayServer(core: RelayCore, port = 0, bind = "127.0.0.1"):
       }
       if (req.method === "POST" && url.pathname === "/v1/relay/enrol") {
         const j = JSON.parse(body) as { host?: string; pubkey?: string; owner_fp?: string; sig?: string };
-        if (!j.host || !j.pubkey || !j.owner_fp || !j.sig) return send(400, { error: "incomplete enrolment" });
+        if (!j.host || !j.pubkey || j.owner_fp === undefined || !j.sig) return send(400, { error: "incomplete enrolment" });
         try { core.enrol(j.host, j.pubkey, j.owner_fp, j.sig); byHost.set(j.host, core.enrolments.get(j.pubkey)!); return send(200, { ok: true }); }
         catch (e) { return send(401, { error: (e as Error).message }); }
       }

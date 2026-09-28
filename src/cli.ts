@@ -8,6 +8,7 @@ import { canonical, fingerprint, ulid } from "./crypto.ts";
 import { buildGrant, CAPS, grantPayload, type Envelope, type Grant } from "./envelope.ts";
 import { advertise, browse, lanIPv4 } from "./discovery.ts";
 import { flushOutbox, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.ts";
+import { relayDrainOutbox, relayFor, relayPull } from "./relay-client.ts";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.ts";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.ts";
 import { ancestors, withProcSnapshot } from "./proc.ts";
@@ -395,7 +396,11 @@ If the codes differ, do not approve: someone is in the middle.`);
       let busy = false;
       const tick = async () => {
         if (busy) return; busy = true;
-        try { await flushOutbox(node); await dispatchWakes(node); await opencodePermissionPass(node, yoloLookup(node), opencodeService); } catch (e) { process.stderr.write(`[mbx] ${(e as Error).message}\n`); } finally { busy = false; }
+        try {
+          await flushOutbox(node); await dispatchWakes(node); await opencodePermissionPass(node, yoloLookup(node), opencodeService);
+          const relay = relayFor(node);
+          if (relay) { await relayDrainOutbox(node, relay); await relayPull(node, relay); }
+        } catch (e) { process.stderr.write(`[mbx] ${(e as Error).message}\n`); } finally { busy = false; }
       };
       await startServer(node, node.config.port, node.config.bind, () => void tick());
       console.log(`[agentmbx] daemon for ${node.host} listening on ${node.config.bind}:${node.config.port}`);

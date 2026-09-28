@@ -8,6 +8,7 @@ import { canonical, fingerprint, ulid } from "./crypto.js";
 import { buildGrant, CAPS, grantPayload } from "./envelope.js";
 import { advertise, browse, lanIPv4 } from "./discovery.js";
 import { flushOutbox, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.js";
+import { relayDrainOutbox, relayFor, relayPull } from "./relay-client.js";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.js";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
 import { ancestors, withProcSnapshot } from "./proc.js";
@@ -466,6 +467,11 @@ If the codes differ, do not approve: someone is in the middle.`);
                     await flushOutbox(node);
                     await dispatchWakes(node);
                     await opencodePermissionPass(node, yoloLookup(node), opencodeService);
+                    const relay = relayFor(node);
+                    if (relay) {
+                        await relayDrainOutbox(node, relay);
+                        await relayPull(node, relay);
+                    }
                 }
                 catch (e) {
                     process.stderr.write(`[mbx] ${e.message}\n`);
