@@ -337,7 +337,7 @@ export async function runMcp(node = new MbxNode()) {
             throw new Error(`MCP handler ${name} must be synchronous to preserve its lease fence`);
         return register(name, config, (...a) => {
             node.store.assertCurrent(version());
-            const state = contextFor(a[1]), before = { agent: state.agent, leaseToken: state.leaseToken, released: state.released, parent: state.parent };
+            const state = contextFor(a[1]), before = { agent: state.agent, leaseToken: state.leaseToken, released: state.released, parent: state.parent, sessionId: state.sessionId };
             try {
                 // Recovery controls must remain callable after lease loss. Each mutation below performs
                 // its own generation check; ordinary tools still require the current holder's lease.
@@ -598,7 +598,8 @@ export async function runMcp(node = new MbxNode()) {
             node.store.assertCurrent(version());
             for (const state of [base, ...states.values()])
                 for (const request of pendingIdentityControls(node.store, fingerprint(state.key.publicKey))) {
-                    const before = { ...state };
+                    // Explicit optional fields restore undefined values added by a failed operation.
+                    const before = { agent: state.agent, leaseToken: state.leaseToken, released: state.released, parent: state.parent, sessionId: state.sessionId };
                     try {
                         const proof = inspectIdentityControlCaller(request.target, request.requester_pid, request.requester_start);
                         prepareState(state, request.name, () => {

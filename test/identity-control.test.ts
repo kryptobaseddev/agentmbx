@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -16,7 +16,9 @@ const command = (home: string, ...args: string[]) => spawnSync(process.execPath,
 
 for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI commands reach the existing MCP holder and retain exact receipts`, async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-control-")), node = new MbxNode(home, { host: "alpha" }), client = new Client({ name: cli, version: "test" });
-  const transport = new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
+  const preload = join(home, "heartbeat.mjs");
+  writeFileSync(preload, "const interval=globalThis.setInterval; globalThis.setInterval=(fn,ms,...args)=>interval(fn,ms===60000?50:ms,...args);");
+  const transport = new StdioClientTransport({ command: process.execPath, args: ["--import", preload, resolve("bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "reader", MBX_CLI: cli, AGENTMBX_DEV: "1" } as Record<string, string> });
   t.after(async () => { try { if (transport.pid) process.kill(transport.pid, "SIGCONT"); } catch {} await client.close(); node.close(); rmSync(home, { recursive: true, force: true }); });
   await client.connect(transport);
@@ -25,6 +27,22 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI comm
   const sid = node.store.db.prepare("SELECT session_id FROM sessions WHERE agent=? AND session_key IS NOT NULL").get(who.agent)!.session_id as string;
   const token = node.store.db.prepare("SELECT token FROM identity_leases WHERE name=?").get(who.agent)!.token as string;
   const message = node.send({ from: "sender", to: [who.agent], subject: "pending", body: "history" }).envelope.id;
+  // Fail after release mutates memory, while the enclosing database transaction can roll back.
+  node.store.db.exec(`CREATE TRIGGER reject_completed_identity_receipt BEFORE UPDATE ON kv
+    WHEN NEW.k GLOB 'identity-request:*' AND json_extract(NEW.v,'$.status')='completed'
+    BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END`);
+  const failedRelease = command(home, "release", "--cli", cli, "--session", sid);
+  assert.equal(failedRelease.status, 1, failedRelease.stderr + failedRelease.stdout);
+  assert.match(JSON.parse(failedRelease.stdout).error, /injected receipt failure/);
+  node.store.db.exec("DROP TRIGGER reject_completed_identity_receipt");
+  const rollbackLease = node.store.db.prepare("SELECT token,released_at,heartbeat_at FROM identity_leases WHERE name=?").get(who.agent)!;
+  assert.equal(rollbackLease.token, token); assert.equal(rollbackLease.released_at, null);
+  let heartbeat = rollbackLease.heartbeat_at;
+  for (let i = 0; i < 20 && heartbeat === rollbackLease.heartbeat_at; i++) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+    heartbeat = node.store.db.prepare("SELECT heartbeat_at FROM identity_leases WHERE name=?").get(who.agent)!.heartbeat_at;
+  }
+  assert.notEqual(heartbeat, rollbackLease.heartbeat_at, "rolled-back release must restore in-memory heartbeat eligibility");
   const released = command(home, "release", "--cli", cli, "--session", sid);
   assert.equal(released.status, 0, released.stderr + released.stdout);
   const releaseReceipt = JSON.parse(released.stdout);
