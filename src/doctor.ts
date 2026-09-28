@@ -19,6 +19,24 @@ export async function daemonAnswers(port: number, timeoutMs = 1500): Promise<boo
   try { await fetch(`http://127.0.0.1:${port}/v1/agents`, { signal: AbortSignal.timeout(timeoutMs) }); return true; } catch { return false; }
 }
 
+/** Binding evidence is separate from configuration and never proves end-to-end delivery. */
+export function sessionReadiness(node: MbxNode, cli: string): Check {
+  const rows = node.store.db.prepare("SELECT pid,pid_start,updated_at,session_id,channel FROM sessions WHERE cli=?").all(cli) as
+    { pid: number | null; pid_start: string | null; updated_at: string; session_id: string; channel: number }[];
+  const live = rows.filter((s) => s.pid && node.sameSession(s.pid, s, { proof: true }));
+  if (!rows.length) return { level: "info", label: `${cli}: no mailbox session bindings; receipt not tested` };
+  if (!live.length) return { level: "warn", label: `${cli}: no verified live mailbox binding (${rows.length} stale or unverified); receipt not tested`,
+    fix: "open a provider session and check its AgentMBX session-start hook" };
+  const real = live.filter((s) => !s.session_id.startsWith("mcp-")).length;
+  const channels = live.filter((s) => s.channel).length;
+  const stale = rows.length - live.length;
+  const onlyProvisional = !real && !channels;
+  return { level: onlyProvisional ? "warn" : "info",
+    label: `${cli}: ${live.length} verified live mailbox binding(s), ${real} real session ID(s), ${channels} channel binding(s)`
+      + (stale ? `, ${stale} stale or unverified` : "") + "; receipt not tested",
+    ...(onlyProvisional ? { fix: "run the provider session-start hook to bind its real session ID" } : {}) };
+}
+
 export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeoutMs?: number } = {}): Promise<Check[]> {
   const out: Check[] = [];
   const add = (level: Level, label: string, fix?: string) => out.push({ level, label, fix });
@@ -45,6 +63,10 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
       const what = kind === "mcp" ? "MCP server" : "hooks";
       add(ok ? "ok" : "fail", `${d.cli}: ${what} ${ok ? "wired" : "not wired"} (${e.map((x) => x.path.replace(ctx.home, "~")).join(", ")})`, ok ? undefined : `agentmbx setup --only ${d.cli}`);
     }
+  }
+
+  if (node) {
+    for (const d of detect(ctx).filter((d) => d.found)) out.push(sessionReadiness(node, d.cli));
   }
 
   const sk = skillStatus(ctx.home);
