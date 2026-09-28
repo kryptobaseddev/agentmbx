@@ -6,6 +6,8 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { bindWakeLease, delegateWake } from "./helpers/wake-lease.ts";
 import { MbxNode } from "../src/node.ts";
 import { dispatchWakes, wakeOpencode } from "../src/wake.ts";
@@ -112,4 +114,59 @@ test("daemon routes an actual MCP holder and refuses its stale binding after rel
   await dispatchWakes(n);
   assert.equal(readFileSync(log, "utf8"), threadId + "\n", "released binding never submits another prompt");
   assert.equal(n.unreadCount(agent), 2);
+});
+
+/** Minimal fake of the OpenCode service: directory lookup + synthetic admission with a valid T112 receipt. */
+function opencodeStub(t: { after: (fn: () => void | Promise<void>) => unknown }, directorySession: string | null) {
+  const calls: string[] = [];
+  const server: Server = createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://x");
+    if (url.pathname === "/api/session") { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ data: directorySession ? [{ id: directorySession }] : [] })); return; }
+    if (url.pathname === `/api/session/${directorySession}/synthetic` && req.method === "POST") {
+      let body = ""; req.on("data", (c) => body += c); req.on("end", () => {
+        calls.push(url.pathname);
+        const text = (JSON.parse(body) as { text?: string }).text ?? "";
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: { id: "msg_stub", sessionID: directorySession, type: "synthetic", delivery: "queue", payload: { text }, time: { created: Date.now() } } }));
+      });
+      return;
+    }
+    res.writeHead(404).end("{}");
+  });
+  t.after(async () => { await new Promise<void>((r) => server.close(() => r())); });
+  return { calls, listen: () => new Promise<string>((r) => server.listen(0, "127.0.0.1", () => r(`http://127.0.0.1:${(server.address() as AddressInfo).port}`))) };
+}
+
+test("MCP-bound opencode agents wake through the service directory fallback", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-wake-ocdir-")), n = new MbxNode(home, { host: "alpha" });
+  const stub = opencodeStub(t, "ses_resolved");
+  const old = { MBX_OPENCODE_URL: process.env.MBX_OPENCODE_URL, MBX_NO_DESKTOP: process.env.MBX_NO_DESKTOP };
+  Object.assign(process.env, { MBX_NO_DESKTOP: "1" });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true });
+    for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
+  process.env.MBX_OPENCODE_URL = await stub.listen();
+  bindWakeLease(n, { agent: "worker", cli: "opencode", session_id: "mcp-424242", pid: process.pid });
+  n.store.db.prepare("UPDATE sessions SET cwd=? WHERE agent='worker'").run("/projects/demo");
+  sendLeased(n, { from: "sender", to: ["worker"], subject: "wake", body: "private", kind: "request" });
+  assert.equal((await dispatchWakes(n))[0].result.ok, true);
+  assert.deepEqual(stub.calls, ["/api/session/ses_resolved/synthetic"], "the mcp- binding woke the service session for its directory");
+  const d = n.store.db.prepare("SELECT state, note FROM deliveries WHERE agent='worker'").get() as { state: string; note: string | null };
+  assert.equal(d.state, "notified"); assert.equal(d.note, null, "delivered by wake, not by desktop notice");
+});
+
+test("the directory fallback is a no-op when the service knows no session there", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-wake-ocnone-")), n = new MbxNode(home, { host: "alpha" });
+  const stub = opencodeStub(t, null);
+  const old = { MBX_OPENCODE_URL: process.env.MBX_OPENCODE_URL, MBX_NO_DESKTOP: process.env.MBX_NO_DESKTOP };
+  Object.assign(process.env, { MBX_NO_DESKTOP: "1" });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true });
+    for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
+  process.env.MBX_OPENCODE_URL = await stub.listen();
+  bindWakeLease(n, { agent: "worker", cli: "opencode", session_id: "mcp-424242", pid: process.pid });
+  n.store.db.prepare("UPDATE sessions SET cwd=? WHERE agent='worker'").run("/projects/demo");
+  sendLeased(n, { from: "sender", to: ["worker"], subject: "wake", body: "private", kind: "request" });
+  await dispatchWakes(n);
+  assert.deepEqual(stub.calls, [], "no synthetic submitted when the directory has no session");
+  const d = n.store.db.prepare("SELECT state, note FROM deliveries WHERE agent='worker'").get() as { state: string; note: string | null };
+  assert.equal(d.note, "desktop", "designed fallback: desktop notice keeps the mail re-wakeable");
 });
