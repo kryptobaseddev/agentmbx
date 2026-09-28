@@ -33,6 +33,11 @@ test("wake receipt inspector observes real mailbox replies and acknowledgments w
   const node = new MbxNode(home, { host: "e2e" });
   t.after(() => { node.close(); rmSync(home, { recursive: true, force: true }); });
   const request = node.send({ from: "tester", to: ["oc-agent"], subject: "wake", body: "PONG-exact", kind: "request" }).envelope;
+  const recovered = JSON.parse(execFileSync("python3", ["-c",
+    "import json,runpy,sys; print(json.dumps(runpy.run_path(sys.argv[1])['find_request'](*sys.argv[2:])))",
+    join(import.meta.dirname, "../scripts/e2e/wake_receipt.py"), home, "oc-agent", "PONG-exact",
+  ], { encoding: "utf8", timeout: 5_000 }));
+  assert.equal(recovered, request.id);
   const inspect = () => JSON.parse(execFileSync("python3", ["-c",
     "import json,runpy,sys; print(json.dumps(runpy.run_path(sys.argv[1])['inspect_receipt'](*sys.argv[2:])))",
     join(import.meta.dirname, "../scripts/e2e/wake_receipt.py"), home, request.id, "oc-agent", "PONG-exact",
