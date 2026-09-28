@@ -66,7 +66,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI guar
   assert.equal(cliCommand(home, "search", "guarded", ...selected).status, 0);
   const reply = cliCommand(home, "send", ...selected, "--reply-to", message, "--to", "sender", "-m", "reply", "--json");
   assert.equal(reply.status, 0, reply.stderr);
-  assert.equal(JSON.parse(node.message(JSON.parse(reply.stdout).id)!.envelope).meta.sender_verification, undefined);
+  assert.equal(JSON.parse(node.message(JSON.parse(reply.stdout).id)!.envelope).meta.sender_verification, "leased");
   assert.equal(cliCommand(home, "ack", message, ...selected).status, 0);
   const acked = guarded(home, selection, "ack", message); assert.equal(acked.status, 0, acked.stderr);
   assert.equal(node.inbox(me.agent).length, 0);

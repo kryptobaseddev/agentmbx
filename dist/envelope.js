@@ -57,7 +57,7 @@ export function checkShape(x) {
     if (Number.isNaN(Date.parse(e.ts)))
         return "bad ts";
     const m = e.meta;
-    if (m?.sender_verification !== undefined && m.sender_verification !== "unverified")
+    if (m?.sender_verification !== undefined && m.sender_verification !== "unverified" && m.sender_verification !== "leased")
         return "bad sender verification";
     if (m?.hop !== undefined && !(Number.isInteger(m.hop) && m.hop >= 0 && m.hop <= 1000))
         return "bad hop";

@@ -8,7 +8,7 @@ export const NAME_RE = /^[a-z0-9][a-z0-9-]{1,39}$/;
 
 /** `origin`: where the content came from (external = a web page, issue, PR comment, email relayed by an agent);
  *  `hop`: how many agent-to-agent relays led to this message. Both are signed with the envelope. */
-export interface Meta { mentions: string[]; directives: string[]; tags: string[]; task_refs: string[]; origin?: "agent" | "external"; hop?: number; project?: string; sender_verification?: "unverified" }
+export interface Meta { mentions: string[]; directives: string[]; tags: string[]; task_refs: string[]; origin?: "agent" | "external"; hop?: number; project?: string; sender_verification?: "unverified" | "leased" }
 
 /** Owner-signed delegation to ONE live session: `sub` is that session's in-memory key, so nothing else on the
  *  host (even a process using the same agent name) can use it. */
@@ -81,7 +81,7 @@ export function checkShape(x: unknown): string | null {
   if (typeof e.subject !== "string") return "bad subject";
   if (Number.isNaN(Date.parse(e.ts))) return "bad ts";
   const m = e.meta as Meta | undefined;
-  if (m?.sender_verification !== undefined && m.sender_verification !== "unverified") return "bad sender verification";
+  if (m?.sender_verification !== undefined && m.sender_verification !== "unverified" && m.sender_verification !== "leased") return "bad sender verification";
   if (m?.hop !== undefined && !(Number.isInteger(m.hop) && m.hop >= 0 && m.hop <= 1000)) return "bad hop";
   if (m?.origin !== undefined && m.origin !== "agent" && m.origin !== "external") return "bad origin";
   if (m?.project !== undefined && (typeof m.project !== "string" || m.project.length > 300)) return "bad project";

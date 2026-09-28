@@ -1,3 +1,4 @@
+import { hasHeldIdentity } from "./identity-leases.js";
 // One mbx host: its key, its store, and the rules for sending, receiving, verifying and delivering.
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { hostname, homedir } from "node:os";
@@ -532,6 +533,12 @@ export class MbxNode {
         if (!NAME_RE.test(fromName) && fromName !== "owner")
             throw new Error(`invalid sender name "${fromName}"`);
         let e = prebuilt ?? buildEnvelope({ ...d, from: `${fromName}@${this.host}` });
+        // Positive host attestation comes from the current lease operation, never a draft flag.
+        // A prebuilt owner-signed envelope is immutable: changing metadata would invalidate its approval.
+        if (prebuilt?.meta.sender_verification === "leased" && (e.from !== `${fromName}@${this.host}` || !hasHeldIdentity(this.store, fromName)))
+            throw new Error("prebuilt sender attestation requires the current identity lease");
+        if (!prebuilt && !d.unverifiedSender && hasHeldIdentity(this.store, fromName))
+            e.meta.sender_verification = "leased";
         if (owner)
             e = ownerSign(e, owner.pub, owner.priv);
         else if (session?.grant)

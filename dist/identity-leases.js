@@ -5,6 +5,15 @@ import { execFileSync } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { NAME_RE } from "./envelope.js";
 import { readLinuxProcess } from "./proc.js";
+// Only a synchronous, open write operation may attest which sender it currently holds.
+const heldOperation = new AsyncLocalStorage();
+export function hasHeldIdentity(store, name) {
+    const scope = heldOperation.getStore();
+    if (!scope?.active || scope.readOnly || scope.store !== store || scope.name !== name)
+        return false;
+    const row = store.db.prepare("SELECT token,released_at FROM identity_leases WHERE name=?").get(name);
+    return row?.token === scope.token && row.released_at === null;
+}
 export const DEFAULT_IDENTITY_IDLE_TTL_MS = 30 * 60_000;
 const UNKNOWN_PROCESS = { alive: null, start: null };
 const EVIDENCE_MAX_AGE_MS = 5000;
@@ -253,7 +262,14 @@ export class IdentityLeases {
                 : this.expire(row, this.now(), this.observedProcess(row, observed)) : "expired";
             if (status !== "live")
                 return { ok: false, status };
-            const value = operation();
+            const scope = { store: this.store, name, token, active: true, readOnly };
+            let value;
+            try {
+                value = heldOperation.run(scope, operation);
+            }
+            finally {
+                scope.active = false;
+            }
             if (value && typeof value.then === "function") {
                 // This cannot cancel external side effects. Store transaction contexts block later DB writes.
                 void Promise.resolve(value).catch(() => { });
