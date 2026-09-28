@@ -100,19 +100,24 @@ export class Store {
       },
     });
     this.db = guarded(this.#rawDb);
+    const allowIdentityMigration = options.allowIdentityMigration || process.env.MBX_MIGRATE_IDENTITY_LEASES === "1";
+    const assertMigrationAllowed = () => {
+      if (!allowIdentityMigration && this.schemaVersion() < 2
+        && this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").get())
+        throw Object.assign(new Error("identity lease migration requires a validated rollout; stop old AgentMBX processes and explicitly set MBX_MIGRATE_IDENTITY_LEASES=1 for the migration"), { code: "IDENTITY_MIGRATION_REQUIRED" });
+    };
     try {
       // Connection-local only: contention can occur even while reading the compatibility marker.
       this.db.exec("PRAGMA busy_timeout=5000");
       // Read the compatibility marker before any schema, journal-mode or permission changes.
       this.assertCurrent();
-      if (existed && this.schemaVersion() < 2 && this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").get()
-        && !options.allowIdentityMigration && process.env.MBX_MIGRATE_IDENTITY_LEASES !== "1")
-        throw Object.assign(new Error("identity lease migration requires a validated rollout; stop old AgentMBX processes and explicitly set MBX_MIGRATE_IDENTITY_LEASES=1 for the migration"), { code: "IDENTITY_MIGRATION_REQUIRED" });
+      assertMigrationAllowed();
       privatePath(home, 0o700);
       privatePath(join(home, "mbx.db"), 0o600, false, existed);
       this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON");
       this.tx(() => {
         this.assertCurrent(); // another opener may have migrated while we waited for the write lock
+        assertMigrationAllowed(); // an old opener may instead have initialized a previously empty database
         this.db.exec(SCHEMA);
         // CREATE TABLE IF NOT EXISTS does not add columns; suppress only confirmed existing columns.
         for (const [table, column] of [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"]]) {

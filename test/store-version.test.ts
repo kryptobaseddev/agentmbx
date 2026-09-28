@@ -101,3 +101,30 @@ test("failed migration rolls back the lease table and version marker together", 
     assert.equal(check.prepare("SELECT fp FROM principals").get()!.fp, "sentinel");
   } finally { check.close(); }
 });
+
+for (const existed of [false, true]) test(`concurrent legacy initialization cannot bypass migration consent (file existed: ${existed})`, t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-migration-race-")), path = join(home, "mbx.db");
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  if (existed) new DatabaseSync(path).close();
+  const exec = DatabaseSync.prototype.exec;
+  let initialized = false;
+  t.mock.method(DatabaseSync.prototype, "exec", function(this: DatabaseSync, sql: string) {
+    if (!initialized && sql === "BEGIN IMMEDIATE") {
+      initialized = true;
+      // An old binary initializes the previously empty database after the first
+      // compatibility check, but before this opener acquires its migration lock.
+      const other = new DatabaseSync(path);
+      try { exec.call(other, "CREATE TABLE legacy_data (value TEXT); INSERT INTO legacy_data (value) VALUES ('preserve'); PRAGMA user_version=1"); }
+      finally { other.close(); }
+    }
+    return exec.call(this, sql);
+  });
+  assert.throws(() => { const store = new Store(home); store.close(); }, { code: "IDENTITY_MIGRATION_REQUIRED" });
+  assert.equal(initialized, true);
+  const check = new DatabaseSync(path);
+  try {
+    assert.equal(check.prepare("PRAGMA user_version").get()!.user_version, 1);
+    assert.equal(check.prepare("SELECT value FROM legacy_data").get()!.value, "preserve");
+    assert.equal(check.prepare("SELECT name FROM sqlite_master WHERE name='identity_leases'").get(), undefined);
+  } finally { check.close(); }
+});
