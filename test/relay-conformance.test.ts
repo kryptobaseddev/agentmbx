@@ -115,3 +115,28 @@ test("enrolment requires the host-key challenge signature (no anonymous registra
   assert.throws(() => core.push({ host: "alpha", pubkey: k.alpha.publicKey }, []), /not enrolled/);
   void verifyData;
 });
+
+test("quotas are per OWNER across their hosts, and push rate is bounded per owner", () => {
+  const core = new RelayCore({ ...DEFAULT_QUOTA, maxQueueDepth: 100, maxOwnerDepth: 2, pushesPerMinute: 100 }), k = hosts();
+  enrol(core, "alpha", k.alpha, "owner-1"); enrol(core, "beta", k.beta, "owner-2");
+  enrol(core, "gamma", generateKeyPair(), "owner-2"); // second host under owner-2
+  const mk = (n: number, to = "bob@beta") => {
+    const d = buildEnvelope({ from: "alice@alpha", to: [to], subject: "s", body: `m${n}` });
+    return signEnvelope(d, "alpha", k.alpha.publicKey, k.alpha.privateKey);
+  };
+  assert.deepEqual(core.push({ host: "alpha", pubkey: k.alpha.publicKey }, [mk(1), mk(2)]), { stored: 2 });
+  // owner-2 depth is now 2 across beta; a third envelope to a NEW owner-2 host is refused by the owner limit
+  const third = core.push({ host: "alpha", pubkey: k.alpha.publicKey }, [mk(3, "carol@gamma")]);
+  assert.equal(third.stored, 0);
+  assert.match(third.error ?? "", /owner queue depth exceeded/);
+  assert.equal(core.ownerDepth("owner-2"), 2);
+
+  const rate = new RelayCore({ ...DEFAULT_QUOTA, pushesPerMinute: 2 }), r = hosts();
+  enrol(rate, "alpha", r.alpha, "o"); enrol(rate, "beta", r.beta, "o");
+  const w = () => { const d = buildEnvelope({ from: "a@alpha", to: ["b@beta"], subject: "s", body: "x" }); return signEnvelope(d, "alpha", r.alpha.publicKey, r.alpha.privateKey); };
+  assert.deepEqual(rate.push({ host: "alpha", pubkey: r.alpha.publicKey }, [w()]), { stored: 1 });
+  assert.deepEqual(rate.push({ host: "alpha", pubkey: r.alpha.publicKey }, [w()]), { stored: 1 });
+  const limited = rate.push({ host: "alpha", pubkey: r.alpha.publicKey }, [w()]);
+  assert.equal(limited.stored, 0);
+  assert.match(limited.error ?? "", /push rate exceeded/);
+});
