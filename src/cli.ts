@@ -11,7 +11,7 @@ import { flushOutbox, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirec
 import { daemonAnswers, doctor, failed, formatChecks } from "./doctor.ts";
 import { agentName, detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.ts";
 import { ancestors } from "./proc.ts";
-import { DEFAULT_PORT, defaultHome, formatFor, formatMessage, MbxNode, summaryLine, trustLabel } from "./node.ts";
+import { DEFAULT_PORT, defaultHome, formatFor, MbxNode, summaryLine, trustLabel } from "./node.ts";
 import { activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary,
   type Level, type PolicyClass, type PolicyRecord, type Revocation } from "./policy.ts";
 import { authHelperPath, createKeychainOwner, createOwnerKey, defaultOwnerBackend, ownerInfo, ownerSignCanonical, readPassphraseFromTTY, type OwnerBackend } from "./owner.ts";
@@ -23,6 +23,7 @@ import { dispatchWakes, inboxCommand, macNotifierPath, notifyDesktop, opencodeSe
 import { kimiHostedServer } from "./kimi-web.ts";
 import { approveKimi, decidePermission, opencodePermissionPass, type Lookup } from "./permission.ts";
 import { listIdentityStatus } from "./identity-status.ts";
+import { withCliIdentity } from "./cli-identity.ts";
 import { buildIdentityTakeover, type IdentityTakeoverApproval } from "./identity-takeover.ts";
 import { findIdentityControl, identityControlReceipt, resolveIdentityControlReceipt, submitIdentityControl, type IdentityControlReceipt } from "./identity-control.ts";
 
@@ -39,6 +40,9 @@ Messages
   agentmbx inbox --as <agent> [--all] [--json] [--needs-reply] [--from <agent>]      agentmbx read <id> --as <agent>      agentmbx ack <id>… | --all | --thread <id>  --as <agent> [--note "…"]
   agentmbx whoami --as <agent> [--role r] [--description "…"]    register/describe yourself (shell sessions)
   agentmbx thread <id>        agentmbx search "<words>"   agentmbx agents   agentmbx status
+    Mailbox reads, acknowledgements and replies require this caller’s current MCP lease.
+    Use --cli <provider> --session <id> when multiple sessions share the caller. --as only selects the held name.
+    New sends without a lease are marked unverified-sender and grant no delegated authority.
   agentmbx status --cli <provider> --session <id> --json   current session identity and mailbox counts (read-only)
   agentmbx identity list [--json]               inspect local identity holders, unread counts and recovery status (read-only)
   agentmbx identity claim [name] --cli <provider> --session <id> [--wait-ms 5000] [--json]
@@ -206,65 +210,83 @@ async function run(argv: string[]) {
   }
   const node = new MbxNode();
   // Inside an agent session (a hook-bound or MCP-bound CLI up the process tree) the session's own name is the default,
-  // and a name held by ANOTHER live session can't be claimed from here. A human terminal may use any --as.
+  // but a shell sender name alone conveys no lease or mailbox access.
   const as = () => {
     const explicit = str("as") ?? process.env.MBX_AGENT;
     const caller = node.callerAgent(ancestors());
     if (!explicit) return caller?.agent ?? die("--as <agent> is required (or run this from inside an agent session with mbx set up)");
-    const name = explicit.split("@")[0];
-    if (caller && name !== caller.agent && node.heldByOther(name, caller.pid))
-      die(`"${name}" belongs to another live session; this session is ${caller.agent}. Use --as ${caller.agent} (or leave --as out).`);
-    if (caller && name !== caller.agent) node.linkIdentity(name, caller.agent); // its mail now reaches this session's notices and wakes
     return explicit;
   };
 
+  if (["inbox", "read", "ack", "thread", "search"].includes(cmd)) {
+    if ((cmd === "read" || cmd === "thread") && !pos[0]) die(`${cmd} <id>`);
+    if (cmd === "ack" && !pos.length && !o.all && !str("thread")) die("ack <id>… | --all | --thread <id>");
+    return withCliIdentity(node, { as: str("as") ?? process.env.MBX_AGENT, cli: str("cli"), session: str("session"),
+      readOnly: ["inbox", "thread", "search"].includes(cmd) }, me => {
+      switch (cmd) {
+        case "inbox": {
+          const known = node.agents().filter((a) => a.host === node.host).map((a) => a.name);
+          if (!known.includes(me) && !node.unreadCount(me)) process.stderr.write(`warning: "${me}" is not a known agent here (known: ${known.join(", ") || "none"}). Typo? Register with: agentmbx whoami --as ${me}\n`);
+          let rows = node.inbox(me, { all: !!o.all, limit: 500 });
+          if (o["needs-reply"]) rows = rows.filter((m) => (JSON.parse(m.envelope) as Envelope).needs_reply);
+          if (str("from")) rows = rows.filter((m) => m.from_addr === str("from") || m.from_addr.split("@")[0] === str("from"));
+          if (o.json) return console.log(JSON.stringify(rows.map((m) => { const e = JSON.parse(m.envelope) as Envelope;
+            return { id: m.id, ts: m.ts, from: m.from_addr, to: e.to, subject: m.subject, kind: m.kind, thread: m.thread, reply_to: m.reply_to,
+              needs_reply: e.needs_reply, refs: e.refs, state: m.state, trust: trustLabel(m) }; }), null, 2));
+          return rows.forEach((m) => console.log(summaryLine(m)));
+        }
+        case "read": { return console.log(formatFor(node, node.read(pos[0] ?? die("read <id>"), me), me)); }
+        case "ack": {
+          let ids = pos;
+          if (o.all) ids = node.inbox(me, { limit: 5000 }).map((m) => m.id);
+          else if (str("thread")) { const t = node.message(str("thread")!, me); ids = node.inbox(me, { limit: 5000 }).filter((m) => m.thread === (t?.thread ?? str("thread"))).map((m) => m.id); }
+          if (!ids.length) die("ack <id>… | --all | --thread <id>");
+          let failureCode = 0;
+          for (const id of ids) {
+            try { console.log(`acked ${node.ack(id, me, str("note") ?? null, str("did"))}`); }
+            catch (e) { failureCode = Math.max(failureCode, cliError(e, "ack")); }
+          }
+          if (failureCode) process.exitCode = failureCode;
+          return;
+        }
+        case "thread": {
+          const m = node.message(pos[0] ?? die("thread <id>"), me);
+          return node.thread(m ? m.thread : pos[0], me).forEach((r) => console.log(formatFor(node, r, me) + "\n"));
+        }
+        case "search": return node.search(pos.join(" "), 20, me).forEach((m) => console.log(summaryLine(m)));
+      }
+    });
+  }
+
   switch (cmd) {
     case "send": {
-      // a shell sender is a real participant: register it so it shows in `agents` and can be addressed back
-      try { node.registerAgent(as().split("@")[0], { cli: "cli" }); } catch { /* invalid names are rejected by send below */ }
+      // Read external input before acquiring the lease's database lock.
       const body = str("m") ?? (str("body-file") ? readFileSync(str("body-file")!, "utf8") : process.stdin.isTTY ? "" : readStdin());
-      const reply = str("reply-to") ? node.read(str("reply-to")!, as().split("@")[0]) : undefined;
-      if (str("reply-to") && !reply) die(`no message ${str("reply-to")}`);
-      const r = node.send({ from: as(), to: (str("to") ?? die("--to is required")).split(",").map((s) => s.trim()).filter(Boolean),
-        subject: str("subject") ?? (reply ? (reply.subject.startsWith("Re: ") ? reply.subject : `Re: ${reply.subject}`) : die("--subject is required")), body, kind: (str("kind") ?? "message") as Envelope["kind"],
-        reply_to: reply?.id ?? null, thread: reply?.thread, needs_reply: !!o["needs-reply"], refs: (o.ref as string[] | undefined) ?? [] });
+      const send = (from: string, unverified = false) => {
+        const reply = str("reply-to") ? node.read(str("reply-to")!, from.split("@")[0]) : undefined;
+        return node.send({ from, to: (str("to") ?? die("--to is required")).split(",").map(s => s.trim()).filter(Boolean),
+          subject: str("subject") ?? (reply ? (reply.subject.startsWith("Re: ") ? reply.subject : `Re: ${reply.subject}`) : die("--subject is required")),
+          body, kind: (str("kind") ?? "message") as Envelope["kind"], reply_to: reply?.id ?? null, thread: reply?.thread,
+          needs_reply: !!o["needs-reply"], refs: (o.ref as string[] | undefined) ?? [], unverifiedSender: unverified });
+      };
+      let entered = false, r: ReturnType<MbxNode["send"]>;
+      try {
+        r = withCliIdentity(node, { as: str("as") ?? process.env.MBX_AGENT, cli: str("cli"), session: str("session") }, me => {
+          entered = true; return send(me);
+        });
+      } catch (error) {
+        // Never replay a failed operation or downgrade a reply / explicitly selected session.
+        if (entered || str("reply-to") || str("cli") || str("session")) throw error;
+        const sender = as();
+        if (!node.agents().some(a => a.name === sender.split("@")[0] && a.host === node.host)) node.registerAgent(sender.split("@")[0], { cli: "cli" });
+        r = send(sender, true);
+        r.warnings.push("unverified-sender: no current identity lease; recipients must not treat the claimed name as delegated authority");
+      }
       r.warnings.forEach((w) => process.stderr.write(`warning: ${w}\n`));
       if (o.json) return console.log(JSON.stringify({ id: r.envelope.id, thread: r.envelope.thread, ref: `mbx:${r.envelope.id}@${node.host}`, local: r.local, remote: r.remote, warnings: r.warnings }));
       console.log(r.envelope.id);
       return;
     }
-    case "inbox": {
-      const me = as().split("@")[0];
-      const known = node.agents().filter((a) => a.host === node.host).map((a) => a.name);
-      if (!known.includes(me) && !node.unreadCount(me)) process.stderr.write(`warning: "${me}" is not a known agent here (known: ${known.join(", ") || "none"}). Typo? Register with: agentmbx whoami --as ${me}\n`);
-      let rows = node.inbox(me, { all: !!o.all, limit: 500 });
-      if (o["needs-reply"]) rows = rows.filter((m) => (JSON.parse(m.envelope) as Envelope).needs_reply);
-      if (str("from")) rows = rows.filter((m) => m.from_addr === str("from") || m.from_addr.split("@")[0] === str("from"));
-      if (o.json) return console.log(JSON.stringify(rows.map((m) => { const e = JSON.parse(m.envelope) as Envelope;
-        return { id: m.id, ts: m.ts, from: m.from_addr, to: e.to, subject: m.subject, kind: m.kind, thread: m.thread, reply_to: m.reply_to,
-          needs_reply: e.needs_reply, refs: e.refs, state: m.state, trust: trustLabel(m) }; }), null, 2));
-      return rows.forEach((m) => console.log(summaryLine(m)));
-    }
-    case "read": { const me = as().split("@")[0]; return console.log(formatFor(node, node.read(pos[0] ?? die("read <id>"), me), me)); }
-    case "ack": {
-      const me = as().split("@")[0];
-      let ids = pos;
-      if (o.all) ids = node.inbox(me, { limit: 5000 }).map((m) => m.id);
-      else if (str("thread")) { const t = node.message(str("thread")!, me); ids = node.inbox(me, { limit: 5000 }).filter((m) => m.thread === (t?.thread ?? str("thread"))).map((m) => m.id); }
-      if (!ids.length) die("ack <id>… | --all | --thread <id>");
-      let failureCode = 0;
-      for (const id of ids) {
-        try { console.log(`acked ${node.ack(id, me, str("note") ?? null, str("did"))}`); }
-        catch (e) { failureCode = Math.max(failureCode, cliError(e, "ack")); }
-      }
-      if (failureCode) process.exitCode = failureCode;
-      return;
-    }
-    case "thread": {
-      const me = str("as")?.split("@")[0], m = node.message(pos[0] ?? die("thread <id>"), me);
-      return node.thread(m && (!me || node.canSee(m, me)) ? m.thread : pos[0], me).forEach((r) => console.log((me ? formatFor(node, r, me) : formatMessage(r)) + "\n"));
-    }
-    case "search": return node.search(pos.join(" "), 20, str("as")?.split("@")[0]).forEach((m) => console.log(summaryLine(m)));
     case "whoami": {
       const name = as().split("@")[0];
       node.registerAgent(name, { cli: str("cli") ?? "cli", role: str("role"), description: str("description") });

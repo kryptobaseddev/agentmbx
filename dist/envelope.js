@@ -24,7 +24,7 @@ export function buildEnvelope(d, now = new Date()) {
     return {
         v: 3, id, ts: now.toISOString(), from: d.from, to: d.to, thread: d.thread ?? id, reply_to: d.reply_to ?? null,
         kind: d.kind ?? "message", subject: d.subject.slice(0, 200), body: d.body, needs_reply: d.needs_reply ?? false,
-        refs: d.refs ?? [], meta: { ...parseMeta(d.body), ...(d.origin === "external" ? { origin: "external" } : {}), ...(d.hop ? { hop: d.hop } : {}), ...(d.project ? { project: d.project.slice(0, 300) } : {}) },
+        refs: d.refs ?? [], meta: { ...parseMeta(d.body), ...(d.unverifiedSender ? { sender_verification: "unverified" } : {}), ...(d.origin === "external" ? { origin: "external" } : {}), ...(d.hop ? { hop: d.hop } : {}), ...(d.project ? { project: d.project.slice(0, 300) } : {}) },
         authority: null, enc: null,
     };
 }
@@ -57,6 +57,8 @@ export function checkShape(x) {
     if (Number.isNaN(Date.parse(e.ts)))
         return "bad ts";
     const m = e.meta;
+    if (m?.sender_verification !== undefined && m.sender_verification !== "unverified")
+        return "bad sender verification";
     if (m?.hop !== undefined && !(Number.isInteger(m.hop) && m.hop >= 0 && m.hop <= 1000))
         return "bad hop";
     if (m?.origin !== undefined && m.origin !== "agent" && m.origin !== "external")

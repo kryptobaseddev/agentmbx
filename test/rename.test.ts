@@ -24,7 +24,7 @@ test("rename moves unacked mail and session bindings while preserving signed env
     assert.equal(n.agentFor("claude", process.pid), "after");
     assert.equal(n.store.get("name:claude:hook-thread"), "after");
     assert.equal(n.resolveAlias("before"), "after");
-    assert.deepEqual(n.linkedNames("after"), ["shell-name"]);
+    assert.deepEqual(n.linkedNames("after"), []);
     assert.equal(n.unreadCount("before"), 0);
     assert.equal(n.inbox("before", { all: true })[0].id, done);
     n.ack(id, "after");

@@ -289,7 +289,7 @@ test("broadcasts reach live sessions only; a shell sender gets mail addressed by
   n.close();
 });
 
-test("a new session never takes a live or recently used shell name; CLI names link to the session that used them", () => {
+test("a new session never takes a live or recently used shell name; CLI names never grant implicit ownership", () => {
   const n = new MbxNode(tmp(), { host: "alpha" });
   n.registerAgent("claude", { cli: "cli" }); // someone ran: agentmbx send --as claude (no session)
   assert.equal(n.pickName("claude", "claude", 999_999), "claude-2", "recent shell name is held");
@@ -297,8 +297,8 @@ test("a new session never takes a live or recently used shell name; CLI names li
   assert.equal(n.pickName("claude", "claude", 999_999), "claude", "an old shell name is free again");
   n.bindSession({ agent: "agentmbx", cli: "claude", session_id: "c1", pid: process.pid, session_key: "k" });
   n.linkIdentity("mac-dev", "agentmbx");
-  assert.deepEqual(n.linkedNames("agentmbx"), ["mac-dev"]);
-  assert.equal(n.identityOwner("mac-dev"), "agentmbx");
+  assert.deepEqual(n.linkedNames("agentmbx"), []);
+  assert.equal(n.identityOwner("mac-dev"), null);
   n.close();
 });
 
@@ -320,6 +320,19 @@ test("identity links: a session can't link (or read through a link) a name that 
   assert.deepEqual(n.linkedNames("vidapeps-lead"), []);
   const id = n.send({ from: "codex", to: ["kimi-home-mbx"], subject: "s", body: "b" }).envelope.id;
   assert.throws(() => n.read(id, "vidapeps-lead"), /no message/);
-  n.linkIdentity("shell-only", "vidapeps-lead"); assert.deepEqual(n.linkedNames("vidapeps-lead"), ["shell-only"]);
+  n.linkIdentity("shell-only", "vidapeps-lead"); assert.deepEqual(n.linkedNames("vidapeps-lead"), []);
   n.close();
+});
+
+
+test("unverified sender cannot borrow an owner policy for the claimed name", () => {
+  const { n, kp, sign } = ownerHost("alpha");
+  const rec = makePolicy({ level: "yolo", agents: ["recipient"], hosts: ["alpha"], ownerPub: kp.publicKey });
+  assert.equal(acceptSigned(n.store.db, sign(rec), "alpha"), null);
+  const ordinary = n.send({ from: "claimed", to: ["recipient"], subject: "verified path", body: "request" }).envelope.id;
+  assert.equal(n.policyFor(n.message(ordinary)!, "recipient").level, "yolo");
+  const unverified = n.send({ from: "claimed", to: ["recipient"], subject: "shell", body: "request", unverifiedSender: true }).envelope.id;
+  const policy = n.policyFor(n.message(unverified)!, "recipient");
+  assert.equal(policy.level, "ask"); assert.deepEqual(policy.classes, []);
+  assert.match(policy.notes.join(" "), /unverified-sender/);
 });

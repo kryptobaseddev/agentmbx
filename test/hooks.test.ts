@@ -58,7 +58,7 @@ test("Claude post-tool hook surfaces arrivals once, including linked names and e
     assert.match(run("s2"), /1 unread mbx message/, "deduplication is session scoped");
     n.linkIdentity("shell-name", "builder");
     const linked = send("shell-name");
-    assert.match(run(), /shell-name \(1; agentmbx inbox --as shell-name\)/);
+    assert.equal(run(), "", "retired links do not notify another mailbox");
     assert.equal(run(), "");
     n.ack(second, "builder");
     assert.equal(run(), "", "acknowledging a message does not repeat the remaining notice");

@@ -163,6 +163,8 @@ export function activePolicies(db, agent, host, now = new Date()) {
 const ORDER = (l) => LEVELS.indexOf(l);
 /** What the receiving agent may do for this message's sender. Downgrades apply even under yolo. */
 export function effectivePolicy(db, o) {
+    if (o.envelope?.meta.sender_verification === "unverified")
+        return { level: "ask", classes: [], ids: [], exp: null, projects: [], grants: [], notes: ["unverified-sender: the claimed identity has no verified lease"] };
     const isLocal = o.fromHost === o.host;
     const principalOk = (selector) => {
         if (!/^principal:[a-f0-9]{4}(?:-[a-f0-9]{4}){3}$/.test(selector))

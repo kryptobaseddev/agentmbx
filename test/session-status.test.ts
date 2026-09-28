@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MbxNode } from "../src/node.ts";
 
-test("session status follows rename, counts linked mail, and rejects stale or unknown bindings", () => {
+test("session status follows rename, excludes formerly linked mail, and rejects stale or unknown bindings", () => {
   const n = new MbxNode(mkdtempSync(join(tmpdir(), "mbx-status-")), { host: "alpha" });
   try {
     n.registerAgent("folder", { cli: "claude" });
@@ -25,12 +25,12 @@ test("session status follows rename, counts linked mail, and rejects stale or un
     const r = run();
     assert.equal(r.status, 0, r.stderr);
     assert.deepEqual(JSON.parse(r.stdout), { agent: "renamed", host: "alpha", address: "renamed@alpha", cli: "claude",
-      session_id: "thread", mailboxes: ["renamed", "shell"], unread: 2, needs_reply: 1, owner_authority: 0, outbox: 0 });
+      session_id: "thread", mailboxes: ["renamed"], unread: 1, needs_reply: 1, owner_authority: 0, outbox: 0 });
     assert.doesNotMatch(r.stdout, /PRIVATE|SECRET/);
     assert.deepEqual(n.agents(), agentsBefore, "status does not register or relabel an agent");
     assert.equal(n.inbox("renamed")[0].state, "delivered");
     n.ack(id, "renamed");
-    assert.equal(JSON.parse(run().stdout).unread, 1);
+    assert.equal(JSON.parse(run().stdout).unread, 0);
     assert.notEqual(run("missing").status, 0);
     assert.notEqual(run("thread", "codex").status, 0);
     n.store.db.prepare("UPDATE sessions SET pid_start='different-process' WHERE session_id='thread'").run();

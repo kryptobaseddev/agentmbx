@@ -21,7 +21,8 @@ test("hidden prefix collisions neither disclose IDs nor hide a visible message",
   assert.equal(n.ack(prefix, "reader"), own);
   n.linkIdentity("shell", "primary");
   const shell = n.send({ from: "sender", to: ["shell"], subject: "linked", body: "linked" }).envelope.id;
-  assert.equal(n.read(prefix, "primary").id, shell);
+  assert.throws(() => n.read(prefix, "primary"), { code: "NOT_FOUND" });
+  assert.equal(n.read(prefix, "shell").id, shell);
   const second = n.send({ from: "sender", to: ["reader"], subject: "second", body: "second" }).envelope.id;
   assert.throws(() => n.read(prefix, "reader"), (e: Error & { code?: string }) => e.code === "AMBIGUOUS" && e.message.includes(own) && e.message.includes(second) && hidden.every(id => !e.message.includes(id)));
 });

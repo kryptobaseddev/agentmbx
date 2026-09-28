@@ -8,7 +8,7 @@ export const NAME_RE = /^[a-z0-9][a-z0-9-]{1,39}$/;
 
 /** `origin`: where the content came from (external = a web page, issue, PR comment, email relayed by an agent);
  *  `hop`: how many agent-to-agent relays led to this message. Both are signed with the envelope. */
-export interface Meta { mentions: string[]; directives: string[]; tags: string[]; task_refs: string[]; origin?: "agent" | "external"; hop?: number; project?: string }
+export interface Meta { mentions: string[]; directives: string[]; tags: string[]; task_refs: string[]; origin?: "agent" | "external"; hop?: number; project?: string; sender_verification?: "unverified" }
 
 /** Owner-signed delegation to ONE live session: `sub` is that session's in-memory key, so nothing else on the
  *  host (even a process using the same agent name) can use it. */
@@ -42,6 +42,7 @@ export interface Draft {
   reply_to?: string | null; needs_reply?: boolean; refs?: string[]; origin?: "agent" | "external"; hop?: number;
   /** the sender's project root (canonical path), so receivers can tell which project a message is about */
   project?: string;
+  unverifiedSender?: boolean;
 }
 
 export function buildEnvelope(d: Draft, now = new Date()): Envelope {
@@ -52,7 +53,7 @@ export function buildEnvelope(d: Draft, now = new Date()): Envelope {
   return {
     v: 3, id, ts: now.toISOString(), from: d.from, to: d.to, thread: d.thread ?? id, reply_to: d.reply_to ?? null,
     kind: d.kind ?? "message", subject: d.subject.slice(0, 200), body: d.body, needs_reply: d.needs_reply ?? false,
-    refs: d.refs ?? [], meta: { ...parseMeta(d.body), ...(d.origin === "external" ? { origin: "external" as const } : {}), ...(d.hop ? { hop: d.hop } : {}), ...(d.project ? { project: d.project.slice(0, 300) } : {}) },
+    refs: d.refs ?? [], meta: { ...parseMeta(d.body), ...(d.unverifiedSender ? { sender_verification: "unverified" as const } : {}), ...(d.origin === "external" ? { origin: "external" as const } : {}), ...(d.hop ? { hop: d.hop } : {}), ...(d.project ? { project: d.project.slice(0, 300) } : {}) },
     authority: null, enc: null,
   };
 }
@@ -80,6 +81,7 @@ export function checkShape(x: unknown): string | null {
   if (typeof e.subject !== "string") return "bad subject";
   if (Number.isNaN(Date.parse(e.ts))) return "bad ts";
   const m = e.meta as Meta | undefined;
+  if (m?.sender_verification !== undefined && m.sender_verification !== "unverified") return "bad sender verification";
   if (m?.hop !== undefined && !(Number.isInteger(m.hop) && m.hop >= 0 && m.hop <= 1000)) return "bad hop";
   if (m?.origin !== undefined && m.origin !== "agent" && m.origin !== "external") return "bad origin";
   if (m?.project !== undefined && (typeof m.project !== "string" || m.project.length > 300)) return "bad project";
