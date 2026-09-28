@@ -80,7 +80,7 @@ Agent integration
   agentmbx hook prompt --cli <…>                adds "N unread mbx messages" to the next turn when there is mail
   agentmbx hook post-tool --cli claude          surfaces new unread mail between tool calls
   agentmbx hook permission --cli <claude|codex|kimi>   YOLO: approves the prompt only under an active owner policy with the permissions class
-  agentmbx import-v2 <MAILBOX/v2 dir>           import the old NAS mailbox as unsigned 'legacy' messages
+  agentmbx import-v2 <MAILBOX/v2 dir>           import this caller's leased mailbox as unsigned 'legacy' messages
 
 Env: MBX_HOME (default ~/.local/share/agentmbx), MBX_AGENT (agent name for mcp/hooks), MBX_ADVERTISE (host:port others use),
      MBX_UPDATE_URL (release download base), MBX_NO_UPDATE_CHECK (daemon skips its daily update check)`;
@@ -512,7 +512,9 @@ If the codes differ, do not approve: someone is in the middle.`);
             return rows.forEach((r) => console.log(`${r.at.slice(0, 19)}Z  ${r.event.padEnd(22)} ${r.detail ?? ""}`));
         }
         case "hook": return hook(node, pos[0], str("cli") ?? "unknown");
-        case "import-v2": return importV2(node, pos[0] ?? die("import-v2 <dir>"));
+        case "import-v2": return importV2(node, pos[0] ?? die("import-v2 <dir>"), {
+            as: str("as") ?? (process.env.MBX_AGENT || undefined), cli: str("cli"), session: str("session")
+        });
         default: die(`unknown command "${cmd}" (agentmbx help)`);
     }
 }
@@ -873,27 +875,41 @@ function emit(cli, event, context) {
     console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: context } }));
 }
 // ---- v2 import -------------------------------------------------------------------------------
-function importV2(node, dir) {
+function importV2(node, dir, selection) {
     const mdir = join(resolve(dir), "messages"), adir = join(resolve(dir), "acks");
-    let n = 0;
-    for (const f of readdirSync(mdir).filter((x) => x.endsWith(".json")).sort()) {
+    // Read the archive before taking the lease write lock; malformed batches have no committed prefix.
+    const entries = readdirSync(mdir).filter(x => x.endsWith(".json")).sort().map(f => {
         const v = JSON.parse(readFileSync(join(mdir, f), "utf8"));
+        if (typeof v.id !== "string" || (!v.id || v.id.length > 200 || /[\/\\\u0000-\u001f\u007f-\u009f]/u.test(v.id)) || !Array.isArray(v.to) || !v.to.every(a => typeof a === "string"))
+            throw new Error(`invalid v2 message identity or recipients in ${f}`);
         const e = { v: 3, id: `v2-${v.id}`, ts: v.ts, from: `${v.from}@legacy`, to: v.to, thread: `v2-${v.thread}`, reply_to: v.reply_to ? `v2-${v.reply_to}` : null,
             kind: ["request", "reply", "status", "decision", "alert"].includes(v.type) ? v.type : "message", subject: v.subject, body: v.body ?? "",
             needs_reply: !!v.needs_reply, refs: v.refs ?? [], meta: { mentions: [], directives: [], tags: [], task_refs: [] }, authority: null, enc: null };
-        if (!node.store.insertMessage(e, "legacy", "legacy", null))
-            continue;
-        for (const a of v.to)
-            if (a !== "all") {
-                node.store.addDelivery(e.id, a);
-                if (existsSync(join(adir, `${v.id}.${a}`))) {
-                    node.store.setDelivery(e.id, a, "read");
-                    node.store.setDelivery(e.id, a, "acked", "acked in v2");
-                }
+        return { e, acked: new Set(v.to.filter(a => /^[a-zA-Z0-9_-]{1,40}$/.test(a) && existsSync(join(adir, `${v.id}.${a}`)))) };
+    });
+    const result = withCliIdentity(node, selection, agent => {
+        let imported = 0;
+        for (const { e, acked } of entries) {
+            if (!e.to.includes(agent))
+                continue;
+            const existing = node.store.db.prepare("SELECT origin,envelope FROM messages WHERE id=?").get(e.id);
+            if (existing && (existing.origin !== "legacy" || canonical(JSON.parse(existing.envelope)) !== canonical(e)))
+                throw new Error(`v2 message ${e.id} conflicts with stored content; nothing imported`);
+            if (node.store.db.prepare("SELECT 1 FROM deliveries WHERE msg_id=? AND agent=?").get(e.id, agent))
+                continue;
+            if (!existing)
+                node.store.insertMessage(e, "legacy", "legacy", null);
+            node.store.addDelivery(e.id, agent);
+            if (acked.has(agent)) {
+                node.store.setDelivery(e.id, agent, "read");
+                node.store.setDelivery(e.id, agent, "acked", "acked in v2");
             }
-        n++;
-    }
-    console.log(`imported ${n} v2 message(s) as legacy`);
+            imported++;
+        }
+        node.store.audit("identity.import-v2", { agent, imported });
+        return { agent, imported };
+    });
+    console.log(`imported ${result.imported} v2 message(s) as legacy for ${result.agent}`);
 }
 // ---- setup -----------------------------------------------------------------------------------
 const servicePath = (home = homedir()) => process.platform === "darwin"
