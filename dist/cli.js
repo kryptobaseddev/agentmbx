@@ -22,6 +22,7 @@ import { dispatchWakes, inboxCommand, macNotifierPath, notifyDesktop, opencodeSe
 import { kimiHostedServer } from "./kimi-web.js";
 import { approveKimi, decidePermission, opencodePermissionPass } from "./permission.js";
 import { listIdentityStatus } from "./identity-status.js";
+import { findIdentityControl, identityControlReceipt, readIdentityControlReceipt, submitIdentityControl } from "./identity-control.js";
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
 
 Start here
@@ -37,6 +38,9 @@ Messages
   agentmbx thread <id>        agentmbx search "<words>"   agentmbx agents   agentmbx status
   agentmbx status --cli <provider> --session <id> --json   current session identity and mailbox counts (read-only)
   agentmbx identity list [--json]               inspect local identity holders, unread counts and recovery status (read-only)
+  agentmbx identity claim [name] --cli <provider> --session <id> [--wait-ms 5000] [--json]
+  agentmbx identity release --cli <provider> --session <id> [--wait-ms 5000] [--json]
+  agentmbx identity result <request-id> [--json] inspect a command receipt; pending means outcome unknown (exit 75)
 
 Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …' line it prints on the other)
   agentmbx init [--host <name>] [--port 7373]       agentmbx discover            (hosts on the LAN, via mDNS)
@@ -128,7 +132,7 @@ async function run(argv) {
             ttl: { type: "string" }, bind: { type: "string" }, role: { type: "string" }, description: { type: "string" }, thread: { type: "string" }, from: { type: "string" }, check: { type: "boolean" }, yes: { type: "boolean", short: "y" },
             compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" },
             backend: { type: "string" }, "no-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
-            project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }
+            project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }, "wait-ms": { type: "string" }
         } });
     if (o.help)
         return console.log(commandHelp(cmd));
@@ -163,17 +167,59 @@ async function run(argv) {
     if (cmd === "notify-test")
         return notifyTest(str("as") ?? process.env.MBX_AGENT ?? "notify-test");
     if (cmd === "identity") {
-        if (pos.length !== 1 || pos[0] !== "list")
-            die("identity list [--json]");
-        const result = listIdentityStatus(defaultHome());
-        if (o.json)
-            return console.log(JSON.stringify(result, null, 2));
-        console.log(`Identities on ${result.host} (advisory snapshot; claims recheck ownership)`);
-        if (!result.identities.length)
-            console.log("No local identities.");
-        for (const row of result.identities)
-            console.log(`${row.name}\t${row.state}\t${row.unread} unread\t${row.last_activity ?? "no activity"}\t${row.reason}`);
-        return;
+        const outputReceipt = (receipt) => {
+            const pending = receipt.status === "pending";
+            process.exitCode = pending ? 75 : receipt.status === "failed" ? 1 : 0;
+            const result = { ...receipt, outcome: pending ? "unknown" : receipt.status,
+                ...(pending ? { check_command: ["agentmbx", "identity", "result", receipt.id, "--json"] } : {}) };
+            console.log(o.json ? JSON.stringify(result, null, 2) : `Request ${receipt.id}: ${result.outcome}${pending ? `. Do not resubmit; inspect with agentmbx identity result ${receipt.id}` : `\n${JSON.stringify(receipt.result ?? receipt.error, null, 2)}`}`);
+        };
+        if (pos[0] === "list" && pos.length === 1) {
+            const result = listIdentityStatus(defaultHome());
+            if (o.json)
+                return console.log(JSON.stringify(result, null, 2));
+            console.log(`Identities on ${result.host} (advisory snapshot; claims recheck ownership)`);
+            if (!result.identities.length)
+                console.log("No local identities.");
+            for (const row of result.identities)
+                console.log(`${row.name}\t${row.state}\t${row.unread} unread\t${row.last_activity ?? "no activity"}\t${row.reason}`);
+            return;
+        }
+        if (pos[0] === "result" && pos.length === 2) {
+            const receipt = readIdentityControlReceipt(defaultHome(), pos[1]);
+            if (!receipt)
+                throw Object.assign(new Error("no identity request with that id"), { code: "NOT_FOUND" });
+            return outputReceipt(receipt);
+        }
+        if ((pos[0] === "claim" && pos.length <= 2) || (pos[0] === "release" && pos.length === 1)) {
+            const cli = str("cli") ?? die("identity commands require --cli and --session"), sid = str("session") ?? die("identity commands require --cli and --session");
+            const wait = Number(str("wait-ms") ?? 5000);
+            if (!Number.isSafeInteger(wait) || wait < 0 || wait > 10_000)
+                die("--wait-ms must be an integer from 0 to 10000");
+            if (!existsSync(join(defaultHome(), "mbx.db")))
+                throw Object.assign(new Error("mailbox is not initialized"), { code: "NOT_FOUND" });
+            const node = new MbxNode();
+            try {
+                const request = submitIdentityControl(node.store, findIdentityControl(node.store, cli, sid), pos[0], pos[1]);
+                process.stderr.write(`Identity request ${request.id} submitted; inspect with agentmbx identity result ${request.id}\n`);
+                const deadline = Date.now() + wait;
+                let receipt = request;
+                try {
+                    while (Date.now() < deadline && receipt.status === "pending") {
+                        await new Promise(resolve => setTimeout(resolve, 50));
+                        receipt = identityControlReceipt(node.store, request.id) ?? receipt;
+                    }
+                }
+                catch {
+                    process.stderr.write("Receipt could not be read; the outcome remains unknown. Inspect the request before resubmitting.\n");
+                }
+                return outputReceipt(receipt);
+            }
+            finally {
+                node.close();
+            }
+        }
+        die("identity list | claim [name] --cli <provider> --session <id> | release --cli <provider> --session <id> | result <request-id>");
     }
     const node = new MbxNode();
     // Inside an agent session (a hook-bound or MCP-bound CLI up the process tree) the session's own name is the default,
