@@ -2,8 +2,8 @@
 // Lease tokens fence stale connections; they are never owner grants or permission approvals.
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
 import { NAME_RE } from "./envelope.ts";
+import { readLinuxProcess } from "./proc.ts";
 import type { Store } from "./store.ts";
 
 export const DEFAULT_IDENTITY_IDLE_TTL_MS = 30 * 60_000;
@@ -25,12 +25,8 @@ export function inspectLeaseProcess(pid: number): ProcessEvidence {
   }
   try {
     if (process.platform === "linux") {
-      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-      const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
-      const boot = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
-      if (fields[0] === "Z" || fields[0] === "X") return { alive: false, start: null };
-      if (!/^\d+$/.test(fields[19] ?? "") || !/^[a-f0-9-]{36}$/.test(boot)) return { alive, start: null };
-      return { alive, start: `linux:${boot}:${fields[19]}` };
+      const p = readLinuxProcess(pid);
+      return p?.dead ? { alive: false, start: null } : { alive, start: p?.start ?? null };
     }
     // Target only this PID, bypass caches, and normalize locale/TZ across independent providers.
     // BSD ps has one-second birth resolution; this is a coordination fence, not a security boundary.
