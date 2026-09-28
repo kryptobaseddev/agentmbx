@@ -47,3 +47,7 @@ test("wake receipt inspector observes real mailbox replies and acknowledgments w
   assert.equal(inspect().receipt_verified, true);
   assert.deepEqual(node.store.db.prepare("SELECT * FROM deliveries ORDER BY msg_id,agent").all(), before);
 });
+
+test("owner terminal preparation preserves argv and requires a terminal before launch", () => {
+  execFileSync("python3", [join(import.meta.dirname, "../scripts/e2e/test_prepare_terminal.py")], { timeout: 10_000, stdio: "pipe" });
+});
