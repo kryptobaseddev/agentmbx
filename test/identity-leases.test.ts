@@ -40,6 +40,14 @@ test("lease expiry fences stale renew/release/operations and preserves mailbox h
   assert.equal(leases.claim("worker", a).name, "worker");
 });
 
+test("an identical claimant re-claims idempotently instead of racing itself", (t) => {
+  const f = fixture(t), { leases, a, b } = f;
+  const first = leases.claim("worker", a);
+  assert.equal(leases.claim("worker", a).token, first.token, "same holder evidence converges on the live lease");
+  assert.equal(leases.claim("worker", { ...a }).token, first.token);
+  assert.throws(() => leases.claim("worker", b), { code: "IDENTITY_IN_USE" }, "a different claimant is still refused");
+});
+
 test("unknown process status retains ownership but cannot authorize operations; death and PID reuse expire", (t) => {
   const f = fixture(t), { leases, processes, a, b } = f;
   const first = leases.claim("worker", a);

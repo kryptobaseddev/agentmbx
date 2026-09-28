@@ -63,6 +63,25 @@ export function reloadFromDisk(e) {
         return;
     } process.exit(code ?? 0); });
 }
+/**
+ * What a failed lease claim should do about an existing holder in THIS process. A service process hosts one
+ * provisional base identity (`mcp-<pid>`) plus a state per provider session id, all sharing one process; any
+ * of them can legitimately end up holding a name another one is now claiming (a stale binding window lets the
+ * base adopt a session's remembered name at startup; concurrent first calls race on one session id).
+ * "transfer" releases our base's claim so the real session takes over; "adopt" reuses a racing same-session
+ * state's claim. Anything in another process (or another session in this one) stays a genuine conflict.
+ */
+export const leaseCollisionAction = (e, prior, o) => {
+    if (e?.code !== "IDENTITY_IN_USE" || !prior || prior.released_at !== null)
+        return null;
+    if (prior.holder_pid !== o.pid || prior.holder_start !== o.start)
+        return null;
+    if (prior.session_id === o.baseSessionId && o.stateSessionId !== o.baseSessionId)
+        return "transfer";
+    if (prior.session_id === o.stateSessionId)
+        return "adopt";
+    return null;
+};
 /** Cron expression for a self-check every `min` minutes (divisors of 60 only, so intervals are even across the hour). */
 export const WATCH_MINUTES = [5, 10, 15, 20, 30, 60];
 export const watchCron = (min) => (min === 60 ? "0 * * * *" : `*/${min} * * * *`);
@@ -251,6 +270,23 @@ export async function runMcp(existing) {
             ambiguousLegacy.add(agent);
         throw Object.assign(new Error(`identity ${agent} has unresolved legacy session holders; choose a distinct identity`), { code: "IDENTITY_IN_USE" });
     };
+    const claimFor = (state, agent) => {
+        const evidence = { pid: process.pid, start: holderStart ?? "", keyFp: fingerprint(state.key.publicKey), cli: env.cli, sessionId: state.sessionId };
+        try {
+            return leases.claim(agent, evidence).token;
+        }
+        catch (e) {
+            const prior = node.store.db.prepare("SELECT token, holder_pid, holder_start, session_id, released_at FROM identity_leases WHERE name=?").get(agent);
+            const action = leaseCollisionAction(e, prior, { pid: process.pid, start: holderStart ?? null, baseSessionId: env.sessionId, stateSessionId: state.sessionId });
+            if (action === "adopt" && prior)
+                return prior.token;
+            if (action === "transfer" && prior) {
+                leases.release(agent, prior.token);
+                return leases.claim(agent, evidence).token;
+            }
+            throw e;
+        }
+    };
     const bind = (state = base, initial = false) => prepareState(state, undefined, () => {
         const result = node.store.tx(() => {
             if (state.leaseToken)
@@ -263,7 +299,7 @@ export async function runMcp(existing) {
                 throw new Error("bound identity changed outside a lease rename");
             if (!state.leaseToken)
                 checkLegacy(agent, state, legacy);
-            const leaseToken = state.leaseToken ?? leases.claim(agent, { pid: process.pid, start: holderStart ?? "", keyFp: fingerprint(state.key.publicKey), cli: env.cli, sessionId: state.sessionId }).token;
+            const leaseToken = state.leaseToken ?? claimFor(state, agent);
             node.registerAgent(agent, { cli: env.cli, role: process.env.MBX_ROLE, description: process.env.MBX_DESCRIPTION });
             publishControl({ ...state, agent, leaseToken });
             return { agent, leaseToken };
@@ -317,6 +353,9 @@ export async function runMcp(existing) {
                 throw new Error(`${env.cli} mailbox ${name} belongs to another live session; choose a distinct session identity`);
             state = { agent: name, sessionId: sid, key: generateKeyPair(), parent: null };
             bind(state);
+            const raced = states.get(sid); // a concurrent first call may have registered its state first
+            if (raced)
+                return raced;
             states.set(sid, state);
         }
         return state;

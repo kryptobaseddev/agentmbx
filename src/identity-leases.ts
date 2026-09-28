@@ -162,7 +162,15 @@ export class IdentityLeases {
       const now = this.now(), p = performance.now() - at <= EVIDENCE_MAX_AGE_MS ? process : UNKNOWN_PROCESS;
       if (p.alive !== true || p.start !== holder.start) throw error("IDENTITY_PROCESS_UNVERIFIED", "claimant process identity is not verified");
       const prior = this.row(name);
-      if (prior && this.expire(prior, now, this.observedProcess(prior, observed)) !== "expired") throw error("IDENTITY_IN_USE", `identity ${name} already has a holder`);
+      if (prior && this.expire(prior, now, this.observedProcess(prior, observed)) !== "expired") {
+        // An identical claimant (concurrent or repeated first binds of one state) re-claims idempotently.
+        if (prior.key_fp === holder.keyFp && prior.holder_pid === holder.pid && prior.holder_start === holder.start
+          && prior.cli === holder.cli && prior.session_id === holder.sessionId) {
+          this.#prepared.getStore()?.observations.set(name, { row: prior, process: p, at });
+          return prior;
+        }
+        throw error("IDENTITY_IN_USE", `identity ${name} already has a holder`);
+      }
       const token = randomUUID();
       this.store.db.prepare(`INSERT INTO identity_leases (name,token,holder_pid,holder_start,key_fp,cli,session_id,claimed_at,heartbeat_at,idle_ttl,released_at,release_reason)
         VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL) ON CONFLICT(name) DO UPDATE SET token=excluded.token,holder_pid=excluded.holder_pid,
