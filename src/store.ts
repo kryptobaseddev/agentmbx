@@ -65,19 +65,23 @@ export class Store {
   constructor(home: string) {
     mkdirSync(home, { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(join(home, "mbx.db"));
-    this.db.exec(SCHEMA);
-    // columns added after 0.2 (CREATE TABLE IF NOT EXISTS doesn't add them to existing databases)
-    for (const ddl of ["ALTER TABLE sessions ADD COLUMN pid_start TEXT", "ALTER TABLE principals ADD COLUMN peer TEXT", "ALTER TABLE policy_revocations ADD COLUMN owner_fp TEXT"]) { try { this.db.exec(ddl); } catch { /* already there */ } }
-    if (this.schemaVersion() < SCHEMA_VERSION) this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-    for (const f of ["mbx.db", "mbx.db-wal", "mbx.db-shm"]) { try { chmodSync(join(home, f), 0o600); } catch { /* not created yet */ } }
+    try {
+      // Read the compatibility marker before any schema, journal-mode or permission changes.
+      this.assertCurrent();
+      this.db.exec(SCHEMA);
+      // columns added after 0.2 (CREATE TABLE IF NOT EXISTS doesn't add them to existing databases)
+      for (const ddl of ["ALTER TABLE sessions ADD COLUMN pid_start TEXT", "ALTER TABLE principals ADD COLUMN peer TEXT", "ALTER TABLE policy_revocations ADD COLUMN owner_fp TEXT"]) { try { this.db.exec(ddl); } catch { /* already there */ } }
+      if (this.schemaVersion() < SCHEMA_VERSION) this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+      for (const f of ["mbx.db", "mbx.db-wal", "mbx.db-shm"]) { try { chmodSync(join(home, f), 0o600); } catch { /* not created yet */ } }
+    } catch (e) { this.db.close(); throw e; }
   }
   close() { this.db.close(); }
 
   schemaVersion(): number { return (this.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version; }
   /** Throws a clear "restart" error when a newer agentmbx has upgraded the store since this process started. */
-  assertCurrent(running: string) {
+  assertCurrent(running?: string) {
     const v = this.schemaVersion();
-    if (v > SCHEMA_VERSION) throw Object.assign(new Error(`this mbx server (agentmbx ${running}) is older than the mailbox store (schema ${v} > ${SCHEMA_VERSION}); a newer agentmbx upgraded it. Restart your CLI session to load the current mbx tools.`), { code: "STALE_SERVER" });
+    if (v > SCHEMA_VERSION) throw Object.assign(new Error(`this mbx server${running ? ` (agentmbx ${running})` : ""} is older than the mailbox store (schema ${v} > ${SCHEMA_VERSION}); a newer agentmbx upgraded it. Update AgentMBX if necessary. Restart your CLI session to load the current mbx tools.`), { code: "STALE_SERVER" });
   }
 
   tx<T>(fn: () => T): T {
