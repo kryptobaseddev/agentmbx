@@ -183,7 +183,7 @@ async function run(argv) {
             }
             catch { /* invalid names are rejected by send below */ }
             const body = str("m") ?? (str("body-file") ? readFileSync(str("body-file"), "utf8") : process.stdin.isTTY ? "" : readStdin());
-            const reply = str("reply-to") ? node.message(str("reply-to")) : undefined;
+            const reply = str("reply-to") ? node.read(str("reply-to"), as().split("@")[0]) : undefined;
             if (str("reply-to") && !reply)
                 die(`no message ${str("reply-to")}`);
             const r = node.send({ from: as(), to: (str("to") ?? die("--to is required")).split(",").map((s) => s.trim()).filter(Boolean),
@@ -223,7 +223,7 @@ async function run(argv) {
             if (o.all)
                 ids = node.inbox(me, { limit: 5000 }).map((m) => m.id);
             else if (str("thread")) {
-                const t = node.message(str("thread"));
+                const t = node.message(str("thread"), me);
                 ids = node.inbox(me, { limit: 5000 }).filter((m) => m.thread === (t?.thread ?? str("thread"))).map((m) => m.id);
             }
             if (!ids.length)
@@ -242,7 +242,7 @@ async function run(argv) {
             return;
         }
         case "thread": {
-            const m = node.message(pos[0] ?? die("thread <id>")), me = str("as")?.split("@")[0];
+            const me = str("as")?.split("@")[0], m = node.message(pos[0] ?? die("thread <id>"), me);
             return node.thread(m && (!me || node.canSee(m, me)) ? m.thread : pos[0], me).forEach((r) => console.log((me ? formatFor(node, r, me) : formatMessage(r)) + "\n"));
         }
         case "search": return node.search(pos.join(" "), 20, str("as")?.split("@")[0]).forEach((m) => console.log(summaryLine(m)));

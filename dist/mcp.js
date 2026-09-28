@@ -317,7 +317,7 @@ export async function runMcp(node = new MbxNode()) {
         annotations: { readOnlyHint: true },
     }, async ({ id }) => {
         const { agent } = current();
-        const m = node.message(id);
+        const m = node.message(id, agent);
         const rows = node.thread(m && node.canSee(m, agent) ? m.thread : id, agent);
         noteRead(rows);
         return text(rows.length ? rows.map((r) => formatFor(node, r, agent)).join("\n\n") : `No thread ${id}.`);

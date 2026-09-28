@@ -587,8 +587,15 @@ export class MbxNode {
     unreadCount(agent) {
         return this.store.db.prepare("SELECT count(*) n FROM deliveries WHERE agent=? AND state <> 'acked'").get(agent).n;
     }
-    message(id) {
-        const rows = this.store.db.prepare("SELECT * FROM messages WHERE id LIKE ? LIMIT 6").all(`${id}%`);
+    message(id, agent) {
+        // Resolve ambiguity only among visible messages. Filtering after LIMIT can leak hidden IDs
+        // and let unrelated mail crowd out the caller's otherwise unique prefix.
+        const visibility = agent ? `AND EXISTS (SELECT 1 FROM json_each(?) names WHERE
+      ((m.origin='local' OR substr(m.from_addr,instr(m.from_addr,'@')+1)=?)
+        AND substr(m.from_addr,1,instr(m.from_addr,'@')-1)=names.value)
+      OR EXISTS (SELECT 1 FROM deliveries d WHERE d.msg_id=m.id AND d.agent=names.value))` : "";
+        const scope = agent ? [JSON.stringify([agent, ...this.linkedNames(agent)]), this.host] : [];
+        const rows = this.store.db.prepare(`SELECT m.* FROM messages m WHERE m.id LIKE ? ${visibility} LIMIT 6`).all(`${id}%`, ...scope);
         if (rows.length > 1)
             throw Object.assign(new Error(`id prefix ${id} matches ${rows.length === 6 ? "6+" : rows.length} messages (${rows.slice(0, 3).map((r) => r.id).join(", ")}…); use more characters`), { code: "AMBIGUOUS" });
         return rows[0];
@@ -606,7 +613,7 @@ export class MbxNode {
     }
     /** Read-only: fetching a message changes nothing (so every CLI can auto-allow it). "Unread" means "not acked". */
     read(id, agent) {
-        const m = this.message(id);
+        const m = this.message(id, agent);
         if (!m || (agent && !this.canSee(m, agent)))
             throw Object.assign(new Error(`no message ${id} (list yours with: agentmbx inbox --as <you> --all)`), { code: "NOT_FOUND" });
         return m;
@@ -614,7 +621,7 @@ export class MbxNode {
     /** `did`: what the agent did on this message's request; recorded in the audit log with the policy that allowed it. */
     ack(id, agent, note = null, did) {
         return this.store.tx(() => {
-            const m = this.message(id);
+            const m = this.message(id, agent);
             if (!m || !this.canSee(m, agent))
                 throw Object.assign(new Error(`no message ${id}`), { code: "NOT_FOUND" });
             const delivered = (name) => !!this.store.db.prepare("SELECT 1 FROM deliveries WHERE msg_id=? AND agent=?").get(m.id, name);
