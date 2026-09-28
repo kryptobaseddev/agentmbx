@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { z } from "zod";
+import { delegateWake } from "./helpers/wake-lease.ts";
 import { MbxNode } from "../src/node.ts";
 
 const BIN = join(import.meta.dirname, "../bin/agentmbx.js");
@@ -77,13 +78,15 @@ test("channel mode: a new request pushes a notifications/claude/channel wake wit
   const { c, notes } = await client(home, "sleeper", { MBX_CHANNEL: "1" });
   assert.ok(c.getServerCapabilities()?.experimental?.["claude/channel"]);
   const n = new MbxNode(home);
+  delegateWake(n, "sleeper");
+  n.send({ from: "claimed", to: ["sleeper"], subject: "unverified", body: "ignored for wake", kind: "request", unverifiedSender: true });
   n.send({ from: "boss", to: ["sleeper"], subject: "wake up", body: "SECRET-BODY-TEXT", kind: "request" });
   n.send({ from: "boss", to: ["sleeper"], subject: "fyi", body: "status only", kind: "status" });
   for (let i = 0; i < 20 && !notes.length; i++) await new Promise((r) => setTimeout(r, 250));
   assert.equal(notes.length, 1);
   const p = notes[0] as { content: string; meta: { count: string } };
   assert.match(p.content, /1 new message\(s\) for sleeper .*Check them with mbx_inbox/);
-  assert.doesNotMatch(p.content, /SECRET-BODY-TEXT/);
+  assert.doesNotMatch(p.content, /SECRET-BODY-TEXT|claimed/);
   assert.equal(p.meta.count, "1");
   n.close(); await c.close();
 });
@@ -202,6 +205,7 @@ test("channel mode ignores retired links and preserves separate mailbox deliveri
   const n = new MbxNode(home, { host: "alpha" });
   const { c, notes } = await client(home, "primary", { MBX_CHANNEL: "1" });
   try {
+    delegateWake(n, "primary");
     n.store.set("ident:shell-alias", "primary");
     n.bindSession({ agent: "separate", cli: "kimi", session_id: "separate-thread", pid: process.pid });
     const send = (to: string) => n.send({ from: "sender", to: [to], subject: "PRIVATE SUBJECT", body: "SECRET BODY", kind: "request" }).envelope.id;

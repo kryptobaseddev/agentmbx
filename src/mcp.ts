@@ -21,7 +21,7 @@ import { activePolicies, delegationNote } from "./policy.ts";
 import { procStart, withProcSnapshot } from "./proc.ts";
 import { updateAvailable } from "./update.ts";
 import { version } from "./version.ts";
-import { wakeText } from "./wake.ts";
+import { hasWakeAuthority, wakeText } from "./wake.ts";
 
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
 It is shared by AI coding agents on this machine and on paired machines. Your user set it up so agents can coordinate;
@@ -559,7 +559,7 @@ export async function runMcp(node = new MbxNode()) {
         for (const mailbox of [agent, ...node.linkedNames(agent)]) {
           const { rows, wanted, brake } = leases.withHeld(agent, base.leaseToken!, () => {
             const rows = node.store.db.prepare(`SELECT m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state='delivered' ORDER BY m.ts`).all(mailbox) as unknown as Parameters<MbxNode["wantsWake"]>[1][];
-            const wanted = rows.filter((r) => node.wantsWake(mailbox, r));
+            const wanted = rows.filter(r => node.wantsWake(mailbox, r) && hasWakeAuthority(node, mailbox, r));
             const brake = wanted.length ? node.takeWake(mailbox, wanted[0].thread) : null;
             return { rows, wanted, brake };
           });
