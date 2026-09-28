@@ -70,6 +70,22 @@ accumulates in the outbox/relay instead of desktop notifications.
 | Denial of service | quotas per owner key; wake brake unchanged (relay adds no wake authority) |
 | Elevation of privilege | none available to the relay: authorization is receiver-side, policy records are owner-signed |
 
+## Existing code anchors (2026-09-28 inventory)
+
+The daemon is already a store-and-forward node for LAN peers; the relay externalizes the same pattern as a
+third transport behind the multi-transport kernel:
+
+- **Outbox queue** (`outbox` table: per-peer msg/host with attempts, next_at, last_error) + `flushOutbox` on the
+  2-second daemon tick — the push side of store-and-forward already exists.
+- **`POST /v1/envelopes`** (host-authenticated) — the envelope-batch endpoint a relay can front; `/v1/policy`,
+  `/v1/policies`, `/v1/agents` carry the same signed records the relay must carry (POLICY §7).
+- **Signed `hop` meta saturated at `MAX_RELAY_DEPTH` (1000) + `origin: external`** — the anti-relay-abuse
+  machinery (T104) is envelope-level and transport-agnostic; a relay hop plugs into it without new rules.
+- **Permanent id dedupe** on receipt — exactly-once storage holds across relay retries.
+
+So the relay's new work is narrow: authenticated push/pull endpoints with per-owner cursors and quotas, plus the
+`enc` body gate — not a new delivery model.
+
 ## Build plan sketch
 
 1. Harvest the Axum/SSE skeleton + delivery-jobs/dead-letter worker from the SignalDock audit into a fresh relay crate.
