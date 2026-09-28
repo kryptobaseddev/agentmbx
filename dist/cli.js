@@ -22,7 +22,7 @@ import { dispatchWakes, inboxCommand, macNotifierPath, notifyDesktop, opencodeSe
 import { kimiHostedServer } from "./kimi-web.js";
 import { approveKimi, decidePermission, opencodePermissionPass } from "./permission.js";
 import { listIdentityStatus } from "./identity-status.js";
-import { findIdentityControl, identityControlReceipt, readIdentityControlReceipt, submitIdentityControl } from "./identity-control.js";
+import { findIdentityControl, identityControlReceipt, resolveIdentityControlReceipt, submitIdentityControl } from "./identity-control.js";
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
 
 Start here
@@ -40,7 +40,7 @@ Messages
   agentmbx identity list [--json]               inspect local identity holders, unread counts and recovery status (read-only)
   agentmbx identity claim [name] --cli <provider> --session <id> [--wait-ms 5000] [--json]
   agentmbx identity release --cli <provider> --session <id> [--wait-ms 5000] [--json]
-  agentmbx identity result <request-id> [--json] inspect a command receipt; pending means outcome unknown (exit 75)
+  agentmbx identity result <request-id> [--json] inspect a receipt and finalize expiry; pending means outcome unknown (exit 75)
 
 Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …' line it prints on the other)
   agentmbx init [--host <name>] [--port 7373]       agentmbx discover            (hosts on the LAN, via mDNS)
@@ -186,7 +186,7 @@ async function run(argv) {
             return;
         }
         if (pos[0] === "result" && pos.length === 2) {
-            const receipt = readIdentityControlReceipt(defaultHome(), pos[1]);
+            const receipt = resolveIdentityControlReceipt(defaultHome(), pos[1]);
             if (!receipt)
                 throw Object.assign(new Error("no identity request with that id"), { code: "NOT_FOUND" });
             return outputReceipt(receipt);

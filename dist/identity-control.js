@@ -150,3 +150,36 @@ export function readIdentityControlReceipt(home, id) {
         db.close();
     }
 }
+/** Settle an abandoned request only after excluding an in-flight writer. Never execute it. */
+export function resolveIdentityControlReceipt(home, id) {
+    const observed = readIdentityControlReceipt(home, id);
+    if (!observed || observed.status !== "pending" || observed.expires_at > Date.now())
+        return observed;
+    const key = identityRequestKey(id), db = new DatabaseSync(join(home, "mbx.db"));
+    try {
+        db.exec("PRAGMA busy_timeout=5000; BEGIN IMMEDIATE");
+        // This path does not initialize or migrate a store, even when migration is enabled elsewhere.
+        if (Number(db.prepare("PRAGMA user_version").get().user_version) !== SCHEMA_VERSION)
+            throw fail("receipt finalization requires the current mailbox schema");
+        const row = db.prepare("SELECT v FROM kv WHERE k=?").get(key);
+        let receipt = row ? JSON.parse(row.v) : null;
+        const now = Date.now();
+        if (receipt?.status === "pending" && receipt.expires_at <= now) {
+            const request = requestSchema.parse(receipt);
+            if (request.id !== id)
+                throw fail("identity receipt ID mismatch");
+            receipt = { ...request, status: "failed", completed_at: now, error: "identity request expired before execution" };
+            db.prepare("UPDATE kv SET v=? WHERE k=?").run(JSON.stringify(receipt), key);
+        }
+        db.exec("COMMIT");
+        return receipt;
+    }
+    catch (error) {
+        if (db.isTransaction)
+            db.exec("ROLLBACK");
+        throw error;
+    }
+    finally {
+        db.close();
+    }
+}
