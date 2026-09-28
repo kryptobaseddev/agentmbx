@@ -95,6 +95,25 @@ test("lease process inspection precedes the write transaction while guarded muta
   assert.ok(locked.length >= 3); assert.ok(locked.every(value => !value), "process inspection must not monopolize the SQLite write lock");
 });
 
+test("prepared outer transactions reuse evidence across claim, rename and renewal without inspecting under lock", t => {
+  const { node, a } = fixture(t), checks: boolean[] = [];
+  const leases = new IdentityLeases(node.store, { clock: () => 1000, inspect: () => {
+    checks.push(node.store.db.isTransaction); return { alive: true, start: a.start };
+  } });
+  assert.throws(() => node.store.tx(() => leases.claim("unprepared", a)), { code: "IDENTITY_PREPARATION_REQUIRED" });
+  leases.prepare(["worker", "renamed"], [a.pid], () => node.store.tx(() => {
+    let invoked = false;
+    assert.throws(() => leases.prepare([], [], async () => { invoked = true; }), { code: "IDENTITY_ASYNC_OPERATION" });
+    assert.equal(invoked, false);
+    const first = leases.claim("worker", a);
+    leases.renew("worker", first.token);
+    const next = leases.rename("worker", first.token, "renamed");
+    leases.renew("renamed", next.token);
+    leases.withHeld("renamed", next.token, () => node.store.set("prepared", "committed"));
+  }));
+  assert.deepEqual(checks, [false]); assert.equal(node.store.get("prepared"), "committed");
+});
+
 test("pre-lock evidence about a dead predecessor cannot expire a new generation", t => {
   const { node, leases, processes, a, b } = fixture(t);
   leases.claim("worker", a);

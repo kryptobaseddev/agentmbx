@@ -15,6 +15,7 @@ import { kimiHostedServer } from "./kimi-web.ts";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess } from "./identity-leases.ts";
 import { formatFor, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
 import { activePolicies, delegationNote } from "./policy.ts";
+import { withProcSnapshot } from "./proc.ts";
 import { updateAvailable } from "./update.ts";
 import { version } from "./version.ts";
 import { wakeText } from "./wake.ts";
@@ -115,34 +116,62 @@ export async function runMcp(node = new MbxNode()) {
   const legacyConflicts = new Set<string>();
   const ambiguousLegacy = new Set<string>();
   type LegacyBinding = { agent: string; cli: string; session_id: string; pid: number | null; pid_start: string | null; session_key: string | null; updated_at: string };
+  const preparedBindings = new AsyncLocalStorage<Map<string, LegacyBinding>>();
+  const bindingId = (row: LegacyBinding) => JSON.stringify([row.cli, row.session_id]);
+  const prepareState = <T>(state: State, target: string | undefined, operation: () => T): T => {
+    if (node.store.db.isTransaction) return leases.prepare([], [], operation); // requires the enclosing prepared scope
+    const rows = !state.leaseToken || target ? node.store.db.prepare("SELECT agent,cli,session_id,pid,pid_start,session_key,updated_at FROM sessions").all() as LegacyBinding[] : [];
+    const names = new Set([state.agent, ...(target ? [target] : [])]);
+    if (!state.leaseToken) {
+      for (const row of rows.filter(r => r.cli === env.cli && r.pid === env.ppid)) {
+        const remembered = node.store.get(`name:${env.cli}:${row.session_id}`);
+        if (remembered) names.add(remembered);
+      }
+    }
+    const pids = new Set([process.pid, env.ppid]);
+    for (const row of rows.filter(r => names.has(r.agent))) {
+      if (row.pid) pids.add(row.pid);
+      if (row.session_key) {
+        try { const child = JSON.parse(node.store.get(`mcp-process:${row.session_key}`) ?? "null"); if (Number.isSafeInteger(child?.pid) && child.pid > 0) pids.add(child.pid); }
+        catch { /* malformed legacy evidence stays unknown */ }
+      }
+    }
+    return preparedBindings.run(new Map(rows.map(row => [bindingId(row), row])),
+      () => withProcSnapshot(() => leases.prepare([...names], [...pids], operation)));
+  };
   const checkLegacy = (agent: string, state: State, rows: LegacyBinding[]) => {
     if (node.store.get(`identity-conflict:${agent}`)) throw Object.assign(new Error(`identity ${agent} has unresolved historical ownership; choose a distinct identity`), { code: "IDENTITY_IN_USE" });
     // Once a lease exists, its generation is authoritative. Before migration, preserve ambiguous
     // live/unknown bindings rather than silently adopting their mailbox or replacing their key.
     if (node.store.db.prepare("SELECT 1 FROM identity_leases WHERE name=?").get(agent)) return;
+    const unobserved = new Set<LegacyBinding>();
     const held = rows.filter(r => {
       if (r.agent !== agent) return false;
+      const original = preparedBindings.getStore()?.get(bindingId(r));
+      if (!original || (["agent", "pid", "pid_start", "session_key", "updated_at"] as const).some(key => original[key] !== r[key])) {
+        unobserved.add(r); return true; // new/rebound rows need fresh evidence, never old PID observations
+      }
       const updated = Date.parse(r.updated_at);
       if (Number.isFinite(updated) && Date.now() - updated >= DEFAULT_IDENTITY_IDLE_TTL_MS) return false;
-      if (r.pid && inspectLeaseProcess(r.pid).alive === false) return false;
+      if (r.pid && leases.processEvidence(r.pid).alive === false) return false;
       if (r.session_key) {
         try {
           const child = JSON.parse(node.store.get(`mcp-process:${r.session_key}`) ?? "null");
-          if (Number.isSafeInteger(child?.pid) && child.pid > 0 && inspectLeaseProcess(child.pid).alive === false) return false;
+          if (Number.isSafeInteger(child?.pid) && child.pid > 0 && leases.processEvidence(child.pid).alive === false) return false;
         } catch { /* unknown legacy evidence remains held */ }
       }
       return true;
     });
     if (!held.length) return;
     const only = held[0];
-    if (held.length === 1 && !only.session_key && only.cli === env.cli && only.pid === env.ppid
+    if (held.length === 1 && !unobserved.has(only) && !only.session_key && only.cli === env.cli && only.pid === env.ppid
       && (only.session_id === state.sessionId || state.sessionId.startsWith("mcp-"))
       && node.sameSession(env.ppid, only, { proof: true })) return;
     legacyConflicts.add(agent);
     if (held.length > 1) ambiguousLegacy.add(agent);
     throw Object.assign(new Error(`identity ${agent} has unresolved legacy session holders; choose a distinct identity`), { code: "IDENTITY_IN_USE" });
   };
-  const bind = (state = base, initial = false) => {
+  const bind = (state = base, initial = false) => prepareState(state, undefined, () => {
     const result = node.store.tx(() => {
       if (state.leaseToken) leases.renew(state.agent, state.leaseToken);
       // Snapshot before bindSession can replace or consolidate any rows.
@@ -156,7 +185,7 @@ export async function runMcp(node = new MbxNode()) {
       return { agent, leaseToken };
     });
     Object.assign(state, result);
-  };
+  });
   try { bind(base, true); }
   catch (error) {
     if ((error as { code?: string }).code !== "IDENTITY_IN_USE") throw error;
@@ -251,9 +280,11 @@ export async function runMcp(node = new MbxNode()) {
         // These handlers only query SQLite. mbx_read advances delivery state despite its
         // readOnlyHint, and whoami can rename, so neither belongs in this snapshot set.
         const readOnly = ["mbx_inbox", "mbx_thread", "mbx_search", "mbx_agents"].includes(name);
-        return requests.run(state, () => readOnly
+        const invoke = () => requests.run(state, () => readOnly
           ? leases.withHeldRead(state.agent, state.leaseToken!, () => cb(...a))
           : leases.withHeld(state.agent, state.leaseToken!, () => cb(...a)));
+        const target = (a[0] as { name?: string } | undefined)?.name;
+        return withProcSnapshot(() => name === "mbx_whoami" ? prepareState(state, target, invoke) : invoke());
       } catch (e) { Object.assign(state, before); throw e; }
     });
   };

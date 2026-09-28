@@ -2,9 +2,27 @@
 // Linux uses kernel birth ticks and boot identity; other platforms use ps. Tables are cached briefly.
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 export interface Proc { ppid: number; start: string }
 let cache: { at: number; table: Map<number, Proc> } | null = null;
+const snapshots = new AsyncLocalStorage<{ active: boolean; at: number; table: Map<number, Proc> }>();
+
+/** Capture process inventory before a database transaction; expired or escaped scopes fail closed. */
+export function withProcSnapshot<T>(operation: () => T): T {
+  if (operation.constructor.name === "AsyncFunction") throw new Error("process snapshots require synchronous operations");
+  const prior = snapshots.getStore();
+  if (prior?.active) return operation();
+  if (prior) throw new Error("process snapshot scope is closed");
+  const table = procTable(0), scope = { active: true, at: performance.now(), table };
+  return snapshots.run(scope, () => {
+    try {
+      const result = operation();
+      if (result && typeof (result as { then?: unknown }).then === "function") { void Promise.resolve(result).catch(() => {}); throw new Error("process snapshots cannot return a thenable"); }
+      return result;
+    } finally { scope.active = false; }
+  });
+}
 
 /** Native Linux evidence works in minimal containers without ps and does not depend on locale/TZ. */
 export function readLinuxProcess(pid: number, bootId?: string): (Proc & { dead: boolean }) | null {
@@ -20,6 +38,8 @@ export function readLinuxProcess(pid: number, bootId?: string): (Proc & { dead: 
 }
 
 export function procTable(maxAgeMs = 2_000): Map<number, Proc> {
+  const snapshot = snapshots.getStore();
+  if (snapshot) return snapshot.active && performance.now() - snapshot.at <= 5000 ? snapshot.table : new Map();
   if (cache && Date.now() - cache.at < maxAgeMs) return cache.table;
   const table = new Map<number, Proc>();
   try {

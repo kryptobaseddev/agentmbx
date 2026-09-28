@@ -2,6 +2,7 @@
 // Lease tokens fence stale connections; they are never owner grants or permission approvals.
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { NAME_RE } from "./envelope.ts";
 import { readLinuxProcess } from "./proc.ts";
 import type { Store } from "./store.ts";
@@ -14,6 +15,7 @@ export interface IdentityLease {
 }
 export type ProcessEvidence = { alive: boolean | null; start: string | null };
 type Observation = { row: IdentityLease | undefined; process: ProcessEvidence; at: number };
+type EvidenceScope = { active: boolean; observations: Map<string, Observation>; processes: Map<number, { value: ProcessEvidence; at: number }> };
 const UNKNOWN_PROCESS: ProcessEvidence = { alive: null, start: null };
 const EVIDENCE_MAX_AGE_MS = 5000;
 const error = (code: string, message: string) => Object.assign(new Error(message), { code });
@@ -44,6 +46,7 @@ export function inspectLeaseProcess(pid: number): ProcessEvidence {
 }
 
 export class IdentityLeases {
+  #prepared = new AsyncLocalStorage<EvidenceScope>();
   private store: Store;
   private clock: () => number;
   private inspect: (pid: number) => ProcessEvidence;
@@ -62,9 +65,47 @@ export class IdentityLeases {
     return this.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(name) as unknown as IdentityLease | undefined;
   }
   private evidence(pid: number): ProcessEvidence {
+    const scope = this.#prepared.getStore();
+    if (scope) {
+      const p = scope.processes.get(pid);
+      return scope.active && p && performance.now() - p.at <= EVIDENCE_MAX_AGE_MS ? p.value : UNKNOWN_PROCESS;
+    }
+    if (this.store.db.isTransaction) throw error("IDENTITY_PREPARATION_REQUIRED", "prepare process evidence before opening an outer transaction");
     try { return this.inspect(pid); } catch { return { alive: null, start: null }; }
   }
+  /** Prepare immutable observations before an outer transaction; nested operations reuse them. */
+  prepare<T>(names: string[], pids: number[], operation: () => T): T {
+    if (operation.constructor.name === "AsyncFunction") throw error("IDENTITY_ASYNC_OPERATION", "prepared operations must be synchronous");
+    const prior = this.#prepared.getStore();
+    if (prior?.active) return operation();
+    if (prior || this.store.db.isTransaction) throw error("IDENTITY_PREPARATION_REQUIRED", "process evidence must be prepared outside a transaction");
+    const scope: EvidenceScope = { active: true, observations: new Map(), processes: new Map() };
+    const inspect = (pid: number) => {
+      let observed = scope.processes.get(pid);
+      if (!observed) { observed = { value: this.evidence(pid), at: performance.now() }; scope.processes.set(pid, observed); }
+      return observed;
+    };
+    for (const name of new Set(names)) {
+      const row = this.row(name), p = row && row.released_at === null ? inspect(row.holder_pid) : { value: UNKNOWN_PROCESS, at: performance.now() };
+      scope.observations.set(name, { row, process: p.value, at: p.at });
+    }
+    for (const pid of new Set(pids)) if (Number.isSafeInteger(pid) && pid > 0) inspect(pid);
+    return this.#prepared.run(scope, () => {
+      try {
+        const result = operation();
+        if (result && typeof (result as { then?: unknown }).then === "function") { void Promise.resolve(result).catch(() => {}); throw error("IDENTITY_ASYNC_OPERATION", "prepared operations cannot return a thenable"); }
+        return result;
+      } finally { scope.active = false; }
+    });
+  }
+  processEvidence(pid: number): ProcessEvidence { return this.evidence(pid); }
   private observe(name: string): Observation {
+    const scope = this.#prepared.getStore();
+    if (scope) {
+      if (!scope.active) throw error("IDENTITY_STATUS_UNKNOWN", "prepared process evidence scope is closed");
+      // Missing observations must not pair a newly observed generation with old PID evidence.
+      return scope.observations.get(name) ?? { row: undefined, process: UNKNOWN_PROCESS, at: performance.now() };
+    }
     const row = this.row(name);
     const process = row && row.released_at === null ? this.evidence(row.holder_pid) : UNKNOWN_PROCESS;
     return { row, process, at: performance.now() };
@@ -93,7 +134,7 @@ export class IdentityLeases {
   }
   claim(name: string, holder: LeaseHolder): IdentityLease {
     this.validateClaim(name, holder);
-    const prior = this.observe(name), process = this.evidence(holder.pid), at = performance.now();
+    const prior = this.observe(name), process = this.evidence(holder.pid), at = this.#prepared.getStore()?.processes.get(holder.pid)?.at ?? performance.now();
     return this.claimPrepared(name, holder, prior, process, at);
   }
   private validateClaim(name: string, holder: LeaseHolder) {
@@ -115,7 +156,9 @@ export class IdentityLeases {
         claimed_at=excluded.claimed_at,heartbeat_at=excluded.heartbeat_at,idle_ttl=excluded.idle_ttl,released_at=NULL,release_reason=NULL`)
         .run(name, token, holder.pid, holder.start, holder.keyFp, holder.cli, holder.sessionId, now, now, this.ttl);
       this.store.audit("identity.claim", { name, holder, previousHolder: prior ? this.holder(prior) : null, at: now });
-      return this.row(name)!;
+      const claimed = this.row(name)!;
+      this.#prepared.getStore()?.observations.set(name, { row: claimed, process: p, at });
+      return claimed;
     });
   }
   /** No automatic reacquisition: callers must explicitly claim after losing a lease. */
