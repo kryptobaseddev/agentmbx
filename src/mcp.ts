@@ -1,5 +1,7 @@
 // `mbx mcp`: the stdio MCP server one agent session runs. It owns an in-memory session key (the only thing that can
 // use an owner grant) and, inside a Claude session started with the mbx channel enabled, pushes wake-ups itself.
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
@@ -86,33 +88,63 @@ export async function runMcp(node = new MbxNode()) {
   const env = detectHost();
   const wanted = agentName(process.cwd(), env.cli);
   // a second live session with the same default name gets a free one (T055); an explicit MBX_AGENT is used as is
-  let agent = process.env.MBX_AGENT ? wanted : node.pickName(wanted, env.cli, env.ppid, env.sessionId);
-  const key = generateKeyPair(); // never written anywhere
-  const bind = (initial = false) => {
-    agent = node.bindSession({ agent, cli: env.cli, session_id: env.sessionId, cwd: process.cwd(), pid: env.ppid, session_key: key.publicKey, channel: env.channel, mcp_pid: process.pid, restore_name: initial && !process.env.MBX_AGENT });
-    node.registerAgent(agent, { cli: env.cli, role: process.env.MBX_ROLE, description: process.env.MBX_DESCRIPTION });
+  type State = { agent: string; sessionId: string; key: ReturnType<typeof generateKeyPair>;
+    parent: { hop: number; external: boolean; at: number } | null };
+  const base: State = { agent: process.env.MBX_AGENT ? wanted : node.pickName(wanted, env.cli, env.ppid, env.sessionId),
+    sessionId: env.sessionId, key: generateKeyPair(), parent: null };
+  const states = new Map<string, State>();
+  const requests = new AsyncLocalStorage<State>();
+  const current = () => requests.getStore() ?? base;
+  const bind = (state = base, initial = false) => {
+    state.agent = node.bindSession({ agent: state.agent, cli: env.cli, session_id: state.sessionId, cwd: process.cwd(), pid: env.ppid,
+      session_key: state.key.publicKey, channel: env.channel, mcp_pid: process.pid, restore_name: initial && !process.env.MBX_AGENT });
+    node.registerAgent(state.agent, { cli: env.cli, role: process.env.MBX_ROLE, description: process.env.MBX_DESCRIPTION });
   };
-  bind(true);
+  bind(base, true);
+  const contextFor = (extra: unknown): State => {
+    if (env.cli !== "opencode") return base;
+    const sid = (extra as { _meta?: { sessionID?: unknown } } | undefined)?._meta?.sessionID;
+    if (sid === undefined) return base; // non-session provider calls keep their provisional mailbox
+    if (typeof sid !== "string" || !/^ses_[a-zA-Z0-9]{1,128}$/.test(sid)) throw new Error("Invalid OpenCode sessionID metadata");
+    let state = states.get(sid);
+    if (!state) {
+      // A service process and transport can serve many sessions. Never reuse its default
+      // mailbox/key or choose the latest session by directory. Metadata grants no authority.
+      const suffix = createHash("sha256").update(sid).digest("hex").slice(0, 10);
+      const name = node.store.get(`name:opencode:${sid}`) ?? `${wanted.slice(0, 29)}-${suffix}`;
+      const other = node.store.db.prepare("SELECT pid,pid_start,updated_at FROM sessions WHERE agent=? AND (cli<>'opencode' OR session_id<>?)")
+        .all(name, sid) as { pid: number | null; pid_start: string | null; updated_at: string }[];
+      if (other.some(r => r.pid && node.sameSession(r.pid, r, { proof: true })))
+        throw new Error(`OpenCode mailbox ${name} belongs to another live session; choose a distinct session identity`);
+      state = { agent: name, sessionId: sid, key: generateKeyPair(), parent: null };
+      bind(state);
+      states.set(sid, state);
+    }
+    return state;
+  };
   // the project this session works in (not the home folder), stamped on what it sends
   const project = (() => { const d = process.cwd(); if (resolve(d) === resolve(homedir()) || d === "/") return undefined; try { return realpathSync(d); } catch { return d; } })();
   // relay tracking: a message this session sends after reading one is one hop further, and inherits an external origin
-  let parent: { hop: number; external: boolean; at: number } | null = null;
   const noteRead = (rows: { envelope: string; from_addr: string }[]) => {
+    const state = current(), { agent } = state;
     for (const r of rows) {
       if (r.from_addr === `${agent}@${node.host}`) continue;
       const m = (JSON.parse(r.envelope) as Envelope).meta as { hop?: number; origin?: string };
-      parent = { hop: Math.max(parent?.hop ?? 0, m.hop ?? 0), external: (parent?.external ?? false) || m.origin === "external", at: Date.now() };
+      state.parent = { hop: Math.max(state.parent?.hop ?? 0, m.hop ?? 0), external: (state.parent?.external ?? false) || m.origin === "external", at: Date.now() };
     }
   };
   const relay = (origin?: "agent" | "external") => {
+    const { parent } = current();
     const p = parent && Date.now() - parent.at < 3_600_000 ? parent : null;
     return { hop: p ? p.hop + 1 : 0, origin: origin === "external" || p?.external ? "external" as const : "agent" as const, project };
   };
+  const agent = base.agent;
   const renamed = agent !== wanted ? `[mbx] This session is ${agent}@${node.host} (default name: "${wanted}"). Pick a clearer name with mbx_whoami {"name": ...} if you like.` : null;
   const extra = [renamed, delegationNote(node.store.db, agent, node.host), noPush(env.cli, env.channel, env.cli === "kimi" && !!kimiHostedServer(env.ppid))
     ? selfWatchInstruction({ delegated: activePolicies(node.store.db, agent, node.host).length > 0 }) : null].filter(Boolean).join("\n");
 
   const session = (): Session => {
+    const { key } = current();
     const row = node.store.db.prepare("SELECT grant FROM grants WHERE sub=? AND revoked=0 AND exp>? ORDER BY exp DESC LIMIT 1")
       .get(`session:${key.publicKey}`, new Date().toISOString()) as { grant: string } | undefined;
     return { priv: key.privateKey, pub: key.publicKey, grant: row ? JSON.parse(row.grant) as Grant : null };
@@ -125,7 +157,10 @@ export async function runMcp(node = new MbxNode()) {
   // every tool first checks that a newer agentmbx hasn't upgraded the store under this long-running server
   const register = server.registerTool.bind(server) as (...a: unknown[]) => unknown;
   (server as { registerTool: unknown }).registerTool = (name: string, config: unknown, cb: (...a: unknown[]) => unknown) =>
-    register(name, config, (...a: unknown[]) => { node.store.assertCurrent(version()); return cb(...a); });
+    register(name, config, (...a: unknown[]) => {
+      node.store.assertCurrent(version());
+      return requests.run(contextFor(a[1]), () => cb(...a));
+    });
 
   server.registerTool("mbx_whoami", {
     title: "Who am I on mbx",
@@ -133,8 +168,11 @@ export async function runMcp(node = new MbxNode()) {
     inputSchema: { name: z.string().regex(NAME_RE).optional().describe("new agent name, e.g. vida-dev"), role: z.string().max(40).optional(), description: z.string().max(200).optional() },
     annotations: { idempotentHint: true },
   }, async ({ name, role, description }) => {
-    if (name && name !== agent) { node.addAlias(agent, name, env.ppid); agent = name; node.keepName(env.cli, env.sessionId, name); }
-    if (name || role || description) { node.registerAgent(agent, { role, description, cli: env.cli }); bind(); }
+    const state = current();
+    let { agent } = state;
+    const { key } = state;
+    if (name && name !== agent) { node.addAlias(agent, name, env.ppid); agent = name; state.agent = name; node.keepName(env.cli, state.sessionId, name); }
+    if (name || role || description) { node.registerAgent(agent, { role, description, cli: env.cli }); bind(state); }
     const s = session();
     const me = node.agents().find((a) => a.name === agent && a.host === node.host);
     const out = { agent, host: node.host, address: `${agent}@${node.host}`, role: me?.role ?? null, description: me?.description ?? null,
@@ -156,6 +194,7 @@ export async function runMcp(node = new MbxNode()) {
       origin: z.enum(["agent", "external"]).optional().describe("external when the content comes from outside (web page, issue, PR comment, email)"),
     },
   }, async ({ to, subject, body, kind, reply_to, needs_reply, refs, idempotency_key, origin }) => {
+    const { agent } = current();
     if (idempotency_key) {
       const prev = node.store.get(`idem:${agent}:${idempotency_key}`);
       if (prev) return text(`Already sent as ${prev} (same idempotency_key).`, { id: prev, duplicate: true });
@@ -178,6 +217,7 @@ export async function runMcp(node = new MbxNode()) {
       origin: z.enum(["agent", "external"]).optional().describe("external when the content comes from outside"),
     },
   }, async ({ id, body, kind, needs_reply, origin }) => {
+    const { agent } = current();
     const m = node.read(id, agent);
     noteRead([m]);
     const subject = /^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`.slice(0, 200);
@@ -193,6 +233,7 @@ export async function runMcp(node = new MbxNode()) {
     inputSchema: { all: z.boolean().default(false), limit: z.number().int().min(1).max(200).default(30) },
     annotations: { readOnlyHint: true },
   }, async ({ all, limit }) => {
+    const { agent } = current();
     const rows = node.inbox(agent, { all, limit });
     if (!rows.length) return text(`No ${all ? "" : "unread "}messages for ${agent}@${node.host}.`, { messages: [] });
     const lines = rows.map((m) => { const p = node.policyFor(m, agent); return `${summaryLine(m)}\n    trust: ${trustLabel(m)} · policy: ${p.level === "yolo" ? "YOLO" : p.level}${p.classes.length ? ` [${p.classes.join(", ")}]` : ""}`; });
@@ -205,7 +246,7 @@ export async function runMcp(node = new MbxNode()) {
     description: "Full content of one or more messages (ids or unique id prefixes), framed with sender verification. Read-only. Next: answer with mbx_reply if it needs one, then mbx_ack once you have dealt with it.",
     inputSchema: { ids: z.array(z.string().min(6)).min(1).max(20) },
     annotations: { readOnlyHint: true },
-  }, async ({ ids }) => { const rows = ids.map((id) => node.read(id, agent)); noteRead(rows); return text(rows.map((m) => formatFor(node, m, agent)).join("\n\n")); });
+  }, async ({ ids }) => { const { agent } = current(); const rows = ids.map((id) => node.read(id, agent)); noteRead(rows); return text(rows.map((m) => formatFor(node, m, agent)).join("\n\n")); });
 
   server.registerTool("mbx_ack", {
     title: "Acknowledge mbx messages",
@@ -213,7 +254,7 @@ export async function runMcp(node = new MbxNode()) {
     inputSchema: { ids: z.array(z.string().min(6)).min(1).max(50), note: z.string().max(500).optional(),
       did: z.string().max(200).optional().describe("if you acted on the request: one line saying what you did (goes to the owner's audit log)") },
     annotations: { idempotentHint: true },
-  }, async ({ ids, note, did }) => text(`Acked: ${ids.map((i) => node.ack(i, agent, note ?? null, did)).join(", ")}`));
+  }, async ({ ids, note, did }) => text(`Acked: ${ids.map((i) => node.ack(i, current().agent, note ?? null, did)).join(", ")}`));
 
   server.registerTool("mbx_thread", {
     title: "Show an mbx thread",
@@ -221,6 +262,7 @@ export async function runMcp(node = new MbxNode()) {
     inputSchema: { id: z.string().min(6) },
     annotations: { readOnlyHint: true },
   }, async ({ id }) => {
+    const { agent } = current();
     const m = node.message(id);
     const rows = node.thread(m && node.canSee(m, agent) ? m.thread : id, agent);
     noteRead(rows);
@@ -233,6 +275,7 @@ export async function runMcp(node = new MbxNode()) {
     inputSchema: { query: z.string().min(2).max(200), limit: z.number().int().min(1).max(50).default(10) },
     annotations: { readOnlyHint: true },
   }, async ({ query, limit }) => {
+    const { agent } = current();
     const rows = node.search(query, limit, agent);
     return text(rows.length ? rows.map(summaryLine).join("\n") : `No matches for "${query}".`, { ids: rows.map((r) => r.id) });
   });
@@ -259,10 +302,12 @@ export async function runMcp(node = new MbxNode()) {
     process.off("exit", retire);
     try {
       node.store.tx(() => {
-        node.store.db.prepare("DELETE FROM kv WHERE k=?").run(`mcp-process:${key.publicKey}`);
-        // Key-scoped cleanup cannot erase a newer connection that replaced this binding.
-        node.store.db.prepare("DELETE FROM sessions WHERE cli=? AND session_key=? AND session_id GLOB 'mcp-*'").run(env.cli, key.publicKey);
-        node.store.db.prepare("UPDATE sessions SET session_key=NULL, channel=0 WHERE cli=? AND session_key=?").run(env.cli, key.publicKey);
+        for (const { key } of [base, ...states.values()]) {
+          node.store.db.prepare("DELETE FROM kv WHERE k=?").run(`mcp-process:${key.publicKey}`);
+          // Key-scoped cleanup cannot erase a newer connection that replaced this binding.
+          node.store.db.prepare("DELETE FROM sessions WHERE cli=? AND session_key=? AND session_id GLOB 'mcp-*'").run(env.cli, key.publicKey);
+          node.store.db.prepare("UPDATE sessions SET session_key=NULL, channel=0 WHERE cli=? AND session_key=?").run(env.cli, key.publicKey);
+        }
       });
     } catch (e) { process.stderr.write(`[mbx] session cleanup failed: ${(e as Error).message}\n`); }
   };
@@ -277,6 +322,7 @@ export async function runMcp(node = new MbxNode()) {
   if (env.channel) {
     timers.push(setInterval(async () => {
       try {
+        const agent = base.agent;
         for (const mailbox of [agent, ...node.linkedNames(agent)]) {
           const rows = node.store.db.prepare(`SELECT m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state='delivered' ORDER BY m.ts`).all(mailbox) as unknown as Parameters<MbxNode["wantsWake"]>[1][];
           if (!rows.length) continue;
@@ -296,7 +342,7 @@ export async function runMcp(node = new MbxNode()) {
     }, 1500).unref());
   }
   // keep last_seen fresh while the session lives
-  timers.push(setInterval(() => { try { bind(); } catch { /* db busy */ } }, 60_000).unref());
+  timers.push(setInterval(() => { try { for (const state of [base, ...states.values()]) bind(state); } catch { /* db busy */ } }, 60_000).unref());
 }
 
 export type { Envelope };
