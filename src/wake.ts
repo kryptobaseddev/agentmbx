@@ -75,7 +75,7 @@ async function kimiBusyNow(sessions: KimiSessionRef[], f: Fetch): Promise<boolea
     const srv = kimiHostedServer(s.pid);
     if (!srv) continue;
     try {
-      const res = await f(`${srv.url}/api/v1/sessions/${encodeURIComponent(s.session_id)}/status`, { headers: { authorization: `Bearer ${srv.token}` }, signal: AbortSignal.timeout(3_000) });
+      const res = await f(`${srv.url}/api/v1/sessions/${encodeURIComponent(s.session_id)}/status`, { headers: { authorization: `Bearer ${srv.token}` }, redirect: "error", signal: AbortSignal.timeout(3_000) });
       const j = await res.json().catch(() => null) as { code?: number; data?: { busy?: boolean } } | null;
       return res.ok && j?.code === 0 && j.data?.busy === true;
     } catch { return false; }
@@ -86,18 +86,20 @@ async function kimiBusyNow(sessions: KimiSessionRef[], f: Fetch): Promise<boolea
 /** The server's configured default model alias (GET /api/v1/config), used when the session has none bound. */
 async function kimiDefaultModel(srv: KimiServer, f: Fetch): Promise<string | null> {
   try {
-    const res = await f(`${srv.url}/api/v1/config`, { headers: { authorization: `Bearer ${srv.token}` }, signal: AbortSignal.timeout(5_000) });
+    const res = await f(`${srv.url}/api/v1/config`, { headers: { authorization: `Bearer ${srv.token}` }, redirect: "error", signal: AbortSignal.timeout(5_000) });
     const j = await res.json().catch(() => null) as { code?: number; data?: { default_model?: string } } | null;
     return res.ok && j?.code === 0 && typeof j.data?.default_model === "string" && j.data.default_model ? j.data.default_model : null;
   } catch { return null; }
 }
 
 /** Is this hosted session mid-turn right now? */
-async function kimiSessionStatus(srv: KimiServer, sessionId: string, f: Fetch): Promise<{ busy?: boolean; model?: string } | { error: string }> {
-  const res = await f(`${srv.url}/api/v1/sessions/${encodeURIComponent(sessionId)}/status`, { headers: { authorization: `Bearer ${srv.token}` }, signal: AbortSignal.timeout(5_000) });
-  const j = await res.json().catch(() => null) as { code?: number; data?: { busy?: boolean; model?: string }; message?: string } | null;
-  if (!res.ok || j?.code !== 0) return { error: `status ${res.status}: ${(j?.message ?? JSON.stringify(j)).slice(0, 200)}` };
-  return j.data ?? {};
+async function kimiSessionStatus(srv: KimiServer, sessionId: string, f: Fetch): Promise<{ busy: boolean; model?: string } | { error: string }> {
+  const res = await f(`${srv.url}/api/v1/sessions/${encodeURIComponent(sessionId)}/status`, { headers: { authorization: `Bearer ${srv.token}` }, redirect: "error", signal: AbortSignal.timeout(5_000) });
+  const j = await res.json().catch(() => null) as { code?: number; data?: { busy?: boolean; model?: string }; message?: string; msg?: string } | null;
+  if (!res.ok || j?.code !== 0) return { error: `status ${res.status}: ${(j?.msg ?? j?.message ?? JSON.stringify(j)).slice(0, 200)}` };
+  if (!j.data || Array.isArray(j.data) || typeof j.data.busy !== "boolean"
+    || (j.data.model !== undefined && typeof j.data.model !== "string")) return { error: "invalid session status response" };
+  return { busy: j.data.busy, ...(j.data.model !== undefined ? { model: j.data.model } : {}) };
 }
 
 /**
@@ -123,9 +125,13 @@ export async function wakeKimi(s: KimiSessionRef, text: string, o: { server?: Ki
     const model = o.model !== undefined ? o.model : st.model ? null : await kimiDefaultModel(srv, f);
     const body: { content: { type: "text"; text: string }[]; model?: string } = { content: [{ type: "text", text }] };
     if (model) body.model = model;
-    const res = await f(`${base}/prompts`, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) });
-    const j = await res.json().catch(() => null) as { code?: number; data?: { prompt_id?: string; status?: string }; message?: string } | null;
-    if (!res.ok || j?.code !== 0) return { ok: false, via: "kimi web", error: `prompts ${res.status}: ${(j?.message ?? JSON.stringify(j)).slice(0, 200)}` };
+    const res = await f(`${base}/prompts`, { method: "POST", headers, body: JSON.stringify(body), redirect: "error", signal: AbortSignal.timeout(15_000) });
+    const j = await res.json().catch(() => null) as { code?: number; data?: { prompt_id?: string; status?: string }; message?: string; msg?: string } | null;
+    if (!res.ok || j?.code !== 0) return { ok: false, via: "kimi web", error: `prompts ${res.status}: ${(j?.msg ?? j?.message ?? JSON.stringify(j)).slice(0, 200)}` };
+    if (!j.data || Array.isArray(j.data) || typeof j.data.prompt_id !== "string" || !j.data.prompt_id.trim()
+      || !["running", "queued", "blocked"].includes(j.data.status ?? ""))
+      return { ok: false, via: "kimi web", error: "invalid prompt submission receipt" };
+    // This confirms submission, not model execution or a mailbox read/reply/ack.
     return { ok: true, via: "kimi web" };
   } catch (e) { return { ok: false, via: "kimi web", error: (e as Error).message }; }
 }
