@@ -3,7 +3,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -56,13 +57,44 @@ export function reloadFromDisk(e) {
     if (process.env[REEXEC_ENV] || !storeMismatchCode(e))
         return;
     process.stderr.write(`[mbx] ${e.message}\n[mbx] reloading mailbox tools from disk to match the upgraded store; this session keeps running.\n`);
+    handOverToFreshProcess(false);
+}
+/**
+ * Re-exec this server from disk and hand over the transport, but keep serving the current call with the
+ * loaded code: the parent's stdin is paused so every subsequent request is read by the new process alone.
+ * Used both for store upgrades and for picking up a newly deployed build without restarting the agent session.
+ */
+function handOverToFreshProcess(pauseStdin) {
     const child = spawn(process.execPath, process.argv.slice(1), { stdio: "inherit", env: { ...process.env, [REEXEC_ENV]: "1" } });
+    if (pauseStdin)
+        try {
+            process.stdin.pause();
+        }
+        catch { /* already closed */ }
     child.on("error", () => process.exit(1));
     child.on("exit", (code, signal) => { if (signal) {
         process.kill(process.pid, signal);
         return;
     } process.exit(code ?? 0); });
 }
+/** Fingerprint of the on-disk build this process loaded, injectable for tests. */
+export const codeFingerprint = (entry = codeEntry(), stat = (p) => statSync(p)) => {
+    try {
+        const s = stat(entry);
+        return `${version()}:${s.mtimeMs}:${s.size}`;
+    }
+    catch {
+        return version();
+    }
+};
+const codeEntry = () => {
+    try {
+        return fileURLToPath(new URL("./cli.js", import.meta.url));
+    }
+    catch {
+        return process.argv[1] ?? "agentmbx";
+    }
+};
 /**
  * What a failed lease claim should do about an existing holder in THIS process. A service process hosts one
  * provisional base identity (`mcp-<pid>`) plus a state per provider session id, all sharing one process; any
@@ -420,7 +452,9 @@ export async function runMcp(existing) {
         instructions: extra ? `${INSTRUCTIONS}\n${extra}` : INSTRUCTIONS,
         capabilities: env.channel ? { experimental: { "claude/channel": {} } } : {},
     });
-    // every tool first checks that a newer agentmbx hasn't upgraded the store under this long-running server
+    // every tool first checks that a newer agentmbx hasn't upgraded the store or the build under this server
+    const boot = codeFingerprint();
+    let handedOver = false;
     const register = server.registerTool.bind(server);
     server.registerTool = (name, config, cb) => {
         if (cb.constructor.name === "AsyncFunction")
@@ -432,6 +466,13 @@ export async function runMcp(existing) {
             catch (e) {
                 reloadFromDisk(e);
                 throw e;
+            }
+            // a deployed build replaced the one this server loaded: finish this call on the old code, then hand
+            // the transport to a fresh process so the session runs the new build without any restart
+            if (!handedOver && !process.env[REEXEC_ENV] && codeFingerprint() !== boot) {
+                handedOver = true;
+                process.stderr.write("[mbx] agentmbx was updated on disk; this session switches to the new build after this call.\n");
+                handOverToFreshProcess(true);
             }
             const state = contextFor(a[1]), before = { agent: state.agent, leaseToken: state.leaseToken, released: state.released, parent: state.parent, sessionId: state.sessionId };
             try {
