@@ -61,12 +61,26 @@ export const noPush = (cli: string, channel: boolean, hosted = false) => !channe
 
 const sh = (cmd: string, args: string[]) => { try { return execFileSync(cmd, args, { encoding: "utf8" }).trim(); } catch { return ""; } };
 
+/** Match the exact local server in Claude's variadic channel options, before `--`. */
+export function hasMbxChannel(args: string): boolean {
+  const tokens = args.split(/\s+/);
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i] === "--") break;
+    const flag = /^(?:--channels|--dangerously-load-development-channels)(?:=(.*))?$/.exec(tokens[i]);
+    if (!flag) continue;
+    const entries = flag[1] === undefined ? [] : [flag[1]];
+    while (/^(?:server|plugin):\S+$/.test(tokens[i + 1] ?? "")) entries.push(tokens[++i]);
+    if (entries.includes("server:mbx")) return true;
+  }
+  return false;
+}
+
 export function detectHost(ppid = process.ppid) {
   const args = sh("/bin/ps", ["-o", "args=", "-p", String(ppid)]);
   const comm = basename(sh("/bin/ps", ["-o", "comm=", "-p", String(ppid)]) || args.split(" ")[0] || "");
   const cli = process.env.MBX_CLI || (/claude/i.test(comm) || /claude/.test(args) ? "claude" : /codex/i.test(args) ? "codex"
     : /opencode/i.test(args) ? "opencode" : /kimi/i.test(args) ? "kimi" : /hermes/i.test(args) ? "hermes" : "unknown");
-  const channel = process.env.MBX_CHANNEL === "1" || (cli === "claude" && /(development-channels|--channels)\s+\S*mbx/.test(args));
+  const channel = process.env.MBX_CHANNEL === "1" || (cli === "claude" && hasMbxChannel(args));
   let sessionId = `mcp-${process.pid}`;
   const cs = join(homedir(), ".claude/sessions", `${ppid}.json`);
   if (cli === "claude" && existsSync(cs)) { try { sessionId = JSON.parse(readFileSync(cs, "utf8")).sessionId ?? sessionId; } catch { /* keep default */ } }
