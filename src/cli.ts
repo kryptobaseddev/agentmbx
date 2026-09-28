@@ -38,7 +38,7 @@ Messages
   agentmbx send --as <agent> --to <a,b,role:x,*,owner> --subject "…" [-m "body" | --body-file f | stdin]
            [--kind message|request|reply|status|decision|alert|task] [--reply-to <id>] [--needs-reply] [--ref path]…
   agentmbx inbox --as <agent> [--all] [--json] [--needs-reply] [--from <agent>]      agentmbx read <id> --as <agent>      agentmbx ack <id>… | --all | --thread <id>  --as <agent> [--note "…"]
-  agentmbx whoami --as <agent> [--role r] [--description "…"]    register/describe yourself (shell sessions)
+  agentmbx whoami --as <agent> [--role r] [--description "…"]    inspect/describe the identity leased to this caller
   agentmbx thread <id>        agentmbx search "<words>"   agentmbx agents   agentmbx status
     Mailbox reads, acknowledgements and replies require this caller’s current MCP lease.
     Use --cli <provider> --session <id> when multiple sessions share the caller. --as only selects the held name.
@@ -221,7 +221,7 @@ async function run(argv: string[]) {
   if (["inbox", "read", "ack", "thread", "search"].includes(cmd)) {
     if ((cmd === "read" || cmd === "thread") && !pos[0]) die(`${cmd} <id>`);
     if (cmd === "ack" && !pos.length && !o.all && !str("thread")) die("ack <id>… | --all | --thread <id>");
-    return withCliIdentity(node, { as: str("as") ?? process.env.MBX_AGENT, cli: str("cli"), session: str("session"),
+    return withCliIdentity(node, { as: str("as") ?? (process.env.MBX_AGENT || undefined), cli: str("cli"), session: str("session"),
       readOnly: ["inbox", "thread", "search"].includes(cmd) }, me => {
       switch (cmd) {
         case "inbox": {
@@ -271,7 +271,7 @@ async function run(argv: string[]) {
       };
       let entered = false, r: ReturnType<MbxNode["send"]>;
       try {
-        r = withCliIdentity(node, { as: str("as") ?? process.env.MBX_AGENT, cli: str("cli"), session: str("session") }, me => {
+        r = withCliIdentity(node, { as: str("as") ?? (process.env.MBX_AGENT || undefined), cli: str("cli"), session: str("session") }, me => {
           entered = true; return send(me);
         });
       } catch (error) {
@@ -288,13 +288,14 @@ async function run(argv: string[]) {
       return;
     }
     case "whoami": {
-      const name = as().split("@")[0];
-      node.registerAgent(name, { cli: str("cli") ?? "cli", role: str("role"), description: str("description") });
-      const a = node.agents().find((x) => x.name === name && x.host === node.host)!;
-      console.log(`${a.name}@${a.host}${a.role ? `  role:${a.role}` : ""}  (${a.cli ?? "?"})  unacked: ${node.unreadCount(name)}${a.description ? `\n${a.description}` : ""}`);
-      console.log(`delivery: ${node.deliveryMode(name)}`);
-      console.log(delegationNote(node.store.db, name, node.host) ?? "policy: none (ask): other agents' requests need your user's OK");
-      return;
+      const edit = str("role") !== undefined || str("description") !== undefined;
+      return withCliIdentity(node, { as: str("as") ?? (process.env.MBX_AGENT || undefined), cli: str("cli"), session: str("session"), readOnly: !edit }, name => {
+        if (edit) node.registerAgent(name, { role: str("role"), description: str("description") });
+        const a = node.agents().find(x => x.name === name && x.host === node.host);
+        console.log(`${name}@${node.host}${a?.role ? `  role:${a.role}` : ""}  (${a?.cli ?? "?"})  unacked: ${node.unreadCount(name)}${a?.description ? `\n${a.description}` : ""}`);
+        console.log(`delivery: ${node.deliveryMode(name)}`);
+        console.log(delegationNote(node.store.db, name, node.host) ?? "policy: none (ask): other agents' requests need your user's OK");
+      });
     }
     case "agents": {
       const live = node.liveAgents();
@@ -304,21 +305,19 @@ async function run(argv: string[]) {
       const sid = str("session");
       if (sid) {
         const cli = str("cli") ?? die("status --session requires --cli <provider>");
-        const s = node.store.db.prepare("SELECT agent, pid, pid_start, updated_at FROM sessions WHERE cli=? AND session_id=?")
-          .get(cli, sid) as { agent: string; pid: number | null; pid_start: string | null; updated_at: string } | undefined;
-        if (!s?.pid || !node.sameSession(s.pid, s)) return die("no live bound session for this provider and session id");
-        const agent = node.agentFor(cli, s.pid) ?? s.agent;
-        const mailboxes = [agent, ...node.linkedNames(agent)];
-        const counts = mailboxes.map((name) => node.store.db.prepare(`SELECT count(*) unread,
-          coalesce(sum(json_extract(m.envelope, '$.needs_reply') = 1), 0) needs_reply,
-          coalesce(sum(json_extract(m.authority, '$.ok') = 1), 0) owner_authority
-          FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state <> 'acked'`).get(name) as
-          { unread: number; needs_reply: number; owner_authority: number });
-        const out = { agent, host: node.host, address: `${agent}@${node.host}`, cli, session_id: sid, mailboxes,
-          unread: counts.reduce((sum, c) => sum + c.unread, 0), needs_reply: counts.reduce((sum, c) => sum + c.needs_reply, 0),
-          owner_authority: counts.reduce((sum, c) => sum + c.owner_authority, 0),
-          outbox: (node.store.db.prepare("SELECT count(*) n FROM outbox").get() as { n: number }).n };
-        return console.log(o.json ? JSON.stringify(out) : `${out.address}: ${out.unread} unread · ${out.needs_reply} needs reply · ${out.owner_authority} owner · ${out.outbox} outbox`);
+        return withCliIdentity(node, { as: str("as") ?? (process.env.MBX_AGENT || undefined), cli, session: sid, readOnly: true }, agent => {
+          const mailboxes = [agent];
+          const counts = mailboxes.map((name) => node.store.db.prepare(`SELECT count(*) unread,
+            coalesce(sum(json_extract(m.envelope, '$.needs_reply') = 1), 0) needs_reply,
+            coalesce(sum(json_extract(m.authority, '$.ok') = 1), 0) owner_authority
+            FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state <> 'acked'`).get(name) as
+            { unread: number; needs_reply: number; owner_authority: number });
+          const out = { agent, host: node.host, address: `${agent}@${node.host}`, cli, session_id: sid, mailboxes,
+            unread: counts.reduce((sum, c) => sum + c.unread, 0), needs_reply: counts.reduce((sum, c) => sum + c.needs_reply, 0),
+            owner_authority: counts.reduce((sum, c) => sum + c.owner_authority, 0),
+            outbox: (node.store.db.prepare("SELECT count(*) n FROM outbox").get() as { n: number }).n };
+          return console.log(o.json ? JSON.stringify(out) : `${out.address}: ${out.unread} unread · ${out.needs_reply} needs reply · ${out.owner_authority} owner · ${out.outbox} outbox`);
+        });
       }
       const q = (sql: string) => (node.store.db.prepare(sql).get() as { n: number }).n;
       console.log(`host ${node.host} (${fingerprint(node.key.publicKey)})  owner ${node.ownerPub ? fingerprint(node.ownerPub) : "none"}
