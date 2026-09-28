@@ -1,5 +1,6 @@
 // The signed message envelope, owner grants, and the body metadata parser.
 import { canonical, fingerprint, nonce, sha256, signData, ulid, verifyData } from "./crypto.ts";
+import { checkEnc, type EncBody } from "./body-encryption.ts";
 
 export const KINDS = ["message", "request", "reply", "status", "decision", "alert", "task"] as const;
 export type Kind = (typeof KINDS)[number];
@@ -24,7 +25,7 @@ export type Authority = { grant: Grant; session_sig: string; owner_sig?: undefin
 export interface Envelope {
   v: 3; id: string; ts: string; from: string; to: string[]; thread: string; reply_to: string | null;
   kind: Kind; subject: string; body: string; needs_reply: boolean; refs: string[]; meta: Meta;
-  authority: Authority | null; enc: null;
+  authority: Authority | null; enc: EncBody | null;
   sig?: { alg: "ed25519"; host: string; key: string; value: string };
 }
 
@@ -86,7 +87,8 @@ export function checkShape(x: unknown): string | null {
   if (e.reply_to !== null && typeof e.reply_to !== "string") return "bad reply_to";
   if (typeof e.needs_reply !== "boolean") return "bad needs_reply";
   if (!Array.isArray(e.refs) || e.refs.some(value => typeof value !== "string")) return "bad refs";
-  if (e.enc !== null) return "unsupported enc";
+  if (e.enc === undefined) return "bad enc";
+  if (e.enc !== null) return checkEnc(e.enc);
   const a = e.authority;
   if (a !== null) {
     if (!a || typeof a !== "object" || Array.isArray(a)) return "bad authority";
