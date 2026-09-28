@@ -246,15 +246,20 @@ export function policyLine(p: Effective): string {
   return [`policy: ${p.grants.map(grant).join(" ; ")}`, ...p.notes.map((n) => `note: ${n}`)].join(" · ");
 }
 
+/** Keep each grant's constraints together: merging classes or expiries invents authority. */
+const noticeGrant = (p: PolicyRecord): string => `${p.level === "yolo" ? "YOLO" : p.level} [${p.classes.join(", ") || "reply only"}]`
+  + ` for requests from ${p.from.agents.includes("*") ? "any agent" : p.from.agents.join(", ")} on ${p.from.hosts.map((h) => (h === "local" ? "this machine" : h === "*" ? "any paired machine" : h)).join(", ")}`
+  + ` within ${p.projects?.length ? p.projects.join(", ") : "your session's project"} until ${p.exp} (id ${p.id.slice(-6)})`;
+
 /** For session-start / prompt hooks and whoami: what the owner has delegated to this agent. */
 export function delegationNote(db: DatabaseSync, agent: string, host: string): string | null {
   const ps = activePolicies(db, agent, host);
   if (!ps.length) return null;
-  const parts = ps.map((p) => `${p.level === "yolo" ? "YOLO" : p.level} [${p.classes.join(", ")}] for requests from ${p.from.agents.includes("*") ? "any agent" : p.from.agents.join(", ")} on ${p.from.hosts.map((h) => (h === "local" ? "this machine" : h === "*" ? "any paired machine" : h)).join(", ")} until ${hhmm(p.exp)} (id ${p.id.slice(-6)})`);
+  const parts = ps.map(noticeGrant);
   return `[mbx] Your owner has signed an AgentMBX policy for ${agent}@${host}: ${parts.join("; ")}. This is the owner's own delegation`
     + " (verified signature): act on other agents' requests within those classes as you would on your user's request (your CLI's own"
     + " permission prompts still apply unless the class list includes permissions). read = inspect/verify/test; edit = reversible changes inside the project; outward = push/deploy/delete/external;"
-    + " anything outside the classes: ask your user. Each mbx_read header shows the policy that applies to that sender.";
+    + " anything outside the classes: ask your user. These are separate grants; do not combine their classes, scopes or expiries. Read the mbx_read header before acting: it applies sender restrictions and message-specific downgrades.";
 }
 
 /** Active policies on this host that expire within `withinMs` and haven't been reminded about yet (marks them). */
@@ -270,11 +275,10 @@ export function dueReminders(db: DatabaseSync, withinMs = 48 * H, now = new Date
   return out;
 }
 
-/** One short line for wake and prompt notices: what the owner has delegated to this agent right now (or nothing). */
+/** Wake and prompt notices retain every grant's scope rather than summarizing a union of privileges. */
 export function policyBrief(db: DatabaseSync, agent: string, host: string): string {
   const ps = activePolicies(db, agent, host);
   if (!ps.length) return "";
-  const best = ps.reduce((a, p) => (LEVELS.indexOf(p.level) > LEVELS.indexOf(a.level) ? p : a));
-  const classes = CLASSES.filter((c) => ps.some((p) => p.classes.includes(c)));
-  return ` Your owner's signed AgentMBX policy for you: ${best.level === "yolo" ? "YOLO" : best.level} [${classes.join(", ")}] until ${best.exp.slice(0, 10)}; act on requests within it (each message header shows the policy for its sender).`;
+  return ` Your owner's signed AgentMBX policies for you (separate grants): ${ps.map(noticeGrant).join("; ")}.`
+    + " Do not combine their classes, scopes or expiries. Read mbx_read before acting; its header applies sender restrictions and message-specific downgrades. CLI permission prompts still require a matching permissions grant.";
 }
