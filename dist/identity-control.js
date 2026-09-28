@@ -8,14 +8,15 @@ import { canonical, sha256 } from "./crypto.js";
 import { NAME_RE } from "./envelope.js";
 import { inspectLeaseProcess } from "./identity-leases.js";
 import { procTable, withProcSnapshot } from "./proc.js";
+import { identityTakeoverApprovalSchema } from "./identity-takeover.js";
 import { SCHEMA_VERSION } from "./store.js";
 const pid = z.number().int().positive(), label = z.string().min(1).max(300);
 const descriptorSchema = z.object({ v: z.literal(1), cli: label, session_id: label, control_key: label,
     mcp_pid: pid, mcp_start: label, parent_pid: pid, parent_start: label, agent: z.string().regex(NAME_RE),
     generation: z.string().regex(/^[a-f0-9]{64}$/).nullable() }).strict();
-const requestSchema = z.object({ v: z.literal(1), id: z.string().uuid(), action: z.enum(["claim", "release"]),
-    name: z.string().regex(NAME_RE).optional(), target: descriptorSchema, requester_pid: pid, requester_start: label,
-    created_at: z.number().int().nonnegative(), expires_at: z.number().int().nonnegative(), status: z.literal("pending") }).strict();
+const requestSchema = z.object({ v: z.literal(1), id: z.string().uuid(), action: z.enum(["claim", "release", "takeover"]),
+    name: z.string().regex(NAME_RE).optional(), approval: identityTakeoverApprovalSchema.optional(), target: descriptorSchema, requester_pid: pid, requester_start: label,
+    created_at: z.number().int().nonnegative(), expires_at: z.number().int().nonnegative(), status: z.literal("pending") }).strict().refine(r => r.action === "takeover" ? !!r.name && !!r.approval : !r.approval, "takeover requires a name and owner approval; other actions cannot carry approval");
 const fail = (message) => Object.assign(new Error(message), { code: "IDENTITY_CONTROL_REFUSED" });
 export const identityControlKey = (cli, sessionId) => `identity-control:${sha256(canonical([cli, sessionId]))}`;
 export const identityRequestKey = (id) => `identity-request:${z.string().uuid().parse(id)}`;
@@ -70,14 +71,14 @@ export function inspectIdentityControlCaller(target, requesterPid, requesterStar
     return { at, valid: related && requester.alive === true && requester.start === requesterStart
             && parent.alive === true && parent.start === target.parent_start && mcp.alive === true && mcp.start === target.mcp_start };
 }
-export function submitIdentityControl(store, target, action, name) {
+export function submitIdentityControl(store, target, action, name, approval) {
     if (action === "release" && name)
         throw fail("release does not accept a target name");
     const requester = inspectLeaseProcess(process.pid);
     if (requester.alive !== true || !requester.start)
         throw fail("cannot verify requester process identity");
     const proof = inspectIdentityControlCaller(target, process.pid, requester.start), now = Date.now();
-    const request = requestSchema.parse({ v: 1, id: randomUUID(), action, ...(name ? { name } : {}), target,
+    const request = requestSchema.parse({ v: 1, id: randomUUID(), action, ...(name ? { name } : {}), ...(approval ? { approval } : {}), target,
         requester_pid: process.pid, requester_start: requester.start, created_at: now, expires_at: now + 10_000, status: "pending" });
     return store.tx(() => {
         if (!proof.valid || performance.now() - proof.at > 5000)

@@ -1,0 +1,94 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { canonical, generateKeyPair, signData } from "../src/crypto.ts";
+import { MbxNode } from "../src/node.ts";
+import { IdentityLeases, inspectLeaseProcess } from "../src/identity-leases.ts";
+import { applyIdentityTakeover, buildIdentityTakeover, type IdentityTakeoverPayload } from "../src/identity-takeover.ts";
+import type { IdentityControlDescriptor } from "../src/identity-control.ts";
+
+function setup(t: { after: (fn: () => void) => void }) {
+  const home = mkdtempSync(join(tmpdir(), "mbx-takeover-")), node = new MbxNode(home, { host: "alpha" }), owner = generateKeyPair();
+  writeFileSync(join(home, "owner.json"), JSON.stringify({ v: 1, backend: "keychain", public_key: owner.publicKey }), { mode: 0o600 });
+  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true }); });
+  const leases = new IdentityLeases(node.store, { inspect: () => ({ alive: true, start: "fixture" }) });
+  const old = leases.claim("occupied", { pid: process.pid, start: "fixture", keyFp: "1111-1111-1111-1111", cli: "claude", sessionId: "old" });
+  const claimant: IdentityControlDescriptor = { v: 1, cli: "codex", session_id: "new", control_key: "2222-2222-2222-2222",
+    mcp_pid: process.pid, mcp_start: "fixture", parent_pid: process.ppid, parent_start: "fixture", agent: "detached", generation: null };
+  const payload = buildIdentityTakeover(node, claimant, "occupied");
+  const sign = (p: IdentityTakeoverPayload) => ({ payload: p, sig: signData(owner.privateKey, canonical(p)) });
+  const replace = () => leases.claim("occupied", { pid: process.pid, start: "fixture", keyFp: claimant.control_key, cli: claimant.cli, sessionId: claimant.session_id });
+  const run = (p = payload, operation = replace) => leases.prepare(["occupied"], [process.pid], () => applyIdentityTakeover(node, leases, sign(p), claimant, operation));
+  return { home, node, owner, leases, old, claimant, payload, sign, replace, run };
+}
+
+test("signed takeover preserves history, fences the old holder, and is single use", t => {
+  const { node, leases, old, payload, run } = setup(t);
+  node.send({ from: "sender", to: ["occupied"], subject: "history", body: "kept" });
+  const messages = node.store.db.prepare("SELECT * FROM messages").all();
+  const next = run(); assert.notEqual(next.token, old.token);
+  assert.throws(() => leases.withHeld("occupied", old.token, () => {}), { code: "IDENTITY_LEASE_LOST" });
+  assert.deepEqual(node.store.db.prepare("SELECT * FROM messages").all(), messages);
+  assert.equal(node.unreadCount("occupied"), 1);
+  assert.ok(node.store.get(`identity-takeover-used:${payload.id}`));
+  assert.throws(() => run(), /already used/);
+});
+
+test("takeover failures preserve the old generation and do not consume approval", t => {
+  const { node, leases, old, claimant, payload, sign, replace, run } = setup(t);
+  const before = () => node.store.db.prepare("SELECT * FROM identity_leases WHERE name='occupied'").get();
+  const initial = before();
+  for (const p of [{ ...payload, expires_at: Date.now() - 1 }, { ...payload, host: "other" },
+    { ...payload, claimant_session: "other" }, { ...payload, previous: { ...payload.previous, generation: "0".repeat(64) } }]) {
+    assert.throws(() => run(p)); assert.deepEqual(before(), initial);
+  }
+  assert.throws(() => applyIdentityTakeover(node, leases, { payload, sig: signData(generateKeyPair().privateKey, canonical(payload)) }, claimant, replace), /signature/);
+  assert.throws(() => applyIdentityTakeover(node, leases, { ...sign(payload), payload: { ...payload, name: "other" } }, claimant, replace), /signature/);
+  assert.throws(() => run(payload, () => { replace(); throw new Error("receipt failure"); }), /receipt failure/);
+  assert.deepEqual(before(), initial); assert.equal(node.store.get(`identity-takeover-used:${payload.id}`), undefined);
+  assert.equal(leases.withHeld("occupied", old.token, () => true), true);
+  assert.throws(() => run(payload, () => old), /did not install/); assert.deepEqual(before(), initial);
+  assert.notEqual(run().token, old.token, "rollback leaves approval usable for the unchanged generation");
+});
+
+for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI owner-approved takeover reaches the existing MCP holder`, async t => {
+  const client = new Client({ name: cli, version: "test" });
+  t.after(async () => { await client.close(); });
+  const { home, node, owner } = setup(t);
+  const helper = join(home, "fake-owner-helper.mjs"), crypto = new URL("../src/crypto.ts", import.meta.url).href;
+  writeFileSync(join(home, "fixture-key.json"), JSON.stringify(owner), { mode: 0o600 });
+  writeFileSync(helper, `#!/usr/bin/env node\nimport {readFileSync} from 'node:fs'; import {signData} from ${JSON.stringify(crypto)};
+    const [cmd,file]=process.argv.slice(2); if(cmd!=='sign') process.exit(5);
+    const key=JSON.parse(readFileSync(new URL('./fixture-key.json',import.meta.url),'utf8'));
+    console.log(signData(key.privateKey,readFileSync(file,'utf8')));`, { mode: 0o700 });
+  // Replace the fixture holder with a real process birth proof so ordinary claim detects it as held.
+  const start = inspectLeaseProcess(process.pid).start!;
+  node.store.db.prepare("UPDATE identity_leases SET holder_start=? WHERE name='occupied'").run(start);
+  const old = node.store.db.prepare("SELECT token FROM identity_leases WHERE name='occupied'").get()!.token;
+  const transport = new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
+    env: { ...process.env, MBX_HOME: home, MBX_AGENT: "destination", MBX_CLI: cli, AGENTMBX_DEV: "1" } as Record<string,string> });
+  await client.connect(transport);
+  const meta = cli === "codex" ? { threadId: "44444444-4444-4444-8444-444444444444" } : cli === "opencode" ? { sessionID: "ses_takeover" } : undefined;
+  const call = (name: string, args: Record<string,unknown> = {}) => client.callTool({ name, arguments: args, ...(meta ? { _meta: meta } : {}) });
+  const me = (await call("mbx_whoami")).structuredContent as { agent: string };
+  const sid = node.store.db.prepare("SELECT session_id FROM sessions WHERE agent=? AND session_key IS NOT NULL").get(me.agent)!.session_id as string;
+  const history = node.send({ from: "sender", to: ["occupied"], subject: "history", body: "kept" }).envelope.id;
+  assert.notEqual((await call("mbx_identity", { action: "release" })).isError, true);
+  assert.equal((await call("mbx_identity", { action: "claim", name: "occupied" })).isError, true);
+  const invoke = (force: boolean) => spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "identity", "takeover", "occupied", ...(force ? ["--force"] : []), "--cli", cli, "--session", sid, "--json"], {
+    encoding: "utf8", timeout: 10000, env: { ...process.env, MBX_HOME: home, MBX_AUTH_HELPER: helper, AGENTMBX_DEV: "1" },
+  });
+  assert.equal(invoke(false).status, 2);
+  const result = invoke(true); assert.equal(result.status, 0, result.stderr + result.stdout);
+  assert.equal(JSON.parse(result.stdout).status, "completed");
+  assert.equal(JSON.parse(result.stdout).result.agent, "occupied");
+  assert.ok(!result.stdout.includes(old as string));
+  assert.equal(((await call("mbx_whoami")).structuredContent as { agent: string }).agent, "occupied");
+  assert.equal(node.inbox("occupied")[0].id, history);
+  assert.equal(node.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE name='occupied'").get()!.holder_pid, transport.pid);
+});

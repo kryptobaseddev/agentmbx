@@ -13,6 +13,7 @@ import { fingerprint, generateKeyPair } from "./crypto.ts";
 import { KINDS, NAME_RE, type Envelope, type Grant } from "./envelope.ts";
 import { kimiHostedServer } from "./kimi-web.ts";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess } from "./identity-leases.ts";
+import { applyIdentityTakeover, type IdentityTakeoverApproval } from "./identity-takeover.ts";
 import { listIdentityStatus } from "./identity-status.ts";
 import { consumeIdentityControl, identityControlAliases, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl, type IdentityControlDescriptor } from "./identity-control.ts";
 import { formatFor, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
@@ -316,8 +317,15 @@ export async function runMcp(node = new MbxNode()) {
     open_threads: Number(node.store.db.prepare("SELECT COUNT(DISTINCT m.thread) n FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state<>'acked'").get(agent)!.n),
     recent_notes: node.store.db.prepare("SELECT msg_id,note,updated_at FROM deliveries WHERE agent=? AND note IS NOT NULL ORDER BY updated_at DESC LIMIT 3").all(agent) });
 
-  const identityOperation = ({ action, name }: { action: "list" | "claim" | "release"; name?: string }) => {
+  const identityOperation = ({ action, name, approval, target: controlTarget }: { action: "list" | "claim" | "release" | "takeover"; name?: string; approval?: IdentityTakeoverApproval; target?: IdentityControlDescriptor }): ReturnType<typeof text> => {
     const state = current();
+    if (action === "takeover") {
+      if (!name || !approval || approval.payload.name !== name || !controlTarget) throw new Error("takeover requires exact owner approval");
+      if (!state.released || state.leaseToken) throw new Error("release the current identity before takeover");
+      const descriptor = controlDescriptor(state, controlTarget.session_id);
+      if (!descriptor) throw new Error("takeover destination process evidence is unavailable");
+      return applyIdentityTakeover(node, leases, approval, descriptor, () => identityOperation({ action: "claim", name }));
+    }
     if (action !== "claim" && name) throw new Error("name is only valid for identity claim");
     if (action === "list") { const result = listIdentityStatus(node.home); return text(JSON.stringify(result, null, 2), result); }
     if (action === "release") {

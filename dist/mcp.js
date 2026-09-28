@@ -13,6 +13,7 @@ import { fingerprint, generateKeyPair } from "./crypto.js";
 import { KINDS, NAME_RE } from "./envelope.js";
 import { kimiHostedServer } from "./kimi-web.js";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess } from "./identity-leases.js";
+import { applyIdentityTakeover } from "./identity-takeover.js";
 import { listIdentityStatus } from "./identity-status.js";
 import { consumeIdentityControl, identityControlAliases, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl } from "./identity-control.js";
 import { formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
@@ -361,8 +362,18 @@ export async function runMcp(node = new MbxNode()) {
     const handoff = (agent) => ({ agent, address: `${agent}@${node.host}`, unread: node.unreadCount(agent),
         open_threads: Number(node.store.db.prepare("SELECT COUNT(DISTINCT m.thread) n FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state<>'acked'").get(agent).n),
         recent_notes: node.store.db.prepare("SELECT msg_id,note,updated_at FROM deliveries WHERE agent=? AND note IS NOT NULL ORDER BY updated_at DESC LIMIT 3").all(agent) });
-    const identityOperation = ({ action, name }) => {
+    const identityOperation = ({ action, name, approval, target: controlTarget }) => {
         const state = current();
+        if (action === "takeover") {
+            if (!name || !approval || approval.payload.name !== name || !controlTarget)
+                throw new Error("takeover requires exact owner approval");
+            if (!state.released || state.leaseToken)
+                throw new Error("release the current identity before takeover");
+            const descriptor = controlDescriptor(state, controlTarget.session_id);
+            if (!descriptor)
+                throw new Error("takeover destination process evidence is unavailable");
+            return applyIdentityTakeover(node, leases, approval, descriptor, () => identityOperation({ action: "claim", name }));
+        }
         if (action !== "claim" && name)
             throw new Error("name is only valid for identity claim");
         if (action === "list") {

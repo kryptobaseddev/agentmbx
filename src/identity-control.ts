@@ -9,6 +9,7 @@ import { NAME_RE } from "./envelope.ts";
 import { inspectLeaseProcess } from "./identity-leases.ts";
 import { procTable, withProcSnapshot } from "./proc.ts";
 import type { Store } from "./store.ts";
+import { identityTakeoverApprovalSchema, type IdentityTakeoverApproval } from "./identity-takeover.ts";
 import { SCHEMA_VERSION } from "./store.ts";
 
 const pid = z.number().int().positive(), label = z.string().min(1).max(300);
@@ -16,9 +17,9 @@ const descriptorSchema = z.object({ v: z.literal(1), cli: label, session_id: lab
   mcp_pid: pid, mcp_start: label, parent_pid: pid, parent_start: label, agent: z.string().regex(NAME_RE),
   generation: z.string().regex(/^[a-f0-9]{64}$/).nullable() }).strict();
 export type IdentityControlDescriptor = z.infer<typeof descriptorSchema>;
-const requestSchema = z.object({ v: z.literal(1), id: z.string().uuid(), action: z.enum(["claim", "release"]),
-  name: z.string().regex(NAME_RE).optional(), target: descriptorSchema, requester_pid: pid, requester_start: label,
-  created_at: z.number().int().nonnegative(), expires_at: z.number().int().nonnegative(), status: z.literal("pending") }).strict();
+const requestSchema = z.object({ v: z.literal(1), id: z.string().uuid(), action: z.enum(["claim", "release", "takeover"]),
+  name: z.string().regex(NAME_RE).optional(), approval: identityTakeoverApprovalSchema.optional(), target: descriptorSchema, requester_pid: pid, requester_start: label,
+  created_at: z.number().int().nonnegative(), expires_at: z.number().int().nonnegative(), status: z.literal("pending") }).strict().refine(r => r.action === "takeover" ? !!r.name && !!r.approval : !r.approval, "takeover requires a name and owner approval; other actions cannot carry approval");
 export type IdentityControlRequest = z.infer<typeof requestSchema>;
 export type IdentityControlReceipt = Omit<IdentityControlRequest, "status"> & {
   status: "pending" | "completed" | "failed"; completed_at?: number; result?: unknown; error?: string;
@@ -70,12 +71,12 @@ export function inspectIdentityControlCaller(target: IdentityControlDescriptor, 
     && parent.alive === true && parent.start === target.parent_start && mcp.alive === true && mcp.start === target.mcp_start };
 }
 
-export function submitIdentityControl(store: Store, target: IdentityControlDescriptor, action: "claim" | "release", name?: string): IdentityControlRequest {
+export function submitIdentityControl(store: Store, target: IdentityControlDescriptor, action: "claim" | "release" | "takeover", name?: string, approval?: IdentityTakeoverApproval): IdentityControlRequest {
   if (action === "release" && name) throw fail("release does not accept a target name");
   const requester = inspectLeaseProcess(process.pid);
   if (requester.alive !== true || !requester.start) throw fail("cannot verify requester process identity");
   const proof = inspectIdentityControlCaller(target, process.pid, requester.start), now = Date.now();
-  const request = requestSchema.parse({ v: 1, id: randomUUID(), action, ...(name ? { name } : {}), target,
+  const request = requestSchema.parse({ v: 1, id: randomUUID(), action, ...(name ? { name } : {}), ...(approval ? { approval } : {}), target,
     requester_pid: process.pid, requester_start: requester.start, created_at: now, expires_at: now + 10_000, status: "pending" });
   return store.tx(() => {
     if (!proof.valid || performance.now() - proof.at > 5000) throw fail("run this command inside the selected provider session; its process ancestry could not be verified");

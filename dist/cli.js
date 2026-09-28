@@ -22,6 +22,7 @@ import { dispatchWakes, inboxCommand, macNotifierPath, notifyDesktop, opencodeSe
 import { kimiHostedServer } from "./kimi-web.js";
 import { approveKimi, decidePermission, opencodePermissionPass } from "./permission.js";
 import { listIdentityStatus } from "./identity-status.js";
+import { buildIdentityTakeover } from "./identity-takeover.js";
 import { findIdentityControl, identityControlReceipt, resolveIdentityControlReceipt, submitIdentityControl } from "./identity-control.js";
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
 
@@ -40,6 +41,7 @@ Messages
   agentmbx identity list [--json]               inspect local identity holders, unread counts and recovery status (read-only)
   agentmbx identity claim [name] --cli <provider> --session <id> [--wait-ms 5000] [--json]
   agentmbx identity release --cli <provider> --session <id> [--wait-ms 5000] [--json]
+  agentmbx identity takeover <name> --force --cli <provider> --session <id>   replace a holder after owner signature
   agentmbx identity result <request-id> [--json] inspect a receipt and finalize expiry; pending means outcome unknown (exit 75)
 
 Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …' line it prints on the other)
@@ -124,7 +126,7 @@ async function run(argv) {
     if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h")
         return console.log(HELP);
     const { values: o, positionals: pos } = parseArgs({ args: rest, allowPositionals: true, strict: cmd !== "hook" && cmd !== "mcp", options: {
-            help: { type: "boolean", short: "h" },
+            help: { type: "boolean", short: "h" }, force: { type: "boolean" },
             as: { type: "string" }, to: { type: "string" }, subject: { type: "string" }, m: { type: "string", short: "m" },
             "body-file": { type: "string" }, kind: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" },
             ref: { type: "string", multiple: true }, all: { type: "boolean" }, json: { type: "boolean" }, note: { type: "string" },
@@ -191,7 +193,9 @@ async function run(argv) {
                 throw Object.assign(new Error("no identity request with that id"), { code: "NOT_FOUND" });
             return outputReceipt(receipt);
         }
-        if ((pos[0] === "claim" && pos.length <= 2) || (pos[0] === "release" && pos.length === 1)) {
+        if ((pos[0] === "claim" && pos.length <= 2) || (pos[0] === "release" && pos.length === 1) || (pos[0] === "takeover" && pos.length === 2)) {
+            if (pos[0] === "takeover" && !o.force)
+                die("identity takeover requires --force and an owner signature");
             const cli = str("cli") ?? die("identity commands require --cli and --session"), sid = str("session") ?? die("identity commands require --cli and --session");
             const wait = Number(str("wait-ms") ?? 5000);
             if (!Number.isSafeInteger(wait) || wait < 0 || wait > 10_000)
@@ -200,7 +204,14 @@ async function run(argv) {
                 throw Object.assign(new Error("mailbox is not initialized"), { code: "NOT_FOUND" });
             const node = new MbxNode();
             try {
-                const request = submitIdentityControl(node.store, findIdentityControl(node.store, cli, sid), pos[0], pos[1]);
+                const target = findIdentityControl(node.store, cli, sid);
+                let approval;
+                if (pos[0] === "takeover") {
+                    const payload = buildIdentityTakeover(node, target, pos[1]);
+                    const summary = `Take over ${payload.name}@${payload.host} (host key ${payload.host_fp}) from ${payload.previous.cli} session ${payload.previous.session_id} (key ${payload.previous.key_fp}, generation ${payload.previous.generation}, PID ${payload.previous.pid}, birth ${payload.previous.start}) to ${payload.claimant_cli} session ${payload.claimant_session} (key ${payload.claimant_key}, binding ${payload.claimant_hash}). The previous session loses access; mail is preserved. Approval expires ${new Date(payload.expires_at).toISOString()}.`;
+                    approval = { payload, sig: (await ownerSignCanonical(node.home, canonical(payload), summary)).sig };
+                }
+                const request = submitIdentityControl(node.store, target, pos[0], pos[1], approval);
                 process.stderr.write(`Identity request ${request.id} submitted; inspect with agentmbx identity result ${request.id}\n`);
                 const deadline = Date.now() + wait;
                 let receipt = request;
@@ -219,7 +230,7 @@ async function run(argv) {
                 node.close();
             }
         }
-        die("identity list | claim [name] --cli <provider> --session <id> | release --cli <provider> --session <id> | result <request-id>");
+        die("identity list | claim [name] --cli <provider> --session <id> | release --cli <provider> --session <id> | takeover <name> --force --cli <provider> --session <id> | result <request-id>");
     }
     const node = new MbxNode();
     // Inside an agent session (a hook-bound or MCP-bound CLI up the process tree) the session's own name is the default,
