@@ -556,15 +556,23 @@ export class MbxNode {
 
   /** `did`: what the agent did on this message's request; recorded in the audit log with the policy that allowed it. */
   ack(id: string, agent: string, note: string | null = null, did?: string) {
-    const m = this.message(id);
-    if (!m || !this.canSee(m, agent)) throw Object.assign(new Error(`no message ${id}`), { code: "NOT_FOUND" });
-    this.store.setDelivery(m.id, agent, "read");
-    this.store.setDelivery(m.id, agent, "acked", note);
-    if (did) {
-      const p = this.policyFor(m, agent);
-      this.store.audit("peer_action", { agent, msg: m.id, thread: m.thread, from: m.from_addr, did: did.slice(0, 200), level: p.level, classes: p.classes, policies: p.ids });
-    }
-    return m.id;
+    return this.store.tx(() => {
+      const m = this.message(id);
+      if (!m || !this.canSee(m, agent)) throw Object.assign(new Error(`no message ${id}`), { code: "NOT_FOUND" });
+      const delivered = (name: string) => !!this.store.db.prepare("SELECT 1 FROM deliveries WHERE msg_id=? AND agent=?").get(m.id, name);
+      // Reading a sent message is allowed, but acknowledging requires a recipient delivery.
+      // Prefer the caller's own copy; never drain additional linked copies on an idempotent retry.
+      const recipients = delivered(agent) ? [agent] : this.linkedNames(agent).filter(delivered);
+      if (!recipients.length) throw Object.assign(new Error(`message ${m.id} was not delivered to ${agent}; there is no recipient acknowledgement to record`), { code: "NOT_RECIPIENT" });
+      if (recipients.length > 1) throw Object.assign(new Error(`message ${m.id} has multiple linked recipients (${recipients.join(", ")}); choose one with agentmbx ack --as <recipient> ${m.id}`), { code: "AMBIGUOUS_RECIPIENT" });
+      const recipient = recipients[0];
+      this.store.setDelivery(m.id, recipient, "acked", note);
+      if (did) {
+        const p = this.policyFor(m, agent);
+        this.store.audit("peer_action", { agent, recipient, msg: m.id, thread: m.thread, from: m.from_addr, did: did.slice(0, 200), level: p.level, classes: p.classes, policies: p.ids });
+      }
+      return m.id;
+    });
   }
 
   /** The owner policy that applies to `agent` acting on this message (computed now: expiry/revocation count). */

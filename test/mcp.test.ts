@@ -209,3 +209,22 @@ test("channel mode notifies linked shell mailboxes without touching independentl
     assert.equal(n.inbox("separate")[0].id, separate);
   } finally { await c.close(); n.close(); }
 });
+
+test("MCP acknowledgement clears one linked delivery and rejects sender-only success", async () => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-mcp-ack-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  const { c } = await client(home, "primary");
+  try {
+    n.linkIdentity("shell-name", "primary");
+    const id = n.send({ from: "sender", to: ["shell-name"], subject: "linked", body: "body" }).envelope.id;
+    assert.equal((await c.callTool({ name: "mbx_read", arguments: { ids: [id] } })).isError, undefined);
+    const ack = await c.callTool({ name: "mbx_ack", arguments: { ids: [id], did: "handled linked message" } });
+    assert.equal(ack.isError, undefined);
+    assert.equal(n.unreadCount("shell-name"), 0);
+    const sent = n.send({ from: "primary", to: ["elsewhere"], subject: "sent", body: "body" }).envelope.id;
+    const denied = await c.callTool({ name: "mbx_ack", arguments: { ids: [sent] } });
+    assert.equal(denied.isError, true);
+    assert.match(textOf(denied), /not delivered/);
+    assert.equal(n.unreadCount("elsewhere"), 1);
+  } finally { await c.close(); n.close(); }
+});
