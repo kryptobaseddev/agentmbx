@@ -8,7 +8,7 @@ import { canonical, fingerprint, ulid } from "./crypto.js";
 import { buildGrant, CAPS, grantPayload } from "./envelope.js";
 import { advertise, browse, lanIPv4 } from "./discovery.js";
 import { flushOutbox, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, startServer, advertisedAddr } from "./http.js";
-import { daemonAnswers, doctor, failed, formatChecks } from "./doctor.js";
+import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.js";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
 import { ancestors, withProcSnapshot } from "./proc.js";
 import { DEFAULT_PORT, defaultHome, formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
@@ -951,9 +951,16 @@ async function setup(o, str) {
             console.log(`host already initialized; --host ignored (edit ${join(home, "config.json")} to rename)`);
         if (existsSync(join(home, "config.json"))) {
             const node = new MbxNode(home);
-            const up = await daemonAnswers(node.config.port);
-            if (up && existsSync(servicePath()))
-                console.log(`daemon: already running on port ${node.config.port}`);
+            const check = await daemonReadiness(node);
+            if (check.state === "matching") {
+                console.log(existsSync(servicePath())
+                    ? `daemon: matching AgentMBX already running on port ${node.config.port} (service definition present)`
+                    : `daemon: matching AgentMBX running on port ${node.config.port} without a service definition; stop that process before running 'agentmbx daemon install'`);
+            }
+            else if (check.state === "unverified") {
+                console.error(`daemon: ${check.label}; automatic daemon installation skipped. Run 'agentmbx doctor' and inspect the listener before installing or restarting.`);
+                process.exitCode = 1;
+            }
             else if (dryRun)
                 console.log("would install and start the daemon service");
             else {
@@ -962,6 +969,7 @@ async function setup(o, str) {
                 }
                 catch (e) {
                     console.log(`daemon: install failed (${e.message}); run 'agentmbx daemon install' later`);
+                    process.exitCode = 1;
                 }
             }
             node.close();
