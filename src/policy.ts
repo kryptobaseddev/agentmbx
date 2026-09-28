@@ -101,6 +101,26 @@ export function ownerKeys(db: DatabaseSync): string[] {
   return (db.prepare("SELECT pub FROM principals WHERE role='owner'").all() as { pub: string }[]).map((r) => r.pub);
 }
 
+function validRevocation(r: Revocation): boolean {
+  return r?.type === "revocation" && r.v === 1 && typeof r.id === "string" && !!r.id.trim()
+    && typeof r.target === "string" && !!r.target.trim() && typeof r.owner_fp === "string"
+    && typeof r.iat === "string" && Number.isFinite(Date.parse(r.iat))
+    && (r.all === undefined || (r.all === true && r.target === "*"));
+}
+
+/** Keep policy insertion and revocation effects atomic, including inside a caller's transaction. */
+function policyWrite<T>(db: DatabaseSync, write: () => T): T {
+  db.exec("SAVEPOINT mbx_policy_write");
+  try {
+    const result = write();
+    db.exec("RELEASE mbx_policy_write");
+    return result;
+  } catch (error) {
+    db.exec("ROLLBACK TO mbx_policy_write; RELEASE mbx_policy_write");
+    throw error;
+  }
+}
+
 /**
  * Verify and store a signed policy or revocation. Returns an error string, or null when stored (or already known).
  * `issuer`: the owner's own machine keeps policies it issued for other hosts too, so offline hosts can pull them later
@@ -116,13 +136,21 @@ export function acceptSigned(db: DatabaseSync, s: Signed<AnyRecord>, host: strin
     const key = (db.prepare("SELECT pub FROM principals").all() as { pub: string }[]).map((x) => x.pub).find((k) => fingerprint(k) === r.owner_fp);
     if (!key) return "not signed by an owner key this host knows";
     if (!verifySigned(s, key)) return "bad owner signature";
-    if (db.prepare("SELECT 1 FROM policy_revocations WHERE id=?").get(r.id)) return null; // already applied
-    const n = r.target === "*"
-      ? db.prepare("UPDATE policies SET revoked=1 WHERE revoked=0 AND owner_fp=? AND iat <= ?").run(r.owner_fp, r.iat).changes
-      : db.prepare("UPDATE policies SET revoked=1 WHERE id=? AND owner_fp=?").run(r.target, r.owner_fp).changes;
-    db.prepare("INSERT OR IGNORE INTO policy_revocations (id,target,iat,record,sig,received_at,owner_fp) VALUES (?,?,?,?,?,?,?)").run(r.id, r.target, r.iat, JSON.stringify(r), s.sig, now, r.owner_fp);
-    db.prepare("INSERT INTO audit (at,event,detail) VALUES (?,?,?)").run(now, "policy.revoked", JSON.stringify({ target: r.target, owner: r.owner_fp, count: n }));
-    return null;
+    if (!validRevocation(r)) return "bad revocation";
+    return policyWrite(db, () => {
+      if (db.prepare("SELECT 1 FROM policy_revocations WHERE id=?").get(r.id)) return null; // already applied
+      const targets = r.target === "*"
+        ? (db.prepare("SELECT id,iat FROM policies WHERE revoked=0 AND owner_fp=?").all(r.owner_fp) as { id: string; iat: string }[])
+          .filter(p => Date.parse(p.iat) <= Date.parse(r.iat)).map(p => p.id)
+        : [r.target];
+      const update = db.prepare("UPDATE policies SET revoked=1 WHERE id=? AND owner_fp=?");
+      let n = 0;
+      for (const id of targets) n += Number(update.run(id, r.owner_fp).changes);
+      db.prepare("INSERT OR IGNORE INTO policy_revocations (id,target,iat,record,sig,received_at,owner_fp) VALUES (?,?,?,?,?,?,?)")
+        .run(r.id, r.target, r.iat, JSON.stringify(r), s.sig, now, r.owner_fp);
+      db.prepare("INSERT INTO audit (at,event,detail) VALUES (?,?,?)").run(now, "policy.revoked", JSON.stringify({ target: r.target, owner: r.owner_fp, count: n }));
+      return null;
+    });
   }
   const key = ownerKeys(db).find((k) => fingerprint(k) === s?.rec?.owner_fp);
   if (!key) return "not signed by this host's owner";
@@ -130,11 +158,15 @@ export function acceptSigned(db: DatabaseSync, s: Signed<AnyRecord>, host: strin
   const r = s.rec, bad = checkRecord(r);
   if (bad) return bad;
   if (!o.issuer && !r.to.hosts.includes("*") && !r.to.hosts.includes(host)) return `policy is for ${r.to.hosts.join(", ")}, not ${host}`;
-  // a policy issued before a kill switch it hasn't seen stays revoked
-  const killed = db.prepare("SELECT 1 FROM policy_revocations WHERE owner_fp=? AND ((target='*' AND iat >= ?) OR target=?)").get(r.owner_fp, r.iat, r.id);
-  db.prepare(`INSERT OR IGNORE INTO policies (id,record,sig,owner_fp,iat,exp,revoked,received_at) VALUES (?,?,?,?,?,?,?,?)`)
-    .run(r.id, JSON.stringify(r), s.sig, r.owner_fp, r.iat, r.exp, killed ? 1 : 0, now);
-  return null;
+  return policyWrite(db, () => {
+    // Compare instants, not signed timestamp spellings; retain the original signed bytes.
+    const revocations = db.prepare("SELECT target,iat FROM policy_revocations WHERE owner_fp=? AND (target='*' OR target=?)")
+      .all(r.owner_fp, r.id) as { target: string; iat: string }[];
+    const killed = revocations.some(rev => rev.target === r.id || Date.parse(rev.iat) >= Date.parse(r.iat));
+    db.prepare(`INSERT OR IGNORE INTO policies (id,record,sig,owner_fp,iat,exp,revoked,received_at) VALUES (?,?,?,?,?,?,?,?)`)
+      .run(r.id, JSON.stringify(r), s.sig, r.owner_fp, r.iat, r.exp, killed ? 1 : 0, now);
+    return null;
+  });
 }
 
 /**
@@ -173,6 +205,17 @@ export function storedPolicies(db: DatabaseSync): {
   invalid: { id: string; reason: string }[];
 } {
   const keys = db.prepare("SELECT pub, role FROM principals").all() as { pub: string; role: string }[];
+  // Older versions compared timestamp text and could miss a kill switch. Derive effective
+  // revocation from retained signed evidence too, without rewriting records or cached flags.
+  const revocations: Revocation[] = [];
+  for (const row of db.prepare("SELECT record,sig FROM policy_revocations").all() as { record: string; sig: string }[]) {
+    try {
+      const rec = JSON.parse(row.record) as Revocation;
+      if (!validRevocation(rec)) continue;
+      const key = keys.find(k => fingerprint(k.pub) === rec.owner_fp);
+      if (key && verifySigned({ rec, sig: row.sig }, key.pub)) revocations.push(rec);
+    } catch { /* Malformed retained evidence cannot establish a revocation. */ }
+  }
   const valid: (Signed<PolicyRecord> & { revoked: boolean; currentOwner: boolean })[] = [];
   const invalid: { id: string; reason: string }[] = [];
   for (const row of db.prepare("SELECT id, record, sig, owner_fp, iat, exp, revoked FROM policies ORDER BY iat").all() as Row[]) {
@@ -184,7 +227,9 @@ export function storedPolicies(db: DatabaseSync): {
         throw new Error("stored metadata differs from signed policy");
       const key = keys.find(k => fingerprint(k.pub) === rec.owner_fp);
       if (!key || !verifySigned({ rec, sig: row.sig }, key.pub)) throw new Error("invalid or unknown owner signature");
-      valid.push({ rec, sig: row.sig, revoked: !!row.revoked, currentOwner: key.role === "owner" });
+      const revoked = !!row.revoked || revocations.some(r => r.owner_fp === rec.owner_fp
+        && (r.target === rec.id || (r.target === "*" && Date.parse(r.iat) >= Date.parse(rec.iat))));
+      valid.push({ rec, sig: row.sig, revoked, currentOwner: key.role === "owner" });
     } catch (e) {
       invalid.push({ id: row.id, reason: e instanceof Error ? e.message : "invalid policy record" });
     }
