@@ -179,8 +179,14 @@ export async function runMcp(node = new MbxNode()) {
         return { hop: p ? p.hop + 1 : 0, origin: origin === "external" || p?.external ? "external" : "agent", project };
     };
     const agent = base.agent;
-    const renamed = agent !== wanted ? `[mbx] This session is ${agent}@${node.host} (default name: "${wanted}"). Pick a clearer name with mbx_whoami {"name": ...} if you like.` : null;
-    const extra = [renamed, delegationNote(node.store.db, agent, node.host), noPush(env.cli, env.channel, env.cli === "kimi" && !!kimiHostedServer(env.ppid))
+    // Initialization belongs to the transport, before per-call metadata identifies its thread.
+    // Never present the provisional mailbox's identity or policy as authority for every caller.
+    const shared = env.cli === "codex" || env.cli === "opencode";
+    const renamed = !shared && agent !== wanted ? `[mbx] This session is ${agent}@${node.host} (default name: "${wanted}"). Pick a clearer name with mbx_whoami {"name": ...} if you like.` : null;
+    const delegation = shared
+        ? "[mbx] This transport can serve multiple sessions. Call mbx_whoami for your current mailbox identity and owner-signed policies. Read each mbx_read header for the policy that applies to that message; another mailbox's grant does not authorize this session."
+        : delegationNote(node.store.db, agent, node.host);
+    const extra = [renamed, delegation, noPush(env.cli, env.channel, env.cli === "kimi" && !!kimiHostedServer(env.ppid))
             ? selfWatchInstruction({ delegated: activePolicies(node.store.db, agent, node.host).length > 0 }) : null].filter(Boolean).join("\n");
     const session = () => {
         const { key } = current();
