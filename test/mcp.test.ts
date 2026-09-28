@@ -155,3 +155,30 @@ for (const hook of [false, true]) test(`MCP SIGKILL recovery ${hook ? "preserves
     } finally { await next.c.close(); }
   } finally { await first.c.close(); n.close(); }
 });
+
+for (const cli of ["claude", "codex", "kimi", "opencode"]) for (const crash of [false, true])
+  test(`${cli}: renamed mailbox survives ${crash ? "crash" : "clean"} reconnect`, async () => {
+    const home = mkdtempSync(join(tmpdir(), "mbx-resume-name-"));
+    const n = new MbxNode(home, { host: "alpha" });
+    const first = await client(home, "initial", { MBX_CLI: cli });
+    try {
+      n.bindSession({ agent: "initial", cli, session_id: "real-thread", pid: process.pid, cwd: process.cwd() });
+      await first.c.callTool({ name: "mbx_whoami", arguments: { name: "chosen" } });
+      const id = n.send({ from: "sender", to: ["chosen"], subject: "mail before reconnect", body: "preserved" }).envelope.id;
+      if (crash) {
+        const closed = new Promise<void>((resolve) => { first.c.onclose = resolve; });
+        process.kill(first.transport.pid!, "SIGKILL");
+        await closed;
+      } else await first.c.close();
+      // No explicit MBX_AGENT override on restart: resume the verified session's chosen name.
+      const next = await client(home, "", { MBX_CLI: cli });
+      try {
+        const who = (await next.c.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent: string };
+        assert.equal(who.agent, "chosen");
+        assert.match(textOf(await next.c.callTool({ name: "mbx_inbox", arguments: {} })), /mail before reconnect/);
+        assert.equal((await next.c.callTool({ name: "mbx_ack", arguments: { ids: [id] } })).isError, undefined);
+        assert.equal(n.unreadCount("chosen"), 0);
+        assert.equal(n.sessionsFor("chosen").length, 1);
+      } finally { await next.c.close(); }
+    } finally { await first.c.close(); n.close(); }
+  });

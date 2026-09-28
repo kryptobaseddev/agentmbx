@@ -124,3 +124,27 @@ for (const proof of ["live", "missing", "malformed", "invalid-pid", "unknown-bir
     }
   } finally { n.close(); }
 });
+
+for (const restore of [false, true]) test(`reconnect ${restore ? "restores a saved name without blocking later renames" : "honors an explicit name"}`, () => {
+  const n = make();
+  try {
+    n.bindSession({ agent: "saved", cli: "codex", session_id: "thread", pid: process.pid });
+    n.keepName("codex", "thread", "saved");
+    const binding = { agent: "explicit", cli: "codex", session_id: "mcp-new", pid: process.pid, session_key: "new-key" };
+    assert.equal(n.bindSession({ ...binding, restore_name: restore }), restore ? "saved" : "explicit");
+    assert.equal(n.bindSession({ ...binding, agent: "later-name" }), "later-name");
+    assert.equal(rows(n)[0].agent, "later-name");
+  } finally { n.close(); }
+});
+
+test("ambiguous saved names are not chosen by reconnect", () => {
+  const n = make();
+  try {
+    for (const name of ["one", "two"]) {
+      n.bindSession({ agent: name, cli: "codex", session_id: name, pid: process.pid });
+      n.keepName("codex", name, name);
+    }
+    assert.equal(n.bindSession({ agent: "fresh", cli: "codex", session_id: "mcp-new", pid: process.pid, session_key: "key", restore_name: true }), "fresh");
+    assert.equal(rows(n).length, 3);
+  } finally { n.close(); }
+});

@@ -176,7 +176,10 @@ export class MbxNode {
             }
             const id = s.session_key && provisional(s.session_id) && target ? target.session_id : s.session_id;
             const key = s.session_key ?? source?.session_key ?? null;
-            const agent = s.session_key ? s.agent : source?.agent ?? this.store.get(`name:${s.cli}:${id}`) ?? s.agent;
+            // Only the first default-name MCP bind may resume a remembered canonical name. Explicit
+            // MBX_AGENT and later whoami renames remain authoritative; ambiguous bindings have no target.
+            const restored = s.restore_name && target && !provisional(id) ? this.store.get(`name:${s.cli}:${id}`) : undefined;
+            const agent = s.session_key ? restored ?? s.agent : source?.agent ?? this.store.get(`name:${s.cli}:${id}`) ?? s.agent;
             const channel = s.channel === undefined ? source?.channel ?? 0 : s.channel ? 1 : 0;
             const cwd = s.cwd ?? target?.cwd ?? source?.cwd ?? null;
             db.prepare("DELETE FROM kv WHERE k=?").run(`alias:${agent}`);

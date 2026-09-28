@@ -117,7 +117,7 @@ export class MbxNode {
    * CLI process; the MCP server owns the name (mbx_whoami can rename it), so both stay under one agent. Only fresh rows of
    * a live process count, so a reused PID can't inherit a dead session's identity. Returns the agent name actually used.
    */
-  bindSession(s: { agent: string; cli: string; session_id: string; cwd?: string; pid?: number; session_key?: string; channel?: boolean; mcp_pid?: number }): string {
+  bindSession(s: { agent: string; cli: string; session_id: string; cwd?: string; pid?: number; session_key?: string; channel?: boolean; mcp_pid?: number; restore_name?: boolean }): string {
     const db = this.store.db, start = procStart(s.pid);
     return this.store.tx(() => {
       // A parent CLI can outlive a crashed MCP child. Retire only keys whose recorded child
@@ -162,7 +162,10 @@ export class MbxNode {
       }
       const id = s.session_key && provisional(s.session_id) && target ? target.session_id : s.session_id;
       const key = s.session_key ?? source?.session_key ?? null;
-      const agent = s.session_key ? s.agent : source?.agent ?? this.store.get(`name:${s.cli}:${id}`) ?? s.agent;
+      // Only the first default-name MCP bind may resume a remembered canonical name. Explicit
+      // MBX_AGENT and later whoami renames remain authoritative; ambiguous bindings have no target.
+      const restored = s.restore_name && target && !provisional(id) ? this.store.get(`name:${s.cli}:${id}`) : undefined;
+      const agent = s.session_key ? restored ?? s.agent : source?.agent ?? this.store.get(`name:${s.cli}:${id}`) ?? s.agent;
       const channel = s.channel === undefined ? source?.channel ?? 0 : s.channel ? 1 : 0;
       const cwd = s.cwd ?? target?.cwd ?? source?.cwd ?? null;
       db.prepare("DELETE FROM kv WHERE k=?").run(`alias:${agent}`);

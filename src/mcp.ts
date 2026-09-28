@@ -88,11 +88,11 @@ export async function runMcp(node = new MbxNode()) {
   // a second live session with the same default name gets a free one (T055); an explicit MBX_AGENT is used as is
   let agent = process.env.MBX_AGENT ? wanted : node.pickName(wanted, env.cli, env.ppid, env.sessionId);
   const key = generateKeyPair(); // never written anywhere
-  const bind = () => {
+  const bind = (initial = false) => {
+    agent = node.bindSession({ agent, cli: env.cli, session_id: env.sessionId, cwd: process.cwd(), pid: env.ppid, session_key: key.publicKey, channel: env.channel, mcp_pid: process.pid, restore_name: initial && !process.env.MBX_AGENT });
     node.registerAgent(agent, { cli: env.cli, role: process.env.MBX_ROLE, description: process.env.MBX_DESCRIPTION });
-    node.bindSession({ agent, cli: env.cli, session_id: env.sessionId, cwd: process.cwd(), pid: env.ppid, session_key: key.publicKey, channel: env.channel, mcp_pid: process.pid });
   };
-  bind();
+  bind(true);
   // the project this session works in (not the home folder), stamped on what it sends
   const project = (() => { const d = process.cwd(); if (resolve(d) === resolve(homedir()) || d === "/") return undefined; try { return realpathSync(d); } catch { return d; } })();
   // relay tracking: a message this session sends after reading one is one hop further, and inherits an external origin
@@ -108,7 +108,7 @@ export async function runMcp(node = new MbxNode()) {
     const p = parent && Date.now() - parent.at < 3_600_000 ? parent : null;
     return { hop: p ? p.hop + 1 : 0, origin: origin === "external" || p?.external ? "external" as const : "agent" as const, project };
   };
-  const renamed = agent !== wanted ? `[mbx] Another live session already uses "${wanted}", so this session is ${agent}@${node.host}. Pick a clearer name with mbx_whoami {"name": ...} if you like.` : null;
+  const renamed = agent !== wanted ? `[mbx] This session is ${agent}@${node.host} (default name: "${wanted}"). Pick a clearer name with mbx_whoami {"name": ...} if you like.` : null;
   const extra = [renamed, delegationNote(node.store.db, agent, node.host), noPush(env.cli, env.channel, env.cli === "kimi" && !!kimiHostedServer(env.ppid))
     ? selfWatchInstruction({ delegated: activePolicies(node.store.db, agent, node.host).length > 0 }) : null].filter(Boolean).join("\n");
 
