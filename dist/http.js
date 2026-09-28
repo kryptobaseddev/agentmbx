@@ -168,7 +168,7 @@ export function startServer(node, port = node.config.port, bind = node.config.bi
                 return send(200, localParty(node, n));
             }
             const peer = verifyHop(node, req.headers, req.method ?? "GET", url.pathname, body);
-            if (req.method === "POST" && url.pathname === "/v1/envelopes") {
+            if (req.method === "POST" && ["/v1/envelopes", "/v2/envelopes"].includes(url.pathname)) {
                 const { envelopes } = JSON.parse(body);
                 if (!Array.isArray(envelopes) || envelopes.length > 200)
                     return send(400, { error: "bad batch" });
@@ -204,9 +204,14 @@ export function startServer(node, port = node.config.port, bind = node.config.bi
 // ---- client: outbox + directory --------------------------------------------------------------
 async function post(node, addr, path, obj) {
     const body = JSON.stringify(obj);
-    const res = await fetch(`http://${addr}${path}`, { method: "POST", headers: signHop(node, "POST", path, body), body, signal: AbortSignal.timeout(15_000) });
-    if (!res.ok)
+    const res = await fetch(`http://${addr}${path}`, { method: "POST", headers: signHop(node, "POST", path, body), body, redirect: "error", signal: AbortSignal.timeout(15_000) });
+    if (!res.ok) {
+        if (path === "/v2/envelopes" && [404, 405, 501].includes(res.status)) {
+            await res.body?.cancel();
+            throw new Error("peer does not support verified-sender delivery (/v2/envelopes); upgrade the receiving AgentMBX; no legacy fallback");
+        }
         throw new Error(`${res.status} ${await res.text()}`);
+    }
     return res.json();
 }
 /** Push due outbox rows to their hosts. Network errors back off; rejections and 72 h expiry alert the sender. */
@@ -227,7 +232,9 @@ export async function flushOutbox(node, now = Date.now()) {
         try {
             if (!peer)
                 throw new Error("host is no longer paired");
-            const { results } = await post(node, peer.addr, "/v1/envelopes", { envelopes: rows.map((r) => JSON.parse(r.envelope)) });
+            // This endpoint requires sender-proof-aware receivers. Never retry via v1: older
+            // receivers can grant policy authority to unverified or missing-marker envelopes.
+            const { results } = await post(node, peer.addr, "/v2/envelopes", { envelopes: rows.map((r) => JSON.parse(r.envelope)) });
             for (const r of rows) {
                 const res = results.find((x) => x.id === r.msg_id)?.result ?? "rejected:missing result";
                 done(r.msg_id, host);
