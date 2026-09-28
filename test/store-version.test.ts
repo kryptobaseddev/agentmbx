@@ -50,7 +50,7 @@ test("every MCP tool refuses an upgraded schema before its callback", async (t) 
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "worker", MBX_CLI: "claude", MBX_CHANNEL: "0", AGENTMBX_DEV: "1" } as Record<string, string> }));
   const args: Record<string, Record<string, unknown>> = {
-    mbx_whoami: {}, mbx_agents: {}, mbx_inbox: {}, mbx_read: { ids: ["missing"] }, mbx_ack: { ids: ["missing"] },
+    mbx_identity: { action: "list" }, mbx_whoami: {}, mbx_agents: {}, mbx_inbox: {}, mbx_read: { ids: ["missing"] }, mbx_ack: { ids: ["missing"] },
     mbx_reply: { id: "missing", body: "test" }, mbx_send: { to: ["other"], subject: "test", body: "test" },
     mbx_thread: { id: "missing" }, mbx_search: { query: "test" },
   };
