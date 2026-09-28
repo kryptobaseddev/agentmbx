@@ -5,15 +5,34 @@
 import { createServer } from "node:http";
 import { canonical, signData, verifyData, nonce as newNonce } from "./crypto.js";
 import { checkShape } from "./envelope.js";
-export const DEFAULT_QUOTA = { maxQueueDepth: 1000, maxEnvelopeBytes: 256 * 1024 * 2, maxBatch: 200 };
+export const DEFAULT_QUOTA = { maxQueueDepth: 1000, maxEnvelopeBytes: 256 * 1024 * 2, maxBatch: 200, maxOwnerDepth: 2000, pushesPerMinute: 120 };
 export class RelayCore {
     enrolments = new Map(); // pubkey -> enrolment
     queues = new Map(); // recipient host pubkey -> queue
     cursors = new Map();
     seen = new Set(); // global id dedupe: exactly-once storage
     pending = new Map(); // host -> enrolment challenge nonce
+    pushes = new Map(); // owner_fp -> push timestamps (rate window)
     quota;
     constructor(quota = DEFAULT_QUOTA) { this.quota = quota; }
+    /** Aggregate stored rows across every host enrolled under one owner fingerprint. */
+    ownerDepth(ownerFp) {
+        const pubs = new Set([...this.enrolments.values()].filter((e) => e.owner_fp === ownerFp).map((e) => e.pubkey));
+        let depth = 0;
+        for (const [pub, q] of this.queues)
+            if (pubs.has(pub))
+                depth += q.length;
+        return depth;
+    }
+    checkRate(ownerFp) {
+        const now = Date.now(), window = this.pushes.get(ownerFp) ?? [];
+        const recent = window.filter((t) => now - t < 60_000);
+        if (recent.length >= this.quota.pushesPerMinute)
+            return `push rate exceeded for owner (${this.quota.pushesPerMinute}/min)`;
+        recent.push(now);
+        this.pushes.set(ownerFp, recent);
+        return null;
+    }
     /** Enrolment step 1: the relay issues a single-use challenge for a host key. */
     challenge(host, pubkey) {
         const n = newNonce();
@@ -49,9 +68,12 @@ export class RelayCore {
     getEncAd(host) { return this.encAds.get(host) ?? null; }
     /** Push envelopes addressed to recipient host keys. Opaque storage; bodies must already be sealed. */
     push(from, envelopes) {
-        this.requireEnrolled(from.pubkey);
+        const enrolment = this.requireEnrolled(from.pubkey);
         if (envelopes.length > this.quota.maxBatch)
             return { stored: 0, error: `batch over limit ${this.quota.maxBatch}` };
+        const rateError = this.checkRate(enrolment.owner_fp);
+        if (rateError)
+            return { stored: 0, error: rateError };
         let stored = 0;
         for (const e of envelopes) {
             if (checkShape(e))
@@ -67,6 +89,8 @@ export class RelayCore {
                 const target = [...this.enrolments.values()].find((en) => en.host === hostPart);
                 if (!target)
                     return { stored, error: `recipient host not enrolled: ${hostPart}` };
+                if (this.ownerDepth(target.owner_fp) >= this.quota.maxOwnerDepth)
+                    return { stored, error: `owner queue depth exceeded for ${hostPart}` };
                 const q = this.queues.get(target.pubkey) ?? [];
                 if (q.length >= this.quota.maxQueueDepth)
                     return { stored, error: `queue depth exceeded for ${hostPart}` };
