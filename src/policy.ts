@@ -196,7 +196,7 @@ export function effectivePolicy(db: DatabaseSync, o: { agent: string; host: stri
   const e = o.envelope, meta = (e?.meta ?? {}) as { origin?: string; hop?: number };
   if (meta.origin === "external") { grants = grants.map((g) => ({ ...g, classes: g.classes.filter((c) => c === "read") })); notes.push("content from outside (origin: external): read only"); }
   let stop = false;
-  if ((meta.hop ?? 0) > MAX_HOP) { stop = true; notes.push(`relayed ${meta.hop} hops (limit ${MAX_HOP}): ask your user`); }
+  if ((meta.hop ?? 0) > MAX_HOP) { stop = true; notes.push(`relay safety depth ${meta.hop} exceeds limit ${MAX_HOP}; may include recent message reads in the sending session, not just this thread: ask your user`); }
   if (e) {
     const acted = (db.prepare("SELECT count(*) n FROM audit WHERE event='peer_action' AND json_extract(detail,'$.thread')=?").get(e.thread) as { n: number }).n;
     if (acted >= MAX_POLICY_ACTIONS_PER_THREAD) { stop = true; notes.push(`this thread already had ${acted} actions under policy: ask your user`); }

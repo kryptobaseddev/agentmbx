@@ -110,7 +110,7 @@ export async function runMcp(node = new MbxNode()) {
   const holderStart = inspectLeaseProcess(process.pid).start;
   // a second live session with the same default name gets a free one (T055); an explicit MBX_AGENT is used as is
   type State = { agent: string; sessionId: string; key: ReturnType<typeof generateKeyPair>; leaseToken?: string; released?: boolean;
-    parent: { hop: number; external: boolean; at: number } | null };
+    parent: { hops: Map<number, number>; externalAt: number | null } | null };
   const base: State = { agent: process.env.MBX_AGENT ? wanted : node.pickName(wanted, env.cli, env.ppid, env.sessionId),
     sessionId: env.sessionId, key: generateKeyPair(), parent: null };
   const states = new Map<string, State>();
@@ -256,19 +256,26 @@ export async function runMcp(node = new MbxNode()) {
   const noteRead = (rows: { envelope: string; from_addr: string }[]) => {
     const state = current(), { agent } = state;
     const now = Date.now();
-    if (state.parent && now - state.parent.at >= 3_600_000) state.parent = null;
+    if (state.parent) for (const [hop, at] of state.parent.hops) {
+      if (now - at >= 3_600_000) state.parent.hops.delete(hop);
+    }
     for (const r of rows) {
       if (r.from_addr === `${agent}@${node.host}`) continue;
       const e = JSON.parse(r.envelope) as Envelope;
       // Retained malformed mail is readable, but cannot erase unknown provenance.
       const m = checkShape(e) ? { hop: MAX_HOP + 1, origin: "external" } : e.meta;
-      state.parent = { hop: Math.max(state.parent?.hop ?? 0, m.hop ?? 0), external: (state.parent?.external ?? false) || m.origin === "external", at: now };
+      state.parent ??= { hops: new Map(), externalAt: null };
+      // Each depth keeps its own last exposure. Lower-depth mail cannot renew a higher one.
+      state.parent.hops.set(m.hop ?? 0, now);
+      if (m.origin === "external") state.parent.externalAt = now;
     }
   };
   const relay = (origin?: "agent" | "external") => {
     const { parent } = current();
-    const p = parent && Date.now() - parent.at < 3_600_000 ? parent : null;
-    return { hop: p ? p.hop + 1 : 0, origin: origin === "external" || p?.external ? "external" as const : "agent" as const, project };
+    const now = Date.now();
+    const depths = parent ? [...parent.hops].filter(([, at]) => now - at < 3_600_000).map(([hop]) => hop) : [];
+    const external = parent?.externalAt != null && now - parent.externalAt < 3_600_000;
+    return { hop: depths.length ? Math.max(...depths) + 1 : 0, origin: origin === "external" || external ? "external" as const : "agent" as const, project };
   };
   const agent = base.agent;
   // Initialization belongs to the transport, before per-call metadata identifies its thread.

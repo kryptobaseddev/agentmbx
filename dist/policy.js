@@ -195,7 +195,7 @@ export function effectivePolicy(db, o) {
     let stop = false;
     if ((meta.hop ?? 0) > MAX_HOP) {
         stop = true;
-        notes.push(`relayed ${meta.hop} hops (limit ${MAX_HOP}): ask your user`);
+        notes.push(`relay safety depth ${meta.hop} exceeds limit ${MAX_HOP}; may include recent message reads in the sending session, not just this thread: ask your user`);
     }
     if (e) {
         const acted = db.prepare("SELECT count(*) n FROM audit WHERE event='peer_action' AND json_extract(detail,'$.thread')=?").get(e.thread).n;
