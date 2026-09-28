@@ -252,6 +252,30 @@ export async function dispatchWakes(node: MbxNode): Promise<{ agent: string; res
       if (!recheck()) { fenced = true; break; }
       if (result.ok || isRetry(result)) break; // a busy hosted session retries next pass instead of a desktop notice
     }
+    // An OpenCode session bound only through its MCP process (the client has not attached per-session
+    // metadata yet) carries an mcp- session id: a process binding, not a wakeable service session. Resolve
+    // the service's most recent session for the binding's project directory and wake that instead of
+    // falling straight to the desktop — the same directory-based fallback bindSession already uses.
+    if (automatic.length && !attempts && !fenced) {
+      for (const guard of held) {
+        const s = guard.session;
+        if (s.cli !== "opencode" || !s.cwd) continue;
+        const recheck = () => {
+          try { return guard.run(() => automatic.every(r => {
+            const delivery = node.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=? AND agent=?").get(r.id, agent);
+            return delivery?.state === "delivered" && (hasWakeAuthority(node, agent, r));
+          })); } catch { return false; }
+        };
+        if (!recheck()) { fenced = true; break; }
+        const resolved = await opencodeSessionFor(s.cwd);
+        if (!resolved || resolved.startsWith("mcp-")) continue;
+        submitted = guard;
+        result = await wakeOpencode(resolved, text, { recheck });
+        attempts++;
+        if (!recheck()) { fenced = true; }
+        break;
+      }
+    }
     if (fenced) {
       if (!attempts || (attempts === 1 && !result.ok && result.error === "wake authority changed")) reservation.release?.();
       node.store.audit("wake.fenced", { agent, count: automatic.length });
