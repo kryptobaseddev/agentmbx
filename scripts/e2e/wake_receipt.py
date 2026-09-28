@@ -5,6 +5,21 @@ from pathlib import Path
 import sqlite3
 
 
+def find_request(home, agent, body):
+    """Recover a send with an uncertain exit without modifying or duplicating mail."""
+    uri = (Path(home) / 'mbx.db').resolve().as_uri() + '?mode=ro'
+    with closing(sqlite3.connect(uri, uri=True)) as db:
+        db.execute('PRAGMA query_only=ON')
+        db.execute('BEGIN')
+        rows = db.execute("""SELECT id, envelope FROM messages WHERE from_addr='tester@e2e'
+            AND body=? AND kind='request' AND reply_to IS NULL AND origin='local' AND trust='local'""", (body,)).fetchall()
+        matches = [message_id for message_id, raw in rows
+                   if any(address in (agent, agent + '@e2e') for address in json.loads(raw).get('to', []))]
+        if len(matches) > 1:
+            raise ValueError('Multiple matching requests; retained session requires inspection, never resend')
+        return matches[0] if matches else None
+
+
 def inspect_receipt(home, message_id, agent, token):
     uri = (Path(home) / 'mbx.db').resolve().as_uri() + '?mode=ro'
     with closing(sqlite3.connect(uri, uri=True)) as db:
