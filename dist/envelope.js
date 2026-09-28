@@ -1,5 +1,6 @@
 // The signed message envelope, owner grants, and the body metadata parser.
 import { canonical, fingerprint, nonce, sha256, signData, ulid, verifyData } from "./crypto.js";
+import { checkEnc } from "./body-encryption.js";
 export const KINDS = ["message", "request", "reply", "status", "decision", "alert", "task"];
 export const MAX_BODY = 256 * 1024;
 // Saturating wire counter: this value means at least this many relay steps.
@@ -66,8 +67,10 @@ export function checkShape(x) {
         return "bad needs_reply";
     if (!Array.isArray(e.refs) || e.refs.some(value => typeof value !== "string"))
         return "bad refs";
+    if (e.enc === undefined)
+        return "bad enc";
     if (e.enc !== null)
-        return "unsupported enc";
+        return checkEnc(e.enc);
     const a = e.authority;
     if (a !== null) {
         if (!a || typeof a !== "object" || Array.isArray(a))
