@@ -6,7 +6,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { kimiHostedServer, type KimiServer } from "./kimi-web.ts";
-import { alive, MbxNode, trustLabel } from "./node.ts";
+import { MbxNode, trustLabel } from "./node.ts";
 import { policyBrief } from "./policy.ts";
 import type { MessageRow } from "./store.ts";
 
@@ -189,9 +189,10 @@ export async function dispatchWakes(node: MbxNode): Promise<{ agent: string; res
   for (const [agent, rows] of byAgent) {
     // a name used only through the CLI from inside a session (linkIdentity) is woken through that session
     const owner = node.sessionsFor(agent).length ? null : node.identityOwner(agent);
-    const sessions = node.sessionsFor(owner ?? agent);
+    const live = node.sessionsFor(owner ?? agent).filter((s) => s.pid && node.sameSession(s.pid, s, { proof: true }));
+    const sessions = live.filter((s) => !s.session_id.startsWith("mcp-"));
     // a live Claude session with the mbx channel enabled pushes for itself (see mcp.ts); leave its rows alone
-    if (sessions.some((s) => s.channel && alive(s.pid))) continue;
+    if (live.some((s) => s.channel)) continue;
     const wanted = rows.filter((r) => node.wantsWake(agent, r));
     const markAll = () => rows.forEach((r) => node.setDelivery(r.id, agent, "notified"));
     if (!wanted.length) { markAll(); continue; }
