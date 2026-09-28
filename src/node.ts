@@ -11,6 +11,7 @@ import { kimiHostedServer } from "./kimi-web.ts";
 import { ownerPublicKey } from "./owner.ts";
 import { effectivePolicy, policyLine } from "./policy.ts";
 import { procStart, provenProcess, sameProcess } from "./proc.ts";
+import { privatePath } from "./private-files.ts";
 import { Store, type DeliveryState, type MessageRow } from "./store.ts";
 
 export const DEFAULT_PORT = 7373;
@@ -47,6 +48,8 @@ export class MbxNode {
   constructor(home = defaultHome(), init: Partial<Config> = {}) {
     this.home = home;
     mkdirSync(home, { recursive: true, mode: 0o700 });
+    privatePath(home, 0o700);
+    for (const file of ["config.json", "host.key", "owner.key", "owner.json"]) privatePath(join(home, file), 0o600, true);
     const cfgPath = join(home, "config.json"), keyPath = join(home, "host.key");
     if (!existsSync(cfgPath)) {
       const c: Config = { host: init.host ?? shortHost(), port: init.port ?? DEFAULT_PORT, bind: init.bind ?? "0.0.0.0" };

@@ -1,8 +1,9 @@
 // SQLite store (node:sqlite, WAL). One per host; every mbx process on the host opens it.
 import { DatabaseSync } from "node:sqlite";
-import { chmodSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Envelope } from "./envelope.ts";
+import { privatePath } from "./private-files.ts";
 
 export type DeliveryState = "queued" | "delivered" | "notified" | "read" | "acked";
 
@@ -64,15 +65,18 @@ export class Store {
   db: DatabaseSync;
   constructor(home: string) {
     mkdirSync(home, { recursive: true, mode: 0o700 });
+    const existed = existsSync(join(home, "mbx.db"));
     this.db = new DatabaseSync(join(home, "mbx.db"));
     try {
       // Read the compatibility marker before any schema, journal-mode or permission changes.
       this.assertCurrent();
+      privatePath(home, 0o700);
+      privatePath(join(home, "mbx.db"), 0o600, false, existed);
       this.db.exec(SCHEMA);
       // columns added after 0.2 (CREATE TABLE IF NOT EXISTS doesn't add them to existing databases)
       for (const ddl of ["ALTER TABLE sessions ADD COLUMN pid_start TEXT", "ALTER TABLE principals ADD COLUMN peer TEXT", "ALTER TABLE policy_revocations ADD COLUMN owner_fp TEXT"]) { try { this.db.exec(ddl); } catch { /* already there */ } }
       if (this.schemaVersion() < SCHEMA_VERSION) this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-      for (const f of ["mbx.db", "mbx.db-wal", "mbx.db-shm"]) { try { chmodSync(join(home, f), 0o600); } catch { /* not created yet */ } }
+      for (const f of ["mbx.db-wal", "mbx.db-shm"]) privatePath(join(home, f), 0o600, true);
     } catch (e) { this.db.close(); throw e; }
   }
   close() { this.db.close(); }

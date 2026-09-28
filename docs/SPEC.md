@@ -58,6 +58,13 @@ Delivery between hosts is **at-least-once**: the outbox retries with backoff for
 
 ## Trust (revised after the council, docs/COUNCIL-VERDICT-2026-09-26.md)
 
+### Local storage and same-user confidentiality (T085)
+On POSIX systems, startup enforces mode 0700 on the mailbox directory and 0600 on config.json, host.key, owner.key/owner.json when present, mbx.db, and its WAL/shared-memory files. Detected mode drift is repaired with a stderr warning. Failure to enforce required modes stops startup. Symlinked key paths and paths of the wrong type are refused. These checks enforce mode bits, not an ACL audit or protection against concurrent path replacement; Windows ACL enforcement is not implemented.
+
+All agents running as the same OS user can read or modify the SQLite store and host key directly. Mailbox visibility checks and identity bindings reduce accidental cross-session access but are not a confidentiality boundary against such processes, administrators, or a compromised account. Bodies, signed envelopes, full-text indexes, WAL files and ordinary backups contain plaintext message content. Host/session signatures authenticate statements; they do not encrypt messages.
+
+**Encryption decision:** retain plaintext local storage for now rather than encrypt durable mail solely to ephemeral MCP signing keys that disappear at session exit. Encryption must use an explicit encryption-key design with durable recipient identity, authenticated key distribution, rotation and recovery, offline and multi-recipient delivery, and treatment of FTS, envelopes, WAL and backups. Encrypting just the body column leaves other plaintext copies. Storing a shared decryption key beside the database does not isolate same-user agents. T065/T081/T082 identity work is prerequisite design input; no per-agent encrypted-at-rest guarantee is claimed.
+
 ### What each check actually proves
 | Label shown to agents | Means | Does not mean |
 |---|---|---|

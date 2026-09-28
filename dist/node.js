@@ -8,6 +8,7 @@ import { kimiHostedServer } from "./kimi-web.js";
 import { ownerPublicKey } from "./owner.js";
 import { effectivePolicy, policyLine } from "./policy.js";
 import { procStart, provenProcess, sameProcess } from "./proc.js";
+import { privatePath } from "./private-files.js";
 import { Store } from "./store.js";
 export const DEFAULT_PORT = 7373;
 export const RETRY_HOURS = 72;
@@ -43,6 +44,9 @@ export class MbxNode {
     constructor(home = defaultHome(), init = {}) {
         this.home = home;
         mkdirSync(home, { recursive: true, mode: 0o700 });
+        privatePath(home, 0o700);
+        for (const file of ["config.json", "host.key", "owner.key", "owner.json"])
+            privatePath(join(home, file), 0o600, true);
         const cfgPath = join(home, "config.json"), keyPath = join(home, "host.key");
         if (!existsSync(cfgPath)) {
             const c = { host: init.host ?? shortHost(), port: init.port ?? DEFAULT_PORT, bind: init.bind ?? "0.0.0.0" };
