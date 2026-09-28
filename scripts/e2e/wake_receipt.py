@@ -17,7 +17,7 @@ def inspect_receipt(home, message_id, agent, token):
         envelope = json.loads(raw)
         host = sender.rsplit('@', 1)[1]
         recipient = agent + '@' + host
-        if recipient not in envelope['to']:
+        if not any(address in (agent, recipient) for address in envelope['to']):
             raise ValueError('Original request was not addressed to the expected agent')
         delivery = db.execute('SELECT state FROM deliveries WHERE msg_id=? AND agent=?', (message_id, agent)).fetchone()
         matches = db.execute('''SELECT id, envelope FROM messages WHERE thread=? AND reply_to=?
@@ -28,7 +28,7 @@ def inspect_receipt(home, message_id, agent, token):
             reply = json.loads(raw_reply)
             if (reply.get('id') == reply_id and reply.get('thread') == thread and
                 reply.get('reply_to') == message_id and reply.get('from') == recipient and
-                reply.get('kind') == 'reply' and reply.get('body') == token and sender in reply.get('to', [])):
+                reply.get('kind') == 'reply' and reply.get('body') == token and any(address in (sender, sender.rsplit('@', 1)[0]) for address in reply.get('to', []))):
                 reply_ids.append(reply_id)
         acked = delivery is not None and delivery[0] == 'acked'
         return {'message_id': message_id, 'reply_ids': reply_ids, 'acked': acked,

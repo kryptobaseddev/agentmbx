@@ -24,3 +24,26 @@ for (const provider of ["claude", "codex"]) {
     assert.equal(report.receipt_verified, false);
   });
 }
+
+test("wake receipt inspector observes real mailbox replies and acknowledgments without writing", async (t) => {
+  const { MbxNode } = await import("../src/node.ts");
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const home = mkdtempSync(join(tmpdir(), "mbx-native-receipt-"));
+  const node = new MbxNode(home, { host: "e2e" });
+  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true }); });
+  const request = node.send({ from: "tester", to: ["oc-agent"], subject: "wake", body: "PONG-exact", kind: "request" }).envelope;
+  const inspect = () => JSON.parse(execFileSync("python3", ["-c",
+    "import json,runpy,sys; print(json.dumps(runpy.run_path(sys.argv[1])['inspect_receipt'](*sys.argv[2:])))",
+    join(import.meta.dirname, "../scripts/e2e/wake_receipt.py"), home, request.id, "oc-agent", "PONG-exact",
+  ], { encoding: "utf8", timeout: 5_000 }));
+  assert.equal(inspect().receipt_verified, false);
+  const reply = node.send({ from: "oc-agent", to: ["tester"], subject: "reply", body: "PONG-exact", kind: "reply", reply_to: request.id, thread: request.thread }).envelope;
+  assert.deepEqual(inspect().reply_ids, [reply.id]);
+  assert.equal(inspect().acked, false);
+  assert.equal(inspect().receipt_verified, false);
+  node.ack(request.id, "oc-agent");
+  const before = node.store.db.prepare("SELECT * FROM deliveries ORDER BY msg_id,agent").all();
+  assert.equal(inspect().receipt_verified, true);
+  assert.deepEqual(node.store.db.prepare("SELECT * FROM deliveries ORDER BY msg_id,agent").all(), before);
+});
