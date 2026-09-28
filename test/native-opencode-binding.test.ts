@@ -109,3 +109,24 @@ test("binding inspection requires a real MCP lease and exact session metadata", 
   await client.close();
   assert.equal(inspectBinding(state).verified, false, "closed holder cannot remain verified");
 });
+
+test("a session claim adopts our own base's name instead of refusing as occupied", async t => {
+  const { state } = prepared(t);
+  const client = new Client({ name: "base-transfer-fixture", version: "test" });
+  t.after(async () => { await client.close(); });
+  await client.connect(new StdioClientTransport({ command: process.execPath,
+    args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"], cwd: state.work,
+    env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: state.home, MBX_AGENT: "opencode-native", MBX_CLI: "opencode", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
+  // the base adopts a name at startup (a remembered-name window)
+  const baseWho = await client.callTool({ name: "mbx_whoami", arguments: {} });
+  const base = JSON.parse((baseWho.content as { text: string }[])[0].text) as { agent: string };
+  assert.ok(base.agent);
+  // history remembers the fleet session id under the same name
+  const node = new MbxNode(state.home);
+  node.store.db.prepare("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)").run("name:opencode:ses_fleettest", base.agent);
+  const inbox = await client.callTool({ name: "mbx_inbox", arguments: {}, _meta: { "ai.opencode/sessionID": "ses_fleettest" } });
+  assert.notEqual(inbox.isError, true, "session tools adopt the name rather than 'belongs to another live session'");
+  const row = node.store.db.prepare("SELECT session_id FROM identity_leases WHERE name=?").get(base.agent) as { session_id: string };
+  assert.equal(row.session_id, "ses_fleettest", "the lease transferred from our base to the real session");
+  node.close();
+});

@@ -343,8 +343,11 @@ export async function runMcp(existing) {
             const suffix = createHash("sha256").update(sid).digest("hex").slice(0, 10);
             const fallback = `${wanted.slice(0, 29)}-${suffix}`;
             const remembered = node.store.get(`name:${env.cli}:${sid}`);
-            const occupied = (name) => node.store.db.prepare("SELECT pid,pid_start,updated_at FROM sessions WHERE agent=? AND (cli<>? OR session_id<>?)")
-                .all(name, env.cli, sid)
+            // A row bound with THIS process's base key is our own provisional binding, not another live
+            // session: excluding it lets the claim below adopt the name through the intra-process transfer
+            // (claimFor releases our base's lease and re-claims for the real session).
+            const occupied = (name) => node.store.db.prepare("SELECT pid,pid_start,updated_at FROM sessions WHERE agent=? AND (cli<>? OR session_id<>?) AND session_key<>?")
+                .all(name, env.cli, sid, base.key.publicKey)
                 .some(r => r.pid && node.sameSession(r.pid, r, { proof: true }));
             // Legacy Codex hooks may have saved the same default for several threads on a daemon.
             // Recover a distinct name without moving any mail whose ownership is ambiguous.
