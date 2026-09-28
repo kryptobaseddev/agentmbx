@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { MbxNode } from "../src/node.ts";
 
 test("MCP startup, rename and heartbeat inspect processes outside SQLite transactions", async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-preflight-")), trace = join(home, "trace.jsonl"), preload = join(home, "trace.mjs");
@@ -31,4 +32,36 @@ test("MCP startup, rename and heartbeat inspect processes outside SQLite transac
   assert.ok(events.some(e => e.event === "heartbeat"));
   const inspections = events.filter(e => e.event !== "heartbeat");
   assert.ok(inspections.length > 0); assert.ok(inspections.every(e => !e.locked), JSON.stringify(inspections.filter(e => e.locked)));
+});
+
+for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} does not adopt a legacy binding replaced after process preflight`, async t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-preflight-rebind-")), preload = join(home, "rebind.mjs"), marker = join(home, "rebound");
+  const node = new MbxNode(home, { host: "alpha" }), client = new Client({ name: cli, version: "test" });
+  t.after(async () => { await client.close(); node.close(); rmSync(home, { recursive: true, force: true }); });
+  node.bindSession({ agent: "reader", cli, session_id: "legacy", pid: process.pid, session_key: "previous-holder" });
+  const id = node.send({ from: "sender", to: ["reader"], subject: "old mail", body: "retain ownership" }).envelope.id;
+  // A second connection commits a hook-like rebind after the preflight SELECT has captured
+  // its rows, but before MCP opens its write transaction. The replacement is otherwise a
+  // valid unique hook binding for the same parent process; parent liveness alone is insufficient.
+  writeFileSync(preload, `import {DatabaseSync} from 'node:sqlite'; import {writeFileSync} from 'node:fs';
+    const prepare=DatabaseSync.prototype.prepare; let changed=false;
+    DatabaseSync.prototype.prepare=function(sql,...args){
+      const statement=prepare.call(this,sql,...args);
+      if(sql==='SELECT agent,cli,session_id,pid,pid_start,session_key,updated_at FROM sessions'){
+        const all=statement.all; statement.all=function(...args){const rows=all.apply(this,args);
+          if(!changed){changed=true; const other=new DatabaseSync(${JSON.stringify(join(home, "mbx.db"))});
+            prepare.call(other,'UPDATE sessions SET session_key=NULL,updated_at=? WHERE cli=? AND session_id=?').run(new Date().toISOString(),${JSON.stringify(cli)},'legacy');
+            other.close(); writeFileSync(${JSON.stringify(marker)},'committed');}
+          return rows;};
+      } return statement;
+    };
+  `);
+  await client.connect(new StdioClientTransport({ command: process.execPath, args: ["--import", preload, join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
+    env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_AGENT: "reader", MBX_CLI: cli, MBX_NO_DESKTOP: "1" } as Record<string, string> }));
+  assert.equal(readFileSync(marker, "utf8"), "committed");
+  const identity = (await client.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent: string };
+  assert.match(identity.agent, /^reader-mcp-[a-f0-9]{16}$/);
+  assert.equal((await client.callTool({ name: "mbx_read", arguments: { ids: [id] } })).isError, true);
+  assert.equal(node.inbox("reader")[0].id, id);
+  assert.equal(node.store.db.prepare("SELECT 1 FROM identity_leases WHERE name='reader'").get(), undefined);
 });
