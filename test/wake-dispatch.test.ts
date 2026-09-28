@@ -77,7 +77,8 @@ for (const current of [true, false]) test(`OpenCode rechecks after async service
     fetch: (async (input: string | URL | Request, options: RequestInit) => {
       calls++; assert.equal(String(input), "http://fixture.invalid/api/session/session-exact/synthetic");
       assert.deepEqual(JSON.parse(options.body as string), { text: "notification", delivery: "queue", resume: true });
-      return Response.json({});
+      return Response.json({ data: { id: "msg_fixture", sessionID: "session-exact", type: "synthetic",
+        delivery: "queue", payload: { text: "notification" }, time: { created: 1 } } });
     }) as typeof fetch,
   });
   assert.equal(calls, current ? 1 : 0); assert.equal(result.ok, current);
