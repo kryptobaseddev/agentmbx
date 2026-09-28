@@ -56,7 +56,9 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI comm
   assert.equal(node.inbox(who.agent)[0].id, message);
   assert.equal(node.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE name=?").get(who.agent)!.holder_pid, transport.pid, "the short-lived CLI is never the holder");
   // A stopped holder cannot answer. Timeout is an unknown outcome with a durable ID.
-  process.kill(transport.pid!, "SIGSTOP");
+  // Exclude a heartbeat transaction before stopping the holder; otherwise SIGSTOP
+  // can strand its SQLite write lock and test lock contention instead of timeout.
+  node.store.tx(() => process.kill(transport.pid!, "SIGSTOP"));
   const timedOut = command(home, "release", "--cli", cli, "--session", sid, "--wait-ms", "0");
   assert.equal(timedOut.status, 75, timedOut.stderr);
   const pending = JSON.parse(timedOut.stdout); assert.equal(pending.outcome, "unknown");
