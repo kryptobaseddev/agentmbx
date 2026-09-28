@@ -9,7 +9,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { Store, SCHEMA_VERSION } from "../src/store.ts";
 import { MbxNode } from "../src/node.ts";
 import { version } from "../src/version.ts";
-import { reloadFromDisk, storeMismatchCode } from "../src/mcp.ts";
+import { reloadFromDisk, storeMismatchCode, leaseCollisionAction } from "../src/mcp.ts";
 
 test("source SQL inserts specify columns for additive schema compatibility", () => {
   const root = join(import.meta.dirname, "../src");
@@ -172,4 +172,17 @@ test("MCP self-reload fires only for store mismatches and only once", () => {
   } finally {
     if (had === undefined) delete process.env.MBX_MCP_REEXEC; else process.env.MBX_MCP_REEXEC = had;
   }
+});
+
+test("lease collisions inside one MCP process converge instead of erroring", () => {
+  const inUse = Object.assign(new Error("identity worker already has a holder"), { code: "IDENTITY_IN_USE" });
+  const prior = { token: "t", holder_pid: 4242, holder_start: "s", session_id: "mcp-4242", released_at: null };
+  const self = { pid: 4242, start: "s", baseSessionId: "mcp-4242", stateSessionId: "ses_9" };
+  assert.equal(leaseCollisionAction(inUse, prior, self), "transfer", "our provisional base yields to the real session");
+  assert.equal(leaseCollisionAction(inUse, { ...prior, session_id: "ses_9" }, self), "adopt", "a racing same-session claim is shared");
+  assert.equal(leaseCollisionAction(inUse, { ...prior, holder_pid: 9999 }, self), null, "another process is a genuine conflict");
+  assert.equal(leaseCollisionAction(inUse, { ...prior, session_id: "ses_other" }, self), null, "another session in this process is a genuine conflict");
+  assert.equal(leaseCollisionAction(inUse, { ...prior, released_at: "r" }, self), null);
+  assert.equal(leaseCollisionAction(Object.assign(new Error("x"), { code: "OTHER" }), prior, self), null);
+  assert.equal(leaseCollisionAction(inUse, undefined, self), null);
 });
