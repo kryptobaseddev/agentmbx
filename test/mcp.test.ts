@@ -182,3 +182,30 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) for (const crash of [
       } finally { await next.c.close(); }
     } finally { await first.c.close(); n.close(); }
   });
+
+test("channel mode notifies linked shell mailboxes without touching independently bound names", async () => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-channel-linked-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  const { c, notes } = await client(home, "primary", { MBX_CHANNEL: "1" });
+  try {
+    n.linkIdentity("shell-alias", "primary");
+    n.linkIdentity("separate", "primary");
+    n.bindSession({ agent: "separate", cli: "kimi", session_id: "separate-thread", pid: process.pid });
+    const id = n.send({ from: "sender", to: ["shell-alias"], subject: "PRIVATE SUBJECT", body: "SECRET BODY", kind: "request" }).envelope.id;
+    const separate = n.send({ from: "sender", to: ["separate"], subject: "other", body: "other", kind: "request" }).envelope.id;
+    for (let i = 0; i < 25 && !notes.length; i++) await new Promise((r) => setTimeout(r, 100));
+    assert.equal(notes.length, 1);
+    const note = notes[0] as { content: string; meta: { agent: string; mailbox: string } };
+    assert.match(note.content, /shell-alias/);
+    assert.match(note.content, /agentmbx inbox --as shell-alias/);
+    assert.doesNotMatch(note.content, /SECRET BODY|PRIVATE SUBJECT/);
+    assert.equal(note.meta.agent, "primary");
+    assert.equal(note.meta.mailbox, "shell-alias");
+    assert.equal(n.inbox("shell-alias")[0].state, "notified");
+    assert.equal(n.inbox("separate")[0].state, "delivered");
+    assert.equal(n.store.db.prepare("SELECT 1 FROM deliveries WHERE agent='primary' AND msg_id=?").get(id), undefined);
+    await new Promise((r) => setTimeout(r, 1700));
+    assert.equal(notes.length, 1, "delivered alias mail is notified once");
+    assert.equal(n.inbox("separate")[0].id, separate);
+  } finally { await c.close(); n.close(); }
+});

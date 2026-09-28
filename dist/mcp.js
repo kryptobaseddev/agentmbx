@@ -298,19 +298,25 @@ export async function runMcp(node = new MbxNode()) {
     if (env.channel) {
         timers.push(setInterval(async () => {
             try {
-                const rows = node.store.db.prepare(`SELECT m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state='delivered' ORDER BY m.ts`).all(agent);
-                if (!rows.length)
-                    return;
-                const wanted = rows.filter((r) => node.wantsWake(agent, r));
-                if (wanted.length) {
-                    const brake = node.takeWake(agent, wanted[0].thread);
-                    if (brake?.startsWith("batched"))
-                        return;
-                    if (!brake)
-                        await server.server.notification({ method: "notifications/claude/channel", params: { content: wakeText(agent, wanted), meta: { count: String(wanted.length), agent } } });
+                for (const mailbox of [agent, ...node.linkedNames(agent)]) {
+                    const rows = node.store.db.prepare(`SELECT m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state='delivered' ORDER BY m.ts`).all(mailbox);
+                    if (!rows.length)
+                        continue;
+                    const wanted = rows.filter((r) => node.wantsWake(mailbox, r));
+                    if (wanted.length) {
+                        const brake = node.takeWake(mailbox, wanted[0].thread);
+                        if (brake?.startsWith("batched"))
+                            continue;
+                        const linked = mailbox === agent ? "" : ` This is your linked mailbox: use agentmbx inbox --as ${mailbox} and agentmbx ack --as ${mailbox} <id>.`;
+                        if (!brake)
+                            await server.server.notification({ method: "notifications/claude/channel", params: {
+                                    content: wakeText(mailbox, wanted) + linked,
+                                    meta: { count: String(wanted.length), agent, mailbox },
+                                } });
+                    }
+                    for (const r of rows)
+                        node.setDelivery(r.id, mailbox, "notified");
                 }
-                for (const r of rows)
-                    node.setDelivery(r.id, agent, "notified");
             }
             catch (e) {
                 process.stderr.write(`[mbx] channel push failed: ${e.message}\n`);
