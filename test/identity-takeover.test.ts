@@ -8,7 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { canonical, generateKeyPair, signData } from "../src/crypto.ts";
 import { MbxNode } from "../src/node.ts";
-import { IdentityLeases, inspectLeaseProcess } from "../src/identity-leases.ts";
+import { IdentityLeases } from "../src/identity-leases.ts";
 import { applyIdentityTakeover, buildIdentityTakeover, type IdentityTakeoverPayload } from "../src/identity-takeover.ts";
 import type { IdentityControlDescriptor } from "../src/identity-control.ts";
 
@@ -57,8 +57,8 @@ test("takeover failures preserve the old generation and do not consume approval"
 });
 
 for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI owner-approved takeover reaches the existing MCP holder`, async t => {
-  const client = new Client({ name: cli, version: "test" });
-  t.after(async () => { await client.close(); });
+  const client = new Client({ name: cli, version: "test" }), displaced = new Client({ name: `${cli}-old`, version: "test" });
+  t.after(async () => { await client.close(); await displaced.close(); });
   const { home, node, owner } = setup(t);
   const helper = join(home, "fake-owner-helper.mjs"), crypto = new URL("../src/crypto.ts", import.meta.url).href;
   writeFileSync(join(home, "fixture-key.json"), JSON.stringify(owner), { mode: 0o600 });
@@ -67,9 +67,11 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI owne
     if(process.env.FIXTURE_OWNER_CANCEL==='1') process.exit(6);
     const key=JSON.parse(readFileSync(new URL('./fixture-key.json',import.meta.url),'utf8'));
     console.log(signData(key.privateKey,readFileSync(file,'utf8')));`, { mode: 0o700 });
-  // Replace the fixture holder with a real process birth proof so ordinary claim detects it as held.
-  const start = inspectLeaseProcess(process.pid).start!;
-  node.store.db.prepare("UPDATE identity_leases SET holder_start=? WHERE name='occupied'").run(start);
+  const fixtureToken = node.store.db.prepare("SELECT token FROM identity_leases WHERE name='occupied'").get()!.token as string;
+  new IdentityLeases(node.store).release("occupied", fixtureToken);
+  await displaced.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
+    env: { ...process.env, MBX_HOME: home, MBX_AGENT: "occupied", MBX_CLI: cli, AGENTMBX_DEV: "1" } as Record<string,string> }));
+  assert.equal((await displaced.callTool({ name: "mbx_whoami", arguments: {} })).isError, undefined);
   const old = node.store.db.prepare("SELECT token FROM identity_leases WHERE name='occupied'").get()!.token;
   const transport = new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "destination", MBX_CLI: cli, AGENTMBX_DEV: "1" } as Record<string,string> });
@@ -111,6 +113,9 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI owne
   assert.equal(JSON.parse(result.stdout).result.agent, "occupied");
   assert.ok(!result.stdout.includes(old as string));
   assert.equal(((await call("mbx_whoami")).structuredContent as { agent: string }).agent, "occupied");
+  assert.equal((await displaced.callTool({ name: "mbx_inbox", arguments: {} })).isError, true, "displaced live MCP holder is fenced");
+  assert.notEqual((await displaced.callTool({ name: "mbx_identity", arguments: { action: "list" } })).isError, true, "recovery controls stay available");
+  assert.equal((await displaced.callTool({ name: "mbx_identity", arguments: { action: "claim", name: "occupied" } })).isError, true, "old holder cannot reclaim the occupied successor generation");
   assert.equal(node.inbox("occupied")[0].id, history);
   assert.equal(node.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE name='occupied'").get()!.holder_pid, transport.pid);
 });
