@@ -1,5 +1,6 @@
 // SQLite store (node:sqlite, WAL). One per host; every mbx process on the host opens it.
 import { DatabaseSync } from "node:sqlite";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Envelope } from "./envelope.ts";
@@ -67,13 +68,14 @@ export const SCHEMA_VERSION = 2;
 
 export class Store {
   db: DatabaseSync;
-  private rawDb: DatabaseSync;
+  #rawDb: DatabaseSync;
+  #transactionContext = new AsyncLocalStorage<{ active: boolean }>();
   private txDepth = 0;
   private txFailure: { error: unknown } | null = null;
   constructor(home: string, options: { allowIdentityMigration?: boolean } = {}) {
     mkdirSync(home, { recursive: true, mode: 0o700 });
     const existed = existsSync(join(home, "mbx.db"));
-    this.rawDb = new DatabaseSync(join(home, "mbx.db"));
+    this.#rawDb = new DatabaseSync(join(home, "mbx.db"));
     // Guard retained connections AND prepared statements if SQLite aborts an enclosing transaction.
     // Otherwise a caught nested failure can silently turn subsequent statements into autocommit writes.
     const guarded = <T extends object>(target: T): T => new Proxy(target, {
@@ -81,8 +83,9 @@ export class Store {
         const value = Reflect.get(object, property, object);
         if (typeof value !== "function") return value;
         return (...args: unknown[]) => {
+          if (this.#transactionContext.getStore()?.active === false) throw new Error("SQLite transaction context is closed; asynchronous continuations cannot use this store");
           if (this.txFailure) throw this.txFailure.error;
-          if (this.txDepth && !this.rawDb.isTransaction) {
+          if (this.txDepth && !this.#rawDb.isTransaction) {
             const error = new Error("SQLite transaction ended before its callback returned");
             this.txFailure = { error }; throw error;
           }
@@ -90,13 +93,13 @@ export class Store {
             const result = Reflect.apply(value, object, args);
             return property === "prepare" || property === "iterate" || property === Symbol.iterator ? guarded(result) : result;
           } catch (error) {
-            if (this.txDepth && !this.rawDb.isTransaction) this.txFailure ??= { error };
+            if (this.txDepth && !this.#rawDb.isTransaction) this.txFailure ??= { error };
             throw error;
           }
         };
       },
     });
-    this.db = guarded(this.rawDb);
+    this.db = guarded(this.#rawDb);
     try {
       // Connection-local only: contention can occur even while reading the compatibility marker.
       this.db.exec("PRAGMA busy_timeout=5000");
@@ -131,6 +134,15 @@ export class Store {
   }
 
   tx<T>(fn: () => T): T {
+    if (this.#transactionContext.getStore()?.active === false) throw new Error("SQLite transaction context is closed; asynchronous continuations cannot start another transaction");
+    const context = { active: true };
+    return this.#transactionContext.run(context, () => {
+      try { return this.runTransaction(fn); }
+      finally { context.active = false; }
+    });
+  }
+
+  private runTransaction<T>(fn: () => T): T {
     if (this.txFailure) throw this.txFailure.error;
     if (fn.constructor.name === "AsyncFunction") throw new Error("Store.tx requires a synchronous callback");
     const depth = this.txDepth, savepoint = `mbx_tx_${depth}`;
@@ -138,19 +150,23 @@ export class Store {
     this.txDepth++;
     try {
       const r = fn();
-      if (r && typeof (r as { then?: unknown }).then === "function") throw new Error("Store.tx cannot return a thenable");
+      if (r && typeof (r as { then?: unknown }).then === "function") {
+        // Rejection does not cancel a promise. Its inherited context fences later database work.
+        void Promise.resolve(r).catch(() => {});
+        throw new Error("Store.tx cannot return a thenable");
+      }
       const failure = this.txFailure as { error: unknown } | null;
       if (failure) throw failure.error;
-      if (!this.rawDb.isTransaction) throw new Error("SQLite transaction ended before its callback returned");
+      if (!this.#rawDb.isTransaction) throw new Error("SQLite transaction ended before its callback returned");
       this.db.exec(depth ? `RELEASE SAVEPOINT ${savepoint}` : "COMMIT");
       return r;
     } catch (e) {
-      if (!this.rawDb.isTransaction) this.txFailure ??= { error: e };
+      if (!this.#rawDb.isTransaction) this.txFailure ??= { error: e };
       const original = this.txFailure?.error ?? e;
       try {
-        if (this.rawDb.isTransaction) {
-          if (depth) this.rawDb.exec(`ROLLBACK TO SAVEPOINT ${savepoint}; RELEASE SAVEPOINT ${savepoint}`);
-          else this.rawDb.exec("ROLLBACK");
+        if (this.#rawDb.isTransaction) {
+          if (depth) this.#rawDb.exec(`ROLLBACK TO SAVEPOINT ${savepoint}; RELEASE SAVEPOINT ${savepoint}`);
+          else this.#rawDb.exec("ROLLBACK");
         }
       } catch { this.txFailure ??= { error: original }; }
       throw original;

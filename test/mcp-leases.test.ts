@@ -66,3 +66,19 @@ test("MCP rename conflicts preserve the source generation, binding and pending m
   assert.equal(node.store.db.prepare("SELECT token FROM identity_leases WHERE name='occupied'").get()!.token, target.token);
   assert.equal(node.store.db.prepare("SELECT 1 FROM identity_leases WHERE name='legacy'").get(), undefined);
 });
+
+for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} legacy conflict keeps tools available without adopting ambiguous mail`, async t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-mcp-legacy-conflict-")), node = new MbxNode(home, { host: "alpha" });
+  const c = new Client({ name: cli, version: "test" });
+  t.after(async () => { await c.close(); node.close(); rmSync(home, { recursive: true, force: true }); });
+  for (const session_id of ["legacy-one", "legacy-two"]) node.bindSession({ agent: "reader", cli, session_id, pid: process.pid });
+  const id = node.send({ from: "sender", to: ["reader"], subject: "ambiguous", body: "preserved" }).envelope.id;
+  await c.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
+    env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: cli, MBX_AGENT: "reader", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
+  const identity = (await c.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent: string };
+  assert.match(identity.agent, /^reader-mcp-[a-f0-9]{16}$/);
+  assert.equal((await c.callTool({ name: "mbx_read", arguments: { ids: [id] } })).isError, true);
+  assert.equal(node.inbox("reader")[0].id, id);
+  assert.ok(node.store.get("identity-conflict:reader"));
+  assert.equal(node.store.db.prepare("SELECT 1 FROM identity_leases WHERE name='reader'").get(), undefined);
+});

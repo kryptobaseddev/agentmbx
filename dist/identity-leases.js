@@ -156,8 +156,11 @@ export class IdentityLeases {
             if (status !== "live")
                 return { ok: false, status };
             const value = operation();
-            if (value && typeof value.then === "function")
+            if (value && typeof value.then === "function") {
+                // This cannot cancel external side effects. Store transaction contexts block later DB writes.
+                void Promise.resolve(value).catch(() => { });
                 throw error("IDENTITY_ASYNC_OPERATION", "lease operations cannot return a thenable");
+            }
             return { ok: true, value };
         });
         if (!result.ok) {

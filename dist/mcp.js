@@ -117,7 +117,10 @@ export async function runMcp(node = new MbxNode()) {
     const requests = new AsyncLocalStorage();
     const current = () => requests.getStore() ?? base;
     const legacyConflicts = new Set();
+    const ambiguousLegacy = new Set();
     const checkLegacy = (agent, state, rows) => {
+        if (node.store.get(`identity-conflict:${agent}`))
+            throw Object.assign(new Error(`identity ${agent} has unresolved historical ownership; choose a distinct identity`), { code: "IDENTITY_IN_USE" });
         // Once a lease exists, its generation is authoritative. Before migration, preserve ambiguous
         // live/unknown bindings rather than silently adopting their mailbox or replacing their key.
         if (node.store.db.prepare("SELECT 1 FROM identity_leases WHERE name=?").get(agent))
@@ -148,6 +151,8 @@ export async function runMcp(node = new MbxNode()) {
             && node.sameSession(env.ppid, only, { proof: true }))
             return;
         legacyConflicts.add(agent);
+        if (held.length > 1)
+            ambiguousLegacy.add(agent);
         throw Object.assign(new Error(`identity ${agent} has unresolved legacy session holders; choose a distinct identity`), { code: "IDENTITY_IN_USE" });
     };
     const bind = (state = base, initial = false) => {
@@ -172,11 +177,15 @@ export async function runMcp(node = new MbxNode()) {
         bind(base, true);
     }
     catch (error) {
-        if (!(env.cli === "codex" || env.cli === "opencode") || error.code !== "IDENTITY_IN_USE")
+        if (error.code !== "IDENTITY_IN_USE")
             throw error;
-        // Shared transports have provisional calls outside any user thread. A conflict there must
-        // neither adopt ambiguous history nor prevent separately identified threads from connecting.
-        base.agent = `${wanted.slice(0, 20)}-mcp-${process.pid}`;
+        // Keep ambiguity after old session rows migrate away. Resolving historical ownership is
+        // an explicit recovery operation, not a side effect of opening another MCP connection.
+        for (const name of ambiguousLegacy)
+            node.store.set(`identity-conflict:${name}`, JSON.stringify({ reason: "ambiguous legacy sessions", at: new Date().toISOString() }));
+        // Keep tools available on every provider without taking another holder's history. The
+        // fresh key suffix cannot accidentally recover a provisional mailbox through PID reuse.
+        base.agent = `${wanted.slice(0, 19)}-mcp-${fingerprint(base.key.publicKey).replaceAll("-", "")}`;
         bind(base);
     }
     const contextFor = (extra) => {
@@ -206,7 +215,7 @@ export async function runMcp(node = new MbxNode()) {
                 .some(r => r.pid && node.sameSession(r.pid, r, { proof: true }));
             // Legacy Codex hooks may have saved the same default for several threads on a daemon.
             // Recover a distinct name without moving any mail whose ownership is ambiguous.
-            const name = remembered && !legacyConflicts.has(remembered) && !(env.cli === "codex" && occupied(remembered)) ? remembered : fallback;
+            const name = remembered && !legacyConflicts.has(remembered) && !node.store.get(`identity-conflict:${remembered}`) && !(env.cli === "codex" && occupied(remembered)) ? remembered : fallback;
             if (occupied(name))
                 throw new Error(`${env.cli} mailbox ${name} belongs to another live session; choose a distinct session identity`);
             state = { agent: name, sessionId: sid, key: generateKeyPair(), parent: null };
@@ -263,17 +272,21 @@ export async function runMcp(node = new MbxNode()) {
     });
     // every tool first checks that a newer agentmbx hasn't upgraded the store under this long-running server
     const register = server.registerTool.bind(server);
-    server.registerTool = (name, config, cb) => register(name, config, (...a) => {
-        node.store.assertCurrent(version());
-        const state = contextFor(a[1]), before = { agent: state.agent, leaseToken: state.leaseToken };
-        try {
-            return requests.run(state, () => leases.withHeld(state.agent, state.leaseToken, () => cb(...a)));
-        }
-        catch (e) {
-            Object.assign(state, before);
-            throw e;
-        }
-    });
+    server.registerTool = (name, config, cb) => {
+        if (cb.constructor.name === "AsyncFunction")
+            throw new Error(`MCP handler ${name} must be synchronous to preserve its lease fence`);
+        return register(name, config, (...a) => {
+            node.store.assertCurrent(version());
+            const state = contextFor(a[1]), before = { agent: state.agent, leaseToken: state.leaseToken };
+            try {
+                return requests.run(state, () => leases.withHeld(state.agent, state.leaseToken, () => cb(...a)));
+            }
+            catch (e) {
+                Object.assign(state, before);
+                throw e;
+            }
+        });
+    };
     server.registerTool("mbx_whoami", {
         title: "Who am I on mbx",
         description: "Show this session's mbx identity (agent name, host, session key fingerprint, whether it holds an owner grant). Pass `name` to rename this session's agent (do it early if the default folder name is vague), `role`/`description` to describe it. Next: mbx_inbox for mail, mbx_agents to see who else is around.",

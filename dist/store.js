@@ -1,5 +1,6 @@
 // SQLite store (node:sqlite, WAL). One per host; every mbx process on the host opens it.
 import { DatabaseSync } from "node:sqlite";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { privatePath } from "./private-files.js";
@@ -61,13 +62,14 @@ CREATE TABLE IF NOT EXISTS pair_tokens (  -- one-time pairing tokens (agentmbx p
 export const SCHEMA_VERSION = 2;
 export class Store {
     db;
-    rawDb;
+    #rawDb;
+    #transactionContext = new AsyncLocalStorage();
     txDepth = 0;
     txFailure = null;
     constructor(home, options = {}) {
         mkdirSync(home, { recursive: true, mode: 0o700 });
         const existed = existsSync(join(home, "mbx.db"));
-        this.rawDb = new DatabaseSync(join(home, "mbx.db"));
+        this.#rawDb = new DatabaseSync(join(home, "mbx.db"));
         // Guard retained connections AND prepared statements if SQLite aborts an enclosing transaction.
         // Otherwise a caught nested failure can silently turn subsequent statements into autocommit writes.
         const guarded = (target) => new Proxy(target, {
@@ -76,9 +78,11 @@ export class Store {
                 if (typeof value !== "function")
                     return value;
                 return (...args) => {
+                    if (this.#transactionContext.getStore()?.active === false)
+                        throw new Error("SQLite transaction context is closed; asynchronous continuations cannot use this store");
                     if (this.txFailure)
                         throw this.txFailure.error;
-                    if (this.txDepth && !this.rawDb.isTransaction) {
+                    if (this.txDepth && !this.#rawDb.isTransaction) {
                         const error = new Error("SQLite transaction ended before its callback returned");
                         this.txFailure = { error };
                         throw error;
@@ -88,14 +92,14 @@ export class Store {
                         return property === "prepare" || property === "iterate" || property === Symbol.iterator ? guarded(result) : result;
                     }
                     catch (error) {
-                        if (this.txDepth && !this.rawDb.isTransaction)
+                        if (this.txDepth && !this.#rawDb.isTransaction)
                             this.txFailure ??= { error };
                         throw error;
                     }
                 };
             },
         });
-        this.db = guarded(this.rawDb);
+        this.db = guarded(this.#rawDb);
         try {
             // Connection-local only: contention can occur even while reading the compatibility marker.
             this.db.exec("PRAGMA busy_timeout=5000");
@@ -135,6 +139,19 @@ export class Store {
             throw Object.assign(new Error(`this mbx server${running ? ` (agentmbx ${running})` : ""} is older than the mailbox store (schema ${v} > ${SCHEMA_VERSION}); a newer agentmbx upgraded it. Update AgentMBX if necessary. Restart your CLI session to load the current mbx tools.`), { code: "STALE_SERVER" });
     }
     tx(fn) {
+        if (this.#transactionContext.getStore()?.active === false)
+            throw new Error("SQLite transaction context is closed; asynchronous continuations cannot start another transaction");
+        const context = { active: true };
+        return this.#transactionContext.run(context, () => {
+            try {
+                return this.runTransaction(fn);
+            }
+            finally {
+                context.active = false;
+            }
+        });
+    }
+    runTransaction(fn) {
         if (this.txFailure)
             throw this.txFailure.error;
         if (fn.constructor.name === "AsyncFunction")
@@ -144,26 +161,29 @@ export class Store {
         this.txDepth++;
         try {
             const r = fn();
-            if (r && typeof r.then === "function")
+            if (r && typeof r.then === "function") {
+                // Rejection does not cancel a promise. Its inherited context fences later database work.
+                void Promise.resolve(r).catch(() => { });
                 throw new Error("Store.tx cannot return a thenable");
+            }
             const failure = this.txFailure;
             if (failure)
                 throw failure.error;
-            if (!this.rawDb.isTransaction)
+            if (!this.#rawDb.isTransaction)
                 throw new Error("SQLite transaction ended before its callback returned");
             this.db.exec(depth ? `RELEASE SAVEPOINT ${savepoint}` : "COMMIT");
             return r;
         }
         catch (e) {
-            if (!this.rawDb.isTransaction)
+            if (!this.#rawDb.isTransaction)
                 this.txFailure ??= { error: e };
             const original = this.txFailure?.error ?? e;
             try {
-                if (this.rawDb.isTransaction) {
+                if (this.#rawDb.isTransaction) {
                     if (depth)
-                        this.rawDb.exec(`ROLLBACK TO SAVEPOINT ${savepoint}; RELEASE SAVEPOINT ${savepoint}`);
+                        this.#rawDb.exec(`ROLLBACK TO SAVEPOINT ${savepoint}; RELEASE SAVEPOINT ${savepoint}`);
                     else
-                        this.rawDb.exec("ROLLBACK");
+                        this.#rawDb.exec("ROLLBACK");
                 }
             }
             catch {

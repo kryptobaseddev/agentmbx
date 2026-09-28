@@ -29,7 +29,15 @@ test("Codex thread metadata isolates daemon mailboxes and recovers colliding hoo
   assert.equal((await call("invalid","mbx_whoami")).isError,true);
   const absent=await c.callTool({name:"mbx_whoami",arguments:{},_meta:{sessionId:a}});
   const provisional=(absent.structuredContent as {agent:string}).agent;
-  assert.match(provisional,/^shared-mcp-\d+$/,"unscoped calls use an isolated provisional mailbox");
+  assert.match(provisional,/^shared-mcp-[a-f0-9]{16}$/,"unscoped calls use a key-scoped provisional mailbox");
   assert.notEqual(provisional,aa.agent,"execution ID cannot substitute for thread ID");
   assert.equal(n.inbox("shared")[0].id,mail,"ambiguous legacy history remains untouched");
+  await c.close();
+  assert.ok(n.store.get("identity-conflict:shared"));
+  const next=new Client({name:"codex",version:"test"});t.after(()=>next.close());
+  await next.connect(new StdioClientTransport({command:process.execPath,args:[join(import.meta.dirname,"../bin/agentmbx.js"),"mcp"],env:{...process.env,AGENTMBX_DEV:"1",MBX_HOME:home,MBX_CLI:"codex",MBX_AGENT:"shared",MBX_NO_DESKTOP:"1"} as Record<string,string>}));
+  const nextName=((await next.callTool({name:"mbx_whoami",arguments:{}})).structuredContent as {agent:string}).agent;
+  assert.match(nextName,/^shared-mcp-[a-f0-9]{16}$/);assert.notEqual(nextName,provisional);
+  assert.equal(n.inbox("shared")[0].id,mail,"reconnect does not adopt history after legacy rows migrate away");
+  await next.close();
 });

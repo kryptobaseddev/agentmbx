@@ -109,6 +109,23 @@ test("lease fences reject async callbacks before invocation and roll back return
   assert.equal(node.store.get("thenable"), undefined);
 });
 
+test("a rejected promise continuation cannot write after its lease transaction closes", async t => {
+  const { node, leases, a, b } = fixture(t), lease = leases.claim("worker", a);
+  const prepared = node.store.db.prepare("INSERT INTO kv(k,v) VALUES ('escaped-async','bad')");
+  let resume!: () => void, pending!: Promise<void>;
+  const wait = new Promise<void>(resolve => { resume = resolve; });
+  assert.throws(() => leases.withHeld("worker", lease.token, () => {
+    pending = (async () => { await wait; prepared.run(); })();
+    return pending;
+  }), { code: "IDENTITY_ASYNC_OPERATION" });
+  leases.release("worker", lease.token); const successor = leases.claim("worker", b);
+  resume();
+  await assert.rejects(pending, /transaction context.*closed/i);
+  assert.equal(node.store.get("escaped-async"), undefined);
+  leases.withHeld("worker", successor.token, () => node.store.set("successor", "good"));
+  assert.equal(node.store.get("successor"), "good");
+});
+
 test("independent observers in different time zones agree on lease process birth", () => {
   const expected = inspectLeaseProcess(process.pid);
   assert.equal(expected.alive, true); assert.ok(expected.start);
