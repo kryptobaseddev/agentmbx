@@ -29,6 +29,11 @@ CREATE TABLE IF NOT EXISTS agents (       -- agents known on this host and on pa
 CREATE TABLE IF NOT EXISTS sessions (     -- live CLI sessions bound to local agents (for wake-up)
   agent TEXT NOT NULL, cli TEXT NOT NULL, session_id TEXT NOT NULL, cwd TEXT, pid INTEGER,
   session_key TEXT, channel INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (cli, session_id));
+CREATE TABLE IF NOT EXISTS identity_leases (
+  name TEXT PRIMARY KEY, token TEXT NOT NULL, holder_pid INTEGER NOT NULL, holder_start TEXT NOT NULL,
+  key_fp TEXT NOT NULL, cli TEXT NOT NULL, session_id TEXT NOT NULL,
+  claimed_at INTEGER NOT NULL, heartbeat_at INTEGER NOT NULL, idle_ttl INTEGER NOT NULL,
+  released_at INTEGER, release_reason TEXT);
 CREATE TABLE IF NOT EXISTS peers (
   host TEXT PRIMARY KEY, pubkey TEXT NOT NULL, owner_pubkey TEXT, addr TEXT NOT NULL,
   state TEXT NOT NULL,           -- 'pending' | 'approved'
@@ -54,9 +59,10 @@ CREATE TABLE IF NOT EXISTS pair_tokens (  -- one-time pairing tokens (agentmbx p
  * Store layout version (PRAGMA user_version). Bump it with every schema change. A process that finds a newer version
  * (an old MCP server still running after an upgrade) refuses to write instead of failing with raw SQL errors.
  */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 export class Store {
     db;
+    txDepth = 0;
     constructor(home) {
         mkdirSync(home, { recursive: true, mode: 0o700 });
         const existed = existsSync(join(home, "mbx.db"));
@@ -93,15 +99,23 @@ export class Store {
             throw Object.assign(new Error(`this mbx server${running ? ` (agentmbx ${running})` : ""} is older than the mailbox store (schema ${v} > ${SCHEMA_VERSION}); a newer agentmbx upgraded it. Update AgentMBX if necessary. Restart your CLI session to load the current mbx tools.`), { code: "STALE_SERVER" });
     }
     tx(fn) {
-        this.db.exec("BEGIN IMMEDIATE");
+        const depth = this.txDepth, savepoint = `mbx_tx_${depth}`;
+        this.db.exec(depth ? `SAVEPOINT ${savepoint}` : "BEGIN IMMEDIATE");
+        this.txDepth++;
         try {
             const r = fn();
-            this.db.exec("COMMIT");
+            this.db.exec(depth ? `RELEASE SAVEPOINT ${savepoint}` : "COMMIT");
             return r;
         }
         catch (e) {
-            this.db.exec("ROLLBACK");
+            if (depth)
+                this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}; RELEASE SAVEPOINT ${savepoint}`);
+            else
+                this.db.exec("ROLLBACK");
             throw e;
+        }
+        finally {
+            this.txDepth = depth;
         }
     }
     audit(event, detail = null) {
