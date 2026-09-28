@@ -4,6 +4,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { hostname, homedir } from "node:os";
 import { join } from "node:path";
 import { fingerprint, generateKeyPair, newPairToken, pairTokenKey, sha256, type KeyPair } from "./crypto.ts";
+import { generateEncKeyPair } from "./body-encryption.ts";
 import {
   attachAuthority, buildEnvelope, ownerSign, ownerSignRequest, withOwnerSig, checkAuthority, checkShape, NAME_RE, signEnvelope, verifyEnvelope,
   type Draft, type AuthorityCheck, type Envelope, type Grant,
@@ -24,7 +25,7 @@ export const WAKE_KINDS = new Set(["request", "task", "decision", "alert"]);
 export const WAKE_LIMITS = { perAgentSeconds: 30, perThreadHour: 6, perAgentDay: 60 };
 
 export interface Config { host: string; port: number; bind: string }
-export interface Peer { host: string; pubkey: string; owner_pubkey: string | null; addr: string; state: string; code: string | null; approved_at: string | null }
+export interface Peer { host: string; pubkey: string; owner_pubkey: string | null; addr: string; state: string; code: string | null; approved_at: string | null; enc_pub?: string | null }
 export interface Session { priv: string; pub: string; grant: Grant | null }
 export type ReceiveResult = "accepted" | "duplicate" | `rejected:${string}`;
 
@@ -45,13 +46,15 @@ const shortHost = () => hostname().split(".")[0].toLowerCase().replace(/[^a-z0-9
 
 export class MbxNode {
   readonly home: string; readonly store: Store; readonly config: Config; readonly key: KeyPair;
+  /** This host's static X25519 encryption keypair (T028 Option A); the public half is shared with paired hosts. */
+  readonly encKey: { publicKey: string; privateKey: string };
 
   constructor(home = defaultHome(), init: Partial<Config> = {}) {
     this.home = home;
     mkdirSync(home, { recursive: true, mode: 0o700 });
     privatePath(home, 0o700);
-    for (const file of ["config.json", "host.key", "owner.key", "owner.json"]) privatePath(join(home, file), 0o600, true);
-    const cfgPath = join(home, "config.json"), keyPath = join(home, "host.key");
+    for (const file of ["config.json", "host.key", "enc.key", "owner.key", "owner.json"]) privatePath(join(home, file), 0o600, true);
+    const cfgPath = join(home, "config.json"), keyPath = join(home, "host.key"), encPath = join(home, "enc.key");
     if (!existsSync(cfgPath)) {
       const c: Config = { host: init.host ?? shortHost(), port: init.port ?? DEFAULT_PORT, bind: init.bind ?? "0.0.0.0" };
       if (!NAME_RE.test(c.host)) throw new Error(`invalid host name "${c.host}" (use a-z, 0-9, -)`);
@@ -60,6 +63,8 @@ export class MbxNode {
     this.config = JSON.parse(readFileSync(cfgPath, "utf8"));
     if (!existsSync(keyPath)) writeFileSync(keyPath, JSON.stringify(generateKeyPair()) + "\n", { mode: 0o600, flag: "wx" });
     this.key = JSON.parse(readFileSync(keyPath, "utf8"));
+    if (!existsSync(encPath)) writeFileSync(encPath, JSON.stringify(generateEncKeyPair()) + "\n", { mode: 0o600, flag: "wx" });
+    this.encKey = JSON.parse(readFileSync(encPath, "utf8"));
     this.store = new Store(home);
     this.retireIdentityLinks();
     this.syncOwner();
@@ -364,7 +369,7 @@ export class MbxNode {
   }
 
   // ---- peers -------------------------------------------------------------------------------
-  peers(): Peer[] { return this.store.db.prepare("SELECT host,pubkey,owner_pubkey,addr,state,code,approved_at FROM peers ORDER BY host").all() as never; }
+  peers(): Peer[] { return this.store.db.prepare("SELECT host,pubkey,owner_pubkey,addr,state,code,approved_at,enc_pub FROM peers ORDER BY host").all() as never; }
   peer(host: string): Peer | undefined { return this.peers().find((p) => p.host === host); }
   approvedPeer(host: string) { const p = this.peer(host); return p && p.state === "approved" ? p : undefined; }
 

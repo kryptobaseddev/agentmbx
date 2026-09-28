@@ -4,6 +4,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { hostname, homedir } from "node:os";
 import { join } from "node:path";
 import { fingerprint, generateKeyPair, newPairToken, pairTokenKey, sha256 } from "./crypto.js";
+import { generateEncKeyPair } from "./body-encryption.js";
 import { attachAuthority, buildEnvelope, ownerSign, ownerSignRequest, withOwnerSig, checkAuthority, checkShape, NAME_RE, signEnvelope, verifyEnvelope, } from "./envelope.js";
 import { kimiHostedServer } from "./kimi-web.js";
 import { ownerPublicKey } from "./owner.js";
@@ -42,13 +43,15 @@ export class MbxNode {
     store;
     config;
     key;
+    /** This host's static X25519 encryption keypair (T028 Option A); the public half is shared with paired hosts. */
+    encKey;
     constructor(home = defaultHome(), init = {}) {
         this.home = home;
         mkdirSync(home, { recursive: true, mode: 0o700 });
         privatePath(home, 0o700);
-        for (const file of ["config.json", "host.key", "owner.key", "owner.json"])
+        for (const file of ["config.json", "host.key", "enc.key", "owner.key", "owner.json"])
             privatePath(join(home, file), 0o600, true);
-        const cfgPath = join(home, "config.json"), keyPath = join(home, "host.key");
+        const cfgPath = join(home, "config.json"), keyPath = join(home, "host.key"), encPath = join(home, "enc.key");
         if (!existsSync(cfgPath)) {
             const c = { host: init.host ?? shortHost(), port: init.port ?? DEFAULT_PORT, bind: init.bind ?? "0.0.0.0" };
             if (!NAME_RE.test(c.host))
@@ -59,6 +62,9 @@ export class MbxNode {
         if (!existsSync(keyPath))
             writeFileSync(keyPath, JSON.stringify(generateKeyPair()) + "\n", { mode: 0o600, flag: "wx" });
         this.key = JSON.parse(readFileSync(keyPath, "utf8"));
+        if (!existsSync(encPath))
+            writeFileSync(encPath, JSON.stringify(generateEncKeyPair()) + "\n", { mode: 0o600, flag: "wx" });
+        this.encKey = JSON.parse(readFileSync(encPath, "utf8"));
         this.store = new Store(home);
         this.retireIdentityLinks();
         this.syncOwner();
@@ -388,7 +394,7 @@ export class MbxNode {
         return this.store.db.prepare("SELECT * FROM sessions WHERE agent=? ORDER BY updated_at DESC").all(agent);
     }
     // ---- peers -------------------------------------------------------------------------------
-    peers() { return this.store.db.prepare("SELECT host,pubkey,owner_pubkey,addr,state,code,approved_at FROM peers ORDER BY host").all(); }
+    peers() { return this.store.db.prepare("SELECT host,pubkey,owner_pubkey,addr,state,code,approved_at,enc_pub FROM peers ORDER BY host").all(); }
     peer(host) { return this.peers().find((p) => p.host === host); }
     approvedPeer(host) { const p = this.peer(host); return p && p.state === "approved" ? p : undefined; }
     upsertPendingPeer(p) {

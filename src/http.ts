@@ -3,7 +3,7 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { hostname } from "node:os";
 import {
-  fingerprint, joinTranscript, nonce as newNonce, pairingCode, pairMac, pairTokenKey, safeEqual, sha256, signData, verifyData, type PairParty,
+  canonical, fingerprint, joinTranscript, nonce as newNonce, pairingCode, pairMac, pairTokenKey, safeEqual, sha256, signData, verifyData, type PairParty,
 } from "./crypto.ts";
 import { NAME_RE, type Envelope } from "./envelope.ts";
 import { MbxNode, RETRY_HOURS } from "./node.ts";
@@ -187,6 +187,12 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
       if (req.method === "GET" && url.pathname === "/v1/agents") {
         return send(200, { host: node.host, agents: node.agents().filter((a) => a.host === node.host).map(({ name, role, cli, description, last_seen }) => ({ name, role, cli, description, last_seen })) });
       }
+      if (req.method === "GET" && url.pathname === "/v1/enc-key") {
+        // Pairwise body-encryption key (T028 Option A). The channel is peer-authenticated by verifyHop
+        // above; the signature lets the requester pin enc_pub to THIS host's already-pinned signing key.
+        const payload = canonical({ v: 1, host: node.host, enc_pub: node.encKey.publicKey });
+        return send(200, { v: 1, host: node.host, enc_pub: node.encKey.publicKey, sig: signData(node.key.privateKey, payload) });
+      }
       return send(404, { error: "not found" });
     } catch (e) {
       const msg = (e as Error).message;
@@ -261,6 +267,29 @@ export async function refreshDirectory(node: MbxNode) {
           .run(a.name, p.host, a.role, a.cli, a.description, a.last_seen);
       }
     } catch { /* peer offline; try next time */ }
+  }
+}
+
+/**
+ * Learn each approved peer's body-encryption key (T028 Option A) over the already-authenticated
+ * host channel. The response signature is checked against the peer's PINNED host signing key, so a
+ * man-in-the-middle cannot substitute its own enc key. Inert until the send path seals for enc.
+ */
+export async function refreshPeerEncKeys(node: MbxNode, f: typeof fetch = fetch): Promise<void> {
+  for (const p of node.peers().filter((x) => x.state === "approved" && !(x as { enc_pub?: string | null }).enc_pub)) {
+    try {
+      const path = "/v1/enc-key";
+      const res = await f(`http://${p.addr}${path}`, { headers: signHop(node, "GET", path, ""), signal: AbortSignal.timeout(5_000) });
+      if (!res.ok) continue;
+      const j = await res.json() as { v?: number; host?: string; enc_pub?: string; sig?: string };
+      if (j.v !== 1 || j.host !== p.host || typeof j.enc_pub !== "string" || typeof j.sig !== "string") continue;
+      if (!verifyData(p.pubkey, canonical({ v: 1, host: p.host, enc_pub: j.enc_pub }), j.sig)) {
+        node.store.audit("enc_key.rejected", { host: p.host, reason: "signature does not verify against the pinned host key" });
+        continue;
+      }
+      node.store.db.prepare("UPDATE peers SET enc_pub=? WHERE host=?").run(j.enc_pub, p.host);
+      node.store.audit("enc_key.learned", { host: p.host });
+    } catch { /* peer offline or too old; try next pass */ }
   }
 }
 

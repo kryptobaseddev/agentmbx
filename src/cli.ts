@@ -7,7 +7,7 @@ import { execFileSync } from "node:child_process";
 import { canonical, fingerprint, ulid } from "./crypto.ts";
 import { buildGrant, CAPS, grantPayload, type Envelope, type Grant } from "./envelope.ts";
 import { advertise, browse, lanIPv4 } from "./discovery.ts";
-import { flushOutbox, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, startServer, advertisedAddr } from "./http.ts";
+import { flushOutbox, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.ts";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.ts";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.ts";
 import { ancestors, withProcSnapshot } from "./proc.ts";
@@ -407,7 +407,7 @@ If the codes differ, do not approve: someone is in the middle.`);
         });
       }
       setInterval(tick, 2000);
-      setInterval(() => { void refreshDirectory(node); void pullPolicies(node); }, 60_000); void refreshDirectory(node); void pullPolicies(node);
+      setInterval(() => { void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node); }, 60_000); void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node);
       // a policy about to lapse: one desktop reminder, 48 h ahead, with the renew command (only where the owner key is)
       const remind = () => { try { if (!node.ownerPub) return; for (const p of dueReminders(node.store.db)) void notifyDesktop({ subtitle: "Policy expires soon",
         body: `${policySummary(p)} expires ${p.exp.slice(0, 16).replace("T", " ")}Z. Renew: agentmbx policy renew ${p.id.slice(-6)}` }); } catch { /* db busy */ } };

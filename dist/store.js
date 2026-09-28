@@ -121,7 +121,7 @@ export class Store {
                 assertMigrationAllowed(); // an old opener may instead have initialized a previously empty database
                 this.db.exec(SCHEMA);
                 // CREATE TABLE IF NOT EXISTS does not add columns; suppress only confirmed existing columns.
-                for (const [table, column] of [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"]]) {
+                for (const [table, column] of [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"]]) {
                     if (!this.db.prepare(`PRAGMA table_info(${table})`).all().some(r => r.name === column))
                         this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
                 }
