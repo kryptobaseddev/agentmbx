@@ -1,21 +1,47 @@
 // Local coordination, not isolation from another process with access to this user's database.
 // Lease tokens fence stale connections; they are never owner grants or permission approvals.
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { NAME_RE } from "./envelope.js";
-import { procTable } from "./proc.js";
 export const DEFAULT_IDENTITY_IDLE_TTL_MS = 30 * 60_000;
 const error = (code, message) => Object.assign(new Error(message), { code });
 /** Missing ps data is unknown, not evidence that a process died. */
 export function inspectLeaseProcess(pid) {
+    let alive = true;
     try {
         process.kill(pid, 0);
     }
     catch (e) {
         if (e.code === "ESRCH")
             return { alive: false, start: null };
-        return { alive: null, start: null };
+        alive = null; // EPERM can still provide birth evidence for detecting PID reuse.
     }
-    return { alive: true, start: procTable(0).get(pid)?.start ?? null };
+    try {
+        if (process.platform === "linux") {
+            const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+            const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+            const boot = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+            if (fields[0] === "Z" || fields[0] === "X")
+                return { alive: false, start: null };
+            if (!/^\d+$/.test(fields[19] ?? "") || !/^[a-f0-9-]{36}$/.test(boot))
+                return { alive, start: null };
+            return { alive, start: `linux:${boot}:${fields[19]}` };
+        }
+        // Target only this PID, bypass caches, and normalize locale/TZ across independent providers.
+        // BSD ps has one-second birth resolution; this is a coordination fence, not a security boundary.
+        const out = execFileSync("ps", ["-p", String(pid), "-o", "stat=,lstart="], {
+            encoding: "utf8", timeout: 1000, stdio: ["ignore", "pipe", "ignore"],
+            env: { ...process.env, TZ: "UTC", LC_ALL: "C", LANG: "C" },
+        }).trim();
+        const match = /^(\S+)\s+([A-Z][a-z]{2} [A-Z][a-z]{2}\s+\d{1,2} \d{2}:\d{2}:\d{2} \d{4})$/.exec(out);
+        if (match?.[1].includes("Z"))
+            return { alive: false, start: null };
+        return { alive, start: match ? `ps-utc:${match[2].replace(/\s+/g, " ")}` : null };
+    }
+    catch {
+        return { alive, start: null };
+    }
 }
 export class IdentityLeases {
     store;
@@ -86,17 +112,22 @@ export class IdentityLeases {
     }
     /** No automatic reacquisition: callers must explicitly claim after losing a lease. */
     renew(name, token) {
-        const row = this.store.tx(() => {
+        const result = this.store.tx(() => {
             const row = this.row(name), now = this.now();
-            if (!row || row.token !== token || this.expire(row, now) !== "live")
-                return null;
+            if (!row || row.token !== token)
+                return { status: "expired" };
+            const status = this.expire(row, now);
+            if (status !== "live")
+                return { status };
             // A backwards wall-clock step cannot shorten the recorded heartbeat.
             this.store.db.prepare("UPDATE identity_leases SET heartbeat_at=MAX(heartbeat_at,?) WHERE name=? AND token=?").run(now, name, token);
-            return this.row(name);
+            return { status: "live", row: this.row(name) };
         });
-        if (!row)
+        if (result.status === "unknown")
+            throw error("IDENTITY_STATUS_UNKNOWN", `identity ${name} process status is unknown; retry this lease token after inspection recovers`);
+        if (!result.row)
             throw error("IDENTITY_LEASE_LOST", `identity ${name} lease is no longer usable; explicitly reclaim it`);
-        return row;
+        return result.row;
     }
     release(name, token) {
         return this.store.tx(() => {
@@ -109,16 +140,37 @@ export class IdentityLeases {
             return true;
         });
     }
+    /** Move ownership atomically with a fresh generation; a failed destination claim restores the source. */
+    rename(name, token, nextName) {
+        return this.store.tx(() => this.withHeld(name, token, () => {
+            const row = this.row(name);
+            if (name === nextName)
+                return row;
+            this.release(name, token);
+            const next = this.claim(nextName, this.holder(row));
+            this.store.audit("identity.rename", { from: name, to: nextName, holder: this.holder(row) });
+            return next;
+        }));
+    }
     /** Hold the SQLite write lock through the operation, so a successor cannot claim halfway through it. */
     withHeld(name, token, operation) {
+        if (operation.constructor.name === "AsyncFunction")
+            throw error("IDENTITY_ASYNC_OPERATION", "lease operations must be synchronous database mutations");
         const result = this.store.tx(() => {
             const row = this.row(name);
-            if (!row || row.token !== token || this.expire(row, this.now()) !== "live")
-                return { ok: false };
-            return { ok: true, value: operation() };
+            const status = row && row.token === token ? this.expire(row, this.now()) : "expired";
+            if (status !== "live")
+                return { ok: false, status };
+            const value = operation();
+            if (value && typeof value.then === "function")
+                throw error("IDENTITY_ASYNC_OPERATION", "lease operations cannot return a thenable");
+            return { ok: true, value };
         });
-        if (!result.ok)
+        if (!result.ok) {
+            if (result.status === "unknown")
+                throw error("IDENTITY_STATUS_UNKNOWN", `identity ${name} process status is unknown; retry this lease token after inspection recovers`);
             throw error("IDENTITY_LEASE_LOST", `identity ${name} lease is no longer usable`);
+        }
         return result.value;
     }
 }

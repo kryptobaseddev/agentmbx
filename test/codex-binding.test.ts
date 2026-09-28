@@ -28,5 +28,8 @@ test("Codex thread metadata isolates daemon mailboxes and recovers colliding hoo
   assert.equal(n.store.db.prepare("SELECT 1 FROM sessions WHERE session_id='execution-not-thread'").get(),undefined);
   assert.equal((await call("invalid","mbx_whoami")).isError,true);
   const absent=await c.callTool({name:"mbx_whoami",arguments:{},_meta:{sessionId:a}});
-  assert.equal((absent.structuredContent as {agent:string}).agent,"shared","execution ID cannot substitute for thread ID");
+  const provisional=(absent.structuredContent as {agent:string}).agent;
+  assert.match(provisional,/^shared-mcp-\d+$/,"unscoped calls use an isolated provisional mailbox");
+  assert.notEqual(provisional,aa.agent,"execution ID cannot substitute for thread ID");
+  assert.equal(n.inbox("shared")[0].id,mail,"ambiguous legacy history remains untouched");
 });

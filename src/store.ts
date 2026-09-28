@@ -8,7 +8,6 @@ import { privatePath } from "./private-files.ts";
 export type DeliveryState = "queued" | "delivered" | "notified" | "read" | "acked";
 
 const SCHEMA = `
-PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY, ts TEXT NOT NULL, from_addr TEXT NOT NULL, thread TEXT NOT NULL, reply_to TEXT,
   kind TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL, envelope TEXT NOT NULL,
@@ -68,20 +67,57 @@ export const SCHEMA_VERSION = 2;
 
 export class Store {
   db: DatabaseSync;
+  private rawDb: DatabaseSync;
   private txDepth = 0;
-  constructor(home: string) {
+  private txFailure: { error: unknown } | null = null;
+  constructor(home: string, options: { allowIdentityMigration?: boolean } = {}) {
     mkdirSync(home, { recursive: true, mode: 0o700 });
     const existed = existsSync(join(home, "mbx.db"));
-    this.db = new DatabaseSync(join(home, "mbx.db"));
+    this.rawDb = new DatabaseSync(join(home, "mbx.db"));
+    // Guard retained connections AND prepared statements if SQLite aborts an enclosing transaction.
+    // Otherwise a caught nested failure can silently turn subsequent statements into autocommit writes.
+    const guarded = <T extends object>(target: T): T => new Proxy(target, {
+      get: (object, property) => {
+        const value = Reflect.get(object, property, object);
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          if (this.txFailure) throw this.txFailure.error;
+          if (this.txDepth && !this.rawDb.isTransaction) {
+            const error = new Error("SQLite transaction ended before its callback returned");
+            this.txFailure = { error }; throw error;
+          }
+          try {
+            const result = Reflect.apply(value, object, args);
+            return property === "prepare" || property === "iterate" || property === Symbol.iterator ? guarded(result) : result;
+          } catch (error) {
+            if (this.txDepth && !this.rawDb.isTransaction) this.txFailure ??= { error };
+            throw error;
+          }
+        };
+      },
+    });
+    this.db = guarded(this.rawDb);
     try {
+      // Connection-local only: contention can occur even while reading the compatibility marker.
+      this.db.exec("PRAGMA busy_timeout=5000");
       // Read the compatibility marker before any schema, journal-mode or permission changes.
       this.assertCurrent();
+      if (existed && this.schemaVersion() < 2 && this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").get()
+        && !options.allowIdentityMigration && process.env.MBX_MIGRATE_IDENTITY_LEASES !== "1")
+        throw Object.assign(new Error("identity lease migration requires a validated rollout; stop old AgentMBX processes and explicitly set MBX_MIGRATE_IDENTITY_LEASES=1 for the migration"), { code: "IDENTITY_MIGRATION_REQUIRED" });
       privatePath(home, 0o700);
       privatePath(join(home, "mbx.db"), 0o600, false, existed);
-      this.db.exec(SCHEMA);
-      // columns added after 0.2 (CREATE TABLE IF NOT EXISTS doesn't add them to existing databases)
-      for (const ddl of ["ALTER TABLE sessions ADD COLUMN pid_start TEXT", "ALTER TABLE principals ADD COLUMN peer TEXT", "ALTER TABLE policy_revocations ADD COLUMN owner_fp TEXT"]) { try { this.db.exec(ddl); } catch { /* already there */ } }
-      if (this.schemaVersion() < SCHEMA_VERSION) this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+      this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON");
+      this.tx(() => {
+        this.assertCurrent(); // another opener may have migrated while we waited for the write lock
+        this.db.exec(SCHEMA);
+        // CREATE TABLE IF NOT EXISTS does not add columns; suppress only confirmed existing columns.
+        for (const [table, column] of [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"]]) {
+          if (!this.db.prepare(`PRAGMA table_info(${table})`).all().some(r => r.name === column))
+            this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
+        }
+        if (this.schemaVersion() < SCHEMA_VERSION) this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+      });
       for (const f of ["mbx.db-wal", "mbx.db-shm"]) privatePath(join(home, f), 0o600, true);
     } catch (e) { this.db.close(); throw e; }
   }
@@ -95,18 +131,30 @@ export class Store {
   }
 
   tx<T>(fn: () => T): T {
+    if (this.txFailure) throw this.txFailure.error;
+    if (fn.constructor.name === "AsyncFunction") throw new Error("Store.tx requires a synchronous callback");
     const depth = this.txDepth, savepoint = `mbx_tx_${depth}`;
     this.db.exec(depth ? `SAVEPOINT ${savepoint}` : "BEGIN IMMEDIATE");
     this.txDepth++;
     try {
       const r = fn();
+      if (r && typeof (r as { then?: unknown }).then === "function") throw new Error("Store.tx cannot return a thenable");
+      const failure = this.txFailure as { error: unknown } | null;
+      if (failure) throw failure.error;
+      if (!this.rawDb.isTransaction) throw new Error("SQLite transaction ended before its callback returned");
       this.db.exec(depth ? `RELEASE SAVEPOINT ${savepoint}` : "COMMIT");
       return r;
     } catch (e) {
-      if (depth) this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}; RELEASE SAVEPOINT ${savepoint}`);
-      else this.db.exec("ROLLBACK");
-      throw e;
-    } finally { this.txDepth = depth; }
+      if (!this.rawDb.isTransaction) this.txFailure ??= { error: e };
+      const original = this.txFailure?.error ?? e;
+      try {
+        if (this.rawDb.isTransaction) {
+          if (depth) this.rawDb.exec(`ROLLBACK TO SAVEPOINT ${savepoint}; RELEASE SAVEPOINT ${savepoint}`);
+          else this.rawDb.exec("ROLLBACK");
+        }
+      } catch { this.txFailure ??= { error: original }; }
+      throw original;
+    } finally { this.txDepth = depth; if (!depth) this.txFailure = null; }
   }
 
   audit(event: string, detail: unknown = null) {

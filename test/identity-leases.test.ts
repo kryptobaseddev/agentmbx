@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { fork, type ChildProcess } from "node:child_process";
+import { execFileSync, fork, type ChildProcess } from "node:child_process";
 import { Store } from "../src/store.ts";
 import { MbxNode } from "../src/node.ts";
-import { IdentityLeases, type ProcessEvidence, type LeaseHolder } from "../src/identity-leases.ts";
+import { IdentityLeases, inspectLeaseProcess, type ProcessEvidence, type LeaseHolder } from "../src/identity-leases.ts";
 
 function fixture(t: TestContext) {
   const home = mkdtempSync(join(tmpdir(), "mbx-leases-")), node = new MbxNode(home, { host: "alpha" });
@@ -45,8 +45,10 @@ test("unknown process status retains ownership but cannot authorize operations; 
   const first = leases.claim("worker", a);
   processes.set(a.pid, { alive: null, start: null });
   assert.throws(() => leases.claim("worker", b), { code: "IDENTITY_IN_USE" });
-  assert.throws(() => leases.renew("worker", first.token), { code: "IDENTITY_LEASE_LOST" });
-  assert.throws(() => leases.withHeld("worker", first.token, () => 1), { code: "IDENTITY_LEASE_LOST" });
+  assert.throws(() => leases.renew("worker", first.token), { code: "IDENTITY_STATUS_UNKNOWN" });
+  assert.throws(() => leases.withHeld("worker", first.token, () => 1), { code: "IDENTITY_STATUS_UNKNOWN" });
+  processes.set(a.pid, { alive: true, start: a.start });
+  assert.equal(leases.renew("worker", first.token).token, first.token, "inspection recovery verifies the same generation without reclaiming");
   processes.set(a.pid, { alive: false, start: null });
   const second = leases.claim("worker", b);
   processes.set(b.pid, { alive: true, start: "reused" }); processes.set(a.pid, { alive: true, start: a.start });
@@ -81,16 +83,58 @@ test("lease configuration and claimant process evidence are validated", (t) => {
   assert.throws(() => leases.claim("worker", { ...a, keyFp: "missing" }), { code: "IDENTITY_LEASE_CONFIG" });
 });
 
+test("SQLite whole-transaction abort preserves its error and fences retained statements until unwind", (t) => {
+  const { node, leases, a } = fixture(t), store = node.store;
+  const lease = leases.claim("worker", a), connection = store.db;
+  const retained = connection.prepare("INSERT INTO kv(k,v) VALUES ('escaped','bad')");
+  connection.exec("CREATE TRIGGER abort_everything BEFORE INSERT ON kv WHEN NEW.k='abort' BEGIN SELECT RAISE(ROLLBACK,'original rollback'); END");
+  assert.throws(() => leases.withHeld("worker", lease.token, () => {
+    assert.throws(() => store.tx(() => store.set("abort", "bad")), /original rollback/);
+    assert.equal(connection.isTransaction, false);
+    assert.throws(() => retained.run(), /original rollback/);
+    assert.throws(() => connection.exec("INSERT INTO kv(k,v) VALUES ('escaped2','bad')"), /original rollback/);
+    assert.throws(() => store.tx(() => store.set("escaped3", "bad")), /original rollback/);
+  }), /original rollback/);
+  for (const key of ["abort", "escaped", "escaped2", "escaped3"]) assert.equal(store.get(key), undefined);
+  leases.withHeld("worker", lease.token, () => store.set("recovered", "good"));
+  assert.equal(store.get("recovered"), "good");
+});
+
+test("lease fences reject async callbacks before invocation and roll back returned thenables", (t) => {
+  const { node, leases, a } = fixture(t), lease = leases.claim("worker", a);
+  let invoked = false;
+  assert.throws(() => leases.withHeld("worker", lease.token, async () => { invoked = true; }), { code: "IDENTITY_ASYNC_OPERATION" });
+  assert.equal(invoked, false);
+  assert.throws(() => leases.withHeld("worker", lease.token, () => { node.store.set("thenable", "bad"); return Promise.resolve(); }), { code: "IDENTITY_ASYNC_OPERATION" });
+  assert.equal(node.store.get("thenable"), undefined);
+});
+
+test("independent observers in different time zones agree on lease process birth", () => {
+  const expected = inspectLeaseProcess(process.pid);
+  assert.equal(expected.alive, true); assert.ok(expected.start);
+  for (const TZ of ["UTC", "America/Los_Angeles", "Asia/Tokyo"]) {
+    const script = `import { inspectLeaseProcess } from ${JSON.stringify(new URL("../src/identity-leases.ts", import.meta.url).href)}; console.log(JSON.stringify(inspectLeaseProcess(${process.pid})));`;
+    const observed = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8", env: { ...process.env, TZ, LC_ALL: "C" } }));
+    assert.deepEqual(observed, expected, TZ);
+  }
+});
+
 test("independent processes racing to claim one identity have exactly one winner", { timeout: 15000 }, async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-lease-race-")); new Store(home).close();
   const children: ChildProcess[] = [];
   t.after(async () => { await Promise.all(children.map(c => new Promise<void>(resolve => { if (c.exitCode !== null || c.signalCode) return resolve(); c.once("exit", () => resolve()); c.kill(); }))); rmSync(home, { recursive: true, force: true }); });
   const participants = Array.from({ length: 2 }, () => {
     const c = fork(join(import.meta.dirname, "fixtures/lease-claimant.ts"), [home], { execArgv: [], stdio: ["ignore", "ignore", "inherit", "ipc"] }); children.push(c);
-    let ready!: () => void, result!: (value: { result: string; token?: string }) => void;
+    let ready!: () => void, result!: (value: { result: string; token?: string }) => void, failed!: (error: Error) => void;
+    const failure = new Promise<never>((_, reject) => { failed = reject; });
+    c.once("error", failed);
+    c.once("exit", (code, signal) => failed(new Error(`lease claimant exited before completion: ${code ?? signal}`)));
     const readiness = new Promise<void>(resolve => { ready = resolve; }), outcome = new Promise<{ result: string; token?: string }>(resolve => { result = resolve; });
     c.on("message", (m: { ready?: boolean; result?: string; token?: string }) => { if (m.ready) ready(); if (m.result) result({ result: m.result, token: m.token }); });
-    return { c, readiness, outcome };
+    const readyOrFailed = Promise.race([readiness, failure]), resultOrFailed = Promise.race([outcome, failure]);
+    // Outcome may reject during startup before the readiness barrier is awaited.
+    void resultOrFailed.catch(() => {});
+    return { c, readiness: readyOrFailed, outcome: resultOrFailed };
   });
   await Promise.all(participants.map(p => p.readiness)); participants.forEach(p => p.c.send("claim"));
   const results = await Promise.all(participants.map(p => p.outcome));

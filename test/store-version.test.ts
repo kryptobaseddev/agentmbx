@@ -64,3 +64,40 @@ test("every MCP tool refuses an upgraded schema before its callback", async (t) 
   }
   assert.equal((n.store.db.prepare("SELECT count(*) n FROM messages").get() as { n: number }).n, 0);
 });
+
+test("v1 lease migration preserves signed message bytes and pending/acked delivery history", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-v1-leases-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const original = new MbxNode(home, { host: "alpha" });
+  const pending = original.send({ from: "sender", to: ["worker"], subject: "pending", body: "durable" }).envelope.id;
+  const acked = original.send({ from: "sender", to: ["worker"], subject: "acked", body: "durable" }).envelope.id;
+  original.ack(acked, "worker");
+  const before = original.store.db.prepare("SELECT * FROM messages ORDER BY id").all();
+  const deliveries = original.store.db.prepare("SELECT * FROM deliveries ORDER BY msg_id").all();
+  original.store.db.exec("DROP TABLE identity_leases; PRAGMA user_version=1"); original.close();
+  const saved = readFileSync(join(home, "mbx.db"));
+  assert.throws(() => new Store(home), { code: "IDENTITY_MIGRATION_REQUIRED" });
+  assert.deepEqual(readFileSync(join(home, "mbx.db")), saved, "normal startup cannot implicitly migrate an existing mailbox");
+  const migrated = new Store(home, { allowIdentityMigration: true });
+  try {
+    assert.equal(migrated.schemaVersion(), SCHEMA_VERSION);
+    assert.deepEqual(migrated.db.prepare("SELECT * FROM messages ORDER BY id").all(), before);
+    assert.deepEqual(migrated.db.prepare("SELECT * FROM deliveries ORDER BY msg_id").all(), deliveries);
+    assert.equal(migrated.db.prepare("SELECT state FROM deliveries WHERE msg_id=?").get(pending)!.state, "delivered");
+    assert.equal(migrated.db.prepare("SELECT count(*) n FROM identity_leases").get()!.n, 0);
+  } finally { migrated.close(); }
+});
+
+test("failed migration rolls back the lease table and version marker together", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-migration-abort-")), path = join(home, "mbx.db");
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const db = new DatabaseSync(path);
+  db.exec("PRAGMA user_version=1; CREATE VIEW principals AS SELECT 'sentinel' AS fp"); db.close();
+  assert.throws(() => new Store(home, { allowIdentityMigration: true }), /view|table/i);
+  const check = new DatabaseSync(path);
+  try {
+    assert.equal(check.prepare("PRAGMA user_version").get()!.user_version, 1);
+    assert.equal(check.prepare("SELECT name FROM sqlite_master WHERE name='identity_leases'").get(), undefined);
+    assert.equal(check.prepare("SELECT fp FROM principals").get()!.fp, "sentinel");
+  } finally { check.close(); }
+});
