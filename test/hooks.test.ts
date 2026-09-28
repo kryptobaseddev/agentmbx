@@ -1,10 +1,34 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MbxNode } from "../src/node.ts";
+import { IdentityLeases } from "../src/identity-leases.ts";
+
+for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} startup offers recovery choices without claiming historical mail`, t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-startup-choice-")), node = new MbxNode(home, { host: "alpha" });
+  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true }); });
+  const leases = new IdentityLeases(node.store, { inspect: () => ({ alive: true, start: "fixture" }) });
+  const lease = leases.claim("historical", { pid: process.pid, start: "fixture", keyFp: "aaaa-bbbb-cccc-dddd", cli, sessionId: "previous" });
+  leases.release("historical", lease.token);
+  node.send({ from: "sender", to: ["historical"], subject: "PRIVATE SUBJECT", body: "SECRET BODY" });
+  const before = node.store.db.prepare("SELECT * FROM identity_leases").all();
+  const result = spawnSync(process.execPath, ["bin/agentmbx.js", "hook", "session-start", "--cli", cli], {
+    input: JSON.stringify({ session_id: "new-session", cwd: "/work" }), encoding: "utf8",
+    env: { ...process.env, MBX_HOME: home, MBX_AGENT: "working", AGENTMBX_DEV: "1" },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const context = cli === "kimi" ? result.stdout : JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+  if (cli !== "kimi") assert.equal(JSON.parse(result.stdout).hookSpecificOutput.hookEventName, "SessionStart");
+  assert.match(context, /mbx_whoami/); assert.match(context, /mbx_identity.*action=list/);
+  assert.match(context, /explicitly release.*claim/);
+  assert.doesNotMatch(context, /SECRET BODY|PRIVATE SUBJECT/);
+  assert.deepEqual(node.store.db.prepare("SELECT * FROM identity_leases").all(), before);
+  assert.equal(node.unreadCount("historical"), 1);
+  assert.equal(node.unreadCount("working"), 0);
+});
 
 test("Claude post-tool hook surfaces arrivals once, including linked names and equal-count replacements", () => {
   const n = new MbxNode(mkdtempSync(join(tmpdir(), "mbx-hooks-")), { host: "alpha" });
