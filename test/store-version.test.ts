@@ -186,3 +186,15 @@ test("lease collisions inside one MCP process converge instead of erroring", () 
   assert.equal(leaseCollisionAction(Object.assign(new Error("x"), { code: "OTHER" }), prior, self), null);
   assert.equal(leaseCollisionAction(inUse, undefined, self), null);
 });
+
+test("code fingerprints detect a deployed build without a schema change", async () => {
+  const { codeFingerprint } = await import("../src/mcp.ts");
+  const base = codeFingerprint("/nonexistent-entry", () => { throw new Error("no file"); });
+  assert.equal(base, version(), "without a readable entry the fingerprint falls back to the version");
+  const a = codeFingerprint("entry", () => ({ mtimeMs: 100, size: 5 }));
+  const b = codeFingerprint("entry", () => ({ mtimeMs: 200, size: 5 }));
+  const c = codeFingerprint("entry", () => ({ mtimeMs: 100, size: 6 }));
+  assert.notEqual(a, b, "mtime change means a new build");
+  assert.notEqual(a, c, "size change means a new build");
+  assert.equal(a, codeFingerprint("entry", () => ({ mtimeMs: 100, size: 5 })), "same build, same fingerprint");
+});

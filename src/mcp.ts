@@ -3,7 +3,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -57,10 +58,29 @@ export const storeMismatchCode = (e: unknown): "STALE_SERVER" | "IDENTITY_MIGRAT
 export function reloadFromDisk(e: unknown): void {
   if (process.env[REEXEC_ENV] || !storeMismatchCode(e)) return;
   process.stderr.write(`[mbx] ${(e as Error).message}\n[mbx] reloading mailbox tools from disk to match the upgraded store; this session keeps running.\n`);
+  handOverToFreshProcess(false);
+}
+
+/**
+ * Re-exec this server from disk and hand over the transport, but keep serving the current call with the
+ * loaded code: the parent's stdin is paused so every subsequent request is read by the new process alone.
+ * Used both for store upgrades and for picking up a newly deployed build without restarting the agent session.
+ */
+function handOverToFreshProcess(pauseStdin: boolean): void {
   const child = spawn(process.execPath, process.argv.slice(1), { stdio: "inherit", env: { ...process.env, [REEXEC_ENV]: "1" } });
+  if (pauseStdin) try { process.stdin.pause(); } catch { /* already closed */ }
   child.on("error", () => process.exit(1));
   child.on("exit", (code, signal) => { if (signal) { process.kill(process.pid, signal); return; } process.exit(code ?? 0); });
 }
+
+/** Fingerprint of the on-disk build this process loaded, injectable for tests. */
+export const codeFingerprint = (entry: string = codeEntry(), stat: (p: string) => { mtimeMs: number; size: number } = (p) => statSync(p)): string => {
+  try { const s = stat(entry); return `${version()}:${s.mtimeMs}:${s.size}`; }
+  catch { return version(); }
+};
+const codeEntry = (): string => {
+  try { return fileURLToPath(new URL("./cli.js", import.meta.url)); } catch { return process.argv[1] ?? "agentmbx"; }
+};
 
 /**
  * What a failed lease claim should do about an existing holder in THIS process. A service process hosts one
@@ -363,13 +383,22 @@ export async function runMcp(existing?: MbxNode) {
     instructions: extra ? `${INSTRUCTIONS}\n${extra}` : INSTRUCTIONS,
     capabilities: env.channel ? { experimental: { "claude/channel": {} } } : {},
   });
-  // every tool first checks that a newer agentmbx hasn't upgraded the store under this long-running server
+  // every tool first checks that a newer agentmbx hasn't upgraded the store or the build under this server
+  const boot = codeFingerprint();
+  let handedOver = false;
   const register = server.registerTool.bind(server) as (...a: unknown[]) => unknown;
   (server as { registerTool: unknown }).registerTool = (name: string, config: unknown, cb: (...a: unknown[]) => unknown) => {
     if (cb.constructor.name === "AsyncFunction") throw new Error(`MCP handler ${name} must be synchronous to preserve its lease fence`);
     return register(name, config, (...a: unknown[]) => {
       try { node.store.assertCurrent(version()); }
       catch (e) { reloadFromDisk(e); throw e; }
+      // a deployed build replaced the one this server loaded: finish this call on the old code, then hand
+      // the transport to a fresh process so the session runs the new build without any restart
+      if (!handedOver && !process.env[REEXEC_ENV] && codeFingerprint() !== boot) {
+        handedOver = true;
+        process.stderr.write("[mbx] agentmbx was updated on disk; this session switches to the new build after this call.\n");
+        handOverToFreshProcess(true);
+      }
       const state = contextFor(a[1]), before = { agent: state.agent, leaseToken: state.leaseToken, released: state.released, parent: state.parent, sessionId: state.sessionId };
       try {
         // Recovery controls must remain callable after lease loss. Each mutation below performs
