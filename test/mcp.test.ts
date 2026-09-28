@@ -12,6 +12,20 @@ import { MbxNode } from "../src/node.ts";
 const BIN = join(import.meta.dirname, "../bin/agentmbx.js");
 const textOf = (r: unknown) => ((r as { content: { text: string }[] }).content[0].text);
 
+test("MCP search finds recipient mail behind unrelated higher-ranked matches", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-mcp-search-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  t.after(() => n.close());
+  for (let i = 0; i < 25; i++) n.send({ from: "other", to: ["elsewhere"], subject: "needle", body: "needle needle" });
+  const own = n.send({ from: "sender", to: ["searcher"], subject: "my result", body: `needle ${"padding ".repeat(100)}` }).envelope.id;
+  const { c } = await client(home, "searcher");
+  t.after(() => c.close());
+  const result = await c.callTool({ name: "mbx_search", arguments: { query: "needle", limit: 1 } });
+  assert.deepEqual(result.structuredContent, { ids: [own] });
+  assert.match(textOf(result), /my result/);
+  assert.doesNotMatch(textOf(result), /elsewhere/);
+});
+
 async function client(home: string, agent: string, extra: Record<string, string> = {}) {
   const c = new Client({ name: "test", version: "1" });
   const notes: unknown[] = [];

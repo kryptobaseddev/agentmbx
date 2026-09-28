@@ -589,11 +589,17 @@ export class MbxNode {
 
   /** Full-text search; with `agent`, only messages that agent can see. */
   search(q: string, limit = 20, agent?: string): MessageRow[] {
-    if (agent) return this.search(q, limit * 20).filter((m) => this.canSee(m, agent)).slice(0, limit);
     const fts = q.replace(/["']/g, " ").split(/\s+/).filter(Boolean).map((w) => `"${w}"`).join(" ");
     if (!fts) return [];
+    // Filter before LIMIT: unrelated higher-ranked mail must not crowd out this mailbox.
+    // Keep sender/recipient semantics identical to canSee, including shell-only linked names.
+    const visibility = agent ? `AND EXISTS (SELECT 1 FROM json_each(?) names WHERE
+      ((m.origin='local' OR substr(m.from_addr,instr(m.from_addr,'@')+1)=?)
+        AND substr(m.from_addr,1,instr(m.from_addr,'@')-1)=names.value)
+      OR EXISTS (SELECT 1 FROM deliveries d WHERE d.msg_id=m.id AND d.agent=names.value))` : "";
+    const scope = agent ? [JSON.stringify([agent, ...this.linkedNames(agent)]), this.host] : [];
     return this.store.db.prepare(`SELECT m.* FROM messages_fts f JOIN messages m ON m.rowid=f.rowid WHERE messages_fts MATCH ?
-      ORDER BY rank LIMIT ?`).all(fts, limit) as never;
+      ${visibility} ORDER BY rank LIMIT ?`).all(fts, ...scope, limit) as never;
   }
 
   setDelivery(id: string, agent: string, s: DeliveryState, note: string | null = null) { return this.store.setDelivery(id, agent, s, note); }
