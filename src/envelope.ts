@@ -61,7 +61,12 @@ export function buildEnvelope(d: Draft, now = new Date()): Envelope {
   };
 }
 
-const unsigned = (e: Envelope) => { const { sig: _s, ...rest } = e; return canonical(rest); };
+// The signed payload: everything except `sig`, with `body` REPLACED by the ciphertext when `enc` is
+// present. The signature therefore commits to the exact ciphertext (swap attacks between two sealed
+// envelopes from one sender fail), while the `body` field itself may carry either the ciphertext on the
+// wire or the decrypted plaintext in local storage — both forms verify identically. Plaintext envelopes
+// (enc: null) canonicalize exactly as before this substitution existed.
+const unsigned = (e: Envelope) => { const { sig: _s, body, ...rest } = e; return canonical({ ...rest, body: rest.enc ? rest.enc.body : body }); };
 
 export function signEnvelope(e: Envelope, host: string, hostPub: string, hostPriv: string): Envelope {
   return { ...e, sig: { alg: "ed25519", host, key: fingerprint(hostPub), value: signData(hostPriv, unsigned(e)) } };
