@@ -1,4 +1,4 @@
-// Host-to-host HTTP: pairing, envelope exchange, agent directory. Every request except /v1/pair* carries a
+// Host-to-host HTTP: pairing, envelope exchange, agent directory. Every request except /v1/pair* and read-only /v1/status carries a
 // signed hop (X-Mbx-Host / -Ts / -Sig over method, path, ts, sha256(body)); freshness is checked on the hop only.
 import { createServer } from "node:http";
 import { hostname } from "node:os";
@@ -6,6 +6,7 @@ import { fingerprint, joinTranscript, nonce as newNonce, pairingCode, pairMac, p
 import { NAME_RE } from "./envelope.js";
 import { MbxNode, RETRY_HOURS } from "./node.js";
 import { notifyDesktop } from "./wake.js";
+import { version } from "./version.js";
 import { storedPolicies, acceptSigned } from "./policy.js";
 export const HOP_SKEW_MS = 5 * 60_000;
 const MAX_REQ = 4 * 1024 * 1024;
@@ -127,6 +128,7 @@ function handleJoin(node, j, hellos, remote) {
 }
 // ---- server ----------------------------------------------------------------------------------
 export function startServer(node, port = node.config.port, bind = node.config.bind, onEnvelope) {
+    const runtime = { service: "agentmbx", v: 1, host: node.host, host_pubkey: node.key.publicKey, version: version(), started_at: new Date().toISOString() };
     let pairAttempts = [], tokenAttempts = [];
     const hellos = new Map(); // hello nonce → expiry
     const server = createServer(async (req, res) => {
@@ -134,6 +136,10 @@ export function startServer(node, port = node.config.port, bind = node.config.bi
         try {
             const url = new URL(req.url ?? "/", "http://x");
             const body = await readBody(req);
+            // Public diagnostic metadata only: this neither issues pairing nonces nor grants authority.
+            if (url.pathname === "/v1/status")
+                return req.method === "GET"
+                    ? send(200, runtime) : send(405, { error: "method not allowed" });
             if (url.pathname === "/v1/pair/hello" || url.pathname === "/v1/pair/join") {
                 tokenAttempts = tokenAttempts.filter((t) => Date.now() - t < 60_000);
                 if (tokenAttempts.push(Date.now()) > TOKEN_REQS_PER_MIN)
