@@ -1,7 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildEnvelope, checkShape, signEnvelope } from "../src/envelope.ts";
-import { generateKeyPair } from "../src/crypto.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { buildEnvelope, checkShape, signEnvelope, verifyEnvelope } from "../src/envelope.ts";
+import { canonical, generateKeyPair, verifyData } from "../src/crypto.ts";
+import { MbxNode } from "../src/node.ts";
 import { checkEnc, generateEncKeyPair, openBody, sealBody, ENC_ALG } from "../src/body-encryption.ts";
 
 const recipient = generateEncKeyPair();
@@ -49,4 +53,48 @@ test("checkShape accepts a signed envelope with a valid enc and still refuses ma
   assert.equal(checkShape({ ...signed, enc }), null);
   assert.equal(checkShape({ ...signed, enc: { v: 9 } }), "unsupported enc version");
   assert.equal(checkShape({ ...signed, enc: null }), null, "plaintext envelopes stay valid");
+});
+
+test("the signature commits to the ciphertext, and wire and decrypted-storage forms verify identically", () => {
+  const sender = generateKeyPair();
+  const draft = buildEnvelope({ from: "agent@alpha", to: ["peer@beta"], subject: "sealed", body: "top secret body" });
+  // simulate the transport edge (relay or opted-in LAN): seal, then sign the wire form
+  const sealed = sealBody(draft.body, recipient.publicKey, draft.id);
+  const wire = signEnvelope({ ...draft, enc: sealed, body: sealed.body }, "alpha", sender.publicKey, sender.privateKey);
+  assert.equal(verifyEnvelope(wire, sender.publicKey), true);
+  const stored = { ...wire, body: draft.body }; // local storage keeps plaintext (D001), enc retained
+  assert.equal(verifyEnvelope(stored, sender.publicKey), true, "decrypted storage form verifies with the same signature");
+  const other = sealBody("a DIFFERENT body", recipient.publicKey, draft.id);
+  const grafted = { ...wire, enc: other, body: other.body };
+  assert.equal(verifyEnvelope(grafted, sender.publicKey), false,
+    "ciphertext is committed: grafting another envelope's ciphertext without re-signing breaks verification");
+  // plaintext envelopes canonicalize exactly as before the enc field existed
+  const plain = signEnvelope(draft, "alpha", sender.publicKey, sender.privateKey);
+  const legacy = { ...draft, enc: null } as Parameters<typeof canonical>[0];
+  assert.equal(verifyData(sender.publicKey, canonical(legacy), plain.sig!.value), true,
+    "signatures produced over the pre-enc canonical form still verify");
+});
+
+test("receive opens sealed bodies, stores plaintext locally, and rejects tampered ciphertext", () => {
+  const homes = [mkdtempSync(join(tmpdir(), "mbx-recv-a-")), mkdtempSync(join(tmpdir(), "mbx-recv-b-"))];
+  const a = new MbxNode(homes[0], { host: "alpha" }), b = new MbxNode(homes[1], { host: "beta" });
+  try {
+    a.addApprovedPeer({ host: "beta", pubkey: b.key.publicKey, owner_pubkey: null, addr: "unused" }, "fixture");
+    b.addApprovedPeer({ host: "alpha", pubkey: a.key.publicKey, owner_pubkey: null, addr: "unused" }, "fixture");
+    const draft = buildEnvelope({ from: "agent@alpha", to: ["peer@beta"], subject: "sealed", body: "secret over the wire" });
+    const sealed = sealBody(draft.body, b.encKey.publicKey, draft.id);
+    const wire = signEnvelope({ ...draft, enc: sealed, body: sealed.body }, "alpha", a.key.publicKey, a.key.privateKey);
+    assert.equal(b.receive(wire, "alpha"), "accepted");
+    const stored = JSON.parse(b.store.db.prepare("SELECT envelope FROM messages WHERE id=?").get(draft.id)!.envelope as string);
+    assert.equal(stored.body, "secret over the wire", "local storage holds the plaintext");
+    assert.ok(stored.enc, "enc is retained so the signature keeps committing to the ciphertext");
+    assert.equal(verifyEnvelope(stored, a.key.publicKey), true, "stored form re-verifies");
+    assert.equal(b.inbox("peer").length, 1);
+
+    const draft2 = buildEnvelope({ from: "agent@alpha", to: ["peer@beta"], subject: "tampered", body: "original" });
+    const sealed2 = sealBody(draft2.body, b.encKey.publicKey, draft2.id);
+    const badBytes = Buffer.from(sealed2.body, "base64"); badBytes[10] ^= 0xff;
+    const tampered = signEnvelope({ ...draft2, enc: { ...sealed2, body: badBytes.toString("base64") }, body: badBytes.toString("base64") }, "alpha", a.key.publicKey, a.key.privateKey);
+    assert.equal(b.receive(tampered, "alpha"), "rejected:undecryptable body");
+  } finally { a.close(); b.close(); homes.forEach((h) => rmSync(h, { recursive: true, force: true })); }
 });

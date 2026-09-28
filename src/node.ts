@@ -4,7 +4,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { hostname, homedir } from "node:os";
 import { join } from "node:path";
 import { fingerprint, generateKeyPair, newPairToken, pairTokenKey, sha256, type KeyPair } from "./crypto.ts";
-import { generateEncKeyPair } from "./body-encryption.ts";
+import { generateEncKeyPair, openBody } from "./body-encryption.ts";
 import {
   attachAuthority, buildEnvelope, ownerSign, ownerSignRequest, withOwnerSig, checkAuthority, checkShape, NAME_RE, signEnvelope, verifyEnvelope,
   type Draft, type AuthorityCheck, type Envelope, type Grant,
@@ -522,11 +522,16 @@ export class MbxNode {
     if (!peer) return "rejected:host not paired";
     if (e.sig?.host !== via || !e.from.endsWith(`@${via}`)) return "rejected:sender host mismatch";
     if (!verifyEnvelope(e, peer.pubkey)) return "rejected:bad signature";
+    let storedEnv = e;
+    if (e.enc) { // sealed bodies (untrusted-hop encryption, T028) open with this host's static enc key
+      try { storedEnv = { ...e, body: openBody(e.enc, this.encKey.privateKey, e.id) }; }
+      catch { return "rejected:undecryptable body"; }
+    }
     if (this.store.hasMessage(e.id)) return "duplicate";
     const auth = e.authority ? checkAuthority(e, peer.owner_pubkey, this.revoked()) : null;
     const r = this.route(e.to, true);
     const stored = this.store.tx(() => {
-      if (!this.store.insertMessage(e, via, "verified", auth)) return false;
+      if (!this.store.insertMessage(storedEnv, via, "verified", auth)) return false;
       for (const a of r.local) this.store.addDelivery(e.id, a);
       return true;
     });
