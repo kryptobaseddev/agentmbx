@@ -66,7 +66,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} hooks re
   assert.equal(n.inbox(agent)[0].state, "delivered");
   const startup = run("session-start"); assert.equal(startup.status, 0, startup.stderr);
   assert.match(startup.stdout, /1 unread/); assert.match(startup.stdout, /owner|Owner/);
-  for (const unknown of [undefined, "missing-session", "", 42, {}]) {
+  for (const unknown of [undefined, ...(cli === "claude" ? [] : ["missing-session"]), "", 42, {}]) {
     const before = n.store.db.prepare("SELECT * FROM sessions").all();
     // null represents absent/invalid session identity; the helper default is intentionally avoided.
     const r = run("prompt", unknown === undefined ? null : unknown);
@@ -131,4 +131,50 @@ test("hosted Kimi does not bootstrap an unknown thread from a provisional parent
   const r = run("prompt", "unknown-hosted-session", "kimi", { KIMI_CODE_HOME: kimiHome });
   assert.equal(r.status, 0, r.stderr); assert.equal(r.stdout, "");
   assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before);
+});
+
+for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} refuses malformed and provisional hook IDs without changing bindings`, async t => {
+  const { n, run, send } = await holder(t, cli);
+  send();
+  const controls = n.store.db.prepare("SELECT v FROM kv WHERE k GLOB 'identity-control:*'").all().map(r => JSON.parse(r.v as string));
+  const provisional = controls.find(d => d.session_id.startsWith("mcp-"))?.session_id ?? "mcp-12345";
+  for (const sid of [" real-hook-session", "real-hook-session ", "bad\nline", "bad\u0000id", "bad\u007fid", "bad\u0085id", "x".repeat(301), provisional]) {
+    const before = n.store.db.prepare("SELECT * FROM sessions").all();
+    for (const event of ["prompt", "post-tool", "stop", "session-start"]) {
+      const r = run(event, sid); assert.equal(r.status, 0, r.stderr);
+      assert.doesNotMatch(r.stdout, /[0-9]+ unread|PRIVATE|SECRET|autonomous/);
+      assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before);
+    }
+  }
+});
+
+test("Claude clear changes only the session alias of one current holder", async t => {
+  const { n, call, agent, sid: originalSid, run, send } = await holder(t, "claude");
+  send(); assert.match(run("prompt").stdout, /1 unread/);
+  const original = n.sessionsFor(agent)[0];
+  const lease = n.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(agent);
+  for (const sid of ["after-clear-1", "after-clear-2", originalSid]) {
+    const r = run("session-start", sid); assert.equal(r.status, 0, r.stderr); assert.match(r.stdout, /1 unread/);
+    const rows = n.sessionsFor(agent); assert.equal(rows.length, 1); assert.equal(rows[0].session_id, sid);
+    assert.equal(rows[0].session_key, original.session_key); assert.equal(rows[0].channel, original.channel);
+    assert.equal(n.store.db.prepare("SELECT token FROM identity_leases WHERE name=?").get(agent)?.token, lease?.token);
+    assert.match(run("prompt", sid).stdout, /1 unread/);
+    assert.notEqual((await call("mbx_inbox")).isError, true);
+  }
+  await call("mbx_identity", { action: "release" });
+  assert.equal(run("prompt", "after-release").stdout, ""); assert.equal(n.sessionsFor(agent).length, 0);
+});
+
+test("Claude new session refuses two MCP holders sharing a parent", async t => {
+  const { n, agent, run, send } = await holder(t, "claude");
+  send(); assert.match(run("prompt").stdout, /1 unread/);
+  const other = new Client({ name: "second-hook-holder", version: "1" });
+  t.after(() => other.close());
+  await other.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
+    env: { ...process.env, MBX_HOME: n.home, MBX_AGENT: "other", MBX_CLI: "claude", AGENTMBX_DEV: "1" } as Record<string,string> }));
+  await other.callTool({ name: "mbx_whoami", arguments: {} });
+  const before = n.store.db.prepare("SELECT * FROM sessions").all();
+  const r = run("prompt", "new-ambiguous-session"); assert.equal(r.status, 0, r.stderr); assert.equal(r.stdout, "");
+  assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before);
+  assert.equal(n.unreadCount(agent), 1);
 });

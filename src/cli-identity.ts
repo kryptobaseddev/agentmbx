@@ -21,18 +21,21 @@ export function withCliIdentity<T>(node: MbxNode, selection: CliIdentitySelectio
   return withIdentity(node, selection, descriptors, operation);
 }
 
-/** Hook bootstrap is limited to a unique provisional single-session provider, never hosted thread guesses. */
+/** Hook bootstrap requires one holder; only Claude may change real session IDs within that holder. */
 export function withHookIdentity<T>(node: MbxNode, cli: string, session: string | undefined,
-  operation: (agent: string, descriptor: IdentityControlDescriptor) => T, allowBootstrap = false): T {
+  operation: (agent: string, descriptor: IdentityControlDescriptor, bootstrap: boolean) => T, allowBootstrap = false): T {
   if (operation.constructor.name === "AsyncFunction") throw refused("hook operations must be synchronous");
-  if (!session) throw refused("hook requires an explicit session id");
+  if (!session || session.length > 300 || session !== session.trim() || /[\u0000-\u001f\u007f-\u009f]/u.test(session) || session.startsWith("mcp-"))
+    throw refused("hook requires a valid non-provisional session id");
   const all = listIdentityControls(node.store).filter(d => d.cli === cli && d.parent_pid === process.ppid);
   let descriptors: IdentityControlDescriptor[], bootstrap = false;
-  if (node.store.get(identityControlKey(cli, session)) !== undefined) descriptors = [findIdentityControl(node.store, cli, session)];
+  const rebindClaude = allowBootstrap && cli === "claude" && !node.store.db.prepare("SELECT 1 FROM sessions WHERE cli=? AND session_id=?").get(cli, session);
+  if (node.store.get(identityControlKey(cli, session)) !== undefined && !rebindClaude) descriptors = [findIdentityControl(node.store, cli, session)];
   else {
     // Hosted providers must first publish an exact session binding. Never bootstrap by directory.
     if (!allowBootstrap || !["claude", "kimi"].includes(cli) || (cli === "kimi" && kimiInstances().some(instance => instance.pid === process.ppid)) || new Set(all.map(d => d.control_key)).size !== 1
-      || all.some(d => !d.session_id.startsWith("mcp-") || !d.lease_session_id.startsWith("mcp-")))
+      || all.some(d => !d.lease_session_id.startsWith("mcp-") || (cli !== "claude" && !d.session_id.startsWith("mcp-"))
+        || !matches(d, rowFor(node, d.agent)) || canonical({ ...d, session_id: "" }) !== canonical({ ...all[0], session_id: "" })))
       throw refused("hook session has no exact current MCP binding");
     descriptors = all; bootstrap = true;
   }
@@ -40,7 +43,7 @@ export function withHookIdentity<T>(node: MbxNode, cli: string, session: string 
   return withIdentity(node, {}, descriptors, (agent, descriptor) => {
     if (bootstrap && canonical(listIdentityControls(node.store).filter(d => d.cli === cli && d.parent_pid === process.ppid)) !== canonical(all))
       throw refused("hook bootstrap bindings changed before the operation");
-    return operation(agent, descriptor);
+    return operation(agent, descriptor, bootstrap);
   });
 }
 

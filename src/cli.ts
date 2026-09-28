@@ -650,14 +650,22 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
     cli === "kimi" && !!kimiHostedServer(process.ppid));
   let entered = false;
   try {
-    return withProcSnapshot(() => withHookIdentity(node, cli, sid, (agent, descriptor) => {
+    return withProcSnapshot(() => withHookIdentity(node, cli, sid, (agent, descriptor, bootstrap) => {
       entered = true;
       const delegated = () => activePolicies(node.store.db, agent, node.host).length > 0;
       if ((event === "prompt" || event === "session-start") && sid) {
-        const bound = node.bindSession({ agent, cli, session_id: sid, cwd, pid: process.ppid });
+        // Claude /clear keeps its MCP holder but replaces its real session ID. Use the
+        // guarded holder's existing key explicitly; bindSession never guesses across real sessions.
+        const source = bootstrap && cli === "claude" ? node.sessionsFor(agent).find(s => s.cli === cli && s.pid === process.ppid
+          && s.session_key && fingerprint(s.session_key) === descriptor.control_key && node.sameSession(s.pid, s, { proof: true })) : undefined;
+        if (bootstrap && cli === "claude" && !source) throw new Error("hook holder has no current session binding");
+        const bound = node.bindSession({ agent, cli, session_id: sid, cwd, pid: process.ppid,
+          ...(source ? { session_key: source.session_key!, channel: !!source.channel } : {}) });
         const row = node.store.db.prepare("SELECT agent,session_key FROM sessions WHERE cli=? AND session_id=?").get(cli, sid);
         if (bound !== agent || !row?.session_key || fingerprint(row.session_key as string) !== descriptor.control_key)
           throw new Error("hook binding does not match the current lease");
+        if (source) node.store.db.prepare("DELETE FROM sessions WHERE cli=? AND pid=? AND session_key=? AND session_id<>?")
+          .run(cli, process.ppid, source.session_key!, sid);
         publishIdentityControl(node.store, { ...descriptor, session_id: sid });
       }
       if (event === "session-start") {
