@@ -69,7 +69,78 @@ const err = (r: WakeResult): string => (r.ok ? "" : r.error);
 const deliveries = (n: MbxNode) => (n.store.db.prepare("SELECT state, note FROM deliveries ORDER BY msg_id").all() as { state: string; note: string | null }[])
   .map((r) => ({ state: r.state, note: r.note }));
 
+for (const concurrent of [false, true]) test(`busy race releases only its reservation (concurrent continuation: ${concurrent})`, async (t) => {
+  const n = new MbxNode(tmp(), { host: "alpha" });
+  t.after(() => n.close());
+  let statusCalls = 0, prompts = 0;
+  t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.endsWith("/status")) {
+      statusCalls++;
+      if (statusCalls === 2 && concurrent) assert.ok(n.allowContinue("web", "another-thread"));
+      return Response.json({ code: 0, data: { busy: statusCalls === 2, model: "m" } });
+    }
+    assert.ok(url.endsWith("/prompts"));
+    prompts++;
+    return Response.json({ code: 0, data: { prompt_id: "p", status: "running" } });
+  });
+  await withKimiHome(kimiHomeWithInstance(12345), async () => {
+    n.bindSession({ agent: "web", cli: "kimi", session_id: "session_race", pid: process.pid });
+    n.send({ from: "boss", to: ["web"], subject: "race", body: "check inbox", kind: "request" });
+    const first = await dispatchWakes(n);
+    assert.equal(first[0].result.ok, false);
+    assert.match(err(first[0].result as WakeResult), /busy/);
+    assert.equal(prompts, 0);
+    assert.deepEqual(deliveries(n), [{ state: "delivered", note: null }]);
+    const wakes = n.store.db.prepare("SELECT thread FROM wakes").all() as { thread: string }[];
+    assert.deepEqual(wakes.map((r) => r.thread), concurrent ? ["another-thread"] : []);
+    const second = await dispatchWakes(n);
+    if (concurrent) {
+      assert.deepEqual(second, [], "the concurrent continuation still enforces the shared brake");
+      assert.equal(prompts, 0);
+    } else {
+      assert.equal(second[0].result.ok, true, "idle retry is not delayed by an unused reservation");
+      assert.equal(prompts, 1);
+      assert.deepEqual(deliveries(n), [{ state: "notified", note: null }]);
+    }
+  });
+});
+
 // ---- hosted-session detection -------------------------------------------------------------------
+test("reservation is retained if an earlier adapter attempt failed before the busy result", async (t) => {
+  const n = new MbxNode(tmp(), { host: "alpha" });
+  t.after(() => n.close());
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    calls++;
+    if (calls === 2) return Response.json({ code: 50000, message: "status unavailable" });
+    return Response.json({ code: 0, data: { busy: calls === 3, model: "m" } });
+  });
+  await withKimiHome(kimiHomeWithInstance(12345), async () => {
+    for (const session_id of ["session_first", "session_second"])
+      n.bindSession({ agent: "web", cli: "kimi", session_id, pid: process.pid });
+    n.send({ from: "boss", to: ["web"], subject: "race", body: "check inbox", kind: "request" });
+    assert.match(err((await dispatchWakes(n))[0].result as WakeResult), /busy/);
+    assert.equal(calls, 3);
+    assert.equal((n.store.db.prepare("SELECT count(*) n FROM wakes").get() as { n: number }).n, 1);
+    assert.deepEqual(deliveries(n), [{ state: "delivered", note: null }]);
+  });
+});
+
+test("reservation release is idempotent even when SQLite reuses the row id", (t) => {
+  const n = new MbxNode(tmp(), { host: "alpha" });
+  t.after(() => n.close());
+  const at = Date.now();
+  const first = n.reserveWake("web", "thread", at);
+  assert.equal(first.brake, null);
+  first.release!();
+  const second = n.reserveWake("web", "thread", at);
+  assert.equal(second.brake, null);
+  first.release!();
+  assert.equal((n.store.db.prepare("SELECT count(*) n FROM wakes").get() as { n: number }).n, 1);
+  assert.match(n.takeWake("web", "thread", at)!, /batched/);
+});
+
 test("kimiHostedServer: only a live instances row for this very pid counts as hosted", () => {
   const home = tmp();
   assert.equal(kimiHostedServer(111, home), null, "no instances dir, no token");

@@ -225,7 +225,8 @@ export async function dispatchWakes(node) {
             out.push({ agent, result: { ok: false, via: "kimi web", error: "session busy (retrying next pass)" } });
             continue;
         }
-        const brake = node.takeWake(agent, wanted[0].thread);
+        const reservation = node.reserveWake(agent, wanted[0].thread);
+        const brake = reservation.brake;
         if (brake?.startsWith("batched"))
             continue; // try again next pass, messages accumulate into one wake
         if (brake) {
@@ -236,6 +237,7 @@ export async function dispatchWakes(node) {
         }
         const text = wakeText(agent, wanted) + (owner ? ` (${agent} is a name your session ${owner} sent as: read it with agentmbx inbox --as ${agent})` : "") + policyBrief(node.store.db, owner ?? agent, node.host);
         let result = { ok: false, via: "none", error: "no bound session" };
+        let attempts = 0;
         for (const s of sessions) {
             if (s.cli === "codex")
                 result = await wakeCodex(s.session_id, text);
@@ -245,10 +247,15 @@ export async function dispatchWakes(node) {
                 result = await wakeKimi(s, text);
             else
                 continue;
+            attempts++;
             if (result.ok || isRetry(result))
                 break; // a busy hosted session retries next pass instead of a desktop notice
         }
         if (isRetry(result)) { // hosted but busy again (race): mail stays delivered, next pass retries
+            // A previous adapter failure could have submitted a wake before losing its response. Retain
+            // that budget; only refund the known-unsent first attempt, by its own reservation identity.
+            if (attempts === 1)
+                reservation.release?.();
             node.store.audit("wake", { agent, via: result.via, ok: false, busy: true, count: wanted.length });
             out.push({ agent, result });
             continue;

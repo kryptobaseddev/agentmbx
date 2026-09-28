@@ -612,13 +612,26 @@ export class MbxNode {
 
   /** Returns why a wake is not allowed right now, or null when it may proceed (and records it). */
   takeWake(agent: string, thread: string | null, now = Date.now()): string | null {
-    const since = (ms: number) => new Date(now - ms).toISOString();
-    const q = (sql: string, ...a: (string | null)[]) => (this.store.db.prepare(sql).get(...a) as { n: number }).n;
-    if (q("SELECT count(*) n FROM wakes WHERE agent=? AND at>?", agent, since(WAKE_LIMITS.perAgentSeconds * 1000))) return "batched (woke recently)";
-    if (thread && q("SELECT count(*) n FROM wakes WHERE agent=? AND thread=? AND at>?", agent, thread, since(3_600_000)) >= WAKE_LIMITS.perThreadHour) return "thread wake cap reached";
-    if (q("SELECT count(*) n FROM wakes WHERE agent=? AND at>?", agent, since(86_400_000)) >= WAKE_LIMITS.perAgentDay) return "daily wake cap reached";
-    this.store.db.prepare("INSERT INTO wakes (agent,thread,at) VALUES (?,?,?)").run(agent, thread, new Date(now).toISOString());
-    return null;
+    return this.reserveWake(agent, thread, now).brake;
+  }
+
+  /** Reserve budget atomically; release only when the adapter proves no wake was submitted. */
+  reserveWake(agent: string, thread: string | null, now = Date.now()): { brake: string; release?: never } | { brake: null; release: () => void } {
+    return this.store.tx(() => {
+      const since = (ms: number) => new Date(now - ms).toISOString();
+      const q = (sql: string, ...a: (string | null)[]) => (this.store.db.prepare(sql).get(...a) as { n: number }).n;
+      if (q("SELECT count(*) n FROM wakes WHERE agent=? AND at>?", agent, since(WAKE_LIMITS.perAgentSeconds * 1000))) return { brake: "batched (woke recently)" };
+      if (thread && q("SELECT count(*) n FROM wakes WHERE agent=? AND thread=? AND at>?", agent, thread, since(3_600_000)) >= WAKE_LIMITS.perThreadHour) return { brake: "thread wake cap reached" };
+      if (q("SELECT count(*) n FROM wakes WHERE agent=? AND at>?", agent, since(86_400_000)) >= WAKE_LIMITS.perAgentDay) return { brake: "daily wake cap reached" };
+      const at = new Date(now).toISOString();
+      const { lastInsertRowid } = this.store.db.prepare("INSERT INTO wakes (agent,thread,at) VALUES (?,?,?)").run(agent, thread, at);
+      let released = false;
+      return { brake: null, release: () => {
+        if (released) return;
+        this.store.db.prepare("DELETE FROM wakes WHERE rowid=? AND agent=? AND thread IS ? AND at=?").run(lastInsertRowid, agent, thread, at);
+        released = true;
+      } };
+    });
   }
 }
 
