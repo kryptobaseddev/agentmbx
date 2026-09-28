@@ -3,6 +3,8 @@
 // decision, so the CLI shows its normal prompt. Per-CLI mechanisms and evidence: docs/RESEARCH.md "Permission hooks per CLI".
 import { agentName } from "./mcp.js";
 import { kimiServer } from "./kimi-web.js";
+import { fingerprint } from "./crypto.js";
+import { IdentityLeases } from "./identity-leases.js";
 export { kimiServer } from "./kimi-web.js";
 /** Tools that collect an answer from the user rather than ask for permission: never auto-approved. */
 const INTERACTIVE = new Set(["AskUserQuestion", "ExitPlanMode"]);
@@ -11,15 +13,54 @@ const NONE = { allow: false, output: "" };
  * The agent a hook invocation belongs to: only a binding recorded for this very CLI process (pid + start time) counts.
  * No verified binding means no decision (fail closed): a stale row, a reused PID or a guessed name never gets YOLO.
  */
-export function resolveAgent(node, cli, sessionId, _cwd, pid) {
+function resolveBinding(node, cli, sessionId, pid) {
     if (!pid)
         return null;
     if (sessionId) {
-        const r = node.store.db.prepare("SELECT agent, pid, pid_start, updated_at FROM sessions WHERE cli=? AND session_id=?").get(cli, sessionId);
-        if (r && r.pid === pid && node.sameSession(pid, r, { proof: true }))
-            return r.agent;
+        const r = node.store.db.prepare("SELECT * FROM sessions WHERE cli=? AND session_id=?").get(cli, sessionId);
+        if (r)
+            return r.pid === pid && node.sameSession(pid, r, { proof: true }) ? r : null;
     }
-    return node.agentFor(cli, pid, { proof: true });
+    const agent = node.agentFor(cli, pid, { proof: true });
+    if (!agent)
+        return null;
+    return node.store.db.prepare("SELECT * FROM sessions WHERE cli=? AND pid=? AND agent=? ORDER BY (session_key IS NOT NULL) DESC,updated_at DESC").all(cli, pid, agent)
+        .find(r => node.sameSession(pid, r, { proof: true })) ?? null;
+}
+/** Check the exact captured binding and generation together. This authorizes only synchronous local work. */
+function withAuthority(node, authority, operation) {
+    try {
+        return node.store.tx(() => {
+            const old = authority.binding;
+            const row = node.store.db.prepare("SELECT * FROM sessions WHERE cli=? AND session_id=?").get(old.cli, old.session_id);
+            if (!row || !row.pid || !node.sameSession(row.pid, row, { proof: true })
+                || ["agent", "pid", "pid_start", "session_key", "cwd"].some(k => row[k] !== old[k]))
+                return null;
+            const lease = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(row.agent);
+            if (authority.leaseToken === null)
+                return lease ? null : operation(); // legacy evidence cannot acquire a new lease implicitly
+            if (!lease || lease.token !== authority.leaseToken || lease.cli !== row.cli || !row.session_key || fingerprint(row.session_key) !== lease.key_fp)
+                return null;
+            return new IdentityLeases(node.store).withHeld(row.agent, authority.leaseToken, operation);
+        });
+    }
+    catch {
+        return null;
+    }
+}
+function captureAuthority(node, binding) {
+    const lease = node.store.db.prepare("SELECT token FROM identity_leases WHERE name=?").get(binding.agent);
+    const authority = { binding, leaseToken: lease?.token ?? null };
+    return withAuthority(node, authority, () => authority);
+}
+export function resolveAgent(node, cli, sessionId, _cwd, pid) {
+    try {
+        const binding = resolveBinding(node, cli, sessionId, pid);
+        return binding && captureAuthority(node, binding) ? binding.agent : null;
+    }
+    catch {
+        return null;
+    }
 }
 /** Hook-side decision for `agentmbx hook permission --cli <cli>`. `output` is what the hook prints on stdout. */
 export function decidePermission(input, cli, lookup, o) {
@@ -37,19 +78,27 @@ export function decidePermission(input, cli, lookup, o) {
         if (s("hook_event_name") && s("hook_event_name") !== "PermissionRequest")
             return NONE;
         const cwd = s("cwd") ?? null;
-        const agent = resolveAgent(o.node, cli, sessionId, cwd ?? "", o.pid);
-        if (!agent)
+        const binding = resolveBinding(o.node, cli, sessionId, o.pid);
+        const authority = binding && captureAuthority(o.node, binding);
+        if (!authority)
             return NONE;
-        const p = lookup(agent, { cwd });
-        if (!p?.ok)
+        // A hosted provider process may serve other, not-yet-bound threads. Its sole current
+        // mailbox is not evidence that an unknown request belongs to that mailbox.
+        if (authority.leaseToken && (cli === "codex" || cli === "kimi") && sessionId !== authority.binding.session_id)
             return NONE;
-        if (cli === "kimi") { // Kimi's hook can't decide; the approval goes through the kimi web API (approveKimi), which audits
-            const approval = s("id");
-            return sessionId && approval ? { allow: true, agent, tool, policy_id: p.policy_id, output: "", cwd, kimi: { session_id: sessionId, approval_id: approval } } : NONE;
-        }
-        o.node.store.audit("yolo_allow", { agent, cli, tool, policy_id: p.policy_id ?? null });
-        return { allow: true, agent, tool, policy_id: p.policy_id,
-            output: JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } }) };
+        const agent = authority.binding.agent;
+        return withAuthority(o.node, authority, () => {
+            const p = lookup(agent, { cwd });
+            if (!p?.ok)
+                return NONE;
+            if (cli === "kimi") { // Kimi's hook can't decide; the approval goes through the kimi web API (approveKimi), which audits
+                const approval = s("id");
+                return sessionId && approval ? { allow: true, agent, tool, policy_id: p.policy_id, output: "", cwd, authority, kimi: { session_id: sessionId, approval_id: approval } } : NONE;
+            }
+            o.node.store.audit("yolo_allow", { agent, cli, tool, policy_id: p.policy_id ?? null });
+            return { allow: true, agent, tool, policy_id: p.policy_id,
+                output: JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } }) };
+        }) ?? NONE;
     }
     catch {
         return NONE;
@@ -62,7 +111,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * error or never lists it: give up, and the user answers the prompt as usual.
  */
 export async function approveKimi(node, d, o = {}) {
-    if (!d.allow || !d.kimi)
+    if (!d.allow || !d.kimi || !d.authority || !withAuthority(node, d.authority, () => true))
         return false;
     const srv = o.server === undefined ? kimiServer() : o.server;
     if (!srv)
@@ -83,8 +132,10 @@ export async function approveKimi(node, d, o = {}) {
                 return false;
             await sleep(250);
         }
-        if (o.recheck && !o.recheck())
-            return false; // revoked or expired while we waited
+        if (!withAuthority(node, d.authority, () => !o.recheck || o.recheck()))
+            return false;
+        // Provider APIs cannot consume a lease token: this is a fresh dispatch check, not revocation
+        // of a request already in flight. Never hold a SQLite transaction across network I/O.
         const res = await f(`${base}/${encodeURIComponent(approval_id)}`, { method: "POST", headers, body: JSON.stringify({ decision: "approved" }), signal: AbortSignal.timeout(3000) });
         const j = await res.json().catch(() => null);
         if (!res.ok || j?.code !== 0)
@@ -104,9 +155,15 @@ export async function approveKimi(node, d, o = {}) {
  */
 export async function opencodePermissionPass(node, lookup, svc, f = fetch) {
     const db = node.store.db;
-    const rows = db.prepare("SELECT agent, session_id, cwd, pid, pid_start, updated_at FROM sessions WHERE cli='opencode' ORDER BY updated_at DESC LIMIT 50").all()
+    const rows = db.prepare("SELECT * FROM sessions WHERE cli='opencode' ORDER BY updated_at DESC LIMIT 50").all()
         .filter((r) => r.pid && node.sameSession(r.pid, r, { proof: true })); // only bindings proven to be a live OpenCode process
-    const covered = rows.map((r) => ({ ...r, p: safeLookup(lookup, r.agent, r.cwd) })).filter((r) => r.p.ok && (r.session_id.startsWith("ses") || r.cwd));
+    const covered = rows.flatMap(r => {
+        const authority = captureAuthority(node, r);
+        if (!authority || (authority.leaseToken && !r.session_id.startsWith("ses")))
+            return [];
+        const p = safeLookup(lookup, r.agent, r.cwd);
+        return p.ok && (r.session_id.startsWith("ses") || r.cwd) ? [{ ...r, p, authority }] : [];
+    });
     if (!covered.length)
         return 0;
     const s = await svc();
@@ -131,8 +188,8 @@ export async function opencodePermissionPass(node, lookup, svc, f = fetch) {
                 if (direct ? q.sessionID !== r.session_id : (owner(q.sessionID) ?? agentName(r.cwd, "opencode")) !== r.agent)
                     continue;
                 done.add(q.id);
-                if (!safeLookup(lookup, r.agent, r.cwd).ok)
-                    break; // re-check right before approving: revocation wins
+                if (!withAuthority(node, r.authority, () => safeLookup(lookup, r.agent, r.cwd).ok))
+                    break;
                 const rep = await f(`${s.url}/api/session/${encodeURIComponent(q.sessionID)}/permission/${encodeURIComponent(q.id)}/reply`, { method: "POST", headers, body: JSON.stringify({ decision: "once" }), signal: AbortSignal.timeout(5000) });
                 if (!rep.ok)
                     continue;
