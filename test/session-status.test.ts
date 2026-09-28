@@ -49,6 +49,9 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} status a
   assert.equal(JSON.parse(run("status", ["--json"]).stdout).owner_authority, 1);
   n.store.db.prepare("INSERT INTO grants VALUES (?,?,?,?,1)").run(grant.id, grant.sub, JSON.stringify(grant), grant.exp);
   assert.equal(JSON.parse(run("status", ["--json"]).stdout).owner_authority, 0, "status rechecks current grant revocation");
+  assert.equal(JSON.parse(run("status", ["--json"]).stdout).unread, 2);
+  const receipt = n.store.db.prepare("SELECT authority FROM messages WHERE id=?").get(assigned) as { authority: string };
+  assert.equal(JSON.parse(receipt.authority).ok, true, "historical receipt remains unchanged");
   const read = await call("mbx_read", { ids: [assigned] });
   assert.doesNotMatch(JSON.stringify(read.content), /authority: OWNER/);
   assert.match(JSON.stringify(read.content), /grant revoked/);

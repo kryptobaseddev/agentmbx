@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { generateKeyPair } from "../src/crypto.ts";
 import { makeGrant } from "../src/envelope.ts";
 import { MbxNode, formatFor } from "../src/node.ts";
-import { hasWakeAuthority } from "../src/wake.ts";
+import { hasWakeAuthority, wakeText } from "../src/wake.ts";
 
 for (const change of ["revoke", "expire", "owner-key", "host-key", "unpair"] as const) test(`owner authority is recomputed after ${change}`, t => {
   const homes = [mkdtempSync(join(tmpdir(), "mbx-authority-a-")), mkdtempSync(join(tmpdir(), "mbx-authority-b-"))];
@@ -29,6 +29,7 @@ for (const change of ["revoke", "expire", "owner-key", "host-key", "unpair"] as 
   else b.store.db.prepare("UPDATE peers SET state='pending' WHERE host='alpha'").run();
   assert.equal(hasWakeAuthority(b, "worker", cached), false, "a cached receipt cannot authorize current wake work");
   assert.doesNotMatch(formatFor(b, cached, "worker"), /authority: OWNER/);
+  assert.doesNotMatch(wakeText("worker", [cached]), /Includes an OWNER-authority message/);
   for (const row of [b.read(e.id, "worker"), ...b.inbox("worker"), ...b.thread(e.thread, "worker"), ...b.search("authorized", 20, "worker")])
     assert.equal(JSON.parse(row.authority!).ok, false);
   assert.deepEqual(b.store.db.prepare("SELECT authority,envelope FROM messages WHERE id=?").get(e.id), stored, "historical receipt and signed bytes remain intact");
