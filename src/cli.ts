@@ -228,11 +228,15 @@ async function run(argv: string[]) {
         if (!s?.pid || !node.sameSession(s.pid, s)) return die("no live bound session for this provider and session id");
         const agent = node.agentFor(cli, s.pid) ?? s.agent;
         const mailboxes = [agent, ...node.linkedNames(agent)];
-        const counts = mailboxes.map((name) => node.store.db.prepare(`SELECT count(*) unread,
-          coalesce(sum(json_extract(m.envelope, '$.needs_reply') = 1), 0) needs_reply,
-          coalesce(sum(json_extract(m.authority, '$.ok') = 1), 0) owner_authority
-          FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state <> 'acked'`).get(name) as
-          { unread: number; needs_reply: number; owner_authority: number });
+        const counts = mailboxes.map(name => {
+          const counts = node.store.db.prepare(`SELECT count(*) unread,
+            coalesce(sum(json_extract(m.envelope, '$.needs_reply') = 1), 0) needs_reply
+            FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state <> 'acked'`).get(name) as
+            { unread: number; needs_reply: number };
+          const claims = node.store.db.prepare(`SELECT m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id
+            WHERE d.agent=? AND d.state <> 'acked' AND json_type(m.envelope, '$.authority')='object'`).all(name) as unknown as ReturnType<MbxNode["inbox"]>;
+          return { ...counts, owner_authority: claims.filter(m => node.authorityFor(m)?.ok).length };
+        });
         const out = { agent, host: node.host, address: `${agent}@${node.host}`, cli, session_id: sid, mailboxes,
           unread: counts.reduce((sum, c) => sum + c.unread, 0), needs_reply: counts.reduce((sum, c) => sum + c.needs_reply, 0),
           owner_authority: counts.reduce((sum, c) => sum + c.owner_authority, 0),
