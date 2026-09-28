@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Real end-to-end: an idle OpenCode session (on the running `opencode service`) is woken by mbx (POST /synthetic),
 reads the message through the mbx MCP tools (configured per-project in a scratch dir), and replies through mbx."""
-import argparse, base64, json, os, subprocess, sys, tempfile, time, urllib.request, uuid
+import argparse, base64, runpy, json, os, subprocess, sys, tempfile, time, urllib.request, uuid
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MBX = os.path.join(ROOT, "bin", "agentmbx.js")
+inspect_receipt = runpy.run_path(os.path.join(ROOT, "scripts/e2e/wake_receipt.py"))["inspect_receipt"]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--resume", metavar="RESULT", help="Observe the retained session and original message; never approve prompts or resend")
 options = parser.parse_args()
@@ -60,13 +61,11 @@ else:
     persist("awaiting_reply")
     d = subprocess.run(["node", "--input-type=module", "-e", f"const {{MbxNode}}=await import('{ROOT}/src/node.ts');const {{dispatchWakes}}=await import('{ROOT}/src/wake.ts');console.log(JSON.stringify(await dispatchWakes(new MbxNode())));"], env=env, capture_output=True, text=True, check=True)
     print("dispatch:", d.stdout.strip(), d.stderr.strip()[-300:])
-def replied():   # a reply from the agent, in the request's thread, carrying the token
-    th = mbx("thread", mid).stdout
-    return any(f"from: {agent}@" in part and token in part for part in th.split("\n# ")[1:])
 t0 = time.time(); ok = False
 seen = set()
 while time.time() - t0 < 180:
-    if replied(): ok = True; break
+    evidence = inspect_receipt(home, mid, agent, token)
+    if evidence["receipt_verified"]: ok = True; break
     try:   # Observe permission requests; only the owner may answer them in the provider UI.
         reqs = api("GET", f"/api/session/{sid}/permission"); reqs = reqs.get("data", reqs) if isinstance(reqs, dict) else reqs
         if reqs:
@@ -76,10 +75,12 @@ while time.time() - t0 < 180:
             sys.exit(3)
     except Exception as ex: print("perm poll error", ex, flush=True)
     time.sleep(3); print(f"  waiting {time.time()-t0:.0f}s", flush=True)
-persist("reply_observed" if ok else "timed_out")
+result, result_path = persist("receipt_verified" if ok else "timed_out")
+result["evidence"] = evidence
+with open(result_path, "w") as f: json.dump(result, f, indent=2)
 print("REPLY RECEIVED" if ok else "NO REPLY", f"after {time.time()-t0:.0f}s")
 print(mbx("thread", mid).stdout[-1200:])
-print("acked:", '"acked"' in mbx("inbox", "--as", agent, "--all", "--json").stdout)
+print("receipt:", json.dumps(evidence))
 try:
     msgs = api("GET", f"/api/session/{sid}/message")
     print("session transcript (tail):", json.dumps(msgs)[-1500:])
