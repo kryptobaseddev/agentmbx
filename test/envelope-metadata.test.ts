@@ -1,3 +1,4 @@
+import { wakeText } from "../src/wake.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -6,7 +7,7 @@ import { join } from "node:path";
 import { buildEnvelope, checkShape, signEnvelope, type Envelope } from "../src/envelope.ts";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { MbxNode, formatFor } from "../src/node.ts";
+import { MbxNode, formatFor, summaryLine } from "../src/node.ts";
 
 test("paired signed mail rejects malformed metadata before storing or waking", async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-meta-"));
@@ -29,13 +30,17 @@ test("paired signed mail rejects malformed metadata before storing or waking", a
     assert.equal(b.store.hasMessage(e.id), false);
     assert.equal(b.inbox("worker").length, 0);
     // Simulate a receipt accepted by an older version, without rewriting its signed bytes.
-    b.store.insertMessage(e, "alpha", "verified", null);
+    b.store.insertMessage(e, "alpha", "verified", { ok: true, session: "signed by the owner" });
     b.store.addDelivery(e.id, "worker");
     const stored = b.inbox("worker")[0];
     assert.equal(b.policyFor(stored, "worker").level, "ask");
     assert.equal(b.wantsWake("worker", stored), false);
     assert.match(b.policyFor(stored, "worker").notes.join(" "), /malformed-envelope/);
     assert.match(formatFor(b, stored, "worker"), /hello @worker/);
+    assert.match(formatFor(b, stored, "worker"), /authority: none/);
+    assert.doesNotMatch(formatFor(b, stored, "worker"), /authority: OWNER/);
+    assert.doesNotMatch(summaryLine(stored), /OWNER/);
+    assert.doesNotMatch(wakeText("worker", [stored]), /OWNER-authority/);
     assert.equal(b.message(e.id)!.envelope, JSON.stringify(e));
     b.ack(e.id, "worker");
     malformedId = e.id;
