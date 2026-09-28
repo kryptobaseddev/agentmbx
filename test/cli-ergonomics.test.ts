@@ -78,3 +78,27 @@ test("CLI inbox JSON retains envelope fields and combines filters", (t) => {
   assert.equal(rows.length, 1);
   for (const key of ["id", "to", "thread", "reply_to", "needs_reply", "refs"]) assert.deepEqual(rows[0][key], a[key as keyof typeof a]);
 });
+
+test("CLI shell senders enter the directory and receive replies without unknown-agent warnings", (t) => {
+  const { cli } = fixture(t);
+  const receiver = cli("whoami", "--as", "receiver", "--role", "reviewer", "--description", "shell receiver");
+  assert.equal(receiver.status, 0, receiver.stderr);
+  assert.match(receiver.stdout, /receiver@test-host.*role:reviewer/);
+  const sent = cli("send", "--as", "shell-sender", "--to", "receiver", "--subject", "registration", "-m", "hello", "--json");
+  assert.equal(sent.status, 0, sent.stderr);
+  const id = JSON.parse(sent.stdout).id;
+  const agents = cli("agents");
+  assert.equal(agents.status, 0, agents.stderr);
+  assert.match(agents.stdout, /shell-sender@test-host\tlive\t\tcli\t/);
+  assert.match(agents.stdout, /receiver@test-host\tlive\treviewer\tcli\t.*shell receiver/);
+  const reply = cli("send", "--as", "receiver", "--to", "shell-sender", "--reply-to", id, "-m", "reply", "--json");
+  assert.equal(reply.status, 0, reply.stderr);
+  assert.equal(reply.stderr, "");
+  assert.deepEqual(JSON.parse(reply.stdout).warnings, []);
+  const inbox = cli("inbox", "--as", "shell-sender", "--json");
+  assert.equal(inbox.status, 0, inbox.stderr);
+  const rows = JSON.parse(inbox.stdout);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].reply_to, id);
+  assert.equal(rows[0].subject, "Re: registration");
+});
