@@ -42,14 +42,23 @@ export async function opencodeService(): Promise<{ url: string; auth: string } |
   } catch { return null; }
 }
 
-export async function wakeOpencode(sessionId: string, text: string): Promise<WakeResult> {
-  const svc = await opencodeService();
+export async function wakeOpencode(sessionId: string, text: string, o: { service?: typeof opencodeService; fetch?: Fetch } = {}): Promise<WakeResult> {
+  const svc = await (o.service ?? opencodeService)();
   if (!svc) return { ok: false, via: "opencode synthetic", error: "opencode service not running" };
   try {
-    const res = await fetch(`${svc.url}/api/session/${encodeURIComponent(sessionId)}/synthetic`, {
+    const res = await (o.fetch ?? fetch)(`${svc.url}/api/session/${encodeURIComponent(sessionId)}/synthetic`, {
       method: "POST", headers: { "content-type": "application/json", ...(svc.auth ? { authorization: svc.auth } : {}) },
-      body: JSON.stringify({ text, delivery: "queue", resume: true }), signal: AbortSignal.timeout(10_000) });
-    return res.ok ? { ok: true, via: "opencode synthetic" } : { ok: false, via: "opencode synthetic", error: `${res.status} ${await res.text()}` };
+      body: JSON.stringify({ text, delivery: "queue", resume: true }), redirect: "error", signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) return { ok: false, via: "opencode synthetic", error: `${res.status} ${(await res.text()).slice(0, 300)}` };
+    const j = await res.json() as { data?: { id?: unknown; sessionID?: unknown; type?: unknown; delivery?: unknown;
+      payload?: { text?: unknown }; time?: { created?: unknown } } } | null;
+    const receipt = j?.data;
+    if (!receipt || typeof receipt.id !== "string" || !receipt.id.startsWith("msg_")
+      || receipt.sessionID !== sessionId || receipt.type !== "synthetic" || receipt.delivery !== "queue"
+      || receipt.payload?.text !== text || typeof receipt.time?.created !== "number" || !Number.isFinite(receipt.time.created))
+      return { ok: false, via: "opencode synthetic", error: "invalid or mismatched synthetic admission receipt" };
+    // Durable admission is not evidence that the model ran or handled the mailbox message.
+    return { ok: true, via: "opencode synthetic" };
   } catch (e) { return { ok: false, via: "opencode synthetic", error: (e as Error).message }; }
 }
 
