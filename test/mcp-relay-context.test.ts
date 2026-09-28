@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { canonical, generateKeyPair, signData } from "../src/crypto.ts";
+import { acceptSigned, makePolicy } from "../src/policy.ts";
 import { MbxNode } from "../src/node.ts";
 
 for (const implicitReply of [false, true]) test(implicitReply ? "mbx_send reply_to records parent provenance" : "expired relay state cannot be revived by a fresh read", async (t) => {
@@ -78,4 +80,36 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: unrelat
   assert.equal(replied.meta.hop, 66);
   assert.equal(replied.meta.origin, "external");
 
+});
+
+for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: maximum relay depth remains deliverable and restricted`, async t => {
+  const { checkShape } = await import("../src/envelope.ts");
+  const home = mkdtempSync(join(tmpdir(), "mbx-relay-cap-"));
+  const owner = generateKeyPair();
+  writeFileSync(join(home, "owner.json"), JSON.stringify({ backend: "keychain", public_key: owner.publicKey }), { mode: 0o600 });
+  const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "relay-cap-test", version: "1" });
+  const rec = makePolicy({ level: "yolo", agents: ["receiver"], hosts: ["alpha"], ownerPub: owner.publicKey });
+  assert.equal(acceptSigned(n.store.db, { rec, sig: signData(owner.privateKey, canonical(rec)) }, "alpha"), null);
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  await c.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
+    env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: cli, MBX_AGENT: "reader", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
+  const parent = n.send({ from: "sender", to: ["reader"], subject: "max depth", body: "data", hop: 1000, origin: "external" }).envelope;
+  assert.equal(checkShape(parent), null);
+  assert.notEqual((await c.callTool({ name: "mbx_read", arguments: { ids: [parent.id] } })).isError, true);
+  for (const request of [
+    { name: "mbx_send", arguments: { to: ["receiver"], subject: "new thread", body: "data" } },
+    { name: "mbx_send", arguments: { to: ["receiver"], subject: "reply", body: "data", reply_to: parent.id } },
+    { name: "mbx_reply", arguments: { id: parent.id, body: "data" } },
+  ]) {
+    const result = await c.callTool(request);
+    assert.notEqual(result.isError, true);
+    const row = n.message((result.structuredContent as { id: string }).id)!;
+    const envelope = JSON.parse(row.envelope);
+    assert.equal(checkShape(envelope), null, "a relay of a valid message must retain a valid wire envelope");
+    assert.equal(envelope.meta.hop, 1000);
+    assert.equal(envelope.meta.origin, "external");
+    const policy = n.policyFor(row, "receiver");
+    assert.equal(policy.level, "ask");
+    assert.match(policy.notes.join(" "), /relay safety depth 1000 exceeds limit 6/);
+  }
 });

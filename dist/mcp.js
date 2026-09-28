@@ -10,7 +10,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { fingerprint, generateKeyPair } from "./crypto.js";
-import { KINDS, NAME_RE } from "./envelope.js";
+import { KINDS, MAX_RELAY_DEPTH, NAME_RE } from "./envelope.js";
 import { kimiHostedServer } from "./kimi-web.js";
 import { formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
 import { activePolicies, delegationNote } from "./policy.js";
@@ -188,7 +188,7 @@ export async function runMcp(node = new MbxNode()) {
         const now = Date.now();
         const depths = parent ? [...parent.hops].filter(([, at]) => now - at < 3_600_000).map(([hop]) => hop) : [];
         const external = parent?.externalAt != null && now - parent.externalAt < 3_600_000;
-        return { hop: depths.length ? Math.max(...depths) + 1 : 0, origin: origin === "external" || external ? "external" : "agent", project };
+        return { hop: depths.length ? Math.min(MAX_RELAY_DEPTH, Math.max(...depths) + 1) : 0, origin: origin === "external" || external ? "external" : "agent", project };
     };
     const agent = base.agent;
     // Initialization belongs to the transport, before per-call metadata identifies its thread.
