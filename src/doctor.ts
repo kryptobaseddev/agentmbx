@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { fingerprint } from "./crypto.ts";
 import { signHop } from "./http.ts";
 import { kimiInstances } from "./kimi-web.ts";
+import { version } from "./version.ts";
 import { MbxNode } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
 import { detect, edits, skillStatus, wired, type SetupCtx } from "./setup.ts";
@@ -18,6 +19,39 @@ export const VERSION = (() => {
 /** True when something answers HTTP on the daemon port (an unsigned request gets 401, which still proves it is up). */
 export async function daemonAnswers(port: number, timeoutMs = 1500): Promise<boolean> {
   try { await fetch(`http://127.0.0.1:${port}/v1/agents`, { signal: AbortSignal.timeout(timeoutMs) }); return true; } catch { return false; }
+}
+
+/** Diagnostic identity comparison, not authentication or proof of message receipt. No pairing side effects. */
+export async function daemonReadiness(node: MbxNode, timeoutMs = 1500): Promise<Check> {
+  const address = `127.0.0.1:${node.config.port}`;
+  const unknown = (reason: string): Check => ({ level: "warn", label: `daemon identity unverified on ${address}: ${reason}`,
+    fix: "check the process listening on this port; an older AgentMBX daemon may need restarting after update" });
+  let response: Response;
+  try { response = await fetch(`http://${address}/v1/status`, { redirect: "manual", signal: AbortSignal.timeout(timeoutMs) }); }
+  catch { return { level: "fail", label: `daemon not answering on ${address}`, fix: `agentmbx daemon install   (log: ${join(node.home, "daemon.log")})` }; }
+  if (response.status !== 200) { await response.body?.cancel(); return unknown(`HTTP ${response.status} (unsupported status endpoint or another service)`); }
+  try {
+    const reader = response.body?.getReader();
+    if (!reader) return unknown("empty response");
+    let size = 0; const parts: Uint8Array[] = [];
+    try {
+      for (;;) {
+        const { done, value } = await reader.read(); if (done) break;
+        size += value.byteLength;
+        if (size > 8192) return unknown("response exceeds 8192 bytes");
+        parts.push(value);
+      }
+    } finally { await reader.cancel(); }
+    const r = JSON.parse(Buffer.concat(parts).toString("utf8"));
+    if (r?.service !== "agentmbx" || r.v !== 1 || typeof r.host !== "string" || typeof r.host_pubkey !== "string"
+      || typeof r.version !== "string" || r.version.length > 64 || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(r.version)
+      || typeof r.started_at !== "string" || !Number.isFinite(Date.parse(r.started_at)) || new Date(r.started_at).toISOString() !== r.started_at)
+      return unknown("malformed AgentMBX status");
+    if (r.host !== node.host || r.host_pubkey !== node.key.publicKey) return unknown("reported host or key differs from this mailbox");
+    if (r.version !== version()) return { level: "warn", label: `daemon reports expected host ${r.host} on ${address}, but version ${r.version} differs from CLI ${version()}`,
+      fix: "restart the daemon after updating; existing MCP sessions may also need restarting" };
+    return { level: "ok", label: `daemon reports expected host ${r.host} on ${address} (version ${r.version}, started ${r.started_at}); receipt not tested` };
+  } catch { return unknown("malformed, interrupted, or timed-out status response"); }
 }
 
 /** Binding evidence is separate from configuration and never proves end-to-end delivery. */
@@ -56,8 +90,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
   else {
     node = new MbxNode(mbxHome);
     add("ok", `host ${node.host} initialized (key ${fingerprint(node.key.publicKey)})`);
-    if (await daemonAnswers(node.config.port)) add("ok", `daemon answers on 127.0.0.1:${node.config.port}`);
-    else add("fail", `daemon not answering on 127.0.0.1:${node.config.port}`, "agentmbx daemon install   (log: " + join(mbxHome, "daemon.log") + ")");
+    out.push(await daemonReadiness(node));
   }
 
   for (const d of detect(ctx)) {
