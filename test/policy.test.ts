@@ -251,7 +251,7 @@ test("--as rule: a session can't claim a name another live session holds; caller
   n.close();
 });
 
-test("stop hook (real CLI): under a policy, fresh mail keeps the turn going once; kimi via exit 2, claude via JSON", async () => {
+test("stop hook: a policy plus an unleased historical binding cannot continue a turn", async () => {
   const { spawnSync } = await import("node:child_process");
   const { n, kp, sign } = ownerHost("alpha");
   for (const [cli, agent] of [["kimi", "k-agent"], ["claude", "c-agent"]] as const) {
@@ -261,10 +261,8 @@ test("stop hook (real CLI): under a policy, fresh mail keeps the turn going once
     assert.deepEqual([run().status, run().stdout], [0, ""], "no mail: nothing");
     n.send({ from: "web", to: [agent], subject: "please run the tests", body: "x", kind: "request" });
     const r = run();
-    if (cli === "kimi") { assert.equal(r.status, 2); assert.match(r.stderr, /1 new message\(s\) for k-agent from web@alpha/); }
-    else { assert.equal(r.status, 0); assert.equal(JSON.parse(r.stdout).decision, "block"); }
-    const again = run();
-    assert.deepEqual([again.status, again.stdout], [0, ""], "the same mail doesn't block twice");
+    assert.deepEqual([r.status, r.stdout, r.stderr], [0, "", ""], "delegation alone does not establish mailbox ownership");
+    assert.equal(n.unreadCount(agent), 1);
   }
   n.close();
 });

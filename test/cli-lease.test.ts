@@ -56,6 +56,9 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI guar
   const implicit = guarded(home, { as: me.agent });
   assert.equal(implicit.status, meta ? 1 : 0, implicit.stderr);
   if (meta) assert.match(implicit.stderr, /ambiguous/);
+  const mismatchedSend = cliCommand(home, "send", "--as", "victim", "--to", "sender", "--subject", "forbidden fallback", "-m", "body");
+  assert.equal(mismatchedSend.status, 1, "a leased or ambiguous caller cannot downgrade to another sender");
+  assert.equal(node.search("forbidden fallback").length, 0);
   const selected = ["--cli", cli, "--session", sid, "--as", me.agent];
   assert.equal(cliCommand(home, "inbox", ...selected, "--json").status, 0);
   const content = cliCommand(home, "read", message, ...selected); assert.equal(content.status, 0, content.stderr); assert.match(content.stdout, /preserved/);
@@ -98,4 +101,9 @@ test("shell names and historical links never establish CLI ownership", t => {
   assert.match(trustLabel(row), /unverified-sender/);
   assert.equal(node.policyFor(row, "recipient").level, "ask");
   assert.equal(node.inbox("offline")[0].state, "delivered");
+  node.store.db.prepare(`INSERT INTO identity_leases (name,token,holder_pid,holder_start,key_fp,cli,session_id,claimed_at,heartbeat_at,idle_ttl)
+    VALUES ('held','fixture',?,'fixture','fixture','claude','other',?,?,1800000)`).run(process.pid, Date.now(), Date.now());
+  const held = cliCommand(home, "send", "--as", "held", "--to", "recipient", "--subject", "held impersonation", "-m", "body");
+  assert.equal(held.status, 1); assert.match(held.stderr, /sender name is leased/);
+  assert.equal(node.search("held impersonation").length, 0);
 });
