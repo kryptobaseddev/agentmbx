@@ -15,7 +15,7 @@ import { kimiHostedServer } from "./kimi-web.ts";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess } from "./identity-leases.ts";
 import { formatFor, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
 import { activePolicies, delegationNote } from "./policy.ts";
-import { withProcSnapshot } from "./proc.ts";
+import { procStart, withProcSnapshot } from "./proc.ts";
 import { updateAvailable } from "./update.ts";
 import { version } from "./version.ts";
 import { wakeText } from "./wake.ts";
@@ -115,12 +115,14 @@ export async function runMcp(node = new MbxNode()) {
   const current = () => requests.getStore() ?? base;
   const legacyConflicts = new Set<string>();
   const ambiguousLegacy = new Set<string>();
-  type LegacyBinding = { agent: string; cli: string; session_id: string; pid: number | null; pid_start: string | null; session_key: string | null; updated_at: string };
+  type LegacyBinding = { agent: string; cli: string; session_id: string; pid: number | null; pid_start: string | null; session_key: string | null; updated_at: string; child_record: string | null };
+  // Read the binding and its child generation in one SQLite snapshot, before bindSession can clean either up.
+  const legacyColumns = "agent,cli,session_id,pid,pid_start,session_key,updated_at,(SELECT v FROM kv WHERE k='mcp-process:'||sessions.session_key) AS child_record";
   const preparedBindings = new AsyncLocalStorage<Map<string, LegacyBinding>>();
   const bindingId = (row: LegacyBinding) => JSON.stringify([row.cli, row.session_id]);
   const prepareState = <T>(state: State, target: string | undefined, operation: () => T): T => {
     if (node.store.db.isTransaction) return leases.prepare([], [], operation); // requires the enclosing prepared scope
-    const rows = !state.leaseToken || target ? node.store.db.prepare("SELECT agent,cli,session_id,pid,pid_start,session_key,updated_at FROM sessions").all() as LegacyBinding[] : [];
+    const rows = !state.leaseToken || target ? node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions`).all() as LegacyBinding[] : [];
     const names = new Set([state.agent, ...(target ? [target] : [])]);
     if (!state.leaseToken) {
       for (const row of rows.filter(r => r.cli === env.cli && r.pid === env.ppid)) {
@@ -132,7 +134,7 @@ export async function runMcp(node = new MbxNode()) {
     for (const row of rows.filter(r => names.has(r.agent))) {
       if (row.pid) pids.add(row.pid);
       if (row.session_key) {
-        try { const child = JSON.parse(node.store.get(`mcp-process:${row.session_key}`) ?? "null"); if (Number.isSafeInteger(child?.pid) && child.pid > 0) pids.add(child.pid); }
+        try { const child = JSON.parse(row.child_record ?? "null"); if (Number.isSafeInteger(child?.pid) && child.pid > 0) pids.add(child.pid); }
         catch { /* malformed legacy evidence stays unknown */ }
       }
     }
@@ -148,7 +150,7 @@ export async function runMcp(node = new MbxNode()) {
     const held = rows.filter(r => {
       if (r.agent !== agent) return false;
       const original = preparedBindings.getStore()?.get(bindingId(r));
-      if (!original || (["agent", "pid", "pid_start", "session_key", "updated_at"] as const).some(key => original[key] !== r[key])) {
+      if (!original || (["agent", "pid", "pid_start", "session_key", "updated_at", "child_record"] as const).some(key => original[key] !== r[key])) {
         unobserved.add(r); return true; // new/rebound rows need fresh evidence, never old PID observations
       }
       const updated = Date.parse(r.updated_at);
@@ -156,8 +158,12 @@ export async function runMcp(node = new MbxNode()) {
       if (r.pid && leases.processEvidence(r.pid).alive === false) return false;
       if (r.session_key) {
         try {
-          const child = JSON.parse(node.store.get(`mcp-process:${r.session_key}`) ?? "null");
-          if (Number.isSafeInteger(child?.pid) && child.pid > 0 && leases.processEvidence(child.pid).alive === false) return false;
+          const child = JSON.parse(r.child_record ?? "null");
+          if (Number.isSafeInteger(child?.pid) && child.pid > 0) {
+            const evidence = leases.processEvidence(child.pid), start = procStart(child.pid);
+            // Legacy child records use procStart's format (not the lease layer's UTC ps format).
+            if (evidence.alive === false || (typeof child.start === "string" && child.start && start && child.start !== start)) return false;
+          }
         } catch { /* unknown legacy evidence remains held */ }
       }
       return true;
@@ -175,7 +181,7 @@ export async function runMcp(node = new MbxNode()) {
     const result = node.store.tx(() => {
       if (state.leaseToken) leases.renew(state.agent, state.leaseToken);
       // Snapshot before bindSession can replace or consolidate any rows.
-      const legacy = state.leaseToken ? [] : node.store.db.prepare("SELECT agent,cli,session_id,pid,pid_start,session_key,updated_at FROM sessions").all() as LegacyBinding[];
+      const legacy = state.leaseToken ? [] : node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions`).all() as LegacyBinding[];
       const agent = node.bindSession({ agent: state.agent, cli: env.cli, session_id: state.sessionId, cwd: process.cwd(), pid: env.ppid,
         session_key: state.key.publicKey, channel: env.channel, mcp_pid: process.pid, restore_name: initial && !process.env.MBX_AGENT });
       if (state.leaseToken && agent !== state.agent) throw new Error("bound identity changed outside a lease rename");
@@ -299,7 +305,7 @@ export async function runMcp(node = new MbxNode()) {
     let { agent } = state;
     const { key } = state;
     if (name && name !== agent) {
-      checkLegacy(name, state, node.store.db.prepare("SELECT agent,cli,session_id,pid,pid_start,session_key,updated_at FROM sessions WHERE agent=?").all(name) as LegacyBinding[]);
+      checkLegacy(name, state, node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions WHERE agent=?`).all(name) as LegacyBinding[]);
       const lease = leases.rename(agent, state.leaseToken!, name);
       node.addAlias(agent, name, env.ppid); agent = name; state.agent = name; state.leaseToken = lease.token;
       node.keepName(env.cli, state.sessionId, name);

@@ -15,7 +15,7 @@ import { kimiHostedServer } from "./kimi-web.js";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess } from "./identity-leases.js";
 import { formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
 import { activePolicies, delegationNote } from "./policy.js";
-import { withProcSnapshot } from "./proc.js";
+import { procStart, withProcSnapshot } from "./proc.js";
 import { updateAvailable } from "./update.js";
 import { version } from "./version.js";
 import { wakeText } from "./wake.js";
@@ -119,12 +119,14 @@ export async function runMcp(node = new MbxNode()) {
     const current = () => requests.getStore() ?? base;
     const legacyConflicts = new Set();
     const ambiguousLegacy = new Set();
+    // Read the binding and its child generation in one SQLite snapshot, before bindSession can clean either up.
+    const legacyColumns = "agent,cli,session_id,pid,pid_start,session_key,updated_at,(SELECT v FROM kv WHERE k='mcp-process:'||sessions.session_key) AS child_record";
     const preparedBindings = new AsyncLocalStorage();
     const bindingId = (row) => JSON.stringify([row.cli, row.session_id]);
     const prepareState = (state, target, operation) => {
         if (node.store.db.isTransaction)
             return leases.prepare([], [], operation); // requires the enclosing prepared scope
-        const rows = !state.leaseToken || target ? node.store.db.prepare("SELECT agent,cli,session_id,pid,pid_start,session_key,updated_at FROM sessions").all() : [];
+        const rows = !state.leaseToken || target ? node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions`).all() : [];
         const names = new Set([state.agent, ...(target ? [target] : [])]);
         if (!state.leaseToken) {
             for (const row of rows.filter(r => r.cli === env.cli && r.pid === env.ppid)) {
@@ -139,7 +141,7 @@ export async function runMcp(node = new MbxNode()) {
                 pids.add(row.pid);
             if (row.session_key) {
                 try {
-                    const child = JSON.parse(node.store.get(`mcp-process:${row.session_key}`) ?? "null");
+                    const child = JSON.parse(row.child_record ?? "null");
                     if (Number.isSafeInteger(child?.pid) && child.pid > 0)
                         pids.add(child.pid);
                 }
@@ -160,7 +162,7 @@ export async function runMcp(node = new MbxNode()) {
             if (r.agent !== agent)
                 return false;
             const original = preparedBindings.getStore()?.get(bindingId(r));
-            if (!original || ["agent", "pid", "pid_start", "session_key", "updated_at"].some(key => original[key] !== r[key])) {
+            if (!original || ["agent", "pid", "pid_start", "session_key", "updated_at", "child_record"].some(key => original[key] !== r[key])) {
                 unobserved.add(r);
                 return true; // new/rebound rows need fresh evidence, never old PID observations
             }
@@ -171,9 +173,13 @@ export async function runMcp(node = new MbxNode()) {
                 return false;
             if (r.session_key) {
                 try {
-                    const child = JSON.parse(node.store.get(`mcp-process:${r.session_key}`) ?? "null");
-                    if (Number.isSafeInteger(child?.pid) && child.pid > 0 && leases.processEvidence(child.pid).alive === false)
-                        return false;
+                    const child = JSON.parse(r.child_record ?? "null");
+                    if (Number.isSafeInteger(child?.pid) && child.pid > 0) {
+                        const evidence = leases.processEvidence(child.pid), start = procStart(child.pid);
+                        // Legacy child records use procStart's format (not the lease layer's UTC ps format).
+                        if (evidence.alive === false || (typeof child.start === "string" && child.start && start && child.start !== start))
+                            return false;
+                    }
                 }
                 catch { /* unknown legacy evidence remains held */ }
             }
@@ -196,7 +202,7 @@ export async function runMcp(node = new MbxNode()) {
             if (state.leaseToken)
                 leases.renew(state.agent, state.leaseToken);
             // Snapshot before bindSession can replace or consolidate any rows.
-            const legacy = state.leaseToken ? [] : node.store.db.prepare("SELECT agent,cli,session_id,pid,pid_start,session_key,updated_at FROM sessions").all();
+            const legacy = state.leaseToken ? [] : node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions`).all();
             const agent = node.bindSession({ agent: state.agent, cli: env.cli, session_id: state.sessionId, cwd: process.cwd(), pid: env.ppid,
                 session_key: state.key.publicKey, channel: env.channel, mcp_pid: process.pid, restore_name: initial && !process.env.MBX_AGENT });
             if (state.leaseToken && agent !== state.agent)
@@ -340,7 +346,7 @@ export async function runMcp(node = new MbxNode()) {
         let { agent } = state;
         const { key } = state;
         if (name && name !== agent) {
-            checkLegacy(name, state, node.store.db.prepare("SELECT agent,cli,session_id,pid,pid_start,session_key,updated_at FROM sessions WHERE agent=?").all(name));
+            checkLegacy(name, state, node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions WHERE agent=?`).all(name));
             const lease = leases.rename(agent, state.leaseToken, name);
             node.addAlias(agent, name, env.ppid);
             agent = name;

@@ -34,11 +34,12 @@ test("MCP startup, rename and heartbeat inspect processes outside SQLite transac
   assert.ok(inspections.length > 0); assert.ok(inspections.every(e => !e.locked), JSON.stringify(inspections.filter(e => e.locked)));
 });
 
-for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} does not adopt a legacy binding replaced after process preflight`, async t => {
+for (const cli of ["claude", "codex", "kimi", "opencode"]) for (const changed of ["binding", "child"]) test(`${cli} does not adopt a legacy ${changed} replaced after process preflight`, async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-preflight-rebind-")), preload = join(home, "rebind.mjs"), marker = join(home, "rebound");
   const node = new MbxNode(home, { host: "alpha" }), client = new Client({ name: cli, version: "test" });
   t.after(async () => { await client.close(); node.close(); rmSync(home, { recursive: true, force: true }); });
   node.bindSession({ agent: "reader", cli, session_id: "legacy", pid: process.pid, session_key: "previous-holder" });
+  if (changed === "child") node.store.set("mcp-process:previous-holder", JSON.stringify({ pid: 2_000_000_000, start: "old-generation" }));
   const id = node.send({ from: "sender", to: ["reader"], subject: "old mail", body: "retain ownership" }).envelope.id;
   // A second connection commits a hook-like rebind after the preflight SELECT has captured
   // its rows, but before MCP opens its write transaction. The replacement is otherwise a
@@ -47,10 +48,14 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} does not
     const prepare=DatabaseSync.prototype.prepare; let changed=false;
     DatabaseSync.prototype.prepare=function(sql,...args){
       const statement=prepare.call(this,sql,...args);
-      if(sql==='SELECT agent,cli,session_id,pid,pid_start,session_key,updated_at FROM sessions'){
+      if(sql.startsWith('SELECT agent,cli,session_id,pid,pid_start,session_key,updated_at')){
         const all=statement.all; statement.all=function(...args){const rows=all.apply(this,args);
           if(!changed){changed=true; const other=new DatabaseSync(${JSON.stringify(join(home, "mbx.db"))});
-            prepare.call(other,'UPDATE sessions SET session_key=NULL,updated_at=? WHERE cli=? AND session_id=?').run(new Date().toISOString(),${JSON.stringify(cli)},'legacy');
+            if(${JSON.stringify(changed)}==='child') {
+              prepare.call(other,'UPDATE kv SET v=? WHERE k=?').run(JSON.stringify({pid:2000000000,start:'new-generation'}),'mcp-process:previous-holder');
+            } else {
+              prepare.call(other,'UPDATE sessions SET session_key=NULL,updated_at=? WHERE cli=? AND session_id=?').run(new Date().toISOString(),${JSON.stringify(cli)},'legacy');
+            }
             other.close(); writeFileSync(${JSON.stringify(marker)},'committed');}
           return rows;};
       } return statement;
