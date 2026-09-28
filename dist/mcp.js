@@ -103,28 +103,35 @@ export async function runMcp(node = new MbxNode()) {
     };
     bind(base, true);
     const contextFor = (extra) => {
-        if (env.cli !== "opencode")
+        if (env.cli !== "opencode" && env.cli !== "codex")
             return base;
         const meta = extra?._meta;
         // OpenCode 2.0.15 uses the namespaced key; current docs also describe sessionID.
         const namespaced = meta?.["ai.opencode/sessionID"], documented = meta?.sessionID;
-        if (namespaced !== undefined && documented !== undefined && namespaced !== documented)
+        if (env.cli === "opencode" && namespaced !== undefined && documented !== undefined && namespaced !== documented)
             throw new Error("Conflicting OpenCode sessionID metadata");
-        const sid = namespaced !== undefined ? namespaced : documented;
+        // Codex threadId is the resumable thread. Its sessionId is a distinct execution ID.
+        const sid = env.cli === "codex" ? meta?.threadId : namespaced !== undefined ? namespaced : documented;
         if (sid === undefined)
             return base; // non-session provider calls keep their provisional mailbox
-        if (typeof sid !== "string" || !/^ses_[a-zA-Z0-9]{1,128}$/.test(sid))
-            throw new Error("Invalid OpenCode sessionID metadata");
+        const valid = env.cli === "codex" ? /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i : /^ses_[a-zA-Z0-9]{1,128}$/;
+        if (typeof sid !== "string" || !valid.test(sid))
+            throw new Error(`Invalid ${env.cli} session identity metadata`);
         let state = states.get(sid);
         if (!state) {
             // A service process and transport can serve many sessions. Never reuse its default
             // mailbox/key or choose the latest session by directory. Metadata grants no authority.
             const suffix = createHash("sha256").update(sid).digest("hex").slice(0, 10);
-            const name = node.store.get(`name:opencode:${sid}`) ?? `${wanted.slice(0, 29)}-${suffix}`;
-            const other = node.store.db.prepare("SELECT pid,pid_start,updated_at FROM sessions WHERE agent=? AND (cli<>'opencode' OR session_id<>?)")
-                .all(name, sid);
-            if (other.some(r => r.pid && node.sameSession(r.pid, r, { proof: true })))
-                throw new Error(`OpenCode mailbox ${name} belongs to another live session; choose a distinct session identity`);
+            const fallback = `${wanted.slice(0, 29)}-${suffix}`;
+            const remembered = node.store.get(`name:${env.cli}:${sid}`);
+            const occupied = (name) => node.store.db.prepare("SELECT pid,pid_start,updated_at FROM sessions WHERE agent=? AND (cli<>? OR session_id<>?)")
+                .all(name, env.cli, sid)
+                .some(r => r.pid && node.sameSession(r.pid, r, { proof: true }));
+            // Legacy Codex hooks may have saved the same default for several threads on a daemon.
+            // Recover a distinct name without moving any mail whose ownership is ambiguous.
+            const name = remembered && !(env.cli === "codex" && occupied(remembered)) ? remembered : fallback;
+            if (occupied(name))
+                throw new Error(`${env.cli} mailbox ${name} belongs to another live session; choose a distinct session identity`);
             state = { agent: name, sessionId: sid, key: generateKeyPair(), parent: null };
             bind(state);
             states.set(sid, state);
