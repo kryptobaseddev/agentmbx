@@ -161,13 +161,13 @@ func summarizeRaw(_ o: [String: Any]) throws -> String {
       let oldCli = previous["cli"] as? String, let oldSession = previous["session_id"] as? String,
       let oldKey = previous["key_fp"] as? String, let generation = previous["generation"] as? String,
       let pid = previous["pid"] as? Int, let birth = previous["start"] as? String,
-      let cli = o["claimant_cli"] as? String, let session = o["claimant_session"] as? String,
+      let cli = o["claimant_cli"] as? String, let session = o["claimant_session"] as? String, let leaseSession = o["claimant_lease_session"] as? String,
       let key = o["claimant_key"] as? String, let binding = o["claimant_hash"] as? String,
       let expiry = o["expires_at"] as? Double else { throw Refusal(reason: "incomplete identity takeover") }
-    let values = [name, host, hostKey, oldCli, oldSession, oldKey, generation, birth, cli, session, key, binding]
+    let values = [name, host, hostKey, oldCli, oldSession, oldKey, generation, birth, cli, session, leaseSession, key, binding]
     guard values.allSatisfy({ !$0.isEmpty && clean($0, Int.max) == $0 }) else { throw Refusal(reason: "identity takeover contains ambiguous display text") }
     let date = ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: expiry / 1000))
-    return "Take over \(name)@\(host) (host key \(hostKey)) from \(oldCli) session \(oldSession) (key \(oldKey), generation \(generation), PID \(pid), birth \(birth)) to \(cli) session \(session) (key \(key), binding \(binding)). The previous session loses access; mail is preserved. Approval expires \(date)."
+    return "Take over \(name)@\(host) (host key \(hostKey)) from \(oldCli) session \(oldSession) (key \(oldKey), generation \(generation), PID \(pid), birth \(birth)) to \(cli) session \(session) (lease session \(leaseSession), key \(key), binding \(binding)). The previous session loses access; mail is preserved. Approval expires \(date)."
   }
   if type == "policy" {
     let level = (o["level"] as? String ?? "custom").uppercased()
