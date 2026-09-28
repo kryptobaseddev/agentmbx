@@ -64,6 +64,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI owne
   writeFileSync(join(home, "fixture-key.json"), JSON.stringify(owner), { mode: 0o600 });
   writeFileSync(helper, `#!/usr/bin/env node\nimport {readFileSync} from 'node:fs'; import {signData} from ${JSON.stringify(crypto)};
     const [cmd,file]=process.argv.slice(2); if(cmd!=='sign') process.exit(5);
+    if(process.env.FIXTURE_OWNER_CANCEL==='1') process.exit(6);
     const key=JSON.parse(readFileSync(new URL('./fixture-key.json',import.meta.url),'utf8'));
     console.log(signData(key.privateKey,readFileSync(file,'utf8')));`, { mode: 0o700 });
   // Replace the fixture holder with a real process birth proof so ordinary claim detects it as held.
@@ -80,10 +81,31 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI owne
   const history = node.send({ from: "sender", to: ["occupied"], subject: "history", body: "kept" }).envelope.id;
   assert.notEqual((await call("mbx_identity", { action: "release" })).isError, true);
   assert.equal((await call("mbx_identity", { action: "claim", name: "occupied" })).isError, true);
-  const invoke = (force: boolean) => spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "identity", "takeover", "occupied", ...(force ? ["--force"] : []), "--cli", cli, "--session", sid, "--json"], {
-    encoding: "utf8", timeout: 10000, env: { ...process.env, MBX_HOME: home, MBX_AUTH_HELPER: helper, AGENTMBX_DEV: "1" },
+  const invoke = (force: boolean, cancel = false) => spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "identity", "takeover", "occupied", ...(force ? ["--force"] : []), "--cli", cli, "--session", sid, "--json"], {
+    encoding: "utf8", timeout: 10000, env: { ...process.env, MBX_HOME: home, MBX_AUTH_HELPER: helper, FIXTURE_OWNER_CANCEL: cancel ? "1" : "0", AGENTMBX_DEV: "1" },
   });
   assert.equal(invoke(false).status, 2);
+  const requestCount = () => node.store.db.prepare("SELECT COUNT(*) n FROM kv WHERE k GLOB 'identity-request:*'").get()!.n;
+  const beforeCancel = requestCount();
+  const cancelled = invoke(true, true);
+  assert.equal(cancelled.status, 1); assert.match(cancelled.stderr, /cancelled|not approved/);
+  assert.equal(requestCount(), beforeCancel, "cancelling approval must not submit a control request");
+  assert.equal(node.store.db.prepare("SELECT token FROM identity_leases WHERE name='occupied'").get()!.token, old);
+  const messages = node.store.db.prepare("SELECT * FROM messages").all();
+  node.store.db.exec(`CREATE TRIGGER reject_takeover_receipt BEFORE UPDATE ON kv
+    WHEN NEW.k GLOB 'identity-request:*' AND json_extract(NEW.v,'$.status')='completed' AND json_extract(NEW.v,'$.action')='takeover'
+    BEGIN SELECT RAISE(ABORT, 'injected takeover receipt failure'); END`);
+  const failed = invoke(true);
+  assert.equal(failed.status, 1, failed.stderr + failed.stdout);
+  const receipt = JSON.parse(failed.stdout);
+  assert.equal(receipt.status, "failed"); assert.match(receipt.error, /injected takeover receipt failure/);
+  node.store.db.exec("DROP TRIGGER reject_takeover_receipt");
+  const restored = node.store.db.prepare("SELECT token,released_at FROM identity_leases WHERE name='occupied'").get()!;
+  assert.equal(restored.token, old); assert.equal(restored.released_at, null);
+  assert.equal(node.store.get(`identity-takeover-used:${receipt.approval.payload.id}`), undefined);
+  assert.equal((await call("mbx_whoami")).isError, true, "failed takeover restores the destination's detached in-memory state");
+  assert.equal((await call("mbx_identity", { action: "claim", name: "occupied" })).isError, true);
+  assert.deepEqual(node.store.db.prepare("SELECT * FROM messages").all(), messages);
   const result = invoke(true); assert.equal(result.status, 0, result.stderr + result.stdout);
   assert.equal(JSON.parse(result.stdout).status, "completed");
   assert.equal(JSON.parse(result.stdout).result.agent, "occupied");
