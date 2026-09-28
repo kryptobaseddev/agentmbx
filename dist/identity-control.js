@@ -11,7 +11,7 @@ import { procTable, withProcSnapshot } from "./proc.js";
 import { identityTakeoverApprovalSchema } from "./identity-takeover.js";
 import { SCHEMA_VERSION } from "./store.js";
 const pid = z.number().int().positive(), label = z.string().min(1).max(300);
-const descriptorSchema = z.object({ v: z.literal(1), cli: label, session_id: label, control_key: label,
+const descriptorSchema = z.object({ v: z.literal(1), cli: label, session_id: label, lease_session_id: label, control_key: label,
     mcp_pid: pid, mcp_start: label, parent_pid: pid, parent_start: label, agent: z.string().regex(NAME_RE),
     generation: z.string().regex(/^[a-f0-9]{64}$/).nullable() }).strict();
 const requestSchema = z.object({ v: z.literal(1), id: z.string().uuid(), action: z.enum(["claim", "release", "takeover"]),

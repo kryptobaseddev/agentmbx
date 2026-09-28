@@ -266,7 +266,7 @@ test("real helper: selftest signatures (CryptoKit Ed25519) verify with Node cryp
 test("real helper: takeover summary identifies both sessions and refuses ambiguous display text", { skip }, () => {
   const payload = { v: 1, type: "identity-takeover", owner_fp: "1111-1111-1111-1111", name: "reader", host: "alpha", host_fp: "2222-2222-2222-2222",
     previous: { cli: "claude", session_id: "old", key_fp: "3333-3333-3333-3333", generation: "a".repeat(64), pid: 123, start: "birth" },
-    claimant_cli: "codex", claimant_session: "new", claimant_key: "4444-4444-4444-4444", claimant_hash: "b".repeat(64), expires_at: Date.parse(hours(1)) };
+    claimant_cli: "codex", claimant_session: "new", claimant_lease_session: "canonical", claimant_key: "4444-4444-4444-4444", claimant_hash: "b".repeat(64), expires_at: Date.parse(hours(1)) };
   const text = ok(payload);
   assert.match(text, /Take over reader@alpha/); assert.match(text, /from claude session old/);
   assert.match(text, /to codex session new/); assert.match(text, /previous session loses access; mail is preserved/);

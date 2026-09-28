@@ -8,7 +8,7 @@ const previousSchema = z.object({ generation: hash, cli: label, session_id: labe
     pid: z.number().int().positive(), start: label }).strict();
 export const identityTakeoverPayloadSchema = z.object({ v: z.literal(1), type: z.literal("identity-takeover"), id: z.string().uuid(),
     owner_fp: fp, host: label, host_fp: fp, name: z.string().regex(NAME_RE), previous: previousSchema,
-    claimant_hash: hash, claimant_cli: label, claimant_session: label, claimant_key: fp,
+    claimant_hash: hash, claimant_cli: label, claimant_session: label, claimant_lease_session: label, claimant_key: fp,
     issued_at: z.number().int().nonnegative(), expires_at: z.number().int().nonnegative() }).strict();
 export const identityTakeoverApprovalSchema = z.object({ payload: identityTakeoverPayloadSchema, sig: z.string().min(1).max(200) }).strict();
 const refused = (message) => Object.assign(new Error(message), { code: "IDENTITY_TAKEOVER_REFUSED" });
@@ -29,7 +29,7 @@ export function buildIdentityTakeover(node, claimant, name) {
     const now = Date.now();
     return identityTakeoverPayloadSchema.parse({ v: 1, type: "identity-takeover", id: randomUUID(), owner_fp: fingerprint(owner),
         host: node.host, host_fp: fingerprint(node.key.publicKey), name, previous: previousHolder(row),
-        claimant_hash: sha256(canonical(claimant)), claimant_cli: claimant.cli, claimant_session: claimant.session_id, claimant_key: claimant.control_key,
+        claimant_hash: sha256(canonical(claimant)), claimant_cli: claimant.cli, claimant_session: claimant.session_id, claimant_lease_session: claimant.lease_session_id, claimant_key: claimant.control_key,
         issued_at: now, expires_at: now + 5 * 60_000 });
 }
 /** Caller prepares claimant process evidence first. Release, replacement, audit and nonce commit together. */
@@ -46,7 +46,7 @@ export function applyIdentityTakeover(node, leases, approval, claimant, operatio
         if (payload.host !== node.host || payload.host_fp !== fingerprint(node.key.publicKey))
             throw refused("owner takeover approval names another host");
         if (claimant.generation !== null || sha256(canonical(claimant)) !== payload.claimant_hash
-            || claimant.cli !== payload.claimant_cli || claimant.session_id !== payload.claimant_session || claimant.control_key !== payload.claimant_key)
+            || claimant.cli !== payload.claimant_cli || claimant.session_id !== payload.claimant_session || claimant.lease_session_id !== payload.claimant_lease_session || claimant.control_key !== payload.claimant_key)
             throw refused("owner takeover destination changed");
         const used = `identity-takeover-used:${payload.id}`;
         if (node.store.get(used))
@@ -58,6 +58,17 @@ export function applyIdentityTakeover(node, leases, approval, claimant, operatio
             throw refused("displaced identity generation changed after approval");
         if (!leases.release(payload.name, row.token))
             throw refused("displaced identity could not be released");
+        // Retire only bindings belonging to the displaced key. Aliases may use a hook ID
+        // distinct from the lease's canonical MCP session ID, so match by key as well.
+        const displaced = node.store.db.prepare("SELECT cli,session_id,session_key FROM sessions WHERE agent=? AND cli=? AND session_key IS NOT NULL")
+            .all(payload.name, payload.previous.cli);
+        const removed = displaced.filter(s => fingerprint(s.session_key) === payload.previous.key_fp);
+        for (const binding of removed) {
+            node.store.db.prepare("DELETE FROM sessions WHERE cli=? AND session_id=? AND session_key=?").run(binding.cli, binding.session_id, binding.session_key);
+            node.store.db.prepare("DELETE FROM kv WHERE k=? AND v=?").run(`name:${binding.cli}:${binding.session_id}`, payload.name);
+            node.store.db.prepare("DELETE FROM kv WHERE k=?").run(`mcp-process:${binding.session_key}`);
+        }
+        node.store.db.prepare("DELETE FROM kv WHERE k=? AND v=?").run(`name:${payload.previous.cli}:${payload.previous.session_id}`, payload.name);
         const result = operation();
         if (result && typeof result.then === "function") {
             void Promise.resolve(result).catch(() => { });
@@ -65,10 +76,10 @@ export function applyIdentityTakeover(node, leases, approval, claimant, operatio
         }
         const replacement = lease(node, payload.name);
         if (!replacement || replacement.released_at !== null || replacement.token === row.token || replacement.key_fp !== claimant.control_key
-            || replacement.holder_pid !== claimant.mcp_pid || replacement.holder_start !== claimant.mcp_start || replacement.cli !== claimant.cli)
+            || replacement.holder_pid !== claimant.mcp_pid || replacement.holder_start !== claimant.mcp_start || replacement.cli !== claimant.cli || replacement.session_id !== claimant.lease_session_id)
             throw refused("takeover did not install the approved destination holder");
         node.store.set(used, JSON.stringify({ approval, completed_at: now }));
-        node.store.audit("identity.takeover", { approval, at: now });
+        node.store.audit("identity.takeover", { approval, removedBindings: removed.map(s => ({ cli: s.cli, session_id: s.session_id })), at: now });
         return result;
     });
 }

@@ -208,7 +208,7 @@ async function run(argv) {
                 let approval;
                 if (pos[0] === "takeover") {
                     const payload = buildIdentityTakeover(node, target, pos[1]);
-                    const summary = `Take over ${payload.name}@${payload.host} (host key ${payload.host_fp}) from ${payload.previous.cli} session ${payload.previous.session_id} (key ${payload.previous.key_fp}, generation ${payload.previous.generation}, PID ${payload.previous.pid}, birth ${payload.previous.start}) to ${payload.claimant_cli} session ${payload.claimant_session} (key ${payload.claimant_key}, binding ${payload.claimant_hash}). The previous session loses access; mail is preserved. Approval expires ${new Date(payload.expires_at).toISOString()}.`;
+                    const summary = `Take over ${payload.name}@${payload.host} (host key ${payload.host_fp}) from ${payload.previous.cli} session ${payload.previous.session_id} (key ${payload.previous.key_fp}, generation ${payload.previous.generation}, PID ${payload.previous.pid}, birth ${payload.previous.start}) to ${payload.claimant_cli} session ${payload.claimant_session} (lease session ${payload.claimant_lease_session}, key ${payload.claimant_key}, binding ${payload.claimant_hash}). The previous session loses access; mail is preserved. Approval expires ${new Date(payload.expires_at).toISOString()}.`;
                     approval = { payload, sig: (await ownerSignCanonical(node.home, canonical(payload), summary)).sig };
                 }
                 const request = submitIdentityControl(node.store, target, pos[0], pos[1], approval);

@@ -124,7 +124,7 @@ export async function runMcp(node = new MbxNode()) {
   const preparedBindings = new AsyncLocalStorage<Map<string, LegacyBinding>>();
   const controlDescriptor = (state: State, sessionId: string): IdentityControlDescriptor | null => {
     const parent = leases.processEvidence(env.ppid);
-    return parent.alive === true && parent.start && holderStart ? { v: 1, cli: env.cli, session_id: sessionId,
+    return parent.alive === true && parent.start && holderStart ? { v: 1, cli: env.cli, session_id: sessionId, lease_session_id: state.sessionId,
       control_key: fingerprint(state.key.publicKey), mcp_pid: process.pid, mcp_start: holderStart,
       parent_pid: env.ppid, parent_start: parent.start, agent: state.agent, generation: identityGeneration(state.leaseToken) } : null;
   };

@@ -72,7 +72,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI comm
 test("control requests reject changed generations and roll back failed operations before recording receipts", t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-control-atomic-")), node = new MbxNode(home, { host: "alpha" });
   t.after(() => { node.close(); rmSync(home, { recursive: true, force: true }); });
-  const descriptor: IdentityControlDescriptor = { v: 1, cli: "claude", session_id: "test", control_key: "test-key", agent: "reader", generation: identityGeneration("old"),
+  const descriptor: IdentityControlDescriptor = { v: 1, cli: "claude", session_id: "test", lease_session_id: "test", control_key: "test-key", agent: "reader", generation: identityGeneration("old"),
     mcp_pid: process.pid, mcp_start: inspectLeaseProcess(process.pid).start!, parent_pid: process.ppid, parent_start: inspectLeaseProcess(process.ppid).start! };
   publishIdentityControl(node.store, descriptor);
   const request = submitIdentityControl(node.store, descriptor, "release");
