@@ -7,7 +7,7 @@ import { execFileSync } from "node:child_process";
 import { canonical, fingerprint, ulid } from "./crypto.js";
 import { buildGrant, CAPS, grantPayload } from "./envelope.js";
 import { advertise, browse, lanIPv4 } from "./discovery.js";
-import { flushOutbox, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, startServer, advertisedAddr } from "./http.js";
+import { flushOutbox, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.js";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.js";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
 import { ancestors, withProcSnapshot } from "./proc.js";
@@ -485,9 +485,10 @@ If the codes differ, do not approve: someone is in the middle.`);
                 });
             }
             setInterval(tick, 2000);
-            setInterval(() => { void refreshDirectory(node); void pullPolicies(node); }, 60_000);
+            setInterval(() => { void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node); }, 60_000);
             void refreshDirectory(node);
             void pullPolicies(node);
+            void refreshPeerEncKeys(node);
             // a policy about to lapse: one desktop reminder, 48 h ahead, with the renew command (only where the owner key is)
             const remind = () => {
                 try {
