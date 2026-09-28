@@ -17,6 +17,14 @@ test("OpenCode metadata isolates sessions, binds wake IDs, and scopes cleanup", 
   const call = (sid: string, name: string, args = {}) => c.callTool({ name, arguments: args, _meta: { sessionID: sid } });
   const [a,b] = await Promise.all([call("ses_alpha", "mbx_whoami"), call("ses_beta", "mbx_whoami")]);
   const aa = a.structuredContent as {agent:string;session:string}, bb=b.structuredContent as {agent:string;session:string};
+  const namespaced = await c.callTool({ name: "mbx_whoami", arguments: {}, _meta: { "ai.opencode/sessionID": "ses_alpha" } });
+  assert.equal((namespaced.structuredContent as {agent:string}).agent, aa.agent);
+  const conflict = await c.callTool({ name: "mbx_whoami", arguments: {}, _meta: { "ai.opencode/sessionID": "ses_alpha", sessionID: "ses_beta" } });
+  assert.equal(conflict.isError, true);
+  for (const value of [null, 17, "", "../bad"]) {
+    const invalid = await c.callTool({ name: "mbx_whoami", arguments: {}, _meta: { "ai.opencode/sessionID": value } });
+    assert.equal(invalid.isError, true);
+  }
   assert.notEqual(aa.agent, bb.agent);
   assert.notEqual(aa.session, bb.session);
   assert.deepEqual(n.store.db.prepare("SELECT session_id FROM sessions WHERE session_id LIKE 'ses_%' ORDER BY session_id").all().map(r=>r.session_id), ["ses_alpha","ses_beta"]);

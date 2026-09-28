@@ -105,7 +105,12 @@ export async function runMcp(node = new MbxNode()) {
     const contextFor = (extra) => {
         if (env.cli !== "opencode")
             return base;
-        const sid = extra?._meta?.sessionID;
+        const meta = extra?._meta;
+        // OpenCode 2.0.15 uses the namespaced key; current docs also describe sessionID.
+        const namespaced = meta?.["ai.opencode/sessionID"], documented = meta?.sessionID;
+        if (namespaced !== undefined && documented !== undefined && namespaced !== documented)
+            throw new Error("Conflicting OpenCode sessionID metadata");
+        const sid = namespaced !== undefined ? namespaced : documented;
         if (sid === undefined)
             return base; // non-session provider calls keep their provisional mailbox
         if (typeof sid !== "string" || !/^ses_[a-zA-Z0-9]{1,128}$/.test(sid))
