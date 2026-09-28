@@ -1,5 +1,5 @@
 // mbx command line. Humans, hooks and scripts use this; agents use the MCP tools (mbx mcp).
-import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
@@ -9,6 +9,7 @@ import { buildGrant, CAPS, grantPayload } from "./envelope.js";
 import { advertise, browse, lanIPv4 } from "./discovery.js";
 import { flushOutbox, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.js";
 import { relayDrainOutbox, relayFor, relayPull } from "./relay-client.js";
+import { RelayCore, startRelayServer } from "./relay.js";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.js";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
 import { ancestors, withProcSnapshot } from "./proc.js";
@@ -57,6 +58,8 @@ Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …'
   agentmbx pair approve <host> <code>
   agentmbx peers                                    agentmbx peers remove <host>
   agentmbx daemon                                   agentmbx daemon install | uninstall   (launchd / systemd user service)
+  agentmbx relay [serve [--port N]]                 run an untrusted store-and-forward relay (ADR-035 reference)
+  agentmbx relay set <url> | relay unset            point this daemon at a relay (picked up on daemon start)
   agentmbx notify-test [--as <agent>]               send a sample desktop notification the way wake-ups do
 
 Owner (each signature needs you: a Touch ID / password prompt on macOS with AgentMBX.app, else the passphrase on a terminal)
@@ -452,6 +455,29 @@ If the codes differ, do not approve: someone is in the middle.`);
                 console.log(`${s.host}\t${s.addr}\tkey ${s.fp || "?"}\t${status}`);
             }
             return;
+        }
+        case "relay": {
+            const sub = pos[0];
+            if (sub === "set" || sub === "unset") {
+                const cfg = join(node.home, "config.json");
+                const c = JSON.parse(readFileSync(cfg, "utf8"));
+                const value = sub === "set" ? (pos[1] ?? die("relay set <url>")) : undefined;
+                if (value !== undefined)
+                    c.relay = value;
+                else
+                    delete c.relay;
+                writeFileSync(cfg, JSON.stringify(c, null, 2) + "\n", { mode: 0o600 });
+                console.log(value ? `relay set to ${value}` : "relay unset");
+                console.log("the daemon reads it on start: agentmbx daemon restart, or launchctl kickstart -k gui/$(id -u)/com.agentmbx.daemon");
+                return;
+            }
+            if (sub !== undefined && sub !== "serve")
+                die("relay [serve [--port N]] | relay set <url> | relay unset");
+            const port = Number(str("port") ?? 7374);
+            const core = new RelayCore();
+            const server = await startRelayServer(core, port, str("bind") ?? "0.0.0.0");
+            console.log(`[agentmbx] untrusted store-and-forward relay listening on :${port} (ADR-035 reference; holds no keys, decides nothing)`);
+            return new Promise(() => void server);
         }
         case "daemon": {
             if (pos[0] === "install")

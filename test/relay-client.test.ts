@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -81,4 +81,17 @@ test("relayDrainOutbox refuses to push plaintext when the peer published no enc 
   assert.deepEqual(drained, { pushed: 0, failed: 1 });
   assert.equal(core.inspect(b.key.publicKey).length, 0, "no plaintext ever reaches the relay");
   assert.equal(a.store.db.prepare("SELECT COUNT(*) n FROM outbox").get()!.n, 1, "mail stays queued for a later retry");
+});
+
+test("agentmbx relay set/unset writes config.json for the next daemon start", async (t) => {
+  const { execFileSync } = await import("node:child_process");
+  const home = mkdtempSync(join(tmpdir(), "mbx-relaycli-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const bin = join(import.meta.dirname, "../bin/agentmbx.js");
+  const env = { ...process.env, MBX_HOME: home, MBX_NO_DESKTOP: "1" } as Record<string, string>;
+  const read = () => JSON.parse(readFileSync(join(home, "config.json"), "utf8")) as { relay?: string };
+  execFileSync(process.execPath, [bin, "relay", "set", "http://relay:7374"], { env, stdio: "pipe" });
+  assert.equal(read().relay, "http://relay:7374");
+  execFileSync(process.execPath, [bin, "relay", "unset"], { env, stdio: "pipe" });
+  assert.equal(read().relay, undefined);
 });
