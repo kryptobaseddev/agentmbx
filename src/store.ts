@@ -5,6 +5,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Envelope } from "./envelope.ts";
 import { privatePath } from "./private-files.ts";
+import { version } from "./version.ts";
 
 export type DeliveryState = "queued" | "delivered" | "notified" | "read" | "acked";
 
@@ -124,7 +125,10 @@ export class Store {
           if (!this.db.prepare(`PRAGMA table_info(${table})`).all().some(r => r.name === column))
             this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
         }
-        if (this.schemaVersion() < SCHEMA_VERSION) this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+        if (this.schemaVersion() < SCHEMA_VERSION) {
+          this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+          this.db.prepare("INSERT OR REPLACE INTO kv (k, v) VALUES ('schema-upgraded-by', ?)").run(version());
+        }
       });
       for (const f of ["mbx.db-wal", "mbx.db-shm"]) privatePath(join(home, f), 0o600, true);
     } catch (e) { this.db.close(); throw e; }
@@ -132,10 +136,19 @@ export class Store {
   close() { this.db.close(); }
 
   schemaVersion(): number { return (this.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version; }
+  /** The agentmbx version that migrated this store to its current schema, when it recorded one. */
+  upgradedBy(): string | null {
+    try { return (this.db.prepare("SELECT v FROM kv WHERE k='schema-upgraded-by'").get() as { v: string } | undefined)?.v ?? null; }
+    catch { return null; } // a store from before this bookkeeping (or before the kv table) simply has none
+  }
   /** Throws a clear "restart" error when a newer agentmbx has upgraded the store since this process started. */
   assertCurrent(running?: string) {
     const v = this.schemaVersion();
-    if (v > SCHEMA_VERSION) throw Object.assign(new Error(`this mbx server${running ? ` (agentmbx ${running})` : ""} is older than the mailbox store (schema ${v} > ${SCHEMA_VERSION}); a newer agentmbx upgraded it. Update AgentMBX if necessary. Restart your CLI session to load the current mbx tools.`), { code: "STALE_SERVER" });
+    if (v <= SCHEMA_VERSION) return;
+    const upgradedBy = this.upgradedBy();
+    throw Object.assign(new Error(upgradedBy && upgradedBy === running
+      ? `the mailbox store was upgraded to schema ${v} by the agentmbx ${running} you are already running; this session loaded its mailbox tools before the upgrade. Restart your CLI session (or reconnect the mbx MCP server) to reload the current tools. Your mail is preserved.`
+      : `this mbx server${running ? ` (agentmbx ${running})` : ""} is older than the mailbox store (schema ${v} > ${SCHEMA_VERSION}${upgradedBy ? `, upgraded by agentmbx ${upgradedBy}` : ""}). Update AgentMBX to the current release if your install is behind. Restart your CLI session to load the current mbx tools. Your mail is preserved.`), { code: "STALE_SERVER" });
   }
 
   tx<T>(fn: () => T): T {

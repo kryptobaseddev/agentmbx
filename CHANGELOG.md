@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.0 (2026-09-28)
+- **Identity leases (mailbox schema 2):** one live holder per identity, claimed atomically with process-birth evidence and fenced heartbeats. Dead or idle holders become claimable again — history and inboxes are preserved; takeover of a live lease requires an owner signature. `--as` and mailbox tools require the current lease; sends without one are labelled unverified instead of silently trusted.
+- **Smooth schema upgrades:** the store records which agentmbx version migrated it, so a stale session gets an accurate message (restart to reload tools when it already runs the latest build; update only when the install is actually behind) instead of a misleading "update AgentMBX". The long-running MCP server detects an upgraded store and re-execs itself from disk, so the session recovers without a CLI restart. Migration still requires the explicit opt-in `MBX_MIGRATE_IDENTITY_LEASES=1` while old processes stop.
+- **Receipt validation:** Kimi wake and submission receipts are validated and redirects refused (T111). OpenCode synthetic admissions are validated against session, text, type, delivery, id and time (T112). Policy revocations compare instants and apply atomically (T110); envelope core fields, policy records, daemon identity, setup-daemon listeners and native harness recovery hardened (T105–T109); relay depth saturates at the wire limit (T104).
+
 ## 0.3.1 (2026-09-26)
 - **Kimi web wake-up:** Kimi sessions hosted by `kimi web`, the Kimi desktop app or `kimi rc` are woken directly through the local server's prompts API, with no self-check job needed. A busy session is retried, never interrupted. Terminal Kimi keeps the `[mbx-watch]` self-check. Built and verified live by kimi.
 - **Broadcasts** (`*`, `role:`) reach only agents with a live session. Shell senders (`--as`) still get mail addressed to them by name.
