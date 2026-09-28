@@ -4,12 +4,17 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { MbxNode } from "../src/node.ts";
 
-function fixture(t: { after: (fn: () => void) => void }) {
+async function fixture(t: { after: (fn: () => void | Promise<void>) => void }, leased = true) {
   const home = mkdtempSync(join(tmpdir(), "mbx-cli-"));
   const n = new MbxNode(home, { host: "test-host" });
-  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  const client = new Client({ name: "cli-test", version: "1" });
+  t.after(async () => { if (leased) await client.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  if (leased) await client.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
+    env: { ...process.env, MBX_HOME: home, MBX_AGENT: "reader", MBX_CLI: "claude", AGENTMBX_DEV: "1" } as Record<string, string> }));
   const cli = (...args: string[]) => spawnSync(process.execPath, [resolve("bin/agentmbx.js"), ...args], {
     encoding: "utf8", input: "", env: { ...process.env, MBX_HOME: home, MBX_AGENT: "", MBX_DEBUG: "", AGENTMBX_DEV: "1" }, timeout: 5000,
   });
@@ -17,9 +22,9 @@ function fixture(t: { after: (fn: () => void) => void }) {
   return { n, cli, send };
 }
 
-test("CLI usage errors are one line, with help hints and exit 2", (t) => {
-  const { cli } = fixture(t);
-  for (const args of [["send", "--as", "sender", "-m", "body"], ["inbox", "--unknown"], ["bad\ncommand"]]) {
+test("CLI usage errors are one line, with help hints and exit 2", async (t) => {
+  const { cli } = await fixture(t);
+  for (const args of [["read"], ["thread"], ["ack"], ["send", "--as", "sender", "-m", "body"], ["inbox", "--unknown"], ["bad\ncommand"]]) {
     const r = cli(...args);
     assert.equal(r.status, 2, r.stderr);
     assert.equal(r.stderr.trim().split("\n").length, 1);
@@ -28,8 +33,8 @@ test("CLI usage errors are one line, with help hints and exit 2", (t) => {
   }
 });
 
-test("CLI command help retains send options and respects option terminators", (t) => {
-  const { cli } = fixture(t);
+test("CLI command help retains send options and respects option terminators", async (t) => {
+  const { cli } = await fixture(t);
   const help = cli("send", "--help");
   assert.equal(help.status, 0);
   assert.match(help.stdout, /--needs-reply/);
@@ -40,8 +45,8 @@ test("CLI command help retains send options and respects option terminators", (t
   assert.match(literal.stderr, /no message --help/);
 });
 
-test("CLI read and ack preserve missing and ambiguous exit codes", (t) => {
-  const { cli, send } = fixture(t);
+test("CLI read and ack preserve missing and ambiguous exit codes", async (t) => {
+  const { cli, send } = await fixture(t);
   const a = send("a"), b = send("b");
   const prefix = a.id.slice(0, 4);
   assert.ok(b.id.startsWith(prefix));
@@ -50,8 +55,8 @@ test("CLI read and ack preserve missing and ambiguous exit codes", (t) => {
   assert.equal(cli("ack", prefix, "--as", "reader").status, 4);
 });
 
-test("CLI variadic ack handles all ids and reports partial failures", (t) => {
-  const { cli, send, n } = fixture(t);
+test("CLI variadic ack handles all ids and reports partial failures", async (t) => {
+  const { cli, send, n } = await fixture(t);
   const a = send("a"), b = send("b");
   const r = cli("ack", a.id, "missing", b.id, "--as", "reader");
   assert.equal(r.status, 3);
@@ -59,8 +64,8 @@ test("CLI variadic ack handles all ids and reports partial failures", (t) => {
   assert.equal(n.inbox("reader").length, 0);
 });
 
-test("CLI ack supports thread selection and all remaining mail", (t) => {
-  const { cli, send, n } = fixture(t);
+test("CLI ack supports thread selection and all remaining mail", async (t) => {
+  const { cli, send, n } = await fixture(t);
   const a = send("a"); send("reply", "sender", a.thread); const other = send("other");
   assert.equal(cli("ack", "--thread", a.id, "--as", "reader").status, 0);
   assert.deepEqual(n.inbox("reader").map(m => m.id), [other.id]);
@@ -68,8 +73,8 @@ test("CLI ack supports thread selection and all remaining mail", (t) => {
   assert.equal(n.inbox("reader").length, 0);
 });
 
-test("CLI inbox JSON retains envelope fields and combines filters", (t) => {
-  const { cli, send, n } = fixture(t);
+test("CLI inbox JSON retains envelope fields and combines filters", async (t) => {
+  const { cli, send, n } = await fixture(t);
   const a = send("a"); send("other", "other");
   n.send({ from: "sender", to: ["reader"], subject: "status", body: "body", needs_reply: false });
   const r = cli("inbox", "--as", "reader", "--json", "--needs-reply", "--from", "sender");
@@ -79,26 +84,15 @@ test("CLI inbox JSON retains envelope fields and combines filters", (t) => {
   for (const key of ["id", "to", "thread", "reply_to", "needs_reply", "refs"]) assert.deepEqual(rows[0][key], a[key as keyof typeof a]);
 });
 
-test("CLI shell senders enter the directory and receive replies without unknown-agent warnings", (t) => {
-  const { cli } = fixture(t);
-  const receiver = cli("whoami", "--as", "receiver", "--role", "reviewer", "--description", "shell receiver");
-  assert.equal(receiver.status, 0, receiver.stderr);
-  assert.match(receiver.stdout, /receiver@test-host.*role:reviewer/);
+test("CLI shell senders can send unverified new mail but cannot read or reply as a mailbox", async (t) => {
+  const { cli, n } = await fixture(t, false);
   const sent = cli("send", "--as", "shell-sender", "--to", "receiver", "--subject", "registration", "-m", "hello", "--json");
   assert.equal(sent.status, 0, sent.stderr);
   const id = JSON.parse(sent.stdout).id;
-  const agents = cli("agents");
-  assert.equal(agents.status, 0, agents.stderr);
-  assert.match(agents.stdout, /shell-sender@test-host\tlive\t\tcli\t/);
-  assert.match(agents.stdout, /receiver@test-host\tlive\treviewer\tcli\t.*shell receiver/);
-  const reply = cli("send", "--as", "receiver", "--to", "shell-sender", "--reply-to", id, "-m", "reply", "--json");
-  assert.equal(reply.status, 0, reply.stderr);
-  assert.equal(reply.stderr, "");
-  assert.deepEqual(JSON.parse(reply.stdout).warnings, []);
-  const inbox = cli("inbox", "--as", "shell-sender", "--json");
-  assert.equal(inbox.status, 0, inbox.stderr);
-  const rows = JSON.parse(inbox.stdout);
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].reply_to, id);
-  assert.equal(rows[0].subject, "Re: registration");
+  assert.match(sent.stderr, /unverified-sender/);
+  assert.equal(n.agents().find(a => a.name === "shell-sender")?.cli, "cli");
+  assert.equal(JSON.parse(n.message(id)!.envelope).meta.sender_verification, "unverified");
+  assert.equal(cli("send", "--as", "receiver", "--to", "shell-sender", "--reply-to", id, "-m", "reply").status, 1);
+  assert.equal(cli("inbox", "--as", "receiver", "--json").status, 1);
+  assert.equal(n.inbox("receiver")[0].state, "delivered");
 });

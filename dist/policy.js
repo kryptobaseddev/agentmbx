@@ -252,6 +252,8 @@ const ORDER = (l) => LEVELS.indexOf(l);
 export function effectivePolicy(db, o) {
     if (o.envelope && checkShape(o.envelope))
         return { level: "ask", classes: [], ids: [], exp: null, projects: [], grants: [], notes: ["malformed-envelope: stored message structure is invalid"] };
+    if (o.envelope && (o.envelope.meta.sender_verification !== "leased" || o.senderVerified !== true))
+        return { level: "ask", classes: [], ids: [], exp: null, projects: [], grants: [], notes: ["unverified-sender: the claimed identity has no verified lease"] };
     const isLocal = o.fromHost === o.host;
     const principalOk = (selector) => {
         if (!/^principal:[a-f0-9]{4}(?:-[a-f0-9]{4}){3}$/.test(selector))

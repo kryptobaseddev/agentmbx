@@ -1,10 +1,10 @@
 // SQLite store (node:sqlite, WAL). One per host; every mbx process on the host opens it.
 import { DatabaseSync } from "node:sqlite";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { privatePath } from "./private-files.js";
 const SCHEMA = `
-PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY, ts TEXT NOT NULL, from_addr TEXT NOT NULL, thread TEXT NOT NULL, reply_to TEXT,
   kind TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL, envelope TEXT NOT NULL,
@@ -29,6 +29,11 @@ CREATE TABLE IF NOT EXISTS agents (       -- agents known on this host and on pa
 CREATE TABLE IF NOT EXISTS sessions (     -- live CLI sessions bound to local agents (for wake-up)
   agent TEXT NOT NULL, cli TEXT NOT NULL, session_id TEXT NOT NULL, cwd TEXT, pid INTEGER,
   session_key TEXT, channel INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (cli, session_id));
+CREATE TABLE IF NOT EXISTS identity_leases (
+  name TEXT PRIMARY KEY, token TEXT NOT NULL, holder_pid INTEGER NOT NULL, holder_start TEXT NOT NULL,
+  key_fp TEXT NOT NULL, cli TEXT NOT NULL, session_id TEXT NOT NULL,
+  claimed_at INTEGER NOT NULL, heartbeat_at INTEGER NOT NULL, idle_ttl INTEGER NOT NULL,
+  released_at INTEGER, release_reason TEXT);
 CREATE TABLE IF NOT EXISTS peers (
   host TEXT PRIMARY KEY, pubkey TEXT NOT NULL, owner_pubkey TEXT, addr TEXT NOT NULL,
   state TEXT NOT NULL,           -- 'pending' | 'approved'
@@ -54,28 +59,74 @@ CREATE TABLE IF NOT EXISTS pair_tokens (  -- one-time pairing tokens (agentmbx p
  * Store layout version (PRAGMA user_version). Bump it with every schema change. A process that finds a newer version
  * (an old MCP server still running after an upgrade) refuses to write instead of failing with raw SQL errors.
  */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 export class Store {
     db;
-    constructor(home) {
+    #rawDb;
+    #transactionContext = new AsyncLocalStorage();
+    txDepth = 0;
+    txFailure = null;
+    constructor(home, options = {}) {
         mkdirSync(home, { recursive: true, mode: 0o700 });
         const existed = existsSync(join(home, "mbx.db"));
-        this.db = new DatabaseSync(join(home, "mbx.db"));
+        this.#rawDb = new DatabaseSync(join(home, "mbx.db"));
+        // Guard retained connections AND prepared statements if SQLite aborts an enclosing transaction.
+        // Otherwise a caught nested failure can silently turn subsequent statements into autocommit writes.
+        const guarded = (target) => new Proxy(target, {
+            get: (object, property) => {
+                const value = Reflect.get(object, property, object);
+                if (typeof value !== "function")
+                    return value;
+                return (...args) => {
+                    if (this.#transactionContext.getStore()?.active === false)
+                        throw new Error("SQLite transaction context is closed; asynchronous continuations cannot use this store");
+                    if (this.txFailure)
+                        throw this.txFailure.error;
+                    if (this.txDepth && !this.#rawDb.isTransaction) {
+                        const error = new Error("SQLite transaction ended before its callback returned");
+                        this.txFailure = { error };
+                        throw error;
+                    }
+                    try {
+                        const result = Reflect.apply(value, object, args);
+                        return property === "prepare" || property === "iterate" || property === Symbol.iterator ? guarded(result) : result;
+                    }
+                    catch (error) {
+                        if (this.txDepth && !this.#rawDb.isTransaction)
+                            this.txFailure ??= { error };
+                        throw error;
+                    }
+                };
+            },
+        });
+        this.db = guarded(this.#rawDb);
+        const allowIdentityMigration = options.allowIdentityMigration || process.env.MBX_MIGRATE_IDENTITY_LEASES === "1";
+        const assertMigrationAllowed = () => {
+            if (!allowIdentityMigration && this.schemaVersion() < 2
+                && this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").get())
+                throw Object.assign(new Error("identity lease migration requires a validated rollout; stop old AgentMBX processes and explicitly set MBX_MIGRATE_IDENTITY_LEASES=1 for the migration"), { code: "IDENTITY_MIGRATION_REQUIRED" });
+        };
         try {
+            // Connection-local only: contention can occur even while reading the compatibility marker.
+            this.db.exec("PRAGMA busy_timeout=5000");
             // Read the compatibility marker before any schema, journal-mode or permission changes.
             this.assertCurrent();
+            assertMigrationAllowed();
             privatePath(home, 0o700);
             privatePath(join(home, "mbx.db"), 0o600, false, existed);
-            this.db.exec(SCHEMA);
-            // columns added after 0.2 (CREATE TABLE IF NOT EXISTS doesn't add them to existing databases)
-            for (const ddl of ["ALTER TABLE sessions ADD COLUMN pid_start TEXT", "ALTER TABLE principals ADD COLUMN peer TEXT", "ALTER TABLE policy_revocations ADD COLUMN owner_fp TEXT"]) {
-                try {
-                    this.db.exec(ddl);
+            this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON");
+            this.tx(() => {
+                this.assertCurrent(); // another opener may have migrated while we waited for the write lock
+                assertMigrationAllowed(); // an old opener may instead have initialized a previously empty database
+                this.db.exec(SCHEMA);
+                // CREATE TABLE IF NOT EXISTS does not add columns; suppress only confirmed existing columns.
+                for (const [table, column] of [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"]]) {
+                    if (!this.db.prepare(`PRAGMA table_info(${table})`).all().some(r => r.name === column))
+                        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
                 }
-                catch { /* already there */ }
-            }
-            if (this.schemaVersion() < SCHEMA_VERSION)
-                this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+                if (this.schemaVersion() < SCHEMA_VERSION)
+                    this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+            });
             for (const f of ["mbx.db-wal", "mbx.db-shm"])
                 privatePath(join(home, f), 0o600, true);
         }
@@ -93,15 +144,80 @@ export class Store {
             throw Object.assign(new Error(`this mbx server${running ? ` (agentmbx ${running})` : ""} is older than the mailbox store (schema ${v} > ${SCHEMA_VERSION}); a newer agentmbx upgraded it. Update AgentMBX if necessary. Restart your CLI session to load the current mbx tools.`), { code: "STALE_SERVER" });
     }
     tx(fn) {
-        this.db.exec("BEGIN IMMEDIATE");
+        return this.transaction(fn, false);
+    }
+    /** A consistent WAL read snapshot that does not reserve the database's writer slot. */
+    readTx(fn) {
+        return this.transaction(fn, true);
+    }
+    transaction(fn, readOnly) {
+        if (this.#transactionContext.getStore()?.active === false)
+            throw new Error("SQLite transaction context is closed; asynchronous continuations cannot start another transaction");
+        if (this.txFailure)
+            throw this.txFailure.error;
+        const context = { active: true };
+        return this.#transactionContext.run(context, () => {
+            const wasReadOnly = readOnly && this.#rawDb.prepare("PRAGMA query_only").get().query_only === 1;
+            if (readOnly)
+                this.#rawDb.exec("PRAGMA query_only=ON");
+            try {
+                return this.runTransaction(fn, readOnly);
+            }
+            finally {
+                try {
+                    if (readOnly && !wasReadOnly)
+                        this.#rawDb.exec("PRAGMA query_only=OFF");
+                }
+                finally {
+                    context.active = false;
+                }
+            }
+        });
+    }
+    runTransaction(fn, readOnly) {
+        if (this.txFailure)
+            throw this.txFailure.error;
+        if (fn.constructor.name === "AsyncFunction")
+            throw new Error("Store.tx requires a synchronous callback");
+        const depth = this.txDepth, savepoint = `mbx_tx_${depth}`;
+        this.db.exec(depth ? `SAVEPOINT ${savepoint}` : readOnly ? "BEGIN" : "BEGIN IMMEDIATE");
+        this.txDepth++;
         try {
             const r = fn();
-            this.db.exec("COMMIT");
+            if (r && typeof r.then === "function") {
+                // Rejection does not cancel a promise. Its inherited context fences later database work.
+                void Promise.resolve(r).catch(() => { });
+                throw new Error("Store.tx cannot return a thenable");
+            }
+            const failure = this.txFailure;
+            if (failure)
+                throw failure.error;
+            if (!this.#rawDb.isTransaction)
+                throw new Error("SQLite transaction ended before its callback returned");
+            this.db.exec(depth ? `RELEASE SAVEPOINT ${savepoint}` : "COMMIT");
             return r;
         }
         catch (e) {
-            this.db.exec("ROLLBACK");
-            throw e;
+            if (!this.#rawDb.isTransaction)
+                this.txFailure ??= { error: e };
+            const original = this.txFailure?.error ?? e;
+            try {
+                if (this.#rawDb.isTransaction) {
+                    if (depth)
+                        this.#rawDb.exec(`ROLLBACK TO SAVEPOINT ${savepoint}; RELEASE SAVEPOINT ${savepoint}`);
+                    else
+                        this.#rawDb.exec("ROLLBACK");
+                }
+            }
+            catch {
+                this.txFailure ??= { error: original };
+            }
+            throw original;
+        }
+        finally {
+            this.txDepth = depth;
+            if (!depth)
+                this.txFailure = null;
         }
     }
     audit(event, detail = null) {

@@ -4,6 +4,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MbxNode } from "../src/node.ts";
+import { fingerprint } from "../src/crypto.ts";
+import { IdentityLeases, inspectLeaseProcess } from "../src/identity-leases.ts";
 import { resolveAgent } from "../src/permission.ts";
 
 const make = () => new MbxNode(mkdtempSync(join(tmpdir(), "mbx-binding-")), { host: "alpha" });
@@ -36,6 +38,10 @@ test("distinct real sessions and ambiguous MCP keys sharing a PID are not combin
     assert.equal(n.bindSession({ agent: "second", cli: "kimi", session_id: "real-second", pid: process.pid }), "second");
     assert.deepEqual(rows(n).map((r) => [r.agent, r.session_key]), [["first", "key-a"], ["second", "key-b"]]);
     assert.equal(n.agentFor("kimi", process.pid, { proof: true }), null, "PID alone cannot choose between these sessions");
+    assert.equal(resolveAgent(n, "kimi", "real-first", "/work", process.pid), null, "binding alone cannot authorize permissions");
+    for (const [agent, key] of [["first", "key-a"], ["second", "key-b"]]) {
+      new IdentityLeases(n.store).claim(agent, { pid: process.pid, start: inspectLeaseProcess(process.pid).start!, keyFp: fingerprint(key), cli: "kimi", sessionId: `real-${agent}` });
+    }
     assert.equal(resolveAgent(n, "kimi", "real-first", "/work", process.pid), "first");
     assert.equal(resolveAgent(n, "kimi", "real-second", "/work", process.pid), "second");
     assert.equal(resolveAgent(n, "kimi", "unknown", "/work", process.pid), null);

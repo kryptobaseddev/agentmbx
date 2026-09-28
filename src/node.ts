@@ -1,3 +1,4 @@
+import { hasHeldIdentity } from "./identity-leases.ts";
 // One mbx host: its key, its store, and the rules for sending, receiving, verifying and delivering.
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { hostname, homedir } from "node:os";
@@ -60,6 +61,7 @@ export class MbxNode {
     if (!existsSync(keyPath)) writeFileSync(keyPath, JSON.stringify(generateKeyPair()) + "\n", { mode: 0o600, flag: "wx" });
     this.key = JSON.parse(readFileSync(keyPath, "utf8"));
     this.store = new Store(home);
+    this.retireIdentityLinks();
     this.syncOwner();
   }
 
@@ -240,21 +242,21 @@ export class MbxNode {
     return !this.store.db.prepare("SELECT 1 FROM sessions WHERE agent=?").get(name);
   }
 
-  /**
-   * A session that sends as another name through the CLI (`--as mac-dev` from inside session `claude`) owns that name
-   * too: mail to it shows in the session's notices and wakes the session.
-   */
-  linkIdentity(name: string, sessionAgent: string) { if (name !== sessionAgent && !this.hasSessions(name)) this.store.set(`ident:${name}`, sessionAgent); }
-  /** A name some CLI session has bound (hook or MCP): its own identity, never linkable to another session. */
-  hasSessions(name: string): boolean { return !!this.store.db.prepare("SELECT 1 FROM sessions WHERE agent=? LIMIT 1").get(name); }
-  /** Names linked to this session agent (see linkIdentity). */
-  linkedNames(sessionAgent: string): string[] {
-    // only shell-only names: a link to a name that sessions bind (made before this rule) is ignored
-    return (this.store.db.prepare("SELECT k FROM kv WHERE k LIKE 'ident:%' AND v=?").all(sessionAgent) as { k: string }[]).map((r) => r.k.slice(6))
-      .filter((n) => !this.hasSessions(n));
+  /** Legacy implicit links never establish ownership. Preserve their mappings in audit only. */
+  retireIdentityLinks() {
+    this.store.tx(() => {
+      const links = this.store.db.prepare("SELECT k,v FROM kv WHERE k GLOB 'ident:*'").all();
+      for (const link of links) {
+        this.store.audit("identity.link.retired", { name: String(link.k).slice(6), previousOwner: link.v });
+        this.store.db.prepare("DELETE FROM kv WHERE k=?").run(link.k);
+      }
+    });
   }
-  /** The session agent a linked name belongs to, if any. */
-  identityOwner(name: string): string | null { return this.store.get(`ident:${name}`) ?? null; }
+  /** @deprecated Explicitly claim an identity instead; retained callers cannot create links. */
+  linkIdentity(name: string, sessionAgent: string) { this.store.audit("identity.link.refused", { name, sessionAgent }); }
+  hasSessions(name: string): boolean { return !!this.store.db.prepare("SELECT 1 FROM sessions WHERE agent=? LIMIT 1").get(name); }
+  linkedNames(_sessionAgent: string): string[] { return []; }
+  identityOwner(_name: string): string | null { return null; }
 
   /** After a rename, mail for the old name follows the session (until a live session takes the old name again). */
   addAlias(oldName: string, newName: string, pid: number) {
@@ -486,6 +488,11 @@ export class MbxNode {
     const fromName = d.from.includes("@") ? d.from.split("@")[0] : d.from;
     if (!NAME_RE.test(fromName) && fromName !== "owner") throw new Error(`invalid sender name "${fromName}"`);
     let e = prebuilt ?? buildEnvelope({ ...d, from: `${fromName}@${this.host}` });
+    // Positive host attestation comes from the current lease operation, never a draft flag.
+    // A prebuilt owner-signed envelope is immutable: changing metadata would invalidate its approval.
+    if (prebuilt?.meta.sender_verification === "leased" && (e.from !== `${fromName}@${this.host}` || !hasHeldIdentity(this.store, fromName)))
+      throw new Error("prebuilt sender attestation requires the current identity lease");
+    if (!prebuilt) e.meta.sender_verification = !d.unverifiedSender && hasHeldIdentity(this.store, fromName) ? "leased" : "unverified";
     if (owner) e = ownerSign(e, owner.pub, owner.priv);
     else if (session?.grant) e = attachAuthority(e, session.grant, session.priv);
     e = signEnvelope(e, this.host, this.key.publicKey, this.key.privateKey);
@@ -608,7 +615,10 @@ export class MbxNode {
   /** The owner policy that applies to `agent` acting on this message (computed now: expiry/revocation count). */
   policyFor(m: MessageRow, agent: string) {
     const [fromAgent, fromHost] = m.from_addr.split("@");
-    return effectivePolicy(this.store.db, { agent, host: this.host, fromAgent, fromHost: m.origin === "local" ? this.host : fromHost, envelope: JSON.parse(m.envelope) as Envelope });
+    const envelope = JSON.parse(m.envelope) as Envelope;
+    const key = m.origin === "local" && fromHost === this.host ? this.key.publicKey : m.origin === fromHost && m.trust === "verified" ? this.approvedPeer(fromHost)?.pubkey : undefined;
+    const senderVerified = !!key && envelope.from === m.from_addr && envelope.sig?.host === fromHost && verifyEnvelope(envelope, key);
+    return effectivePolicy(this.store.db, { agent, host: this.host, fromAgent, fromHost, envelope, senderVerified });
   }
 
   /** A thread's messages, oldest first; with `agent`, only the ones that agent can see. */
@@ -683,7 +693,8 @@ export function trustLabel(m: MessageRow): string {
   const auth = !a ? "authority: none"
     : a.ok ? (a.session === "signed by the owner" ? "authority: OWNER (signed by the owner directly)" : `authority: OWNER via ${m.from_addr} session ${a.session} (caps: ${a.caps!.join(", ")})`)
     : `authority: none (owner authority claimed but rejected: ${a.reason})`;
-  return `${t} · ${auth}`;
+  const sender = (JSON.parse(m.envelope) as Envelope).meta?.sender_verification !== "leased" && !(m.authority && JSON.parse(m.authority).ok) ? " · unverified-sender (claimed identity has no verified lease)" : "";
+  return `${t} · ${auth}${sender}`;
 }
 
 export function formatMessage(m: MessageRow, policy?: string): string {

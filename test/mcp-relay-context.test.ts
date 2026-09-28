@@ -18,7 +18,8 @@ for (const implicitReply of [false, true]) test(implicitReply ? "mbx_send reply_
   // Test-only child clock injection: exercise the real MCP handlers without waiting an hour.
   writeFileSync(preload, `import {readFileSync} from 'node:fs'; Date.now = () => Number(readFileSync(${JSON.stringify(clock)}, 'utf8'));`);
   await c.connect(new StdioClientTransport({ command: process.execPath, args: ["--import", preload, join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
-    env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "claude", MBX_AGENT: "reader", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
+    // Keep the lease valid while independently advancing the one-hour relay provenance clock.
+    env: { ...process.env, AGENTMBX_DEV: "1", MBX_IDENTITY_IDLE_TTL_MS: "7200000", MBX_HOME: home, MBX_CLI: "claude", MBX_AGENT: "reader", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
   const parent = n.send({ from: "sender", to: ["reader"], subject: "external", body: "data", hop: 5, origin: "external" }).envelope;
   const fresh = n.send({ from: "sender", to: ["reader"], subject: "fresh", body: "data", hop: 0 }).envelope;
   const send = async (reply_to?: string) => {
@@ -46,7 +47,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: unrelat
   let now = Date.now(); writeFileSync(clock, String(now));
   writeFileSync(preload, `import {readFileSync} from 'node:fs'; Date.now = () => Number(readFileSync(${JSON.stringify(clock)}, 'utf8'));`);
   await c.connect(new StdioClientTransport({ command: process.execPath, args: ["--import", preload, join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
-    env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: cli, MBX_AGENT: "reader", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
+    env: { ...process.env, AGENTMBX_DEV: "1", MBX_IDENTITY_IDLE_TTL_MS: "10800000", MBX_HOME: home, MBX_CLI: cli, MBX_AGENT: "reader", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
   const old = n.send({ from: "sender", to: ["reader"], subject: "old context", body: "data", hop: 65, origin: "external" }).envelope;
   const fresh = n.send({ from: "sender", to: ["reader"], subject: "unrelated", body: "data" }).envelope;
   const read = async (id: string) => assert.notEqual((await c.callTool({ name: "mbx_read", arguments: { ids: [id] } })).isError, true);

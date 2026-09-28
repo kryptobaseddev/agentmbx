@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MbxNode } from "../src/node.ts";
@@ -25,4 +25,26 @@ for (const state of ["absent", "stale", "provisional", "real", "channel", "mixed
   if (state === "channel") { assert.match(check.label, /1 channel/); assert.equal(check.fix, undefined); }
   if (state === "mixed") assert.match(check.label, /1 verified live.*1 stale/);
   assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions ORDER BY cli,session_id").all(), before);
+});
+
+for (const hosted of [false, true]) for (const mixed of [false, true]) test(`doctor Kimi hosted=${hosted} mixed=${mixed} distinguishes missing session identity`, t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-doctor-kimi-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  const prior = process.env.KIMI_CODE_HOME;
+  process.env.KIMI_CODE_HOME = join(home, "kimi");
+  t.after(() => { if (prior === undefined) delete process.env.KIMI_CODE_HOME; else process.env.KIMI_CODE_HOME = prior; n.close(); rmSync(home, { recursive: true, force: true }); });
+  mkdirSync(join(process.env.KIMI_CODE_HOME, "server/instances"), { recursive: true });
+  if (hosted) writeFileSync(join(process.env.KIMI_CODE_HOME, "server/instances/server.json"), JSON.stringify({ pid: process.pid, port: 12345 }));
+  n.bindSession({ agent: "worker", cli: "kimi", session_id: "mcp-test", pid: process.pid });
+  if (mixed) n.store.db.prepare("INSERT INTO sessions (agent,cli,session_id,pid,pid_start,updated_at) SELECT 'bound',cli,'session_bound',pid,pid_start,updated_at FROM sessions WHERE session_id='mcp-test'").run();
+  const before = n.store.db.prepare("SELECT * FROM sessions ORDER BY session_id").all();
+  const check = sessionReadiness(n, "kimi");
+  if (hosted) {
+    assert.equal(check.level, "warn");
+    assert.match(check.label, /1 hosted binding.*explicit session identity/);
+    assert.match(check.fix!, /provider integration/);
+    assert.doesNotMatch(check.fix!, /run the provider session-start hook/);
+  } else if (!mixed) assert.match(check.fix!, /session-start hook/);
+  assert.match(check.label, /receipt not tested/);
+  assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions ORDER BY session_id").all(), before);
 });

@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { generateKeyPair, fingerprint } from "../src/crypto.ts";
+import { IdentityLeases, inspectLeaseProcess } from "../src/identity-leases.ts";
 import { MbxNode } from "../src/node.ts";
 import { approveKimi, decidePermission, kimiServer, opencodePermissionPass, type Lookup } from "../src/permission.ts";
 import { runSetup, type SetupCtx } from "../src/setup.ts";
@@ -15,7 +17,11 @@ const no: Lookup = () => ({ ok: false });
 const audits = (n: MbxNode) => (n.store.db.prepare("SELECT event, detail FROM audit WHERE event='yolo_allow'").all() as { detail: string }[]).map((r) => JSON.parse(r.detail));
 const req = (extra: Record<string, unknown> = {}) => ({ session_id: "s1", cwd: "/work/api-dev", hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command: "ls" }, ...extra });
 /** A session bound to THIS process (pid + start time), as the MCP server of a running CLI would record it. */
-const bound = (n: MbxNode, agent: string, cli: string) => n.bindSession({ agent, cli, session_id: `mcp-${cli}`, cwd: "/work/api-dev", pid: process.pid, session_key: "k" });
+const bound = (n: MbxNode, agent: string, cli: string, sessionId = "s1") => {
+  const key = generateKeyPair();
+  new IdentityLeases(n.store).claim(agent, { pid: process.pid, start: inspectLeaseProcess(process.pid).start!, keyFp: fingerprint(key.publicKey), cli, sessionId });
+  n.bindSession({ agent, cli, session_id: sessionId, cwd: "/work/api-dev", pid: process.pid, session_key: key.publicKey });
+};
 const ALLOW = { hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } };
 
 test("claude and codex: allow under an active policy, with the documented JSON and an audit line", () => {
@@ -56,10 +62,11 @@ test("the agent comes from a binding of this very process (session, else MCP); n
   // a session row recorded for another process (pid 4242) is not this session
   n.bindSession({ agent: "elsewhere", cli: "claude", session_id: "s1", cwd: "/work/api-dev", pid: 4242 });
   assert.equal(ask(req(), "claude", process.pid).allow, false);
-  n.bindSession({ agent: "renamed", cli: "claude", session_id: "s1", cwd: "/work/api-dev", pid: process.pid });
+  bound(n, "renamed", "claude");
   ask(req(), "claude", process.pid);
-  n.bindSession({ agent: "via-mcp", cli: "codex", session_id: "mcp-x", pid: process.pid, session_key: "k" });
-  ask(req({ session_id: "unbound" }), "codex", process.pid);
+  bound(n, "via-mcp", "codex");
+  assert.equal(ask(req({ session_id: "unbound" }), "codex", process.pid).allow, false);
+  ask(req(), "codex", process.pid);
   assert.deepEqual(seen, ["renamed", "via-mcp"]);
 });
 
@@ -110,8 +117,8 @@ test("kimiServer finds a live instance and its token", () => {
 test("opencode daemon pass: replies once for covered agents only, and makes no request without a policy", async () => {
   const n = node();
   // bindings proven to be live OpenCode processes (pid + start time), as the MCP server records them
-  n.bindSession({ agent: "yolo", cli: "opencode", session_id: "ses_A", pid: process.pid });
-  n.bindSession({ agent: "careful", cli: "opencode", session_id: "ses_B", pid: process.pid });
+  bound(n, "yolo", "opencode", "ses_A");
+  bound(n, "careful", "opencode", "ses_B");
   const calls: { url: string; method: string; body?: string }[] = [];
   const fake = (async (url: string, init: RequestInit = {}) => {
     calls.push({ url, method: init.method ?? "GET", body: init.body as string });
@@ -128,7 +135,7 @@ test("opencode daemon pass: replies once for covered agents only, and makes no r
   assert.deepEqual(audits(n), [{ agent: "yolo", cli: "opencode", tool: "bash", policy_id: "pol_1" }]);
 });
 
-test("opencode daemon pass: an MCP-only binding uses its folder's pending list and skips other agents' sessions", async () => {
+test("opencode daemon pass: legacy MCP-only bindings cannot use folder-based approval", async () => {
   const n = node();
   n.bindSession({ agent: "web", cli: "opencode", session_id: "mcp-123", cwd: "/work/web", pid: process.pid, session_key: "k" });
   n.bindSession({ agent: "other", cli: "opencode", session_id: "ses_other", cwd: "/work/web" });
@@ -142,9 +149,9 @@ test("opencode daemon pass: an MCP-only binding uses its folder's pending list a
     }
     posts.push(url); return new Response(null, { status: 204 });
   }) as typeof fetch;
-  assert.equal(await opencodePermissionPass(n, (a) => (a === "web" ? yes(a) : no(a)), async () => ({ url: "http://oc", auth: "" }), fake), 1);
-  assert.equal(listUrl, "http://oc/api/permission/request?location%5Bdirectory%5D=%2Fwork%2Fweb");
-  assert.deepEqual(posts, ["http://oc/api/session/ses_unbound/permission/per_mine/reply"]);
+  assert.equal(await opencodePermissionPass(n, (a) => (a === "web" ? yes(a) : no(a)), async () => ({ url: "http://oc", auth: "" }), fake), 0);
+  assert.equal(listUrl, "");
+  assert.deepEqual(posts, []);
 });
 
 // ---- setup wiring --------------------------------------------------------------------------------

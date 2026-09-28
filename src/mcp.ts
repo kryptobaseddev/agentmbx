@@ -12,11 +12,16 @@ import { z } from "zod";
 import { fingerprint, generateKeyPair } from "./crypto.ts";
 import { checkShape, KINDS, MAX_RELAY_DEPTH, NAME_RE, type Envelope, type Grant } from "./envelope.ts";
 import { kimiHostedServer } from "./kimi-web.ts";
+import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess } from "./identity-leases.ts";
+import { applyIdentityTakeover, type IdentityTakeoverApproval } from "./identity-takeover.ts";
+import { listIdentityStatus } from "./identity-status.ts";
+import { consumeIdentityControl, identityControlAliases, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl, type IdentityControlDescriptor } from "./identity-control.ts";
 import { formatFor, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
 import { activePolicies, delegationNote, MAX_HOP } from "./policy.ts";
+import { procStart, withProcSnapshot } from "./proc.ts";
 import { updateAvailable } from "./update.ts";
 import { version } from "./version.ts";
-import { wakeText } from "./wake.ts";
+import { hasWakeAuthority, wakeText } from "./wake.ts";
 
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
 It is shared by AI coding agents on this machine and on paired machines. Your user set it up so agents can coordinate;
@@ -101,20 +106,118 @@ const text = (s: string, structured?: Record<string, unknown>) => ({ content: [{
 export async function runMcp(node = new MbxNode()) {
   const env = detectHost();
   const wanted = agentName(process.cwd(), env.cli);
+  const leases = new IdentityLeases(node.store, { idleTtlMs: process.env.MBX_IDENTITY_IDLE_TTL_MS === undefined ? undefined : Number(process.env.MBX_IDENTITY_IDLE_TTL_MS) });
+  const holderStart = inspectLeaseProcess(process.pid).start;
   // a second live session with the same default name gets a free one (T055); an explicit MBX_AGENT is used as is
-  type State = { agent: string; sessionId: string; key: ReturnType<typeof generateKeyPair>;
+  type State = { agent: string; sessionId: string; key: ReturnType<typeof generateKeyPair>; leaseToken?: string; released?: boolean;
     parent: { hops: Map<number, number>; externalAt: number | null } | null };
   const base: State = { agent: process.env.MBX_AGENT ? wanted : node.pickName(wanted, env.cli, env.ppid, env.sessionId),
     sessionId: env.sessionId, key: generateKeyPair(), parent: null };
   const states = new Map<string, State>();
   const requests = new AsyncLocalStorage<State>();
   const current = () => requests.getStore() ?? base;
-  const bind = (state = base, initial = false) => {
-    state.agent = node.bindSession({ agent: state.agent, cli: env.cli, session_id: state.sessionId, cwd: process.cwd(), pid: env.ppid,
-      session_key: state.key.publicKey, channel: env.channel, mcp_pid: process.pid, restore_name: initial && !process.env.MBX_AGENT });
-    node.registerAgent(state.agent, { cli: env.cli, role: process.env.MBX_ROLE, description: process.env.MBX_DESCRIPTION });
+  const legacyConflicts = new Set<string>();
+  const ambiguousLegacy = new Set<string>();
+  type LegacyBinding = { agent: string; cli: string; session_id: string; pid: number | null; pid_start: string | null; session_key: string | null; updated_at: string; child_record: string | null };
+  // Read the binding and its child generation in one SQLite snapshot, before bindSession can clean either up.
+  const legacyColumns = "agent,cli,session_id,pid,pid_start,session_key,updated_at,(SELECT v FROM kv WHERE k='mcp-process:'||sessions.session_key) AS child_record";
+  const preparedBindings = new AsyncLocalStorage<Map<string, LegacyBinding>>();
+  const controlDescriptor = (state: State, sessionId: string): IdentityControlDescriptor | null => {
+    const parent = leases.processEvidence(env.ppid);
+    return parent.alive === true && parent.start && holderStart ? { v: 1, cli: env.cli, session_id: sessionId, lease_session_id: state.sessionId,
+      control_key: fingerprint(state.key.publicKey), mcp_pid: process.pid, mcp_start: holderStart,
+      parent_pid: env.ppid, parent_start: parent.start, agent: state.agent, generation: identityGeneration(state.leaseToken) } : null;
   };
-  bind(base, true);
+  const publishControl = (state: State) => {
+    const ids = new Set([state.sessionId, ...identityControlAliases(node.store, fingerprint(state.key.publicKey)).map(d => d.session_id),
+      ...node.store.db.prepare("SELECT session_id FROM sessions WHERE cli=? AND session_key=?").all(env.cli, state.key.publicKey).map(r => r.session_id as string)]);
+    for (const sid of ids) { const descriptor = controlDescriptor(state, sid); if (descriptor) publishIdentityControl(node.store, descriptor); }
+  };
+  const bindingId = (row: LegacyBinding) => JSON.stringify([row.cli, row.session_id]);
+  const prepareState = <T>(state: State, target: string | undefined, operation: () => T): T => {
+    if (node.store.db.isTransaction) return leases.prepare([], [], operation); // requires the enclosing prepared scope
+    const rows = !state.leaseToken || target ? node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions`).all() as LegacyBinding[] : [];
+    const names = new Set([state.agent, ...(target ? [target] : [])]);
+    if (!state.leaseToken) {
+      for (const row of rows.filter(r => r.cli === env.cli && r.pid === env.ppid)) {
+        const remembered = node.store.get(`name:${env.cli}:${row.session_id}`);
+        if (remembered) names.add(remembered);
+      }
+    }
+    const pids = new Set([process.pid, env.ppid]);
+    for (const row of rows.filter(r => names.has(r.agent))) {
+      if (row.pid) pids.add(row.pid);
+      if (row.session_key) {
+        try { const child = JSON.parse(row.child_record ?? "null"); if (Number.isSafeInteger(child?.pid) && child.pid > 0) pids.add(child.pid); }
+        catch { /* malformed legacy evidence stays unknown */ }
+      }
+    }
+    return preparedBindings.run(new Map(rows.map(row => [bindingId(row), row])),
+      () => withProcSnapshot(() => leases.prepare([...names], [...pids], operation)));
+  };
+  const checkLegacy = (agent: string, state: State, rows: LegacyBinding[]) => {
+    if (node.store.get(`identity-conflict:${agent}`)) throw Object.assign(new Error(`identity ${agent} has unresolved historical ownership; choose a distinct identity`), { code: "IDENTITY_IN_USE" });
+    // Once a lease exists, its generation is authoritative. Before migration, preserve ambiguous
+    // live/unknown bindings rather than silently adopting their mailbox or replacing their key.
+    if (node.store.db.prepare("SELECT 1 FROM identity_leases WHERE name=?").get(agent)) return;
+    const unobserved = new Set<LegacyBinding>();
+    const held = rows.filter(r => {
+      if (r.agent !== agent) return false;
+      const original = preparedBindings.getStore()?.get(bindingId(r));
+      if (!original || (["agent", "pid", "pid_start", "session_key", "updated_at", "child_record"] as const).some(key => original[key] !== r[key])) {
+        unobserved.add(r); return true; // new/rebound rows need fresh evidence, never old PID observations
+      }
+      const updated = Date.parse(r.updated_at);
+      if (Number.isFinite(updated) && Date.now() - updated >= DEFAULT_IDENTITY_IDLE_TTL_MS) return false;
+      if (r.pid && leases.processEvidence(r.pid).alive === false) return false;
+      if (r.session_key) {
+        try {
+          const child = JSON.parse(r.child_record ?? "null");
+          if (Number.isSafeInteger(child?.pid) && child.pid > 0) {
+            const evidence = leases.processEvidence(child.pid), start = procStart(child.pid);
+            // Legacy child records use procStart's format (not the lease layer's UTC ps format).
+            if (evidence.alive === false || (typeof child.start === "string" && child.start && start && child.start !== start)) return false;
+          }
+        } catch { /* unknown legacy evidence remains held */ }
+      }
+      return true;
+    });
+    if (!held.length) return;
+    const only = held[0];
+    if (held.length === 1 && !unobserved.has(only) && !only.session_key && only.cli === env.cli && only.pid === env.ppid
+      && (only.session_id === state.sessionId || state.sessionId.startsWith("mcp-"))
+      && node.sameSession(env.ppid, only, { proof: true })) return;
+    legacyConflicts.add(agent);
+    if (held.length > 1) ambiguousLegacy.add(agent);
+    throw Object.assign(new Error(`identity ${agent} has unresolved legacy session holders; choose a distinct identity`), { code: "IDENTITY_IN_USE" });
+  };
+  const bind = (state = base, initial = false) => prepareState(state, undefined, () => {
+    const result = node.store.tx(() => {
+      if (state.leaseToken) leases.renew(state.agent, state.leaseToken);
+      // Snapshot before bindSession can replace or consolidate any rows.
+      const legacy = state.leaseToken ? [] : node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions`).all() as LegacyBinding[];
+      const agent = node.bindSession({ agent: state.agent, cli: env.cli, session_id: state.sessionId, cwd: process.cwd(), pid: env.ppid,
+        session_key: state.key.publicKey, channel: env.channel, mcp_pid: process.pid, restore_name: initial && !process.env.MBX_AGENT });
+      if (state.leaseToken && agent !== state.agent) throw new Error("bound identity changed outside a lease rename");
+      if (!state.leaseToken) checkLegacy(agent, state, legacy);
+      const leaseToken = state.leaseToken ?? leases.claim(agent, { pid: process.pid, start: holderStart ?? "", keyFp: fingerprint(state.key.publicKey), cli: env.cli, sessionId: state.sessionId }).token;
+      node.registerAgent(agent, { cli: env.cli, role: process.env.MBX_ROLE, description: process.env.MBX_DESCRIPTION });
+      publishControl({ ...state, agent, leaseToken });
+      return { agent, leaseToken };
+    });
+    Object.assign(state, result);
+  });
+  try { bind(base, true); }
+  catch (error) {
+    if ((error as { code?: string }).code !== "IDENTITY_IN_USE") throw error;
+    // Keep ambiguity after old session rows migrate away. Resolving historical ownership is
+    // an explicit recovery operation, not a side effect of opening another MCP connection.
+    for (const name of ambiguousLegacy) node.store.set(`identity-conflict:${name}`, JSON.stringify({ reason: "ambiguous legacy sessions", at: new Date().toISOString() }));
+    // Keep tools available on every provider without taking another holder's history. The
+    // fresh key suffix cannot accidentally recover a provisional mailbox through PID reuse.
+    base.agent = `${wanted.slice(0, 19)}-mcp-${fingerprint(base.key.publicKey).replaceAll("-", "")}`;
+    bind(base);
+  }
   const contextFor = (extra: unknown): State => {
     if (env.cli !== "opencode" && env.cli !== "codex") return base;
     const meta = (extra as { _meta?: Record<string, unknown> } | undefined)?._meta;
@@ -139,7 +242,7 @@ export async function runMcp(node = new MbxNode()) {
         .some(r => r.pid && node.sameSession(r.pid, r, { proof: true }));
       // Legacy Codex hooks may have saved the same default for several threads on a daemon.
       // Recover a distinct name without moving any mail whose ownership is ambiguous.
-      const name = remembered && !(env.cli === "codex" && occupied(remembered)) ? remembered : fallback;
+      const name = remembered && !legacyConflicts.has(remembered) && !node.store.get(`identity-conflict:${remembered}`) && !(env.cli === "codex" && occupied(remembered)) ? remembered : fallback;
       if (occupied(name)) throw new Error(`${env.cli} mailbox ${name} belongs to another live session; choose a distinct session identity`);
       state = { agent: name, sessionId: sid, key: generateKeyPair(), parent: null };
       bind(state);
@@ -198,22 +301,95 @@ export async function runMcp(node = new MbxNode()) {
   });
   // every tool first checks that a newer agentmbx hasn't upgraded the store under this long-running server
   const register = server.registerTool.bind(server) as (...a: unknown[]) => unknown;
-  (server as { registerTool: unknown }).registerTool = (name: string, config: unknown, cb: (...a: unknown[]) => unknown) =>
-    register(name, config, (...a: unknown[]) => {
+  (server as { registerTool: unknown }).registerTool = (name: string, config: unknown, cb: (...a: unknown[]) => unknown) => {
+    if (cb.constructor.name === "AsyncFunction") throw new Error(`MCP handler ${name} must be synchronous to preserve its lease fence`);
+    return register(name, config, (...a: unknown[]) => {
       node.store.assertCurrent(version());
-      return requests.run(contextFor(a[1]), () => cb(...a));
+      const state = contextFor(a[1]), before = { agent: state.agent, leaseToken: state.leaseToken, released: state.released, parent: state.parent, sessionId: state.sessionId };
+      try {
+        // Recovery controls must remain callable after lease loss. Each mutation below performs
+        // its own generation check; ordinary tools still require the current holder's lease.
+        if (name === "mbx_identity") return withProcSnapshot(() => prepareState(state, (a[0] as { name?: string })?.name, () => requests.run(state, () => cb(...a))));
+        // These handlers only query SQLite. mbx_read advances delivery state despite its
+        // readOnlyHint, and whoami can rename, so neither belongs in this snapshot set.
+        const readOnly = ["mbx_inbox", "mbx_thread", "mbx_search", "mbx_agents"].includes(name);
+        const invoke = () => requests.run(state, () => readOnly
+          ? leases.withHeldRead(state.agent, state.leaseToken!, () => cb(...a))
+          : leases.withHeld(state.agent, state.leaseToken!, () => cb(...a)));
+        const target = (a[0] as { name?: string } | undefined)?.name;
+        return withProcSnapshot(() => name === "mbx_whoami" ? prepareState(state, target, invoke) : invoke());
+      } catch (e) { Object.assign(state, before); throw e; }
     });
+  };
+
+  const handoff = (agent: string) => ({ agent, address: `${agent}@${node.host}`, unread: node.unreadCount(agent),
+    open_threads: Number(node.store.db.prepare("SELECT COUNT(DISTINCT m.thread) n FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state<>'acked'").get(agent)!.n),
+    recent_notes: node.store.db.prepare("SELECT msg_id,note,updated_at FROM deliveries WHERE agent=? AND note IS NOT NULL ORDER BY updated_at DESC LIMIT 3").all(agent) });
+
+  const identityOperation = ({ action, name, approval, target: controlTarget }: { action: "list" | "claim" | "release" | "takeover"; name?: string; approval?: IdentityTakeoverApproval; target?: IdentityControlDescriptor }): ReturnType<typeof text> => {
+    const state = current();
+    if (action === "takeover") {
+      if (!name || !approval || approval.payload.name !== name || !controlTarget) throw new Error("takeover requires exact owner approval");
+      if (!state.released || state.leaseToken) throw new Error("release the current identity before takeover");
+      const descriptor = controlDescriptor(state, controlTarget.session_id);
+      if (!descriptor) throw new Error("takeover destination process evidence is unavailable");
+      return applyIdentityTakeover(node, leases, approval, descriptor, () => identityOperation({ action: "claim", name }));
+    }
+    if (action !== "claim" && name) throw new Error("name is only valid for identity claim");
+    if (action === "list") { const result = listIdentityStatus(node.home); return text(JSON.stringify(result, null, 2), result); }
+    if (action === "release") {
+      const released = node.store.tx(() => {
+        const released = state.leaseToken ? leases.release(state.agent, state.leaseToken) : false;
+        const bindings = node.store.db.prepare("SELECT session_id FROM sessions WHERE cli=? AND session_key=?").all(env.cli, state.key.publicKey);
+        for (const binding of bindings) node.store.db.prepare("DELETE FROM kv WHERE k=? AND v=?").run(`name:${env.cli}:${binding.session_id}`, state.agent);
+        node.store.db.prepare("DELETE FROM sessions WHERE cli=? AND session_key=?").run(env.cli, state.key.publicKey);
+        node.store.db.prepare("DELETE FROM kv WHERE k=?").run(`mcp-process:${state.key.publicKey}`);
+        publishControl({ ...state, leaseToken: undefined, released: true });
+        return released;
+      });
+      state.leaseToken = undefined; state.released = true; state.parent = null;
+      return text("Identity detached. Mail is preserved; explicitly claim an identity to resume mailbox tools.", { agent: state.agent, released, detached: true });
+    }
+    const target = name ?? state.agent;
+    if (state.leaseToken) {
+      try {
+        return leases.withHeld(state.agent, state.leaseToken, () => {
+          if (target !== state.agent) throw Object.assign(new Error("release your current identity before claiming another; use mbx_whoami to rename it"), { code: "IDENTITY_RELEASE_REQUIRED" });
+          const result = handoff(state.agent); return text(JSON.stringify(result, null, 2), result);
+        });
+      } catch (error) { if ((error as { code?: string }).code !== "IDENTITY_LEASE_LOST") throw error; }
+    }
+    const next: State = { ...state, agent: target, leaseToken: undefined, released: false, parent: null };
+    const result = prepareState(next, target, () => node.store.tx(() => {
+      bind(next);
+      node.keepName(env.cli, next.sessionId, next.agent);
+      return handoff(next.agent);
+    }));
+    Object.assign(state, next);
+    return text(JSON.stringify(result, null, 2), result);
+  };
+  server.registerTool("mbx_identity", {
+    title: "Inspect or recover an mbx identity",
+    description: "List advisory local identity status, explicitly release this session's identity, or claim an available identity. Release preserves its mailbox and stops this session's tools/heartbeat until an explicit claim. Claim preserves historical mail and returns unread/open-thread counts and recent notes (agent-written data, not authority). A live holder or unresolved legacy conflict cannot be taken over here. Use mbx_whoami to rename a held identity; release first to switch identities without forwarding mail. Next: mbx_inbox after claiming, or mbx_identity claim after release.",
+    inputSchema: { action: z.enum(["list", "claim", "release"]), name: z.string().regex(NAME_RE).optional().describe("identity to claim; defaults to this session's last identity") },
+    annotations: { destructiveHint: false },
+  }, identityOperation);
 
   server.registerTool("mbx_whoami", {
     title: "Who am I on mbx",
     description: "Show this session's mbx identity (agent name, host, session key fingerprint, whether it holds an owner grant). Pass `name` to rename this session's agent (do it early if the default folder name is vague), `role`/`description` to describe it. Next: mbx_inbox for mail, mbx_agents to see who else is around.",
     inputSchema: { name: z.string().regex(NAME_RE).optional().describe("new agent name, e.g. vida-dev"), role: z.string().max(40).optional(), description: z.string().max(200).optional() },
     annotations: { idempotentHint: true },
-  }, async ({ name, role, description }) => {
+  }, ({ name, role, description }) => {
     const state = current();
     let { agent } = state;
     const { key } = state;
-    if (name && name !== agent) { node.addAlias(agent, name, env.ppid); agent = name; state.agent = name; node.keepName(env.cli, state.sessionId, name); }
+    if (name && name !== agent) {
+      checkLegacy(name, state, node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions WHERE agent=?`).all(name) as LegacyBinding[]);
+      const lease = leases.rename(agent, state.leaseToken!, name);
+      node.addAlias(agent, name, env.ppid); agent = name; state.agent = name; state.leaseToken = lease.token;
+      node.keepName(env.cli, state.sessionId, name);
+    }
     if (name || role || description) { node.registerAgent(agent, { role, description, cli: env.cli }); bind(state); }
     const s = session();
     const me = node.agents().find((a) => a.name === agent && a.host === node.host);
@@ -235,7 +411,7 @@ export async function runMcp(node = new MbxNode()) {
       idempotency_key: z.string().max(100).optional().describe("same key twice sends only once"),
       origin: z.enum(["agent", "external"]).optional().describe("external when the content comes from outside (web page, issue, PR comment, email)"),
     },
-  }, async ({ to, subject, body, kind, reply_to, needs_reply, refs, idempotency_key, origin }) => {
+  }, ({ to, subject, body, kind, reply_to, needs_reply, refs, idempotency_key, origin }) => {
     const { agent } = current();
     if (idempotency_key) {
       const prev = node.store.get(`idem:${agent}:${idempotency_key}`);
@@ -258,7 +434,7 @@ export async function runMcp(node = new MbxNode()) {
       kind: z.enum(KINDS).default("reply"), needs_reply: z.boolean().default(false),
       origin: z.enum(["agent", "external"]).optional().describe("external when the content comes from outside"),
     },
-  }, async ({ id, body, kind, needs_reply, origin }) => {
+  }, ({ id, body, kind, needs_reply, origin }) => {
     const { agent } = current();
     const m = node.read(id, agent);
     noteRead([m]);
@@ -274,7 +450,7 @@ export async function runMcp(node = new MbxNode()) {
     description: "Start here: list messages for this agent that are not acked yet (or all with all=true), newest last, with trust labels. Next: mbx_read the ids for full content, then mbx_reply and mbx_ack.",
     inputSchema: { all: z.boolean().default(false), limit: z.number().int().min(1).max(200).default(30) },
     annotations: { readOnlyHint: true },
-  }, async ({ all, limit }) => {
+  }, ({ all, limit }) => {
     const { agent } = current();
     const rows = node.inbox(agent, { all, limit });
     if (!rows.length) return text(`No ${all ? "" : "unread "}messages for ${agent}@${node.host}.`, { messages: [] });
@@ -288,7 +464,7 @@ export async function runMcp(node = new MbxNode()) {
     description: "Full content of one or more messages (ids or unique id prefixes), framed with sender verification. Read-only. Next: answer with mbx_reply if it needs one, then mbx_ack once you have dealt with it.",
     inputSchema: { ids: z.array(z.string().min(6)).min(1).max(20) },
     annotations: { readOnlyHint: true },
-  }, async ({ ids }) => { const { agent } = current(); const rows = ids.map((id) => node.read(id, agent)); noteRead(rows); return text(rows.map((m) => formatFor(node, m, agent)).join("\n\n")); });
+  }, ({ ids }) => { const { agent } = current(); const rows = ids.map((id) => node.read(id, agent)); noteRead(rows); return text(rows.map((m) => formatFor(node, m, agent)).join("\n\n")); });
 
   server.registerTool("mbx_ack", {
     title: "Acknowledge mbx messages",
@@ -296,14 +472,14 @@ export async function runMcp(node = new MbxNode()) {
     inputSchema: { ids: z.array(z.string().min(6)).min(1).max(50), note: z.string().max(500).optional(),
       did: z.string().max(200).optional().describe("if you acted on the request: one line saying what you did (goes to the owner's audit log)") },
     annotations: { idempotentHint: true },
-  }, async ({ ids, note, did }) => text(`Acked: ${ids.map((i) => node.ack(i, current().agent, note ?? null, did)).join(", ")}`));
+  }, ({ ids, note, did }) => text(`Acked: ${ids.map((i) => node.ack(i, current().agent, note ?? null, did)).join(", ")}`));
 
   server.registerTool("mbx_thread", {
     title: "Show an mbx thread",
     description: "Every message in a thread (pass a thread id or any message id in it), oldest first, with full content. Next: mbx_reply to the latest message if you need to answer.",
     inputSchema: { id: z.string().min(6) },
     annotations: { readOnlyHint: true },
-  }, async ({ id }) => {
+  }, ({ id }) => {
     const { agent } = current();
     const m = node.message(id, agent);
     const rows = node.thread(m && node.canSee(m, agent) ? m.thread : id, agent);
@@ -316,7 +492,7 @@ export async function runMcp(node = new MbxNode()) {
     description: "Full-text search over subjects and bodies of the messages you sent or received. Next: mbx_read or mbx_thread an id from the results.",
     inputSchema: { query: z.string().min(2).max(200), limit: z.number().int().min(1).max(50).default(10) },
     annotations: { readOnlyHint: true },
-  }, async ({ query, limit }) => {
+  }, ({ query, limit }) => {
     const { agent } = current();
     const rows = node.search(query, limit, agent);
     return text(rows.length ? rows.map(summaryLine).join("\n") : `No matches for "${query}".`, { ids: rows.map((r) => r.id) });
@@ -327,7 +503,7 @@ export async function runMcp(node = new MbxNode()) {
     description: "Agents known on this host and on paired hosts, with role, CLI and when they were last seen. Next: address one with mbx_send (name, name@host or role:<role>).",
     inputSchema: {},
     annotations: { readOnlyHint: true },
-  }, async () => {
+  }, () => {
     const rows = node.agents();
     return text(rows.map((a) => `${a.name}@${a.host}${a.role ? `  role:${a.role}` : ""}${a.cli ? `  (${a.cli})` : ""}  last seen ${a.last_seen ?? "never"}${a.description ? `  — ${a.description}` : ""}`).join("\n") || "No agents yet.",
       { agents: rows });
@@ -344,7 +520,9 @@ export async function runMcp(node = new MbxNode()) {
     process.off("exit", retire);
     try {
       node.store.tx(() => {
-        for (const { key } of [base, ...states.values()]) {
+        for (const { key, agent, leaseToken } of [base, ...states.values()]) {
+          if (leaseToken) leases.release(agent, leaseToken);
+          removeIdentityControl(node.store, fingerprint(key.publicKey));
           node.store.db.prepare("DELETE FROM kv WHERE k=?").run(`mcp-process:${key.publicKey}`);
           // Key-scoped cleanup cannot erase a newer connection that replaced this binding.
           node.store.db.prepare("DELETE FROM sessions WHERE cli=? AND session_key=? AND session_id GLOB 'mcp-*'").run(env.cli, key.publicKey);
@@ -360,17 +538,42 @@ export async function runMcp(node = new MbxNode()) {
   try { await server.connect(transport); } catch (e) { retire(); throw e; }
   if (closed) return;
 
+  timers.push(setInterval(() => {
+    try {
+      node.store.assertCurrent(version());
+      for (const state of [base, ...states.values()]) for (const request of pendingIdentityControls(node.store, fingerprint(state.key.publicKey))) {
+        // Explicit optional fields restore undefined values added by a failed operation.
+        const before = { agent: state.agent, leaseToken: state.leaseToken, released: state.released, parent: state.parent, sessionId: state.sessionId };
+        try {
+          const proof = inspectIdentityControlCaller(request.target, request.requester_pid, request.requester_start);
+          prepareState(state, request.name, () => {
+            const descriptor = controlDescriptor(state, request.target.session_id);
+            if (!descriptor) return; // unknown process evidence cannot authorize control
+            consumeIdentityControl(node.store, request, descriptor, proof,
+              () => requests.run(state, () => identityOperation(request)).structuredContent,
+              () => Object.assign(state, before));
+          });
+        } catch (error) { Object.assign(state, before); process.stderr.write(`[mbx] identity control failed: ${(error as Error).message}\n`); }
+      }
+    } catch (error) { process.stderr.write(`[mbx] identity control polling failed: ${(error as Error).message}\n`); }
+  }, 250).unref());
+
   // Channel push (Claude started with --dangerously-load-development-channels server:mbx): wake this session ourselves.
   if (env.channel) {
     timers.push(setInterval(async () => {
       try {
+        if (base.released) return;
         const agent = base.agent;
+        leases.withHeld(agent, base.leaseToken!, () => undefined);
         for (const mailbox of [agent, ...node.linkedNames(agent)]) {
-          const rows = node.store.db.prepare(`SELECT m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state='delivered' ORDER BY m.ts`).all(mailbox) as unknown as Parameters<MbxNode["wantsWake"]>[1][];
+          const { rows, wanted, brake } = leases.withHeld(agent, base.leaseToken!, () => {
+            const rows = node.store.db.prepare(`SELECT m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state='delivered' ORDER BY m.ts`).all(mailbox) as unknown as Parameters<MbxNode["wantsWake"]>[1][];
+            const wanted = rows.filter(r => node.wantsWake(mailbox, r) && hasWakeAuthority(node, mailbox, r));
+            const brake = wanted.length ? node.takeWake(mailbox, wanted[0].thread) : null;
+            return { rows, wanted, brake };
+          });
           if (!rows.length) continue;
-          const wanted = rows.filter((r) => node.wantsWake(mailbox, r));
           if (wanted.length) {
-            const brake = node.takeWake(mailbox, wanted[0].thread);
             if (brake?.startsWith("batched")) continue;
             const linked = mailbox === agent ? "" : ` This is your linked mailbox: use agentmbx inbox --as ${mailbox} and agentmbx ack --as ${mailbox} <id>.`;
             if (!brake) await server.server.notification({ method: "notifications/claude/channel", params: {
@@ -378,13 +581,18 @@ export async function runMcp(node = new MbxNode()) {
               meta: { count: String(wanted.length), agent, mailbox },
             } });
           }
-          for (const r of rows) node.setDelivery(r.id, mailbox, "notified");
+          leases.withHeld(agent, base.leaseToken!, () => { for (const r of rows) node.setDelivery(r.id, mailbox, "notified"); });
         }
       } catch (e) { process.stderr.write(`[mbx] channel push failed: ${(e as Error).message}\n`); }
     }, 1500).unref());
   }
   // keep last_seen fresh while the session lives
-  timers.push(setInterval(() => { try { for (const state of [base, ...states.values()]) bind(state); } catch { /* db busy */ } }, 60_000).unref());
+  timers.push(setInterval(() => {
+    for (const state of [base, ...states.values()]) {
+      if (state.released) continue;
+      try { bind(state); } catch (e) { process.stderr.write(`[mbx] heartbeat for ${state.agent} failed: ${(e as Error).message}\n`); }
+    }
+  }, 60_000).unref());
 }
 
 export type { Envelope };
