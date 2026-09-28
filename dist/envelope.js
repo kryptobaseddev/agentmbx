@@ -56,8 +56,37 @@ export function checkShape(x) {
         return "bad body";
     if (typeof e.subject !== "string")
         return "bad subject";
-    if (Number.isNaN(Date.parse(e.ts)))
+    if (typeof e.ts !== "string" || Number.isNaN(Date.parse(e.ts)))
         return "bad ts";
+    if (typeof e.thread !== "string")
+        return "bad thread";
+    if (e.reply_to !== null && typeof e.reply_to !== "string")
+        return "bad reply_to";
+    if (typeof e.needs_reply !== "boolean")
+        return "bad needs_reply";
+    if (!Array.isArray(e.refs) || e.refs.some(value => typeof value !== "string"))
+        return "bad refs";
+    if (e.enc !== null)
+        return "unsupported enc";
+    const a = e.authority;
+    if (a !== null) {
+        if (!a || typeof a !== "object" || Array.isArray(a))
+            return "bad authority";
+        if (a.owner_sig !== undefined) {
+            if (typeof a.owner_sig !== "string" || typeof a.owner_fp !== "string" || a.grant !== undefined || a.session_sig !== undefined)
+                return "bad owner authority";
+        }
+        else {
+            const g = a.grant;
+            if (!g || typeof g !== "object" || Array.isArray(g) || g.v !== 2 || typeof a.session_sig !== "string" || a.owner_fp !== undefined)
+                return "bad grant authority";
+            for (const field of ["id", "iss", "sub", "agent", "host", "iat", "exp", "nonce", "sig"])
+                if (typeof g[field] !== "string")
+                    return `bad grant.${field}`;
+            if (!Array.isArray(g.caps) || g.caps.some(value => typeof value !== "string"))
+                return "bad grant.caps";
+        }
+    }
     const m = e.meta;
     if (!m || typeof m !== "object" || Array.isArray(m))
         return "bad meta";
