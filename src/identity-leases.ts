@@ -13,6 +13,9 @@ export interface IdentityLease {
   claimed_at: number; heartbeat_at: number; idle_ttl: number; released_at: number | null; release_reason: string | null;
 }
 export type ProcessEvidence = { alive: boolean | null; start: string | null };
+type Observation = { row: IdentityLease | undefined; process: ProcessEvidence; at: number };
+const UNKNOWN_PROCESS: ProcessEvidence = { alive: null, start: null };
+const EVIDENCE_MAX_AGE_MS = 5000;
 const error = (code: string, message: string) => Object.assign(new Error(message), { code });
 
 /** Missing ps data is unknown, not evidence that a process died. */
@@ -61,12 +64,25 @@ export class IdentityLeases {
   private evidence(pid: number): ProcessEvidence {
     try { return this.inspect(pid); } catch { return { alive: null, start: null }; }
   }
-  private expire(row: IdentityLease, now: number): "live" | "unknown" | "expired" {
-    if (row.released_at !== null) return "expired";
-    const p = this.evidence(row.holder_pid);
+  private observe(name: string): Observation {
+    const row = this.row(name);
+    const process = row && row.released_at === null ? this.evidence(row.holder_pid) : UNKNOWN_PROCESS;
+    return { row, process, at: performance.now() };
+  }
+  private observedProcess(row: IdentityLease, observed: Observation): ProcessEvidence {
+    // Evidence gathered before locking cannot expire or authorize a successor generation.
+    return observed.row?.token === row.token && observed.row.holder_pid === row.holder_pid
+      && observed.row.holder_start === row.holder_start && performance.now() - observed.at <= EVIDENCE_MAX_AGE_MS ? observed.process : UNKNOWN_PROCESS;
+  }
+  private status(row: IdentityLease, now: number, p: ProcessEvidence): { state: "live" | "unknown" | "expired"; reason: string | null } {
+    if (row.released_at !== null) return { state: "expired", reason: null };
     const reason = now - row.heartbeat_at >= row.idle_ttl ? "idle"
       : p.alive === false ? "dead" : p.start && p.start !== row.holder_start ? "pid-reused" : null;
-    if (!reason) return p.alive === true && p.start === row.holder_start ? "live" : "unknown";
+    return { state: reason ? "expired" : p.alive === true && p.start === row.holder_start ? "live" : "unknown", reason };
+  }
+  private expire(row: IdentityLease, now: number, p: ProcessEvidence): "live" | "unknown" | "expired" {
+    const { state, reason } = this.status(row, now, p);
+    if (!reason) return state;
     this.store.db.prepare("UPDATE identity_leases SET released_at=?,release_reason=? WHERE name=? AND token=? AND released_at IS NULL")
       .run(now, reason, row.name, row.token);
     this.store.audit("identity.expire", { name: row.name, holder: this.holder(row), reason, at: now });
@@ -76,14 +92,22 @@ export class IdentityLeases {
     return { pid: row.holder_pid, start: row.holder_start, keyFp: row.key_fp, cli: row.cli, sessionId: row.session_id };
   }
   claim(name: string, holder: LeaseHolder): IdentityLease {
+    this.validateClaim(name, holder);
+    const prior = this.observe(name), process = this.evidence(holder.pid), at = performance.now();
+    return this.claimPrepared(name, holder, prior, process, at);
+  }
+  private validateClaim(name: string, holder: LeaseHolder) {
     if (!NAME_RE.test(name) || !Number.isSafeInteger(holder.pid) || holder.pid <= 0 || !holder.start
       || !/^[a-f0-9]{4}(?:-[a-f0-9]{4}){3}$/.test(holder.keyFp) || !holder.cli || !holder.sessionId)
       throw error("IDENTITY_LEASE_CONFIG", "claim needs a valid identity and complete process/session evidence");
+  }
+  private claimPrepared(name: string, holder: LeaseHolder, observed: Observation, process: ProcessEvidence, at: number): IdentityLease {
+    this.validateClaim(name, holder);
     return this.store.tx(() => {
-      const now = this.now(), p = this.evidence(holder.pid);
+      const now = this.now(), p = performance.now() - at <= EVIDENCE_MAX_AGE_MS ? process : UNKNOWN_PROCESS;
       if (p.alive !== true || p.start !== holder.start) throw error("IDENTITY_PROCESS_UNVERIFIED", "claimant process identity is not verified");
       const prior = this.row(name);
-      if (prior && this.expire(prior, now) !== "expired") throw error("IDENTITY_IN_USE", `identity ${name} already has a holder`);
+      if (prior && this.expire(prior, now, this.observedProcess(prior, observed)) !== "expired") throw error("IDENTITY_IN_USE", `identity ${name} already has a holder`);
       const token = randomUUID();
       this.store.db.prepare(`INSERT INTO identity_leases (name,token,holder_pid,holder_start,key_fp,cli,session_id,claimed_at,heartbeat_at,idle_ttl,released_at,release_reason)
         VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL) ON CONFLICT(name) DO UPDATE SET token=excluded.token,holder_pid=excluded.holder_pid,
@@ -96,10 +120,11 @@ export class IdentityLeases {
   }
   /** No automatic reacquisition: callers must explicitly claim after losing a lease. */
   renew(name: string, token: string): IdentityLease {
+    const observed = this.observe(name);
     const result = this.store.tx(() => {
       const row = this.row(name), now = this.now();
       if (!row || row.token !== token) return { status: "expired" as const };
-      const status = this.expire(row, now);
+      const status = this.expire(row, now, this.observedProcess(row, observed));
       if (status !== "live") return { status };
       // A backwards wall-clock step cannot shorten the recorded heartbeat.
       this.store.db.prepare("UPDATE identity_leases SET heartbeat_at=MAX(heartbeat_at,?) WHERE name=? AND token=?").run(now, name, token);
@@ -121,21 +146,32 @@ export class IdentityLeases {
   }
   /** Move ownership atomically with a fresh generation; a failed destination claim restores the source. */
   rename(name: string, token: string, nextName: string): IdentityLease {
-    return this.store.tx(() => this.withHeld(name, token, () => {
+    const source = this.observe(name), destination = name === nextName ? source : this.observe(nextName);
+    return this.withObserved(name, token, source, () => {
       const row = this.row(name)!;
       if (name === nextName) return row;
       this.release(name, token);
-      const next = this.claim(nextName, this.holder(row));
+      const next = this.claimPrepared(nextName, this.holder(row), destination, this.observedProcess(row, source), source.at);
       this.store.audit("identity.rename", { from: name, to: nextName, holder: this.holder(row) });
       return next;
-    }));
+    });
   }
   /** Hold the SQLite write lock through the operation, so a successor cannot claim halfway through it. */
   withHeld<T>(name: string, token: string, operation: () => T): T {
     if (operation.constructor.name === "AsyncFunction") throw error("IDENTITY_ASYNC_OPERATION", "lease operations must be synchronous database mutations");
-    const result = this.store.tx(() => {
+    return this.withObserved(name, token, this.observe(name), operation);
+  }
+  /** Authorize a read at one WAL snapshot; concurrent writers need not wait for its result. */
+  withHeldRead<T>(name: string, token: string, operation: () => T): T {
+    if (operation.constructor.name === "AsyncFunction") throw error("IDENTITY_ASYNC_OPERATION", "lease reads must be synchronous");
+    return this.withObserved(name, token, this.observe(name), operation, true);
+  }
+  private withObserved<T>(name: string, token: string, observed: Observation, operation: () => T, readOnly = false): T {
+    const run = () => {
       const row = this.row(name);
-      const status = row && row.token === token ? this.expire(row, this.now()) : "expired";
+      const status = row && row.token === token ? readOnly
+        ? this.status(row, this.now(), this.observedProcess(row, observed)).state
+        : this.expire(row, this.now(), this.observedProcess(row, observed)) : "expired";
       if (status !== "live") return { ok: false as const, status };
       const value = operation();
       if (value && typeof (value as { then?: unknown }).then === "function") {
@@ -144,7 +180,8 @@ export class IdentityLeases {
         throw error("IDENTITY_ASYNC_OPERATION", "lease operations cannot return a thenable");
       }
       return { ok: true as const, value };
-    });
+    };
+    const result = readOnly ? this.store.readTx(run) : this.store.tx(run);
     if (!result.ok) {
       if (result.status === "unknown") throw error("IDENTITY_STATUS_UNKNOWN", `identity ${name} process status is unknown; retry this lease token after inspection recovers`);
       throw error("IDENTITY_LEASE_LOST", `identity ${name} lease is no longer usable`);

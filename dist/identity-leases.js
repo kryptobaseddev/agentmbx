@@ -5,6 +5,8 @@ import { execFileSync } from "node:child_process";
 import { NAME_RE } from "./envelope.js";
 import { readLinuxProcess } from "./proc.js";
 export const DEFAULT_IDENTITY_IDLE_TTL_MS = 30 * 60_000;
+const UNKNOWN_PROCESS = { alive: null, start: null };
+const EVIDENCE_MAX_AGE_MS = 5000;
 const error = (code, message) => Object.assign(new Error(message), { code });
 /** Missing ps data is unknown, not evidence that a process died. */
 export function inspectLeaseProcess(pid) {
@@ -67,14 +69,27 @@ export class IdentityLeases {
             return { alive: null, start: null };
         }
     }
-    expire(row, now) {
+    observe(name) {
+        const row = this.row(name);
+        const process = row && row.released_at === null ? this.evidence(row.holder_pid) : UNKNOWN_PROCESS;
+        return { row, process, at: performance.now() };
+    }
+    observedProcess(row, observed) {
+        // Evidence gathered before locking cannot expire or authorize a successor generation.
+        return observed.row?.token === row.token && observed.row.holder_pid === row.holder_pid
+            && observed.row.holder_start === row.holder_start && performance.now() - observed.at <= EVIDENCE_MAX_AGE_MS ? observed.process : UNKNOWN_PROCESS;
+    }
+    status(row, now, p) {
         if (row.released_at !== null)
-            return "expired";
-        const p = this.evidence(row.holder_pid);
+            return { state: "expired", reason: null };
         const reason = now - row.heartbeat_at >= row.idle_ttl ? "idle"
             : p.alive === false ? "dead" : p.start && p.start !== row.holder_start ? "pid-reused" : null;
+        return { state: reason ? "expired" : p.alive === true && p.start === row.holder_start ? "live" : "unknown", reason };
+    }
+    expire(row, now, p) {
+        const { state, reason } = this.status(row, now, p);
         if (!reason)
-            return p.alive === true && p.start === row.holder_start ? "live" : "unknown";
+            return state;
         this.store.db.prepare("UPDATE identity_leases SET released_at=?,release_reason=? WHERE name=? AND token=? AND released_at IS NULL")
             .run(now, reason, row.name, row.token);
         this.store.audit("identity.expire", { name: row.name, holder: this.holder(row), reason, at: now });
@@ -84,15 +99,23 @@ export class IdentityLeases {
         return { pid: row.holder_pid, start: row.holder_start, keyFp: row.key_fp, cli: row.cli, sessionId: row.session_id };
     }
     claim(name, holder) {
+        this.validateClaim(name, holder);
+        const prior = this.observe(name), process = this.evidence(holder.pid), at = performance.now();
+        return this.claimPrepared(name, holder, prior, process, at);
+    }
+    validateClaim(name, holder) {
         if (!NAME_RE.test(name) || !Number.isSafeInteger(holder.pid) || holder.pid <= 0 || !holder.start
             || !/^[a-f0-9]{4}(?:-[a-f0-9]{4}){3}$/.test(holder.keyFp) || !holder.cli || !holder.sessionId)
             throw error("IDENTITY_LEASE_CONFIG", "claim needs a valid identity and complete process/session evidence");
+    }
+    claimPrepared(name, holder, observed, process, at) {
+        this.validateClaim(name, holder);
         return this.store.tx(() => {
-            const now = this.now(), p = this.evidence(holder.pid);
+            const now = this.now(), p = performance.now() - at <= EVIDENCE_MAX_AGE_MS ? process : UNKNOWN_PROCESS;
             if (p.alive !== true || p.start !== holder.start)
                 throw error("IDENTITY_PROCESS_UNVERIFIED", "claimant process identity is not verified");
             const prior = this.row(name);
-            if (prior && this.expire(prior, now) !== "expired")
+            if (prior && this.expire(prior, now, this.observedProcess(prior, observed)) !== "expired")
                 throw error("IDENTITY_IN_USE", `identity ${name} already has a holder`);
             const token = randomUUID();
             this.store.db.prepare(`INSERT INTO identity_leases (name,token,holder_pid,holder_start,key_fp,cli,session_id,claimed_at,heartbeat_at,idle_ttl,released_at,release_reason)
@@ -106,11 +129,12 @@ export class IdentityLeases {
     }
     /** No automatic reacquisition: callers must explicitly claim after losing a lease. */
     renew(name, token) {
+        const observed = this.observe(name);
         const result = this.store.tx(() => {
             const row = this.row(name), now = this.now();
             if (!row || row.token !== token)
                 return { status: "expired" };
-            const status = this.expire(row, now);
+            const status = this.expire(row, now, this.observedProcess(row, observed));
             if (status !== "live")
                 return { status };
             // A backwards wall-clock step cannot shorten the recorded heartbeat.
@@ -136,23 +160,35 @@ export class IdentityLeases {
     }
     /** Move ownership atomically with a fresh generation; a failed destination claim restores the source. */
     rename(name, token, nextName) {
-        return this.store.tx(() => this.withHeld(name, token, () => {
+        const source = this.observe(name), destination = name === nextName ? source : this.observe(nextName);
+        return this.withObserved(name, token, source, () => {
             const row = this.row(name);
             if (name === nextName)
                 return row;
             this.release(name, token);
-            const next = this.claim(nextName, this.holder(row));
+            const next = this.claimPrepared(nextName, this.holder(row), destination, this.observedProcess(row, source), source.at);
             this.store.audit("identity.rename", { from: name, to: nextName, holder: this.holder(row) });
             return next;
-        }));
+        });
     }
     /** Hold the SQLite write lock through the operation, so a successor cannot claim halfway through it. */
     withHeld(name, token, operation) {
         if (operation.constructor.name === "AsyncFunction")
             throw error("IDENTITY_ASYNC_OPERATION", "lease operations must be synchronous database mutations");
-        const result = this.store.tx(() => {
+        return this.withObserved(name, token, this.observe(name), operation);
+    }
+    /** Authorize a read at one WAL snapshot; concurrent writers need not wait for its result. */
+    withHeldRead(name, token, operation) {
+        if (operation.constructor.name === "AsyncFunction")
+            throw error("IDENTITY_ASYNC_OPERATION", "lease reads must be synchronous");
+        return this.withObserved(name, token, this.observe(name), operation, true);
+    }
+    withObserved(name, token, observed, operation, readOnly = false) {
+        const run = () => {
             const row = this.row(name);
-            const status = row && row.token === token ? this.expire(row, this.now()) : "expired";
+            const status = row && row.token === token ? readOnly
+                ? this.status(row, this.now(), this.observedProcess(row, observed)).state
+                : this.expire(row, this.now(), this.observedProcess(row, observed)) : "expired";
             if (status !== "live")
                 return { ok: false, status };
             const value = operation();
@@ -162,7 +198,8 @@ export class IdentityLeases {
                 throw error("IDENTITY_ASYNC_OPERATION", "lease operations cannot return a thenable");
             }
             return { ok: true, value };
-        });
+        };
+        const result = readOnly ? this.store.readTx(run) : this.store.tx(run);
         if (!result.ok) {
             if (result.status === "unknown")
                 throw error("IDENTITY_STATUS_UNKNOWN", `identity ${name} process status is unknown; retry this lease token after inspection recovers`);

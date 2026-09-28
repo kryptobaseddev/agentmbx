@@ -3,7 +3,7 @@
 // decision, so the CLI shows its normal prompt. Per-CLI mechanisms and evidence: docs/RESEARCH.md "Permission hooks per CLI".
 import { agentName } from "./mcp.ts";
 import { kimiServer } from "./kimi-web.ts";
-import type { MbxNode } from "./node.ts";
+import { LIVE_AGENT_MS, type MbxNode } from "./node.ts";
 import { fingerprint } from "./crypto.ts";
 import { IdentityLeases, type IdentityLease } from "./identity-leases.ts";
 
@@ -38,16 +38,23 @@ function resolveBinding(node: MbxNode, cli: string, sessionId: string | undefine
 /** Check the exact captured binding and generation together. This authorizes only synchronous local work. */
 function withAuthority<T>(node: MbxNode, authority: PermissionAuthority, operation: () => T): T | null {
   try {
-    return node.store.tx(() => {
-      const old = authority.binding;
+    const old = authority.binding;
+    if (!old.pid || !node.sameSession(old.pid, old, { proof: true })) return null;
+    const observedAt = performance.now();
+    const checked = () => {
       const row = node.store.db.prepare("SELECT * FROM sessions WHERE cli=? AND session_id=?").get(old.cli, old.session_id) as PermissionBinding | undefined;
-      if (!row || !row.pid || !node.sameSession(row.pid, row, { proof: true })
+      if (!row || !row.pid || performance.now() - observedAt > 5000
+        || !Number.isFinite(Date.parse(row.updated_at)) || Date.now() - Date.parse(row.updated_at) > LIVE_AGENT_MS
         || ["agent", "pid", "pid_start", "session_key", "cwd"].some(k => row[k as keyof PermissionBinding] !== old[k as keyof PermissionBinding])) return null;
       const lease = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(row.agent) as IdentityLease | undefined;
       if (authority.leaseToken === null) return lease ? null : operation(); // legacy evidence cannot acquire a new lease implicitly
       if (!lease || lease.token !== authority.leaseToken || lease.cli !== row.cli || !row.session_key || fingerprint(row.session_key) !== lease.key_fp) return null;
-      return new IdentityLeases(node.store).withHeld(row.agent, authority.leaseToken, operation);
-    });
+      return operation();
+    };
+    // Let the lease guard gather process evidence before opening the transaction. Session and
+    // policy checks still execute under that same guard, without a nested process inspection.
+    return authority.leaseToken === null ? node.store.tx(checked)
+      : new IdentityLeases(node.store).withHeld(old.agent, authority.leaseToken, checked);
   } catch { return null; }
 }
 

@@ -83,6 +83,51 @@ test("lease configuration and claimant process evidence are validated", (t) => {
   assert.throws(() => leases.claim("worker", { ...a, keyFp: "missing" }), { code: "IDENTITY_LEASE_CONFIG" });
 });
 
+test("lease process inspection precedes the write transaction while guarded mutations remain locked", t => {
+  const { node, a } = fixture(t), locked: boolean[] = [];
+  const leases = new IdentityLeases(node.store, { clock: () => 1000, inspect: () => {
+    locked.push(node.store.db.isTransaction); return { alive: true, start: a.start };
+  } });
+  const lease = leases.claim("worker", a);
+  leases.renew("worker", lease.token);
+  leases.withHeld("worker", lease.token, () => { assert.equal(node.store.db.isTransaction, true); node.store.set("guarded", "yes"); });
+  leases.rename("worker", lease.token, "renamed");
+  assert.ok(locked.length >= 3); assert.ok(locked.every(value => !value), "process inspection must not monopolize the SQLite write lock");
+});
+
+test("pre-lock evidence about a dead predecessor cannot expire a new generation", t => {
+  const { node, leases, processes, a, b } = fixture(t);
+  leases.claim("worker", a);
+  const c = { ...a, pid: 30, start: "birth-c", keyFp: "cccc-cccc-cccc-cccc", sessionId: "c" };
+  processes.set(c.pid, { alive: true, start: c.start });
+  let replacement: string | undefined, armed = true;
+  const contender = new IdentityLeases(node.store, { clock: () => 1000, idleTtlMs: 100, inspect: pid => {
+    if (pid === a.pid && armed) {
+      armed = false; processes.set(a.pid, { alive: false, start: null });
+      replacement = leases.claim("worker", b).token;
+      return { alive: false, start: null };
+    }
+    return processes.get(pid) ?? { alive: null, start: null };
+  } });
+  assert.throws(() => contender.claim("worker", c), { code: "IDENTITY_IN_USE" });
+  assert.ok(replacement);
+  assert.equal(node.store.db.prepare("SELECT token FROM identity_leases WHERE name='worker'").get()!.token, replacement);
+});
+
+test("lease read snapshots reject writes without blocking a concurrent connection", t => {
+  const { home, node, leases, a } = fixture(t), lease = leases.claim("worker", a), writer = new Store(home);
+  try {
+    leases.withHeldRead("worker", lease.token, () => {
+      assert.throws(() => node.store.set("forbidden", "write"), /readonly/i);
+      writer.set("concurrent", "committed");
+      assert.equal(node.store.get("concurrent"), undefined, "reader retains its authorized snapshot");
+    });
+    assert.equal(node.store.get("concurrent"), "committed");
+    leases.withHeld("worker", lease.token, () => node.store.set("after-read", "write"));
+    assert.equal(node.store.get("after-read"), "write", "query_only is restored after a read snapshot");
+  } finally { writer.close(); }
+});
+
 test("SQLite whole-transaction abort preserves its error and fences retained statements until unwind", (t) => {
   const { node, leases, a } = fixture(t), store = node.store;
   const lease = leases.claim("worker", a), connection = store.db;

@@ -20,6 +20,17 @@ function fixture(t: TestContext, cli: string, sessionId = "s1") {
   return { node, leases, lease, holder, input };
 }
 
+test("permission process checks run before the approval transaction locks SQLite", t => {
+  const { node, input } = fixture(t, "claude"), checks: boolean[] = [];
+  const sameSession = node.sameSession.bind(node), kill = process.kill;
+  node.sameSession = (...args) => { checks.push(node.store.db.isTransaction); return sameSession(...args); };
+  process.kill = ((...args: Parameters<typeof process.kill>) => { checks.push(node.store.db.isTransaction); return kill(...args); }) as typeof process.kill;
+  try {
+    const result = decidePermission(input, "claude", () => { assert.equal(node.store.db.isTransaction, true); return yes(); }, { node, pid: process.pid });
+    assert.equal(result.allow, true); assert.ok(checks.length > 0); assert.ok(checks.every(locked => !locked));
+  } finally { process.kill = kill; node.sameSession = sameSession; }
+});
+
 for (const cli of ["claude", "codex", "kimi"]) test(`${cli} permission decision requires the live lease and matching session key`, t => {
   const { node, leases, lease, holder, input } = fixture(t, cli);
   const decide = () => decidePermission(input, cli, yes, { node, pid: process.pid });

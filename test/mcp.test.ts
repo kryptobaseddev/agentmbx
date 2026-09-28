@@ -207,7 +207,9 @@ test("channel mode notifies linked shell mailboxes without touching independentl
     n.bindSession({ agent: "separate", cli: "kimi", session_id: "separate-thread", pid: process.pid });
     const id = n.send({ from: "sender", to: ["shell-alias"], subject: "PRIVATE SUBJECT", body: "SECRET BODY", kind: "request" }).envelope.id;
     const separate = n.send({ from: "sender", to: ["separate"], subject: "other", body: "other", kind: "request" }).envelope.id;
-    for (let i = 0; i < 25 && !notes.length; i++) await new Promise((r) => setTimeout(r, 100));
+    // Notification receipt can precede the sender's post-send delivery commit. Observe both
+    // milestones within the original deadline instead of assuming cross-process event order.
+    for (let i = 0; i < 25 && (!notes.length || n.inbox("shell-alias")[0]?.state !== "notified"); i++) await new Promise((r) => setTimeout(r, 100));
     assert.equal(notes.length, 1);
     const note = notes[0] as { content: string; meta: { agent: string; mailbox: string } };
     assert.match(note.content, /shell-alias/);

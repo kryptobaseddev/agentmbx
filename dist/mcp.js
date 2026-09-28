@@ -279,7 +279,12 @@ export async function runMcp(node = new MbxNode()) {
             node.store.assertCurrent(version());
             const state = contextFor(a[1]), before = { agent: state.agent, leaseToken: state.leaseToken };
             try {
-                return requests.run(state, () => leases.withHeld(state.agent, state.leaseToken, () => cb(...a)));
+                // These handlers only query SQLite. mbx_read advances delivery state despite its
+                // readOnlyHint, and whoami can rename, so neither belongs in this snapshot set.
+                const readOnly = ["mbx_inbox", "mbx_thread", "mbx_search", "mbx_agents"].includes(name);
+                return requests.run(state, () => readOnly
+                    ? leases.withHeldRead(state.agent, state.leaseToken, () => cb(...a))
+                    : leases.withHeld(state.agent, state.leaseToken, () => cb(...a)));
             }
             catch (e) {
                 Object.assign(state, before);

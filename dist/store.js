@@ -139,25 +139,43 @@ export class Store {
             throw Object.assign(new Error(`this mbx server${running ? ` (agentmbx ${running})` : ""} is older than the mailbox store (schema ${v} > ${SCHEMA_VERSION}); a newer agentmbx upgraded it. Update AgentMBX if necessary. Restart your CLI session to load the current mbx tools.`), { code: "STALE_SERVER" });
     }
     tx(fn) {
+        return this.transaction(fn, false);
+    }
+    /** A consistent WAL read snapshot that does not reserve the database's writer slot. */
+    readTx(fn) {
+        return this.transaction(fn, true);
+    }
+    transaction(fn, readOnly) {
         if (this.#transactionContext.getStore()?.active === false)
             throw new Error("SQLite transaction context is closed; asynchronous continuations cannot start another transaction");
+        if (this.txFailure)
+            throw this.txFailure.error;
         const context = { active: true };
         return this.#transactionContext.run(context, () => {
+            const wasReadOnly = readOnly && this.#rawDb.prepare("PRAGMA query_only").get().query_only === 1;
+            if (readOnly)
+                this.#rawDb.exec("PRAGMA query_only=ON");
             try {
-                return this.runTransaction(fn);
+                return this.runTransaction(fn, readOnly);
             }
             finally {
-                context.active = false;
+                try {
+                    if (readOnly && !wasReadOnly)
+                        this.#rawDb.exec("PRAGMA query_only=OFF");
+                }
+                finally {
+                    context.active = false;
+                }
             }
         });
     }
-    runTransaction(fn) {
+    runTransaction(fn, readOnly) {
         if (this.txFailure)
             throw this.txFailure.error;
         if (fn.constructor.name === "AsyncFunction")
             throw new Error("Store.tx requires a synchronous callback");
         const depth = this.txDepth, savepoint = `mbx_tx_${depth}`;
-        this.db.exec(depth ? `SAVEPOINT ${savepoint}` : "BEGIN IMMEDIATE");
+        this.db.exec(depth ? `SAVEPOINT ${savepoint}` : readOnly ? "BEGIN" : "BEGIN IMMEDIATE");
         this.txDepth++;
         try {
             const r = fn();
