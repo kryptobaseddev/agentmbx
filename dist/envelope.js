@@ -161,7 +161,14 @@ export function checkAuthority(e, ownerPub, revoked, now = new Date()) {
     const sessionPub = a.grant.sub.slice(8);
     if (!verifyData(sessionPub, sessionPayload(e), a.session_sig))
         return { ok: false, reason: "not sent by the granted session (session signature invalid)" };
-    if (Date.parse(a.grant.exp) <= now.getTime())
+    const issued = typeof a.grant.iat === "string" ? Date.parse(a.grant.iat) : NaN;
+    const expires = typeof a.grant.exp === "string" ? Date.parse(a.grant.exp) : NaN;
+    const at = now.getTime();
+    if (!Number.isFinite(issued) || !Number.isFinite(expires) || !Number.isFinite(at))
+        return { ok: false, reason: "grant validity timestamps are invalid" };
+    if (expires <= issued || expires - issued > MAX_GRANT_HOURS * 3_600_000)
+        return { ok: false, reason: "grant lifetime is outside the allowed interval" };
+    if (expires <= at)
         return { ok: false, reason: "grant expired" };
     if (revoked.has(a.grant.id))
         return { ok: false, reason: "grant revoked" };
