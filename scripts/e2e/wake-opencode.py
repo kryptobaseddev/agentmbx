@@ -36,13 +36,16 @@ t0 = time.time(); ok = False
 seen = set()
 while time.time() - t0 < 180:
     if replied(): ok = True; break
-    try:   # a user would be asked here; approve only requests that are about the mbx tools, and log every one
+    try:   # Observe permission requests; only the owner may answer them in the provider UI.
         reqs = api("GET", f"/api/session/{sid}/permission"); reqs = reqs.get("data", reqs) if isinstance(reqs, dict) else reqs
-        for r in reqs or []:
-            if r["id"] in seen: continue
-            seen.add(r["id"]); blob = json.dumps(r)
-            print("permission request:", r.get("action"), r.get("resources"), blob[:300], flush=True)
-            if "mbx" in blob: api("POST", f"/api/session/{sid}/permission/{r['id']}/reply", {"reply": "once"}); print("  -> approved once (mbx)", flush=True)
+        if reqs:
+            result = {"outcome": "awaiting_owner_approval", "session_id": sid, "mbx_home": home,
+                      "work": work, "message_id": mid, "permissions": [{"id": r.get("id"), "action": r.get("action")} for r in reqs]}
+            result_path = os.path.join(work, "wake-result.json")
+            with open(result_path, "w") as f: json.dump(result, f, indent=2)
+            print(json.dumps(result), flush=True)
+            print("Session retained for inspection and explicit owner action in OpenCode; result:", result_path, flush=True)
+            sys.exit(3)
     except Exception as ex: print("perm poll error", ex, flush=True)
     time.sleep(3); print(f"  waiting {time.time()-t0:.0f}s", flush=True)
 print("REPLY RECEIVED" if ok else "NO REPLY", f"after {time.time()-t0:.0f}s")
@@ -52,6 +55,5 @@ try:
     msgs = api("GET", f"/api/session/{sid}/message")
     print("session transcript (tail):", json.dumps(msgs)[-1500:])
 except Exception as ex: print("transcript error", ex)
-try: api("DELETE", f"/api/session/{sid}")
-except Exception: pass
+print("Session retained for inspection:", sid, "work:", work, flush=True)
 sys.exit(0 if ok else 1)
