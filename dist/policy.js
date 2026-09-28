@@ -20,6 +20,14 @@ export function parseTtl(s) {
 export function makePolicy(o) {
     if (!LEVELS.includes(o.level))
         throw new Error(`unknown level "${o.level}" (use ${LEVELS.join(", ")})`);
+    for (const xs of [o.agents, o.hosts, o.from ?? ["local"], o.fromAgents ?? ["*"]]) {
+        if (!selectors(xs))
+            throw new Error("bad scope");
+    }
+    if (o.projects !== undefined && !selectors(o.projects, true))
+        throw new Error("bad projects");
+    if (o.classes !== undefined && !Array.isArray(o.classes))
+        throw new Error("bad classes");
     const classes = [...new Set(o.classes ?? LEVEL_CLASSES[o.level])].sort((a, b) => CLASSES.indexOf(a) - CLASSES.indexOf(b));
     const bad = classes.filter((c) => !CLASSES.includes(c));
     if (bad.length)
@@ -58,15 +66,21 @@ export function policySummary(r) {
         + `${r.projects?.length ? ` within ${r.projects.join(", ")}` : ""} for ${dur(Date.parse(r.exp) - Date.parse(r.iat))}`;
 }
 export const verifySigned = (s, ownerPub) => s.rec.owner_fp === fingerprint(ownerPub) && verifyData(ownerPub, canonical(s.rec), s.sig);
+const selectors = (xs, empty = false) => Array.isArray(xs)
+    && (empty || xs.length > 0) && xs.every(x => typeof x === "string" && x.trim().length > 0);
 function checkRecord(r) {
-    if (r?.v !== 1 || r.type !== "policy" || typeof r.id !== "string")
+    if (r?.v !== 1 || r.type !== "policy" || typeof r.id !== "string" || !r.id.trim() || typeof r.owner_fp !== "string" || !r.owner_fp.trim())
         return "not a policy";
     if (!LEVELS.includes(r.level) || !Array.isArray(r.classes) || r.classes.some((c) => !CLASSES.includes(c)))
         return "bad level or classes";
     if (r.classes.includes("permissions") && r.level !== "yolo")
         return "permissions class outside yolo";
-    if (!r.to?.agents?.length || !r.to?.hosts?.length || !r.from?.hosts?.length || !r.from?.agents?.length)
+    if (![r.to?.agents, r.to?.hosts, r.from?.hosts, r.from?.agents].every(xs => selectors(xs)))
         return "bad scope";
+    if (r.projects !== undefined && !selectors(r.projects, true))
+        return "bad projects";
+    if (typeof r.iat !== "string" || typeof r.exp !== "string")
+        return "bad lifetime";
     const iat = Date.parse(r.iat), exp = Date.parse(r.exp);
     if (Number.isNaN(iat) || Number.isNaN(exp) || exp - iat > TTL.max[r.level] || exp <= iat)
         return "bad lifetime";
@@ -153,12 +167,36 @@ function acceptDevice(db, s, host, o) {
 /** The issuing machine's local step: keep every record the owner signs, also those for other hosts (served to their pulls). */
 export const issueSigned = (db, s, host) => acceptSigned(db, s, host, { issuer: true });
 const matches = (xs, x) => xs.includes("*") || xs.includes(x);
+/** Validate retained evidence without changing it. Expired records remain available for explicit renewal. */
+export function storedPolicies(db) {
+    const keys = db.prepare("SELECT pub, role FROM principals").all();
+    const valid = [];
+    const invalid = [];
+    for (const row of db.prepare("SELECT id, record, sig, owner_fp, iat, exp, revoked FROM policies ORDER BY iat").all()) {
+        try {
+            const rec = JSON.parse(row.record);
+            const bad = checkRecord(rec);
+            if (bad)
+                throw new Error(bad);
+            if (row.id !== rec.id || row.owner_fp !== rec.owner_fp || row.iat !== rec.iat || row.exp !== rec.exp)
+                throw new Error("stored metadata differs from signed policy");
+            const key = keys.find(k => fingerprint(k.pub) === rec.owner_fp);
+            if (!key || !verifySigned({ rec, sig: row.sig }, key.pub))
+                throw new Error("invalid or unknown owner signature");
+            valid.push({ rec, sig: row.sig, revoked: !!row.revoked, currentOwner: key.role === "owner" });
+        }
+        catch (e) {
+            invalid.push({ id: row.id, reason: e instanceof Error ? e.message : "invalid policy record" });
+        }
+    }
+    return { valid, invalid };
+}
 /** Unrevoked, unexpired policies from a current owner key that cover `agent` on `host`. */
 export function activePolicies(db, agent, host, now = new Date()) {
-    const owners = new Set(ownerKeys(db).map(fingerprint));
-    return db.prepare("SELECT id, record, sig, exp FROM policies WHERE revoked=0 AND exp > ? ORDER BY iat").all(now.toISOString())
-        .map((r) => ({ ...JSON.parse(r.record), sig: r.sig }))
-        .filter((p) => owners.has(p.owner_fp) && matches(p.to.agents, agent) && matches(p.to.hosts, host));
+    return storedPolicies(db).valid
+        .filter(p => p.currentOwner && !p.revoked && Date.parse(p.rec.exp) > now.getTime()
+        && matches(p.rec.to.agents, agent) && matches(p.rec.to.hosts, host))
+        .map(p => ({ ...p.rec, sig: p.sig }));
 }
 const ORDER = (l) => LEVELS.indexOf(l);
 /** What the receiving agent may do for this message's sender. Downgrades apply even under yolo. */
@@ -270,14 +308,15 @@ export function delegationNote(db, agent, host) {
 }
 /** Active policies on this host that expire within `withinMs` and haven't been reminded about yet (marks them). */
 export function dueReminders(db, withinMs = 48 * H, now = new Date()) {
-    const soon = new Date(now.getTime() + withinMs).toISOString();
-    const rows = db.prepare("SELECT id, record FROM policies WHERE revoked=0 AND exp > ? AND exp <= ?").all(now.toISOString(), soon);
+    const soon = now.getTime() + withinMs;
+    const rows = storedPolicies(db).valid.filter(p => p.currentOwner && !p.revoked
+        && Date.parse(p.rec.exp) > now.getTime() && Date.parse(p.rec.exp) <= soon).map(p => p.rec);
     const out = [];
     for (const r of rows) {
         if (db.prepare("SELECT 1 FROM kv WHERE k=?").get(`reminded:${r.id}`))
             continue;
         db.prepare("INSERT INTO kv (k,v) VALUES (?,?) ON CONFLICT(k) DO NOTHING").run(`reminded:${r.id}`, now.toISOString());
-        out.push(JSON.parse(r.record));
+        out.push(r);
     }
     return out;
 }

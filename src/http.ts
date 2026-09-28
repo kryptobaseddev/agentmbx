@@ -8,7 +8,7 @@ import {
 import { NAME_RE, type Envelope } from "./envelope.ts";
 import { MbxNode, RETRY_HOURS } from "./node.ts";
 import { notifyDesktop } from "./wake.ts";
-import { acceptSigned, type AnyRecord, type Signed } from "./policy.ts";
+import { storedPolicies, acceptSigned, type AnyRecord, type Signed } from "./policy.ts";
 
 export const HOP_SKEW_MS = 5 * 60_000;
 const MAX_REQ = 4 * 1024 * 1024;
@@ -261,8 +261,8 @@ export function signedRecords(node: MbxNode): Signed<AnyRecord>[] {
   const db = node.store.db, now = new Date().toISOString(), since = new Date(Date.now() - 30 * 86_400_000).toISOString();
   const rs = db.prepare("SELECT record, sig FROM policy_revocations WHERE iat > ?").all(since) as { record: string; sig: string }[];
   const ds = db.prepare("SELECT record, sig FROM devices").all() as { record: string; sig: string }[];
-  const ps = db.prepare("SELECT record, sig FROM policies WHERE exp > ?").all(now) as { record: string; sig: string }[];
-  return [...rs, ...ds, ...ps].map((r) => ({ rec: JSON.parse(r.record) as AnyRecord, sig: r.sig })).sort((a, b) => (recordKey(a) < recordKey(b) ? -1 : 1));
+  const ps = storedPolicies(db).valid.filter(p => Date.parse(p.rec.exp) > Date.parse(now)).map(({ rec, sig }) => ({ rec, sig }));
+  return [...[...rs, ...ds].map((r) => ({ rec: JSON.parse(r.record) as AnyRecord, sig: r.sig })), ...ps].sort((a, b) => (recordKey(a) < recordKey(b) ? -1 : 1));
 }
 
 /** Send signed records to the paired hosts they concern. Returns per-host results; offline hosts get them on their next pull. */
