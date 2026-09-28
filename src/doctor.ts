@@ -3,6 +3,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fingerprint } from "./crypto.ts";
 import { signHop } from "./http.ts";
+import { kimiInstances } from "./kimi-web.ts";
+import { version } from "./version.ts";
 import { MbxNode } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
 import { detect, edits, skillStatus, wired, type SetupCtx } from "./setup.ts";
@@ -19,6 +21,46 @@ export async function daemonAnswers(port: number, timeoutMs = 1500): Promise<boo
   try { await fetch(`http://127.0.0.1:${port}/v1/agents`, { signal: AbortSignal.timeout(timeoutMs) }); return true; } catch { return false; }
 }
 
+export interface DaemonReadiness extends Check { state: "matching" | "unverified" | "unreachable" }
+
+/** Diagnostic identity comparison, not authentication or proof of message receipt. No pairing side effects. */
+export async function daemonReadiness(node: MbxNode, timeoutMs = 1500): Promise<DaemonReadiness> {
+  const address = `127.0.0.1:${node.config.port}`;
+  const unknown = (reason: string): DaemonReadiness => ({ state: "unverified", level: "warn", label: `daemon identity unverified on ${address}: ${reason}`,
+    fix: "check the process listening on this port; an older AgentMBX daemon may need restarting after update" });
+  let response: Response;
+  try { response = await fetch(`http://${address}/v1/status`, { redirect: "manual", signal: AbortSignal.timeout(timeoutMs) }); }
+  catch (error) {
+    // Only a refused connection establishes an absent listener. Timeout/reset/abort is uncertain.
+    const refused = (error as { cause?: { code?: string } }).cause?.code === "ECONNREFUSED";
+    return { state: refused ? "unreachable" : "unverified", level: "fail", label: `daemon not answering on ${address}`,
+      fix: refused ? `agentmbx daemon install   (log: ${join(node.home, "daemon.log")})` : "check the process listening on this port before installing or restarting the daemon" };
+  }
+  if (response.status !== 200) { await response.body?.cancel(); return unknown(`HTTP ${response.status} (unsupported status endpoint or another service)`); }
+  try {
+    const reader = response.body?.getReader();
+    if (!reader) return unknown("empty response");
+    let size = 0; const parts: Uint8Array[] = [];
+    try {
+      for (;;) {
+        const { done, value } = await reader.read(); if (done) break;
+        size += value.byteLength;
+        if (size > 8192) return unknown("response exceeds 8192 bytes");
+        parts.push(value);
+      }
+    } finally { await reader.cancel(); }
+    const r = JSON.parse(Buffer.concat(parts).toString("utf8"));
+    if (r?.service !== "agentmbx" || r.v !== 1 || typeof r.host !== "string" || typeof r.host_pubkey !== "string"
+      || typeof r.version !== "string" || r.version.length > 64 || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(r.version)
+      || typeof r.started_at !== "string" || !Number.isFinite(Date.parse(r.started_at)) || new Date(r.started_at).toISOString() !== r.started_at)
+      return unknown("malformed AgentMBX status");
+    if (r.host !== node.host || r.host_pubkey !== node.key.publicKey) return unknown("reported host or key differs from this mailbox");
+    if (r.version !== version()) return { state: "unverified", level: "warn", label: `daemon reports expected host ${r.host} on ${address}, but version ${r.version} differs from CLI ${version()}`,
+      fix: "restart the daemon after updating; existing MCP sessions may also need restarting" };
+    return { state: "matching", level: "ok", label: `daemon reports expected host ${r.host} on ${address} (version ${r.version}, started ${r.started_at}); receipt not tested` };
+  } catch { return unknown("malformed, interrupted, or timed-out status response"); }
+}
+
 /** Binding evidence is separate from configuration and never proves end-to-end delivery. */
 export function sessionReadiness(node: MbxNode, cli: string): Check {
   const rows = node.store.db.prepare("SELECT pid,pid_start,updated_at,session_id,channel FROM sessions WHERE cli=?").all(cli) as
@@ -31,6 +73,12 @@ export function sessionReadiness(node: MbxNode, cli: string): Check {
   const channels = live.filter((s) => s.channel).length;
   const stale = rows.length - live.length;
   const onlyProvisional = !real && !channels;
+  const hostedPids = cli === "kimi" ? new Set(kimiInstances().map(instance => instance?.pid)) : new Set<number>();
+  const hostedProvisional = live.filter(s => s.session_id.startsWith("mcp-") && hostedPids.has(s.pid!)).length;
+  if (hostedProvisional) return { level: "warn",
+    label: `${cli}: ${hostedProvisional} hosted binding(s) still need explicit session identity; ${real} real session ID(s); receipt not tested`,
+    fix: "use a provider integration that supplies explicit per-session MCP identity; a shared-server hook cannot infer the session from its directory" };
+
   return { level: onlyProvisional ? "warn" : "info",
     label: `${cli}: ${live.length} verified live mailbox binding(s), ${real} real session ID(s), ${channels} channel binding(s)`
       + (stale ? `, ${stale} stale or unverified` : "") + "; receipt not tested",
@@ -49,8 +97,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
   else {
     node = new MbxNode(mbxHome);
     add("ok", `host ${node.host} initialized (key ${fingerprint(node.key.publicKey)})`);
-    if (await daemonAnswers(node.config.port)) add("ok", `daemon answers on 127.0.0.1:${node.config.port}`);
-    else add("fail", `daemon not answering on 127.0.0.1:${node.config.port}`, "agentmbx daemon install   (log: " + join(mbxHome, "daemon.log") + ")");
+    out.push(await daemonReadiness(node));
   }
 
   for (const d of detect(ctx)) {

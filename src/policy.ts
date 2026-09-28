@@ -4,7 +4,7 @@ import { realpathSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { canonical, fingerprint, ulid, verifyData } from "./crypto.ts";
-import { verifyEnvelope, type Envelope } from "./envelope.ts";
+import { checkShape, verifyEnvelope, type Envelope } from "./envelope.ts";
 
 export const CLASSES = ["read", "edit", "outward", "permissions"] as const;
 export type PolicyClass = (typeof CLASSES)[number];
@@ -37,6 +37,11 @@ export function parseTtl(s: string): number {
 export function makePolicy(o: { level: Level; classes?: PolicyClass[]; agents: string[]; hosts: string[]; from?: string[]; fromAgents?: string[];
   projects?: string[]; ttlMs?: number; ownerPub: string; now?: Date }): PolicyRecord {
   if (!LEVELS.includes(o.level)) throw new Error(`unknown level "${o.level}" (use ${LEVELS.join(", ")})`);
+  for (const xs of [o.agents, o.hosts, o.from ?? ["local"], o.fromAgents ?? ["*"]]) {
+    if (!selectors(xs)) throw new Error("bad scope");
+  }
+  if (o.projects !== undefined && !selectors(o.projects, true)) throw new Error("bad projects");
+  if (o.classes !== undefined && !Array.isArray(o.classes)) throw new Error("bad classes");
   const classes = [...new Set(o.classes ?? LEVEL_CLASSES[o.level])].sort((a, b) => CLASSES.indexOf(a) - CLASSES.indexOf(b));
   const bad = classes.filter((c) => !CLASSES.includes(c));
   if (bad.length) throw new Error(`unknown classes: ${bad.join(", ")} (known: ${CLASSES.join(", ")})`);
@@ -76,11 +81,16 @@ export function policySummary(r: AnyRecord): string {
 export const verifySigned = (s: Signed<AnyRecord>, ownerPub: string) =>
   s.rec.owner_fp === fingerprint(ownerPub) && verifyData(ownerPub, canonical(s.rec), s.sig);
 
+const selectors = (xs: unknown, empty = false): xs is string[] => Array.isArray(xs)
+  && (empty || xs.length > 0) && xs.every(x => typeof x === "string" && x.trim().length > 0);
+
 function checkRecord(r: PolicyRecord): string | null {
-  if (r?.v !== 1 || r.type !== "policy" || typeof r.id !== "string") return "not a policy";
+  if (r?.v !== 1 || r.type !== "policy" || typeof r.id !== "string" || !r.id.trim() || typeof r.owner_fp !== "string" || !r.owner_fp.trim()) return "not a policy";
   if (!LEVELS.includes(r.level) || !Array.isArray(r.classes) || r.classes.some((c) => !CLASSES.includes(c))) return "bad level or classes";
   if (r.classes.includes("permissions") && r.level !== "yolo") return "permissions class outside yolo";
-  if (!r.to?.agents?.length || !r.to?.hosts?.length || !r.from?.hosts?.length || !r.from?.agents?.length) return "bad scope";
+  if (![r.to?.agents, r.to?.hosts, r.from?.hosts, r.from?.agents].every(xs => selectors(xs))) return "bad scope";
+  if (r.projects !== undefined && !selectors(r.projects, true)) return "bad projects";
+  if (typeof r.iat !== "string" || typeof r.exp !== "string") return "bad lifetime";
   const iat = Date.parse(r.iat), exp = Date.parse(r.exp);
   if (Number.isNaN(iat) || Number.isNaN(exp) || exp - iat > TTL.max[r.level] || exp <= iat) return "bad lifetime";
   return null;
@@ -89,6 +99,26 @@ function checkRecord(r: PolicyRecord): string | null {
 /** Owner keys this host takes policies from: its own owner key, or the one it adopted when pairing. */
 export function ownerKeys(db: DatabaseSync): string[] {
   return (db.prepare("SELECT pub FROM principals WHERE role='owner'").all() as { pub: string }[]).map((r) => r.pub);
+}
+
+function validRevocation(r: Revocation): boolean {
+  return r?.type === "revocation" && r.v === 1 && typeof r.id === "string" && !!r.id.trim()
+    && typeof r.target === "string" && !!r.target.trim() && typeof r.owner_fp === "string"
+    && typeof r.iat === "string" && Number.isFinite(Date.parse(r.iat))
+    && (r.all === undefined || (r.all === true && r.target === "*"));
+}
+
+/** Keep policy insertion and revocation effects atomic, including inside a caller's transaction. */
+function policyWrite<T>(db: DatabaseSync, write: () => T): T {
+  db.exec("SAVEPOINT mbx_policy_write");
+  try {
+    const result = write();
+    db.exec("RELEASE mbx_policy_write");
+    return result;
+  } catch (error) {
+    db.exec("ROLLBACK TO mbx_policy_write; RELEASE mbx_policy_write");
+    throw error;
+  }
 }
 
 /**
@@ -106,13 +136,21 @@ export function acceptSigned(db: DatabaseSync, s: Signed<AnyRecord>, host: strin
     const key = (db.prepare("SELECT pub FROM principals").all() as { pub: string }[]).map((x) => x.pub).find((k) => fingerprint(k) === r.owner_fp);
     if (!key) return "not signed by an owner key this host knows";
     if (!verifySigned(s, key)) return "bad owner signature";
-    if (db.prepare("SELECT 1 FROM policy_revocations WHERE id=?").get(r.id)) return null; // already applied
-    const n = r.target === "*"
-      ? db.prepare("UPDATE policies SET revoked=1 WHERE revoked=0 AND owner_fp=? AND iat <= ?").run(r.owner_fp, r.iat).changes
-      : db.prepare("UPDATE policies SET revoked=1 WHERE id=? AND owner_fp=?").run(r.target, r.owner_fp).changes;
-    db.prepare("INSERT OR IGNORE INTO policy_revocations (id,target,iat,record,sig,received_at,owner_fp) VALUES (?,?,?,?,?,?,?)").run(r.id, r.target, r.iat, JSON.stringify(r), s.sig, now, r.owner_fp);
-    db.prepare("INSERT INTO audit (at,event,detail) VALUES (?,?,?)").run(now, "policy.revoked", JSON.stringify({ target: r.target, owner: r.owner_fp, count: n }));
-    return null;
+    if (!validRevocation(r)) return "bad revocation";
+    return policyWrite(db, () => {
+      if (db.prepare("SELECT 1 FROM policy_revocations WHERE id=?").get(r.id)) return null; // already applied
+      const targets = r.target === "*"
+        ? (db.prepare("SELECT id,iat FROM policies WHERE revoked=0 AND owner_fp=?").all(r.owner_fp) as { id: string; iat: string }[])
+          .filter(p => Date.parse(p.iat) <= Date.parse(r.iat)).map(p => p.id)
+        : [r.target];
+      const update = db.prepare("UPDATE policies SET revoked=1 WHERE id=? AND owner_fp=?");
+      let n = 0;
+      for (const id of targets) n += Number(update.run(id, r.owner_fp).changes);
+      db.prepare("INSERT OR IGNORE INTO policy_revocations (id,target,iat,record,sig,received_at,owner_fp) VALUES (?,?,?,?,?,?,?)")
+        .run(r.id, r.target, r.iat, JSON.stringify(r), s.sig, now, r.owner_fp);
+      db.prepare("INSERT INTO audit (at,event,detail) VALUES (?,?,?)").run(now, "policy.revoked", JSON.stringify({ target: r.target, owner: r.owner_fp, count: n }));
+      return null;
+    });
   }
   const key = ownerKeys(db).find((k) => fingerprint(k) === s?.rec?.owner_fp);
   if (!key) return "not signed by this host's owner";
@@ -120,11 +158,15 @@ export function acceptSigned(db: DatabaseSync, s: Signed<AnyRecord>, host: strin
   const r = s.rec, bad = checkRecord(r);
   if (bad) return bad;
   if (!o.issuer && !r.to.hosts.includes("*") && !r.to.hosts.includes(host)) return `policy is for ${r.to.hosts.join(", ")}, not ${host}`;
-  // a policy issued before a kill switch it hasn't seen stays revoked
-  const killed = db.prepare("SELECT 1 FROM policy_revocations WHERE owner_fp=? AND ((target='*' AND iat >= ?) OR target=?)").get(r.owner_fp, r.iat, r.id);
-  db.prepare(`INSERT OR IGNORE INTO policies (id,record,sig,owner_fp,iat,exp,revoked,received_at) VALUES (?,?,?,?,?,?,?,?)`)
-    .run(r.id, JSON.stringify(r), s.sig, r.owner_fp, r.iat, r.exp, killed ? 1 : 0, now);
-  return null;
+  return policyWrite(db, () => {
+    // Compare instants, not signed timestamp spellings; retain the original signed bytes.
+    const revocations = db.prepare("SELECT target,iat FROM policy_revocations WHERE owner_fp=? AND (target='*' OR target=?)")
+      .all(r.owner_fp, r.id) as { target: string; iat: string }[];
+    const killed = revocations.some(rev => rev.target === r.id || Date.parse(rev.iat) >= Date.parse(r.iat));
+    db.prepare(`INSERT OR IGNORE INTO policies (id,record,sig,owner_fp,iat,exp,revoked,received_at) VALUES (?,?,?,?,?,?,?,?)`)
+      .run(r.id, JSON.stringify(r), s.sig, r.owner_fp, r.iat, r.exp, killed ? 1 : 0, now);
+    return null;
+  });
 }
 
 /**
@@ -154,15 +196,53 @@ function acceptDevice(db: DatabaseSync, s: Signed<DeviceRecord>, host: string, o
 /** The issuing machine's local step: keep every record the owner signs, also those for other hosts (served to their pulls). */
 export const issueSigned = (db: DatabaseSync, s: Signed<AnyRecord>, host: string) => acceptSigned(db, s, host, { issuer: true });
 
-type Row = { id: string; record: string; sig: string; exp: string };
+type Row = { id: string; record: string; sig: string; owner_fp: string; iat: string; exp: string; revoked: number };
 const matches = (xs: string[], x: string) => xs.includes("*") || xs.includes(x);
+
+/** Validate retained evidence without changing it. Expired records remain available for explicit renewal. */
+export function storedPolicies(db: DatabaseSync): {
+  valid: (Signed<PolicyRecord> & { revoked: boolean; currentOwner: boolean })[];
+  invalid: { id: string; reason: string }[];
+} {
+  const keys = db.prepare("SELECT pub, role FROM principals").all() as { pub: string; role: string }[];
+  // Older versions compared timestamp text and could miss a kill switch. Derive effective
+  // revocation from retained signed evidence too, without rewriting records or cached flags.
+  const revocations: Revocation[] = [];
+  for (const row of db.prepare("SELECT record,sig FROM policy_revocations").all() as { record: string; sig: string }[]) {
+    try {
+      const rec = JSON.parse(row.record) as Revocation;
+      if (!validRevocation(rec)) continue;
+      const key = keys.find(k => fingerprint(k.pub) === rec.owner_fp);
+      if (key && verifySigned({ rec, sig: row.sig }, key.pub)) revocations.push(rec);
+    } catch { /* Malformed retained evidence cannot establish a revocation. */ }
+  }
+  const valid: (Signed<PolicyRecord> & { revoked: boolean; currentOwner: boolean })[] = [];
+  const invalid: { id: string; reason: string }[] = [];
+  for (const row of db.prepare("SELECT id, record, sig, owner_fp, iat, exp, revoked FROM policies ORDER BY iat").all() as Row[]) {
+    try {
+      const rec = JSON.parse(row.record) as PolicyRecord;
+      const bad = checkRecord(rec);
+      if (bad) throw new Error(bad);
+      if (row.id !== rec.id || row.owner_fp !== rec.owner_fp || row.iat !== rec.iat || row.exp !== rec.exp)
+        throw new Error("stored metadata differs from signed policy");
+      const key = keys.find(k => fingerprint(k.pub) === rec.owner_fp);
+      if (!key || !verifySigned({ rec, sig: row.sig }, key.pub)) throw new Error("invalid or unknown owner signature");
+      const revoked = !!row.revoked || revocations.some(r => r.owner_fp === rec.owner_fp
+        && (r.target === rec.id || (r.target === "*" && Date.parse(r.iat) >= Date.parse(rec.iat))));
+      valid.push({ rec, sig: row.sig, revoked, currentOwner: key.role === "owner" });
+    } catch (e) {
+      invalid.push({ id: row.id, reason: e instanceof Error ? e.message : "invalid policy record" });
+    }
+  }
+  return { valid, invalid };
+}
 
 /** Unrevoked, unexpired policies from a current owner key that cover `agent` on `host`. */
 export function activePolicies(db: DatabaseSync, agent: string, host: string, now = new Date()): (PolicyRecord & { sig: string })[] {
-  const owners = new Set(ownerKeys(db).map(fingerprint));
-  return (db.prepare("SELECT id, record, sig, exp FROM policies WHERE revoked=0 AND exp > ? ORDER BY iat").all(now.toISOString()) as Row[])
-    .map((r) => ({ ...(JSON.parse(r.record) as PolicyRecord), sig: r.sig }))
-    .filter((p) => owners.has(p.owner_fp) && matches(p.to.agents, agent) && matches(p.to.hosts, host));
+  return storedPolicies(db).valid
+    .filter(p => p.currentOwner && !p.revoked && Date.parse(p.rec.exp) > now.getTime()
+      && matches(p.rec.to.agents, agent) && matches(p.rec.to.hosts, host))
+    .map(p => ({ ...p.rec, sig: p.sig }));
 }
 
 /** One policy's grant: its classes only apply within its own projects (no mixing scopes across policies). */
@@ -172,7 +252,9 @@ export interface Effective { level: Level; classes: PolicyClass[]; ids: string[]
 const ORDER = (l: Level) => LEVELS.indexOf(l);
 
 /** What the receiving agent may do for this message's sender. Downgrades apply even under yolo. */
-export function effectivePolicy(db: DatabaseSync, o: { agent: string; host: string; fromAgent: string; fromHost: string; envelope?: Envelope; now?: Date }): Effective {
+export function effectivePolicy(db: DatabaseSync, o: { agent: string; host: string; fromAgent: string; fromHost: string; envelope?: Envelope; senderVerified?: boolean; now?: Date }): Effective {
+  if (o.envelope && checkShape(o.envelope)) return { level: "ask", classes: [], ids: [], exp: null, projects: [], grants: [], notes: ["malformed-envelope: stored message structure is invalid"] };
+  if (o.envelope && (o.envelope.meta.sender_verification !== "leased" || o.senderVerified !== true)) return { level: "ask", classes: [], ids: [], exp: null, projects: [], grants: [], notes: ["unverified-sender: the claimed identity has no verified lease"] };
   const isLocal = o.fromHost === o.host;
   const principalOk = (selector: string): boolean => {
     if (!/^principal:[a-f0-9]{4}(?:-[a-f0-9]{4}){3}$/.test(selector)) return false;
@@ -194,7 +276,7 @@ export function effectivePolicy(db: DatabaseSync, o: { agent: string; host: stri
   const e = o.envelope, meta = (e?.meta ?? {}) as { origin?: string; hop?: number };
   if (meta.origin === "external") { grants = grants.map((g) => ({ ...g, classes: g.classes.filter((c) => c === "read") })); notes.push("content from outside (origin: external): read only"); }
   let stop = false;
-  if ((meta.hop ?? 0) > MAX_HOP) { stop = true; notes.push(`relayed ${meta.hop} hops (limit ${MAX_HOP}): ask your user`); }
+  if ((meta.hop ?? 0) > MAX_HOP) { stop = true; notes.push(`relay safety depth ${meta.hop} exceeds limit ${MAX_HOP}; may include recent message reads in the sending session, not just this thread: ask your user`); }
   if (e) {
     const acted = (db.prepare("SELECT count(*) n FROM audit WHERE event='peer_action' AND json_extract(detail,'$.thread')=?").get(e.thread) as { n: number }).n;
     if (acted >= MAX_POLICY_ACTIONS_PER_THREAD) { stop = true; notes.push(`this thread already had ${acted} actions under policy: ask your user`); }
@@ -264,13 +346,14 @@ export function delegationNote(db: DatabaseSync, agent: string, host: string): s
 
 /** Active policies on this host that expire within `withinMs` and haven't been reminded about yet (marks them). */
 export function dueReminders(db: DatabaseSync, withinMs = 48 * H, now = new Date()): PolicyRecord[] {
-  const soon = new Date(now.getTime() + withinMs).toISOString();
-  const rows = db.prepare("SELECT id, record FROM policies WHERE revoked=0 AND exp > ? AND exp <= ?").all(now.toISOString(), soon) as { id: string; record: string }[];
+  const soon = now.getTime() + withinMs;
+  const rows = storedPolicies(db).valid.filter(p => p.currentOwner && !p.revoked
+    && Date.parse(p.rec.exp) > now.getTime() && Date.parse(p.rec.exp) <= soon).map(p => p.rec);
   const out: PolicyRecord[] = [];
   for (const r of rows) {
     if (db.prepare("SELECT 1 FROM kv WHERE k=?").get(`reminded:${r.id}`)) continue;
     db.prepare("INSERT INTO kv (k,v) VALUES (?,?) ON CONFLICT(k) DO NOTHING").run(`reminded:${r.id}`, now.toISOString());
-    out.push(JSON.parse(r.record) as PolicyRecord);
+    out.push(r);
   }
   return out;
 }

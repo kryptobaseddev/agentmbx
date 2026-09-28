@@ -1,3 +1,4 @@
+import { sendLeased } from "./helpers/leased-send.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -24,9 +25,9 @@ test("principal policies use verified local ownership and current signed peer en
     .run("beta", b.n.key.publicKey, b.owner.publicKey, new Date().toISOString());
   const policy = makePolicy({ level: "autonomous", agents: ["reader"], hosts: ["alpha"], from: [`principal:${fp}`], fromAgents: ["sender"], ownerPub: a.owner.publicKey });
   assert.equal(acceptSigned(db, { rec: policy, sig: signData(a.owner.privateKey, canonical(policy)) }, "alpha"), null);
-  const envelope = b.n.send({ from: "sender", to: ["reader@alpha"], subject: "signed", body: "request" }).envelope;
+  const envelope = sendLeased(b.n, { from: "sender", to: ["reader@alpha"], subject: "signed", body: "request" }).envelope;
   assert.equal(a.n.receive(envelope, "beta"), "accepted");
-  const context = { agent: "reader", host: "alpha", fromAgent: "sender", fromHost: "beta", envelope };
+  const context = { agent: "reader", host: "alpha", fromAgent: "sender", fromHost: "beta", envelope, senderVerified: true };
   assert.equal(a.n.policyFor(a.n.message(envelope.id)!, "reader").level, "autonomous");
   assert.equal(effectivePolicy(db, { ...context, fromAgent: "other" }).level, "ask");
   assert.equal(effectivePolicy(db, { ...context, envelope: undefined }).level, "ask", "no signature evidence");

@@ -1,7 +1,6 @@
 // YOLO (docs/POLICY.md §5): a CLI session auto-approves its own permission prompts while an owner policy grants its
 // agent the `permissions` class. Anything else (no policy, unknown agent, malformed input, any error) returns no
 // decision, so the CLI shows its normal prompt. Per-CLI mechanisms and evidence: docs/RESEARCH.md "Permission hooks per CLI".
-import { agentName } from "./mcp.ts";
 import { kimiServer } from "./kimi-web.ts";
 import { LIVE_AGENT_MS, type MbxNode } from "./node.ts";
 import { fingerprint } from "./crypto.ts";
@@ -12,7 +11,7 @@ export { kimiServer } from "./kimi-web.ts";
 /** Is the permissions class granted to `agent` for a session working in `ctx.cwd`? (see policy.ts hasClass) */
 export type Lookup = (agent: string, ctx?: { cwd?: string | null }) => { ok: boolean; policy_id?: string; exp?: string };
 interface PermissionBinding { agent: string; cli: string; session_id: string; pid: number | null; pid_start: string | null; session_key: string | null; updated_at: string; cwd: string | null }
-interface PermissionAuthority { binding: PermissionBinding; leaseToken: string | null }
+interface PermissionAuthority { binding: PermissionBinding; leaseToken: string }
 export interface Decision { allow: boolean; agent?: string; tool?: string; policy_id?: string; output: string; cwd?: string | null; authority?: PermissionAuthority; kimi?: { session_id: string; approval_id: string } }
 
 /** Tools that collect an answer from the user rather than ask for permission: never auto-approved. */
@@ -47,20 +46,19 @@ function withAuthority<T>(node: MbxNode, authority: PermissionAuthority, operati
         || !Number.isFinite(Date.parse(row.updated_at)) || Date.now() - Date.parse(row.updated_at) > LIVE_AGENT_MS
         || ["agent", "pid", "pid_start", "session_key", "cwd"].some(k => row[k as keyof PermissionBinding] !== old[k as keyof PermissionBinding])) return null;
       const lease = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(row.agent) as IdentityLease | undefined;
-      if (authority.leaseToken === null) return lease ? null : operation(); // legacy evidence cannot acquire a new lease implicitly
       if (!lease || lease.token !== authority.leaseToken || lease.cli !== row.cli || !row.session_key || fingerprint(row.session_key) !== lease.key_fp) return null;
       return operation();
     };
     // Let the lease guard gather process evidence before opening the transaction. Session and
     // policy checks still execute under that same guard, without a nested process inspection.
-    return authority.leaseToken === null ? node.store.tx(checked)
-      : new IdentityLeases(node.store).withHeld(old.agent, authority.leaseToken, checked);
+    return new IdentityLeases(node.store).withHeld(old.agent, authority.leaseToken, checked);
   } catch { return null; }
 }
 
 function captureAuthority(node: MbxNode, binding: PermissionBinding): PermissionAuthority | null {
   const lease = node.store.db.prepare("SELECT token FROM identity_leases WHERE name=?").get(binding.agent) as { token: string } | undefined;
-  const authority = { binding, leaseToken: lease?.token ?? null };
+  if (!lease) return null;
+  const authority = { binding, leaseToken: lease.token };
   return withAuthority(node, authority, () => authority);
 }
 
@@ -88,7 +86,7 @@ export function decidePermission(input: unknown, cli: string, lookup: Lookup, o:
     if (!authority) return NONE;
     // A hosted provider process may serve other, not-yet-bound threads. Its sole current
     // mailbox is not evidence that an unknown request belongs to that mailbox.
-    if (authority.leaseToken && (cli === "codex" || cli === "kimi") && sessionId !== authority.binding.session_id) return NONE;
+    if ((cli === "codex" || cli === "kimi") && sessionId !== authority.binding.session_id) return NONE;
     const agent = authority.binding.agent;
     return withAuthority(o.node, authority, () => {
       const p = lookup(agent, { cwd });
@@ -146,9 +144,8 @@ export interface OpencodeSvc { url: string; auth: string }
 
 /**
  * One daemon pass: for each OpenCode session bound to an agent whose policy is active, reply "once" to its pending
- * permission requests. Agents without a policy cost no request at all. A binding with a real session id (ses_…) is
- * queried directly; an MCP-only binding (mcp-<pid>) falls back to the pending requests of its directory, skipping any
- * request from a session bound to another agent, or from an unbound session whose folder name is another agent's.
+ * permission requests. Only a current lease and an exact provider session binding may authorize a request.
+ * Provisional or legacy bindings never infer ownership from a project directory.
  */
 export async function opencodePermissionPass(node: MbxNode, lookup: Lookup, svc: () => Promise<OpencodeSvc | null>, f: Fetch = fetch): Promise<number> {
   const db = node.store.db;
@@ -156,28 +153,25 @@ export async function opencodePermissionPass(node: MbxNode, lookup: Lookup, svc:
     .filter((r) => r.pid && node.sameSession(r.pid, r, { proof: true })); // only bindings proven to be a live OpenCode process
   const covered = rows.flatMap(r => {
     const authority = captureAuthority(node, r);
-    if (!authority || (authority.leaseToken && !r.session_id.startsWith("ses"))) return [];
+    if (!authority || !r.session_id.startsWith("ses")) return [];
     const p = safeLookup(lookup, r.agent, r.cwd);
-    return p.ok && (r.session_id.startsWith("ses") || r.cwd) ? [{ ...r, p, authority }] : [];
+    return p.ok ? [{ ...r, p, authority }] : [];
   });
   if (!covered.length) return 0;
   const s = await svc();
   if (!s) return 0;
   const headers = { "content-type": "application/json", ...(s.auth ? { authorization: s.auth } : {}) };
-  const owner = (sid: string) => (db.prepare("SELECT agent FROM sessions WHERE cli='opencode' AND session_id=?").get(sid) as { agent: string } | undefined)?.agent;
   const done = new Set<string>();
   let n = 0;
   for (const r of covered) {
     try {
-      const direct = r.session_id.startsWith("ses");
-      const url = direct ? `${s.url}/api/session/${encodeURIComponent(r.session_id)}/permission`
-        : `${s.url}/api/permission/request?${new URLSearchParams({ "location[directory]": r.cwd! })}`;
+      const url = `${s.url}/api/session/${encodeURIComponent(r.session_id)}/permission`;
       const res = await f(url, { headers, signal: AbortSignal.timeout(5000) });
       if (!res.ok) continue;
       const j = await res.json() as { data?: { id: string; sessionID: string; action: string }[] };
       for (const q of j.data ?? []) {
         if (!q.id?.startsWith("per") || !q.sessionID?.startsWith("ses") || done.has(q.id)) continue;
-        if (direct ? q.sessionID !== r.session_id : (owner(q.sessionID) ?? agentName(r.cwd!, "opencode")) !== r.agent) continue;
+        if (q.sessionID !== r.session_id) continue;
         done.add(q.id);
         if (!withAuthority(node, r.authority, () => safeLookup(lookup, r.agent, r.cwd).ok)) break;
         const rep = await f(`${s.url}/api/session/${encodeURIComponent(q.sessionID)}/permission/${encodeURIComponent(q.id)}/reply`,

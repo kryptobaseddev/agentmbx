@@ -90,3 +90,18 @@ test("leased OpenCode provisional mailbox cannot approve an unbound same-folder 
   assert.equal(await opencodePermissionPass(node, yes, async () => ({ url: "http://test.invalid", auth: "" }), fake), 0);
   assert.equal(calls, 0);
 });
+
+for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} legacy binding without a lease cannot approve permissions`, async t => {
+  const { node, input } = fixture(t, cli, cli === "opencode" ? "ses_test" : "s1");
+  // Reproduce an older installation's process/key binding without lease evidence.
+  node.store.db.prepare("DELETE FROM identity_leases WHERE name='worker'").run();
+  let lookups = 0, requests = 0;
+  const lookup = () => { lookups++; return yes(); };
+  if (cli === "opencode") {
+    const fake = (async () => { requests++; return Response.json({ data: [{ id: "per_test", sessionID: "ses_test", action: "Bash" }] }); }) as typeof fetch;
+    assert.equal(await opencodePermissionPass(node, lookup, async () => ({ url: "http://test.invalid", auth: "" }), fake), 0);
+  } else assert.equal(decidePermission(input, cli, lookup, { node, pid: process.pid }).allow, false);
+  assert.equal(lookups, 0);
+  assert.equal(requests, 0);
+  assert.equal(node.store.db.prepare("SELECT count(*) AS n FROM audit WHERE event='yolo_allow'").get()!.n, 0);
+});

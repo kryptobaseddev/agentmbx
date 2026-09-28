@@ -15,15 +15,14 @@ function fixture(t: TestContext) {
 const send = (n: MbxNode, to: string[]) => n.send({ from: "sender", to, subject: "ack", body: "body" }).envelope.id;
 const state = (n: MbxNode, id: string, agent: string) => (n.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=? AND agent=?").get(id, agent) as { state: string } | undefined)?.state;
 
-test("primary session acknowledges one linked recipient without creating a primary delivery", (t) => {
+test("retired identity links cannot acknowledge another mailbox", (t) => {
   const n = fixture(t), id = send(n, ["shell-one"]);
-  assert.equal(n.ack(id, "primary", "done", "handled linked request"), id);
-  assert.equal(state(n, id, "shell-one"), "acked");
+  assert.throws(() => n.ack(id, "primary", "done", "forbidden"), { code: "NOT_FOUND" });
+  assert.equal(state(n, id, "shell-one"), "delivered");
   assert.equal(state(n, id, "primary"), undefined);
-  assert.equal(n.ack(id, "primary"), id, "repeat acknowledgement stays idempotent");
-  const audit = n.store.db.prepare("SELECT detail FROM audit WHERE event='peer_action'").get() as { detail: string };
-  assert.equal(JSON.parse(audit.detail).agent, "primary");
-  assert.equal(JSON.parse(audit.detail).recipient, "shell-one");
+  assert.equal(n.store.db.prepare("SELECT detail FROM audit WHERE event='peer_action'").get(), undefined);
+  assert.equal(n.ack(id, "shell-one"), id);
+  assert.equal(n.ack(id, "shell-one"), id, "recipient acknowledgement remains idempotent");
 });
 
 test("direct delivery wins without acknowledging linked duplicate recipients", (t) => {
@@ -35,11 +34,11 @@ test("direct delivery wins without acknowledging linked duplicate recipients", (
 
 test("multiple linked recipient copies require an explicit mailbox choice", (t) => {
   const n = fixture(t), id = send(n, ["shell-one", "shell-two"]);
-  assert.throws(() => n.ack(id, "primary"), { code: "AMBIGUOUS_RECIPIENT" });
+  assert.throws(() => n.ack(id, "primary"), { code: "NOT_FOUND" });
   assert.equal(state(n, id, "shell-one"), "delivered");
   n.ack(id, "shell-one");
   assert.equal(state(n, id, "shell-two"), "delivered");
-  assert.throws(() => n.ack(id, "primary"), { code: "AMBIGUOUS_RECIPIENT" });
+  assert.throws(() => n.ack(id, "primary"), { code: "NOT_FOUND" });
 });
 
 test("sender visibility and independently bound names grant no acknowledgement", (t) => {
@@ -53,6 +52,6 @@ test("sender visibility and independently bound names grant no acknowledgement",
 for (const recipient of ["primary", "shell-one"]) test(`acknowledgement for ${recipient} rolls back if auditing fails`, (t) => {
   const n = fixture(t), id = send(n, [recipient]);
   t.mock.method(n.store, "audit", () => { throw new Error("audit unavailable"); });
-  assert.throws(() => n.ack(id, "primary", null, "handled"), /audit unavailable/);
+  assert.throws(() => n.ack(id, recipient, null, "handled"), /audit unavailable/);
   assert.equal(state(n, id, recipient), "delivered");
 });

@@ -7,6 +7,15 @@ import { NAME_RE } from "./envelope.ts";
 import { readLinuxProcess } from "./proc.ts";
 import type { Store } from "./store.ts";
 
+// Only a synchronous, open write operation may attest which sender it currently holds.
+const heldOperation = new AsyncLocalStorage<{ store: Store; name: string; token: string; active: boolean; readOnly: boolean }>();
+export function hasHeldIdentity(store: Store, name: string): boolean {
+  const scope = heldOperation.getStore();
+  if (!scope?.active || scope.readOnly || scope.store !== store || scope.name !== name) return false;
+  const row = store.db.prepare("SELECT token,released_at FROM identity_leases WHERE name=?").get(name);
+  return row?.token === scope.token && row.released_at === null;
+}
+
 export const DEFAULT_IDENTITY_IDLE_TTL_MS = 30 * 60_000;
 export interface LeaseHolder { pid: number; start: string; keyFp: string; cli: string; sessionId: string }
 export interface IdentityLease {
@@ -221,7 +230,10 @@ export class IdentityLeases {
         ? this.status(row, this.now(), this.observedProcess(row, observed)).state
         : this.expire(row, this.now(), this.observedProcess(row, observed)) : "expired";
       if (status !== "live") return { ok: false as const, status };
-      const value = operation();
+      const scope = { store: this.store, name, token, active: true, readOnly };
+      let value: T;
+      try { value = heldOperation.run(scope, operation); }
+      finally { scope.active = false; }
       if (value && typeof (value as { then?: unknown }).then === "function") {
         // This cannot cancel external side effects. Store transaction contexts block later DB writes.
         void Promise.resolve(value).catch(() => {});

@@ -1,9 +1,15 @@
-import { test } from "node:test";
+import { sendLeased } from "./helpers/leased-send.ts";
+import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { canonical, signData } from "../src/crypto.ts";
+import { createOwnerKey, unlockOwnerKey } from "../src/owner.ts";
+import { acceptSigned, makePolicy } from "../src/policy.ts";
 import { MbxNode } from "../src/node.ts";
 import { IdentityLeases } from "../src/identity-leases.ts";
 
@@ -30,84 +36,158 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} startup 
   assert.equal(node.unreadCount("working"), 0);
 });
 
-test("Claude post-tool hook surfaces arrivals once, including linked names and equal-count replacements", () => {
-  const n = new MbxNode(mkdtempSync(join(tmpdir(), "mbx-hooks-")), { host: "alpha" });
-  try {
-    n.bindSession({ agent: "builder", cli: "claude", session_id: "mcp-builder", pid: process.pid, session_key: "k" });
-    const run = (session = "s1", cli = "claude") => {
-      const r = spawnSync(process.execPath, ["bin/agentmbx.js", "hook", "post-tool", "--cli", cli], {
-        input: JSON.stringify({ session_id: session, tool_name: "Bash" }), encoding: "utf8",
-        env: { ...process.env, MBX_HOME: n.home, AGENTMBX_DEV: "1" },
-      });
-      assert.equal(r.status, 0, r.stderr);
-      return r.stdout;
-    };
-    assert.equal(run(), "", "empty inbox is silent");
-    const send = (to = "builder") => n.send({ from: "sender", to: [to], subject: "PRIVATE SUBJECT", body: "SECRET BODY", kind: "request" }).envelope.id;
-    const first = send();
-    const output = JSON.parse(run()).hookSpecificOutput;
-    assert.equal(output.hookEventName, "PostToolUse");
-    assert.match(output.additionalContext, /1 unread mbx message.*builder@alpha/);
-    assert.doesNotMatch(output.additionalContext, /SECRET BODY|PRIVATE SUBJECT/);
-    assert.equal(n.inbox("builder")[0].state, "delivered", "notice neither reads nor acknowledges mail");
-    assert.equal(run(), "", "unchanged inbox is silent");
-    n.ack(first, "builder");
-    const second = send();
-    assert.match(run(), /1 unread mbx message/, "new message at the same count still notifies");
-    assert.equal(run(), "");
-    assert.match(run("s2"), /1 unread mbx message/, "deduplication is session scoped");
-    n.linkIdentity("shell-name", "builder");
-    const linked = send("shell-name");
-    assert.match(run(), /shell-name \(1; agentmbx inbox --as shell-name\)/);
-    assert.equal(run(), "");
-    n.ack(second, "builder");
-    assert.equal(run(), "", "acknowledging a message does not repeat the remaining notice");
-    n.ack(linked, "shell-name");
-    assert.equal(run(), "");
-    send();
-    assert.equal(run("s1", "codex"), "", "unsupported providers do not receive Claude hook output");
-    assert.match(run(), /1 unread mbx message/);
-  } finally { n.close(); }
+
+async function holder(t: TestContext, cli: string) {
+  const home = mkdtempSync(join(tmpdir(), "mbx-hooks-"));
+  createOwnerKey(home, "test-only-passphrase");
+  const n = new MbxNode(home, { host: "alpha" }), owner = unlockOwnerKey(home, "test-only-passphrase");
+  const client = new Client({ name: "hook-test", version: "1" });
+  t.after(async () => { await client.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  await client.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
+    env: { ...process.env, MBX_HOME: home, MBX_AGENT: "builder", MBX_CLI: cli, AGENTMBX_DEV: "1" } as Record<string,string> }));
+  const sid = cli === "codex" ? "77777777-7777-4777-8777-777777777777" : cli === "opencode" ? "ses_hooktest" : "real-hook-session";
+  const meta = cli === "codex" ? { threadId: sid } : cli === "opencode" ? { sessionID: sid } : undefined;
+  const call = (name: string, args: Record<string,unknown> = {}) => client.callTool({ name, arguments: args, ...(meta ? { _meta: meta } : {}) });
+  const agent = ((await call("mbx_whoami")).structuredContent as { agent: string }).agent;
+  const rec = makePolicy({ level: "autonomous", agents: [agent], hosts: ["alpha"], ownerPub: owner.publicKey });
+  assert.equal(acceptSigned(n.store.db, { rec, sig: signData(owner.privateKey, canonical(rec)) }, "alpha"), null);
+  const run = (event: string, session: unknown = sid, provider = cli, extraEnv: Record<string,string> = {}) => spawnSync(process.execPath,
+    [resolve("bin/agentmbx.js"), "hook", event, "--cli", provider], { input: JSON.stringify({ session_id: session, cwd: process.cwd() }),
+      encoding: "utf8", timeout: 10_000, env: { ...process.env, MBX_HOME: home, MBX_AGENT: "unrelated", AGENTMBX_DEV: "1", ...extraEnv } });
+  const send = (to = agent) => sendLeased(n, { from: "sender", to: [to], subject: "PRIVATE SUBJECT", body: "SECRET BODY", kind: "request" }).envelope.id;
+  return { n, call, agent, sid, run, send };
+}
+
+for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} hooks require current leases, bind exact IDs and stop after release`, async t => {
+  const { n, call, agent, sid, run, send } = await holder(t, cli);
+  const id = send();
+  const prompt = run("prompt"); assert.equal(prompt.status, 0, prompt.stderr);
+  assert.match(prompt.stdout, /1 unread mbx message/); assert.doesNotMatch(prompt.stdout, /PRIVATE SUBJECT|SECRET BODY|unrelated/);
+  const rows = n.sessionsFor(agent); assert.equal(rows.length, 1); assert.equal(rows[0].session_id, sid); assert.ok(rows[0].session_key);
+  assert.equal(n.inbox(agent)[0].state, "delivered");
+  const startup = run("session-start"); assert.equal(startup.status, 0, startup.stderr);
+  assert.match(startup.stdout, /1 unread/); assert.match(startup.stdout, /owner|Owner/);
+  for (const unknown of [undefined, ...(cli === "claude" ? [] : ["missing-session"]), "", 42, {}]) {
+    const before = n.store.db.prepare("SELECT * FROM sessions").all();
+    // null represents absent/invalid session identity; the helper default is intentionally avoided.
+    const r = run("prompt", unknown === undefined ? null : unknown);
+    assert.equal(r.status, 0, r.stderr); assert.equal(r.stdout, "");
+    assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before);
+  }
+  const stopped = run("stop");
+  if (cli === "kimi") { assert.equal(stopped.status, 2); assert.match(stopped.stderr, /Before stopping/); }
+  else if (cli !== "opencode") { assert.equal(stopped.status, 0); assert.equal(JSON.parse(stopped.stdout).decision, "block"); }
+  else assert.equal(stopped.stdout, "");
+  assert.equal(run("stop").stdout, "", "the same mail does not block twice");
+  n.ack(id, agent);
+  n.send({ from: "claimed", to: [agent], subject: "unverified", body: "not delegated", kind: "request", unverifiedSender: true });
+  const unverified = run("stop"); assert.equal(unverified.status, 0, unverified.stderr); assert.equal(unverified.stdout, "");
+  sendLeased(n, { from: "sender", to: [agent], subject: "over relay limit", body: "not delegated", kind: "request", hop: 1000 });
+  assert.equal(run("stop").stdout, "");
+  assert.notEqual((await call("mbx_identity", { action: "release" })).isError, true);
+  const before = n.store.db.prepare("SELECT * FROM sessions").all();
+  for (const event of ["prompt", "post-tool", "stop", "session-start"]) {
+    const r = run(event); assert.equal(r.status, 0, r.stderr);
+    if (event === "session-start") { assert.match(r.stdout, /Identity choices/); assert.doesNotMatch(r.stdout, /You are|autonomous|new message|1 unread/); }
+    else assert.equal(r.stdout, "");
+    assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before, "released hooks cannot recreate bindings");
+  }
+  assert.equal(n.inbox(agent).length, 2); assert.ok(n.inbox(agent).every(m => m.state === "delivered"));
 });
 
-for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} prompt recovers missed startup and preserves MCP identity`, () => {
-  const n = new MbxNode(mkdtempSync(join(tmpdir(), "mbx-prompt-bind-")), { host: "alpha" });
-  try {
-    n.bindSession({ agent: "chosen", cli, session_id: "mcp-placeholder", pid: process.pid, session_key: "key" });
-    const run = (sid: unknown) => spawnSync(process.execPath, ["bin/agentmbx.js", "hook", "prompt", "--cli", cli], {
-      input: JSON.stringify({ session_id: sid, cwd: "/work" }), encoding: "utf8",
-      env: { ...process.env, MBX_HOME: n.home, AGENTMBX_DEV: "1" },
-    });
-    const first = run("real-session");
-    assert.equal(first.status, 0, first.stderr);
-    const rows = n.sessionsFor("chosen");
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0].session_id, "real-session");
-    assert.equal(rows[0].session_key, "key");
-    n.store.db.prepare("UPDATE sessions SET updated_at='2000-01-01T00:00:00Z'").run();
-    const refresh = run("real-session");
-    assert.equal(refresh.status, 0, refresh.stderr);
-    assert.notEqual(n.sessionsFor("chosen")[0].updated_at, "2000-01-01T00:00:00Z");
-    for (const missing of [undefined]) {
-      const before = n.store.db.prepare("SELECT * FROM sessions").all();
-      const result = run(missing);
-      assert.equal(result.status, 0, result.stderr);
-      assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before, "no guessed session ID");
-    }
-  } finally { n.close(); }
+test("Claude post-tool deduplicates exact leased mailbox arrivals and ignores retired links", async t => {
+  const { n, agent, run, send } = await holder(t, "claude");
+  assert.equal(run("prompt").status, 0);
+  assert.equal(run("post-tool").stdout, "");
+  const first = send();
+  assert.match(run("post-tool").stdout, /1 unread/); assert.equal(run("post-tool").stdout, "");
+  n.ack(first, agent); send();
+  assert.match(run("post-tool").stdout, /1 unread/); assert.equal(run("post-tool").stdout, "");
+  n.store.set("ident:shell", agent); send("shell");
+  assert.equal(run("post-tool").stdout, "");
+  assert.equal(run("post-tool", "different-session").stdout, "");
 });
 
+test("unleased hooks neither rebind legacy sessions nor reveal mailbox counts", t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-hook-legacy-")), n = new MbxNode(home, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  n.bindSession({ agent: "builder", cli: "kimi", session_id: "legacy", pid: process.pid });
+  sendLeased(n, { from: "sender", to: ["builder"], subject: "private", body: "private" });
+  const before = n.store.db.prepare("SELECT * FROM sessions").all();
+  for (const event of ["prompt", "stop", "session-start"]) {
+    const r = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", event, "--cli", "kimi"], {
+      input: JSON.stringify({ session_id: "legacy" }), encoding: "utf8", env: { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1" } });
+    assert.equal(r.status, 0, r.stderr); assert.doesNotMatch(r.stdout, /builder|1 unread|private/);
+  }
+  assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before);
+});
 
-test("prompt hooks ignore nonstring and empty session IDs", () => {
-  const n = new MbxNode(mkdtempSync(join(tmpdir(), "mbx-prompt-invalid-")), { host: "alpha" });
-  try {
-    for (const sid of [null, "", 42, {}]) {
-      const r = spawnSync(process.execPath, ["bin/agentmbx.js", "hook", "prompt", "--cli", "kimi"], {
-        input: JSON.stringify({ session_id: sid }), encoding: "utf8",
-        env: { ...process.env, MBX_HOME: n.home, AGENTMBX_DEV: "1" },
-      });
-      assert.equal(r.status, 0, r.stderr);
-      assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), []);
+test("hosted Kimi does not bootstrap an unknown thread from a provisional parent, even without a server token", async t => {
+  const { n, run, send } = await holder(t, "kimi");
+  send();
+  const kimiHome = join(n.home, "kimi-fixture");
+  mkdirSync(join(kimiHome, "server/instances"), { recursive: true });
+  writeFileSync(join(kimiHome, "server/instances/test.json"), JSON.stringify({ pid: process.pid, port: 12345 }));
+  const before = n.store.db.prepare("SELECT * FROM sessions").all();
+  const r = run("prompt", "unknown-hosted-session", "kimi", { KIMI_CODE_HOME: kimiHome });
+  assert.equal(r.status, 0, r.stderr); assert.equal(r.stdout, "");
+  assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before);
+});
+
+for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} refuses malformed and provisional hook IDs without changing bindings`, async t => {
+  const { n, run, send } = await holder(t, cli);
+  send();
+  const controls = n.store.db.prepare("SELECT v FROM kv WHERE k GLOB 'identity-control:*'").all().map(r => JSON.parse(r.v as string));
+  const provisional = controls.find(d => d.session_id.startsWith("mcp-"))?.session_id ?? "mcp-12345";
+  for (const sid of [" real-hook-session", "real-hook-session ", "bad\nline", "bad\u0000id", "bad\u007fid", "bad\u0085id", "x".repeat(301), provisional]) {
+    const before = n.store.db.prepare("SELECT * FROM sessions").all();
+    for (const event of ["prompt", "post-tool", "stop", "session-start"]) {
+      const r = run(event, sid); assert.equal(r.status, 0, r.stderr);
+      assert.doesNotMatch(r.stdout, /[0-9]+ unread|PRIVATE|SECRET|autonomous/);
+      assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before);
     }
-  } finally { n.close(); }
+  }
+});
+
+test("Claude clear changes only the session alias of one current holder", async t => {
+  const { n, call, agent, sid: originalSid, run, send } = await holder(t, "claude");
+  send(); assert.match(run("prompt").stdout, /1 unread/);
+  const original = n.sessionsFor(agent)[0];
+  const lease = n.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(agent);
+  for (const sid of ["after-clear-1", "after-clear-2", originalSid]) {
+    const r = run("session-start", sid); assert.equal(r.status, 0, r.stderr); assert.match(r.stdout, /1 unread/);
+    const rows = n.sessionsFor(agent); assert.equal(rows.length, 1); assert.equal(rows[0].session_id, sid);
+    assert.equal(rows[0].session_key, original.session_key); assert.equal(rows[0].channel, original.channel);
+    assert.equal(n.store.db.prepare("SELECT token FROM identity_leases WHERE name=?").get(agent)?.token, lease?.token);
+    assert.match(run("prompt", sid).stdout, /1 unread/);
+    assert.notEqual((await call("mbx_inbox")).isError, true);
+  }
+  await call("mbx_identity", { action: "release" });
+  assert.equal(run("prompt", "after-release").stdout, ""); assert.equal(n.sessionsFor(agent).length, 0);
+});
+
+test("Claude new session refuses two MCP holders sharing a parent", async t => {
+  const { n, agent, run, send } = await holder(t, "claude");
+  send(); assert.match(run("prompt").stdout, /1 unread/);
+  const other = new Client({ name: "second-hook-holder", version: "1" });
+  t.after(() => other.close());
+  await other.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
+    env: { ...process.env, MBX_HOME: n.home, MBX_AGENT: "other", MBX_CLI: "claude", AGENTMBX_DEV: "1" } as Record<string,string> }));
+  await other.callTool({ name: "mbx_whoami", arguments: {} });
+  const before = n.store.db.prepare("SELECT * FROM sessions").all();
+  const r = run("prompt", "new-ambiguous-session"); assert.equal(r.status, 0, r.stderr); assert.equal(r.stdout, "");
+  assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before);
+  assert.equal(n.unreadCount(agent), 1);
+});
+
+for (const cli of ["claude", "codex", "kimi"]) test(`${cli} Stop honors a directly signed owner request without a broad policy`, async t => {
+  const { n, agent, run } = await holder(t, cli);
+  assert.equal(run("prompt").status, 0);
+  n.store.db.prepare("DELETE FROM policies").run();
+  const owner = unlockOwnerKey(n.home, "test-only-passphrase");
+  await n.sendAsOwner({ from: "owner", to: [agent], subject: "owner task", body: "signed instruction", kind: "request" },
+    async payload => ({ sig: signData(owner.privateKey, payload) }));
+  const r = run("stop");
+  if (cli === "kimi") { assert.equal(r.status, 2); assert.match(r.stderr, /Before stopping/); }
+  else { assert.equal(r.status, 0, r.stderr); assert.equal(JSON.parse(r.stdout).decision, "block"); }
 });

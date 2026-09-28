@@ -10,18 +10,18 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { fingerprint, generateKeyPair } from "./crypto.js";
-import { KINDS, NAME_RE } from "./envelope.js";
+import { checkShape, KINDS, MAX_RELAY_DEPTH, NAME_RE } from "./envelope.js";
 import { kimiHostedServer } from "./kimi-web.js";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess } from "./identity-leases.js";
 import { applyIdentityTakeover } from "./identity-takeover.js";
 import { listIdentityStatus } from "./identity-status.js";
 import { consumeIdentityControl, identityControlAliases, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl } from "./identity-control.js";
 import { formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
-import { activePolicies, delegationNote } from "./policy.js";
+import { activePolicies, delegationNote, MAX_HOP } from "./policy.js";
 import { procStart, withProcSnapshot } from "./proc.js";
 import { updateAvailable } from "./update.js";
 import { version } from "./version.js";
-import { wakeText } from "./wake.js";
+import { hasWakeAuthority, wakeText } from "./wake.js";
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
 It is shared by AI coding agents on this machine and on paired machines. Your user set it up so agents can coordinate;
 replying, answering questions, sharing status and acking are always fine.
@@ -297,19 +297,30 @@ export async function runMcp(node = new MbxNode()) {
     const noteRead = (rows) => {
         const state = current(), { agent } = state;
         const now = Date.now();
-        if (state.parent && now - state.parent.at >= 3_600_000)
-            state.parent = null;
+        if (state.parent)
+            for (const [hop, at] of state.parent.hops) {
+                if (now - at >= 3_600_000)
+                    state.parent.hops.delete(hop);
+            }
         for (const r of rows) {
             if (r.from_addr === `${agent}@${node.host}`)
                 continue;
-            const m = JSON.parse(r.envelope).meta;
-            state.parent = { hop: Math.max(state.parent?.hop ?? 0, m.hop ?? 0), external: (state.parent?.external ?? false) || m.origin === "external", at: now };
+            const e = JSON.parse(r.envelope);
+            // Retained malformed mail is readable, but cannot erase unknown provenance.
+            const m = checkShape(e) ? { hop: MAX_HOP + 1, origin: "external" } : e.meta;
+            state.parent ??= { hops: new Map(), externalAt: null };
+            // Each depth keeps its own last exposure. Lower-depth mail cannot renew a higher one.
+            state.parent.hops.set(m.hop ?? 0, now);
+            if (m.origin === "external")
+                state.parent.externalAt = now;
         }
     };
     const relay = (origin) => {
         const { parent } = current();
-        const p = parent && Date.now() - parent.at < 3_600_000 ? parent : null;
-        return { hop: p ? p.hop + 1 : 0, origin: origin === "external" || p?.external ? "external" : "agent", project };
+        const now = Date.now();
+        const depths = parent ? [...parent.hops].filter(([, at]) => now - at < 3_600_000).map(([hop]) => hop) : [];
+        const external = parent?.externalAt != null && now - parent.externalAt < 3_600_000;
+        return { hop: depths.length ? Math.min(MAX_RELAY_DEPTH, Math.max(...depths) + 1) : 0, origin: origin === "external" || external ? "external" : "agent", project };
     };
     const agent = base.agent;
     // Initialization belongs to the transport, before per-call metadata identifies its thread.
@@ -641,7 +652,7 @@ export async function runMcp(node = new MbxNode()) {
                 for (const mailbox of [agent, ...node.linkedNames(agent)]) {
                     const { rows, wanted, brake } = leases.withHeld(agent, base.leaseToken, () => {
                         const rows = node.store.db.prepare(`SELECT m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state='delivered' ORDER BY m.ts`).all(mailbox);
-                        const wanted = rows.filter((r) => node.wantsWake(mailbox, r));
+                        const wanted = rows.filter(r => node.wantsWake(mailbox, r) && hasWakeAuthority(node, mailbox, r));
                         const brake = wanted.length ? node.takeWake(mailbox, wanted[0].thread) : null;
                         return { rows, wanted, brake };
                     });

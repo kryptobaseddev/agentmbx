@@ -31,7 +31,7 @@ test("scoped search matches visibility for direct, sent, linked and separately b
   send("other", ["elsewhere"]);
   const expected = () => n.search("needle", 100).filter(m => n.canSee(m, "primary")).map(m => m.id);
   assert.deepEqual(n.search("needle", 100, "primary").map(m => m.id), expected());
-  assert.deepEqual(new Set(expected()), new Set([direct, linked, sent, linkedSent]));
+  assert.deepEqual(new Set(expected()), new Set([direct, sent]));
   assert.equal(n.search("needle", 2, "primary").length, 2);
   assert.deepEqual(n.search("needle", 0, "primary"), []);
   assert.deepEqual(n.search(' " ', 10, "primary"), []);

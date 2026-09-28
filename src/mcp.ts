@@ -10,18 +10,18 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { fingerprint, generateKeyPair } from "./crypto.ts";
-import { KINDS, NAME_RE, type Envelope, type Grant } from "./envelope.ts";
+import { checkShape, KINDS, MAX_RELAY_DEPTH, NAME_RE, type Envelope, type Grant } from "./envelope.ts";
 import { kimiHostedServer } from "./kimi-web.ts";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess } from "./identity-leases.ts";
 import { applyIdentityTakeover, type IdentityTakeoverApproval } from "./identity-takeover.ts";
 import { listIdentityStatus } from "./identity-status.ts";
 import { consumeIdentityControl, identityControlAliases, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl, type IdentityControlDescriptor } from "./identity-control.ts";
 import { formatFor, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
-import { activePolicies, delegationNote } from "./policy.ts";
+import { activePolicies, delegationNote, MAX_HOP } from "./policy.ts";
 import { procStart, withProcSnapshot } from "./proc.ts";
 import { updateAvailable } from "./update.ts";
 import { version } from "./version.ts";
-import { wakeText } from "./wake.ts";
+import { hasWakeAuthority, wakeText } from "./wake.ts";
 
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
 It is shared by AI coding agents on this machine and on paired machines. Your user set it up so agents can coordinate;
@@ -110,7 +110,7 @@ export async function runMcp(node = new MbxNode()) {
   const holderStart = inspectLeaseProcess(process.pid).start;
   // a second live session with the same default name gets a free one (T055); an explicit MBX_AGENT is used as is
   type State = { agent: string; sessionId: string; key: ReturnType<typeof generateKeyPair>; leaseToken?: string; released?: boolean;
-    parent: { hop: number; external: boolean; at: number } | null };
+    parent: { hops: Map<number, number>; externalAt: number | null } | null };
   const base: State = { agent: process.env.MBX_AGENT ? wanted : node.pickName(wanted, env.cli, env.ppid, env.sessionId),
     sessionId: env.sessionId, key: generateKeyPair(), parent: null };
   const states = new Map<string, State>();
@@ -256,17 +256,26 @@ export async function runMcp(node = new MbxNode()) {
   const noteRead = (rows: { envelope: string; from_addr: string }[]) => {
     const state = current(), { agent } = state;
     const now = Date.now();
-    if (state.parent && now - state.parent.at >= 3_600_000) state.parent = null;
+    if (state.parent) for (const [hop, at] of state.parent.hops) {
+      if (now - at >= 3_600_000) state.parent.hops.delete(hop);
+    }
     for (const r of rows) {
       if (r.from_addr === `${agent}@${node.host}`) continue;
-      const m = (JSON.parse(r.envelope) as Envelope).meta as { hop?: number; origin?: string };
-      state.parent = { hop: Math.max(state.parent?.hop ?? 0, m.hop ?? 0), external: (state.parent?.external ?? false) || m.origin === "external", at: now };
+      const e = JSON.parse(r.envelope) as Envelope;
+      // Retained malformed mail is readable, but cannot erase unknown provenance.
+      const m = checkShape(e) ? { hop: MAX_HOP + 1, origin: "external" } : e.meta;
+      state.parent ??= { hops: new Map(), externalAt: null };
+      // Each depth keeps its own last exposure. Lower-depth mail cannot renew a higher one.
+      state.parent.hops.set(m.hop ?? 0, now);
+      if (m.origin === "external") state.parent.externalAt = now;
     }
   };
   const relay = (origin?: "agent" | "external") => {
     const { parent } = current();
-    const p = parent && Date.now() - parent.at < 3_600_000 ? parent : null;
-    return { hop: p ? p.hop + 1 : 0, origin: origin === "external" || p?.external ? "external" as const : "agent" as const, project };
+    const now = Date.now();
+    const depths = parent ? [...parent.hops].filter(([, at]) => now - at < 3_600_000).map(([hop]) => hop) : [];
+    const external = parent?.externalAt != null && now - parent.externalAt < 3_600_000;
+    return { hop: depths.length ? Math.min(MAX_RELAY_DEPTH, Math.max(...depths) + 1) : 0, origin: origin === "external" || external ? "external" as const : "agent" as const, project };
   };
   const agent = base.agent;
   // Initialization belongs to the transport, before per-call metadata identifies its thread.
@@ -559,7 +568,7 @@ export async function runMcp(node = new MbxNode()) {
         for (const mailbox of [agent, ...node.linkedNames(agent)]) {
           const { rows, wanted, brake } = leases.withHeld(agent, base.leaseToken!, () => {
             const rows = node.store.db.prepare(`SELECT m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state='delivered' ORDER BY m.ts`).all(mailbox) as unknown as Parameters<MbxNode["wantsWake"]>[1][];
-            const wanted = rows.filter((r) => node.wantsWake(mailbox, r));
+            const wanted = rows.filter(r => node.wantsWake(mailbox, r) && hasWakeAuthority(node, mailbox, r));
             const brake = wanted.length ? node.takeWake(mailbox, wanted[0].thread) : null;
             return { rows, wanted, brake };
           });

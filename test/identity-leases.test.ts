@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { execFileSync, fork, type ChildProcess } from "node:child_process";
 import { Store } from "../src/store.ts";
 import { MbxNode } from "../src/node.ts";
-import { IdentityLeases, inspectLeaseProcess, type ProcessEvidence, type LeaseHolder } from "../src/identity-leases.ts";
+import { IdentityLeases, hasHeldIdentity, inspectLeaseProcess, type ProcessEvidence, type LeaseHolder } from "../src/identity-leases.ts";
 
 function fixture(t: TestContext) {
   const home = mkdtempSync(join(tmpdir(), "mbx-leases-")), node = new MbxNode(home, { host: "alpha" });
@@ -221,4 +221,39 @@ test("independent processes racing to claim one identity have exactly one winner
   const results = await Promise.all(participants.map(p => p.outcome));
   assert.deepEqual(results.map(r => r.result).sort(), ["IDENTITY_IN_USE", "claimed"]);
   const store = new Store(home); try { assert.equal(store.db.prepare("SELECT count(*) n FROM identity_leases WHERE released_at IS NULL").get()!.n, 1); } finally { store.close(); }
+});
+
+test("sender attestation is confined to the current synchronous write lease", async t => {
+  const { node, leases, a, b } = fixture(t), other = fixture(t);
+  const first = leases.claim("worker", a), second = leases.claim("other", b);
+  assert.equal(hasHeldIdentity(node.store, "worker"), false);
+  const forged = node.send({ from: "worker", to: ["recipient"], subject: "unleased", body: "body" }).envelope;
+  forged.meta.sender_verification = "leased";
+  assert.throws(() => node.send({ from: "worker", to: ["recipient"], subject: "forged", body: "body" }, undefined, undefined, forged), /requires the current identity lease/);
+  let escaped: Promise<boolean> | undefined;
+  leases.prepare(["worker", "other"], [a.pid, b.pid], () => leases.withHeld("worker", first.token, () => {
+    assert.equal(hasHeldIdentity(node.store, "worker"), true);
+    assert.equal(hasHeldIdentity(other.node.store, "worker"), false);
+    assert.equal(hasHeldIdentity(node.store, "other"), false);
+    const sent = node.send({ from: "worker", to: ["recipient"], subject: "leased", body: "body" }).envelope;
+    assert.equal(sent.meta.sender_verification, "leased");
+    assert.notEqual(node.send({ from: "other", to: ["recipient"], subject: "not this holder", body: "body" }).envelope.meta.sender_verification, "leased");
+    assert.equal(node.send({ from: "worker", to: ["recipient"], subject: "explicit unverified", body: "body", unverifiedSender: true }).envelope.meta.sender_verification, "unverified");
+    leases.withHeld("other", second.token, () => {
+      assert.equal(hasHeldIdentity(node.store, "other"), true);
+      assert.equal(hasHeldIdentity(node.store, "worker"), false);
+    });
+    assert.equal(hasHeldIdentity(node.store, "worker"), true);
+    escaped = Promise.resolve().then(() => hasHeldIdentity(node.store, "worker"));
+  }));
+  assert.equal(await escaped, false);
+  leases.withHeldRead("worker", first.token, () => assert.equal(hasHeldIdentity(node.store, "worker"), false));
+  assert.throws(() => leases.withHeld("worker", first.token, () => { throw new Error("rollback"); }), /rollback/);
+  assert.equal(hasHeldIdentity(node.store, "worker"), false);
+  leases.prepare(["worker"], [a.pid, b.pid], () => leases.withHeld("worker", first.token, () => {
+    leases.release("worker", first.token);
+    assert.equal(hasHeldIdentity(node.store, "worker"), false);
+    leases.claim("worker", b);
+    assert.equal(hasHeldIdentity(node.store, "worker"), false, "a replacement generation cannot inherit the ambient holder");
+  }));
 });

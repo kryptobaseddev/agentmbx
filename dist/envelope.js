@@ -2,6 +2,8 @@
 import { canonical, fingerprint, nonce, sha256, signData, ulid, verifyData } from "./crypto.js";
 export const KINDS = ["message", "request", "reply", "status", "decision", "alert", "task"];
 export const MAX_BODY = 256 * 1024;
+// Saturating wire counter: this value means at least this many relay steps.
+export const MAX_RELAY_DEPTH = 1000;
 export const NAME_RE = /^[a-z0-9][a-z0-9-]{1,39}$/;
 export function parseMeta(body) {
     const uniq = (xs) => [...new Set(xs)];
@@ -24,7 +26,7 @@ export function buildEnvelope(d, now = new Date()) {
     return {
         v: 3, id, ts: now.toISOString(), from: d.from, to: d.to, thread: d.thread ?? id, reply_to: d.reply_to ?? null,
         kind: d.kind ?? "message", subject: d.subject.slice(0, 200), body: d.body, needs_reply: d.needs_reply ?? false,
-        refs: d.refs ?? [], meta: { ...parseMeta(d.body), ...(d.origin === "external" ? { origin: "external" } : {}), ...(d.hop ? { hop: d.hop } : {}), ...(d.project ? { project: d.project.slice(0, 300) } : {}) },
+        refs: d.refs ?? [], meta: { ...parseMeta(d.body), ...(d.unverifiedSender ? { sender_verification: "unverified" } : {}), ...(d.origin === "external" ? { origin: "external" } : {}), ...(d.hop ? { hop: d.hop } : {}), ...(d.project ? { project: d.project.slice(0, 300) } : {}) },
         authority: null, enc: null,
     };
 }
@@ -54,10 +56,47 @@ export function checkShape(x) {
         return "bad body";
     if (typeof e.subject !== "string")
         return "bad subject";
-    if (Number.isNaN(Date.parse(e.ts)))
+    if (typeof e.ts !== "string" || Number.isNaN(Date.parse(e.ts)))
         return "bad ts";
+    if (typeof e.thread !== "string")
+        return "bad thread";
+    if (e.reply_to !== null && typeof e.reply_to !== "string")
+        return "bad reply_to";
+    if (typeof e.needs_reply !== "boolean")
+        return "bad needs_reply";
+    if (!Array.isArray(e.refs) || e.refs.some(value => typeof value !== "string"))
+        return "bad refs";
+    if (e.enc !== null)
+        return "unsupported enc";
+    const a = e.authority;
+    if (a !== null) {
+        if (!a || typeof a !== "object" || Array.isArray(a))
+            return "bad authority";
+        if (a.owner_sig !== undefined) {
+            if (typeof a.owner_sig !== "string" || typeof a.owner_fp !== "string" || a.grant !== undefined || a.session_sig !== undefined)
+                return "bad owner authority";
+        }
+        else {
+            const g = a.grant;
+            if (!g || typeof g !== "object" || Array.isArray(g) || g.v !== 2 || typeof a.session_sig !== "string" || a.owner_fp !== undefined)
+                return "bad grant authority";
+            for (const field of ["id", "iss", "sub", "agent", "host", "iat", "exp", "nonce", "sig"])
+                if (typeof g[field] !== "string")
+                    return `bad grant.${field}`;
+            if (!Array.isArray(g.caps) || g.caps.some(value => typeof value !== "string"))
+                return "bad grant.caps";
+        }
+    }
     const m = e.meta;
-    if (m?.hop !== undefined && !(Number.isInteger(m.hop) && m.hop >= 0 && m.hop <= 1000))
+    if (!m || typeof m !== "object" || Array.isArray(m))
+        return "bad meta";
+    for (const field of ["mentions", "directives", "tags", "task_refs"]) {
+        if (!Array.isArray(m[field]) || m[field].some(value => typeof value !== "string"))
+            return `bad meta.${field}`;
+    }
+    if (m?.sender_verification !== undefined && m.sender_verification !== "unverified" && m.sender_verification !== "leased")
+        return "bad sender verification";
+    if (m?.hop !== undefined && !(Number.isInteger(m.hop) && m.hop >= 0 && m.hop <= MAX_RELAY_DEPTH))
         return "bad hop";
     if (m?.origin !== undefined && m.origin !== "agent" && m.origin !== "external")
         return "bad origin";
@@ -153,7 +192,14 @@ export function checkAuthority(e, ownerPub, revoked, now = new Date()) {
     const sessionPub = a.grant.sub.slice(8);
     if (!verifyData(sessionPub, sessionPayload(e), a.session_sig))
         return { ok: false, reason: "not sent by the granted session (session signature invalid)" };
-    if (Date.parse(a.grant.exp) < now.getTime())
+    const issued = typeof a.grant.iat === "string" ? Date.parse(a.grant.iat) : NaN;
+    const expires = typeof a.grant.exp === "string" ? Date.parse(a.grant.exp) : NaN;
+    const at = now.getTime();
+    if (!Number.isFinite(issued) || !Number.isFinite(expires) || !Number.isFinite(at))
+        return { ok: false, reason: "grant validity timestamps are invalid" };
+    if (expires <= issued || expires - issued > MAX_GRANT_HOURS * 3_600_000)
+        return { ok: false, reason: "grant lifetime is outside the allowed interval" };
+    if (expires <= at)
         return { ok: false, reason: "grant expired" };
     if (revoked.has(a.grant.id))
         return { ok: false, reason: "grant revoked" };

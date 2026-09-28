@@ -40,11 +40,14 @@ export function findIdentityControl(store: Store, cli: string, sessionId: string
   if (descriptor.cli !== cli || descriptor.session_id !== sessionId) throw fail("control endpoint identity mismatch");
   return descriptor;
 }
-export function identityControlAliases(store: Store, controlKey: string): IdentityControlDescriptor[] {
+export function listIdentityControls(store: Store): IdentityControlDescriptor[] {
   return store.db.prepare("SELECT v FROM kv WHERE k GLOB 'identity-control:*'").all().flatMap(row => {
-    try { const parsed = descriptorSchema.safeParse(JSON.parse(row.v as string)); return parsed.success && parsed.data.control_key === controlKey ? [parsed.data] : []; }
+    try { const parsed = descriptorSchema.safeParse(JSON.parse(row.v as string)); return parsed.success ? [parsed.data] : []; }
     catch { return []; }
   });
+}
+export function identityControlAliases(store: Store, controlKey: string): IdentityControlDescriptor[] {
+  return listIdentityControls(store).filter(descriptor => descriptor.control_key === controlKey);
 }
 export function removeIdentityControl(store: Store, controlKey: string) {
   for (const descriptor of identityControlAliases(store, controlKey)) store.db.prepare("DELETE FROM kv WHERE k=?").run(identityControlKey(descriptor.cli, descriptor.session_id));

@@ -1,4 +1,4 @@
-// Host-to-host HTTP: pairing, envelope exchange, agent directory. Every request except /v1/pair* carries a
+// Host-to-host HTTP: pairing, envelope exchange, agent directory. Every request except /v1/pair* and read-only /v1/status carries a
 // signed hop (X-Mbx-Host / -Ts / -Sig over method, path, ts, sha256(body)); freshness is checked on the hop only.
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { hostname } from "node:os";
@@ -8,7 +8,8 @@ import {
 import { NAME_RE, type Envelope } from "./envelope.ts";
 import { MbxNode, RETRY_HOURS } from "./node.ts";
 import { notifyDesktop } from "./wake.ts";
-import { acceptSigned, type AnyRecord, type Signed } from "./policy.ts";
+import { version } from "./version.ts";
+import { storedPolicies, acceptSigned, type AnyRecord, type Signed } from "./policy.ts";
 
 export const HOP_SKEW_MS = 5 * 60_000;
 const MAX_REQ = 4 * 1024 * 1024;
@@ -127,12 +128,16 @@ function handleJoin(node: MbxNode, j: JoinRequest, hellos: Map<string, number>, 
 
 // ---- server ----------------------------------------------------------------------------------
 export function startServer(node: MbxNode, port = node.config.port, bind = node.config.bind, onEnvelope?: () => void): Promise<Server> {
+  const runtime = { service: "agentmbx", v: 1, host: node.host, host_pubkey: node.key.publicKey, version: version(), started_at: new Date().toISOString() };
   let pairAttempts: number[] = [], tokenAttempts: number[] = [];
   const hellos = new Map<string, number>(); // hello nonce → expiry
   const server = createServer(async (req, res) => {
     const send = (code: number, obj: unknown) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
     try {
       const url = new URL(req.url ?? "/", "http://x"); const body = await readBody(req);
+      // Public diagnostic metadata only: this neither issues pairing nonces nor grants authority.
+      if (url.pathname === "/v1/status") return req.method === "GET"
+        ? send(200, runtime) : send(405, { error: "method not allowed" });
       if (url.pathname === "/v1/pair/hello" || url.pathname === "/v1/pair/join") {
         tokenAttempts = tokenAttempts.filter((t) => Date.now() - t < 60_000);
         if (tokenAttempts.push(Date.now()) > TOKEN_REQS_PER_MIN) return send(429, { error: "too many pairing attempts; wait a minute" });
@@ -161,7 +166,7 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
         return send(200, localParty(node, n));
       }
       const peer = verifyHop(node, req.headers, req.method ?? "GET", url.pathname, body);
-      if (req.method === "POST" && url.pathname === "/v1/envelopes") {
+      if (req.method === "POST" && ["/v1/envelopes", "/v2/envelopes"].includes(url.pathname)) {
         const { envelopes } = JSON.parse(body) as { envelopes: unknown[] };
         if (!Array.isArray(envelopes) || envelopes.length > 200) return send(400, { error: "bad batch" });
         const results = envelopes.map((e) => ({ id: (e as Envelope)?.id, result: node.receive(e, peer) }));
@@ -194,8 +199,14 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
 // ---- client: outbox + directory --------------------------------------------------------------
 async function post(node: MbxNode, addr: string, path: string, obj: unknown) {
   const body = JSON.stringify(obj);
-  const res = await fetch(`http://${addr}${path}`, { method: "POST", headers: signHop(node, "POST", path, body), body, signal: AbortSignal.timeout(15_000) });
-  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+  const res = await fetch(`http://${addr}${path}`, { method: "POST", headers: signHop(node, "POST", path, body), body, redirect: "error", signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) {
+    if (path === "/v2/envelopes" && [404, 405, 501].includes(res.status)) {
+      await res.body?.cancel();
+      throw new Error("peer does not support verified-sender delivery (/v2/envelopes); upgrade the receiving AgentMBX; no legacy fallback");
+    }
+    throw new Error(`${res.status} ${await res.text()}`);
+  }
   return res.json();
 }
 
@@ -215,7 +226,9 @@ export async function flushOutbox(node: MbxNode, now = Date.now()): Promise<{ se
     const peer = node.approvedPeer(host);
     try {
       if (!peer) throw new Error("host is no longer paired");
-      const { results } = await post(node, peer.addr, "/v1/envelopes", { envelopes: rows.map((r) => JSON.parse(r.envelope)) }) as { results: { id: string; result: string }[] };
+      // This endpoint requires sender-proof-aware receivers. Never retry via v1: older
+      // receivers can grant policy authority to unverified or missing-marker envelopes.
+      const { results } = await post(node, peer.addr, "/v2/envelopes", { envelopes: rows.map((r) => JSON.parse(r.envelope)) }) as { results: { id: string; result: string }[] };
       for (const r of rows) {
         const res = results.find((x) => x.id === r.msg_id)?.result ?? "rejected:missing result";
         done(r.msg_id, host);
@@ -261,8 +274,8 @@ export function signedRecords(node: MbxNode): Signed<AnyRecord>[] {
   const db = node.store.db, now = new Date().toISOString(), since = new Date(Date.now() - 30 * 86_400_000).toISOString();
   const rs = db.prepare("SELECT record, sig FROM policy_revocations WHERE iat > ?").all(since) as { record: string; sig: string }[];
   const ds = db.prepare("SELECT record, sig FROM devices").all() as { record: string; sig: string }[];
-  const ps = db.prepare("SELECT record, sig FROM policies WHERE exp > ?").all(now) as { record: string; sig: string }[];
-  return [...rs, ...ds, ...ps].map((r) => ({ rec: JSON.parse(r.record) as AnyRecord, sig: r.sig })).sort((a, b) => (recordKey(a) < recordKey(b) ? -1 : 1));
+  const ps = storedPolicies(db).valid.filter(p => Date.parse(p.rec.exp) > Date.parse(now)).map(({ rec, sig }) => ({ rec, sig }));
+  return [...[...rs, ...ds].map((r) => ({ rec: JSON.parse(r.record) as AnyRecord, sig: r.sig })), ...ps].sort((a, b) => (recordKey(a) < recordKey(b) ? -1 : 1));
 }
 
 /** Send signed records to the paired hosts they concern. Returns per-host results; offline hosts get them on their next pull. */
