@@ -1,3 +1,4 @@
+import { sendLeased } from "./helpers/leased-send.ts";
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -53,7 +54,7 @@ async function holder(t: TestContext, cli: string) {
   const run = (event: string, session: unknown = sid, provider = cli, extraEnv: Record<string,string> = {}) => spawnSync(process.execPath,
     [resolve("bin/agentmbx.js"), "hook", event, "--cli", provider], { input: JSON.stringify({ session_id: session, cwd: process.cwd() }),
       encoding: "utf8", timeout: 10_000, env: { ...process.env, MBX_HOME: home, MBX_AGENT: "unrelated", AGENTMBX_DEV: "1", ...extraEnv } });
-  const send = (to = agent) => n.send({ from: "sender", to: [to], subject: "PRIVATE SUBJECT", body: "SECRET BODY", kind: "request" }).envelope.id;
+  const send = (to = agent) => sendLeased(n, { from: "sender", to: [to], subject: "PRIVATE SUBJECT", body: "SECRET BODY", kind: "request" }).envelope.id;
   return { n, call, agent, sid, run, send };
 }
 
@@ -81,7 +82,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} hooks re
   n.ack(id, agent);
   n.send({ from: "claimed", to: [agent], subject: "unverified", body: "not delegated", kind: "request", unverifiedSender: true });
   const unverified = run("stop"); assert.equal(unverified.status, 0, unverified.stderr); assert.equal(unverified.stdout, "");
-  n.send({ from: "sender", to: [agent], subject: "over relay limit", body: "not delegated", kind: "request", hop: 1000 });
+  sendLeased(n, { from: "sender", to: [agent], subject: "over relay limit", body: "not delegated", kind: "request", hop: 1000 });
   assert.equal(run("stop").stdout, "");
   assert.notEqual((await call("mbx_identity", { action: "release" })).isError, true);
   const before = n.store.db.prepare("SELECT * FROM sessions").all();
@@ -111,7 +112,7 @@ test("unleased hooks neither rebind legacy sessions nor reveal mailbox counts", 
   const home = mkdtempSync(join(tmpdir(), "mbx-hook-legacy-")), n = new MbxNode(home, { host: "alpha" });
   t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
   n.bindSession({ agent: "builder", cli: "kimi", session_id: "legacy", pid: process.pid });
-  n.send({ from: "sender", to: ["builder"], subject: "private", body: "private" });
+  sendLeased(n, { from: "sender", to: ["builder"], subject: "private", body: "private" });
   const before = n.store.db.prepare("SELECT * FROM sessions").all();
   for (const event of ["prompt", "stop", "session-start"]) {
     const r = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", event, "--cli", "kimi"], {
@@ -177,4 +178,16 @@ test("Claude new session refuses two MCP holders sharing a parent", async t => {
   const r = run("prompt", "new-ambiguous-session"); assert.equal(r.status, 0, r.stderr); assert.equal(r.stdout, "");
   assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before);
   assert.equal(n.unreadCount(agent), 1);
+});
+
+for (const cli of ["claude", "codex", "kimi"]) test(`${cli} Stop honors a directly signed owner request without a broad policy`, async t => {
+  const { n, agent, run } = await holder(t, cli);
+  assert.equal(run("prompt").status, 0);
+  n.store.db.prepare("DELETE FROM policies").run();
+  const owner = unlockOwnerKey(n.home, "test-only-passphrase");
+  await n.sendAsOwner({ from: "owner", to: [agent], subject: "owner task", body: "signed instruction", kind: "request" },
+    async payload => ({ sig: signData(owner.privateKey, payload) }));
+  const r = run("stop");
+  if (cli === "kimi") { assert.equal(r.status, 2); assert.match(r.stderr, /Before stopping/); }
+  else { assert.equal(r.status, 0, r.stderr); assert.equal(JSON.parse(r.stdout).decision, "block"); }
 });

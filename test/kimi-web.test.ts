@@ -1,3 +1,4 @@
+import { sendLeased } from "./helpers/leased-send.ts";
 // Waking kimi web-hosted kimi sessions (T049): hosted-session detection from $KIMI_CODE_HOME/server/instances,
 // the prompts/status REST shape against a fake HTTP server, the busy gate in dispatchWakes, and the shared
 // wake brake + desktop fallback. All kimi-home dirs here are isolated temp dirs; KIMI_CODE_HOME is only ever
@@ -87,7 +88,7 @@ for (const concurrent of [false, true]) test(`busy race releases only its reserv
   });
   await withKimiHome(kimiHomeWithInstance(12345), async () => {
     bindWakeLease(n, { agent: "web", cli: "kimi", session_id: "session_race", pid: process.pid });
-    n.send({ from: "boss", to: ["web"], subject: "race", body: "check inbox", kind: "request" });
+    sendLeased(n, { from: "boss", to: ["web"], subject: "race", body: "check inbox", kind: "request" });
     const first = await dispatchWakes(n);
     assert.equal(first[0].result.ok, false);
     assert.match(err(first[0].result as WakeResult), /busy/);
@@ -120,7 +121,7 @@ test("reservation is retained if an earlier adapter attempt failed before the bu
   await withKimiHome(kimiHomeWithInstance(12345), async () => {
     for (const session_id of ["session_first", "session_second"])
       bindWakeLease(n, { agent: "web", cli: "kimi", session_id, pid: process.pid });
-    n.send({ from: "boss", to: ["web"], subject: "race", body: "check inbox", kind: "request" });
+    sendLeased(n, { from: "boss", to: ["web"], subject: "race", body: "check inbox", kind: "request" });
     assert.match(err((await dispatchWakes(n))[0].result as WakeResult), /busy/);
     assert.equal(calls, 3);
     assert.equal((n.store.db.prepare("SELECT count(*) n FROM wakes").get() as { n: number }).n, 1);
@@ -234,7 +235,7 @@ test("dispatchWakes wakes a hosted kimi session with the shared brake and no des
   await withKimiHome(home, async () => {
     n.registerAgent("web");
     bindWakeLease(n, { agent: "web", cli: "kimi", session_id: "session_t049", pid: process.pid });
-    n.send({ from: "boss", to: ["web"], subject: "ping", body: "check your inbox", kind: "request" });
+    sendLeased(n, { from: "boss", to: ["web"], subject: "ping", body: "check your inbox", kind: "request" });
     const out = await dispatchWakes(n);
     assert.deepEqual(out.map((o) => [o.agent, o.result.ok, o.result.via]), [["web", true, "kimi web"]]);
     assert.deepEqual(deliveries(n), [{ state: "notified", note: null }]);
@@ -257,7 +258,7 @@ test("a busy hosted session is skipped without spending the brake, and is woken 
   await withKimiHome(home, async () => {
     n.registerAgent("web");
     bindWakeLease(n, { agent: "web", cli: "kimi", session_id: "session_t049", pid: process.pid });
-    n.send({ from: "boss", to: ["web"], subject: "ping", body: "one", kind: "request" });
+    sendLeased(n, { from: "boss", to: ["web"], subject: "ping", body: "one", kind: "request" });
     const first = await dispatchWakes(n);
     assert.equal(first[0].result.ok, false);
     assert.match(err(first[0].result as WakeResult), /busy/);
@@ -280,9 +281,9 @@ test("the shared wake brake batches a second wake inside 30 s (same as the other
   await withKimiHome(home, async () => {
     n.registerAgent("web");
     bindWakeLease(n, { agent: "web", cli: "kimi", session_id: "session_t049", pid: process.pid });
-    n.send({ from: "boss", to: ["web"], subject: "one", body: "x", kind: "request" });
+    sendLeased(n, { from: "boss", to: ["web"], subject: "one", body: "x", kind: "request" });
     assert.equal((await dispatchWakes(n))[0].result.ok, true);
-    n.send({ from: "boss", to: ["web"], subject: "two", body: "y", kind: "request" });
+    sendLeased(n, { from: "boss", to: ["web"], subject: "two", body: "y", kind: "request" });
     const out = await dispatchWakes(n);
     assert.equal(out.length, 0, "batched: no result row, mail accumulates into one wake");
     assert.equal(seen.filter((s) => s.method === "POST").length, 1, "no second HTTP wake within the brake window");
@@ -299,7 +300,7 @@ test("terminal kimi sessions are never woken: the wake falls back to the desktop
   await withKimiHome(home, async () => {
     n.registerAgent("term");
     bindWakeLease(n, { agent: "term", cli: "kimi", session_id: "session_term", pid: process.pid });
-    n.send({ from: "boss", to: ["term"], subject: "ping", body: "check your inbox", kind: "request" });
+    sendLeased(n, { from: "boss", to: ["term"], subject: "ping", body: "check your inbox", kind: "request" });
     const out = await dispatchWakes(n);
     assert.equal(out.length, 1);
     assert.equal(out[0].result.ok, false);
@@ -317,7 +318,7 @@ test("mail that only reached the desktop is retried when a hosted kimi session b
   const n = new MbxNode(tmp(), { host: "alpha" });
   await withKimiHome(home, async () => {
     n.registerAgent("web");
-    const id = n.send({ from: "boss", to: ["web"], subject: "s", body: "b", kind: "request" }).envelope.id;
+    const id = sendLeased(n, { from: "boss", to: ["web"], subject: "s", body: "b", kind: "request" }).envelope.id;
     n.setDelivery(id, "web", "notified", "desktop");
     bindWakeLease(n, { agent: "web", cli: "kimi", session_id: "session_t049", pid: process.pid });
     assert.equal((n.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=?").get(id) as { state: string }).state, "delivered", "a hosted binding re-queues desktop-only mail for a real wake");
@@ -332,7 +333,7 @@ for (const change of ["release-before-post", "policy-before-post", "ack-before-p
   let statusCalls = 0, prompts = 0, id = "";
   await withKimiHome(kimiHomeWithInstance(12345), async () => {
     const holder = bindWakeLease(n, { agent: "web", cli: "kimi", session_id: "session_fence", pid: process.pid });
-    id = n.send({ from: "boss", to: ["web"], subject: "guarded", body: "private", kind: "request" }).envelope.id;
+    id = sendLeased(n, { from: "boss", to: ["web"], subject: "guarded", body: "private", kind: "request" }).envelope.id;
     const mutate = () => {
       if (change.startsWith("release")) holder.release();
       else if (change.startsWith("policy")) n.store.db.prepare("UPDATE policies SET revoked=1").run();
@@ -362,7 +363,7 @@ for (const downgrade of ["unverified", "relay-limit", "no-policy"]) test(`daemon
   await withKimiHome(kimiHomeWithInstance(12345), async () => {
     bindWakeLease(n, { agent: "web", cli: "kimi", session_id: "session_policy", pid: process.pid });
     if (downgrade === "no-policy") n.store.db.prepare("UPDATE policies SET revoked=1").run();
-    const id = n.send({ from: "claimed", to: ["web"], subject: "ask", body: "private", kind: "request",
+    const id = sendLeased(n, { from: "claimed", to: ["web"], subject: "ask", body: "private", kind: "request",
       unverifiedSender: downgrade === "unverified", hop: downgrade === "relay-limit" ? 1000 : undefined }).envelope.id;
     let calls = 0; t.mock.method(globalThis, "fetch", async () => { calls++; throw new Error("must not call provider"); });
     await dispatchWakes(n);

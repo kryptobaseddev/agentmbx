@@ -1,3 +1,4 @@
+import { sendLeased } from "./helpers/leased-send.ts";
 // Drive `mbx mcp` with the official MCP client over stdio.
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -80,8 +81,8 @@ test("channel mode: a new request pushes a notifications/claude/channel wake wit
   const n = new MbxNode(home);
   delegateWake(n, "sleeper");
   n.send({ from: "claimed", to: ["sleeper"], subject: "unverified", body: "ignored for wake", kind: "request", unverifiedSender: true });
-  n.send({ from: "boss", to: ["sleeper"], subject: "wake up", body: "SECRET-BODY-TEXT", kind: "request" });
-  n.send({ from: "boss", to: ["sleeper"], subject: "fyi", body: "status only", kind: "status" });
+  sendLeased(n, { from: "boss", to: ["sleeper"], subject: "wake up", body: "SECRET-BODY-TEXT", kind: "request" });
+  sendLeased(n, { from: "boss", to: ["sleeper"], subject: "fyi", body: "status only", kind: "status" });
   for (let i = 0; i < 20 && !notes.length; i++) await new Promise((r) => setTimeout(r, 250));
   assert.equal(notes.length, 1);
   const p = notes[0] as { content: string; meta: { count: string } };
@@ -208,7 +209,7 @@ test("channel mode ignores retired links and preserves separate mailbox deliveri
     delegateWake(n, "primary");
     n.store.set("ident:shell-alias", "primary");
     n.bindSession({ agent: "separate", cli: "kimi", session_id: "separate-thread", pid: process.pid });
-    const send = (to: string) => n.send({ from: "sender", to: [to], subject: "PRIVATE SUBJECT", body: "SECRET BODY", kind: "request" }).envelope.id;
+    const send = (to: string) => sendLeased(n, { from: "sender", to: [to], subject: "PRIVATE SUBJECT", body: "SECRET BODY", kind: "request" }).envelope.id;
     const id = send("shell-alias"), separate = send("separate");
     send("primary");
     for (let i = 0; i < 25 && !notes.length; i++) await new Promise(r => setTimeout(r, 100));

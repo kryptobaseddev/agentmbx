@@ -18,7 +18,7 @@ import { periodicUpdateCheck, updateAvailable, updateCommand } from "./update.js
 import { installKind, version } from "./version.js";
 import { installService, serviceLabel, uninstallService } from "./service.js";
 import { CLIS, defaultHostName, defaultWhich, formatRows, ownerStep, resolveCommand, runSetup, shJoin } from "./setup.js";
-import { dispatchWakes, inboxCommand, macNotifierPath, notifyDesktop, opencodeService } from "./wake.js";
+import { dispatchWakes, hasWakeAuthority, inboxCommand, macNotifierPath, notifyDesktop, opencodeService } from "./wake.js";
 import { kimiHostedServer } from "./kimi-web.js";
 import { approveKimi, decidePermission, opencodePermissionPass } from "./permission.js";
 import { listIdentityStatus } from "./identity-status.js";
@@ -783,7 +783,6 @@ async function hook(node, event, cli) {
     try {
         return withProcSnapshot(() => withHookIdentity(node, cli, sid, (agent, descriptor, bootstrap) => {
             entered = true;
-            const delegated = () => activePolicies(node.store.db, agent, node.host).length > 0;
             if ((event === "prompt" || event === "session-start") && sid) {
                 // Claude /clear keeps its MCP holder but replaces its real session ID. Use the
                 // guarded holder's existing key explicitly; bindSession never guesses across real sessions.
@@ -838,12 +837,12 @@ async function hook(node, event, cli) {
             }
             if (event === "stop") {
                 // Keep going instead of going idle when mail that wants this agent arrived during the turn, but only when the
-                // owner has delegated work to it (a policy), only for mail newer than what was already surfaced, within the wake caps.
-                if (!["claude", "codex", "kimi"].includes(cli) || !delegated())
+                // owner has delegated work or signed the request, only for mail newer than what was already surfaced, within the wake caps.
+                if (!["claude", "codex", "kimi"].includes(cli))
                     return;
                 const mark = `stopseen:${cli}:${sid ?? process.ppid}`, seen = node.store.get(mark) ?? new Date(Date.now() - 10 * 60_000).toISOString();
                 const fresh = node.inbox(agent, { limit: 50 })
-                    .filter(m => m.received_at > seen && m.from_addr !== `${agent}@${node.host}` && node.wantsWake(agent, m) && node.policyFor(m, agent).level !== "ask");
+                    .filter(m => m.received_at > seen && m.from_addr !== `${agent}@${node.host}` && node.wantsWake(agent, m) && hasWakeAuthority(node, agent, m));
                 if (!fresh.length)
                     return;
                 node.store.set(mark, fresh.map((m) => m.received_at).sort().at(-1));

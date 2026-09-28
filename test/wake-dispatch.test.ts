@@ -1,3 +1,4 @@
+import { sendLeased } from "./helpers/leased-send.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
@@ -34,7 +35,7 @@ for (const invalid of ["dead-pid", "reused-pid", "missing-birth", "expired", "no
       // Both rows are expired: no adapter may be called.
     }
     if (invalid === "stale-channel" || invalid === "live-channel") n.store.db.prepare("UPDATE sessions SET channel=1,cli='claude' WHERE session_id=?").run(bad);
-    n.send({ from: "sender", to: ["worker"], subject: "wake", body: "private body", kind: "request" });
+    sendLeased(n, { from: "sender", to: ["worker"], subject: "wake", body: "private body", kind: "request" });
     const out = await dispatchWakes(n);
     if (invalid === "live-channel") {
       assert.equal(existsSync(log), false);
@@ -64,7 +65,7 @@ for (const defect of ["released", "generation", "key", "parent", "missing-contro
   const old = { MBX_CODEX_BIN: process.env.MBX_CODEX_BIN, MBX_TEST_WAKE_LOG: process.env.MBX_TEST_WAKE_LOG, MBX_NO_DESKTOP: process.env.MBX_NO_DESKTOP };
   Object.assign(process.env, { MBX_CODEX_BIN: bin, MBX_TEST_WAKE_LOG: log, MBX_NO_DESKTOP: "1" });
   t.after(() => { for (const [k,v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
-  n.send({ from: "sender", to: ["worker"], subject: "retained", body: "private", kind: "request" });
+  sendLeased(n, { from: "sender", to: ["worker"], subject: "retained", body: "private", kind: "request" });
   await dispatchWakes(n); assert.equal(existsSync(log), false); assert.equal(n.unreadCount("worker"), 1);
 });
 
@@ -98,7 +99,7 @@ test("daemon routes an actual MCP holder and refuses its stale binding after rel
   const agent = ((await call("mbx_whoami")).structuredContent as { agent: string }).agent;
   delegateWake(n, agent);
   const original = n.sessionsFor(agent)[0];
-  n.send({ from: "sender", to: [agent], subject: "wake", body: "private", kind: "request" });
+  sendLeased(n, { from: "sender", to: [agent], subject: "wake", body: "private", kind: "request" });
   assert.equal((await dispatchWakes(n))[0].result.ok, true);
   assert.equal(readFileSync(log, "utf8"), threadId + "\n");
   assert.notEqual((await call("mbx_identity", { action: "release" })).isError, true);
@@ -106,7 +107,7 @@ test("daemon routes an actual MCP holder and refuses its stale binding after rel
   n.store.db.prepare(`INSERT INTO sessions (agent,cli,session_id,pid,pid_start,session_key,channel,updated_at)
     VALUES (?,?,?,?,?,?,?,?)`).run(original.agent, original.cli, original.session_id, original.pid, original.pid_start, original.session_key, original.channel, original.updated_at);
   n.store.db.prepare("DELETE FROM wakes").run();
-  n.send({ from: "sender", to: [agent], subject: "retained", body: "private", kind: "request" });
+  sendLeased(n, { from: "sender", to: [agent], subject: "retained", body: "private", kind: "request" });
   await dispatchWakes(n);
   assert.equal(readFileSync(log, "utf8"), threadId + "\n", "released binding never submits another prompt");
   assert.equal(n.unreadCount(agent), 2);

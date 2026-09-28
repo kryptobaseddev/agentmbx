@@ -492,7 +492,7 @@ export class MbxNode {
     // A prebuilt owner-signed envelope is immutable: changing metadata would invalidate its approval.
     if (prebuilt?.meta.sender_verification === "leased" && (e.from !== `${fromName}@${this.host}` || !hasHeldIdentity(this.store, fromName)))
       throw new Error("prebuilt sender attestation requires the current identity lease");
-    if (!prebuilt && !d.unverifiedSender && hasHeldIdentity(this.store, fromName)) e.meta.sender_verification = "leased";
+    if (!prebuilt) e.meta.sender_verification = !d.unverifiedSender && hasHeldIdentity(this.store, fromName) ? "leased" : "unverified";
     if (owner) e = ownerSign(e, owner.pub, owner.priv);
     else if (session?.grant) e = attachAuthority(e, session.grant, session.priv);
     e = signEnvelope(e, this.host, this.key.publicKey, this.key.privateKey);
@@ -595,7 +595,10 @@ export class MbxNode {
   /** The owner policy that applies to `agent` acting on this message (computed now: expiry/revocation count). */
   policyFor(m: MessageRow, agent: string) {
     const [fromAgent, fromHost] = m.from_addr.split("@");
-    return effectivePolicy(this.store.db, { agent, host: this.host, fromAgent, fromHost: m.origin === "local" ? this.host : fromHost, envelope: JSON.parse(m.envelope) as Envelope });
+    const envelope = JSON.parse(m.envelope) as Envelope;
+    const key = m.origin === "local" && fromHost === this.host ? this.key.publicKey : m.origin === fromHost && m.trust === "verified" ? this.approvedPeer(fromHost)?.pubkey : undefined;
+    const senderVerified = !!key && envelope.from === m.from_addr && envelope.sig?.host === fromHost && verifyEnvelope(envelope, key);
+    return effectivePolicy(this.store.db, { agent, host: this.host, fromAgent, fromHost, envelope, senderVerified });
   }
 
   /** A thread's messages, oldest first; with `agent`, only the ones that agent can see. */
@@ -662,7 +665,7 @@ export function trustLabel(m: MessageRow): string {
   const auth = !a ? "authority: none"
     : a.ok ? (a.session === "signed by the owner" ? "authority: OWNER (signed by the owner directly)" : `authority: OWNER via ${m.from_addr} session ${a.session} (caps: ${a.caps!.join(", ")})`)
     : `authority: none (owner authority claimed but rejected: ${a.reason})`;
-  const sender = (JSON.parse(m.envelope) as Envelope).meta?.sender_verification === "unverified" ? " · unverified-sender (claimed identity has no verified lease)" : "";
+  const sender = (JSON.parse(m.envelope) as Envelope).meta?.sender_verification !== "leased" && !(m.authority && JSON.parse(m.authority).ok) ? " · unverified-sender (claimed identity has no verified lease)" : "";
   return `${t} · ${auth}${sender}`;
 }
 
