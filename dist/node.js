@@ -579,10 +579,33 @@ export class MbxNode {
             .run(e.from.split("@")[0], via, new Date().toISOString());
         return stored ? "accepted" : "duplicate";
     }
+    /** Current authority is distinct from the immutable receipt stored when mail arrived. */
+    authorityFor(m) {
+        try {
+            const e = JSON.parse(m.envelope);
+            if (!e.authority)
+                return null;
+            if (checkShape(e))
+                return { ok: false, reason: "stored message structure is invalid" };
+            const host = m.from_addr.split("@")[1], local = m.origin === "local" && host === this.host;
+            const peer = !local && m.origin === host && m.trust === "verified" ? this.approvedPeer(host) : undefined;
+            const key = local ? this.key.publicKey : peer?.pubkey;
+            if (!key || e.from !== m.from_addr || e.sig?.host !== host || !verifyEnvelope(e, key))
+                return { ok: false, reason: "sending host signature or current pairing is not verified" };
+            return checkAuthority(e, local ? this.ownerPub : peer?.owner_pubkey ?? null, this.revoked());
+        }
+        catch {
+            return { ok: false, reason: "stored owner authority could not be verified" };
+        }
+    }
+    currentAuthority(m) {
+        const authority = this.authorityFor(m);
+        return { ...m, authority: authority ? JSON.stringify(authority) : null };
+    }
     // ---- reading -----------------------------------------------------------------------------
     inbox(agent, opts = {}) {
         return this.store.db.prepare(`SELECT m.*, d.state FROM deliveries d JOIN messages m ON m.id=d.msg_id
-      WHERE d.agent=? ${opts.all ? "" : "AND d.state <> 'acked'"} ORDER BY m.ts LIMIT ?`).all(agent, opts.limit ?? 50);
+      WHERE d.agent=? ${opts.all ? "" : "AND d.state <> 'acked'"} ORDER BY m.ts LIMIT ?`).all(agent, opts.limit ?? 50).map(m => this.currentAuthority(m));
     }
     unreadCount(agent) {
         return this.store.db.prepare("SELECT count(*) n FROM deliveries WHERE agent=? AND state <> 'acked'").get(agent).n;
@@ -598,7 +621,7 @@ export class MbxNode {
         const rows = this.store.db.prepare(`SELECT m.* FROM messages m WHERE m.id LIKE ? ${visibility} LIMIT 6`).all(`${id}%`, ...scope);
         if (rows.length > 1)
             throw Object.assign(new Error(`id prefix ${id} matches ${rows.length === 6 ? "6+" : rows.length} messages (${rows.slice(0, 3).map((r) => r.id).join(", ")}…); use more characters`), { code: "AMBIGUOUS" });
-        return rows[0];
+        return rows[0] ? this.currentAuthority(rows[0]) : undefined;
     }
     /**
      * Can `agent` (or a name linked to its session) see this message: it sent it or it was delivered to it. Everything
@@ -649,7 +672,7 @@ export class MbxNode {
     /** A thread's messages, oldest first; with `agent`, only the ones that agent can see. */
     thread(thread, agent) {
         const rows = this.store.db.prepare("SELECT * FROM messages WHERE thread=? ORDER BY ts").all(thread);
-        return agent ? rows.filter((m) => this.canSee(m, agent)) : rows;
+        return (agent ? rows.filter((m) => this.canSee(m, agent)) : rows).map(m => this.currentAuthority(m));
     }
     /** Full-text search; with `agent`, only messages that agent can see. */
     search(q, limit = 20, agent) {
@@ -664,7 +687,7 @@ export class MbxNode {
       OR EXISTS (SELECT 1 FROM deliveries d WHERE d.msg_id=m.id AND d.agent=names.value))` : "";
         const scope = agent ? [JSON.stringify([agent, ...this.linkedNames(agent)]), this.host] : [];
         return this.store.db.prepare(`SELECT m.* FROM messages_fts f JOIN messages m ON m.rowid=f.rowid WHERE messages_fts MATCH ?
-      ${visibility} ORDER BY rank LIMIT ?`).all(fts, ...scope, limit);
+      ${visibility} ORDER BY rank LIMIT ?`).all(fts, ...scope, limit).map(m => this.currentAuthority(m));
     }
     setDelivery(id, agent, s, note = null) { return this.store.setDelivery(id, agent, s, note); }
     // ---- wake brake --------------------------------------------------------------------------
@@ -703,7 +726,7 @@ export class MbxNode {
 }
 // ---- presentation (shared by CLI and MCP) -----------------------------------------------------
 /** A message framed for `agent`, with the policy line computed on this host. */
-export const formatFor = (node, m, agent) => formatMessage(m, policyLine(node.policyFor(m, agent)));
+export const formatFor = (node, m, agent) => formatMessage(node.currentAuthority(m), policyLine(node.policyFor(m, agent)));
 /** Structural guard for legacy cached authority; this does not revalidate key revocation or expiry. */
 export function storedAuthority(m) {
     if (!m.authority)

@@ -39,3 +39,31 @@ test("session status follows rename, counts linked mail, and rejects stale or un
     assert.notEqual(run("mcp-session").status, 0);
   } finally { n.close(); }
 });
+
+for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} status revalidates owner claims after revocation`, async t => {
+  const { writeFileSync, rmSync } = await import("node:fs");
+  const { generateKeyPair } = await import("../src/crypto.ts");
+  const { makeGrant } = await import("../src/envelope.ts");
+  const home = mkdtempSync(join(tmpdir(), "mbx-status-authority-"));
+  const owner = generateKeyPair(), session = generateKeyPair();
+  writeFileSync(join(home, "owner.json"), JSON.stringify({ backend: "keychain", public_key: owner.publicKey }), { mode: 0o600 });
+  const n = new MbxNode(home, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  n.bindSession({ agent: "worker", cli, session_id: "status-authority", pid: process.pid });
+  const grant = makeGrant(owner.publicKey, owner.privateKey, session.publicKey, "master", "alpha", ["task.assign"], 1);
+  const id = n.send({ from: "master", to: ["worker"], subject: "PRIVATE", body: "SECRET", kind: "task" },
+    { pub: session.publicKey, priv: session.privateKey, grant }).envelope.id;
+  const status = () => {
+    const r = spawnSync(process.execPath, ["bin/agentmbx.js", "status", "--cli", cli, "--session", "status-authority", "--json"],
+      { encoding: "utf8", env: { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1" } });
+    assert.equal(r.status, 0, r.stderr);
+    assert.doesNotMatch(r.stdout, /PRIVATE|SECRET/);
+    return JSON.parse(r.stdout);
+  };
+  assert.equal(status().owner_authority, 1);
+  n.store.db.prepare("INSERT INTO grants VALUES (?,?,?,?,1)").run(grant.id, grant.sub, JSON.stringify(grant), grant.exp);
+  assert.equal(status().owner_authority, 0);
+  assert.equal(status().unread, 1);
+  const raw = n.store.db.prepare("SELECT authority FROM messages WHERE id=?").get(id) as { authority: string };
+  assert.equal(JSON.parse(raw.authority).ok, true, "historical receipt is retained");
+});

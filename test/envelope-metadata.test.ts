@@ -37,7 +37,8 @@ test("paired signed mail rejects malformed metadata before storing or waking", a
     assert.equal(b.wantsWake("worker", stored), false);
     assert.match(b.policyFor(stored, "worker").notes.join(" "), /malformed-envelope/);
     assert.match(formatFor(b, stored, "worker"), /hello @worker/);
-    assert.match(formatFor(b, stored, "worker"), /authority: none.*stored message structure is invalid/);
+    assert.match(formatFor(b, stored, "worker"), /authority: none/);
+    assert.doesNotMatch(formatFor(b, stored, "worker"), /authority: OWNER/);
     assert.doesNotMatch(summaryLine(stored), /OWNER/);
     assert.doesNotMatch(wakeText("worker", [stored]), /OWNER-authority/);
     assert.equal(b.message(e.id)!.envelope, JSON.stringify(e));

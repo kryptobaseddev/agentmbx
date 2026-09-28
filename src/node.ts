@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fingerprint, generateKeyPair, newPairToken, pairTokenKey, sha256, type KeyPair } from "./crypto.ts";
 import {
   attachAuthority, buildEnvelope, ownerSign, ownerSignRequest, withOwnerSig, checkAuthority, checkShape, NAME_RE, signEnvelope, verifyEnvelope,
-  type Draft, type Envelope, type Grant,
+  type Draft, type AuthorityCheck, type Envelope, type Grant,
 } from "./envelope.ts";
 import { kimiHostedServer } from "./kimi-web.ts";
 import { ownerPublicKey } from "./owner.ts";
@@ -523,10 +523,30 @@ export class MbxNode {
     return stored ? "accepted" : "duplicate";
   }
 
+  /** Current authority is distinct from the immutable receipt stored when mail arrived. */
+  authorityFor(m: MessageRow): AuthorityCheck | null {
+    try {
+      const e = JSON.parse(m.envelope) as Envelope;
+      if (!e.authority) return null;
+      if (checkShape(e)) return { ok: false, reason: "stored message structure is invalid" };
+      const host = m.from_addr.split("@")[1], local = m.origin === "local" && host === this.host;
+      const peer = !local && m.origin === host && m.trust === "verified" ? this.approvedPeer(host) : undefined;
+      const key = local ? this.key.publicKey : peer?.pubkey;
+      if (!key || e.from !== m.from_addr || e.sig?.host !== host || !verifyEnvelope(e, key))
+        return { ok: false, reason: "sending host signature or current pairing is not verified" };
+      return checkAuthority(e, local ? this.ownerPub : peer?.owner_pubkey ?? null, this.revoked());
+    } catch { return { ok: false, reason: "stored owner authority could not be verified" }; }
+  }
+
+  currentAuthority(m: MessageRow): MessageRow {
+    const authority = this.authorityFor(m);
+    return { ...m, authority: authority ? JSON.stringify(authority) : null };
+  }
+
   // ---- reading -----------------------------------------------------------------------------
   inbox(agent: string, opts: { all?: boolean; limit?: number } = {}): MessageRow[] {
-    return this.store.db.prepare(`SELECT m.*, d.state FROM deliveries d JOIN messages m ON m.id=d.msg_id
-      WHERE d.agent=? ${opts.all ? "" : "AND d.state <> 'acked'"} ORDER BY m.ts LIMIT ?`).all(agent, opts.limit ?? 50) as never;
+    return (this.store.db.prepare(`SELECT m.*, d.state FROM deliveries d JOIN messages m ON m.id=d.msg_id
+      WHERE d.agent=? ${opts.all ? "" : "AND d.state <> 'acked'"} ORDER BY m.ts LIMIT ?`).all(agent, opts.limit ?? 50) as unknown as MessageRow[]).map(m => this.currentAuthority(m));
   }
 
   unreadCount(agent: string): number {
@@ -543,7 +563,7 @@ export class MbxNode {
     const scope = agent ? [JSON.stringify([agent, ...this.linkedNames(agent)]), this.host] : [];
     const rows = this.store.db.prepare(`SELECT m.* FROM messages m WHERE m.id LIKE ? ${visibility} LIMIT 6`).all(`${id}%`, ...scope) as unknown as MessageRow[];
     if (rows.length > 1) throw Object.assign(new Error(`id prefix ${id} matches ${rows.length === 6 ? "6+" : rows.length} messages (${rows.slice(0, 3).map((r) => r.id).join(", ")}…); use more characters`), { code: "AMBIGUOUS" });
-    return rows[0];
+    return rows[0] ? this.currentAuthority(rows[0]) : undefined;
   }
 
   /**
@@ -594,7 +614,7 @@ export class MbxNode {
   /** A thread's messages, oldest first; with `agent`, only the ones that agent can see. */
   thread(thread: string, agent?: string): MessageRow[] {
     const rows = this.store.db.prepare("SELECT * FROM messages WHERE thread=? ORDER BY ts").all(thread) as unknown as MessageRow[];
-    return agent ? rows.filter((m) => this.canSee(m, agent)) : rows;
+    return (agent ? rows.filter((m) => this.canSee(m, agent)) : rows).map(m => this.currentAuthority(m));
   }
 
   /** Full-text search; with `agent`, only messages that agent can see. */
@@ -608,8 +628,8 @@ export class MbxNode {
         AND substr(m.from_addr,1,instr(m.from_addr,'@')-1)=names.value)
       OR EXISTS (SELECT 1 FROM deliveries d WHERE d.msg_id=m.id AND d.agent=names.value))` : "";
     const scope = agent ? [JSON.stringify([agent, ...this.linkedNames(agent)]), this.host] : [];
-    return this.store.db.prepare(`SELECT m.* FROM messages_fts f JOIN messages m ON m.rowid=f.rowid WHERE messages_fts MATCH ?
-      ${visibility} ORDER BY rank LIMIT ?`).all(fts, ...scope, limit) as never;
+    return (this.store.db.prepare(`SELECT m.* FROM messages_fts f JOIN messages m ON m.rowid=f.rowid WHERE messages_fts MATCH ?
+      ${visibility} ORDER BY rank LIMIT ?`).all(fts, ...scope, limit) as unknown as MessageRow[]).map(m => this.currentAuthority(m));
   }
 
   setDelivery(id: string, agent: string, s: DeliveryState, note: string | null = null) { return this.store.setDelivery(id, agent, s, note); }
@@ -648,7 +668,7 @@ export class MbxNode {
 
 // ---- presentation (shared by CLI and MCP) -----------------------------------------------------
 /** A message framed for `agent`, with the policy line computed on this host. */
-export const formatFor = (node: MbxNode, m: MessageRow, agent: string) => formatMessage(m, policyLine(node.policyFor(m, agent)));
+export const formatFor = (node: MbxNode, m: MessageRow, agent: string) => formatMessage(node.currentAuthority(m), policyLine(node.policyFor(m, agent)));
 
 /** Structural guard for legacy cached authority; this does not revalidate key revocation or expiry. */
 export function storedAuthority(m: MessageRow): { ok: boolean; caps?: string[]; session?: string; reason?: string } | null {
