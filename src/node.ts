@@ -617,6 +617,7 @@ export class MbxNode {
   // ---- wake brake --------------------------------------------------------------------------
   wantsWake(agent: string, m: MessageRow): boolean {
     const e = JSON.parse(m.envelope) as Envelope;
+    if (checkShape(e)) return false;
     return WAKE_KINDS.has(e.kind) || e.needs_reply || e.meta.mentions.some((x) => x === agent || x === `${agent}@${this.host}`);
   }
 
@@ -649,9 +650,16 @@ export class MbxNode {
 /** A message framed for `agent`, with the policy line computed on this host. */
 export const formatFor = (node: MbxNode, m: MessageRow, agent: string) => formatMessage(m, policyLine(node.policyFor(m, agent)));
 
+/** Structural guard for legacy cached authority; this does not revalidate key revocation or expiry. */
+export function storedAuthority(m: MessageRow): { ok: boolean; caps?: string[]; session?: string; reason?: string } | null {
+  if (!m.authority) return null;
+  if (checkShape(JSON.parse(m.envelope))) return { ok: false, reason: "stored message structure is invalid" };
+  return JSON.parse(m.authority);
+}
+
 export function trustLabel(m: MessageRow): string {
   const t = m.trust === "local" ? "local (same user on this host)" : m.trust === "verified" ? `verified (paired host ${m.origin})` : "legacy (unsigned v2)";
-  const a = m.authority ? JSON.parse(m.authority) as { ok: boolean; caps?: string[]; session?: string; reason?: string } : null;
+  const a = storedAuthority(m);
   const auth = !a ? "authority: none"
     : a.ok ? (a.session === "signed by the owner" ? "authority: OWNER (signed by the owner directly)" : `authority: OWNER via ${m.from_addr} session ${a.session} (caps: ${a.caps!.join(", ")})`)
     : `authority: none (owner authority claimed but rejected: ${a.reason})`;
@@ -663,7 +671,7 @@ export function formatMessage(m: MessageRow, policy?: string): string {
   return [
     `# ${m.subject}`,
     `id: ${m.id}  ref: mbx:${m.id}@${e.sig?.host ?? "?"}  thread: ${m.thread}${m.reply_to ? `  reply_to: ${m.reply_to}` : ""}`,
-    `from: ${m.from_addr}  to: ${e.to.join(", ")}  kind: ${m.kind}${e.needs_reply ? " (needs reply)" : ""}  at: ${m.ts}${e.meta.project ? `  project: ${e.meta.project}` : ""}`,
+    `from: ${m.from_addr}  to: ${e.to.join(", ")}  kind: ${m.kind}${e.needs_reply ? " (needs reply)" : ""}  at: ${m.ts}${e.meta?.project && typeof e.meta.project === "string" ? `  project: ${e.meta.project}` : ""}`,
     `trust: ${trustLabel(m)}`,
     policy ?? "",
     e.refs.length ? `refs: ${e.refs.join(", ")}` : "",
@@ -675,6 +683,6 @@ export function formatMessage(m: MessageRow, policy?: string): string {
 
 export function summaryLine(m: MessageRow): string {
   const e = JSON.parse(m.envelope) as Envelope;
-  const flags = [m.kind, e.needs_reply ? "needs reply" : "", m.authority && JSON.parse(m.authority).ok ? "OWNER" : "", m.state ?? ""].filter(Boolean).join(", ");
+  const flags = [m.kind, e.needs_reply ? "needs reply" : "", storedAuthority(m)?.ok ? "OWNER" : "", m.state ?? ""].filter(Boolean).join(", ");
   return `${m.id}  ${m.ts.slice(0, 16)}Z  ${m.from_addr} → ${e.to.join(",")}  [${flags}]  ${m.subject}`;
 }

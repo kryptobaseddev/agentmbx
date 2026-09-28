@@ -10,10 +10,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { fingerprint, generateKeyPair } from "./crypto.ts";
-import { KINDS, MAX_RELAY_DEPTH, NAME_RE, type Envelope, type Grant } from "./envelope.ts";
+import { checkShape, KINDS, MAX_RELAY_DEPTH, NAME_RE, type Envelope, type Grant } from "./envelope.ts";
 import { kimiHostedServer } from "./kimi-web.ts";
 import { formatFor, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
-import { activePolicies, delegationNote } from "./policy.ts";
+import { activePolicies, delegationNote, MAX_HOP } from "./policy.ts";
 import { updateAvailable } from "./update.ts";
 import { version } from "./version.ts";
 import { wakeText } from "./wake.ts";
@@ -158,7 +158,9 @@ export async function runMcp(node = new MbxNode()) {
     }
     for (const r of rows) {
       if (r.from_addr === `${agent}@${node.host}`) continue;
-      const m = (JSON.parse(r.envelope) as Envelope).meta as { hop?: number; origin?: string };
+      const e = JSON.parse(r.envelope) as Envelope;
+      // Retained malformed mail is readable, but cannot erase unknown provenance.
+      const m = checkShape(e) ? { hop: MAX_HOP + 1, origin: "external" } : e.meta;
       state.parent ??= { hops: new Map(), externalAt: null };
       // Each depth keeps its own last exposure. Lower-depth mail cannot renew a higher one.
       state.parent.hops.set(m.hop ?? 0, now);
