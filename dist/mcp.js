@@ -166,11 +166,14 @@ export async function runMcp(node = new MbxNode()) {
     // relay tracking: a message this session sends after reading one is one hop further, and inherits an external origin
     const noteRead = (rows) => {
         const state = current(), { agent } = state;
+        const now = Date.now();
+        if (state.parent && now - state.parent.at >= 3_600_000)
+            state.parent = null;
         for (const r of rows) {
             if (r.from_addr === `${agent}@${node.host}`)
                 continue;
             const m = JSON.parse(r.envelope).meta;
-            state.parent = { hop: Math.max(state.parent?.hop ?? 0, m.hop ?? 0), external: (state.parent?.external ?? false) || m.origin === "external", at: Date.now() };
+            state.parent = { hop: Math.max(state.parent?.hop ?? 0, m.hop ?? 0), external: (state.parent?.external ?? false) || m.origin === "external", at: now };
         }
     };
     const relay = (origin) => {
@@ -252,6 +255,7 @@ export async function runMcp(node = new MbxNode()) {
         let thread;
         if (reply_to) {
             const m = node.read(reply_to, agent);
+            noteRead([m]);
             thread = m.thread;
             reply_to = m.id;
         }
