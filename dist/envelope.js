@@ -155,7 +155,7 @@ export function checkAuthority(e, ownerPub, revoked, now = new Date()) {
     const sessionPub = a.grant.sub.slice(8);
     if (!verifyData(sessionPub, sessionPayload(e), a.session_sig))
         return { ok: false, reason: "not sent by the granted session (session signature invalid)" };
-    if (Date.parse(a.grant.exp) < now.getTime())
+    if (Date.parse(a.grant.exp) <= now.getTime())
         return { ok: false, reason: "grant expired" };
     if (revoked.has(a.grant.id))
         return { ok: false, reason: "grant revoked" };

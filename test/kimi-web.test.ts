@@ -1,3 +1,6 @@
+import { generateKeyPair } from "../src/crypto.ts";
+import { makeGrant } from "../src/envelope.ts";
+import { unlockOwnerKey } from "../src/owner.ts";
 import { sendLeased } from "./helpers/leased-send.ts";
 // Waking kimi web-hosted kimi sessions (T049): hosted-session detection from $KIMI_CODE_HOME/server/instances,
 // the prompts/status REST shape against a fake HTTP server, the busy gate in dispatchWakes, and the shared
@@ -328,14 +331,18 @@ test("mail that only reached the desktop is retried when a hosted kimi session b
   server.close();
 });
 
-for (const change of ["release-before-post", "policy-before-post", "ack-before-post", "release-after-post", "ack-after-post"]) test(`wake rechecks authority across async adapter work: ${change}`, async t => {
+for (const change of ["release-before-post", "policy-before-post", "ack-before-post", "release-after-post", "ack-after-post", "grant-before-post", "grant-after-post"]) test(`wake rechecks authority across async adapter work: ${change}`, async t => {
   const n = new MbxNode(tmp(), { host: "alpha" }); t.after(() => n.close());
   let statusCalls = 0, prompts = 0, id = "";
   await withKimiHome(kimiHomeWithInstance(12345), async () => {
     const holder = bindWakeLease(n, { agent: "web", cli: "kimi", session_id: "session_fence", pid: process.pid });
-    id = sendLeased(n, { from: "boss", to: ["web"], subject: "guarded", body: "private", kind: "request" }).envelope.id;
+    const draft = { from: "boss", to: ["web"], subject: "guarded", body: "private", kind: "request" as const };
+    const key = generateKeyPair(), owner = unlockOwnerKey(n.home, "test-only-passphrase");
+    const grant = makeGrant(owner.publicKey, owner.privateKey, key.publicKey, "boss", n.host, ["task.assign"]);
+    id = change.startsWith("grant") ? n.send(draft, { pub: key.publicKey, priv: key.privateKey, grant }).envelope.id : sendLeased(n, draft).envelope.id;
     const mutate = () => {
-      if (change.startsWith("release")) holder.release();
+      if (change.startsWith("grant")) n.store.db.prepare("INSERT INTO grants VALUES (?,?,?,?,1)").run(grant.id, grant.sub, JSON.stringify(grant), grant.exp);
+      else if (change.startsWith("release")) holder.release();
       else if (change.startsWith("policy")) n.store.db.prepare("UPDATE policies SET revoked=1").run();
       else n.ack(id, "web");
     };

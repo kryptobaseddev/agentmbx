@@ -172,7 +172,7 @@ export function checkAuthority(e: Envelope, ownerPub: string | null, revoked: Se
   if (!a.grant.sub.startsWith("session:")) return { ok: false, reason: "grant subject is not a session key" };
   const sessionPub = a.grant.sub.slice(8);
   if (!verifyData(sessionPub, sessionPayload(e), a.session_sig)) return { ok: false, reason: "not sent by the granted session (session signature invalid)" };
-  if (Date.parse(a.grant.exp) < now.getTime()) return { ok: false, reason: "grant expired" };
+  if (Date.parse(a.grant.exp) <= now.getTime()) return { ok: false, reason: "grant expired" };
   if (revoked.has(a.grant.id)) return { ok: false, reason: "grant revoked" };
   const missing = capsNeeded(e).filter((c) => !a.grant.caps.includes(c));
   if (missing.length) return { ok: false, reason: `outside the grant's caps (needs ${missing.join(", ")})` };

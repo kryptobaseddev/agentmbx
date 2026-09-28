@@ -1,7 +1,9 @@
+import { generateKeyPair } from "../src/crypto.ts";
+import { makeGrant } from "../src/envelope.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -39,6 +41,18 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} status a
   assert.equal(edited.status, 0, edited.stderr);
   assert.equal(n.agents().find(a => a.name === "renamed")!.cli, cli, "metadata edits retain provider identity");
   assert.equal(n.agents().find(a => a.name === "renamed")!.role, "reviewer");
+  const owner = generateKeyPair(), master = generateKeyPair();
+  writeFileSync(join(home, "owner.json"), JSON.stringify({ backend: "keychain", public_key: owner.publicKey }), { mode: 0o600 });
+  const grant = makeGrant(owner.publicKey, owner.privateKey, master.publicKey, "master", n.host, ["task.assign"]);
+  const assigned = n.send({ from: "master", to: ["renamed"], subject: "owner task", body: "do it", kind: "task" },
+    { pub: master.publicKey, priv: master.privateKey, grant }).envelope.id;
+  assert.equal(JSON.parse(run("status", ["--json"]).stdout).owner_authority, 1);
+  n.store.db.prepare("INSERT INTO grants VALUES (?,?,?,?,1)").run(grant.id, grant.sub, JSON.stringify(grant), grant.exp);
+  assert.equal(JSON.parse(run("status", ["--json"]).stdout).owner_authority, 0, "status rechecks current grant revocation");
+  const read = await call("mbx_read", { ids: [assigned] });
+  assert.doesNotMatch(JSON.stringify(read.content), /authority: OWNER/);
+  assert.match(JSON.stringify(read.content), /grant revoked/);
+  n.ack(assigned, "renamed");
   for (const cmd of ["status", "whoami"]) {
     assert.notEqual(run(cmd, ["--as", "folder"]).status, 0);
     assert.notEqual(run(cmd, [], "missing").status, 0);
