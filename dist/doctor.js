@@ -28,14 +28,17 @@ export async function daemonAnswers(port, timeoutMs = 1500) {
 /** Diagnostic identity comparison, not authentication or proof of message receipt. No pairing side effects. */
 export async function daemonReadiness(node, timeoutMs = 1500) {
     const address = `127.0.0.1:${node.config.port}`;
-    const unknown = (reason) => ({ level: "warn", label: `daemon identity unverified on ${address}: ${reason}`,
+    const unknown = (reason) => ({ state: "unverified", level: "warn", label: `daemon identity unverified on ${address}: ${reason}`,
         fix: "check the process listening on this port; an older AgentMBX daemon may need restarting after update" });
     let response;
     try {
         response = await fetch(`http://${address}/v1/status`, { redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
     }
-    catch {
-        return { level: "fail", label: `daemon not answering on ${address}`, fix: `agentmbx daemon install   (log: ${join(node.home, "daemon.log")})` };
+    catch (error) {
+        // Only a refused connection establishes an absent listener. Timeout/reset/abort is uncertain.
+        const refused = error.cause?.code === "ECONNREFUSED";
+        return { state: refused ? "unreachable" : "unverified", level: "fail", label: `daemon not answering on ${address}`,
+            fix: refused ? `agentmbx daemon install   (log: ${join(node.home, "daemon.log")})` : "check the process listening on this port before installing or restarting the daemon" };
     }
     if (response.status !== 200) {
         await response.body?.cancel();
@@ -69,9 +72,9 @@ export async function daemonReadiness(node, timeoutMs = 1500) {
         if (r.host !== node.host || r.host_pubkey !== node.key.publicKey)
             return unknown("reported host or key differs from this mailbox");
         if (r.version !== version())
-            return { level: "warn", label: `daemon reports expected host ${r.host} on ${address}, but version ${r.version} differs from CLI ${version()}`,
+            return { state: "unverified", level: "warn", label: `daemon reports expected host ${r.host} on ${address}, but version ${r.version} differs from CLI ${version()}`,
                 fix: "restart the daemon after updating; existing MCP sessions may also need restarting" };
-        return { level: "ok", label: `daemon reports expected host ${r.host} on ${address} (version ${r.version}, started ${r.started_at}); receipt not tested` };
+        return { state: "matching", level: "ok", label: `daemon reports expected host ${r.host} on ${address} (version ${r.version}, started ${r.started_at}); receipt not tested` };
     }
     catch {
         return unknown("malformed, interrupted, or timed-out status response");
