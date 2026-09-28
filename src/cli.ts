@@ -12,7 +12,7 @@ import { daemonAnswers, doctor, failed, formatChecks } from "./doctor.ts";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.ts";
 import { ancestors, withProcSnapshot } from "./proc.ts";
 import { DEFAULT_PORT, defaultHome, formatFor, MbxNode, summaryLine, trustLabel } from "./node.ts";
-import { activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary,
+import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary,
   type Level, type PolicyClass, type PolicyRecord, type Revocation } from "./policy.ts";
 import { authHelperPath, createKeychainOwner, createOwnerKey, defaultOwnerBackend, ownerInfo, ownerSignCanonical, readPassphraseFromTTY, type OwnerBackend } from "./owner.ts";
 import { periodicUpdateCheck, updateAvailable, updateCommand } from "./update.ts";
@@ -337,7 +337,9 @@ peers ${node.peers().map((p) => `${p.host}(${p.state})`).join(" ") || "none"}  a
 version ${version()} (${installKind()})`);
       const upd = updateAvailable(node.store);
       if (upd) console.log(`update available: ${upd} (run: agentmbx update)`);
-      const all = (node.store.db.prepare("SELECT record FROM policies WHERE revoked=0 AND exp > ?").all(new Date().toISOString()) as { record: string }[]).map((r) => JSON.parse(r.record) as PolicyRecord);
+      const stored = storedPolicies(node.store.db);
+      if (stored.invalid.length) console.error(`warning: ${stored.invalid.length} invalid stored policies ignored`);
+      const all = stored.valid.filter(p => p.currentOwner && !p.revoked && Date.parse(p.rec.exp) > Date.now()).map(p => p.rec);
       console.log(all.length ? `policies ${all.length}: ${all.map((p) => `${p.level === "yolo" ? "YOLO" : p.level}(${p.to.agents.join(",")} until ${p.exp.slice(0, 16)}Z)`).join(" ")}` : "policies none (agents ask before acting on each other's requests)");
       if (all.some((p) => p.level === "yolo")) console.log("!!! YOLO is active: those agents approve their own permission prompts. Kill switch: agentmbx policy revoke --all");
       return;
@@ -605,8 +607,9 @@ async function policy(node: MbxNode, pos: string[], str: (k: string) => string |
   }
   if (sub === "renew") {
     const id = pos[1] ?? die("policy renew <id> [--ttl 30d]");
-    const row = node.store.db.prepare("SELECT record FROM policies WHERE id LIKE ? AND revoked=0").get(`%${id}`) as { record: string } | undefined;
-    const old = row ? JSON.parse(row.record) as PolicyRecord : die(`no active policy ${id}`);
+    const candidates = storedPolicies(node.store.db).valid.filter(p => p.currentOwner && !p.revoked && p.rec.id.endsWith(id));
+    if (candidates.length !== 1) die(`expected one valid owner policy for ${id}, found ${candidates.length}`);
+    const old = candidates[0].rec;
     const rec = makePolicy({ level: old.level, classes: old.classes, agents: old.to.agents, hosts: old.to.hosts, from: old.from.hosts, fromAgents: old.from.agents,
       projects: old.projects, ttlMs: str("ttl") ? parseTtl(str("ttl")!) : undefined, ownerPub: ownerPub() });
     await publish(rec);
@@ -622,8 +625,10 @@ async function policy(node: MbxNode, pos: string[], str: (k: string) => string |
     return;
   }
   if (sub === "list" || !sub) {
-    const rows = (node.store.db.prepare("SELECT record, revoked FROM policies WHERE exp > ? ORDER BY iat").all(new Date().toISOString()) as { record: string; revoked: number }[])
-      .map((r) => ({ ...(JSON.parse(r.record) as PolicyRecord), revoked: !!r.revoked })).filter((p) => o.all || !p.revoked);
+    const stored = storedPolicies(node.store.db);
+    for (const p of stored.invalid) console.error(`warning: invalid stored policy ${p.id}: ${p.reason}`);
+    const rows = stored.valid.filter(p => Date.parse(p.rec.exp) > Date.now() && (o.all || (p.currentOwner && !p.revoked)))
+      .map(p => ({ ...p.rec, revoked: p.revoked }));
     if (o.json) return console.log(JSON.stringify(rows, null, 2));
     if (!rows.length) return console.log("no active policies: agents answer each other but ask before acting (set one with: agentmbx policy set <agents> collaborate)");
     return rows.forEach((p) => console.log(`${p.id}${p.revoked ? " (revoked)" : ""}  ${policySummary(p)}  expires ${p.exp.slice(0, 16)}Z`));

@@ -6,7 +6,7 @@ import { fingerprint, joinTranscript, nonce as newNonce, pairingCode, pairMac, p
 import { NAME_RE } from "./envelope.js";
 import { MbxNode, RETRY_HOURS } from "./node.js";
 import { notifyDesktop } from "./wake.js";
-import { acceptSigned } from "./policy.js";
+import { storedPolicies, acceptSigned } from "./policy.js";
 export const HOP_SKEW_MS = 5 * 60_000;
 const MAX_REQ = 4 * 1024 * 1024;
 const HELLO_TTL_MS = 2 * 60_000;
@@ -291,8 +291,8 @@ export function signedRecords(node) {
     const db = node.store.db, now = new Date().toISOString(), since = new Date(Date.now() - 30 * 86_400_000).toISOString();
     const rs = db.prepare("SELECT record, sig FROM policy_revocations WHERE iat > ?").all(since);
     const ds = db.prepare("SELECT record, sig FROM devices").all();
-    const ps = db.prepare("SELECT record, sig FROM policies WHERE exp > ?").all(now);
-    return [...rs, ...ds, ...ps].map((r) => ({ rec: JSON.parse(r.record), sig: r.sig })).sort((a, b) => (recordKey(a) < recordKey(b) ? -1 : 1));
+    const ps = storedPolicies(db).valid.filter(p => Date.parse(p.rec.exp) > Date.parse(now)).map(({ rec, sig }) => ({ rec, sig }));
+    return [...[...rs, ...ds].map((r) => ({ rec: JSON.parse(r.record), sig: r.sig })), ...ps].sort((a, b) => (recordKey(a) < recordKey(b) ? -1 : 1));
 }
 /** Send signed records to the paired hosts they concern. Returns per-host results; offline hosts get them on their next pull. */
 export async function pushPolicy(node, items) {
