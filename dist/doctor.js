@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fingerprint } from "./crypto.js";
 import { signHop } from "./http.js";
+import { kimiInstances } from "./kimi-web.js";
 import { MbxNode } from "./node.js";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.js";
 import { detect, edits, skillStatus, wired } from "./setup.js";
@@ -37,6 +38,12 @@ export function sessionReadiness(node, cli) {
     const channels = live.filter((s) => s.channel).length;
     const stale = rows.length - live.length;
     const onlyProvisional = !real && !channels;
+    const hostedPids = cli === "kimi" ? new Set(kimiInstances().map(instance => instance?.pid)) : new Set();
+    const hostedProvisional = live.filter(s => s.session_id.startsWith("mcp-") && hostedPids.has(s.pid)).length;
+    if (hostedProvisional)
+        return { level: "warn",
+            label: `${cli}: ${hostedProvisional} hosted binding(s) still need explicit session identity; ${real} real session ID(s); receipt not tested`,
+            fix: "use a provider integration that supplies explicit per-session MCP identity; a shared-server hook cannot infer the session from its directory" };
     return { level: onlyProvisional ? "warn" : "info",
         label: `${cli}: ${live.length} verified live mailbox binding(s), ${real} real session ID(s), ${channels} channel binding(s)`
             + (stale ? `, ${stale} stale or unverified` : "") + "; receipt not tested",
