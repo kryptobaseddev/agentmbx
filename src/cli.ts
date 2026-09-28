@@ -8,7 +8,7 @@ import { canonical, fingerprint, ulid } from "./crypto.ts";
 import { buildGrant, CAPS, grantPayload, type Envelope, type Grant } from "./envelope.ts";
 import { advertise, browse, lanIPv4 } from "./discovery.ts";
 import { flushOutbox, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, startServer, advertisedAddr } from "./http.ts";
-import { daemonAnswers, doctor, failed, formatChecks } from "./doctor.ts";
+import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.ts";
 import { agentName, detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.ts";
 import { ancestors } from "./proc.ts";
 import { DEFAULT_PORT, defaultHome, formatFor, formatMessage, MbxNode, summaryLine, trustLabel } from "./node.ts";
@@ -675,10 +675,16 @@ async function setup(o: Record<string, unknown>, str: (k: string) => string | un
     } else if (str("host")) console.log(`host already initialized; --host ignored (edit ${join(home, "config.json")} to rename)`);
     if (existsSync(join(home, "config.json"))) {
       const node = new MbxNode(home);
-      const up = await daemonAnswers(node.config.port);
-      if (up && existsSync(servicePath())) console.log(`daemon: already running on port ${node.config.port}`);
-      else if (dryRun) console.log("would install and start the daemon service");
-      else { try { installService(node.home); } catch (e) { console.log(`daemon: install failed (${(e as Error).message}); run 'agentmbx daemon install' later`); } }
+      const check = await daemonReadiness(node);
+      if (check.state === "matching") {
+        console.log(existsSync(servicePath())
+          ? `daemon: matching AgentMBX already running on port ${node.config.port} (service definition present)`
+          : `daemon: matching AgentMBX running on port ${node.config.port} without a service definition; stop that process before running 'agentmbx daemon install'`);
+      } else if (check.state === "unverified") {
+        console.error(`daemon: ${check.label}; automatic daemon installation skipped. Run 'agentmbx doctor' and inspect the listener before installing or restarting.`);
+        process.exitCode = 1;
+      } else if (dryRun) console.log("would install and start the daemon service");
+      else { try { installService(node.home); } catch (e) { console.log(`daemon: install failed (${(e as Error).message}); run 'agentmbx daemon install' later`); process.exitCode = 1; } }
       node.close();
     }
   }
