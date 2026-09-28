@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import runpy
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -25,6 +26,7 @@ class PermissionBoundaryTest(unittest.TestCase):
                     return original_open(path, *args, **kwargs)
 
                 def command(args, **kwargs):
+                    self.assertTrue(kwargs.get("check"), "Subprocess failures must stop the harness")
                     output = "http://provider.invalid" if args[:3] == ["opencode", "service", "status"] else ""
                     if "send" in args:
                         output = "test-message-id"
@@ -39,7 +41,7 @@ class PermissionBoundaryTest(unittest.TestCase):
                     raise AssertionError(f"Unexpected provider action: {req.method} {req.full_url}")
 
                 with patch("builtins.open", local_open), patch("tempfile.mkdtemp", lambda **kw: original_mkdtemp(dir=root, **kw)), \
-                     patch("subprocess.run", command), patch("urllib.request.urlopen", request), contextlib.redirect_stdout(io.StringIO()):
+                     patch("sys.argv", ["wake-opencode.py"]), patch("subprocess.run", command), patch("urllib.request.urlopen", request), contextlib.redirect_stdout(io.StringIO()):
                     with self.assertRaises(SystemExit) as exit_result:
                         runpy.run_path(str(Path(__file__).with_name("wake-opencode.py")), run_name="__main__")
                 self.assertEqual(exit_result.exception.code, 3)
@@ -50,6 +52,23 @@ class PermissionBoundaryTest(unittest.TestCase):
                 self.assertEqual(report["outcome"], "awaiting_owner_approval")
                 self.assertEqual(report["session_id"], "ses_test")
                 self.assertEqual(report["permissions"], [{"id": "per_test", "action": action}])
+                calls.clear()
+                resumed_commands = []
+                def resume_command(args, **kwargs):
+                    resumed_commands.append(args)
+                    return command(args, **kwargs)
+                with patch("builtins.open", local_open), patch("sys.argv", ["wake-opencode.py", "--resume", str(reports[0])]), \
+                     patch("subprocess.run", resume_command), patch("urllib.request.urlopen", request), contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as resumed:
+                        runpy.run_path(str(Path(__file__).with_name("wake-opencode.py")), run_name="__main__")
+                self.assertEqual(resumed.exception.code, 3)
+                self.assertEqual([method for method, _ in calls], ["GET"])
+                self.assertEqual(len(resumed_commands), 2)  # service status and original thread only
+                self.assertEqual(resumed_commands[1][-2:], ["thread", "test-message-id"])
+                after = json.loads(reports[0].read_text())
+                for key in ("session_id", "message_id", "token", "mbx_home", "work"):
+                    self.assertEqual(after[key], report[key])
+
 
 
 if __name__ == "__main__":
