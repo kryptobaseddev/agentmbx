@@ -10,14 +10,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { fingerprint, generateKeyPair } from "./crypto.js";
-import { KINDS, NAME_RE } from "./envelope.js";
+import { checkShape, KINDS, NAME_RE } from "./envelope.js";
 import { kimiHostedServer } from "./kimi-web.js";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess } from "./identity-leases.js";
 import { applyIdentityTakeover } from "./identity-takeover.js";
 import { listIdentityStatus } from "./identity-status.js";
 import { consumeIdentityControl, identityControlAliases, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl } from "./identity-control.js";
 import { formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
-import { activePolicies, delegationNote } from "./policy.js";
+import { activePolicies, delegationNote, MAX_HOP } from "./policy.js";
 import { procStart, withProcSnapshot } from "./proc.js";
 import { updateAvailable } from "./update.js";
 import { version } from "./version.js";
@@ -302,7 +302,9 @@ export async function runMcp(node = new MbxNode()) {
         for (const r of rows) {
             if (r.from_addr === `${agent}@${node.host}`)
                 continue;
-            const m = JSON.parse(r.envelope).meta;
+            const e = JSON.parse(r.envelope);
+            // Retained malformed mail is readable, but cannot erase unknown provenance.
+            const m = checkShape(e) ? { hop: MAX_HOP + 1, origin: "external" } : e.meta;
             state.parent = { hop: Math.max(state.parent?.hop ?? 0, m.hop ?? 0), external: (state.parent?.external ?? false) || m.origin === "external", at: now };
         }
     };

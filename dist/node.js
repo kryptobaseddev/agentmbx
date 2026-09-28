@@ -592,6 +592,8 @@ export class MbxNode {
             const e = JSON.parse(m.envelope);
             if (!e.authority)
                 return null;
+            if (checkShape(e))
+                return { ok: false, reason: "stored message structure is invalid" };
             const host = m.from_addr.split("@")[1], local = m.origin === "local" && host === this.host;
             const peer = !local && m.origin === host && m.trust === "verified" ? this.approvedPeer(host) : undefined;
             const key = local ? this.key.publicKey : peer?.pubkey;
@@ -701,6 +703,8 @@ export class MbxNode {
     // ---- wake brake --------------------------------------------------------------------------
     wantsWake(agent, m) {
         const e = JSON.parse(m.envelope);
+        if (checkShape(e))
+            return false;
         return WAKE_KINDS.has(e.kind) || e.needs_reply || e.meta.mentions.some((x) => x === agent || x === `${agent}@${this.host}`);
     }
     /** Returns why a wake is not allowed right now, or null when it may proceed (and records it). */
@@ -747,7 +751,7 @@ export function formatMessage(m, policy) {
     return [
         `# ${m.subject}`,
         `id: ${m.id}  ref: mbx:${m.id}@${e.sig?.host ?? "?"}  thread: ${m.thread}${m.reply_to ? `  reply_to: ${m.reply_to}` : ""}`,
-        `from: ${m.from_addr}  to: ${e.to.join(", ")}  kind: ${m.kind}${e.needs_reply ? " (needs reply)" : ""}  at: ${m.ts}${e.meta.project ? `  project: ${e.meta.project}` : ""}`,
+        `from: ${m.from_addr}  to: ${e.to.join(", ")}  kind: ${m.kind}${e.needs_reply ? " (needs reply)" : ""}  at: ${m.ts}${e.meta?.project && typeof e.meta.project === "string" ? `  project: ${e.meta.project}` : ""}`,
         `trust: ${trustLabel(m)}`,
         policy ?? "",
         e.refs.length ? `refs: ${e.refs.join(", ")}` : "",

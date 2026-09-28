@@ -3,7 +3,7 @@
 import { realpathSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { canonical, fingerprint, ulid, verifyData } from "./crypto.js";
-import { verifyEnvelope } from "./envelope.js";
+import { checkShape, verifyEnvelope } from "./envelope.js";
 export const CLASSES = ["read", "edit", "outward", "permissions"];
 export const LEVELS = ["ask", "collaborate", "autonomous", "yolo"];
 export const LEVEL_CLASSES = { ask: [], collaborate: ["read", "edit"], autonomous: ["read", "edit"], yolo: [...CLASSES] };
@@ -163,6 +163,8 @@ export function activePolicies(db, agent, host, now = new Date()) {
 const ORDER = (l) => LEVELS.indexOf(l);
 /** What the receiving agent may do for this message's sender. Downgrades apply even under yolo. */
 export function effectivePolicy(db, o) {
+    if (o.envelope && checkShape(o.envelope))
+        return { level: "ask", classes: [], ids: [], exp: null, projects: [], grants: [], notes: ["malformed-envelope: stored message structure is invalid"] };
     if (o.envelope && (o.envelope.meta.sender_verification !== "leased" || o.senderVerified !== true))
         return { level: "ask", classes: [], ids: [], exp: null, projects: [], grants: [], notes: ["unverified-sender: the claimed identity has no verified lease"] };
     const isLocal = o.fromHost === o.host;

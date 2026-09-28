@@ -4,7 +4,7 @@ import { realpathSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { canonical, fingerprint, ulid, verifyData } from "./crypto.ts";
-import { verifyEnvelope, type Envelope } from "./envelope.ts";
+import { checkShape, verifyEnvelope, type Envelope } from "./envelope.ts";
 
 export const CLASSES = ["read", "edit", "outward", "permissions"] as const;
 export type PolicyClass = (typeof CLASSES)[number];
@@ -173,6 +173,7 @@ const ORDER = (l: Level) => LEVELS.indexOf(l);
 
 /** What the receiving agent may do for this message's sender. Downgrades apply even under yolo. */
 export function effectivePolicy(db: DatabaseSync, o: { agent: string; host: string; fromAgent: string; fromHost: string; envelope?: Envelope; senderVerified?: boolean; now?: Date }): Effective {
+  if (o.envelope && checkShape(o.envelope)) return { level: "ask", classes: [], ids: [], exp: null, projects: [], grants: [], notes: ["malformed-envelope: stored message structure is invalid"] };
   if (o.envelope && (o.envelope.meta.sender_verification !== "leased" || o.senderVerified !== true)) return { level: "ask", classes: [], ids: [], exp: null, projects: [], grants: [], notes: ["unverified-sender: the claimed identity has no verified lease"] };
   const isLocal = o.fromHost === o.host;
   const principalOk = (selector: string): boolean => {

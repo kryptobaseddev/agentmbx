@@ -80,7 +80,11 @@ export function checkShape(x: unknown): string | null {
   if (typeof e.body !== "string" || Buffer.byteLength(e.body) > MAX_BODY) return "bad body";
   if (typeof e.subject !== "string") return "bad subject";
   if (Number.isNaN(Date.parse(e.ts))) return "bad ts";
-  const m = e.meta as Meta | undefined;
+  const m = e.meta;
+  if (!m || typeof m !== "object" || Array.isArray(m)) return "bad meta";
+  for (const field of ["mentions", "directives", "tags", "task_refs"] as const) {
+    if (!Array.isArray(m[field]) || m[field].some(value => typeof value !== "string")) return `bad meta.${field}`;
+  }
   if (m?.sender_verification !== undefined && m.sender_verification !== "unverified" && m.sender_verification !== "leased") return "bad sender verification";
   if (m?.hop !== undefined && !(Number.isInteger(m.hop) && m.hop >= 0 && m.hop <= 1000)) return "bad hop";
   if (m?.origin !== undefined && m.origin !== "agent" && m.origin !== "external") return "bad origin";
