@@ -6,6 +6,7 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { setKimiHostedCheck } from "./wake-check.js";
 export const kimiCodeHome = () => process.env.KIMI_CODE_HOME || join(homedir(), ".kimi-code");
 const alive = (pid) => { try {
     process.kill(pid, 0);
@@ -64,3 +65,5 @@ export function kimiHostedServer(pid, kimiHome = kimiCodeHome(), isAlive = alive
     }
     return null;
 }
+// Register the real hosted check for node core (T067): node.ts asks wake-check, never this adapter.
+setKimiHostedCheck((pid) => kimiHostedServer(pid) !== null);
