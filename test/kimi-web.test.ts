@@ -32,7 +32,7 @@ function fakeKimiServer(state: FakeState) {
     req.on("data", (c) => { body += c; });
     req.on("end", () => {
       seen.push({ method: req.method ?? "", url: req.url ?? "", auth: (req.headers.authorization as string | undefined) ?? null, body });
-      const json = (x: unknown) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(x)); };
+      const json = (x: unknown) => { res.writeHead(200, { "content-type": "application/json", "connection": "close" }); res.end(JSON.stringify(x)); };
       const url = req.url ?? "";
       if (url.startsWith("/api/v1/sessions/") && url.endsWith("/status")) {
         const data: Record<string, unknown> = { busy: state.busy === true, thinking_level: "off", permission: "default", plan_mode: false, swarm_mode: false, context_tokens: 0 };
@@ -44,7 +44,7 @@ function fakeKimiServer(state: FakeState) {
         if (state.failPrompts) return json({ code: 40040, message: "Model not set", data: null });
         return json({ code: 0, data: { prompt_id: "prm_test", status: "running" } });
       }
-      res.writeHead(404, { "content-type": "application/json" });
+      res.writeHead(404, { "content-type": "application/json", "connection": "close" });
       res.end(JSON.stringify({ code: 40400, message: "not found" }));
     });
   });

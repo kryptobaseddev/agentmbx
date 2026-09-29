@@ -121,12 +121,12 @@ function opencodeStub(t: { after: (fn: () => void | Promise<void>) => unknown },
   const calls: string[] = [];
   const server: Server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://x");
-    if (url.pathname === "/api/session") { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ data: directorySession ? [{ id: directorySession }] : [] })); return; }
+    if (url.pathname === "/api/session") { res.writeHead(200, { "content-type": "application/json", "connection": "close" }); res.end(JSON.stringify({ data: directorySession ? [{ id: directorySession }] : [] })); return; }
     if (url.pathname === `/api/session/${directorySession}/synthetic` && req.method === "POST") {
       let body = ""; req.on("data", (c) => body += c); req.on("end", () => {
         calls.push(url.pathname);
         const text = (JSON.parse(body) as { text?: string }).text ?? "";
-        res.writeHead(200, { "content-type": "application/json" });
+        res.writeHead(200, { "content-type": "application/json", "connection": "close" });
         res.end(JSON.stringify({ data: { id: "msg_stub", sessionID: directorySession, type: "synthetic", delivery: "queue", payload: { text }, time: { created: Date.now() } } }));
       });
       return;
