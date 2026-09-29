@@ -184,8 +184,16 @@ Wake adapters are chosen by the recipient's session binding:
 - **GET /v1/pair/hello, POST /v1/pair/join:** token pairing (see Host pairing). Unsigned, rate-limited to 30/min.
 - **POST /v1/pair:** SAS pairing exchange (`pair --compare`). Rate-limited, and pending requests expire after 10 min.
 - **GET /v1/agents:** the directory of the host's agents. Request headers are signed: host, ts, and a signature over method, path, ts and body hash.
-- **Plain HTTP on the LAN:** integrity comes from the signatures. Bodies are readable on the wire until `enc` lands; the docs say so plainly.
+- **Plain HTTP on the LAN:** integrity comes from the signatures. Relay hops must seal bodies (`enc`, see Envelope); direct LAN delivery between paired hosts may carry plaintext by the D001 local-trust decision.
 - **Discovery:** `_agentmbx._tcp` mDNS/DNS-SD (see LAN discovery); explicit addresses always work.
+
+## Relay protocol (untrusted store-and-forward; ADR-035)
+- **What it is:** a third transport for when LAN cannot reach a paired host. The relay holds no private keys, decides no authorization, and **never carries plaintext bodies** — only envelopes whose `enc` field seals the body for the recipient (see Envelope). Tamper and sender enforcement stay receiver-side, exactly like LAN.
+- **Enrolment:** `POST /v1/relay/challenge` → single-use nonce; `POST /v1/relay/enrol` with `{host, pubkey, owner_fp, sig}` where sig is the host key over the challenge. No anonymous or bearer registration. Enrolment publishes the host's signed enc-key advertisement (`POST /v1/relay/enc-key`), readable by any enrolled host (`GET /v1/relay/enc-key?host=…`).
+- **Push:** `POST /v1/relay/messages` `{envelopes:[…]}` — host-authenticated (same signed-hop shape as LAN). Stored per recipient host queue. Envelopes with no recipient enc key are refused client-side: mail waits in the sender's outbox rather than flow as plaintext.
+- **Pull/ack:** `GET /v1/relay/messages?after=<cursor>` then `POST /v1/relay/ack {cursor}`; acked rows are dropped. Storage is exactly-once by envelope id across retries.
+- **Quotas (per owner, aggregated across the owner's hosts):** queue depth, envelope size, batch size, owner depth, and a per-minute push rate. Over-limit pushes get an honest error and stop at the limit.
+- **Metadata the relay operator sees:** envelope ids, addresses, subject, sizes, timing, hop counts. Accepted and documented in the threat model.
 
 ## Compatibility
 `mbx import-v2 <dir>` imports the NAS v2 messages as unsigned, `legacy`-labelled records. There is no live v2 bridge in v1 (a council scope cut).

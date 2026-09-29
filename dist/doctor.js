@@ -174,6 +174,11 @@ export async function doctor(ctx, mbxHome, opts = {}) {
         }));
         for (const p of peers.filter((x) => x.state === "pending"))
             add("warn", `pairing with ${p.host} pending (code ${p.code})`, `if ${p.host} shows the same code: agentmbx pair approve ${p.host} ${p.code}`);
+        const relay = process.env.MBX_RELAY_URL ?? node.config.relay ?? null;
+        if (relay) {
+            const enrolled = node.store.get(`relay-enrolled:${relay}`);
+            add(enrolled ? "ok" : "warn", `relay configured: ${relay}${enrolled ? " (enrolled)" : " (not yet enrolled — the daemon enrols on its next pass)"}`, enrolled ? undefined : `check the relay is running: agentmbx relay serve --port …`);
+        }
         node.close();
     }
     return out;
