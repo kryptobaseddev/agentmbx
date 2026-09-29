@@ -10,7 +10,7 @@
     "node": ">=24"
   },
   "scripts": {
-    "test": "AGENTMBX_DEV=1 node --test --test-concurrency=1 'test/*.test.ts'",
+    "test": "AGENTMBX_DEV=1 node --test --test-concurrency=1 --test-timeout=240000 --test-force-exit 'test/*.test.ts'",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
     "build:macos": "bash scripts/build-macos-app.sh",

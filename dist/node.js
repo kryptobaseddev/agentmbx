@@ -1,4 +1,5 @@
 import { hasHeldIdentity } from "./identity-leases.js";
+import { kimiHostedCheck } from "./wake-check.js";
 // One mbx host: its key, its store, and the rules for sending, receiving, verifying and delivering.
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { hostname, homedir } from "node:os";
@@ -6,7 +7,6 @@ import { join } from "node:path";
 import { fingerprint, generateKeyPair, newPairToken, pairTokenKey, sha256 } from "./crypto.js";
 import { generateEncKeyPair, openBody } from "./body-encryption.js";
 import { attachAuthority, buildEnvelope, ownerSign, ownerSignRequest, withOwnerSig, checkAuthority, checkShape, NAME_RE, signEnvelope, verifyEnvelope, } from "./envelope.js";
-import { kimiHostedServer } from "./kimi-web.js";
 import { ownerPublicKey } from "./owner.js";
 import { effectivePolicy, policyLine } from "./policy.js";
 import { procStart, provenProcess, sameProcess } from "./proc.js";
@@ -33,9 +33,8 @@ catch (e) {
     return e.code === "EPERM";
 } };
 const WAKEABLE = new Set(["codex", "opencode"]);
-/** A session row can be woken when its CLI has a wake adapter and the row is a real (non-MCP) session; kimi rows
- *  only count when the binding's pid is a live `kimi web` server instance — terminal TUI sessions are never woken. */
-const sessionWakeable = (x) => !!x.channel || ((WAKEABLE.has(x.cli) || (x.cli === "kimi" && !!kimiHostedServer(x.pid))) && !x.session_id.startsWith("mcp-"));
+/** Adapter boundary (T067): node core never imports kimi-web; the adapter registers the real check in wake-check. */
+const sessionWakeable = (x) => !!x.channel || ((WAKEABLE.has(x.cli) || (x.cli === "kimi" && kimiHostedCheck(x.pid))) && !x.session_id.startsWith("mcp-"));
 export const defaultHome = () => process.env.MBX_HOME || join(homedir(), ".local", "share", "agentmbx");
 const shortHost = () => hostname().split(".")[0].toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) || "host";
 export class MbxNode {

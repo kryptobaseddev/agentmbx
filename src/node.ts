@@ -1,4 +1,5 @@
 import { hasHeldIdentity } from "./identity-leases.ts";
+import { kimiHostedCheck } from "./wake-check.ts";
 // One mbx host: its key, its store, and the rules for sending, receiving, verifying and delivering.
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { hostname, homedir } from "node:os";
@@ -9,7 +10,6 @@ import {
   attachAuthority, buildEnvelope, ownerSign, ownerSignRequest, withOwnerSig, checkAuthority, checkShape, NAME_RE, signEnvelope, verifyEnvelope,
   type Draft, type AuthorityCheck, type Envelope, type Grant,
 } from "./envelope.ts";
-import { kimiHostedServer } from "./kimi-web.ts";
 import { ownerPublicKey } from "./owner.ts";
 import { effectivePolicy, policyLine } from "./policy.ts";
 import { procStart, provenProcess, sameProcess } from "./proc.ts";
@@ -36,10 +36,9 @@ export const LIVE_AGENT_MS = 24 * 3_600_000;
 export const SHELL_AGENT_MS = 2 * 3_600_000;
 export const alive = (pid: number | null | undefined) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; } };
 const WAKEABLE = new Set(["codex", "opencode"]);
-/** A session row can be woken when its CLI has a wake adapter and the row is a real (non-MCP) session; kimi rows
- *  only count when the binding's pid is a live `kimi web` server instance — terminal TUI sessions are never woken. */
+/** Adapter boundary (T067): node core never imports kimi-web; the adapter registers the real check in wake-check. */
 const sessionWakeable = (x: { cli: string; session_id: string; pid?: number | null; channel?: number | boolean }): boolean =>
-  !!x.channel || ((WAKEABLE.has(x.cli) || (x.cli === "kimi" && !!kimiHostedServer(x.pid))) && !x.session_id.startsWith("mcp-"));
+  !!x.channel || ((WAKEABLE.has(x.cli) || (x.cli === "kimi" && kimiHostedCheck(x.pid))) && !x.session_id.startsWith("mcp-"));
 
 export const defaultHome = () => process.env.MBX_HOME || join(homedir(), ".local", "share", "agentmbx");
 const shortHost = () => hostname().split(".")[0].toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) || "host";
