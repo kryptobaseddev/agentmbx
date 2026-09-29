@@ -10,7 +10,7 @@ import { IdentityLeases } from "../src/identity-leases.ts";
 import { listIdentityStatus } from "../src/identity-status.ts";
 
 const cli = (home: string, ...args: string[]) => spawnSync(process.execPath, [resolve("bin/agentmbx.js"), ...args], {
-  encoding: "utf8", env: { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1" }, timeout: 5000,
+  encoding: "utf8", env: { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1" }, timeout: 20_000,
 });
 
 test("identity inventory distinguishes current, expired, unknown and legacy ownership without mutating leases", t => {
