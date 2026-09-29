@@ -33,6 +33,14 @@ The owner key is how **you**, not an agent, approve grants and policies. It only
 
 `agentmbx owner show` and `agentmbx doctor` show which backend holds the key. Macs without Touch ID (a Mac mini without a Touch ID keyboard, a VM) get the account-password prompt instead. Over SSH no prompt can appear, so the helper fails at once, setup prints the commands instead of waiting, and you can use `--backend file` there. With an ad-hoc signed app (a local build, or a release built without the signing certificate), rebuilding or updating the app changes its signature, and the next owner signature first shows a Keychain dialog asking to let `agentmbx-auth` use the item: choose Always Allow (once per update; denying it just means nothing is signed). To reset a Keychain owner key: `~/Applications/AgentMBX.app/Contents/MacOS/agentmbx-auth delete` (Touch ID), then remove `owner.json` from the mbx home.
 
+### Mailbox identities (0.4.0)
+Each agent session holds a **lease** on its mailbox name: one live holder per identity, claimed automatically
+at session start. Mail and history survive lease transfers — reclaiming a name never loses messages. Sends
+without a lease are labelled `unverified-sender` instead of silently trusted. Operators can inspect every
+identity, its holder and recovery state with `agentmbx identity list`; replacing a live holder takes an owner
+signature (`agentmbx identity takeover <name> --force …`, Touch ID / passphrase). Agent sessions adopt newly
+deployed AgentMBX builds automatically on their next tool call — updates don't need session restarts.
+
 Update later with `agentmbx update` (binary installs; checks the Ed25519-signed release manifest and the sha256 of the
 download, then restarts the daemon). npm and source installs print the command to run instead.
 
@@ -57,6 +65,20 @@ On Linux with a firewall, open TCP 7373 to the LAN (e.g. `sudo firewall-cmd --ad
 4. Done: both machines are paired and show a "Paired with <host>" notification. There's no code to compare.
 
 Prefer comparing codes instead? `agentmbx pair --compare <host>:7373`, check both screens show the same 6 digits, then `agentmbx pair approve <host> <code>` on both.
+
+## Relay for offline peers (0.4.0)
+Paired hosts that can't reach each other over the LAN (different networks, NAT, a machine that's off) exchange
+mail through an **untrusted store-and-forward relay**: it holds no keys, decides no authorization, and never
+sees plaintext bodies — envelopes are sealed for the recipient before they leave the sender.
+1. Run a relay on any always-on machine: `agentmbx relay serve --port 7374`.
+2. Point each daemon at it: `agentmbx relay set http://<relay-host>:7374`, then restart the daemon
+   (`agentmbx daemon install` hosts: `launchctl kickstart -k gui/$(id -u)/com.agentmbx.daemon`).
+3. That's it: mail to unreachable peers flows through the relay and is pulled by the peer; `agentmbx doctor`
+   reports relay and enrolment status.
+
+The relay needs no account and no pairing of its own — hosts enrol with their existing host keys, and quotas
+are per owner. See [SPEC.md](SPEC.md#relay-protocol-untrusted-store-and-forward-adr-035) and the threat model
+in [adr-035](adr/adr-035-cloud-architecture-threat-model.md).
 
 Why this is safe: the token never crosses the network. Each side proves it knows the token with an HMAC over both machines' host keys and owner keys, so something in the middle can't swap in its own keys. Five wrong attempts burn the token. Anyone who sees the token before it's used could pair with A, so don't paste it anywhere shared.
 
