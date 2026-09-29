@@ -13,7 +13,7 @@ import { RelayCore, startRelayServer } from "./relay.js";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.js";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
 import { ancestors, withProcSnapshot } from "./proc.js";
-import { DEFAULT_PORT, defaultHome, formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
+import { DEFAULT_PORT, defaultHome, formatFor, MbxNode, setKimiHostedCheck, summaryLine, trustLabel } from "./node.js";
 import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary } from "./policy.js";
 import { authHelperPath, createKeychainOwner, createOwnerKey, defaultOwnerBackend, ownerInfo, ownerSignCanonical, readPassphraseFromTTY } from "./owner.js";
 import { periodicUpdateCheck, updateAvailable, updateCommand } from "./update.js";
@@ -133,6 +133,7 @@ async function run(argv) {
     const [cmd, ...rest] = argv;
     if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h")
         return console.log(HELP);
+    setKimiHostedCheck((pid) => !!kimiHostedServer(pid)); // T067: adapters wire in at the entrypoint, node core stays free of them
     const { values: o, positionals: pos } = parseArgs({ args: rest, allowPositionals: true, strict: cmd !== "hook" && cmd !== "mcp", options: {
             help: { type: "boolean", short: "h" }, force: { type: "boolean" },
             as: { type: "string" }, to: { type: "string" }, subject: { type: "string" }, m: { type: "string", short: "m" },

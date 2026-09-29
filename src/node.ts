@@ -9,7 +9,6 @@ import {
   attachAuthority, buildEnvelope, ownerSign, ownerSignRequest, withOwnerSig, checkAuthority, checkShape, NAME_RE, signEnvelope, verifyEnvelope,
   type Draft, type AuthorityCheck, type Envelope, type Grant,
 } from "./envelope.ts";
-import { kimiHostedServer } from "./kimi-web.ts";
 import { ownerPublicKey } from "./owner.ts";
 import { effectivePolicy, policyLine } from "./policy.ts";
 import { procStart, provenProcess, sameProcess } from "./proc.ts";
@@ -36,10 +35,14 @@ export const LIVE_AGENT_MS = 24 * 3_600_000;
 export const SHELL_AGENT_MS = 2 * 3_600_000;
 export const alive = (pid: number | null | undefined) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; } };
 const WAKEABLE = new Set(["codex", "opencode"]);
+/** Adapter boundary (T067): node core never imports kimi-web. The daemon injects the real hosted-server
+ *  check at startup; without it, kimi rows count as hosted never, which only narrows wake targeting. */
+let kimiHostedCheck: (pid: number | null | undefined) => boolean = () => false;
+export const setKimiHostedCheck = (fn: (pid: number | null | undefined) => boolean): void => { kimiHostedCheck = fn; };
 /** A session row can be woken when its CLI has a wake adapter and the row is a real (non-MCP) session; kimi rows
  *  only count when the binding's pid is a live `kimi web` server instance — terminal TUI sessions are never woken. */
 const sessionWakeable = (x: { cli: string; session_id: string; pid?: number | null; channel?: number | boolean }): boolean =>
-  !!x.channel || ((WAKEABLE.has(x.cli) || (x.cli === "kimi" && !!kimiHostedServer(x.pid))) && !x.session_id.startsWith("mcp-"));
+  !!x.channel || ((WAKEABLE.has(x.cli) || (x.cli === "kimi" && kimiHostedCheck(x.pid))) && !x.session_id.startsWith("mcp-"));
 
 export const defaultHome = () => process.env.MBX_HOME || join(homedir(), ".local", "share", "agentmbx");
 const shortHost = () => hostname().split(".")[0].toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) || "host";
