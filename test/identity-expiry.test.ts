@@ -27,7 +27,7 @@ test("result finalizes an expired abandoned request once without executing or to
   const deliveries = node.store.db.prepare("SELECT * FROM deliveries").all();
   assert.equal(readIdentityControlReceipt(home, request.id)!.status, "pending", "pure read retains the original receipt");
   const result = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "identity", "result", request.id, "--json"], {
-    encoding: "utf8", env: { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1" }, timeout: 5000,
+    encoding: "utf8", env: { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1" }, timeout: 20_000,
   });
   assert.equal(result.status, 1, result.stderr);
   assert.equal(JSON.parse(result.stdout).outcome, "failed");

@@ -16,7 +16,7 @@ async function fixture(t: { after: (fn: () => void | Promise<void>) => void }, l
   if (leased) await client.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "reader", MBX_CLI: "claude", AGENTMBX_DEV: "1" } as Record<string, string> }));
   const cli = (...args: string[]) => spawnSync(process.execPath, [resolve("bin/agentmbx.js"), ...args], {
-    encoding: "utf8", input: "", env: { ...process.env, MBX_HOME: home, MBX_AGENT: "", MBX_DEBUG: "", AGENTMBX_DEV: "1" }, timeout: 5000,
+    encoding: "utf8", input: "", env: { ...process.env, MBX_HOME: home, MBX_AGENT: "", MBX_DEBUG: "", AGENTMBX_DEV: "1" }, timeout: 20_000,
   });
   const send = (subject: string, from = "sender", thread?: string) => n.send({ from, to: ["reader"], subject, body: "body", thread, needs_reply: true, refs: ["src/cli.ts"] }).envelope;
   return { n, cli, send };

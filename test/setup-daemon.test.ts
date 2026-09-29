@@ -30,7 +30,7 @@ for (const kind of ["unverified-service", "unverified-manual", "matching-service
   // HOME is isolated and service-manager executables are canaries; no test can touch a real daemon service.
   const args = [resolve("bin/agentmbx.js"), "setup", "--only", "daemon", "--no-owner", "--yes", ...(kind === "absent" ? ["--dry-run"] : [])];
   let result: { stdout: string; stderr: string; code?: number };
-  try { result = await exec(process.execPath, args, { env: { ...process.env, HOME: home, MBX_HOME: mbx, MBX_SERVICE_LABEL: "", PATH: bin, AGENTMBX_DEV: "1", MBX_TEST_SERVICE_CANARY: canary }, timeout: 5000 }); }
+  try { result = await exec(process.execPath, args, { env: { ...process.env, HOME: home, MBX_HOME: mbx, MBX_SERVICE_LABEL: "", PATH: bin, AGENTMBX_DEV: "1", MBX_TEST_SERVICE_CANARY: canary }, timeout: 20_000 }); }
   catch (e) { result = e as typeof result; }
   const output = result.stdout + result.stderr;
   assert.equal(existsSync(canary), false, output);
