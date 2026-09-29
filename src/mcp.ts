@@ -58,16 +58,21 @@ export const storeMismatchCode = (e: unknown): "STALE_SERVER" | "IDENTITY_MIGRAT
 export function reloadFromDisk(e: unknown): void {
   if (process.env[REEXEC_ENV] || !storeMismatchCode(e)) return;
   process.stderr.write(`[mbx] ${(e as Error).message}\n[mbx] reloading mailbox tools from disk to match the upgraded store; this session keeps running.\n`);
-  handOverToFreshProcess(false);
+  handOverToFreshProcess(false, process.env[REEXEC_PARENT_AGENT]);
 }
+
+/** Env for the re-exec child: flagged once, carrying the parent's agent name so the child can reclaim it. */
+export const reexecEnv = (parentAgent: string | undefined): NodeJS.ProcessEnv =>
+  ({ ...process.env, [REEXEC_ENV]: "1", ...(parentAgent ? { [REEXEC_PARENT_AGENT]: parentAgent } : {}) });
+const REEXEC_PARENT_AGENT = "MBX_MCP_PARENT_AGENT";
 
 /**
  * Re-exec this server from disk and hand over the transport, but keep serving the current call with the
  * loaded code: the parent's stdin is paused so every subsequent request is read by the new process alone.
  * Used both for store upgrades and for picking up a newly deployed build without restarting the agent session.
  */
-function handOverToFreshProcess(pauseStdin: boolean): void {
-  const child = spawn(process.execPath, process.argv.slice(1), { stdio: "inherit", env: { ...process.env, [REEXEC_ENV]: "1" } });
+function handOverToFreshProcess(pauseStdin: boolean, parentAgent?: string): void {
+  const child = spawn(process.execPath, process.argv.slice(1), { stdio: "inherit", env: reexecEnv(parentAgent) });
   if (pauseStdin) try { process.stdin.pause(); } catch { /* already closed */ }
   child.on("error", () => process.exit(1));
   child.on("exit", (code, signal) => { if (signal) { process.kill(process.pid, signal); return; } process.exit(code ?? 0); });
@@ -143,6 +148,7 @@ export function detectHost(ppid = process.ppid) {
   const comm = basename(sh("/bin/ps", ["-o", "comm=", "-p", String(ppid)]) || args.split(" ")[0] || "");
   const cli = process.env.MBX_CLI || (/claude/i.test(comm) || /claude/.test(args) ? "claude" : /codex/i.test(args) ? "codex"
     : /opencode/i.test(args) ? "opencode" : /kimi/i.test(args) ? "kimi" : /hermes/i.test(args) ? "hermes" : "unknown");
+  if (cli !== "unknown" && !process.env.MBX_CLI) process.env.MBX_CLI = cli; // re-exec children inherit a stable classification
   const channel = process.env.MBX_CHANNEL === "1" || (cli === "claude" && hasMbxChannel(args));
   let sessionId = `mcp-${process.pid}`;
   const cs = join(homedir(), ".claude/sessions", `${ppid}.json`);
@@ -169,7 +175,8 @@ export async function runMcp(existing?: MbxNode) {
     catch (e) { reloadFromDisk(e); throw e; }
   }
   const env = detectHost();
-  const wanted = agentName(process.cwd(), env.cli);
+  // a re-exec child reclaims the name its parent released at handover, instead of minting a provisional one
+  const wanted = process.env[REEXEC_PARENT_AGENT] ?? agentName(process.cwd(), env.cli);
   const leases = new IdentityLeases(node.store, { idleTtlMs: process.env.MBX_IDENTITY_IDLE_TTL_MS === undefined ? undefined : Number(process.env.MBX_IDENTITY_IDLE_TTL_MS) });
   const holderStart = inspectLeaseProcess(process.pid).start;
   // a second live session with the same default name gets a free one (T055); an explicit MBX_AGENT is used as is
@@ -391,13 +398,20 @@ export async function runMcp(existing?: MbxNode) {
     if (cb.constructor.name === "AsyncFunction") throw new Error(`MCP handler ${name} must be synchronous to preserve its lease fence`);
     return register(name, config, (...a: unknown[]) => {
       try { node.store.assertCurrent(version()); }
-      catch (e) { reloadFromDisk(e); throw e; }
+      catch (e) {
+        if (!process.env[REEXEC_ENV] && storeMismatchCode(e)) {
+          try { if (base.leaseToken) leases.release(base.agent, base.leaseToken); } catch { /* lease already gone */ }
+          handOverToFreshProcess(false, base.agent);
+        } else reloadFromDisk(e);
+        throw e;
+      }
       // a deployed build replaced the one this server loaded: finish this call on the old code, then hand
       // the transport to a fresh process so the session runs the new build without any restart
       if (!handedOver && !process.env[REEXEC_ENV] && codeFingerprint() !== boot) {
         handedOver = true;
         process.stderr.write("[mbx] agentmbx was updated on disk; this session switches to the new build after this call.\n");
-        handOverToFreshProcess(true);
+        try { if (base.leaseToken) leases.release(base.agent, base.leaseToken); } catch { /* lease already gone */ }
+        handOverToFreshProcess(true, base.agent);
       }
       const state = contextFor(a[1]), before = { agent: state.agent, leaseToken: state.leaseToken, released: state.released, parent: state.parent, sessionId: state.sessionId };
       try {

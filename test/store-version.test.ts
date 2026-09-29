@@ -198,3 +198,13 @@ test("code fingerprints detect a deployed build without a schema change", async 
   assert.notEqual(a, c, "size change means a new build");
   assert.equal(a, codeFingerprint("entry", () => ({ mtimeMs: 100, size: 5 })), "same build, same fingerprint");
 });
+
+test("re-exec children inherit the parent agent and a stable cli classification", async () => {
+  const { reexecEnv } = await import("../src/mcp.ts");
+  const without = reexecEnv(undefined);
+  assert.equal(without.MBX_MCP_REEXEC, "1");
+  assert.equal(without.MBX_MCP_PARENT_AGENT, undefined);
+  const withAgent = reexecEnv("worker");
+  assert.equal(withAgent.MBX_MCP_REEXEC, "1");
+  assert.equal(withAgent.MBX_MCP_PARENT_AGENT, "worker", "the child reclaims the released parent name");
+});
