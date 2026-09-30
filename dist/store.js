@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS messages (
   authority TEXT,                -- JSON {caps, grant_id, session} when an owner grant verified, else NULL
   received_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS messages_thread ON messages(thread, ts);
+CREATE INDEX IF NOT EXISTS messages_sender ON messages(from_addr, id);
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(subject, body, content='messages', content_rowid='rowid');
 CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
   INSERT INTO messages_fts(rowid, subject, body) VALUES (new.rowid, new.subject, new.body); END;
