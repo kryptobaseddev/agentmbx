@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { execFileSync } from "node:child_process";
 import { canonical, fingerprint, ulid } from "./crypto.ts";
-import { buildGrant, CAPS, grantPayload, type Envelope, type Grant } from "./envelope.ts";
+import { buildGrant, CAPS, grantPayload, NAME_RE, type Envelope, type Grant } from "./envelope.ts";
 import { advertise, browse, lanIPv4 } from "./discovery.ts";
 import { flushOutbox, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.ts";
 import { relayDrainOutbox, relayFor, relayPull } from "./relay-client.ts";
@@ -24,6 +24,7 @@ import { CLIS, defaultHostName, defaultWhich, formatRows, ownerStep, resolveComm
 import { dispatchWakes, hasWakeAuthority, inboxCommand, macNotifierPath, notifyDesktop, opencodeService } from "./wake.ts";
 import { kimiHostedServer } from "./kimi-web.ts";
 import { approveKimi, decidePermission, opencodePermissionPass, type Lookup } from "./permission.ts";
+import { diagnosticSnapshot, type RuntimeObservation } from "./diagnostics.ts";
 import { listIdentityStatus } from "./identity-status.ts";
 import { withCliIdentity, withHookIdentity, type CliIdentitySelection } from "./cli-identity.ts";
 import { buildIdentityTakeover, type IdentityTakeoverApproval } from "./identity-takeover.ts";
@@ -49,6 +50,8 @@ Messages
   agentmbx identity list [--json]               inspect local identity holders, unread counts and recovery status (read-only)
   agentmbx identity claim [name] --cli <provider> --session <id> [--wait-ms 5000] [--json]
   agentmbx identity release --cli <provider> --session <id> [--wait-ms 5000] [--json]
+  agentmbx diagnostics --mailbox <name> [--cli <provider> --session <id>] [--limit 20] [--json]
+                  read-only local diagnostics; connector version stays unknown without runtime evidence
   agentmbx identity takeover <name> --force --cli <provider> --session <id>   replace a holder after owner signature
   agentmbx identity result <request-id> [--json] inspect a receipt and finalize expiry; pending means outcome unknown (exit 75)
 
@@ -109,6 +112,25 @@ function commandHelp(cmd: string): string {
   return lines.length ? lines.join("\n") : HELP;
 }
 
+/** A local daemon observation is separate from installed and connector versions. */
+async function observeDiagnosticDaemon(home: string): Promise<{ state: "observed" | "unreachable" | "unknown"; observation?: RuntimeObservation }> {
+  let config: { host?: unknown; port?: unknown; bind?: unknown };
+  try { config = JSON.parse(readFileSync(join(home, "config.json"), "utf8")); } catch { return { state: "unknown" }; }
+  if (!config || typeof config.host !== "string" || !Number.isSafeInteger(config.port) || Number(config.port) < 1 || Number(config.port) > 65535) return { state: "unknown" };
+  try {
+    const local = config.bind === "::1" ? "[::1]" : "127.0.0.1";
+    const response = await fetch(`http://${local}:${config.port}/v1/status`, { redirect: "manual", signal: AbortSignal.timeout(800) });
+    if (!response.ok || !response.body) { await response.body?.cancel(); return { state: "unknown" }; }
+    const reader = response.body.getReader(), chunks: Uint8Array[] = [];
+    let size = 0;
+    try { for (;;) { const part = await reader.read(); if (part.done) break; size += part.value.byteLength; if (size > 4096) { await reader.cancel(); return { state: "unknown" }; } chunks.push(part.value); } }
+    finally { reader.releaseLock(); }
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    if (body?.service !== "agentmbx" || body.v !== 1 || body.host !== config.host || typeof body.version !== "string" || !/^\d+\.\d+\.\d+(?:[-+][a-zA-Z0-9.-]+)?$/.test(body.version)) return { state: "unknown" };
+    return { state: "observed", observation: { host: body.host, version: body.version, observed_at: new Date().toISOString() } };
+  } catch { return { state: "unreachable" }; }
+}
+
 /** Stable exit codes and one-line diagnostics for both single and batch commands. */
 function cliError(e: unknown, cmd: string): number {
   const err = e as Error & { code?: string };
@@ -133,7 +155,7 @@ async function run(argv: string[]) {
     as: { type: "string" }, to: { type: "string" }, subject: { type: "string" }, m: { type: "string", short: "m" },
     "body-file": { type: "string" }, kind: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" },
     ref: { type: "string", multiple: true }, all: { type: "boolean" }, json: { type: "boolean" }, note: { type: "string" },
-    host: { type: "string" }, port: { type: "string" }, cli: { type: "string" }, session: { type: "string" }, caps: { type: "string" },
+    mailbox: { type: "string" }, limit: { type: "string" }, host: { type: "string" }, port: { type: "string" }, cli: { type: "string" }, session: { type: "string" }, caps: { type: "string" },
     ttl: { type: "string" }, bind: { type: "string" }, role: { type: "string" }, description: { type: "string" }, thread: { type: "string" }, from: { type: "string" }, check: { type: "boolean" }, yes: { type: "boolean", short: "y" },
     compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" },
     backend: { type: "string" }, "no-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
@@ -159,6 +181,27 @@ async function run(argv: string[]) {
     const n = new MbxNode(defaultHome(), { host: str("host"), port: str("port") ? Number(str("port")) : undefined, bind: str("bind") });
     console.log(`mbx home: ${n.home}\nhost: ${n.host}  key: ${fingerprint(n.key.publicKey)}  listens on ${n.config.bind}:${n.config.port}  advertised as ${advertisedAddr(n)}`);
     console.log(n.ownerPub ? `owner key: ${fingerprint(n.ownerPub)}` : "owner key: none yet (run: agentmbx owner init)");
+    return;
+  }
+  if (cmd === "diagnostics") {
+    const mailbox = str("mailbox") ?? die("diagnostics requires --mailbox <name>");
+    if (!NAME_RE.test(mailbox) || pos.length) die("diagnostics requires a valid --mailbox name and no positional arguments");
+    const cli = str("cli"), sid = str("session"), limit = Number(str("limit") ?? 20);
+    if (!!cli !== !!sid) die("diagnostics requires both --cli and --session when selecting a provider session");
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) die("--limit must be an integer from 1 to 100");
+    const home = defaultHome(), daemon = await observeDiagnosticDaemon(home);
+    const snapshot = diagnosticSnapshot(home, { mailbox, cli, session_id: sid, limit }, { daemon: daemon.observation });
+    const result = { ...snapshot, daemon_connection: { state: daemon.state },
+      recovery_guidance: ["Call mbx_whoami in the current provider thread to verify its actual connector and identity.",
+        "If its connector is disconnected or stale, reconnect the mbx MCP server before changing ownership.",
+        "Inspect the exact holder before release or owner-approved takeover; this diagnostic command changes nothing."] };
+    if (o.json) return console.log(JSON.stringify(result, null, 2));
+    console.log(`Diagnostics for ${mailbox}@${snapshot.host} (read-only advisory snapshot)`);
+    console.log(`Installed ${snapshot.builds.installed.version}; daemon ${snapshot.builds.daemon.version ?? "unknown"} (${daemon.state}); connector unknown (${snapshot.builds.connector.binding_exists ? "binding recorded" : "no binding recorded"})`);
+    console.log(`Ownership ${snapshot.ownership.state}: ${snapshot.ownership.reason}`);
+    if (snapshot.ownership.holder) console.log(`Holder ${snapshot.ownership.holder.cli} session ${snapshot.ownership.holder.session_id}; process ${snapshot.ownership.process}`);
+    console.log(`${snapshot.messages.unread} unread; ${snapshot.messages.queued_outgoing} outgoing messages queued; ${snapshot.outbox.length} queue rows shown; ${snapshot.recovery.length} recovery receipts shown`);
+    for (const guidance of result.recovery_guidance) console.log(guidance);
     return;
   }
   if (cmd === "notify-test") return notifyTest(str("as") ?? process.env.MBX_AGENT ?? "notify-test");
