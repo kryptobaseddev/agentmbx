@@ -10,7 +10,6 @@ import { version } from "./version.js";
 import { rotationLog, saveRotationLog } from "./key-rotation.js";
 import { storedPolicies, acceptSigned } from "./policy.js";
 export const HOP_SKEW_MS = 5 * 60_000;
-const MAX_REQ = 4 * 1024 * 1024;
 const HELLO_TTL_MS = 2 * 60_000;
 const TOKEN_REQS_PER_MIN = 30;
 const hopPayload = (method, path, ts, body) => `${method}\n${path}\n${ts}\n${sha256(body)}`;
@@ -32,12 +31,17 @@ export function verifyHop(node, headers, method, path, body, now = Date.now()) {
     return h;
 }
 export const advertisedAddr = (node) => process.env.MBX_ADVERTISE || `${hostname().replace(/\.local$/, "").toLowerCase()}.local:${node.config.port}`;
-const readBody = (req) => new Promise((res, rej) => {
+export const DEFAULT_LIMITS = { maxRequestBytes: 4 * 1024 * 1024, peerReqsPerMin: 600, headersTimeoutMs: 10_000, requestTimeoutMs: 30_000, keepAliveTimeoutMs: 5_000 };
+const httpError = (status, message) => Object.assign(new Error(message), { status });
+const readBody = (req, max) => new Promise((res, rej) => {
+    const tooBig = () => httpError(413, `request body over ${max} bytes`);
+    if (Number(req.headers["content-length"]) > max)
+        return rej(tooBig());
     let n = 0;
     const chunks = [];
-    req.on("data", (c) => { n += c.length; if (n > MAX_REQ) {
-        rej(new Error("request too large"));
-        req.destroy();
+    req.on("data", (c) => { if ((n += c.length) > max) {
+        chunks.length = 0;
+        rej(tooBig());
     }
     else
         chunks.push(c); });
@@ -128,15 +132,23 @@ function handleJoin(node, j, hellos, remote) {
     return { code: 200, body: { v: 1, host: node.host, mac: pairMac(match.key, "accept", transcript) } };
 }
 // ---- server ----------------------------------------------------------------------------------
-export function startServer(node, port = node.config.port, bind = node.config.bind, onEnvelope) {
+export function startServer(node, port = node.config.port, bind = node.config.bind, onEnvelope, limits = {}) {
+    const L = { ...DEFAULT_LIMITS, ...limits };
+    const peerReqs = new Map(); // authenticated host → request times in the last minute
     const runtime = { service: "agentmbx", v: 1, host: node.host, host_pubkey: node.key.publicKey, version: version(), started_at: new Date().toISOString() };
-    let pairAttempts = [], tokenAttempts = [];
+    let pairAttempts = [], tokenAttempts = [], rotateAttempts = [];
     const hellos = new Map(); // hello nonce → expiry
-    const server = createServer(async (req, res) => {
-        const send = (code, obj) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
+    const server = createServer({ headersTimeout: L.headersTimeoutMs, requestTimeout: L.requestTimeoutMs, keepAliveTimeout: L.keepAliveTimeoutMs,
+        connectionsCheckingInterval: Math.min(1_000, L.headersTimeoutMs) }, async (req, res) => {
+        const send = (code, obj) => {
+            if (res.headersSent)
+                return void res.end();
+            res.writeHead(code, { "content-type": "application/json" });
+            res.end(JSON.stringify(obj));
+        };
         try {
             const url = new URL(req.url ?? "/", "http://x");
-            const body = await readBody(req);
+            const body = await readBody(req, L.maxRequestBytes);
             // Public diagnostic metadata only: this neither issues pairing nonces nor grants authority.
             if (url.pathname === "/v1/status")
                 return req.method === "GET"
@@ -177,12 +189,19 @@ export function startServer(node, port = node.config.port, bind = node.config.bi
             if (req.method === "POST" && url.pathname === "/v1/rotate") {
                 // Self-authenticating (T030): each record is signed by the key this host pinned, so a rotated peer whose hops
                 // no longer verify can still move its pin. Nothing else is reachable without a verified hop.
+                rotateAttempts = rotateAttempts.filter((t) => Date.now() - t < 60_000);
+                if (rotateAttempts.push(Date.now()) > 30)
+                    return send(429, { error: "too many key rotation announcements; retry later" });
                 const { records } = JSON.parse(body);
                 if (!Array.isArray(records) || records.length > 50)
                     return send(400, { error: "bad batch" });
                 return send(200, { results: records.map((r) => node.acceptRotation(r)) });
             }
             const peer = verifyHop(node, req.headers, req.method ?? "GET", url.pathname, body);
+            const now = Date.now(), recent = (peerReqs.get(peer) ?? []).filter((t) => now - t < 60_000);
+            peerReqs.set(peer, recent);
+            if (recent.push(now) > L.peerReqsPerMin)
+                return send(429, { error: `rate limit: over ${L.peerReqsPerMin} requests a minute from ${peer}; retry later` });
             if (req.method === "POST" && url.pathname === "/v1/unpair") {
                 // The peer removed this pairing: drop it here too, so mail stops queueing for a host that refuses it.
                 node.removePeer(peer);
@@ -193,7 +212,7 @@ export function startServer(node, port = node.config.port, bind = node.config.bi
             if (req.method === "POST" && ["/v1/envelopes", "/v2/envelopes"].includes(url.pathname)) {
                 const { envelopes } = JSON.parse(body);
                 if (!Array.isArray(envelopes) || envelopes.length > 200)
-                    return send(400, { error: "bad batch" });
+                    return send(400, { error: "bad batch: envelopes must be an array of at most 200" });
                 const results = envelopes.map((e) => ({ id: e?.id, result: node.receive(e, peer) }));
                 if (results.some((r) => r.result === "accepted"))
                     onEnvelope?.();
@@ -202,7 +221,7 @@ export function startServer(node, port = node.config.port, bind = node.config.bi
             if (req.method === "POST" && url.pathname === "/v1/policy") {
                 const { items } = JSON.parse(body);
                 if (!Array.isArray(items) || items.length > 200)
-                    return send(400, { error: "bad batch" });
+                    return send(400, { error: "bad batch: items must be an array of at most 200" });
                 return send(200, { results: items.map((it) => ({ id: it?.rec?.id, error: acceptSigned(node.store.db, it, node.host, { hostPub: node.key.publicKey }) })) });
             }
             if (req.method === "GET" && url.pathname === "/v1/policies") {
@@ -223,8 +242,14 @@ export function startServer(node, port = node.config.port, bind = node.config.bi
             return send(404, { error: "not found" });
         }
         catch (e) {
-            const msg = e.message;
-            send(/paired|signature|timestamp/.test(msg) ? 401 : 400, { error: msg });
+            const { message: msg, status } = e;
+            // oversized body: answer, then discard (never buffer) the rest for up to 2 s so the client reads the 413, not a reset
+            if (status === 413) {
+                send(413, { error: msg });
+                req.resume();
+                return void setTimeout(() => req.complete || req.destroy(), 2_000).unref();
+            }
+            send(status ?? (/paired|signature|timestamp/.test(msg) ? 401 : 400), { error: msg });
         }
     });
     return new Promise((resolve, reject) => { server.once("error", reject); server.listen(port, bind, () => resolve(server)); });

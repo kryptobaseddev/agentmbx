@@ -13,7 +13,6 @@ import { rotationLog, saveRotationLog, type SignedRotation } from "./key-rotatio
 import { storedPolicies, acceptSigned, type AnyRecord, type Signed } from "./policy.ts";
 
 export const HOP_SKEW_MS = 5 * 60_000;
-const MAX_REQ = 4 * 1024 * 1024;
 const HELLO_TTL_MS = 2 * 60_000;
 const TOKEN_REQS_PER_MIN = 30;
 
@@ -37,9 +36,17 @@ export function verifyHop(node: MbxNode, headers: Record<string, string | string
 
 export const advertisedAddr = (node: MbxNode) => process.env.MBX_ADVERTISE || `${hostname().replace(/\.local$/, "").toLowerCase()}.local:${node.config.port}`;
 
-const readBody = (req: IncomingMessage) => new Promise<string>((res, rej) => {
+/** Server limits (T029). Timeouts bound slowloris clients; the body cap is enforced while streaming; the per-peer
+ *  rate covers every signed-hop request (a daemon polls a peer roughly 30-60 times a minute). */
+export interface ServerLimits { maxRequestBytes: number; peerReqsPerMin: number; headersTimeoutMs: number; requestTimeoutMs: number; keepAliveTimeoutMs: number }
+export const DEFAULT_LIMITS: ServerLimits = { maxRequestBytes: 4 * 1024 * 1024, peerReqsPerMin: 600, headersTimeoutMs: 10_000, requestTimeoutMs: 30_000, keepAliveTimeoutMs: 5_000 };
+
+const httpError = (status: number, message: string) => Object.assign(new Error(message), { status });
+const readBody = (req: IncomingMessage, max: number) => new Promise<string>((res, rej) => {
+  const tooBig = () => httpError(413, `request body over ${max} bytes`);
+  if (Number(req.headers["content-length"]) > max) return rej(tooBig());
   let n = 0; const chunks: Buffer[] = [];
-  req.on("data", (c: Buffer) => { n += c.length; if (n > MAX_REQ) { rej(new Error("request too large")); req.destroy(); } else chunks.push(c); });
+  req.on("data", (c: Buffer) => { if ((n += c.length) > max) { chunks.length = 0; rej(tooBig()); } else chunks.push(c); });
   req.on("end", () => res(Buffer.concat(chunks).toString("utf8"))); req.on("error", rej);
 });
 
@@ -128,14 +135,20 @@ function handleJoin(node: MbxNode, j: JoinRequest, hellos: Map<string, number>, 
 }
 
 // ---- server ----------------------------------------------------------------------------------
-export function startServer(node: MbxNode, port = node.config.port, bind = node.config.bind, onEnvelope?: () => void): Promise<Server> {
+export function startServer(node: MbxNode, port = node.config.port, bind = node.config.bind, onEnvelope?: () => void, limits: Partial<ServerLimits> = {}): Promise<Server> {
+  const L = { ...DEFAULT_LIMITS, ...limits };
+  const peerReqs = new Map<string, number[]>(); // authenticated host → request times in the last minute
   const runtime = { service: "agentmbx", v: 1, host: node.host, host_pubkey: node.key.publicKey, version: version(), started_at: new Date().toISOString() };
-  let pairAttempts: number[] = [], tokenAttempts: number[] = [];
+  let pairAttempts: number[] = [], tokenAttempts: number[] = [], rotateAttempts: number[] = [];
   const hellos = new Map<string, number>(); // hello nonce → expiry
-  const server = createServer(async (req, res) => {
-    const send = (code: number, obj: unknown) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
+  const server = createServer({ headersTimeout: L.headersTimeoutMs, requestTimeout: L.requestTimeoutMs, keepAliveTimeout: L.keepAliveTimeoutMs,
+    connectionsCheckingInterval: Math.min(1_000, L.headersTimeoutMs) }, async (req, res) => {
+    const send = (code: number, obj: unknown) => {
+      if (res.headersSent) return void res.end();
+      res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(obj));
+    };
     try {
-      const url = new URL(req.url ?? "/", "http://x"); const body = await readBody(req);
+      const url = new URL(req.url ?? "/", "http://x"); const body = await readBody(req, L.maxRequestBytes);
       // Public diagnostic metadata only: this neither issues pairing nonces nor grants authority.
       if (url.pathname === "/v1/status") return req.method === "GET"
         ? send(200, runtime) : send(405, { error: "method not allowed" });
@@ -169,11 +182,16 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
       if (req.method === "POST" && url.pathname === "/v1/rotate") {
         // Self-authenticating (T030): each record is signed by the key this host pinned, so a rotated peer whose hops
         // no longer verify can still move its pin. Nothing else is reachable without a verified hop.
+        rotateAttempts = rotateAttempts.filter((t) => Date.now() - t < 60_000);
+        if (rotateAttempts.push(Date.now()) > 30) return send(429, { error: "too many key rotation announcements; retry later" });
         const { records } = JSON.parse(body) as { records: SignedRotation[] };
         if (!Array.isArray(records) || records.length > 50) return send(400, { error: "bad batch" });
         return send(200, { results: records.map((r) => node.acceptRotation(r)) });
       }
       const peer = verifyHop(node, req.headers, req.method ?? "GET", url.pathname, body);
+      const now = Date.now(), recent = (peerReqs.get(peer) ?? []).filter((t) => now - t < 60_000);
+      peerReqs.set(peer, recent);
+      if (recent.push(now) > L.peerReqsPerMin) return send(429, { error: `rate limit: over ${L.peerReqsPerMin} requests a minute from ${peer}; retry later` });
       if (req.method === "POST" && url.pathname === "/v1/unpair") {
         // The peer removed this pairing: drop it here too, so mail stops queueing for a host that refuses it.
         node.removePeer(peer);
@@ -183,14 +201,14 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
       }
       if (req.method === "POST" && ["/v1/envelopes", "/v2/envelopes"].includes(url.pathname)) {
         const { envelopes } = JSON.parse(body) as { envelopes: unknown[] };
-        if (!Array.isArray(envelopes) || envelopes.length > 200) return send(400, { error: "bad batch" });
+        if (!Array.isArray(envelopes) || envelopes.length > 200) return send(400, { error: "bad batch: envelopes must be an array of at most 200" });
         const results = envelopes.map((e) => ({ id: (e as Envelope)?.id, result: node.receive(e, peer) }));
         if (results.some((r) => r.result === "accepted")) onEnvelope?.();
         return send(200, { results });
       }
       if (req.method === "POST" && url.pathname === "/v1/policy") {
         const { items } = JSON.parse(body) as { items: Signed<AnyRecord>[] };
-        if (!Array.isArray(items) || items.length > 200) return send(400, { error: "bad batch" });
+        if (!Array.isArray(items) || items.length > 200) return send(400, { error: "bad batch: items must be an array of at most 200" });
         return send(200, { results: items.map((it) => ({ id: it?.rec?.id, error: acceptSigned(node.store.db, it, node.host, { hostPub: node.key.publicKey }) })) });
       }
       if (req.method === "GET" && url.pathname === "/v1/policies") {
@@ -210,8 +228,10 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
       }
       return send(404, { error: "not found" });
     } catch (e) {
-      const msg = (e as Error).message;
-      send(/paired|signature|timestamp/.test(msg) ? 401 : 400, { error: msg });
+      const { message: msg, status } = e as Error & { status?: number };
+      // oversized body: answer, then discard (never buffer) the rest for up to 2 s so the client reads the 413, not a reset
+      if (status === 413) { send(413, { error: msg }); req.resume(); return void setTimeout(() => req.complete || req.destroy(), 2_000).unref(); }
+      send(status ?? (/paired|signature|timestamp/.test(msg) ? 401 : 400), { error: msg });
     }
   });
   return new Promise((resolve, reject) => { server.once("error", reject); server.listen(port, bind, () => resolve(server)); });
