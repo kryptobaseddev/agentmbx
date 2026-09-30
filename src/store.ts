@@ -1,7 +1,7 @@
 // SQLite store (node:sqlite, WAL). One per host; every mbx process on the host opens it.
 import { DatabaseSync } from "node:sqlite";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Envelope } from "./envelope.ts";
 import { privatePath } from "./private-files.ts";
@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS messages (
   received_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS messages_thread ON messages(thread, ts);
 CREATE INDEX IF NOT EXISTS messages_sender ON messages(from_addr, id);
+CREATE TRIGGER IF NOT EXISTS messages_writer_version BEFORE INSERT ON messages BEGIN
+  SELECT CASE WHEN mbx_writer_schema_version()<3 THEN RAISE(ABORT,'AgentMBX writer schema is stale; restart this process') END; END;
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(subject, body, content='messages', content_rowid='rowid');
 CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
   INSERT INTO messages_fts(rowid, subject, body) VALUES (new.rowid, new.subject, new.body); END;
@@ -26,6 +28,15 @@ CREATE TABLE IF NOT EXISTS deliveries (   -- one row per (message, recipient age
   msg_id TEXT NOT NULL REFERENCES messages(id), agent TEXT NOT NULL, state TEXT NOT NULL,
   updated_at TEXT NOT NULL, note TEXT, PRIMARY KEY (msg_id, agent));
 CREATE INDEX IF NOT EXISTS deliveries_agent ON deliveries(agent, state);
+CREATE TRIGGER IF NOT EXISTS deliveries_writer_version BEFORE INSERT ON deliveries BEGIN
+  SELECT CASE WHEN mbx_writer_schema_version()<3 THEN RAISE(ABORT,'AgentMBX writer schema is stale; restart this process') END; END;
+-- First visibility ordering only: retained events never authorize current mailbox reads.
+CREATE TABLE IF NOT EXISTS mailbox_visibility (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT, mailbox TEXT NOT NULL,
+  message_id TEXT NOT NULL REFERENCES messages(id), UNIQUE(mailbox, message_id));
+CREATE INDEX IF NOT EXISTS mailbox_visibility_mailbox_seq ON mailbox_visibility(mailbox, seq);
+CREATE TRIGGER IF NOT EXISTS deliveries_visibility AFTER INSERT ON deliveries BEGIN
+  INSERT OR IGNORE INTO mailbox_visibility (mailbox,message_id) VALUES (new.agent,new.msg_id); END;
 CREATE TABLE IF NOT EXISTS outbox (       -- envelopes waiting to reach a paired host
   msg_id TEXT NOT NULL, host TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at TEXT NOT NULL,
   last_error TEXT, created_at TEXT NOT NULL, PRIMARY KEY (msg_id, host));
@@ -66,18 +77,22 @@ CREATE TABLE IF NOT EXISTS pair_tokens (  -- one-time pairing tokens (agentmbx p
  * Store layout version (PRAGMA user_version). Bump it with every schema change. A process that finds a newer version
  * (an old MCP server still running after an upgrade) refuses to write instead of failing with raw SQL errors.
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 export class Store {
   db: DatabaseSync;
   #rawDb: DatabaseSync;
   #transactionContext = new AsyncLocalStorage<{ active: boolean }>();
+  private localHost: string | null = null;
   private txDepth = 0;
   private txFailure: { error: unknown } | null = null;
-  constructor(home: string, options: { allowIdentityMigration?: boolean } = {}) {
+  constructor(home: string, options: { allowIdentityMigration?: boolean; host?: string } = {}) {
     mkdirSync(home, { recursive: true, mode: 0o700 });
     const existed = existsSync(join(home, "mbx.db"));
     this.#rawDb = new DatabaseSync(join(home, "mbx.db"));
+    // Old retained connections lack this function, including previously prepared statements.
+    // Visibility inserts therefore fail closed after migration instead of bypassing the ledger.
+    this.#rawDb.function("mbx_writer_schema_version", { deterministic: true }, () => SCHEMA_VERSION);
     // Guard retained connections AND prepared statements if SQLite aborts an enclosing transaction.
     // Otherwise a caught nested failure can silently turn subsequent statements into autocommit writes.
     const guarded = <T extends object>(target: T): T => new Proxy(target, {
@@ -121,6 +136,21 @@ export class Store {
         this.assertCurrent(); // another opener may have migrated while we waited for the write lock
         assertMigrationAllowed(); // an old opener may instead have initialized a previously empty database
         this.db.exec(SCHEMA);
+        const configPath = join(home, "config.json");
+        const host = options.host ?? (existsSync(configPath) ? JSON.parse(readFileSync(configPath, "utf8")).host : null);
+        this.localHost = typeof host === "string" && host ? host : null;
+        if (this.schemaVersion() < 3) {
+          // Legacy order is deterministic, not an assertion about historical receipt ordering.
+          // Recipient visibility includes ACKed mail. Sender visibility matches MbxNode.canSee.
+          this.db.prepare(`INSERT OR IGNORE INTO mailbox_visibility (mailbox,message_id)
+            SELECT visible.mailbox,visible.message_id FROM (
+              SELECT d.agent mailbox,d.msg_id message_id FROM deliveries d
+              UNION
+              SELECT CASE WHEN instr(m.from_addr,'@')>0 THEN substr(m.from_addr,1,instr(m.from_addr,'@')-1) ELSE m.from_addr END,m.id
+                FROM messages m WHERE m.origin='local' OR substr(m.from_addr,instr(m.from_addr,'@')+1)=?
+            ) visible JOIN messages m ON m.id=visible.message_id
+            ORDER BY m.received_at,m.id,visible.mailbox`).run(this.localHost);
+        }
         // CREATE TABLE IF NOT EXISTS does not add columns; suppress only confirmed existing columns.
         for (const [table, column] of [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"]]) {
           if (!this.db.prepare(`PRAGMA table_info(${table})`).all().some(r => r.name === column))
@@ -216,10 +246,18 @@ export class Store {
 
   /** Insert once (id dedupe). Returns false when the id was already stored. */
   insertMessage(e: Envelope, origin: string, trust: string, authority: unknown | null): boolean {
-    const r = this.db.prepare(`INSERT OR IGNORE INTO messages (id,ts,from_addr,thread,reply_to,kind,subject,body,envelope,origin,trust,authority,received_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(e.id, e.ts, e.from, e.thread, e.reply_to, e.kind, e.subject, e.body,
-      JSON.stringify(e), origin, trust, authority == null ? null : JSON.stringify(authority), new Date().toISOString());
-    return r.changes > 0;
+    return this.tx(() => {
+      const r = this.db.prepare(`INSERT OR IGNORE INTO messages (id,ts,from_addr,thread,reply_to,kind,subject,body,envelope,origin,trust,authority,received_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(e.id, e.ts, e.from, e.thread, e.reply_to, e.kind, e.subject, e.body,
+        JSON.stringify(e), origin, trust, authority == null ? null : JSON.stringify(authority), new Date().toISOString());
+      // A duplicate must not grant visibility from a different caller-supplied envelope.
+      if (r.changes > 0) {
+        const [sender, host] = e.from.split("@");
+        if (origin === "local" || host === this.localHost)
+          this.db.prepare("INSERT OR IGNORE INTO mailbox_visibility (mailbox,message_id) VALUES (?,?)").run(sender, e.id);
+      }
+      return r.changes > 0;
+    });
   }
 
   addDelivery(msgId: string, agent: string, state: DeliveryState = "delivered") {
