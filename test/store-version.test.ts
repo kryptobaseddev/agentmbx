@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -159,7 +159,7 @@ test("migration records the upgrading version and stale peers get accurate advic
   } finally { migrated.close(); }
 });
 
-test("MCP self-reload fires only for store mismatches and only once", () => {
+test("MCP self-reload ignores unrelated errors and legacy repeated attempts", () => {
   assert.equal(storeMismatchCode(Object.assign(new Error("x"), { code: "STALE_SERVER" })), "STALE_SERVER");
   assert.equal(storeMismatchCode(Object.assign(new Error("x"), { code: "IDENTITY_MIGRATION_REQUIRED" })), "IDENTITY_MIGRATION_REQUIRED");
   assert.equal(storeMismatchCode(new Error("boom")), null);
@@ -172,6 +172,17 @@ test("MCP self-reload fires only for store mismatches and only once", () => {
   } finally {
     if (had === undefined) delete process.env.MBX_MCP_REEXEC; else process.env.MBX_MCP_REEXEC = had;
   }
+});
+
+test("MCP reload guard allows later builds while fencing repeated attempts at one build", async () => {
+  const { canReloadBuild } = await import("../src/mcp.ts");
+  assert.equal(canReloadBuild({}, "build-a"), true);
+  const child = { MBX_MCP_REEXEC: "1", MBX_MCP_REEXEC_BUILD: "build-a" };
+  assert.equal(canReloadBuild(child, "build-a"), false, "failed replacement cannot respawn itself");
+  assert.equal(canReloadBuild(child, "build-b"), true, "later deployments remain eligible");
+  assert.equal(canReloadBuild({ ...child, MBX_MCP_REEXEC_BUILD: "build-b" }, "build-b"), false);
+  assert.equal(canReloadBuild({ MBX_MCP_REEXEC: "1" }, "build-a"), false, "legacy startup stays bounded");
+  assert.equal(canReloadBuild({ MBX_MCP_REEXEC: "1" }, "build-b", "build-a"), true, "legacy process can detect a later deployment");
 });
 
 test("lease collisions inside one MCP process converge instead of erroring", () => {
@@ -199,12 +210,37 @@ test("code fingerprints detect a deployed build without a schema change", async 
   assert.equal(a, codeFingerprint("entry", () => ({ mtimeMs: 100, size: 5 })), "same build, same fingerprint");
 });
 
+test("code fingerprints detect npm manifest updates with unchanged entry timestamps and sizes", async t => {
+  const { codeFingerprint } = await import("../src/mcp.ts");
+  const root = mkdtempSync(join(tmpdir(), "mbx-fingerprint-")), manifest = join(root, "package.json"), entry = join(root, "dist/cli.js");
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const cached = version(), stat = () => ({ mtimeMs: 100, size: 5 });
+  writeFileSync(manifest, JSON.stringify({ version: "0.4.1" }));
+  const before = codeFingerprint(entry, stat);
+  writeFileSync(manifest, JSON.stringify({ version: "0.4.2" }));
+  const after = codeFingerprint(entry, stat);
+  assert.notEqual(after, before);
+  assert.equal(codeFingerprint(entry, stat), after, "old and replacement processes observe the same disk manifest");
+  assert.equal(version(), cached, "the process's loaded version remains distinct from the disk version");
+});
+
 test("re-exec children inherit the parent agent and a stable cli classification", async () => {
   const { reexecEnv } = await import("../src/mcp.ts");
   const without = reexecEnv(undefined);
   assert.equal(without.MBX_MCP_REEXEC, "1");
+  assert.equal(without.MBX_MCP_REEXEC_BUILD, (await import("../src/mcp.ts")).codeFingerprint());
   assert.equal(without.MBX_MCP_PARENT_AGENT, undefined);
   const withAgent = reexecEnv("worker");
   assert.equal(withAgent.MBX_MCP_REEXEC, "1");
   assert.equal(withAgent.MBX_MCP_PARENT_AGENT, "worker", "the child reclaims the released parent name");
+});
+
+test("reload metadata preserves explicit detachments without carrying session authority", async () => {
+  const { reexecEnv, detachedReloadState } = await import("../src/mcp.ts");
+  const released = { base: { agent: "reader", released: true, aliases: ["claude-real-session"] }, sessions: [{ sessionId: "ses_detached", agent: "reviewer" }] };
+  assert.deepEqual(detachedReloadState(reexecEnv("reader", undefined, released)), released);
+  assert.equal(detachedReloadState({ MBX_MCP_DETACHED: JSON.stringify(released) }), undefined, "normal startup cannot adopt reload metadata");
+  assert.throws(() => detachedReloadState({ MBX_MCP_REEXEC: "1", MBX_MCP_DETACHED: '{"base":{"agent":"bad name","released":true},"sessions":[]}' }));
+  const extra = { ...released, token: "private", key: "private", grant: "private" };
+  assert.deepEqual(detachedReloadState(reexecEnv("reader", undefined, extra)), released);
 });

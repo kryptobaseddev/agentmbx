@@ -191,7 +191,9 @@ export class IdentityLeases {
                     this.#prepared.getStore()?.observations.set(name, { row: prior, process: p, at });
                     return prior;
                 }
-                throw error("IDENTITY_IN_USE", `identity ${name} already has a holder`);
+                throw error("IDENTITY_IN_USE", `identity ${name} already has a holder (${prior.cli} session ${prior.session_id}). `
+                    + "The finishing holder must call mbx_identity release before ending; then release your current identity and claim this name. "
+                    + "Closing a hosted conversation may leave its shared MCP process running. If the holder cannot release, the owner can use agentmbx identity takeover.");
             }
             const token = randomUUID();
             this.store.db.prepare(`INSERT INTO identity_leases (name,token,holder_pid,holder_start,key_fp,cli,session_id,claimed_at,heartbeat_at,idle_ttl,released_at,release_reason)
