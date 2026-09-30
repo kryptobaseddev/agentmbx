@@ -7,7 +7,8 @@ export interface ReplayOptions {
   project?: string; project_host?: string; topic?: string; thread?: string;
 }
 export type ReplayItem = MessageRow | { id: string; content_omitted: true; reason: "REPLAY_ITEM_TOO_LARGE" };
-export interface ReplayPage { messages: ReplayItem[]; next_cursor: string; has_more: boolean }
+/** `history_pruned` (present only when nonzero): retention-pruned positions this page passed over (T031). */
+export interface ReplayPage { messages: ReplayItem[]; next_cursor: string; has_more: boolean; history_pruned?: number }
 interface Frame { v: 1; epoch: string; mailbox: string; filter: string; position: number; end: number }
 const fail = (code: string, message: string): never => { throw Object.assign(new Error(message), { code }); };
 const EPOCH_KEY = "replay:epoch";
@@ -43,7 +44,9 @@ export function replayQuery(store: Store, mailbox: string, options: ReplayOption
   return store.readTx(() => {
     const epoch = store.get(EPOCH_KEY);
     if (!epoch) fail("CURSOR_EXPIRED", "Replay generation is unavailable; initialize this store before replay");
-    const maximum = Number(store.db.prepare("SELECT COALESCE(MAX(seq),0) n FROM mailbox_visibility WHERE mailbox=?").get(mailbox)!.n);
+    // Pruned positions still count as history: a cursor past them stays valid and AUTOINCREMENT never reuses them.
+    const maximum = Math.max(Number(store.db.prepare("SELECT COALESCE(MAX(seq),0) n FROM mailbox_visibility WHERE mailbox=?").get(mailbox)!.n),
+      Number(store.db.prepare("SELECT COALESCE(MAX(seq),0) n FROM mailbox_pruned WHERE mailbox=?").get(mailbox)!.n));
     if (!Number.isSafeInteger(maximum) || maximum < 0) fail("CURSOR_INVALID", "Replay history exceeds supported bounds");
     let frame: Frame = { v: 1, epoch: epoch!, mailbox, filter, position: 0, end: maximum };
     if (options.cursor !== undefined) {
@@ -70,10 +73,16 @@ export function replayQuery(store: Store, mailbox: string, options: ReplayOption
     const rows = store.db.prepare(`SELECT v.seq,v.message_id FROM mailbox_visibility v
       WHERE v.mailbox=? AND v.seq>? AND v.seq<=? ORDER BY v.seq LIMIT ?`)
       .all(mailbox, frame.position, frame.end, scanLimit) as unknown as { seq: number; message_id: string }[];
-    const messages: ReplayItem[] = [];
-    const page = (position: number): ReplayPage => ({ messages, next_cursor: encode({ ...frame, position }), has_more: position < frame.end });
+    const messages: ReplayItem[] = [], start = frame.position;
+    // Retention gaps are never silent: count pruned positions in the interval this page covers.
+    const prunedIn = (to: number) => Number(store.db.prepare("SELECT count(*) n FROM mailbox_pruned WHERE mailbox=? AND seq>? AND seq<=?").get(mailbox, start, to)!.n);
+    const gap = prunedIn(frame.end) > 0;
+    const page = (position: number): ReplayPage => {
+      const pruned = gap ? prunedIn(position) : 0;
+      return { messages, next_cursor: encode({ ...frame, position }), has_more: position < frame.end, ...(pruned ? { history_pruned: pruned } : {}) };
+    };
     // Reserve the longest remaining position and boolean representation, including hidden scan progress.
-    const budgetBytes = (): number => bytes({ messages, next_cursor: encode({ ...frame, position: frame.end }), has_more: false });
+    const budgetBytes = (): number => bytes({ messages, next_cursor: encode({ ...frame, position: frame.end }), has_more: false, ...(gap ? { history_pruned: frame.end } : {}) });
     for (const row of rows) {
       const { seq } = row;
       const message = store.db.prepare("SELECT * FROM messages WHERE id=?").get(row.message_id) as unknown as MessageRow | undefined;

@@ -132,6 +132,17 @@ counts and redacted recovery receipts, with no message bodies or lease credentia
 Installed CLI, observed daemon and connector version are separate evidence. Its access
 boundary is the local OS user; it is not a browser console or an agent permission grant.
 
+### Retention and machine replacement
+
+Retention is off by default; nothing is deleted until you choose a window. `agentmbx prune --older-than 90 --dry-run`
+reports what would go; without `--dry-run` it deletes only settled mail (all local deliveries acked, nothing queued in
+the outbox, received and last updated before the window) and runs VACUUM. `agentmbx retention set 90` lets the daemon
+do the same every 6 h. Replay reports pruned positions as `history_pruned` rather than skipping them silently.
+
+`agentmbx identity export <file>` seals this host's keys, config and paired peers with a passphrase (file mode 600);
+`agentmbx identity import <file>` restores them on a replacement machine so peers keep accepting it. Treat the file as a
+private key and run only one machine with that identity. A macOS Keychain owner key cannot be exported.
+
 ## Quick start
 
 ```sh
@@ -228,6 +239,7 @@ When an agent has no wake path (or its wake fails), the daemon shows a desktop n
 - **Setup:** `setup [--dry-run] [--only …] [--uninstall]`, `doctor`, `version [--check]`, `update`
 - **Machines:** `init`, `pair`, `join`, `discover`, `pair --compare`, `pair approve`, `peers`, `peers remove`, `daemon [install|uninstall]`, `notify-test`
 - **Owner:** `owner init|show|grant|revoke`
+- **Maintenance:** `prune [--older-than <days>] [--dry-run]`, `retention [set <days> | off]` (default off), `identity export|import <file> [--force]`
 - **Integration:** `mcp`, `hook session-start|prompt|stop --cli <cli>`, `import-v2`
 - **Install:** `version [--check]`, `update [--check] [--yes]`
 
