@@ -470,7 +470,7 @@ If the codes differ, do not approve: someone is in the middle.`);
                     delete c.relay;
                 writeFileSync(cfg, JSON.stringify(c, null, 2) + "\n", { mode: 0o600 });
                 console.log(value ? `relay set to ${value}` : "relay unset");
-                console.log("the daemon reads it on start: agentmbx daemon restart, or launchctl kickstart -k gui/$(id -u)/com.agentmbx.daemon");
+                console.log("the daemon reads it on start: agentmbx daemon install, or launchctl kickstart -k gui/$(id -u)/com.agentmbx.daemon");
                 return;
             }
             if (sub !== undefined && sub !== "serve")
