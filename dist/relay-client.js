@@ -2,8 +2,7 @@
 // seal for us, push undeliverable outbox envelopes to the relay (sealed — the relay never sees bodies),
 // and poll for incoming relay mail through the normal node.receive path (signature-verified, decrypted).
 import { canonical, signData, verifyData } from "./crypto.js";
-import { sealBody } from "./body-encryption.js";
-import { signEnvelope } from "./envelope.js";
+import { sealEnvelope } from "./envelope.js";
 /** Where the daemon learns the relay address: MBX_RELAY_URL wins, then config.json's relay field. */
 export const relayFor = (node) => process.env.MBX_RELAY_URL ?? node.config.relay ?? null;
 const hop = (node, method, path, body) => {
@@ -64,8 +63,7 @@ export async function relayDrainOutbox(node, relay, f = fetch) {
             continue;
         } // never push plaintext bodies to the relay (ADR-035)
         const e = JSON.parse(row.envelope);
-        const sealed = sealBody(e.body, peerEnc, e.id);
-        const wire = signEnvelope({ ...e, enc: sealed, body: sealed.body }, node.host, node.key.publicKey, node.key.privateKey);
+        const wire = sealEnvelope(e, peerEnc, node.host, node.key.publicKey, node.key.privateKey);
         const r = await call(node, "POST", url(relay, "/v1/relay/messages"), { envelopes: [wire] }, f);
         if (r.status === 200) {
             node.store.db.prepare("DELETE FROM outbox WHERE msg_id=? AND host=?").run(row.msg_id, row.host);

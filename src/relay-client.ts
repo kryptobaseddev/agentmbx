@@ -2,8 +2,7 @@
 // seal for us, push undeliverable outbox envelopes to the relay (sealed — the relay never sees bodies),
 // and poll for incoming relay mail through the normal node.receive path (signature-verified, decrypted).
 import { canonical, signData, verifyData } from "./crypto.ts";
-import { sealBody } from "./body-encryption.ts";
-import { signEnvelope, type Envelope } from "./envelope.ts";
+import { sealEnvelope, type Envelope } from "./envelope.ts";
 import type { MbxNode } from "./node.ts";
 
 export interface RelayRef { url: string }
@@ -67,8 +66,7 @@ export async function relayDrainOutbox(node: MbxNode, relay: string, f: typeof f
     const peerEnc = await relayPeerEnc(node, relay, row.host, f);
     if (!peerEnc) { failed++; continue; } // never push plaintext bodies to the relay (ADR-035)
     const e = JSON.parse(row.envelope) as Envelope;
-    const sealed = sealBody(e.body, peerEnc, e.id);
-    const wire = signEnvelope({ ...e, enc: sealed, body: sealed.body }, node.host, node.key.publicKey, node.key.privateKey);
+    const wire = sealEnvelope(e, peerEnc, node.host, node.key.publicKey, node.key.privateKey);
     const r = await call(node, "POST", url(relay, "/v1/relay/messages"), { envelopes: [wire] }, f);
     if (r.status === 200) { node.store.db.prepare("DELETE FROM outbox WHERE msg_id=? AND host=?").run(row.msg_id, row.host); pushed++; }
     else failed++;

@@ -1,6 +1,6 @@
 // The signed message envelope, owner grants, and the body metadata parser.
 import { canonical, fingerprint, nonce, sha256, signData, ulid, verifyData } from "./crypto.js";
-import { checkEnc } from "./body-encryption.js";
+import { checkEnc, sealBody } from "./body-encryption.js";
 export const KINDS = ["message", "request", "reply", "status", "decision", "alert", "task"];
 export const MAX_BODY = 256 * 1024;
 // Saturating wire counter: this value means at least this many relay steps.
@@ -39,6 +39,11 @@ export function buildEnvelope(d, now = new Date()) {
 const unsigned = (e) => { const { sig: _s, body, ...rest } = e; return canonical({ ...rest, body: rest.enc ? rest.enc.body : body }); };
 export function signEnvelope(e, host, hostPub, hostPriv) {
     return { ...e, sig: { alg: "ed25519", host, key: fingerprint(hostPub), value: signData(hostPriv, unsigned(e)) } };
+}
+/** Seal the body for one recipient host's enc key and host-sign the wire form (T028). Local copies stay plaintext (D001). */
+export function sealEnvelope(e, recipientEncPub, host, hostPub, hostPriv) {
+    const sealed = sealBody(e.body, recipientEncPub, e.id);
+    return signEnvelope({ ...e, enc: sealed, body: sealed.body }, host, hostPub, hostPriv);
 }
 export function verifyEnvelope(e, hostPub) {
     return !!e.sig && e.sig.alg === "ed25519" && e.sig.key === fingerprint(hostPub) && verifyData(hostPub, unsigned(e), e.sig.value);
@@ -131,14 +136,18 @@ export function makeGrant(ownerPub, ownerPriv, sessionPub, agent, host, caps, ho
     const g = buildGrant(ownerPub, sessionPub, agent, host, caps, hours, now);
     return { ...g, sig: signData(ownerPriv, grantPayload(g)) };
 }
+// Authority signatures commit to the pre-sealing form: transport sealing (T028) fills `enc` and swaps the
+// body for ciphertext after signing, so verifiers pass the opened envelope and a filled `enc` reads as the
+// `enc: null` it was signed with. Envelopes without the field keep canonicalizing without it.
+const presealed = (rest) => (rest.enc ? { ...rest, enc: null } : rest);
 /** What the session key signs: the envelope without its host signature and without the session signature itself. */
 const sessionPayload = (e) => {
     const { sig: _s, authority, ...rest } = e;
-    return canonical({ ...rest, authority: authority?.grant ? { grant: authority.grant } : null });
+    return canonical({ ...presealed(rest), authority: authority?.grant ? { grant: authority.grant } : null });
 };
 const ownerPayload = (e) => {
     const { sig: _s, authority, ...rest } = e;
-    return canonical({ ...rest, authority: { owner_fp: authority?.owner_fp ?? null } });
+    return canonical({ ...presealed(rest), authority: { owner_fp: authority?.owner_fp ?? null } });
 };
 /** Step 1 of an owner-signed envelope: `payload` is the exact bytes the owner key signs (via ownerSignCanonical). */
 export function ownerSignRequest(e, ownerPub) {

@@ -3,7 +3,7 @@
 import { createServer } from "node:http";
 import { hostname } from "node:os";
 import { canonical, fingerprint, joinTranscript, nonce as newNonce, pairingCode, pairMac, pairTokenKey, safeEqual, sha256, signData, verifyData, } from "./crypto.js";
-import { NAME_RE } from "./envelope.js";
+import { NAME_RE, sealEnvelope } from "./envelope.js";
 import { MbxNode, RETRY_HOURS } from "./node.js";
 import { notifyDesktop } from "./wake.js";
 import { version } from "./version.js";
@@ -240,13 +240,22 @@ export async function flushOutbox(node, now = Date.now()) {
         node.send({ from: "mbx", to: [e.from.split("@")[0]], kind: "alert", subject: `Undelivered to ${r.host}: ${e.subject}`, body: `Message ${e.id} could not be delivered to host ${r.host}: ${why}` });
     };
     for (const [host, rows] of byHost) {
-        const peer = node.approvedPeer(host);
+        let peer = node.approvedPeer(host);
         try {
             if (!peer)
                 throw new Error("host is no longer paired");
+            if (!peer.enc_pub) {
+                await refreshPeerEncKeys(node, fetch, host);
+                peer = node.approvedPeer(host);
+            }
+            // Bodies never cross the LAN in plaintext (T028): without the peer's pinned enc key, keep retrying.
+            const encPub = peer?.enc_pub;
+            if (!peer || !encPub)
+                throw new Error(`${host} has not published a body-encryption key; upgrade AgentMBX there (bodies are never sent in plaintext)`);
             // This endpoint requires sender-proof-aware receivers. Never retry via v1: older
             // receivers can grant policy authority to unverified or missing-marker envelopes.
-            const { results } = await post(node, peer.addr, "/v2/envelopes", { envelopes: rows.map((r) => JSON.parse(r.envelope)) });
+            const envelopes = rows.map((r) => sealEnvelope(JSON.parse(r.envelope), encPub, node.host, node.key.publicKey, node.key.privateKey));
+            const { results } = await post(node, peer.addr, "/v2/envelopes", { envelopes });
             for (const r of rows) {
                 const res = results.find((x) => x.id === r.msg_id)?.result ?? "rejected:missing result";
                 done(r.msg_id, host);
@@ -297,10 +306,10 @@ export async function refreshDirectory(node) {
 /**
  * Learn each approved peer's body-encryption key (T028 Option A) over the already-authenticated
  * host channel. The response signature is checked against the peer's PINNED host signing key, so a
- * man-in-the-middle cannot substitute its own enc key. Inert until the send path seals for enc.
+ * man-in-the-middle cannot substitute its own enc key. The LAN send path seals every body with it.
  */
-export async function refreshPeerEncKeys(node, f = fetch) {
-    for (const p of node.peers().filter((x) => x.state === "approved" && !x.enc_pub)) {
+export async function refreshPeerEncKeys(node, f = fetch, only) {
+    for (const p of node.peers().filter((x) => x.state === "approved" && !x.enc_pub && (only === undefined || x.host === only))) {
         try {
             const path = "/v1/enc-key";
             const res = await f(`http://${p.addr}${path}`, { headers: signHop(node, "GET", path, ""), signal: AbortSignal.timeout(5_000) });

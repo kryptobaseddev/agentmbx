@@ -529,7 +529,7 @@ export class MbxNode {
       catch { return "rejected:undecryptable body"; }
     }
     if (this.store.hasMessage(e.id)) return "duplicate";
-    const auth = e.authority ? checkAuthority(e, peer.owner_pubkey, this.revoked()) : null;
+    const auth = storedEnv.authority ? checkAuthority(storedEnv, peer.owner_pubkey, this.revoked()) : null;
     const r = this.route(e.to, true);
     const stored = this.store.tx(() => {
       if (!this.store.insertMessage(storedEnv, via, "verified", auth)) return false;
