@@ -7,6 +7,10 @@ export type Kind = (typeof KINDS)[number];
 export const MAX_BODY = 256 * 1024;
 // Saturating wire counter: this value means at least this many relay steps.
 export const MAX_RELAY_DEPTH = 1000;
+// Per-envelope caps for input from the network (T029). The senders' own limits are tighter (MCP: 20 recipients, 20 refs).
+export const MAX_SUBJECT = 200, MAX_RECIPIENTS = 100, MAX_REFS = 100, MAX_FIELD = 300, MAX_REF = 2048;
+/** A sealed body on the wire: base64 of the MAX_BODY plaintext plus the 16-byte AEAD tag. */
+export const MAX_SEALED_BODY = 4 * Math.ceil((MAX_BODY + 16) / 3);
 export const NAME_RE = /^[a-z0-9][a-z0-9-]{1,39}$/;
 
 /** `origin`: where the content came from (external = a web page, issue, PR comment, email relayed by an agent);
@@ -89,17 +93,27 @@ export function checkShape(x: unknown): string | null {
   if (e.v !== 3) return "unsupported version";
   if (typeof e.id !== "string" || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(e.id)) return "bad id";
   if (typeof e.from !== "string" || !e.from.includes("@")) return "bad from";
+  if (e.from.length > MAX_FIELD) return `from over ${MAX_FIELD} characters`;
   if (!Array.isArray(e.to) || !e.to.length || e.to.some((t) => typeof t !== "string")) return "bad to";
+  if (e.to.length > MAX_RECIPIENTS) return `more than ${MAX_RECIPIENTS} recipients`;
+  if (e.to.some((t) => t.length > MAX_FIELD)) return `recipient over ${MAX_FIELD} characters`;
   if (!KINDS.includes(e.kind)) return "bad kind";
-  if (typeof e.body !== "string" || Buffer.byteLength(e.body) > MAX_BODY) return "bad body";
+  if (e.enc === undefined) return "bad enc";
+  if (typeof e.body !== "string") return "bad body";
+  const maxBody = e.enc === null ? MAX_BODY : MAX_SEALED_BODY; // wire form of a sealed body is its base64 ciphertext
+  if (Buffer.byteLength(e.body) > maxBody) return `body over ${maxBody} bytes`;
   if (typeof e.subject !== "string") return "bad subject";
+  if (e.subject.length > MAX_SUBJECT) return `subject over ${MAX_SUBJECT} characters`;
   if (typeof e.ts !== "string" || Number.isNaN(Date.parse(e.ts))) return "bad ts";
-  if (typeof e.thread !== "string") return "bad thread";
-  if (e.reply_to !== null && typeof e.reply_to !== "string") return "bad reply_to";
+  if (typeof e.thread !== "string" || e.thread.length > MAX_FIELD) return "bad thread";
+  if (e.reply_to !== null && (typeof e.reply_to !== "string" || e.reply_to.length > MAX_FIELD)) return "bad reply_to";
   if (typeof e.needs_reply !== "boolean") return "bad needs_reply";
   if (!Array.isArray(e.refs) || e.refs.some(value => typeof value !== "string")) return "bad refs";
-  if (e.enc === undefined) return "bad enc";
-  if (e.enc !== null) return checkEnc(e.enc);
+  if (e.refs.length > MAX_REFS || e.refs.some((r) => r.length > MAX_REF)) return `more than ${MAX_REFS} refs or a ref over ${MAX_REF} characters`;
+  if (e.enc !== null) { // sealed envelopes still get the authority/meta checks below
+    const bad = checkEnc(e.enc); if (bad) return bad;
+    if (e.enc.body.length > MAX_SEALED_BODY) return `sealed body over ${MAX_SEALED_BODY} bytes`;
+  }
   const a = e.authority;
   if (a !== null) {
     if (!a || typeof a !== "object" || Array.isArray(a)) return "bad authority";

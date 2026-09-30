@@ -522,7 +522,8 @@ export class MbxNode {
     const peer = this.approvedPeer(via);
     if (!peer) return "rejected:host not paired";
     if (e.sig?.host !== via || !e.from.endsWith(`@${via}`)) return "rejected:sender host mismatch";
-    if (!verifyEnvelope(e, peer.pubkey)) return "rejected:bad signature";
+    try { if (!verifyEnvelope(e, peer.pubkey)) return "rejected:bad signature"; }
+    catch { return "rejected:envelope cannot be canonicalized (too deeply nested or non-finite numbers)"; }
     let storedEnv = e;
     if (e.enc) { // sealed bodies (untrusted-hop encryption, T028) open with this host's static enc key
       try { storedEnv = { ...e, body: openBody(e.enc, this.encKey.privateKey, e.id) }; }
