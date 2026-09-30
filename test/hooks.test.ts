@@ -51,12 +51,49 @@ async function holder(t: TestContext, cli: string) {
   const agent = ((await call("mbx_whoami")).structuredContent as { agent: string }).agent;
   const rec = makePolicy({ level: "autonomous", agents: [agent], hosts: ["alpha"], ownerPub: owner.publicKey });
   assert.equal(acceptSigned(n.store.db, { rec, sig: signData(owner.privateKey, canonical(rec)) }, "alpha"), null);
-  const run = (event: string, session: unknown = sid, provider = cli, extraEnv: Record<string,string> = {}) => spawnSync(process.execPath,
-    [resolve("bin/agentmbx.js"), "hook", event, "--cli", provider], { input: JSON.stringify({ session_id: session, cwd: process.cwd() }),
+  const run = (event: string, session: unknown = sid, provider = cli, extraEnv: Record<string,string> = {}, input: Record<string,unknown> = {}) => spawnSync(process.execPath,
+    [resolve("bin/agentmbx.js"), "hook", event, "--cli", provider], { input: JSON.stringify({ session_id: session, cwd: process.cwd(), ...input }),
       encoding: "utf8", timeout: 10_000, env: { ...process.env, MBX_HOME: home, MBX_AGENT: "unrelated", AGENTMBX_DEV: "1", ...extraEnv } });
   const send = (to = agent) => sendLeased(n, { from: "sender", to: [to], subject: "PRIVATE SUBJECT", body: "SECRET BODY", kind: "request" }).envelope.id;
   return { n, call, agent, sid, run, send };
 }
+
+test("Claude SessionEnd releases only the exact exiting holder and preserves mail", async t => {
+  const { n, call, agent, sid, run, send } = await holder(t, "claude");
+  assert.equal(run("prompt").status, 0); // establish the real SessionEnd session id
+  const mail = send();
+  const before = n.store.db.prepare("SELECT token,released_at FROM identity_leases WHERE name=?").get(agent)!;
+  for (const reason of ["clear", "resume", "unknown", undefined]) {
+    const result = run("session-end", sid, "claude", {}, { reason });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "");
+    assert.deepEqual(n.store.db.prepare("SELECT token,released_at FROM identity_leases WHERE name=?").get(agent), before);
+  }
+  assert.equal(run("session-end", "wrong-session", "claude", {}, { reason: "other" }).status, 0);
+  assert.deepEqual(n.store.db.prepare("SELECT token,released_at FROM identity_leases WHERE name=?").get(agent), before);
+  const result = run("session-end", sid, "claude", {}, { reason: "prompt_input_exit" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr, "", "completed shutdown must not report an uncertain result");
+  assert.notEqual(n.store.db.prepare("SELECT released_at FROM identity_leases WHERE name=?").get(agent)!.released_at, null);
+  assert.equal((await call("mbx_inbox")).isError, true);
+  assert.equal(n.inbox(agent)[0].id, mail);
+});
+
+test("unbound SessionEnd hooks cannot release historical mailboxes", t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-end-unbound-")), node = new MbxNode(home, { host: "alpha" });
+  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true }); });
+  const leases = new IdentityLeases(node.store, { inspect: () => ({ alive: true, start: "fixture" }) });
+  leases.claim("historical", { pid: process.pid, start: "fixture", keyFp: "aaaa-bbbb-cccc-dddd", cli: "claude", sessionId: "previous" });
+  const before = node.store.db.prepare("SELECT * FROM identity_leases").all();
+  const result = spawnSync(process.execPath, ["bin/agentmbx.js", "hook", "session-end", "--cli", "claude"], {
+    input: JSON.stringify({ session_id: "previous", reason: "other" }), encoding: "utf8",
+    env: { ...process.env, MBX_HOME: home, MBX_AGENT: "historical", AGENTMBX_DEV: "1" },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "");
+  assert.deepEqual(node.store.db.prepare("SELECT * FROM identity_leases").all(), before);
+});
 
 for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} hooks require current leases, bind exact IDs and stop after release`, async t => {
   const { n, call, agent, sid, run, send } = await holder(t, cli);

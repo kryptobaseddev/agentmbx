@@ -34,6 +34,14 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} status a
   assert.deepEqual(JSON.parse(status.stdout), { agent: "renamed", host: "alpha", address: "renamed@alpha", cli,
     session_id: sid, mailboxes: ["renamed"], unread: 1, needs_reply: 1, owner_authority: 0, outbox: 0 });
   assert.doesNotMatch(status.stdout, /PRIVATE|SECRET/);
+  // Outgoing queue counts belong to the exact sender, not every agent on this host.
+  const unrelated = send("unrelated");
+  const outgoing = n.send({ from: "renamed", to: ["receiver"], subject: "queued", body: "history" }).envelope.id;
+  const queue = n.store.db.prepare("INSERT INTO outbox(msg_id,host,next_at,created_at) VALUES (?,?,?,?)");
+  queue.run(unrelated, "offline", new Date().toISOString(), new Date().toISOString());
+  assert.equal(JSON.parse(run("status", ["--json"]).stdout).outbox, 0);
+  for (const host of ["offline", "also-offline"]) queue.run(outgoing, host, new Date().toISOString(), new Date().toISOString());
+  assert.equal(JSON.parse(run("status", ["--json"]).stdout).outbox, 1, "one message queued for two hosts counts once");
   const who = run("whoami"); assert.equal(who.status, 0, who.stderr); assert.match(who.stdout, /renamed@alpha/);
   assert.deepEqual(n.agents().map(({ last_seen, ...a }) => a), before, "read queries do not register or relabel agents");
   assert.equal(n.inbox("renamed")[0].state, "delivered");

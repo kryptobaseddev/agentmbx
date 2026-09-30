@@ -87,6 +87,7 @@ test("setup wires every CLI, backs files up, leaves other hook groups alone, and
   assert.equal(s.hooks.Stop.length, 2); assert.equal(s.hooks.Stop[1].hooks[0].command, "/opt/bin/agentmbx hook stop --cli claude");
   assert.equal(s.hooks.PreToolUse.length, 1);
   assert.equal(s.hooks.PostToolUse[0].hooks[0].command, "/opt/bin/agentmbx hook post-tool --cli claude");
+  assert.equal(s.hooks.SessionEnd[0].hooks[0].command, "/opt/bin/agentmbx hook session-end --cli claude");
 
   // Codex
   assert.match(rd(home, ".codex/config.toml"), /\[mcp_servers\.mbx\]\ncommand = "\/opt\/bin\/agentmbx"\nargs = \["mcp"\]\ndefault_tools_approval_mode = "approve"\n$/);
@@ -112,6 +113,9 @@ test("setup wires every CLI, backs files up, leaves other hook groups alone, and
 
   // Skill copied + linked
   assert.match(readFileSync(join(skillDest(home), "SKILL.md"), "utf8"), /^---\nname: agentmbx\n/);
+  assert.match(readFileSync(join(skillDest(home), "SKILL.md"), "utf8"), /Ending a session and handing off its mailbox/);
+  assert.equal(readFileSync(join(skillDest(home), "scripts/claude-statusline.sh"), "utf8"),
+    readFileSync(join(import.meta.dirname, "../skill/scripts/claude-statusline.sh"), "utf8"));
   for (const d of [".claude/skills/agentmbx", ".codex/skills/agentmbx"]) assert.equal(readlinkSync(join(home, d)), skillDest(home));
 
   // second run: nothing changes, no duplicates, no new backups

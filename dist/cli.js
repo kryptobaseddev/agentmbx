@@ -81,6 +81,7 @@ Install
 Agent integration
   agentmbx mcp                                  stdio MCP server (add to Claude/Codex/OpenCode/Kimi/Hermes MCP config)
   agentmbx hook session-start --cli <codex|kimi|claude|opencode>   bind the running session (reads the hook JSON on stdin)
+  agentmbx hook session-end --cli claude         release the exact session on terminal exit (keeps /clear and /resume bindings)
   agentmbx hook prompt --cli <…>                adds "N unread mbx messages" to the next turn when there is mail
   agentmbx hook post-tool --cli claude          surfaces new unread mail between tool calls
   agentmbx hook permission --cli <claude|codex|kimi>   YOLO: approves the prompt only under an active owner policy with the permissions class
@@ -384,7 +385,8 @@ async function run(argv) {
                     const out = { agent, host: node.host, address: `${agent}@${node.host}`, cli, session_id: sid, mailboxes,
                         unread: counts.reduce((sum, c) => sum + c.unread, 0), needs_reply: counts.reduce((sum, c) => sum + c.needs_reply, 0),
                         owner_authority: counts.reduce((sum, c) => sum + c.owner_authority, 0),
-                        outbox: node.store.db.prepare("SELECT count(*) n FROM outbox").get().n };
+                        outbox: node.store.db.prepare("SELECT count(DISTINCT o.msg_id) n FROM outbox o JOIN messages m ON m.id=o.msg_id WHERE m.from_addr=?")
+                            .get(`${agent}@${node.host}`).n };
                     return console.log(o.json ? JSON.stringify(out) : `${out.address}: ${out.unread} unread · ${out.needs_reply} needs reply · ${out.owner_authority} owner · ${out.outbox} outbox`);
                 });
             }
@@ -468,7 +470,7 @@ If the codes differ, do not approve: someone is in the middle.`);
                     delete c.relay;
                 writeFileSync(cfg, JSON.stringify(c, null, 2) + "\n", { mode: 0o600 });
                 console.log(value ? `relay set to ${value}` : "relay unset");
-                console.log("the daemon reads it on start: agentmbx daemon restart, or launchctl kickstart -k gui/$(id -u)/com.agentmbx.daemon");
+                console.log("the daemon reads it on start: agentmbx daemon install, or launchctl kickstart -k gui/$(id -u)/com.agentmbx.daemon");
                 return;
             }
             if (sub !== undefined && sub !== "serve")
@@ -816,12 +818,33 @@ async function hook(node, event, cli) {
             await approveKimi(node, d, { recheck: () => yoloLookup(node)(d.agent, { cwd: d.cwd }).ok });
         return;
     }
-    if (!["session-start", "prompt", "post-tool", "stop"].includes(event ?? ""))
-        die("hook session-start | prompt | post-tool | stop | permission --cli <cli>");
+    if (!["session-start", "session-end", "prompt", "post-tool", "stop"].includes(event ?? ""))
+        die("hook session-start | session-end | prompt | post-tool | stop | permission --cli <cli>");
     const cwd = typeof input.cwd === "string" && input.cwd ? input.cwd : process.cwd();
     const rawSid = input.session_id ?? input.sessionId ?? input.thread_id;
     const sid = typeof rawSid === "string" && rawSid.trim() ? rawSid : undefined;
-    const choices = "[mbx] Identity choices: call mbx_whoami to confirm this session's identity. Keep it, or pass a new name to mbx_whoami to rename it. To recover an existing mailbox, use mbx_identity with action=list to inspect ownership, unread counts and last activity, then explicitly release your current identity and claim the chosen available name. Switching identities preserves the old mailbox without forwarding its mail. Live holders and unresolved historical conflicts cannot be claimed through these controls.";
+    if (event === "session-end") {
+        // /clear and interactive /resume can retain the same MCP connection. Its key and
+        // persona are rebound by SessionStart; releasing here would strand that connection.
+        if (cli !== "claude" || !["logout", "prompt_input_exit", "other"].includes(String(input.reason)))
+            return;
+        let receipt;
+        try {
+            receipt = withProcSnapshot(() => withHookIdentity(node, cli, sid, (_agent, descriptor) => submitIdentityControl(node.store, descriptor, "release")));
+        }
+        catch {
+            return;
+        } // no exact current binding: never guess a mailbox from the directory
+        const deadline = Date.now() + 1000;
+        while (receipt.status === "pending" && Date.now() < deadline) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+            receipt = identityControlReceipt(node.store, receipt.id) ?? receipt;
+        }
+        if (receipt.status !== "completed")
+            process.stderr.write(`[mbx] session-end release ${receipt.id}: ${receipt.status}; inspect with agentmbx identity result ${receipt.id} --json.\n`);
+        return;
+    }
+    const choices = "[mbx] Identity choices: call mbx_whoami to confirm this session's identity. Keep it, or pass a new name to mbx_whoami to rename it. To recover an existing mailbox, use mbx_identity with action=list to inspect ownership, unread counts and last activity, then explicitly release your current identity and claim the chosen available name. Switching identities preserves the old mailbox without forwarding its mail. Live holders and unresolved historical conflicts cannot be claimed through these controls. When the owner ends this session or requests a handoff, call mbx_identity release after your final mailbox work; finishing a turn is not ending a session. Closing a hosted conversation may leave its shared MCP holder running.";
     // Inspect provider capabilities and processes before the lease transaction. No directory-based session discovery.
     const watch = event === "session-start" && noPush(cli, cli === "claude" && detectHost(process.ppid).channel, cli === "kimi" && !!kimiHostedServer(process.ppid));
     let entered = false;

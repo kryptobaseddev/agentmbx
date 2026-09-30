@@ -417,8 +417,8 @@ export function edits(ctx, cli) {
                             return false;
                         }
                     } },
-                { cli, kind: "hooks", item: "hooks SessionStart + UserPromptSubmit + PostToolUse + PermissionRequest + Stop", path: join(home, ".claude/settings.json"),
-                    ...jsonHooks([...STOP_EVENTS, ["PostToolUse", "post-tool"]], "claude", cmd) },
+                { cli, kind: "hooks", item: "hooks SessionStart + SessionEnd + UserPromptSubmit + PostToolUse + PermissionRequest + Stop", path: join(home, ".claude/settings.json"),
+                    ...jsonHooks([...STOP_EVENTS, ["PostToolUse", "post-tool"], ["SessionEnd", "session-end"]], "claude", cmd) },
             ];
         }
         case "codex":
