@@ -103,7 +103,8 @@ export function sessionReadiness(node, cli) {
     return { level: onlyProvisional ? "warn" : "info",
         label: `${cli}: ${live.length} verified live mailbox binding(s), ${real} real session ID(s), ${channels} channel binding(s)`
             + (stale ? `, ${stale} stale or unverified` : "") + "; receipt not tested",
-        ...(onlyProvisional ? { fix: "run the provider session-start hook to bind its real session ID" } : {}) };
+        ...(onlyProvisional ? { fix: "run the provider session-start hook to bind its real session ID" }
+            : cli === "claude" && !channels ? { fix: "start Claude with 'agentmbx claude' (adds the mbx channel) so idle sessions wake on mail; others see mail on their next prompt" } : {}) };
 }
 export async function doctor(ctx, mbxHome, opts = {}) {
     const out = [];

@@ -1,9 +1,9 @@
 // mbx command line. Humans, hooks and scripts use this; agents use the MCP tools (mbx mcp).
 import { existsSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { constants as osConstants, homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { canonical, fingerprint, ulid } from "./crypto.js";
 import { buildGrant, CAPS, grantPayload, NAME_RE } from "./envelope.js";
 import { advertise, browse, lanIPv4 } from "./discovery.js";
@@ -20,7 +20,7 @@ import { periodicUpdateCheck, updateAvailable, updateCommand } from "./update.js
 import { installKind, version } from "./version.js";
 import { installService, serviceLabel, uninstallService } from "./service.js";
 import { CLIS, defaultHostName, defaultWhich, formatRows, ownerStep, resolveCommand, runSetup, shJoin } from "./setup.js";
-import { dispatchWakes, hasWakeAuthority, humanPromptKey, inboxCommand, isHumanPrompt, macNotifierPath, notifyDesktop, opencodeService } from "./wake.js";
+import { dispatchWakes, hasWakeAuthority, humanPromptKey, inboxCommand, isHumanPrompt, macNotifierPath, notifyDesktop, opencodeService, which } from "./wake.js";
 import { kimiHostedServer } from "./kimi-web.js";
 import { approveKimi, decidePermission, opencodePermissionPass } from "./permission.js";
 import { diagnosticSnapshot } from "./diagnostics.js";
@@ -36,6 +36,7 @@ Start here
   agentmbx setup [--yes] [--dry-run] [--only claude,codex,opencode,kimi,hermes,skill,owner] [--host <name>] [--no-owner] [--policy ask|collaborate|autonomous|yolo] [--uninstall]
                   init this host, install the daemon, wire every detected agent CLI (MCP + hooks + skill), create the owner key
   agentmbx doctor   checklist: host, daemon, each CLI's wiring, skill, peers, pending pairings
+  agentmbx claude [claude args…]   start Claude Code with the mbx channel, so the idle session wakes when mail arrives
 
 Messages
   agentmbx send --as <agent> --to <a,b,role:x,*,owner> --subject "…" [-m "body" | --body-file f | stdin]
@@ -192,10 +193,25 @@ export async function main(argv = process.argv.slice(2)) {
         process.exitCode = cliError(e, argv[0] ?? "");
     }
 }
+/** Claude Code arguments with the mbx channel enabled (T044). Claude has no persistent setting for this; a flag is the only way. */
+export const claudeChannelArgs = (args) => args.some((a, i) => /^--(?:channels|dangerously-load-development-channels)(?:=|$)/.test(a) && /(?:^|[=\s,])server:mbx(?:$|[\s,])/.test(a.includes("=") ? a : args[i + 1] ?? ""))
+    ? args : ["--dangerously-load-development-channels", "server:mbx", ...args];
+/** `agentmbx claude [args]`: run Claude Code with the mbx channel so an idle session wakes when mail arrives. */
+async function launchClaude(args) {
+    const bin = process.env.MBX_CLAUDE_BIN || which("claude") || die("claude not found on PATH (set MBX_CLAUDE_BIN)");
+    const child = spawn(bin, claudeChannelArgs(args), { stdio: "inherit" });
+    const ignore = () => { }; // the terminal delivers Ctrl-C to Claude directly; this wrapper just waits
+    process.on("SIGINT", ignore);
+    const code = await new Promise((resolve) => child.on("exit", (c, sig) => resolve(c ?? (sig ? 128 + (osConstants.signals[sig] ?? 0) : 1))));
+    process.off("SIGINT", ignore);
+    process.exitCode = code;
+}
 async function run(argv) {
     const [cmd, ...rest] = argv;
     if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h")
         return console.log(HELP);
+    if (cmd === "claude")
+        return launchClaude(rest); // every argument belongs to Claude Code: parse nothing here
     const { values: o, positionals: pos } = parseArgs({ args: rest, allowPositionals: true, strict: cmd !== "hook" && cmd !== "mcp", options: {
             help: { type: "boolean", short: "h" }, force: { type: "boolean" },
             as: { type: "string" }, to: { type: "string" }, subject: { type: "string" }, m: { type: "string", short: "m" },
