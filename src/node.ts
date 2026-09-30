@@ -14,7 +14,7 @@ import {
 } from "./envelope.ts";
 import { ownerPublicKey } from "./owner.ts";
 import { effectivePolicy, policyLine } from "./policy.ts";
-import { procStart, provenProcess, sameProcess } from "./proc.ts";
+import { procStart, procTable, provenProcess, sameProcess } from "./proc.ts";
 import { privatePath } from "./private-files.ts";
 import { Store, type DeliveryState, type MessageRow } from "./store.ts";
 
@@ -396,6 +396,23 @@ export class MbxNode {
     this.store.db.prepare("UPDATE peers SET state='approved', approved_at=? WHERE host=?").run(new Date().toISOString(), host);
     this.notePeerOwner(host, p.owner_pubkey);
     this.store.audit("pair.approved", { host, key: fingerprint(p.pubkey) });
+  }
+
+  /**
+   * Drop session rows whose process is provably gone (T046): the PID no longer exists, or it was reused by a process
+   * with a different start time. Rows without that proof stay; chosen names live in kv and survive for the next bind.
+   */
+  pruneDeadSessions(): number {
+    if (procTable().size === 0) return 0; // no process listing: nothing can be proven dead
+    const rows = this.store.db.prepare("SELECT cli,session_id,pid,pid_start FROM sessions WHERE pid IS NOT NULL").all() as { cli: string; session_id: string; pid: number; pid_start: string | null }[];
+    const dead = rows.filter((r) => {
+      try { process.kill(r.pid, 0); } catch (e) { return (e as NodeJS.ErrnoException).code === "ESRCH"; }
+      const start = procStart(r.pid);
+      return !!r.pid_start && !!start && start !== r.pid_start;
+    });
+    for (const r of dead) this.store.db.prepare("DELETE FROM sessions WHERE cli=? AND session_id=? AND pid=?").run(r.cli, r.session_id, r.pid);
+    if (dead.length) this.store.audit("sessions.pruned", { count: dead.length, sessions: dead.slice(0, 50).map((r) => `${r.cli}:${r.session_id}`) });
+    return dead.length;
   }
 
   // ---- key rotation (T030) ------------------------------------------------------------------

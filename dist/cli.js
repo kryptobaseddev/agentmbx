@@ -646,7 +646,10 @@ If the codes differ, do not approve: someone is in the middle.`);
                 });
             }
             setInterval(tick, 2000);
-            setInterval(() => { void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node); }, 60_000);
+            setInterval(() => { void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node); try {
+                node.pruneDeadSessions();
+            }
+            catch { /* db busy: next minute */ } }, 60_000);
             void refreshDirectory(node);
             void pullPolicies(node);
             void refreshPeerEncKeys(node);

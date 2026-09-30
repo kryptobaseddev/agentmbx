@@ -528,7 +528,7 @@ If the codes differ, do not approve: someone is in the middle.`);
         });
       }
       setInterval(tick, 2000);
-      setInterval(() => { void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node); }, 60_000); void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node);
+      setInterval(() => { void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node); try { node.pruneDeadSessions(); } catch { /* db busy: next minute */ } }, 60_000); void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node);
       // a policy about to lapse: one desktop reminder, 48 h ahead, with the renew command (only where the owner key is)
       const remind = () => { try { if (!node.ownerPub) return; for (const p of dueReminders(node.store.db)) void notifyDesktop({ subtitle: "Policy expires soon",
         body: `${policySummary(p)} expires ${p.exp.slice(0, 16).replace("T", " ")}Z. Renew: agentmbx policy renew ${p.id.slice(-6)}` }); } catch { /* db busy */ } };
