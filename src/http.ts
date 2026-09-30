@@ -284,7 +284,7 @@ export async function refreshPeerEncKeys(node: MbxNode, f: typeof fetch = fetch,
   for (const p of node.peers().filter((x) => x.state === "approved" && !x.enc_pub && (only === undefined || x.host === only))) {
     try {
       const path = "/v1/enc-key";
-      const res = await f(`http://${p.addr}${path}`, { headers: signHop(node, "GET", path, ""), signal: AbortSignal.timeout(5_000) });
+      const res = await f(`http://${p.addr}${path}`, { headers: signHop(node, "GET", path, ""), redirect: "error", signal: AbortSignal.timeout(5_000) });
       if (!res.ok) continue;
       const j = await res.json() as { v?: number; host?: string; enc_pub?: string; sig?: string };
       if (j.v !== 1 || j.host !== p.host || typeof j.enc_pub !== "string" || typeof j.sig !== "string") continue;

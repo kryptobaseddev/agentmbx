@@ -26,6 +26,7 @@ test("unsupported peers retain queued mail without legacy fallback, then deliver
   const port = (server.address() as AddressInfo).port, addr = `127.0.0.1:${port}`;
   a.addApprovedPeer({ host: "beta", pubkey: b.key.publicKey, owner_pubkey: null, addr }, "fixture");
   b.addApprovedPeer({ host: "alpha", pubkey: a.key.publicKey, owner_pubkey: null, addr: "unused" }, "fixture");
+  a.store.db.prepare("UPDATE peers SET enc_pub=? WHERE host='beta'").run(b.encKey.publicKey); // learned earlier (T028): exercise the v2 path
   const unverified = a.send({ from: "sender", to: ["recipient@beta"], subject: "unverified", body: "readable" }).envelope;
   const leased = sendLeased(a, { from: "sender", to: ["recipient@beta"], subject: "leased", body: "verified holder" }).envelope;
   assert.deepEqual(await flushOutbox(a), { sent: 0, failed: 0 });

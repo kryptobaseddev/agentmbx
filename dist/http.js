@@ -312,7 +312,7 @@ export async function refreshPeerEncKeys(node, f = fetch, only) {
     for (const p of node.peers().filter((x) => x.state === "approved" && !x.enc_pub && (only === undefined || x.host === only))) {
         try {
             const path = "/v1/enc-key";
-            const res = await f(`http://${p.addr}${path}`, { headers: signHop(node, "GET", path, ""), signal: AbortSignal.timeout(5_000) });
+            const res = await f(`http://${p.addr}${path}`, { headers: signHop(node, "GET", path, ""), redirect: "error", signal: AbortSignal.timeout(5_000) });
             if (!res.ok)
                 continue;
             const j = await res.json();
