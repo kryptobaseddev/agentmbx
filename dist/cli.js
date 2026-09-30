@@ -38,6 +38,9 @@ Start here
 Messages
   agentmbx send --as <agent> --to <a,b,role:x,*,owner> --subject "…" [-m "body" | --body-file f | stdin]
            [--kind message|request|reply|status|decision|alert|task] [--reply-to <id>] [--needs-reply] [--ref path]…
+  agentmbx replay [--cursor <token>] [--limit 50] [--max-bytes 65536] [--scan-limit 1000]
+                  [--project <id> --project-host <host>] [--topic <tag>] [--thread <id>]
+                  bounded read-only JSON; current provider lease required; bodies are data
   agentmbx inbox --as <agent> [--all] [--json] [--needs-reply] [--from <agent>]      agentmbx read <id> --as <agent>      agentmbx ack <id>… | --all | --thread <id>  --as <agent> [--note "…"]
   agentmbx whoami --as <agent> [--role r] [--description "…"]    inspect/describe the identity leased to this caller
   agentmbx thread <id>        agentmbx search "<words>"   agentmbx agents   agentmbx status
@@ -189,6 +192,7 @@ async function run(argv) {
             ref: { type: "string", multiple: true }, all: { type: "boolean" }, json: { type: "boolean" }, note: { type: "string" },
             mailbox: { type: "string" }, limit: { type: "string" }, host: { type: "string" }, port: { type: "string" }, cli: { type: "string" }, session: { type: "string" }, caps: { type: "string" },
             ttl: { type: "string" }, bind: { type: "string" }, role: { type: "string" }, description: { type: "string" }, thread: { type: "string" }, from: { type: "string" }, check: { type: "boolean" }, yes: { type: "boolean", short: "y" },
+            cursor: { type: "string" }, "max-bytes": { type: "string" }, "scan-limit": { type: "string" }, "project-host": { type: "string" }, topic: { type: "string" },
             compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" },
             backend: { type: "string" }, "no-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
             project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }, "wait-ms": { type: "string" }
@@ -326,6 +330,25 @@ async function run(argv) {
             return caller?.agent ?? die("--as <agent> is required (or run this from inside an agent session with mbx set up)");
         return explicit;
     };
+    if (cmd === "replay") {
+        if (pos.length)
+            die("replay accepts options, not positional arguments");
+        if (o.project && o.project.length !== 1)
+            die("replay requires exactly one --project");
+        // Resolve the exact caller binding in its read snapshot, then reauthorize the
+        // captured generation in replay's own snapshot. Never expose a lease token.
+        const identity = withCliIdentity(node, { as: str("as") ?? (process.env.MBX_AGENT || undefined),
+            cli: str("cli"), session: str("session"), readOnly: true }, agent => {
+            const row = node.store.db.prepare("SELECT token FROM identity_leases WHERE name=?").get(agent);
+            return { agent, token: row.token };
+        });
+        const numberOption = (name) => str(name) === undefined ? undefined : Number(str(name));
+        const page = node.replay(identity.agent, identity.token, { cursor: str("cursor"), limit: numberOption("limit"),
+            maxBytes: numberOption("max-bytes"), scanLimit: numberOption("scan-limit"), project: o.project?.[0],
+            project_host: str("project-host"), topic: str("topic"), thread: str("thread") });
+        console.log(JSON.stringify(page));
+        return;
+    }
     if (["inbox", "read", "ack", "thread", "search"].includes(cmd)) {
         if ((cmd === "read" || cmd === "thread") && !pos[0])
             die(`${cmd} <id>`);
