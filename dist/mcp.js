@@ -860,6 +860,10 @@ export async function runMcp(existing) {
     }
     if (closed)
         return;
+    // The reused client does not initialize again. Registration happened before
+    // connection, so announce the replacement catalog on this live transport.
+    if (process.env[REEXEC_ENV])
+        await server.server.sendToolListChanged();
     timers.push(setInterval(() => {
         try {
             node.store.assertCurrent(version());

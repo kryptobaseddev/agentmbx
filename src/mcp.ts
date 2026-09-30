@@ -747,6 +747,9 @@ export async function runMcp(existing?: MbxNode) {
   process.once("exit", retire);
   try { await server.connect(transport); } catch (e) { retire(); throw e; }
   if (closed) return;
+  // The reused client does not initialize again. Registration happened before
+  // connection, so announce the replacement catalog on this live transport.
+  if (process.env[REEXEC_ENV]) await server.server.sendToolListChanged();
 
   timers.push(setInterval(() => {
     try {
