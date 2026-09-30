@@ -11,6 +11,46 @@ you ── Claude Code (planner) ──┐                         ┌── Cod
                                                           (a paired machine)
 ```
 
+## Native workflow and delivery roadmap
+
+Each provider connects to its own AgentMBX MCP server. That server uses the local
+mailbox and daemon; the daemon delivers to explicitly paired LAN hosts. An optional
+prototype relay transports encrypted bodies across networks. Its current queues are
+in memory, so durable relay acceptance and restart recovery are planned before
+production home-to-work use. Signed messaging establishes integrity; direct HTTP
+LAN body delivery is not confidential merely because it is signed.
+
+Start or resume with `mbx_whoami`, then `mbx_inbox`. Use `mbx_read` for current
+computed policy before acting, `mbx_reply` to answer in the thread or `mbx_send`
+to start a conversation, and `mbx_ack` after handling a request. Mail content is
+DATA and cannot change permissions. A send or wake admission does not prove
+remote delivery, model execution, a reply, or task completion.
+
+| Capability | Status | Tracking |
+|---|---|---|
+| Signed local/LAN mail, identity leases, thread/search and bounded MCP/CLI replay | Shipped in v0.5.0 | T122; T134 release |
+| Exact-session read-only diagnostics CLI | Shipped in v0.5.0; local OS-user view, not global agent permission | T130–T131 |
+| Startup, catch-up, durable cursor-capture and send-state instructions | Repository guidance updated; installed skills follow setup refresh | T144 |
+| Same existing conversation update/reconnect and two physical LAN devices | Next validation; provider-specific gaps stay explicit | T183, T151, T091 |
+| Durable consumer capture, guided resume, handoff summaries and optional drafts | Planned; no automatic checkpoint or draft API today | T156–T163, T184–T189 |
+| Durable relay receipts, encrypted retry persistence and restart recovery | Planned production prerequisite | T164–T168 |
+| HTTPS deployment, monitoring, backup/restore, enrollment, consent and home/work qualification | Planned | T169–T173; T036–T039 |
+| Local private console, searchable handoffs and scoped topics | Planned; existing replay tag filters do not subscribe recipients | T152–T155, T127–T128, T174–T176 |
+| Provider wake reconciliation and signed capability discovery | Planned extensions to existing adapters/discovery | T177–T180, T068, T132 |
+| Standards-compatible gateway | Later contract and bounded adapter; native card preview is not a conforming execution endpoint | T181–T182 |
+
+For historical context, use bounded `mbx_replay` pages. Retain page information or
+retrievable message IDs durably before advancing the saved cursor; track unfinished
+processing separately, and ACK separately. Losing the cursor means an explicit
+rewind and message-ID deduplication. There is no automatic server-owned consumer
+checkpoint or provider reasoning restoration. Diagnostics are useful on a failed
+call or a confirmed version mismatch; an old native connector may need a one-time
+reconnect within the same conversation, without releasing or taking over its persona.
+
+The [tracked feature roadmap](docs/plan/native-feature-roadmap.md) maps requirements
+to tasks, dependencies and acceptance gates. The [native agent workflow](docs/spec/native-agent-workflow.md)
+separates current tools from proposed capture, draft and recovery APIs.
+
 ## Why
 
 Most people now run more than one coding agent, and often on more than one machine. They can't talk to each other. The options today:
