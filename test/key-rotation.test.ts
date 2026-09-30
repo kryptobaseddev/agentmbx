@@ -10,6 +10,7 @@ import { MbxNode } from "../src/node.ts";
 import { canonical, generateKeyPair, signData } from "../src/crypto.ts";
 import { finishRotation, saveRotationLog, type SignedRotation } from "../src/key-rotation.ts";
 import { sealEnvelope, buildEnvelope, signEnvelope } from "../src/envelope.ts";
+import { exportIdentity, importIdentity } from "../src/identity-backup.ts";
 
 process.env.MBX_NO_DESKTOP = "1";
 
@@ -150,4 +151,22 @@ test("removing a pairing tells the peer, which drops it too", async (t) => {
   assert.equal(B.n.peer("alpha"), undefined, "beta removed alpha");
   assert.ok(B.n.store.db.prepare("SELECT 1 FROM audit WHERE event='pair.removed_by_peer'").get());
   assert.equal(await notifyUnpair(A.n, "beta"), false, "nothing to notify once removed");
+});
+
+test("an identity bundle carries rotation history, so a restored host still verifies pre-rotation mail", () => {
+  const [home, restored] = [mkdtempSync(join(tmpdir(), "mbx-rot-exp-")), mkdtempSync(join(tmpdir(), "mbx-rot-imp-"))];
+  try {
+    const n = new MbxNode(home, { host: "alpha" });
+    const old = n.key.publicKey;
+    n.rotateKeys();
+    const file = join(home, "bundle.json");
+    exportIdentity(n, file, "correct horse battery staple");
+    const current = n.key.publicKey;
+    n.close();
+    importIdentity(restored, readFileSync(file, "utf8"), "correct horse battery staple");
+    const r = new MbxNode(restored);
+    assert.deepEqual(r.hostKeys("alpha"), [current, old], "retired keys came along");
+    assert.equal(JSON.parse(readFileSync(join(restored, "rotations.json"), "utf8")).records.length, 1, "pending announcements can still finish");
+    r.close();
+  } finally { rmSync(home, { recursive: true, force: true }); rmSync(restored, { recursive: true, force: true }); }
 });

@@ -14,8 +14,9 @@ import { NAME_RE } from "./envelope.js";
 import { MbxNode } from "./node.js";
 import { ownerInfo } from "./owner.js";
 import { privatePath } from "./private-files.js";
+import { retiredKeys, rotationLog } from "./key-rotation.js";
 const SCRYPT = { N: 1 << 17, r: 8, p: 1, maxmem: 256 * 1024 * 1024 };
-export const IDENTITY_FILES = ["config.json", "host.key", "enc.key", "owner.key", "owner.json"];
+export const IDENTITY_FILES = ["config.json", "host.key", "enc.key", "owner.key", "owner.json", "retired-keys.json", "rotations.json"];
 const fail = (code, message) => { throw Object.assign(new Error(message), { code }); };
 const checkPassphrase = (s) => { if (s.length < 12)
     fail("USAGE_ERROR", "use a passphrase of at least 12 characters"); };
@@ -65,8 +66,9 @@ export function identityBundle(node) {
         v: 1, created_at: new Date().toISOString(), host: node.host, config: JSON.parse(readFileSync(join(node.home, "config.json"), "utf8")),
         host_key: node.key, enc_key: node.encKey,
         owner: !info ? null : info.backend === "file" ? { backend: "file", file: JSON.parse(readFileSync(info.path, "utf8")) } : { backend: "keychain", public_key: info.public_key },
-        peers: db.prepare("SELECT host,pubkey,owner_pubkey,addr,enc_pub,created_at,approved_at FROM peers WHERE state='approved' ORDER BY host").all(),
+        peers: db.prepare("SELECT host,pubkey,owner_pubkey,addr,enc_pub,prev_keys,created_at,approved_at FROM peers WHERE state='approved' ORDER BY host").all(),
         principals: db.prepare("SELECT fp,pub,role,label,via,added_at,peer FROM principals WHERE via<>'local' ORDER BY fp").all(),
+        retired: retiredKeys(node.home), rotations: rotationLog(node.home),
     };
 }
 /** Write the sealed bundle (0600, never over an existing file unless `force`). */
@@ -115,6 +117,10 @@ export function importIdentity(home, raw, passphrase, o = {}) {
     put("enc.key", b.enc_key);
     if (b.owner?.backend === "file")
         put("owner.key", b.owner.file);
+    if (b.retired?.host.length || b.retired?.enc.length)
+        put("retired-keys.json", b.retired);
+    if (b.rotations?.records.length)
+        put("rotations.json", b.rotations);
     const node = new MbxNode(home);
     try {
         node.store.tx(() => {
@@ -122,10 +128,10 @@ export function importIdentity(home, raw, passphrase, o = {}) {
             // A replaced identity's local owner must not keep authority here; only the restored owner key (if any) counts.
             db.prepare("DELETE FROM principals WHERE via='local' AND fp<>?").run(owner ? fingerprint(owner) : "");
             for (const p of b.peers)
-                db.prepare(`INSERT INTO peers (host,pubkey,owner_pubkey,addr,state,code,nonce_local,nonce_remote,created_at,approved_at,enc_pub)
-        VALUES (?,?,?,?,'approved',NULL,NULL,NULL,?,?,?) ON CONFLICT(host) DO UPDATE SET pubkey=excluded.pubkey, owner_pubkey=excluded.owner_pubkey,
-        addr=excluded.addr, state='approved', code=NULL, approved_at=excluded.approved_at, enc_pub=excluded.enc_pub`)
-                    .run(p.host, p.pubkey, p.owner_pubkey, p.addr, p.created_at, p.approved_at, p.enc_pub);
+                db.prepare(`INSERT INTO peers (host,pubkey,owner_pubkey,addr,state,code,nonce_local,nonce_remote,created_at,approved_at,enc_pub,prev_keys)
+        VALUES (?,?,?,?,'approved',NULL,NULL,NULL,?,?,?,?) ON CONFLICT(host) DO UPDATE SET pubkey=excluded.pubkey, owner_pubkey=excluded.owner_pubkey,
+        addr=excluded.addr, state='approved', code=NULL, approved_at=excluded.approved_at, enc_pub=excluded.enc_pub, prev_keys=excluded.prev_keys`)
+                    .run(p.host, p.pubkey, p.owner_pubkey, p.addr, p.created_at, p.approved_at, p.enc_pub, p.prev_keys ?? null);
             for (const r of b.principals)
                 db.prepare(`INSERT INTO principals (fp,pub,role,label,via,added_at,peer) VALUES (?,?,?,?,?,?,?)
         ON CONFLICT(fp) DO UPDATE SET role=excluded.role, label=excluded.label, via=excluded.via, peer=excluded.peer`)

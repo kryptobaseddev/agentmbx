@@ -51,7 +51,7 @@ export class MbxNode {
         this.home = home;
         mkdirSync(home, { recursive: true, mode: 0o700 });
         privatePath(home, 0o700);
-        for (const file of ["config.json", "host.key", "enc.key", "owner.key", "owner.json"])
+        for (const file of ["config.json", "host.key", "enc.key", "owner.key", "owner.json", "retired-keys.json", "rotations.json"])
             privatePath(join(home, file), 0o600, true);
         const cfgPath = join(home, "config.json"), keyPath = join(home, "host.key"), encPath = join(home, "enc.key");
         if (!existsSync(cfgPath)) {
