@@ -110,9 +110,9 @@ Pinned source revision: https://github.com/kryptobaseddev/agentmbx/tree/60638c82
 
 - [Relay memory state and owner-labelled enrollment](https://github.com/kryptobaseddev/agentmbx/blob/60638c8267476d87d3cca67e28febf9235b3a5b1/src/relay.ts#L17-L73).
 - [Relay fanout, dedup, pull and ACK](https://github.com/kryptobaseddev/agentmbx/blob/60638c8267476d87d3cca67e28febf9235b3a5b1/src/relay.ts#L76-L119).
-- [HTTP relay auth, partial acceptance and encryption advertisement response](https://github.com/kryptobaseddev/agentmbx/blob/60638c8267476d87d3cca67e28febf9235b3a5b1/src/relay.ts#L133-L187).
+- [HTTP relay auth, partial acceptance and encryption advertisement response](https://github.com/kryptobaseddev/agentmbx/blob/60638c8267476d87d3cca67e28febf9235b3a5b1/src/relay.ts#L133-L186).
 - [Client enrollment persistence and key discovery](https://github.com/kryptobaseddev/agentmbx/blob/60638c8267476d87d3cca67e28febf9235b3a5b1/src/relay-client.ts#L31-L57).
-- [Client sealed push/outbox deletion and receive/checkpoint behavior](https://github.com/kryptobaseddev/agentmbx/blob/60638c8267476d87d3cca67e28febf9235b3a5b1/src/relay-client.ts#L61-L100).
+- [Client sealed push/outbox deletion and receive/checkpoint behavior](https://github.com/kryptobaseddev/agentmbx/blob/60638c8267476d87d3cca67e28febf9235b3a5b1/src/relay-client.ts#L61-L99).
 - [Wake authority/no-body hints and provider admission validation](https://github.com/kryptobaseddev/agentmbx/blob/60638c8267476d87d3cca67e28febf9235b3a5b1/src/wake.ts#L15-L68).
 - [Kimi busy/status/submission handling](https://github.com/kryptobaseddev/agentmbx/blob/60638c8267476d87d3cca67e28febf9235b3a5b1/src/wake.ts#L111-L150).
 - [Dispatcher lease guards, brakes, retry and notification completion](https://github.com/kryptobaseddev/agentmbx/blob/60638c8267476d87d3cca67e28febf9235b3a5b1/src/wake.ts#L205-L301).
