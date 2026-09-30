@@ -1,4 +1,5 @@
-import { hasHeldIdentity } from "./identity-leases.js";
+import { hasHeldIdentity, IdentityLeases } from "./identity-leases.js";
+import { initializeReplay, replayQuery } from "./replay.js";
 import { kimiHostedCheck } from "./wake-check.js";
 // One mbx host: its key, its store, and the rules for sending, receiving, verifying and delivering.
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
@@ -65,6 +66,7 @@ export class MbxNode {
             writeFileSync(encPath, JSON.stringify(generateEncKeyPair()) + "\n", { mode: 0o600, flag: "wx" });
         this.encKey = JSON.parse(readFileSync(encPath, "utf8"));
         this.store = new Store(home, { host: this.host });
+        initializeReplay(this.store);
         this.retireIdentityLinks();
         this.syncOwner();
     }
@@ -624,6 +626,10 @@ export class MbxNode {
         return { ...m, authority: authority ? JSON.stringify(authority) : null };
     }
     // ---- reading -----------------------------------------------------------------------------
+    /** Explicit position replay; fetching never changes delivery state or checkpoints. */
+    replay(agent, leaseToken, options = {}) {
+        return new IdentityLeases(this.store).withHeldRead(agent, leaseToken, () => replayQuery(this.store, agent, options, m => this.canSee(m, agent), m => m.from_addr.split("@")[1] ?? "", m => this.currentAuthority(m)));
+    }
     inbox(agent, opts = {}) {
         return this.store.db.prepare(`SELECT m.*, d.state FROM deliveries d JOIN messages m ON m.id=d.msg_id
       WHERE d.agent=? ${opts.all ? "" : "AND d.state <> 'acked'"} ORDER BY m.ts LIMIT ?`).all(agent, opts.limit ?? 50).map(m => this.currentAuthority(m));
