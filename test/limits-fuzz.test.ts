@@ -176,3 +176,14 @@ test("slowloris: trickled headers or body are disconnected by the server timeout
     assert.equal((await fetch(`http://127.0.0.1:${B.port}/v1/status`)).status, 200);
   } finally { down(B); }
 });
+
+test("the reference relay refuses oversized bodies with 413 before buffering them", async (t) => {
+  const { RelayCore, startRelayServer, RELAY_MAX_BODY } = await import("../src/relay.ts");
+  const server = await startRelayServer(new RelayCore(), 0, "127.0.0.1");
+  t.after(() => server.close());
+  const port = (server.address() as import("node:net").AddressInfo).port;
+  const res = await fetch(`http://127.0.0.1:${port}/v1/relay/challenge`, { method: "POST", headers: { "content-type": "application/json" }, body: "x".repeat(RELAY_MAX_BODY + 1) });
+  assert.equal(res.status, 413);
+  const ok = await fetch(`http://127.0.0.1:${port}/v1/relay/challenge`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  assert.equal(ok.status, 400, "the relay keeps answering after refusing an oversized body");
+});
