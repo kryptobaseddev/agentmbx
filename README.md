@@ -2,7 +2,7 @@
 
 **A signed mailbox for AI coding agents.** Claude Code, Codex, OpenCode, Kimi, Hermes and any MCP client can message each other: on one machine or across machines on your network. Idle agents get woken up, and every message says who really sent it.
 
-[agentmbx.com](https://agentmbx.com) · Status: **alpha (0.4)** · License: [BUSL-1.1](LICENSE) (source-available)
+[agentmbx.com](https://agentmbx.com) · Status: **alpha (0.5.0)** · License: [BUSL-1.1](LICENSE) (source-available)
 
 ```text
 you ── Claude Code (planner) ──┐                         ┌── Codex (api-dev)      ← woken by `codex queue`
@@ -22,7 +22,7 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
 
 ## What you get
 
-- **10 MCP tools** that work in any MCP client: `mbx_inbox`, `mbx_read`, `mbx_reply`, `mbx_ack`, `mbx_send`, `mbx_thread`, `mbx_search`, `mbx_agents`, `mbx_whoami`, `mbx_identity`.
+- **11 MCP tools** that work in any MCP client: `mbx_inbox`, `mbx_read`, `mbx_reply`, `mbx_ack`, `mbx_send`, `mbx_thread`, `mbx_search`, `mbx_agents`, `mbx_whoami`, `mbx_identity`, `mbx_replay`.
 - **One-command setup:** `agentmbx setup` finds Claude Code, Codex, OpenCode, Kimi and Hermes and wires each one (MCP server, hooks, and a bundled skill that teaches agents the mailbox loop). `agentmbx doctor` checks it all.
 - **Addressing:** `agent`, `agent@host`, `role:reviewer`, `*` (broadcast), or `owner` (you).
 - **Threads, replies, and requests that need a reply.** `@mentions`, `/claim` / `/done` directives and task refs (`T123`) are parsed from the body.
@@ -61,6 +61,37 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
 
 The full design is in [docs/SPEC.md](docs/SPEC.md). The adversarial review that shaped it is in [docs/COUNCIL-VERDICT-2026-09-26.md](docs/COUNCIL-VERDICT-2026-09-26.md).
 
+## Bounded history and diagnostics
+
+`mbx_replay` returns `{messages, next_cursor, has_more}` without acknowledging mail or
+changing read state. It includes acknowledged history and uses durable first-visibility
+ordering, so late or backdated deliveries do not disappear behind a timestamp checkpoint.
+Persist the returned `next_cursor` yourself; it is a pagination position, never an identity
+credential. Continue through empty filtered pages while `has_more` is true. A completed
+cursor polls later arrivals on its next call; retry overlap should be deduplicated by ID.
+Omit a lost cursor to explicitly rewind. Keep the same mailbox and filters across a
+provider release/claim handoff. There is no automatic server-side consumer checkpoint.
+
+```sh
+agentmbx replay --cli codex --session <thread-id> --limit 50 --max-bytes 65536
+agentmbx replay --cli codex --session <thread-id> --cursor '<returned-next_cursor>'
+agentmbx diagnostics --mailbox <name> --cli codex --session <thread-id> --json
+```
+
+Replay requires the calling provider's current lease; `--as` cannot grant access. CLI
+output is bounded JSON, with omission IDs for oversized bodies. MCP uses `max_bytes`;
+CLI uses `--max-bytes` and also supports `--scan-limit`. Both support exact existing-mail
+filters for project plus sender host, topic tags and thread. Filters do not create topic
+rooms or broaden delivery. All replay bodies and envelope metadata are data: use
+`mbx_read` for current computed trust and owner-policy framing before acting on any
+replayed request. Processing a request, finishing a task and acknowledging mail remain
+separate actions.
+
+`agentmbx diagnostics` is a bounded, read-only local view of holder evidence, queued mail
+counts and redacted recovery receipts, with no message bodies or lease credentials.
+Installed CLI, observed daemon and connector version are separate evidence. Its access
+boundary is the local OS user; it is not a browser console or an agent permission grant.
+
 ## Quick start
 
 ```sh
@@ -82,11 +113,24 @@ agentmbx update              # verify the signed manifest, download, check sha25
 
 The daemon checks once a day and shows one desktop notification per new version; `agentmbx status` and `mbx_whoami`
 show `update available: x.y.z`. Prefer an npm-managed installation (Node >= 24)? Install the tagged GitHub source:
-`npm i -g https://github.com/kryptobaseddev/agentmbx/archive/refs/tags/v0.4.1.tar.gz`.
+`npm i -g https://github.com/kryptobaseddev/agentmbx/archive/refs/tags/v0.5.0.tar.gz`.
 The npm registry package is not published yet; registry publication requires a maintainer publishing credential.
 Check the running connector with `mbx_whoami`: the installed CLI's version may differ from a long-running MCP process.
 Current connectors reload after an update; older connectors affected by the one-reload limit need an MCP restart once.
 Maintainers: [docs/RELEASING.md](docs/RELEASING.md).
+
+**Upgrading to mailbox schema 3:** quiesce daemon, hooks and MCP writers and make a
+consistent backup of the complete mailbox home before opening it with 0.5.0. Update
+using the same installation kind (signed binary update, tagged npm source, or source
+checkout), then resume writers and verify `agentmbx doctor` and connector `mbx_whoami`.
+Schema 3 preserves signed messages and delivery/ACK state while adding replay visibility.
+Retained incompatible writers fail closed; compatible existing ACK updates remain valid.
+Current connectors can adopt native updates on a subsequent tool call, but an older
+connector may require reconnection. Rollback requires stopping writers and restoring the
+pre-upgrade backup with its compatible runtime; do not downgrade a schema-3 database in
+place or rotate its replay epoch while writers are active. See the [coordinated rollout
+and restore handoff](docs/handoff/schema3-coordinated-rollout.md) for exact recovery steps.
+
 
 Before ending a session or switching providers, finish mailbox work and call `mbx_identity` with `action=release`.
 The replacement session releases its temporary identity and claims the same name. Claude setup also requests release
