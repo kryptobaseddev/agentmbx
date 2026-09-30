@@ -40,6 +40,7 @@
 # (detected project facts and bootstrap scripts — not runtime state).
 !project-context.json
 # T12325: write-once portable project identity (ADR-094, amends ADR-013 §9).
+!project.json
 !project-id
 !setup-otel.sh
 !DATA-SAFETY-IMPLEMENTATION-SUMMARY.md
