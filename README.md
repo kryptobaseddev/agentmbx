@@ -32,7 +32,7 @@ remote delivery, model execution, a reply, or task completion.
 | Exact-session read-only diagnostics CLI | Shipped in v0.5.0; local OS-user view, not global agent permission | T130–T131 |
 | Startup, catch-up, durable cursor-capture and send-state instructions | Repository guidance updated; installed skills follow setup refresh | T144 |
 | Same existing conversation update/reconnect and two physical LAN devices | Next validation; provider-specific gaps stay explicit | T183, T151, T091 |
-| Durable consumer capture, guided resume, handoff summaries and optional drafts | Planned; no automatic checkpoint or draft API today | T156–T163 |
+| Durable consumer capture, guided resume, handoff summaries and optional drafts | Planned; no automatic checkpoint or draft API today | T156–T163, T184–T189 |
 | Durable relay receipts, encrypted retry persistence and restart recovery | Planned production prerequisite | T164–T168 |
 | HTTPS deployment, monitoring, backup/restore, enrollment, consent and home/work qualification | Planned | T169–T173; T036–T039 |
 | Local private console, searchable handoffs and scoped topics | Planned; existing replay tag filters do not subscribe recipients | T152–T155, T127–T128, T174–T176 |
