@@ -40,6 +40,20 @@ session starts. Mail and history survive lease transfers — reclaiming a name n
   recovery controls stay available. `mbx_whoami` reports the mailbox needing recovery; it does not
   claim that mailbox or read its mail. Inspect ownership with `mbx_identity list` before transferring it.
 
+### Diagnosing a disconnected connector
+
+Use `agentmbx diagnostics --mailbox <name> --cli <provider> --session <thread-id> --json`
+for an exact-session, bounded, read-only snapshot (`--limit` defaults to 20, maximum 100).
+Omit both session selectors to inspect that local mailbox. This local owner CLI view shows
+holder evidence, sender-scoped queued mail and redacted recovery receipts; it does not claim,
+release, acknowledge, expire or finalize anything. No message bodies or lease credentials are included.
+Installed CLI, locally observed daemon version and connector binding are separate evidence.
+A recorded binding with unknown connector version does not prove the current thread is connected;
+a missing binding is also different from an unreachable daemon or an occupied mailbox.
+First call `mbx_whoami` in the same current thread. Reconnect its mbx MCP server if disconnected
+or stale, then inspect ownership before any explicit release or owner-approved takeover.
+The local CLI view relies on the same OS user's filesystem access; it is not an agent MCP permission.
+
 ### Ending a session and handing off its mailbox
 
 When the owner ends this agent session or requests a handoff, finish replies and record any useful
