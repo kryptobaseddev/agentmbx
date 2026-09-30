@@ -22,7 +22,7 @@ import { activePolicies, delegationNote, MAX_HOP } from "./policy.ts";
 import { procStart, withProcSnapshot } from "./proc.ts";
 import { updateAvailable } from "./update.ts";
 import { installKind, version } from "./version.ts";
-import { hasWakeAuthority, wakeText } from "./wake.ts";
+import { hasWakeAuthority, humanPromptKey, wakeText } from "./wake.ts";
 
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
 It is shared by AI coding agents on this machine and on paired machines. Your user set it up so agents can coordinate;
@@ -431,9 +431,11 @@ export async function runMcp(existing?: MbxNode) {
     }
   };
   const relay = (origin?: "agent" | "external") => {
-    const { parent } = current();
+    const { parent, agent } = current();
     const now = Date.now();
-    const depths = parent ? [...parent.hops].filter(([, at]) => now - at < 3_600_000).map(([hop]) => hop) : [];
+    // A prompt the owner typed since an exposure ends that agent-to-agent chain (T104): only depth resets, never external origin.
+    const human = Date.parse(node.store.get(humanPromptKey(agent)) ?? "") || 0;
+    const depths = parent ? [...parent.hops].filter(([, at]) => now - at < 3_600_000 && at > human).map(([hop]) => hop) : [];
     const external = parent?.externalAt != null && now - parent.externalAt < 3_600_000;
     return { hop: depths.length ? Math.min(MAX_RELAY_DEPTH, Math.max(...depths) + 1) : 0, origin: origin === "external" || external ? "external" as const : "agent" as const, project };
   };

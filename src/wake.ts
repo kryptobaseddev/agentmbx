@@ -20,6 +20,11 @@ const isRetry = (r: WakeResult): boolean => !r.ok && r.retry === true;
 export const hasWakeAuthority = (node: MbxNode, agent: string, message: MessageRow): boolean =>
   node.policyFor(message, agent).level !== "ask" || node.authorityFor(message)?.ok === true;
 
+/** kv key: when the owner last typed a prompt in a session holding `agent` (hook "prompt"; ends relay chains, T104). */
+export const humanPromptKey = (agent: string) => `human-prompt:${agent}`;
+/** Prompts AgentMBX itself submits (wakes, [mbx-watch] self-checks) are not the owner and never end a relay chain. */
+export const isHumanPrompt = (prompt: unknown): boolean => typeof prompt === "string" && !!prompt.trim() && !/^\s*\[mbx(-watch)?\]/.test(prompt);
+
 export function wakeText(agent: string, msgs: MessageRow[]): string {
   const senders = [...new Set(msgs.map((m) => `${m.from_addr} [${trustLabel(m).split(" · ")[0].split(" (")[0]}]`))].join(", ");
   const owner = msgs.some(m => (JSON.parse(m.envelope) as { authority?: unknown }).authority) ? " Includes an owner-authority claim; verify its current mbx_read header." : "";

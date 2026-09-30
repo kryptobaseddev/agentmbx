@@ -13,6 +13,10 @@ const run = promisify(execFile);
 const isRetry = (r) => !r.ok && r.retry === true;
 /** A wake starts agent work, so a downgraded message cannot borrow the mailbox's broad policy. */
 export const hasWakeAuthority = (node, agent, message) => node.policyFor(message, agent).level !== "ask" || node.authorityFor(message)?.ok === true;
+/** kv key: when the owner last typed a prompt in a session holding `agent` (hook "prompt"; ends relay chains, T104). */
+export const humanPromptKey = (agent) => `human-prompt:${agent}`;
+/** Prompts AgentMBX itself submits (wakes, [mbx-watch] self-checks) are not the owner and never end a relay chain. */
+export const isHumanPrompt = (prompt) => typeof prompt === "string" && !!prompt.trim() && !/^\s*\[mbx(-watch)?\]/.test(prompt);
 export function wakeText(agent, msgs) {
     const senders = [...new Set(msgs.map((m) => `${m.from_addr} [${trustLabel(m).split(" · ")[0].split(" (")[0]}]`))].join(", ");
     const owner = msgs.some(m => JSON.parse(m.envelope).authority) ? " Includes an owner-authority claim; verify its current mbx_read header." : "";

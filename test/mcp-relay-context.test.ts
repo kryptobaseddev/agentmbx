@@ -8,6 +8,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { canonical, generateKeyPair, signData } from "../src/crypto.ts";
 import { acceptSigned, makePolicy } from "../src/policy.ts";
 import { MbxNode } from "../src/node.ts";
+import { humanPromptKey, isHumanPrompt, wakeText } from "../src/wake.ts";
 
 for (const implicitReply of [false, true]) test(implicitReply ? "mbx_send reply_to records parent provenance" : "expired relay state cannot be revived by a fresh read", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-relay-"));
@@ -113,4 +114,38 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: maximum
     assert.equal(policy.level, "ask");
     assert.match(policy.notes.join(" "), /relay safety depth 1000 exceeds limit 6/);
   }
+});
+
+test("a prompt the owner typed ends the relay chain; wake prompts and external origin do not reset (T104)", async t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-relay-human-"));
+  const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "relay-human-test", version: "1" });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  const clock = join(home, "clock"), preload = join(home, "clock.mjs");
+  let now = Date.now(); writeFileSync(clock, String(now));
+  writeFileSync(preload, `import {readFileSync} from 'node:fs'; Date.now = () => Number(readFileSync(${JSON.stringify(clock)}, 'utf8'));`);
+  await c.connect(new StdioClientTransport({ command: process.execPath, args: ["--import", preload, join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
+    env: { ...process.env, AGENTMBX_DEV: "1", MBX_IDENTITY_IDLE_TTL_MS: "7200000", MBX_HOME: home, MBX_CLI: "claude", MBX_AGENT: "reader", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
+  const deep = n.send({ from: "sender", to: ["reader"], subject: "deep chain", body: "data", hop: 5 }).envelope;
+  const external = n.send({ from: "sender", to: ["reader"], subject: "web page", body: "data", origin: "external" }).envelope;
+  const read = async (id: string) => assert.notEqual((await c.callTool({ name: "mbx_read", arguments: { ids: [id] } })).isError, true);
+  const send = async () => {
+    const r = await c.callTool({ name: "mbx_send", arguments: { to: ["receiver"], subject: "new work", body: "direct message" } });
+    assert.notEqual(r.isError, true);
+    return JSON.parse(n.message((r.structuredContent as { id: string }).id)!.envelope);
+  };
+  await read(deep.id);
+  assert.equal((await send()).meta.hop, 6, "within a chain, depth accumulates");
+  assert.equal(isHumanPrompt(wakeText("reader", [n.message(deep.id)!])), false, "a daemon wake is not the owner");
+  assert.equal(isHumanPrompt("[mbx-watch] Call mbx_inbox."), false, "a self-check is not the owner");
+  assert.equal(isHumanPrompt(undefined), false, "an unknown hook shape never resets");
+  assert.equal(isHumanPrompt("please ask the reviewer again"), true);
+  now += 1000; writeFileSync(clock, String(now));
+  n.store.set(humanPromptKey("reader"), new Date(now).toISOString()); // what the prompt hook records for a typed prompt
+  assert.equal((await send()).meta.hop ?? 0, 0, "the owner's prompt ended the chain");
+  await read(external.id);
+  now += 1000; writeFileSync(clock, String(now));
+  n.store.set(humanPromptKey("reader"), new Date(now).toISOString());
+  const after = await send();
+  assert.equal(after.meta.hop ?? 0, 0);
+  assert.equal(after.meta.origin, "external", "external origin survives a typed prompt: it cannot be laundered");
 });

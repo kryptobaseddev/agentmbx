@@ -20,7 +20,7 @@ import { periodicUpdateCheck, updateAvailable, updateCommand } from "./update.js
 import { installKind, version } from "./version.js";
 import { installService, serviceLabel, uninstallService } from "./service.js";
 import { CLIS, defaultHostName, defaultWhich, formatRows, ownerStep, resolveCommand, runSetup, shJoin } from "./setup.js";
-import { dispatchWakes, hasWakeAuthority, inboxCommand, macNotifierPath, notifyDesktop, opencodeService } from "./wake.js";
+import { dispatchWakes, hasWakeAuthority, humanPromptKey, inboxCommand, isHumanPrompt, macNotifierPath, notifyDesktop, opencodeService } from "./wake.js";
 import { kimiHostedServer } from "./kimi-web.js";
 import { approveKimi, decidePermission, opencodePermissionPass } from "./permission.js";
 import { diagnosticSnapshot } from "./diagnostics.js";
@@ -1011,6 +1011,8 @@ async function hook(node, event, cli) {
                 if (!ids.some((id) => !previous.has(id)))
                     return;
             }
+            if (event === "prompt" && isHumanPrompt(input.prompt))
+                node.store.set(humanPromptKey(agent), new Date().toISOString());
             if (event === "prompt" || event === "post-tool") {
                 const n = node.unreadCount(agent);
                 if (n)
