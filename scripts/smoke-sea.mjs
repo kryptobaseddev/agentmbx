@@ -65,6 +65,10 @@ try {
   };
   const page = await replay({ limit: 1, max_bytes: 2048 });
   check(page.messages.length === 1 && page.messages[0].id === id && typeof page.next_cursor === "string", "held mailbox replay includes delivered fixture");
+  const cliPage = JSON.parse(run("replay", "--as", "smoker", "--limit", "1", "--max-bytes", "2048"));
+  check(JSON.stringify(cliPage) === JSON.stringify(page), "packaged CLI replay matches actual held MCP page");
+  const cliNext = JSON.parse(run("replay", "--as", "smoker", "--cursor", cliPage.next_cursor, "--limit", "1", "--max-bytes", "2048"));
+  check(cliNext.messages.length === 0 && !cliNext.has_more, "packaged CLI replay continuation omits prior page");
   const retry = await replay({ limit: 1, max_bytes: 2048 });
   check(JSON.stringify(page) === JSON.stringify(retry), "replay retry preserves page and cursor");
   const diagnostic = JSON.parse(run("diagnostics", "--mailbox", "smoker", "--json"));
@@ -84,6 +88,8 @@ try {
   check(!released.isError, "MCP identity release");
   const after = refused();
   check(after.status === 1 && after.stdout === "", "released MCP cannot authorize CLI access");
+  const deniedReplay = spawnSync(bin, ["replay", "--as", "smoker"], { env, encoding: "utf8", timeout: 5000 });
+  check(deniedReplay.status === 1 && deniedReplay.stdout === "", "released holder cannot authorize packaged CLI replay");
   console.log("SEA smoke test passed");
 } finally {
   if (child && child.exitCode === null) {
