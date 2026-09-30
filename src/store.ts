@@ -35,6 +35,10 @@ CREATE TABLE IF NOT EXISTS mailbox_visibility (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, mailbox TEXT NOT NULL,
   message_id TEXT NOT NULL REFERENCES messages(id), UNIQUE(mailbox, message_id));
 CREATE INDEX IF NOT EXISTS mailbox_visibility_mailbox_seq ON mailbox_visibility(mailbox, seq);
+-- Retention tombstones (src/retention.ts): visibility positions whose settled message was pruned. Replay reports them
+-- as an explicit gap. Additive: stores without it simply have nothing pruned (no schema version change).
+CREATE TABLE IF NOT EXISTS mailbox_pruned (
+  mailbox TEXT NOT NULL, seq INTEGER NOT NULL, message_id TEXT NOT NULL, pruned_at TEXT NOT NULL, PRIMARY KEY (mailbox, seq)) WITHOUT ROWID;
 CREATE TRIGGER IF NOT EXISTS deliveries_visibility AFTER INSERT ON deliveries BEGIN
   INSERT OR IGNORE INTO mailbox_visibility (mailbox,message_id) VALUES (new.agent,new.msg_id); END;
 CREATE TABLE IF NOT EXISTS outbox (       -- envelopes waiting to reach a paired host

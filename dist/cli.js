@@ -24,6 +24,8 @@ import { dispatchWakes, hasWakeAuthority, inboxCommand, macNotifierPath, notifyD
 import { kimiHostedServer } from "./kimi-web.js";
 import { approveKimi, decidePermission, opencodePermissionPass } from "./permission.js";
 import { diagnosticSnapshot } from "./diagnostics.js";
+import { configuredRetention, prune, retentionDays } from "./retention.js";
+import { exportIdentity, identityInitialized, importIdentity } from "./identity-backup.js";
 import { listIdentityStatus } from "./identity-status.js";
 import { withCliIdentity, withHookIdentity } from "./cli-identity.js";
 import { buildIdentityTakeover } from "./identity-takeover.js";
@@ -67,6 +69,14 @@ Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …'
   agentmbx relay [serve [--port N]]                 run an untrusted store-and-forward relay (ADR-035 reference)
   agentmbx relay set <url> | relay unset            point this daemon at a relay (picked up on daemon start)
   agentmbx notify-test [--as <agent>]               send a sample desktop notification the way wake-ups do
+  agentmbx identity export <file> [--force]         passphrase-sealed backup (0600) of this host's keys, config and paired peers
+  agentmbx identity import <file> [--force]         restore it on a replacement machine; --force backs up an existing identity first
+                  passphrase from the terminal, or MBX_IDENTITY_PASSPHRASE; a Keychain owner key is not exported
+
+Retention (default off: nothing is deleted until you set it)
+  agentmbx retention [set <days> | off]             the daemon prunes settled mail older than <days> every 6 h
+  agentmbx prune [--older-than <days>] [--dry-run]  delete acked, settled mail older than the window, then VACUUM
+                  never touches unacked mail or the outbox; replay reports pruned history as history_pruned
 
 Owner (each signature needs you: a Touch ID / password prompt on macOS with AgentMBX.app, else the passphrase on a terminal)
   agentmbx owner init [--backend keychain|file]   agentmbx owner show
@@ -195,7 +205,8 @@ async function run(argv) {
             cursor: { type: "string" }, "max-bytes": { type: "string" }, "scan-limit": { type: "string" }, "project-host": { type: "string" }, topic: { type: "string" },
             compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" },
             backend: { type: "string" }, "no-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
-            project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }, "wait-ms": { type: "string" }
+            project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }, "wait-ms": { type: "string" },
+            "older-than": { type: "string" }
         } });
     if (o.help)
         return console.log(commandHelp(cmd));
@@ -318,7 +329,9 @@ async function run(argv) {
                 node.close();
             }
         }
-        die("identity list | claim [name] --cli <provider> --session <id> | release --cli <provider> --session <id> | takeover <name> --force --cli <provider> --session <id> | result <request-id>");
+        if ((pos[0] === "export" || pos[0] === "import") && pos.length === 2)
+            return identityBackup(pos[0], pos[1], !!o.force);
+        die("identity list | export <file> | import <file> | claim [name] --cli <provider> --session <id> | release --cli <provider> --session <id> | takeover <name> --force --cli <provider> --session <id> | result <request-id>");
     }
     const node = new MbxNode();
     // Inside an agent session (a hook-bound or MCP-bound CLI up the process tree) the session's own name is the default,
@@ -637,6 +650,51 @@ If the codes differ, do not approve: someone is in the middle.`);
             const updCheck = () => void periodicUpdateCheck(node.store, (title, text) => notifyDesktop({ subtitle: title, body: text })); // gated to once per 24 h via kv
             setInterval(updCheck, 3600_000).unref();
             updCheck();
+            // Retention is opt-in (config retention_days). No VACUUM here: it would lock out live writers; `agentmbx prune` does it.
+            const retention = configuredRetention(node.config);
+            if (retention) {
+                const sweep = () => {
+                    try {
+                        const r = prune(node.store, retention);
+                        if (r.messages)
+                            process.stderr.write(`[agentmbx] retention: pruned ${r.messages} settled messages older than ${retention} days\n`);
+                    }
+                    catch (e) {
+                        process.stderr.write(`[agentmbx] retention: ${e.message}\n`);
+                    }
+                };
+                setInterval(sweep, 6 * 3600_000).unref();
+                setTimeout(sweep, 60_000).unref();
+            }
+            return;
+        }
+        case "retention": {
+            const cfg = join(node.home, "config.json");
+            const c = JSON.parse(readFileSync(cfg, "utf8"));
+            if (pos[0] === "set" || pos[0] === "off") {
+                if (pos[0] === "set")
+                    c.retention_days = retentionDays(pos[1] ?? die("retention set <days>"));
+                else
+                    delete c.retention_days;
+                writeFileSync(cfg, JSON.stringify(c, null, 2) + "\n", { mode: 0o600 });
+                console.log(c.retention_days ? `retention: settled mail older than ${c.retention_days} days is pruned by the daemon` : "retention off: nothing is pruned automatically");
+                return console.log("the daemon reads it on start: agentmbx daemon install, or launchctl kickstart -k gui/$(id -u)/com.agentmbx.daemon");
+            }
+            if (pos.length)
+                die("retention [set <days> | off]");
+            const days = configuredRetention(c);
+            return console.log(days ? `retention: ${days} days (the daemon prunes every 6 h)` : "retention off (default): nothing is pruned automatically");
+        }
+        case "prune": {
+            if (pos.length)
+                die("prune [--older-than <days>] [--dry-run]");
+            const days = str("older-than") !== undefined ? retentionDays(str("older-than")) : configuredRetention(node.config)
+                ?? die("no retention is configured: pass --older-than <days> or run agentmbx retention set <days>");
+            const r = prune(node.store, days, { dryRun: !!o["dry-run"], vacuum: true });
+            if (o.json)
+                return console.log(JSON.stringify(r, null, 2));
+            console.log(`${r.dry_run ? "would prune" : "pruned"} ${r.messages} messages (${r.deliveries} acked deliveries, ${r.replay_positions} replay positions) received before ${r.cutoff}`);
+            console.log(`kept: ${r.kept.unacked} unacked, ${r.kept.outbox} in the outbox, ${r.kept.recent_activity} acked within the window${r.vacuumed ? "; VACUUM done" : ""}`);
             return;
         }
         case "owner": return owner(node, pos, str, o);
@@ -657,6 +715,41 @@ If the codes differ, do not approve: someone is in the middle.`);
         });
         default: die(`unknown command "${cmd}" (agentmbx help)`);
     }
+}
+// ---- identity backup ----------------------------------------------------------------------
+const identityPassphrase = (confirm) => {
+    if (process.env.MBX_IDENTITY_PASSPHRASE)
+        return process.env.MBX_IDENTITY_PASSPHRASE;
+    const p = readPassphraseFromTTY("Identity bundle passphrase (12+ characters): ");
+    if (confirm && readPassphraseFromTTY("Repeat the passphrase: ") !== p)
+        die("the passphrases do not match");
+    return p;
+};
+async function identityBackup(action, file, force) {
+    const home = defaultHome();
+    if (action === "export") {
+        if (!identityInitialized(home))
+            throw Object.assign(new Error(`no host identity in ${home} (run agentmbx init)`), { code: "NOT_FOUND" });
+        const node = new MbxNode(home);
+        try {
+            const r = exportIdentity(node, resolve(file), identityPassphrase(true), { force });
+            console.log(`exported ${r.host} (host key ${fingerprint(node.key.publicKey)}, ${r.peers} paired peers) to ${resolve(file)} (mode 600)`);
+            if (r.owner === "keychain")
+                console.log("owner key: in the macOS Keychain and not exportable; only its public key is recorded. Create or adopt an owner on the new machine.");
+            process.stderr.write(`\nWARNING: this file holds ${r.host}'s private signing and encryption keys${r.owner === "file" ? " and the encrypted owner key" : ""}. Anyone with the file and its passphrase can act as ${r.host} towards every paired host. Keep it offline, never commit or share it, and delete it after the restore. Run only ONE machine with this identity.\n`);
+        }
+        finally {
+            node.close();
+        }
+        return;
+    }
+    const r = importIdentity(home, readFileSync(resolve(file), "utf8"), identityPassphrase(false), { force });
+    if (r.backup)
+        console.log(`previous identity backed up to ${r.backup}`);
+    console.log(`restored ${r.host} into ${home} with ${r.peers.length} paired peers${r.peers.length ? ` (${r.peers.join(", ")})` : ""}; they accept this host's existing key.`);
+    if (r.owner?.backend === "keychain")
+        console.log(`owner key: the old owner key (${fingerprint(r.owner.public_key)}) lived in a macOS Keychain and was not exported. Run agentmbx owner init here, or adopt a paired host's owner.`);
+    console.log("If this machine's address changed, peers still dial the old one: re-pair or update the peer address there. Then: agentmbx daemon install; agentmbx doctor");
 }
 // ---- token pairing ---------------------------------------------------------------------------
 const withPort = (a) => (/:\d+$/.test(a) ? a : `${a}:${DEFAULT_PORT}`);

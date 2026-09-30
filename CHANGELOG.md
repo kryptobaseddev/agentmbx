@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Retention (opt-in):** `agentmbx prune [--older-than <days>] [--dry-run]` deletes only settled mail (every local delivery acked, no outbox row, received and last updated before the window), then runs VACUUM. Default is off: `agentmbx retention set <days>` stores `retention_days` in config.json and the daemon then prunes every 6 h (without VACUUM). Unacked mail, including every pending wake, and queued outbox mail are never pruned. Pruned replay positions leave tombstones: replay pages report them as `history_pruned` and existing cursors stay valid. The tombstone table is additive; processes older than this release do not report the gap.
+- **Host identity backup:** `agentmbx identity export <file>` writes a 0600, passphrase-sealed bundle (scrypt + XChaCha20-Poly1305) of config, host signing key, body encryption key, a file-backend owner key (still owner-passphrase encrypted) and approved peers with pinned keys. `agentmbx identity import <file>` restores it on a replacement machine so existing pairings stay valid; it refuses an initialized home unless `--force`, which first backs up the old identity files and a copy of mbx.db. A macOS Keychain owner key is not exportable. Mail, policies and devices are not in the bundle.
+
 ## 0.5.0 (2026-09-30)
 
 - **Bounded replay:** `mbx_replay` is the eleventh MCP tool; `agentmbx replay` exposes the same read-only JSON page and cursor contract through the caller's exact current provider lease. First-ever mailbox visibility is ordered durably, including late/backdated grants. Caller-persisted cursors retain finite snapshot position across same-persona provider handoffs; completed cursors poll new visibility, and lost cursors explicitly rewind with ID deduplication. No automatic server checkpoint or ACK is implied.
