@@ -64,7 +64,7 @@ export class MbxNode {
     this.key = JSON.parse(readFileSync(keyPath, "utf8"));
     if (!existsSync(encPath)) writeFileSync(encPath, JSON.stringify(generateEncKeyPair()) + "\n", { mode: 0o600, flag: "wx" });
     this.encKey = JSON.parse(readFileSync(encPath, "utf8"));
-    this.store = new Store(home);
+    this.store = new Store(home, { host: this.host });
     this.retireIdentityLinks();
     this.syncOwner();
   }
