@@ -9,6 +9,7 @@ import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { MbxNode } from "../src/node.ts";
+import { Store, SCHEMA_VERSION } from "../src/store.ts";
 
 for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} status and whoami require the exact current lease and preserve metadata`, async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-status-")), n = new MbxNode(home, { host: "alpha" });
@@ -87,4 +88,39 @@ test("a live legacy session row does not authorize status or whoami", t => {
     assert.notEqual(r.status, 0); assert.equal(r.stdout, "");
   }
   assert.equal(n.agents().find(a => a.name === "offline")!.role, "original");
+});
+
+test("sender outbox index is added to existing stores without changing mail or schema version", t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-status-index-")), n = new MbxNode(home, { host: "alpha" });
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const query = "SELECT count(DISTINCT o.msg_id) n FROM outbox o JOIN messages m ON m.id=o.msg_id WHERE m.from_addr=?";
+  const columns = () => n.store.db.prepare("PRAGMA index_info(messages_sender)").all().map(r => r.name);
+  assert.deepEqual(columns(), ["from_addr", "id"], "fresh stores have the covering sender index");
+  const messages = [
+    n.send({ from: "sender", to: ["recipient"], subject: "one", body: "mail" }).envelope.id,
+    n.send({ from: "sender", to: ["recipient"], subject: "two", body: "mail" }).envelope.id,
+    n.send({ from: "other", to: ["recipient"], subject: "other", body: "mail" }).envelope.id,
+  ];
+  const now = new Date().toISOString();
+  const queue = n.store.db.prepare("INSERT INTO outbox(msg_id,host,next_at,created_at) VALUES (?,?,?,?)");
+  for (const id of messages) for (const host of ["offline", "also-offline"]) queue.run(id, host, now, now);
+  n.ack(messages[0], "recipient");
+  const tables = ["messages", "deliveries", "outbox"];
+  const before = tables.map(table => n.store.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all());
+  n.store.db.exec("DROP INDEX messages_sender");
+  assert.equal(n.store.schemaVersion(), SCHEMA_VERSION);
+  n.close();
+
+  const reopened = new Store(home);
+  t.after(() => reopened.close());
+  assert.equal(reopened.schemaVersion(), SCHEMA_VERSION, "additive indexes do not change compatibility version");
+  assert.deepEqual(reopened.db.prepare("PRAGMA index_info(messages_sender)").all().map(r => r.name), ["from_addr", "id"]);
+  assert.deepEqual(tables.map(table => reopened.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()), before,
+    "opening an existing current-schema database preserves envelopes, ACK state, queue and retries");
+  assert.equal(reopened.db.prepare(query).get("sender@alpha")!.n, 2, "multiple queued peers count each sender message once");
+  assert.equal(reopened.db.prepare(query).get("other@alpha")!.n, 1);
+  assert.equal(reopened.db.prepare(query).get("sender@another-host")!.n, 0, "host is part of exact sender identity");
+  assert.match(reopened.db.prepare("EXPLAIN QUERY PLAN " + query).all("sender@alpha").map(r => r.detail).join("\n"),
+    /SEARCH m USING COVERING INDEX messages_sender \(from_addr=\?\)/,
+    "sender lookup uses the covering index without forcing a planner hint");
 });
