@@ -262,11 +262,12 @@ export function effectivePolicy(db: DatabaseSync, o: { agent: string; host: stri
     if (isLocal) return ownerKeys(db).some(key => fingerprint(key) === fp);
     // A retained principals row or a message's owner claim is not a current pairing. Recheck
     // the envelope against the pinned host key so re-pairing cannot relabel old signed mail.
-    const peer = db.prepare("SELECT pubkey,owner_pubkey FROM peers WHERE host=? AND state='approved'").get(o.fromHost) as
-      { pubkey: string; owner_pubkey: string | null } | undefined;
+    const peer = db.prepare("SELECT pubkey,owner_pubkey,prev_keys FROM peers WHERE host=? AND state='approved'").get(o.fromHost) as
+      { pubkey: string; owner_pubkey: string | null; prev_keys: string | null } | undefined;
     const e = o.envelope;
-    return !!peer?.owner_pubkey && fingerprint(peer.owner_pubkey) === fp && !!e
-      && e.from === `${o.fromAgent}@${o.fromHost}` && e.sig?.host === o.fromHost && verifyEnvelope(e, peer.pubkey);
+    // retired keys (T030) still verify mail that arrived before the peer rotated
+    return !!peer?.owner_pubkey && fingerprint(peer.owner_pubkey) === fp && !!e && e.from === `${o.fromAgent}@${o.fromHost}` && e.sig?.host === o.fromHost
+      && [peer.pubkey, ...(JSON.parse(peer.prev_keys ?? "[]") as string[])].some((k) => verifyEnvelope(e, k));
   };
   const hostOk = (h: string[]) => h.includes("*") || (isLocal ? h.includes("local") || h.includes(o.host) : h.includes(o.fromHost)) || h.some(principalOk);
   const ps = activePolicies(db, o.agent, o.host, o.now).filter((p) => matches(p.from.agents, o.fromAgent) && hostOk(p.from.hosts));

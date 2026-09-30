@@ -152,7 +152,7 @@ export class Store {
             ORDER BY m.received_at,m.id,visible.mailbox`).run(this.localHost);
                 }
                 // CREATE TABLE IF NOT EXISTS does not add columns; suppress only confirmed existing columns.
-                for (const [table, column] of [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"]]) {
+                for (const [table, column] of [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"]]) {
                     if (!this.db.prepare(`PRAGMA table_info(${table})`).all().some(r => r.name === column))
                         this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
                 }

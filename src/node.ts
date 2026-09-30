@@ -7,6 +7,7 @@ import { hostname, homedir } from "node:os";
 import { join } from "node:path";
 import { fingerprint, generateKeyPair, newPairToken, pairTokenKey, sha256, type KeyPair } from "./crypto.ts";
 import { generateEncKeyPair, openBody } from "./body-encryption.ts";
+import { checkRotation, finishRotation, retiredKeys, rotateKeys, type RetiredKeys, type SignedRotation } from "./key-rotation.ts";
 import {
   attachAuthority, buildEnvelope, ownerSign, ownerSignRequest, withOwnerSig, checkAuthority, checkShape, NAME_RE, signEnvelope, verifyEnvelope,
   type Draft, type AuthorityCheck, type Envelope, type Grant,
@@ -26,7 +27,7 @@ export const WAKE_KINDS = new Set(["request", "task", "decision", "alert"]);
 export const WAKE_LIMITS = { perAgentSeconds: 30, perThreadHour: 6, perAgentDay: 60 };
 
 export interface Config { host: string; port: number; bind: string }
-export interface Peer { host: string; pubkey: string; owner_pubkey: string | null; addr: string; state: string; code: string | null; approved_at: string | null; enc_pub?: string | null }
+export interface Peer { host: string; pubkey: string; owner_pubkey: string | null; addr: string; state: string; code: string | null; approved_at: string | null; enc_pub?: string | null; prev_keys?: string | null }
 export interface Session { priv: string; pub: string; grant: Grant | null }
 export type ReceiveResult = "accepted" | "duplicate" | `rejected:${string}`;
 
@@ -45,9 +46,10 @@ export const defaultHome = () => process.env.MBX_HOME || join(homedir(), ".local
 const shortHost = () => hostname().split(".")[0].toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) || "host";
 
 export class MbxNode {
-  readonly home: string; readonly store: Store; readonly config: Config; readonly key: KeyPair;
+  readonly home: string; readonly store: Store; readonly config: Config; key: KeyPair;
   /** This host's static X25519 encryption keypair (T028 Option A); the public half is shared with paired hosts. */
-  readonly encKey: { publicKey: string; privateKey: string };
+  encKey: { publicKey: string; privateKey: string };
+  #retired: RetiredKeys = { host: [], enc: [] };
 
   constructor(home = defaultHome(), init: Partial<Config> = {}) {
     this.home = home;
@@ -61,10 +63,12 @@ export class MbxNode {
       writeFileSync(cfgPath, JSON.stringify(c, null, 2) + "\n", { mode: 0o600 });
     }
     this.config = JSON.parse(readFileSync(cfgPath, "utf8"));
+    finishRotation(home); // a rotation interrupted after its record was logged completes before any key is used
     if (!existsSync(keyPath)) writeFileSync(keyPath, JSON.stringify(generateKeyPair()) + "\n", { mode: 0o600, flag: "wx" });
     this.key = JSON.parse(readFileSync(keyPath, "utf8"));
     if (!existsSync(encPath)) writeFileSync(encPath, JSON.stringify(generateEncKeyPair()) + "\n", { mode: 0o600, flag: "wx" });
     this.encKey = JSON.parse(readFileSync(encPath, "utf8"));
+    this.#retired = retiredKeys(home);
     this.store = new Store(home, { host: this.host });
     initializeReplay(this.store);
     this.retireIdentityLinks();
@@ -370,7 +374,7 @@ export class MbxNode {
   }
 
   // ---- peers -------------------------------------------------------------------------------
-  peers(): Peer[] { return this.store.db.prepare("SELECT host,pubkey,owner_pubkey,addr,state,code,approved_at,enc_pub FROM peers ORDER BY host").all() as never; }
+  peers(): Peer[] { return this.store.db.prepare("SELECT host,pubkey,owner_pubkey,addr,state,code,approved_at,enc_pub,prev_keys FROM peers ORDER BY host").all() as never; }
   peer(host: string): Peer | undefined { return this.peers().find((p) => p.host === host); }
   approvedPeer(host: string) { const p = this.peer(host); return p && p.state === "approved" ? p : undefined; }
 
@@ -392,6 +396,46 @@ export class MbxNode {
     this.store.db.prepare("UPDATE peers SET state='approved', approved_at=? WHERE host=?").run(new Date().toISOString(), host);
     this.notePeerOwner(host, p.owner_pubkey);
     this.store.audit("pair.approved", { host, key: fingerprint(p.pubkey) });
+  }
+
+  // ---- key rotation (T030) ------------------------------------------------------------------
+  /** Rotate this host's signing and enc keys; announce the returned record to every peer (announceRotations). */
+  rotateKeys(): SignedRotation {
+    const r = rotateKeys(this.home, this.host, this.key, this.encKey);
+    this.reloadKeys();
+    this.store.audit("host.key_rotated", { from: fingerprint(r.rec.old_pub), to: fingerprint(r.rec.new_pub) });
+    return r;
+  }
+
+  /** Pick up keys rotated by another process (the CLI rotates; the daemon reloads on its next tick). */
+  reloadKeys(): boolean {
+    finishRotation(this.home);
+    const key = JSON.parse(readFileSync(join(this.home, "host.key"), "utf8")) as KeyPair;
+    this.#retired = retiredKeys(this.home);
+    if (key.publicKey === this.key.publicKey) return false;
+    this.key = key;
+    this.encKey = JSON.parse(readFileSync(join(this.home, "enc.key"), "utf8"));
+    return true;
+  }
+
+  /** Host keys that may have signed stored mail from `host`: the current key first, then retired ones. */
+  hostKeys(host: string): string[] {
+    if (host === this.host) return [this.key.publicKey, ...this.#retired.host.map((k) => k.publicKey)];
+    const p = this.approvedPeer(host);
+    return p ? [p.pubkey, ...(JSON.parse(p.prev_keys ?? "[]") as string[])] : [];
+  }
+
+  /** Apply a peer's signed key rotation. Only a record that starts from the pinned key moves the pin. */
+  acceptRotation(s: SignedRotation): "rotated" | "current" | `rejected:${string}` {
+    const p = this.approvedPeer(s?.rec?.host);
+    if (!p) return "rejected:host not paired";
+    if (s.rec.new_pub === p.pubkey) return "current";
+    const bad = checkRotation(s, p.pubkey);
+    if (bad) { this.store.audit("peer.rotation_rejected", { host: p.host, reason: bad }); return `rejected:${bad}`; }
+    const prev = [p.pubkey, ...(JSON.parse(p.prev_keys ?? "[]") as string[])];
+    this.store.db.prepare("UPDATE peers SET pubkey=?, enc_pub=?, prev_keys=? WHERE host=? AND pubkey=?").run(s.rec.new_pub, s.rec.new_enc_pub, JSON.stringify(prev), p.host, p.pubkey);
+    this.store.audit("peer.key_rotated", { host: p.host, from: fingerprint(p.pubkey), to: fingerprint(s.rec.new_pub) });
+    return "rotated";
   }
 
   removePeer(host: string) {
@@ -525,8 +569,10 @@ export class MbxNode {
     if (!verifyEnvelope(e, peer.pubkey)) return "rejected:bad signature";
     let storedEnv = e;
     if (e.enc) { // sealed bodies (untrusted-hop encryption, T028) open with this host's static enc key
-      try { storedEnv = { ...e, body: openBody(e.enc, this.encKey.privateKey, e.id) }; }
-      catch { return "rejected:undecryptable body"; }
+      // retired enc keys still open mail sealed before this host rotated (T030)
+      const opened = [this.encKey, ...this.#retired.enc].map((k) => { try { return openBody(e.enc!, k.privateKey, e.id); } catch { return null; } }).find((b) => b !== null);
+      if (opened == null) return "rejected:undecryptable body";
+      storedEnv = { ...e, body: opened };
     }
     if (this.store.hasMessage(e.id)) return "duplicate";
     const auth = storedEnv.authority ? checkAuthority(storedEnv, peer.owner_pubkey, this.revoked()) : null;
@@ -549,8 +595,8 @@ export class MbxNode {
       if (checkShape(e)) return { ok: false, reason: "stored message structure is invalid" };
       const host = m.from_addr.split("@")[1], local = m.origin === "local" && host === this.host;
       const peer = !local && m.origin === host && m.trust === "verified" ? this.approvedPeer(host) : undefined;
-      const key = local ? this.key.publicKey : peer?.pubkey;
-      if (!key || e.from !== m.from_addr || e.sig?.host !== host || !verifyEnvelope(e, key))
+      const keys = local || peer ? this.hostKeys(host) : [];
+      if (!keys.length || e.from !== m.from_addr || e.sig?.host !== host || !keys.some((k) => verifyEnvelope(e, k)))
         return { ok: false, reason: "sending host signature or current pairing is not verified" };
       return checkAuthority(e, local ? this.ownerPub : peer?.owner_pubkey ?? null, this.revoked());
     } catch { return { ok: false, reason: "stored owner authority could not be verified" }; }
@@ -633,8 +679,8 @@ export class MbxNode {
   policyFor(m: MessageRow, agent: string) {
     const [fromAgent, fromHost] = m.from_addr.split("@");
     const envelope = JSON.parse(m.envelope) as Envelope;
-    const key = m.origin === "local" && fromHost === this.host ? this.key.publicKey : m.origin === fromHost && m.trust === "verified" ? this.approvedPeer(fromHost)?.pubkey : undefined;
-    const senderVerified = !!key && envelope.from === m.from_addr && envelope.sig?.host === fromHost && verifyEnvelope(envelope, key);
+    const keys = (m.origin === "local" && fromHost === this.host) || (m.origin === fromHost && m.trust === "verified") ? this.hostKeys(fromHost) : [];
+    const senderVerified = envelope.from === m.from_addr && envelope.sig?.host === fromHost && keys.some((k) => verifyEnvelope(envelope, k));
     return effectivePolicy(this.store.db, { agent, host: this.host, fromAgent, fromHost, envelope, senderVerified });
   }
 

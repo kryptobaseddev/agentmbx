@@ -7,7 +7,7 @@ import { execFileSync } from "node:child_process";
 import { canonical, fingerprint, ulid } from "./crypto.ts";
 import { buildGrant, CAPS, grantPayload, NAME_RE, type Envelope, type Grant } from "./envelope.ts";
 import { advertise, browse, lanIPv4 } from "./discovery.ts";
-import { flushOutbox, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.ts";
+import { announceRotations, flushOutbox, notifyUnpair, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.ts";
 import { relayDrainOutbox, relayFor, relayPull } from "./relay-client.ts";
 import { RelayCore, startRelayServer } from "./relay.ts";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.ts";
@@ -65,6 +65,7 @@ Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …'
   agentmbx pair --compare <host:port>               manual alternative: compare a 6-digit code, then on BOTH hosts
   agentmbx pair approve <host> <code>
   agentmbx peers                                    agentmbx peers remove <host>
+  agentmbx host rotate                              new host and encryption keys, announced to peers (pairings kept)
   agentmbx daemon                                   agentmbx daemon install | uninstall   (launchd / systemd user service)
   agentmbx relay [serve [--port N]]                 run an untrusted store-and-forward relay (ADR-035 reference)
   agentmbx relay set <url> | relay unset            point this daemon at a relay (picked up on daemon start)
@@ -415,8 +416,21 @@ version ${version()} (${installKind()})`);
       if (all.some((p) => p.level === "yolo")) console.log("!!! YOLO is active: those agents approve their own permission prompts. Kill switch: agentmbx policy revoke --all");
       return;
     }
+    case "host": {
+      if (pos[0] !== "rotate") die("host rotate");
+      const r = node.rotateKeys();
+      console.log(`host key rotated: ${fingerprint(r.rec.old_pub)} -> ${fingerprint(r.rec.new_pub)} (encryption key rotated too)`);
+      for (const a of await announceRotations(node, fetch, true)) console.log(`  ${a.host}: ${a.ok ? "accepted" : `pending (${a.error}); the daemon keeps retrying`}`);
+      console.log("peers verify the rotation with the key they pinned at pairing; no re-pairing is needed. The daemon picks up the new keys within seconds.");
+      return;
+    }
     case "peers": {
-      if (pos[0] === "remove") { node.removePeer(pos[1] ?? die("peers remove <host>")); return console.log(`removed ${pos[1]}`); }
+      if (pos[0] === "remove") {
+        const host = pos[1] ?? die("peers remove <host>");
+        const told = await notifyUnpair(node, host);
+        node.removePeer(host);
+        return console.log(`removed ${host}${told ? " (it removed this host too)" : " (it was not reachable; it stops trusting this host when its mail is refused)"}`);
+      }
       return node.peers().forEach((p) => console.log(`${p.host}\t${p.state}\t${p.addr}\tkey ${fingerprint(p.pubkey)}\towner ${p.owner_pubkey ? fingerprint(p.owner_pubkey) : "-"}${p.state === "pending" ? `\tcode ${p.code}` : ""}`));
     }
     case "pair": {
@@ -486,7 +500,8 @@ If the codes differ, do not approve: someone is in the middle.`);
       const tick = async () => {
         if (busy) return; busy = true;
         try {
-          await flushOutbox(node); await dispatchWakes(node); await opencodePermissionPass(node, yoloLookup(node), opencodeService);
+          if (node.reloadKeys()) process.stderr.write("[mbx] host keys rotated; using the new keys\n");
+          await announceRotations(node); await flushOutbox(node); await dispatchWakes(node); await opencodePermissionPass(node, yoloLookup(node), opencodeService);
           const relay = relayFor(node);
           if (relay) { await relayDrainOutbox(node, relay); await relayPull(node, relay); }
         } catch (e) { process.stderr.write(`[mbx] ${(e as Error).message}\n`); } finally { busy = false; }

@@ -9,6 +9,7 @@ import { NAME_RE, sealEnvelope, type Envelope } from "./envelope.ts";
 import { MbxNode, RETRY_HOURS } from "./node.ts";
 import { notifyDesktop } from "./wake.ts";
 import { version } from "./version.ts";
+import { rotationLog, saveRotationLog, type SignedRotation } from "./key-rotation.ts";
 import { storedPolicies, acceptSigned, type AnyRecord, type Signed } from "./policy.ts";
 
 export const HOP_SKEW_MS = 5 * 60_000;
@@ -165,7 +166,21 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
         process.stderr.write(`\n[agentmbx] pairing request from ${offer.host} (${offer.addr}). Code ${code}. Approve with: agentmbx pair approve ${offer.host} ${code}\n`);
         return send(200, localParty(node, n));
       }
+      if (req.method === "POST" && url.pathname === "/v1/rotate") {
+        // Self-authenticating (T030): each record is signed by the key this host pinned, so a rotated peer whose hops
+        // no longer verify can still move its pin. Nothing else is reachable without a verified hop.
+        const { records } = JSON.parse(body) as { records: SignedRotation[] };
+        if (!Array.isArray(records) || records.length > 50) return send(400, { error: "bad batch" });
+        return send(200, { results: records.map((r) => node.acceptRotation(r)) });
+      }
       const peer = verifyHop(node, req.headers, req.method ?? "GET", url.pathname, body);
+      if (req.method === "POST" && url.pathname === "/v1/unpair") {
+        // The peer removed this pairing: drop it here too, so mail stops queueing for a host that refuses it.
+        node.removePeer(peer);
+        node.store.audit("pair.removed_by_peer", { host: peer });
+        process.stderr.write(`\n[agentmbx] ${peer} removed its pairing with this host; removed ${peer} here too\n`);
+        return send(200, { ok: true });
+      }
       if (req.method === "POST" && ["/v1/envelopes", "/v2/envelopes"].includes(url.pathname)) {
         const { envelopes } = JSON.parse(body) as { envelopes: unknown[] };
         if (!Array.isArray(envelopes) || envelopes.length > 200) return send(400, { error: "bad batch" });
@@ -255,6 +270,38 @@ export async function flushOutbox(node: MbxNode, now = Date.now()): Promise<{ se
     }
   }
   return { sent, failed };
+}
+
+/** Deliver this host's key rotations to every peer that has not accepted them yet (T030). */
+const rotationTried = new Map<string, number>();
+export async function announceRotations(node: MbxNode, f: typeof fetch = fetch, force = false, now = Date.now()): Promise<{ host: string; ok: boolean; error?: string }[]> {
+  const log = rotationLog(node.home);
+  if (!log.records.length) return [];
+  const out: { host: string; ok: boolean; error?: string }[] = [];
+  for (const p of node.peers().filter((x) => x.state === "approved" && (log.delivered[x.host] ?? 0) < log.records.length)) {
+    if (!force && now - (rotationTried.get(p.host) ?? 0) < 60_000) continue; // an offline peer is retried once a minute
+    rotationTried.set(p.host, now);
+    try {
+      const body = JSON.stringify({ records: log.records.slice(log.delivered[p.host] ?? 0) });
+      const res = await f(`http://${p.addr}/v1/rotate`, { method: "POST", headers: { "content-type": "application/json" }, body, redirect: "error", signal: AbortSignal.timeout(5_000) });
+      if (!res.ok) throw new Error(res.status === 404 ? "peer does not support key rotation; upgrade AgentMBX there" : `${res.status} ${await res.text()}`);
+      const { results } = await res.json() as { results: string[] };
+      const bad = results.find((r) => r.startsWith("rejected"));
+      if (bad) throw new Error(bad);
+      const fresh = rotationLog(node.home); // re-read: another process may have rotated again meanwhile
+      fresh.delivered[p.host] = Math.max(fresh.delivered[p.host] ?? 0, log.records.length);
+      saveRotationLog(node.home, fresh);
+      out.push({ host: p.host, ok: true });
+    } catch (e) { out.push({ host: p.host, ok: false, error: (e as Error).message }); }
+  }
+  return out;
+}
+
+/** Tell a peer this host is removing their pairing (best effort: an offline peer learns when its hops start failing). */
+export async function notifyUnpair(node: MbxNode, host: string): Promise<boolean> {
+  const p = node.approvedPeer(host);
+  if (!p) return false;
+  try { return (await post(node, p.addr, "/v1/unpair", {}) as { ok?: boolean }).ok === true; } catch { return false; }
 }
 
 /** Pull each paired host's agent list so bare names and `mbx agents` work across machines. */

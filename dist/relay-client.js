@@ -20,9 +20,10 @@ const call = async (node, method, path, obj, f) => {
 };
 const url = (relay, path) => `${relay.replace(/\/$/, "")}${path}`;
 /** Enrolment state per relay, so restarts don't re-run the challenge dance. */
-const enrolledFlag = (relay) => `relay-enrolled:${relay}`;
+// keyed by the host key too: a rotated host (T030) enrols its new key
+const enrolledFlag = (relay, hostPub) => `relay-enrolled:${relay}:${hostPub}`;
 export async function relayEnrol(node, relay, f = fetch) {
-    if (node.store.get(enrolledFlag(relay)))
+    if (node.store.get(enrolledFlag(relay, node.key.publicKey)))
         return true;
     const ownerFp = fingerprintOf(node);
     const chal = await call(node, "POST", url(relay, "/v1/relay/challenge"), { host: node.host, pubkey: node.key.publicKey }, f);
@@ -32,7 +33,7 @@ export async function relayEnrol(node, relay, f = fetch) {
     const sig = signData(node.key.privateKey, canonical({ v: 1, challenge, host: node.host, pubkey: node.key.publicKey, owner_fp: ownerFp }));
     const r = await call(node, "POST", url(relay, "/v1/relay/enrol"), { host: node.host, pubkey: node.key.publicKey, owner_fp: ownerFp, sig }, f);
     if (r.status === 200) {
-        node.store.set(enrolledFlag(relay), new Date().toISOString());
+        node.store.set(enrolledFlag(relay, node.key.publicKey), new Date().toISOString());
         await relayPublishEnc(node, relay, f);
         return true;
     }

@@ -7,6 +7,7 @@ import { hostname, homedir } from "node:os";
 import { join } from "node:path";
 import { fingerprint, generateKeyPair, newPairToken, pairTokenKey, sha256 } from "./crypto.js";
 import { generateEncKeyPair, openBody } from "./body-encryption.js";
+import { checkRotation, finishRotation, retiredKeys, rotateKeys } from "./key-rotation.js";
 import { attachAuthority, buildEnvelope, ownerSign, ownerSignRequest, withOwnerSig, checkAuthority, checkShape, NAME_RE, signEnvelope, verifyEnvelope, } from "./envelope.js";
 import { ownerPublicKey } from "./owner.js";
 import { effectivePolicy, policyLine } from "./policy.js";
@@ -45,6 +46,7 @@ export class MbxNode {
     key;
     /** This host's static X25519 encryption keypair (T028 Option A); the public half is shared with paired hosts. */
     encKey;
+    #retired = { host: [], enc: [] };
     constructor(home = defaultHome(), init = {}) {
         this.home = home;
         mkdirSync(home, { recursive: true, mode: 0o700 });
@@ -59,12 +61,14 @@ export class MbxNode {
             writeFileSync(cfgPath, JSON.stringify(c, null, 2) + "\n", { mode: 0o600 });
         }
         this.config = JSON.parse(readFileSync(cfgPath, "utf8"));
+        finishRotation(home); // a rotation interrupted after its record was logged completes before any key is used
         if (!existsSync(keyPath))
             writeFileSync(keyPath, JSON.stringify(generateKeyPair()) + "\n", { mode: 0o600, flag: "wx" });
         this.key = JSON.parse(readFileSync(keyPath, "utf8"));
         if (!existsSync(encPath))
             writeFileSync(encPath, JSON.stringify(generateEncKeyPair()) + "\n", { mode: 0o600, flag: "wx" });
         this.encKey = JSON.parse(readFileSync(encPath, "utf8"));
+        this.#retired = retiredKeys(home);
         this.store = new Store(home, { host: this.host });
         initializeReplay(this.store);
         this.retireIdentityLinks();
@@ -395,7 +399,7 @@ export class MbxNode {
         return this.store.db.prepare("SELECT * FROM sessions WHERE agent=? ORDER BY updated_at DESC").all(agent);
     }
     // ---- peers -------------------------------------------------------------------------------
-    peers() { return this.store.db.prepare("SELECT host,pubkey,owner_pubkey,addr,state,code,approved_at,enc_pub FROM peers ORDER BY host").all(); }
+    peers() { return this.store.db.prepare("SELECT host,pubkey,owner_pubkey,addr,state,code,approved_at,enc_pub,prev_keys FROM peers ORDER BY host").all(); }
     peer(host) { return this.peers().find((p) => p.host === host); }
     approvedPeer(host) { const p = this.peer(host); return p && p.state === "approved" ? p : undefined; }
     upsertPendingPeer(p) {
@@ -419,6 +423,49 @@ export class MbxNode {
         this.store.db.prepare("UPDATE peers SET state='approved', approved_at=? WHERE host=?").run(new Date().toISOString(), host);
         this.notePeerOwner(host, p.owner_pubkey);
         this.store.audit("pair.approved", { host, key: fingerprint(p.pubkey) });
+    }
+    // ---- key rotation (T030) ------------------------------------------------------------------
+    /** Rotate this host's signing and enc keys; announce the returned record to every peer (announceRotations). */
+    rotateKeys() {
+        const r = rotateKeys(this.home, this.host, this.key, this.encKey);
+        this.reloadKeys();
+        this.store.audit("host.key_rotated", { from: fingerprint(r.rec.old_pub), to: fingerprint(r.rec.new_pub) });
+        return r;
+    }
+    /** Pick up keys rotated by another process (the CLI rotates; the daemon reloads on its next tick). */
+    reloadKeys() {
+        finishRotation(this.home);
+        const key = JSON.parse(readFileSync(join(this.home, "host.key"), "utf8"));
+        this.#retired = retiredKeys(this.home);
+        if (key.publicKey === this.key.publicKey)
+            return false;
+        this.key = key;
+        this.encKey = JSON.parse(readFileSync(join(this.home, "enc.key"), "utf8"));
+        return true;
+    }
+    /** Host keys that may have signed stored mail from `host`: the current key first, then retired ones. */
+    hostKeys(host) {
+        if (host === this.host)
+            return [this.key.publicKey, ...this.#retired.host.map((k) => k.publicKey)];
+        const p = this.approvedPeer(host);
+        return p ? [p.pubkey, ...JSON.parse(p.prev_keys ?? "[]")] : [];
+    }
+    /** Apply a peer's signed key rotation. Only a record that starts from the pinned key moves the pin. */
+    acceptRotation(s) {
+        const p = this.approvedPeer(s?.rec?.host);
+        if (!p)
+            return "rejected:host not paired";
+        if (s.rec.new_pub === p.pubkey)
+            return "current";
+        const bad = checkRotation(s, p.pubkey);
+        if (bad) {
+            this.store.audit("peer.rotation_rejected", { host: p.host, reason: bad });
+            return `rejected:${bad}`;
+        }
+        const prev = [p.pubkey, ...JSON.parse(p.prev_keys ?? "[]")];
+        this.store.db.prepare("UPDATE peers SET pubkey=?, enc_pub=?, prev_keys=? WHERE host=? AND pubkey=?").run(s.rec.new_pub, s.rec.new_enc_pub, JSON.stringify(prev), p.host, p.pubkey);
+        this.store.audit("peer.key_rotated", { host: p.host, from: fingerprint(p.pubkey), to: fingerprint(s.rec.new_pub) });
+        return "rotated";
     }
     removePeer(host) {
         this.store.db.prepare("DELETE FROM peers WHERE host=?").run(host);
@@ -580,12 +627,16 @@ export class MbxNode {
             return "rejected:bad signature";
         let storedEnv = e;
         if (e.enc) { // sealed bodies (untrusted-hop encryption, T028) open with this host's static enc key
-            try {
-                storedEnv = { ...e, body: openBody(e.enc, this.encKey.privateKey, e.id) };
+            // retired enc keys still open mail sealed before this host rotated (T030)
+            const opened = [this.encKey, ...this.#retired.enc].map((k) => { try {
+                return openBody(e.enc, k.privateKey, e.id);
             }
             catch {
+                return null;
+            } }).find((b) => b !== null);
+            if (opened == null)
                 return "rejected:undecryptable body";
-            }
+            storedEnv = { ...e, body: opened };
         }
         if (this.store.hasMessage(e.id))
             return "duplicate";
@@ -612,8 +663,8 @@ export class MbxNode {
                 return { ok: false, reason: "stored message structure is invalid" };
             const host = m.from_addr.split("@")[1], local = m.origin === "local" && host === this.host;
             const peer = !local && m.origin === host && m.trust === "verified" ? this.approvedPeer(host) : undefined;
-            const key = local ? this.key.publicKey : peer?.pubkey;
-            if (!key || e.from !== m.from_addr || e.sig?.host !== host || !verifyEnvelope(e, key))
+            const keys = local || peer ? this.hostKeys(host) : [];
+            if (!keys.length || e.from !== m.from_addr || e.sig?.host !== host || !keys.some((k) => verifyEnvelope(e, k)))
                 return { ok: false, reason: "sending host signature or current pairing is not verified" };
             return checkAuthority(e, local ? this.ownerPub : peer?.owner_pubkey ?? null, this.revoked());
         }
@@ -695,8 +746,8 @@ export class MbxNode {
     policyFor(m, agent) {
         const [fromAgent, fromHost] = m.from_addr.split("@");
         const envelope = JSON.parse(m.envelope);
-        const key = m.origin === "local" && fromHost === this.host ? this.key.publicKey : m.origin === fromHost && m.trust === "verified" ? this.approvedPeer(fromHost)?.pubkey : undefined;
-        const senderVerified = !!key && envelope.from === m.from_addr && envelope.sig?.host === fromHost && verifyEnvelope(envelope, key);
+        const keys = (m.origin === "local" && fromHost === this.host) || (m.origin === fromHost && m.trust === "verified") ? this.hostKeys(fromHost) : [];
+        const senderVerified = envelope.from === m.from_addr && envelope.sig?.host === fromHost && keys.some((k) => verifyEnvelope(envelope, k));
         return effectivePolicy(this.store.db, { agent, host: this.host, fromAgent, fromHost, envelope, senderVerified });
     }
     /** A thread's messages, oldest first; with `agent`, only the ones that agent can see. */
