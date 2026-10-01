@@ -3,6 +3,10 @@
 // evidence only; this module adds no process inspection of its own.
 import { IdentityLeases, identityLeaseStatus } from "./identity-leases.js";
 import { hasWakeAuthority } from "./wake.js";
+import { procTable } from "./proc.js";
+import { activityKey, parseActivity, SHARED_IDLE_MS } from "./identity-availability.js";
+/** A holder renews its lease every minute; three missed beats mean its session is suspended or gone. */
+const STALE_HEARTBEAT_MS = 3 * 60_000;
 const iso = (ms) => new Date(ms).toISOString();
 /** Is a session holding `name` right now? Unknown process evidence with a fresh heartbeat counts as live (it is the
  *  lease's own rule for "unknown"); everything else says since when and who held it last. */
@@ -14,19 +18,34 @@ export function mailboxLiveness(node, name, now = Date.now()) {
     try {
         ({ state, reason } = identityLeaseStatus(row, now, new IdentityLeases(node.store).processEvidence(row.holder_pid)));
     }
-    catch { /* evidence unavailable inside a transaction: judge by the lease row and heartbeat alone */
+    catch {
+        // Evidence can't be inspected inside a transaction: judge by the lease row, the process table snapshot taken before
+        // it (a vanished holder is gone) and the heartbeat, which a live holder renews every minute (T204 review).
+        const table = procTable();
         if (row.released_at !== null || now - row.heartbeat_at >= row.idle_ttl) {
             state = "expired";
             reason = row.released_at !== null ? null : "idle";
         }
+        else if (table.size && !table.has(row.holder_pid)) {
+            state = "expired";
+            reason = "dead";
+        }
+        else if (now - row.heartbeat_at >= STALE_HEARTBEAT_MS) {
+            state = "expired";
+            reason = `no heartbeat for ${Math.round((now - row.heartbeat_at) / 60_000)} min`;
+        }
     }
-    if (state === "live")
-        return { live: true, detail: `held by ${row.cli} session ${row.session_id.slice(0, 12)}` };
-    if (state === "unknown")
-        return { live: true, detail: `held by ${row.cli} session ${row.session_id.slice(0, 12)} (process unconfirmed, heartbeat ${Math.round((now - row.heartbeat_at) / 1000)} s ago)` };
+    const holder = `${row.cli} session ${row.session_id.slice(0, 12)}`;
+    if (state === "live" || state === "unknown") {
+        const activity = parseActivity(node.store.get(activityKey(name)));
+        const quiet = activity?.shared && now - activity.at >= SHARED_IDLE_MS
+            ? `; its conversation has made no mbx call for ${Math.round((now - activity.at) / 60_000)} min and may have ended` : "";
+        return { live: true, detail: state === "live" ? `held by ${holder}${quiet}`
+                : `held by ${holder} (process unconfirmed, heartbeat ${Math.round((now - row.heartbeat_at) / 1000)} s ago)${quiet}` };
+    }
     const since = row.released_at ?? row.heartbeat_at;
     const why = row.release_reason ?? reason ?? "released";
-    return { live: false, detail: `no live session since ${iso(since)} (last holder ${row.cli} session ${row.session_id.slice(0, 12)}, ${why})` };
+    return { live: false, detail: `no live session since ${iso(since)} (last holder ${holder}, ${why})` };
 }
 /** One receipt per resolved target of a stored message. */
 export function recipientReceipts(node, msgId, targets, now = Date.now()) {
