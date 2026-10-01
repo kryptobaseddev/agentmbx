@@ -31,6 +31,8 @@ export function mailboxLiveness(node: MbxNode, name: string, now = Date.now()): 
     if (row.released_at !== null || now - row.heartbeat_at >= row.idle_ttl) { state = "expired"; reason = row.released_at !== null ? null : "idle"; }
     else if (table.size && !table.has(row.holder_pid)) { state = "expired"; reason = "dead"; }
     else if (now - row.heartbeat_at >= STALE_HEARTBEAT_MS) { state = "expired"; reason = `no heartbeat for ${Math.round((now - row.heartbeat_at) / 60_000)} min`; }
+    // Its pid is running and it renewed within three minutes: as live as an advisory receipt can tell.
+    else if (table.has(row.holder_pid)) state = "live";
   }
   const holder = `${row.cli} session ${row.session_id.slice(0, 12)}`;
   if (state === "live" || state === "unknown") {
@@ -141,7 +143,8 @@ export function deliveryReceipts(node: MbxNode, m: MessageRow, now = Date.now())
 }
 
 /** One line per recipient, for thread views. */
-export const receiptLine = (r: DeliveryReceipt) => `  → ${r.address}: ${r.state}${r.updated_at ? ` ${r.updated_at.slice(0, 19)}Z` : ""}`
+// "notified" with note "desktop" means only the owner saw a desktop notice: no agent session was told.
+export const receiptLine = (r: DeliveryReceipt) => `  → ${r.address}: ${r.state === "notified" && r.note === "desktop" ? "notified (owner desktop notice only)" : r.state}${r.updated_at ? ` ${r.updated_at.slice(0, 19)}Z` : ""}`
   + `${r.did ? ` · did: ${r.did}` : ""}${r.note ? ` · note: ${r.note}` : ""}${r.outbox ? ` · attempts ${r.outbox.attempts}${r.outbox.last_error ? ` (${r.outbox.last_error.slice(0, 60)})` : ""}` : ""} · ${r.liveness}`;
 
 interface SentFrame { v: 1; epoch: string; sender: string; position: string; end: string }
