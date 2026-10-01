@@ -139,7 +139,17 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
         const res = await fetch(`http://${p.addr}${path}`, { headers: signHop(node!, "GET", path, ""), signal: AbortSignal.timeout(opts.peerTimeoutMs ?? 3000) });
         if (res.ok) add("ok", `peer ${p.host} (${p.addr}) reachable and accepts our signature`);
         else add("warn", `peer ${p.host} (${p.addr}) answered ${res.status}: ${(await res.text()).slice(0, 120)}`, `re-pair: agentmbx peers remove ${p.host} && agentmbx pair ${p.addr}`);
-      } catch (e) { add("warn", `peer ${p.host} (${p.addr}) unreachable: ${(e as Error).message}`, `check that its daemon runs and TCP ${p.addr.split(":").pop()} is open`); }
+      } catch (e) {
+        const seen = node!.store.get(`peer-lastseen:${p.host}`);
+        add("warn", `peer ${p.host} (${p.addr}) unreachable: ${(e as Error).message}${seen && seen !== p.addr ? `; last seen at ${seen}` : ""}`,
+          seen && seen !== p.addr ? `the daemon re-checks it every minute; to move it now: agentmbx peers addr ${p.host} ${seen}` : `check that its daemon runs and TCP ${p.addr.split(":").pop()} is open`);
+      }
+      // T201: how this peer's address was last healed, and how fresh its presence beacon is
+      try {
+        const heal = JSON.parse(node!.store.get(`peer-heal:${p.host}`) ?? "null") as { via: string; at: string; from: string; to: string } | null;
+        const pres = node!.store.get(`peer-presence-at:${p.host}`);
+        if (heal || pres) add("info", `peer ${p.host}: ${heal ? `address healed ${heal.from} -> ${heal.to} via ${heal.via} at ${heal.at}` : "address never healed"}; ${pres ? `last presence ${pres}` : "no presence beacon yet (peer runs an older AgentMBX)"}`);
+      } catch { /* malformed kv: nothing to report */ }
     }));
     for (const p of peers.filter((x) => x.state === "pending")) add("warn", `pairing with ${p.host} pending (code ${p.code})`, `if ${p.host} shows the same code: agentmbx pair approve ${p.host} ${p.code}`);
     const relay = process.env.MBX_RELAY_URL ?? (node.config as { relay?: string }).relay ?? null;

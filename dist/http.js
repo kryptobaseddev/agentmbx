@@ -1,7 +1,9 @@
 // Host-to-host HTTP: pairing, envelope exchange, agent directory. Every request except /v1/pair* and read-only /v1/status carries a
 // signed hop (X-Mbx-Host / -Ts / -Sig over method, path, ts, sha256(body)); freshness is checked on the hop only.
 import { createServer } from "node:http";
-import { hostname } from "node:os";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
+import { hostname, networkInterfaces } from "node:os";
 import { canonical, fingerprint, joinTranscript, nonce as newNonce, pairingCode, pairMac, pairTokenKey, safeEqual, sha256, signData, verifyData, } from "./crypto.js";
 import { NAME_RE, sealEnvelope } from "./envelope.js";
 import { MbxNode, RETRY_HOURS } from "./node.js";
@@ -15,7 +17,9 @@ const TOKEN_REQS_PER_MIN = 30;
 const hopPayload = (method, path, ts, body) => `${method}\n${path}\n${ts}\n${sha256(body)}`;
 export function signHop(node, method, path, body) {
     const ts = new Date().toISOString();
-    return { "x-mbx-host": node.host, "x-mbx-ts": ts, "x-mbx-sig": signData(node.key.privateKey, hopPayload(method, path, ts, body)), "content-type": "application/json" };
+    // x-mbx-port is an unsigned hint for address healing (learnPeerAddr): it is only ever used after a key-checked probe.
+    return { "x-mbx-host": node.host, "x-mbx-ts": ts, "x-mbx-sig": signData(node.key.privateKey, hopPayload(method, path, ts, body)),
+        "x-mbx-port": String(node.config.port), "content-type": "application/json" };
 }
 /** Returns the paired peer host name, or throws with the reason. */
 export function verifyHop(node, headers, method, path, body, now = Date.now()) {
@@ -30,6 +34,213 @@ export function verifyHop(node, headers, method, path, body, now = Date.now()) {
         throw new Error("bad hop signature");
     return h;
 }
+// ---- address healing and presence (T151) -------------------------------------------------------
+// A peer's address is pinned at pairing, but DHCP moves machines. Trust never depends on the address (hops are signed,
+// bodies sealed to pinned keys), so the address may move, but only to a place that proves it is the peer: a challenge
+// probe (GET /v1/status?challenge=N) must come back signed by the PINNED host key over the fresh challenge and the
+// addresses the peer itself reports, and the candidate's IP must be one of those signed addresses. A replayed hop or a
+// proxied status can't pass: the proxy can't sign, and a relayed answer names the real peer's IPs, not the proxy's.
+// Candidates come from: a verified hop from a new IP; a signed presence beacon (POST /v1/presence); alternates stored
+// from earlier beacons; mDNS; or `agentmbx peers addr`. Plain /v1/status stays public and unsigned.
+/** Split "host:port", "[v6]:port" or "host". */
+export function splitAddr(addr) {
+    const v6 = /^\[([^\]]+)\](?::(\d+))?$/.exec(addr);
+    if (v6)
+        return { host: v6[1], port: v6[2] ? Number(v6[2]) : null };
+    const i = addr.lastIndexOf(":");
+    if (i > 0 && addr.indexOf(":") === i && /^\d+$/.test(addr.slice(i + 1)))
+        return { host: addr.slice(0, i), port: Number(addr.slice(i + 1)) };
+    return { host: addr, port: null };
+}
+export const joinAddr = (host, port) => (isIP(host) === 6 ? `[${host}]:${port}` : `${host}:${port}`);
+const validPort = (p) => { const n = Number(p); return Number.isInteger(n) && n > 0 && n < 65536 ? n : null; };
+const unmap = (ip) => ip.replace(/^::ffff:/i, "");
+const resolveName = async (name) => (await lookup(name, { all: true })).map((r) => r.address);
+/** This host's own reachable addresses (LAN IPv4 + the listening port), for presence and signed status. */
+export const selfAddrs = (node, ifaces = networkInterfaces()) => process.env.MBX_SELF_ADDRS ? process.env.MBX_SELF_ADDRS.split(",").filter(Boolean)
+    : announcedIPv4(ifaces).map((ip) => joinAddr(ip, node.config.port));
+/** Container bridges and VPN tunnels: not where a LAN peer can reach us. */
+const VIRTUAL_IFACE = /^(docker|br-|veth|virbr|podman|cni|flannel|utun|tun|tap)/i;
+/** Non-internal IPv4 addresses worth announcing: physical interfaces first; virtual ones only when nothing else is
+ *  left, so a VPN-only host still announces something. */
+export function announcedIPv4(ifaces) {
+    const all = Object.entries(ifaces).flatMap(([name, list]) => (list ?? []).filter((i) => i.family === "IPv4" && !i.internal).map((i) => ({ name, ip: i.address })));
+    const real = all.filter((x) => !VIRTUAL_IFACE.test(x.name));
+    return (real.length ? real : all).map((x) => x.ip);
+}
+const statusPayload = (s) => canonical({ v: 1, kind: "status", host: s.host, host_pubkey: s.host_pubkey, challenge: s.challenge, addrs: s.addrs, version: s.version, at: s.at });
+/** Answer a status challenge: the same public fields, plus addrs, signed by this host's key. */
+export function signedStatus(node, challenge) {
+    const s = { host: node.host, host_pubkey: node.key.publicKey, challenge, addrs: selfAddrs(node), version: version(), at: new Date().toISOString() };
+    return { v: 1, service: "agentmbx", ...s, sig: signData(node.key.privateKey, statusPayload(s)) };
+}
+/** Challenge-probe `addr`: true only if it answers as `host`, signed by the pinned key over our fresh challenge, and
+ *  lists `addr`'s IP among its own signed addresses. Peers without challenge support never pass (no unsigned moves). */
+export async function probePeer(node, host, addr, f = fetch, opts = {}) {
+    const p = node.approvedPeer(host);
+    if (!p)
+        return false;
+    const challenge = newNonce();
+    try {
+        const res = await f(`http://${addr}/v1/status?challenge=${encodeURIComponent(challenge)}`, { redirect: "error", signal: AbortSignal.timeout(3_000) });
+        if (!res.ok) {
+            await res.body?.cancel();
+            return false;
+        }
+        const s = await res.json();
+        if (s.host !== host || s.host_pubkey !== p.pubkey || s.challenge !== challenge || typeof s.sig !== "string")
+            return false;
+        if (!Array.isArray(s.addrs) || !s.addrs.every((a) => typeof a === "string") || typeof s.version !== "string" || typeof s.at !== "string")
+            return false;
+        if (!verifyData(p.pubkey, statusPayload({ host, host_pubkey: p.pubkey, challenge, addrs: s.addrs, version: s.version, at: s.at }), s.sig))
+            return false;
+        const want = unmap(splitAddr(addr).host);
+        const signed = new Set(s.addrs.map((a) => unmap(splitAddr(a).host)));
+        if (isIP(want))
+            return signed.has(want);
+        // A name: a relaying proxy would pass the signature, so its IPs must be among the signed addrs too. Only an
+        // owner-typed `peers addr` may point at a name the peer doesn't list (e.g. a DNS name for a NAT or tunnel).
+        if (opts.ownerTyped)
+            return true;
+        const ips = await (opts.resolve ?? resolveName)(want).catch(() => []);
+        return ips.some((ip) => signed.has(unmap(ip)));
+    }
+    catch {
+        return false;
+    }
+}
+/** Point `host` at `addr` if a challenge probe there proves it is that host. Returns the new address or null. */
+export async function healPeerAddr(node, host, addr, via, f = fetch) {
+    const p = node.approvedPeer(host);
+    if (!p || p.addr === addr || !(await probePeer(node, host, addr, f, { ownerTyped: via === "cli" })))
+        return null;
+    if (!node.setPeerAddr(host, addr, via))
+        return null;
+    node.store.set(`peer-heal:${host}`, JSON.stringify({ via, at: new Date().toISOString(), from: p.addr, to: addr }));
+    process.stderr.write(`[agentmbx] ${host} moved: ${p.addr} -> ${addr} (${via}, challenge verified)\n`);
+    return addr;
+}
+const failing = (node, host) => !!node.store.db.prepare("SELECT 1 FROM outbox WHERE host=? AND attempts>0 LIMIT 1").get(host);
+const listKv = (node, k) => { try {
+    const v = JSON.parse(node.store.get(k) ?? "[]");
+    return Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
+}
+catch {
+    return [];
+} };
+/** Should a candidate replace the pinned address? A pinned IP that the peer no longer reports, or mail that fails. A
+ *  working pinned name (x.local) is kept: it survives DHCP better than an IP. */
+function shouldMove(node, host, pinned, reported) {
+    if (failing(node, host))
+        return true;
+    const ph = splitAddr(pinned).host;
+    if (!isIP(ph))
+        return false;
+    return reported ? !reported.some((a) => splitAddr(a).host === ph) : true;
+}
+const learnTried = new Map();
+/** After a verified hop from `host`: remember the source IP, and if it differs from the pinned one, try it (port from
+ *  the peer's hint, else the pinned port, else 7373). One probe a minute per peer. */
+export async function learnPeerAddr(node, host, remoteIp, portHint, f = fetch, now = Date.now()) {
+    const p = node.approvedPeer(host);
+    const ip = unmap(remoteIp);
+    if (!p || !isIP(ip))
+        return null;
+    const pinned = splitAddr(p.addr);
+    const cand = joinAddr(ip, validPort(portHint) ?? pinned.port ?? 7373);
+    node.store.set(`peer-lastseen:${host}`, cand);
+    if (pinned.host === ip || !shouldMove(node, host, p.addr, null))
+        return null;
+    if (now - (learnTried.get(host) ?? 0) < 60_000)
+        return null;
+    learnTried.set(host, now);
+    return healPeerAddr(node, host, cand, "verified-hop", f);
+}
+const presenceTried = new Map();
+export const resetLearnThrottle = () => { learnTried.clear(); presenceTried.clear(); };
+/** Receiver of POST /v1/presence (hop already verified). Answers at once after the replay and shape checks; candidates
+ *  are challenge-probed in the background (at most one healing run a minute per peer), so a slow or dead candidate never
+ *  holds the sender's request open. `healing` resolves to the new address, if any (tests await it). */
+export function acceptPresence(node, host, body, remoteIp, f = fetch, now = Date.now()) {
+    const b = body;
+    if (b?.v !== 1 || !Number.isSafeInteger(b.seq) || !Array.isArray(b.addrs) || b.addrs.length > 16 || !b.addrs.every((a) => typeof a === "string" && a.length <= 64))
+        return { ok: false, error: "bad presence" };
+    const last = Number(node.store.get(`peer-presence-seq:${host}`) ?? 0);
+    if (b.seq <= last)
+        return { ok: false, error: "stale presence (seq)" };
+    node.store.set(`peer-presence-seq:${host}`, String(b.seq));
+    node.store.set(`peer-presence-at:${host}`, new Date().toISOString());
+    const addrs = b.addrs;
+    node.store.set(`peer-alts:${host}`, JSON.stringify(addrs));
+    const p = node.approvedPeer(host);
+    if (!p || !shouldMove(node, host, p.addr, addrs))
+        return { ok: true };
+    if (now - (presenceTried.get(host) ?? 0) < 60_000)
+        return { ok: true };
+    presenceTried.set(host, now);
+    const ip = unmap(remoteIp), port = validPort(b.port);
+    const cands = [...new Set([...(isIP(ip) && port ? [joinAddr(ip, port)] : []), ...addrs])].filter((a) => a !== p.addr);
+    const healing = (async () => {
+        for (const c of cands) {
+            const moved = await healPeerAddr(node, host, c, "presence", f);
+            if (moved)
+                return moved;
+        }
+        return null;
+    })().catch(() => null);
+    return { ok: true, healing };
+}
+/** Send a signed presence beacon to peers: to the pinned address, and for peers with failing mail to every known
+ *  alternate too. Old peers (404) are ignored. Returns the hosts that accepted it. */
+export async function sendPresence(node, f = fetch, only) {
+    const body = JSON.stringify({ v: 1, seq: Date.now(), port: node.config.port, addrs: selfAddrs(node), version: version() });
+    const ok = [];
+    await Promise.all(node.peers().filter((p) => p.state === "approved" && (!only || only.includes(p.host))).map(async (p) => {
+        const targets = [...new Set([p.addr, ...(failing(node, p.host) ? [...listKv(node, `peer-alts:${p.host}`), node.store.get(`peer-lastseen:${p.host}`) ?? ""] : [])])].filter(Boolean);
+        for (const t of targets) {
+            try {
+                const res = await f(`http://${t}/v1/presence`, { method: "POST", headers: signHop(node, "POST", "/v1/presence", body), body, redirect: "error", signal: AbortSignal.timeout(3_000) });
+                await res.body?.cancel();
+                if (res.ok) {
+                    ok.push(p.host);
+                    return;
+                }
+            }
+            catch { /* next target */ }
+        }
+    }));
+    return ok;
+}
+/** Failure ladder for peers whose mail keeps failing: last inbound IP, stored alternates, then mDNS. Each rung is a
+ *  challenge probe. Run once a minute by the daemon; costs nothing while mail flows. */
+export async function healStuckPeers(node, find, f = fetch) {
+    const stuck = node.store.db.prepare("SELECT DISTINCT host FROM outbox WHERE attempts>=2").all()
+        .map((r) => node.approvedPeer(r.host)).filter((p) => !!p);
+    const moved = [];
+    let seen = null;
+    for (const p of stuck) {
+        const ladder = [node.store.get(`peer-lastseen:${p.host}`) ?? "", ...listKv(node, `peer-alts:${p.host}`)];
+        let done = false;
+        for (const c of [...new Set(ladder)].filter((c) => c && c !== p.addr))
+            if (await healPeerAddr(node, p.host, c, "ladder", f)) {
+                done = true;
+                break;
+            }
+        if (!done) {
+            seen ??= await find();
+            const hit = seen.find((s) => s.host === p.host && s.fp === fingerprint(p.pubkey));
+            if (hit && await healPeerAddr(node, p.host, hit.addr, "mdns", f))
+                done = true;
+        }
+        if (done)
+            moved.push(p.host);
+    }
+    return moved;
+}
+/** @deprecated name kept for callers of the first T151 patch. */
+export const healPeersViaDiscovery = healStuckPeers;
+/** A fingerprint of this host's addresses: the daemon re-announces presence when it changes (DHCP, Wi-Fi switch). */
+export const addrSignature = (node) => selfAddrs(node).slice().sort().join(",");
 export const advertisedAddr = (node) => process.env.MBX_ADVERTISE || `${hostname().replace(/\.local$/, "").toLowerCase()}.local:${node.config.port}`;
 export const DEFAULT_LIMITS = { maxRequestBytes: 4 * 1024 * 1024, peerReqsPerMin: 600, headersTimeoutMs: 10_000, requestTimeoutMs: 30_000, keepAliveTimeoutMs: 5_000 };
 const httpError = (status, message) => Object.assign(new Error(message), { status });
@@ -159,9 +370,16 @@ export function startServer(node, port = node.config.port, bind = node.config.bi
             const url = new URL(req.url ?? "/", "http://x");
             const body = await readBody(req, L.maxRequestBytes);
             // Public diagnostic metadata only: this neither issues pairing nonces nor grants authority.
-            if (url.pathname === "/v1/status")
-                return req.method === "GET"
-                    ? send(200, runtime) : send(405, { error: "method not allowed" });
+            if (url.pathname === "/v1/status") {
+                if (req.method !== "GET")
+                    return send(405, { error: "method not allowed" });
+                const challenge = url.searchParams.get("challenge");
+                if (challenge === null)
+                    return send(200, runtime);
+                if (!isStr(challenge, 64))
+                    return send(400, { error: "bad challenge" });
+                return send(200, signedStatus(node, challenge)); // proves this host's key and its own addresses (T151)
+            }
             if (url.pathname === "/v1/pair/hello" || url.pathname === "/v1/pair/join") {
                 tokenAttempts = tokenAttempts.filter((t) => Date.now() - t < 60_000);
                 if (tokenAttempts.push(Date.now()) > TOKEN_REQS_PER_MIN)
@@ -220,10 +438,16 @@ export function startServer(node, port = node.config.port, bind = node.config.bi
                 return send(200, { results: records.map((r) => node.acceptRotation(r)) });
             }
             const peer = verifyHop(node, req.headers, req.method ?? "GET", url.pathname, body);
+            if (url.pathname !== "/v1/presence")
+                void learnPeerAddr(node, peer, req.socket.remoteAddress ?? "", req.headers["x-mbx-port"]).catch(() => { });
             const now = Date.now(), recent = (peerReqs.get(peer) ?? []).filter((t) => now - t < 60_000);
             peerReqs.set(peer, recent);
             if (recent.push(now) > L.peerReqsPerMin)
                 return send(429, { error: `rate limit: over ${L.peerReqsPerMin} requests a minute from ${peer}; retry later` });
+            if (req.method === "POST" && url.pathname === "/v1/presence") {
+                const { healing: _h, ...r } = acceptPresence(node, peer, JSON.parse(body), req.socket.remoteAddress ?? "");
+                return send(r.ok ? 202 : 400, r);
+            }
             if (req.method === "POST" && url.pathname === "/v1/unpair") {
                 // The peer removed this pairing: drop it here too, so mail stops queueing for a host that refuses it.
                 node.removePeer(peer);
