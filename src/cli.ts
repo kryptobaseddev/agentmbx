@@ -27,7 +27,8 @@ import { kimiMultiHost } from "./kimi-web.ts";
 import { bindInstruction, issueBindTicket } from "./bind-ticket.ts";
 import { activityKey } from "./identity-availability.ts";
 import { inspectLeaseProcess } from "./identity-leases.ts";
-import { linkedKey, recordSessionHint, registeredIdentity } from "./registry.ts";
+import { AUTO_NAME_RE, linkedKey, projectOf, recordSessionHint, registeredIdentity } from "./registry.ts";
+import { applyForward, buildForward, pruneCandidates, retireMailbox } from "./identity-cleanup.ts";
 import { installDesktopPlugin, kimiDesktop, kimiDesktopDir, removeDesktopPlugin, writeDesktopPlugin } from "./kimi-desktop.ts";
 import { approveKimi, decidePermission, opencodePermissionPass, type Lookup } from "./permission.ts";
 import { diagnosticSnapshot, type RuntimeObservation } from "./diagnostics.ts";
@@ -59,7 +60,9 @@ Messages
     Use --cli <provider> --session <id> when multiple sessions share the caller. --as only selects the held name.
     New sends without a lease are marked unverified-sender and grant no delegated authority.
   agentmbx status --cli <provider> --session <id> --json   current session identity and mailbox counts (read-only)
-  agentmbx identity list [--json]               inspect local identity holders, unread counts and recovery status (read-only)
+  agentmbx identity list [--project <dir>] [--all] [--json]   identities with role, holder, claimable and unread (read-only)
+  agentmbx identity prune [--days 7] [--apply]   retire mailboxes older versions generated that nobody holds (dry run by default)
+  agentmbx identity forward <from> <to>          move a mailbox's unread mail to another, with your owner signature
   agentmbx identity claim [name] --cli <provider> --session <id> [--wait-ms 5000] [--json]
   agentmbx identity release --cli <provider> --session <id> [--wait-ms 5000] [--json]
   agentmbx diagnostics --mailbox <name> [--cli <provider> --session <id>] [--limit 20] [--json]
@@ -202,7 +205,7 @@ async function run(argv: string[]) {
     compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" },
     backend: { type: "string" }, "no-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
     project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }, "wait-ms": { type: "string" },
-    "older-than": { type: "string" }, minutes: { type: "string" } } });
+    "older-than": { type: "string" }, minutes: { type: "string" }, apply: { type: "boolean" }, days: { type: "string" } } });
   if (o.help) return console.log(commandHelp(cmd));
   const str = (k: string) => (typeof (o as Record<string, unknown>)[k] === "string" ? (o as Record<string, unknown>)[k] as string : undefined);
 
@@ -260,11 +263,41 @@ async function run(argv: string[]) {
       console.log(o.json ? JSON.stringify(result, null, 2) : `Request ${receipt.id}: ${result.outcome}${pending ? `. Do not resubmit; inspect with agentmbx identity result ${receipt.id}` : `\n${JSON.stringify(receipt.result ?? receipt.error, null, 2)}`}`);
     };
     if (pos[0] === "list" && pos.length === 1) {
-      const result = listIdentityStatus(defaultHome());
+      const project = (o.project as string[] | undefined)?.[0];
+      const result = listIdentityStatus(defaultHome(), { project: project ? projectOf(project) : undefined, includeRetired: !!o.all });
       if (o.json) return console.log(JSON.stringify(result, null, 2));
-      console.log(`Identities on ${result.host} (advisory snapshot; claims recheck ownership)`);
+      console.log(`Identities on ${result.host}${project ? ` for ${projectOf(project)}` : ""} (advisory snapshot; claims recheck ownership)`);
       if (!result.identities.length) console.log("No local identities.");
-      for (const row of result.identities) console.log(`${row.name}\t${row.state}\t${row.unread} unread\t${row.last_activity ?? "no activity"}\t${row.reason}`);
+      for (const row of result.identities) console.log(`${row.name}\t${row.role ?? (row.registered ? "" : "unregistered")}\t${row.state}${row.claimable ? " (claimable)" : ""}\t${row.unread} unread\t${row.last_activity ?? "no activity"}\t${row.reason}`);
+      return;
+    }
+    if (pos[0] === "prune" && pos.length === 1) {
+      // T209: retire mailboxes older versions generated that nobody holds, with no unread mail and no recent traffic.
+      const days = Number(str("days") ?? 7);
+      if (!Number.isFinite(days) || days < 1) die("--days must be at least 1");
+      const node = new MbxNode();
+      try {
+        const { retire, kept } = pruneCandidates(node, { days });
+        if (o.apply) for (const r of retire) retireMailbox(node, r.name, "agentmbx identity prune");
+        if (o.json) return console.log(JSON.stringify({ applied: !!o.apply, retire, kept: kept.filter(k => AUTO_NAME_RE.test(k.name)) }, null, 2));
+        console.log(`${o.apply ? "Retired" : "Would retire"} ${retire.length} generated mailbox(es) on ${node.host}${o.apply ? "" : " (dry run: add --apply)"}:`);
+        for (const r of retire) console.log(`  ${r.name}\t${r.messages} message(s)\tlast ${r.last_activity ?? "never"}`);
+        const held = kept.filter(k => AUTO_NAME_RE.test(k.name));
+        if (held.length) { console.log(`Kept ${held.length} generated mailbox(es):`); for (const k of held) console.log(`  ${k.name}\t${k.reason}`); }
+        console.log("Messages are never deleted; claiming a retired name brings it back.");
+      } finally { node.close(); }
+      return;
+    }
+    if (pos[0] === "forward" && pos.length === 3) {
+      // T209: move one mailbox's unread mail to another, with the owner's signature (Touch ID or passphrase).
+      const node = new MbxNode();
+      try {
+        const payload = buildForward(node, pos[1], pos[2]);
+        const summary = `Forward ${payload.unread} unread message(s) from ${payload.from}@${payload.host} to ${payload.to}@${payload.host}; ${payload.from} routes to ${payload.to} from now on. Approval expires ${new Date(payload.expires_at).toISOString()}.`;
+        const { sig } = await ownerSignCanonical(node.home, canonical(payload), summary);
+        const r = applyForward(node, { payload, sig });
+        console.log(o.json ? JSON.stringify({ from: payload.from, to: payload.to, ...r }) : `Moved ${r.moved} unread message(s) from ${payload.from} to ${payload.to}; ${payload.from} now routes to ${payload.to}.`);
+      } finally { node.close(); }
       return;
     }
     if (pos[0] === "result" && pos.length === 2) {
@@ -301,7 +334,7 @@ async function run(argv: string[]) {
       } finally { node.close(); }
     }
     if ((pos[0] === "export" || pos[0] === "import") && pos.length === 2) return identityBackup(pos[0], pos[1], !!o.force);
-    die("identity list | export <file> | import <file> | claim [name] --cli <provider> --session <id> | release --cli <provider> --session <id> | takeover <name> --force --cli <provider> --session <id> | result <request-id>");
+    die("identity list [--project <dir>] [--all] | prune [--days 7] [--apply] | forward <from> <to> | export <file> | import <file> | claim [name] --cli <provider> --session <id> | release --cli <provider> --session <id> | takeover <name> --force --cli <provider> --session <id> | result <request-id>");
   }
   const node = new MbxNode();
   // Inside an agent session (a hook-bound or MCP-bound CLI up the process tree) the session's own name is the default,

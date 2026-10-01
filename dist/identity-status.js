@@ -16,7 +16,7 @@ export function listIdentityStatus(home, options = {}) {
         throw new Error("mailbox host configuration is invalid");
     const db = new DatabaseSync(path, { readOnly: true });
     const rows = new Map(), leases = [], conflicts = new Set(), activityByName = new Map();
-    const inProject = new Set();
+    const inProject = new Set(), retired = new Set();
     let schema;
     const row = (name) => {
         let value = rows.get(name);
@@ -47,6 +47,14 @@ export function listIdentityStatus(home, options = {}) {
         }
         for (const r of db.prepare("SELECT agent,MAX(updated_at) activity FROM sessions GROUP BY agent").all())
             activity(row(r.agent), r.activity);
+        for (const r of db.prepare("SELECT k FROM kv WHERE k LIKE 'retired:%'").all()) {
+            const name = r.k.slice("retired:".length);
+            retired.add(name);
+            if (options.includeRetired) {
+                const item = row(name);
+                item.reason = "retired by identity prune; claiming it brings it back";
+            }
+        }
         for (const r of db.prepare("SELECT k FROM kv WHERE k LIKE 'identity-conflict:%'").all()) {
             const name = r.k.slice("identity-conflict:".length);
             conflicts.add(name);
@@ -109,7 +117,8 @@ export function listIdentityStatus(home, options = {}) {
         item.claimable = false;
         item.reason = "historical ownership requires explicit recovery";
     }
-    const all = [...rows.values()].sort((a, b) => a.name.localeCompare(b.name));
+    // Retired mailboxes (identity prune, T209) leave listings unless asked for; their history is still in the store.
+    const all = [...rows.values()].filter(i => options.includeRetired || !retired.has(i.name) || i.state === "held").sort((a, b) => a.name.localeCompare(b.name));
     return { host: config.host, schema_version: schema, observed_at: new Date(now).toISOString(), advisory: true,
         ...(options.project ? { project: options.project } : {}),
         identities: options.project ? all.filter(i => inProject.has(i.name)) : all };
