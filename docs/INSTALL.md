@@ -171,8 +171,10 @@ command = "agentmbx hook permission --cli kimi"
 timeout = 10
 # <<< agentmbx <<<
 ```
-- Kimi's TUI accepts no push from outside, so an idle Kimi session only sees mail when its user next types.
-- For hands-off agents: ask the Kimi session to create a CronCreate job that checks `mbx_inbox` every few minutes, or run it under `kimi web`.
+- Terminal Kimi accepts no push from outside, so the session wakes itself: it keeps one background task running `agentmbx watch` (the prompt hook and the skill ask it to). The task exits with a no-body hint when mail that wants the session arrives, and Kimi starts a turn from the task's completion. `MBX_SELF_WATCH=<minutes>` asks for a `[mbx-watch]` CronCreate self-check instead.
+- `kimi web` / `kimi rc`: woken through the server's prompts API. A server reads its hooks once at start, so restart one that was started before `agentmbx setup` (`agentmbx doctor` flags it). A conversation in manual approval mode asks before every mbx tool call: allow `mbx_*` so mail handling isn't blocked.
+- Kimi desktop app: it keeps a private Kimi Code home, so `agentmbx setup` (with the app running) installs AgentMBX into it as a native Kimi plugin (mbx MCP server and hooks). Conversations are woken through the app's local control socket. Run `agentmbx setup --only kimi` again after an app reinstall.
+- Hosted conversations (web and desktop) share one app process, so each links itself to its own mbx server once: its first prompt carries a one-time bind ticket for `mbx_whoami`.
 
 ### Hermes
 If `~/.hermes/config.yaml` exists, setup adds:

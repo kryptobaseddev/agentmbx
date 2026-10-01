@@ -24,11 +24,11 @@ Legend: ✅ verified, 🟡 works with a documented limit, ❌ gap (tracked).
 
 | CLI | MCP | Hooks | Wake an idle session | Keep going on mail mid-turn | YOLO approvals |
 |---|---|---|---|---|---|
-| Claude Code | ✅ | ✅ SessionStart, UserPromptSubmit, PermissionRequest, Stop | 🟡 push only with `--dangerously-load-development-channels server:mbx`; otherwise a `[mbx-watch]` CronCreate self-check (under a policy) | ✅ Stop `{decision:block}` | ✅ `PermissionRequest` |
+| Claude Code | ✅ | ✅ SessionStart, UserPromptSubmit, PermissionRequest, Stop | ✅ push: the session's own mbx server posts the hint through `CLAUDE_CODE_MESSAGING_SOCKET` (no flag needed, T202); `agentmbx claude` adds the research-preview channel | ✅ Stop `{decision:block}` | ✅ `PermissionRequest` |
 | Codex | ✅ | ✅ same four (Codex asks to trust new hooks once) | ✅ `codex queue` (needs a codex that has `queue`) | ✅ same Stop schema (verified in 0.157.1) | ✅ `PermissionRequest` (0.157.1) |
 | OpenCode | ✅ | none | ✅ service API (`opencode service` must run) | n/a | ✅ daemon answers via the service API |
-| Kimi Code (terminal) | ✅ (MCP server instructions don't reach the model: guidance ships in the skill and hook notes) | ✅ SessionStart, UserPromptSubmit, PermissionRequest, Stop | 🟡 `[mbx-watch]` CronCreate self-check (under a policy) | ✅ Stop hook, exit 2 + reason on stderr (verified by kimi) | ❌ unsupported: Kimi's PermissionRequest hook is observation-only. Use `kimi --yolo` yourself |
-| Kimi (`kimi web` / desktop / `kimi rc`) | ✅ | ✅ (hooks run per hosted session) | ✅ push via `POST /api/v1/sessions/{id}/prompts`, waits while busy, sends the default model when the session has none (T049, verified live by kimi) | ✅ Stop hook | ✅ approvals API |
+| Kimi Code (terminal) | ✅ (MCP server instructions don't reach the model: guidance ships in the skill and hook notes) | ✅ SessionStart, UserPromptSubmit, PermissionRequest, Stop | ✅ a background `agentmbx watch` task the session keeps running exits with the no-body hint and starts the next turn (T033); `[mbx-watch]` cron self-check remains the `MBX_SELF_WATCH` fallback | ✅ Stop hook, exit 2 + reason on stderr (verified by kimi) | ❌ unsupported: Kimi's PermissionRequest hook is observation-only. Use `kimi --yolo` yourself |
+| Kimi (`kimi web` / desktop / `kimi rc`) | ✅ | ✅ (hooks run per hosted session) | ✅ desktop: control-socket `conversations.send` after a busy check; `kimi web` / `kimi rc`: prompts API, waits while busy, sends the default model when the session has none; each conversation links itself with its bind ticket first (T033, verified live) | ✅ Stop hook | ✅ approvals API |
 | Hermes | ✅ | none | ❌ cron now, plugin planned | ❌ | ❌ |
 | Anything else with MCP | ✅ (manual config) | none | desktop notification | none | none |
 

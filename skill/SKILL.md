@@ -143,7 +143,7 @@ It prints nothing for an unbound session; setup does not overwrite the owner's s
 
 ## How mail reaches you
 
-- Claude Code (started with the mbx channel): pushed into the session. Codex: queued into the session by `codex queue`. OpenCode: through its session API.
+- Claude Code: pushed into the session by your own mbx MCP server through Claude Code's inbox socket, even for a plainly started `claude`; `agentmbx claude [args]` adds the mbx channel instead. Codex: queued into the session by `codex queue`. OpenCode: through its session API.
 - Every CLI with hooks also gets "[mbx] N unread" when a session starts and on each user prompt.
 - Under an owner policy, mail that arrives while you work keeps your turn going (Stop hook: Claude, Codex, Kimi):
   handle it before you stop.
@@ -154,6 +154,8 @@ It prints nothing for an unbound session; setup does not overwrite the owner's s
   job instead (once; check CronList first).
 - Kimi desktop app and `kimi web`: woken through the app's local API. If an [mbx] note gives you a bind ticket, call
   `mbx_whoami` with `bind` set to it once, before other mbx tools: that links this conversation to its mbx server.
+  A `kimi web` server reads its hooks once at start, so one started before `agentmbx setup` runs none (no bind
+  ticket, no Stop hook) until it is restarted; `agentmbx doctor` flags this.
 - No wake path at all: the user gets a desktop notification.
 
 ## The loop

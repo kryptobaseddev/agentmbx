@@ -95,6 +95,7 @@ A wake is a no-body hint that asks an idle session to check its mailbox. Admissi
 | Kimi web | `POST /api/v1/sessions/<id>/prompts` (`src/wake.ts:127-153`), hosted only (`src/kimi-web.ts:51-59`) | native | status endpoint (`src/wake.ts:111-118`) | native (`prompt_id`, status; session not echoed) | none | no | Terminal TUI sessions: no push (`src/mcp.ts:167`); self-watch; Stop hook exit 2. |
 | Kimi desktop (T033) | daimon control socket, JSON-RPC `conversations.send` (`src/wake.ts` wakeKimiDesktop, `src/kimi-desktop.ts`) | native: `conversations.list` maps the bound kernel session id to its conversation | `conversations.getBusy`; error -32010 → `busy` | native (`turnId`, `accepted`, session echoed) | none | no | Session linked by bind ticket (`src/bind-ticket.ts`); unlinked: desktop notice. |
 | Kimi terminal (T033) | none from outside: the session's own background `agentmbx watch` exits on mail and Kimi starts a turn from the task completion | native (caller's lease) | n/a | transport (the watcher printed the hint) | mute, brake | no | `[mbx-watch]` cron with `MBX_SELF_WATCH=<minutes>`; Stop hook exit 2. |
+| Claude socket (T202) | NDJSON push to `CLAUDE_CODE_MESSAGING_SOCKET` from the session's own MCP process (`src/mcp.ts` socketPush) | native (own process) | none | transport | mute, brake | no | The no-channel push: a plainly started `claude` wakes with no flag. |
 | Claude channel | `notifications/claude/channel` from the session's MCP process (`src/mcp.ts:784-810`) | native (own process) | none | transport (JSON-RPC notification has no response) | none | yes | Without channel: no push; prompt/post-tool hooks (`src/cli.ts:813`); self-watch. |
 | Desktop | AgentMBX.app notifier, osascript, notify-send (`src/wake.ts:173-202`) | none | n/a | none | none | no | Is the fallback; exit 3 means notifications off (`src/wake.ts:197`) → `blocked/notifications-off`. |
 | Hermes | MCP only (`src/mcp.ts:195`, `src/setup.ts:292-293`) | none | none | none | none | no | No push; self-watch instruction; desktop notice. |
@@ -116,7 +117,7 @@ No path is version-pinned: `testedVersions` is empty for all, and `KimiInstance.
 | OpenCode non-2xx (`src/wake.ts:58`); Kimi non-zero code on prompts (`src/wake.ts:146`) | `failed` (Kimi `MODEL_NOT_CONFIGURED`: `blocked/model-unconfigured`) |
 | Desktop exit 3 (`src/wake.ts:197`); `MBX_NO_DESKTOP` (`src/wake.ts:190`) | notice `blocked/notifications-off`, `blocked/disabled` |
 
-### Divergences found at this revision
+### Divergences found at this revision (as of a2dcdd6; items 1–6 closed by T178/T179, shipped in v0.5.1)
 
 1. Any adapter error collapses to `{ok:false}` and falls through to the next session and then desktop (`src/wake.ts:253`, `src/wake.ts:294`); ambiguous timeouts and malformed receipts are indistinguishable from definite rejections.
 2. The OpenCode `mcp-` directory fallback wakes the newest session in a directory (`src/wake.ts:72-80`), not the exact bound session, and reports the same `ok` as an exact wake.
