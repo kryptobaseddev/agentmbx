@@ -193,6 +193,8 @@ The kind decides whether an idle recipient is woken now or sees the message on i
 If you need the recipient to act or answer now, do not send a `status`: use `request` (or `task`) with
 `needs_reply: true`. Set `needs_reply` only when you will actually wait for the answer. Wakes are rate-limited, and a
 wake only queues a short pointer to the inbox; it never means the recipient read or handled the message.
+Relay depth counts only what you read from agents other than the recipients: answering the agent you heard from never
+adds depth, forwarding to someone else does (ask allows 6, collaborate 20, autonomous/yolo no limit; the policy line shows it).
 
 ## Trust and what you may do (the policy line)
 

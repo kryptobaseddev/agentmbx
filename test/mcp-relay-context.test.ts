@@ -75,11 +75,17 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: unrelat
       assert.equal(sent.meta.origin ?? "agent", i === 0 ? "external" : "agent");
     }
   }
-  // Explicit replies re-read their parent; expiry must not erase actual reply provenance.
+  // Explicit replies re-read their parent; expiry must not erase actual reply provenance. Forwarding the old thread to
+  // someone else keeps its depth; answering its own sender does not relay it (T104), but external origin stays.
+  const fwd = await c.callTool({ name: "mbx_send", arguments: { to: ["one"], subject: "fwd", body: "fwd", reply_to: old.id } });
+  assert.notEqual(fwd.isError, true);
+  const forwarded = JSON.parse(n.message((fwd.structuredContent as { id: string }).id)!.envelope);
+  assert.equal(forwarded.meta.hop, 66);
+  assert.equal(forwarded.meta.origin, "external");
   const reply = await c.callTool({ name: "mbx_reply", arguments: { id: old.id, body: "reply" } });
   assert.notEqual(reply.isError, true);
   const replied = JSON.parse(n.message((reply.structuredContent as { id: string }).id)!.envelope);
-  assert.equal(replied.meta.hop, 66);
+  assert.equal(replied.meta.hop ?? 0, 0);
   assert.equal(replied.meta.origin, "external");
 
 });
@@ -90,7 +96,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: maximum
   const owner = generateKeyPair();
   writeFileSync(join(home, "owner.json"), JSON.stringify({ backend: "keychain", public_key: owner.publicKey }), { mode: 0o600 });
   const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "relay-cap-test", version: "1" });
-  const rec = makePolicy({ level: "yolo", agents: ["receiver"], hosts: ["alpha"], ownerPub: owner.publicKey });
+  const rec = makePolicy({ level: "collaborate", agents: ["receiver"], hosts: ["alpha"], ownerPub: owner.publicKey });
   assert.equal(acceptSigned(n.store.db, { rec, sig: signData(owner.privateKey, canonical(rec)) }, "alpha"), null);
   t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
   await c.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
@@ -101,7 +107,6 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: maximum
   for (const request of [
     { name: "mbx_send", arguments: { to: ["receiver"], subject: "new thread", body: "data" } },
     { name: "mbx_send", arguments: { to: ["receiver"], subject: "reply", body: "data", reply_to: parent.id } },
-    { name: "mbx_reply", arguments: { id: parent.id, body: "data" } },
   ]) {
     const result = await c.callTool(request);
     assert.notEqual(result.isError, true);
@@ -112,10 +117,14 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: maximum
     assert.equal(envelope.meta.origin, "external");
     const policy = n.policyFor(row, "receiver");
     assert.equal(policy.level, "ask");
-    assert.match(policy.notes.join(" "), /relay safety depth 1000 exceeds limit 6/);
-    assert.ok((result.structuredContent as { warnings: string[] }).warnings.some(w => /relay safety depth 1000 exceeds 6: .*will not be woken/.test(w)),
+    assert.match(policy.notes.join(" "), /relay depth 1000 exceeds 20 for collaborate/);
+    assert.ok((result.structuredContent as { warnings: string[] }).warnings.some(w => /relay depth 1000 exceeds 20: .*will not be woken.*autonomous and yolo have no depth limit/.test(w)),
       "the sender learns the brake applies, instead of a silent missed wake (Fedora T151 report)");
   }
+  // answering the deep message's own sender is a conversation, not a relay: no depth, but external origin stays
+  const answer = await c.callTool({ name: "mbx_reply", arguments: { id: parent.id, body: "data" } });
+  const answered = JSON.parse(n.message((answer.structuredContent as { id: string }).id)!.envelope);
+  assert.equal(answered.meta.hop ?? 0, 0); assert.equal(answered.meta.origin, "external");
 });
 
 test("a prompt the owner typed ends the relay chain; wake prompts and external origin do not reset (T104)", async t => {

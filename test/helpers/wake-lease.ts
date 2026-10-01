@@ -24,10 +24,10 @@ export function bindWakeLease(n: MbxNode, s: { agent: string; cli: string; sessi
   return { token: holder.token, release: () => leases.release(s.agent, holder!.token) };
 }
 
-export function delegateWake(n: MbxNode, agent: string) {
+export function delegateWake(n: MbxNode, agent: string, level: "collaborate" | "autonomous" = "autonomous") {
   if (!n.ownerPub) { createOwnerKey(n.home, "test-only-passphrase"); n.syncOwner(); }
   const owner = unlockOwnerKey(n.home, "test-only-passphrase");
-  const rec = makePolicy({ level: "autonomous", agents: [agent], hosts: [n.host], ownerPub: owner.publicKey });
+  const rec = makePolicy({ level, agents: [agent], hosts: [n.host], ownerPub: owner.publicKey });
   const error = acceptSigned(n.store.db, { rec, sig: signData(owner.privateKey, canonical(rec)) }, n.host);
   if (error) throw new Error(error);
 }

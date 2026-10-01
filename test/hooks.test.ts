@@ -119,8 +119,13 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} hooks re
   n.ack(id, agent);
   n.send({ from: "claimed", to: [agent], subject: "unverified", body: "not delegated", kind: "request", unverifiedSender: true });
   const unverified = run("stop"); assert.equal(unverified.status, 0, unverified.stderr); assert.equal(unverified.stdout, "");
-  sendLeased(n, { from: "sender", to: [agent], subject: "over relay limit", body: "not delegated", kind: "request", hop: 1000 });
-  assert.equal(run("stop").stdout, "");
+  // autonomous has no relay depth limit (T104): even depth-1000 mail keeps the turn going like any delegated request
+  const deep = sendLeased(n, { from: "sender", to: [agent], subject: "deep chain", body: "delegated", kind: "request", hop: 1000 }).envelope.id;
+  const deepStop = run("stop");
+  if (cli === "kimi") assert.equal(deepStop.status, 2);
+  else if (cli !== "opencode") assert.equal(JSON.parse(deepStop.stdout).decision, "block");
+  else assert.equal(deepStop.stdout, "");
+  n.ack(deep, agent);
   assert.notEqual((await call("mbx_identity", { action: "release" })).isError, true);
   const before = n.store.db.prepare("SELECT * FROM sessions").all();
   for (const event of ["prompt", "post-tool", "stop", "session-start"]) {
@@ -129,7 +134,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} hooks re
     else assert.equal(r.stdout, "");
     assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before, "released hooks cannot recreate bindings");
   }
-  assert.equal(n.inbox(agent).length, 2); assert.ok(n.inbox(agent).every(m => m.state === "delivered"));
+  assert.equal(n.inbox(agent).length, 1, "the unverified message (the deep one was acked)"); assert.ok(n.inbox(agent).every(m => m.state === "delivered"));
 });
 
 test("Claude post-tool deduplicates exact leased mailbox arrivals and ignores retired links", async t => {
