@@ -95,6 +95,13 @@ test("receive() enforces per-envelope caps with clear reasons; a near-max sealed
   } finally { down(A, B); }
 });
 
+/** JSON text for any fuzz value. Deeply nested values overflow JSON.stringify on smaller CI stacks, so they are written
+ *  iteratively at the same depth: the server must still see (and survive) the deep body. */
+const json = (v: unknown): string => {
+  try { return JSON.stringify(v) ?? ""; }
+  catch (e) { if (!(e instanceof RangeError)) throw e; return "[".repeat(5000) + "1" + "]".repeat(5000); }
+};
+
 const ROUTES: [string, string][] = [["GET", "/v1/status"], ["GET", "/v1/pair/hello"], ["POST", "/v1/pair/join"], ["POST", "/v1/pair"], ["POST", "/v1/envelopes"],
   ["POST", "/v2/envelopes"], ["POST", "/v1/policy"], ["GET", "/v1/policies"], ["GET", "/v1/agents"], ["GET", "/v1/enc-key"], ["PUT", "/v1/envelopes"], ["POST", "/nope"]];
 
@@ -107,7 +114,7 @@ test("random bodies to every HTTP endpoint never crash the server or produce a 5
     for (let i = 0; i < 1500; i++) {
       const [method, path] = pick(r, ROUTES);
       const raw = int(r, 4) === 0 ? Buffer.from(Array.from({ length: int(r, 200) }, () => int(r, 256)))
-        : Buffer.from(JSON.stringify(int(r, 2) ? mutate(r, valid) : value(r)) ?? "");
+        : Buffer.from(json(int(r, 2) ? mutate(r, valid) : value(r)));
       const body = method === "GET" && r() < 0.7 ? "" : raw.toString("utf8");
       const headers = r() < 0.8 ? signHop(A.n, method, path, body) : { "content-type": pick(r, ["application/json", "text/plain"]) };
       if (r() < 0.1) headers["x-mbx-ts"] = str(r).replace(/[^\x20-\x7e]/g, "");
