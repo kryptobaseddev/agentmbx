@@ -126,6 +126,27 @@ No path is version-pinned: `testedVersions` is empty for all, and `KimiInstance.
 5. The Claude channel path uses `takeWake` (non-refundable, `src/node.ts:672-674`) and a lease `withHeld` check rather than `captureWakeIdentity`; a failed notification leaves its budget spent (`src/mcp.ts:794-808`).
 6. Kimi prompt `status: "blocked"` is reported as the same success as `running` (`src/wake.ts:148-151`).
 
+### Live receipts and open receipt gaps (v0.5.1, T091/T180)
+
+Real idle sessions were woken on 2026-10-01 against the release candidate (evidence in `.cleo/cache/evidence/`):
+
+| Provider (version) | Path | Admission receipt | Model ran, read, replied, acked | Evidence |
+|---|---|---|---|---|
+| Claude Code (MacBook and Fedora) | session socket | transport | yes, both directions, ~1.5 s | t151-physical-lan.txt |
+| Codex CLI 0.159.2 | `codex queue` | exit-status | yes | t180-codex-wake.txt |
+| OpenCode 2.0.20 | synthetic (service) | native `msg_` id | yes | t180-opencode-wake.txt |
+| Kimi Code 2.1.1 terminal | `agentmbx watch` exit | transport | yes | t033-kimi-terminal-watcher.txt |
+| Kimi desktop 3.2.12 | control `conversations.send` | native turnId | yes | t033-kimi-desktop-wake.txt |
+| Kimi web 2.1.1 | prompts API | native prompt id | yes | t033-kimi-web-wake.txt |
+| any, fail-closed | desktop notice when the sender is over the relay allowance | none | n/a (Codex probe 1) | t180-codex-wake.txt |
+
+Open gaps, each reproducible:
+- Hermes has no wake adapter (deferred, T189): mail waits for its next prompt or a desktop notice.
+- Codex admission is exit-status only: `codex queue` returns no native id, so a queued-but-lost hint cannot be told apart from a delivered one.
+- A `kimi web` server started before `agentmbx setup` runs no hooks, so its conversations never get a bind ticket and are not woken (doctor flags it; restart the server).
+- Kimi web conversations in manual approval mode stop on every mbx tool call until approved (observed in the web test).
+- The Claude channel path (`agentmbx claude`) was not re-proven live in this release; the socket push replaced it as the default.
+
 ## Testable requirements
 
 Each item names the implementing task. Fixtures MUST use synthetic native endpoints or stub CLIs (as in `test/wake-dispatch.test.ts`, `test/opencode-response-contract.test.ts`, `test/kimi-response-contract.test.ts`); live receipts remain T091.

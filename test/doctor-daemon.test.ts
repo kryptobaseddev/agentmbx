@@ -71,3 +71,14 @@ test("real status probe is bounded read-only metadata and does not spend pairing
   await close(server);
   const check = await daemonReadiness(n, 200); assert.equal(check.level, "fail"); assert.match(check.label, /not answering/);
 });
+
+test("doctor reports each peer's presence age and how its address was last healed (T201)", async t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-doctor-heal-")), n = new MbxNode(home, { host: "alpha", port: 1 });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  n.store.db.prepare("INSERT INTO peers (host,pubkey,addr,state,created_at,approved_at) VALUES ('beta','k','127.0.0.1:9','approved',?,?)").run(new Date().toISOString(), new Date().toISOString());
+  n.store.set("peer-heal:beta", JSON.stringify({ via: "verified-hop", at: "2026-10-01T16:47:43.137Z", from: "10.0.10.29:7373", to: "127.0.0.1:9" }));
+  n.store.set("peer-presence-at:beta", "2026-10-01T16:43:09.116Z");
+  const checks = await doctor({ home, cmd: ["agentmbx"], which: () => null, useClis: false }, home, { peerTimeoutMs: 300 });
+  assert.ok(checks.some(c => c.label === "peer beta: address healed 10.0.10.29:7373 -> 127.0.0.1:9 via verified-hop at 2026-10-01T16:47:43.137Z; last presence 2026-10-01T16:43:09.116Z"),
+    checks.map(c => c.label).join("\n"));
+});
