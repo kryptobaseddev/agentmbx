@@ -235,6 +235,9 @@ export function agentName(cwd = process.cwd(), cli) {
     return NAME_RE.test(n) ? n : "agent";
 }
 const text = (s, structured) => ({ content: [{ type: "text", text: s }], ...(structured ? { structuredContent: structured } : {}) });
+/** A status that looks like it wants attention will not get it: say so to the sender (owner decision 2026-09-30). */
+export const statusWakeWarning = (e) => e.kind === "status" && (e.needs_reply || e.meta.mentions.length)
+    ? ["kind=status never wakes the recipient (not even with needs_reply or a mention); it waits for their next prompt. To get attention now, send kind=request with needs_reply=true."] : [];
 export async function runMcp(existing) {
     let node;
     if (existing)
@@ -703,10 +706,11 @@ export async function runMcp(existing) {
     });
     server.registerTool("mbx_send", {
         title: "Send an mbx message",
-        description: "Start a new conversation with other agents (to answer a message, use mbx_reply instead). `to` accepts agent names (vida-dev), agent@host (vida-dev@fedora), role:<role>, * (everyone), or owner; find names with mbx_agents. Use kind=request/task with needs_reply=true when you need an answer. A successful send is acceptance, not recipient delivery, reply or task completion; queued transport retry is not a draft API. Avoid manually resending an uncertain send. Next: check mbx_inbox for answers.",
+        description: "Start a new conversation with other agents (to answer a message, use mbx_reply instead). `to` accepts agent names (vida-dev), agent@host (vida-dev@fedora), role:<role>, * (everyone), or owner; find names with mbx_agents. Kind decides waking: request/task/decision/alert wake an idle recipient; message/reply wake only with needs_reply=true or an @mention; status NEVER wakes (it waits for the recipient's next prompt). Use kind=request/task with needs_reply=true when you need an answer. A successful send is acceptance, not recipient delivery, reply or task completion; queued transport retry is not a draft API. Avoid manually resending an uncertain send. Next: check mbx_inbox for answers.",
         inputSchema: {
             to: z.array(z.string().min(1)).min(1).max(20), subject: z.string().min(1).max(200), body: z.string().max(256 * 1024),
-            kind: z.enum(KINDS).default("message"), reply_to: z.string().optional().describe("id of the message you are answering; keeps the thread"),
+            kind: z.enum(KINDS).default("message").describe("request/task/decision/alert wake the recipient; message/reply wake only with needs_reply or an @mention; status never wakes"),
+            reply_to: z.string().optional().describe("id of the message you are answering; keeps the thread"),
             needs_reply: z.boolean().default(false), refs: z.array(z.string()).max(20).default([]),
             idempotency_key: z.string().max(100).optional().describe("same key twice sends only once"),
             origin: z.enum(["agent", "external"]).optional().describe("external when the content comes from outside (web page, issue, PR comment, email)"),
@@ -729,7 +733,7 @@ export async function runMcp(existing) {
         if (idempotency_key)
             node.store.set(`idem:${agent}:${idempotency_key}`, r.envelope.id);
         const out = { id: r.envelope.id, ref: `mbx:${r.envelope.id}@${node.host}`, thread: r.envelope.thread, delivered_locally: r.local, queued_for_hosts: r.remote,
-            owner_authority: !!r.envelope.authority, warnings: r.warnings };
+            owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...statusWakeWarning(r.envelope)] };
         return text(JSON.stringify(out, null, 2), out);
     });
     server.registerTool("mbx_reply", {

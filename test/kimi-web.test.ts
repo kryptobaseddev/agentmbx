@@ -18,6 +18,9 @@ import { bindWakeLease } from "./helpers/wake-lease.ts";
 import { MbxNode } from "../src/node.ts";
 import { dispatchWakes, wakeKimi, type WakeResult } from "../src/wake.ts";
 
+/** The legacy fields; the typed outcome (T178) is asserted separately. */
+const legacy = ({ outcome: _o, ...r }: { outcome?: unknown } & Record<string, unknown>) => r;
+
 process.env.MBX_NO_DESKTOP = "1";
 const tmp = () => mkdtempSync(join(tmpdir(), "mbx-kimi-"));
 
@@ -166,7 +169,7 @@ test("kimiHostedServer: only a live instances row for this very pid counts as ho
 test("wakeKimi submits the wake text as a user prompt with the bearer token", async () => {
   const { server, url, seen } = await fakeKimiServer({ model: "kimi-code/kimi-for-coding" });
   const r = await wakeKimi({ session_id: "session_t", pid: null }, "wake text here", { server: { url, token: "tok" } });
-  assert.deepEqual(r, { ok: true, via: "kimi web" });
+  assert.deepEqual(legacy(r), { ok: true, via: "kimi web" }); assert.equal(r.outcome?.kind, "admitted");
   assert.equal(seen.length, 2);
   assert.equal(seen[0].method, "GET");
   assert.match(seen[0].url, /\/api\/v1\/sessions\/session_t\/status$/);
@@ -183,7 +186,7 @@ test("wakeKimi submits the wake text as a user prompt with the bearer token", as
 test("wakeKimi on a busy session returns retry and submits no prompt", async () => {
   const { server, url, seen } = await fakeKimiServer({ busy: true, model: "m" });
   const r = await wakeKimi({ session_id: "session_t", pid: null }, "wake", { server: { url, token: "tok" } });
-  assert.deepEqual(r, { ok: false, via: "kimi web", error: "session busy", retry: true });
+  assert.deepEqual(legacy(r), { ok: false, via: "kimi web", error: "session busy", retry: true }); assert.equal(r.outcome?.kind, "busy");
   assert.equal(seen.filter((s) => s.method === "POST").length, 0, "no prompt submitted while the session is mid-turn");
   server.close();
 });
@@ -191,7 +194,7 @@ test("wakeKimi on a busy session returns retry and submits no prompt", async () 
 test("wakeKimi passes the server default model when the session has none bound (the 'Model not set' fix)", async () => {
   const { server, url, seen } = await fakeKimiServer({ model: null, defaultModel: "kimi-code/kimi-for-coding" });
   const r = await wakeKimi({ session_id: "session_t", pid: null }, "wake", { server: { url, token: "tok" } });
-  assert.deepEqual(r, { ok: true, via: "kimi web" });
+  assert.deepEqual(legacy(r), { ok: true, via: "kimi web" }); assert.equal(r.outcome?.kind, "admitted");
   const post = seen.find((s) => s.method === "POST")!;
   assert.equal((JSON.parse(post.body) as { model?: string }).model, "kimi-code/kimi-for-coding");
   server.close();
@@ -224,7 +227,7 @@ test("wakeKimi refuses terminal TUI sessions (no instances row for the pid) with
   server.on("request", () => { httpCalls++; });
   await withKimiHome(home, async () => {
     const r = await wakeKimi({ session_id: "session_t", pid: 2 ** 22 + 12345 }, "wake");
-    assert.deepEqual(r, { ok: false, via: "kimi web", error: "not a kimi web-hosted session" });
+    assert.deepEqual(legacy(r), { ok: false, via: "kimi web", error: "not a kimi web-hosted session" }); assert.equal(r.outcome?.kind, "not_submitted");
   });
   assert.equal(httpCalls, 0, "terminal sessions are rejected before any request");
   server.close();

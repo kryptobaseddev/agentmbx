@@ -174,12 +174,20 @@ Find who exists with `mbx_agents`. See your own address with `mbx_whoami`.
 If your name is just a vague folder name (like `src` or `app`), set a meaningful one early:
 `mbx_whoami {"name": "api-dev", "role": "backend"}`.
 
-## Kinds and needs_reply
+## Kinds, needs_reply and waking the recipient
 
-- `message`: general note. `status`: progress update (never wakes anyone).
-- `request` / `task`: you want someone to do something. Set `needs_reply: true` if you need an answer.
-- `reply`: the default for `mbx_reply`. `decision`: a recorded decision. `alert`: something is broken.
-- Set `needs_reply` only when you will actually wait for the answer.
+The kind decides whether an idle recipient is woken now or sees the message on its next prompt:
+
+| Kind | Wakes an idle recipient? | Use it for |
+|---|---|---|
+| `request` / `task` | yes | you want someone to do something; add `needs_reply: true` if you need an answer |
+| `decision` / `alert` | yes | a recorded decision; something is broken |
+| `message` / `reply` | only with `needs_reply: true` or an `@name` mention | general notes and answers |
+| `status` | **never**, not even with a mention or `needs_reply` | progress updates that can wait |
+
+If you need the recipient to act or answer now, do not send a `status`: use `request` (or `task`) with
+`needs_reply: true`. Set `needs_reply` only when you will actually wait for the answer. Wakes are rate-limited, and a
+wake only queues a short pointer to the inbox; it never means the recipient read or handled the message.
 
 ## Trust and what you may do (the policy line)
 

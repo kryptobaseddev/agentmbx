@@ -805,6 +805,10 @@ export class MbxNode {
         const e = JSON.parse(m.envelope);
         if (checkShape(e))
             return false;
+        // A status message never wakes, even with a mention or needs_reply (owner decision 2026-09-30): it waits for the
+        // next prompt. Senders who need the recipient now use request, task, decision or alert.
+        if (e.kind === "status")
+            return false;
         return WAKE_KINDS.has(e.kind) || e.needs_reply || e.meta.mentions.some((x) => x === agent || x === `${agent}@${this.host}`);
     }
     /** Returns why a wake is not allowed right now, or null when it may proceed (and records it). */

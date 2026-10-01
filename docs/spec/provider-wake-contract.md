@@ -139,7 +139,7 @@ Each item names the implementing task. Fixtures MUST use synthetic native endpoi
 | WC-08 | Timeout or connection reset after the write → `unknown`; no second native write in the pass, to that or any other session. | T178 |
 | WC-09 | Busy → no write, reservation refunded, mail `delivered`, next pass retries; busy race after status check is classified by the provider's answer. | T178 |
 | WC-10 | Codex exit 0 records `exit-status` strength; OpenCode/Kimi record `native`; Claude channel records `transport`. | T178 |
-| WC-11 | OpenCode directory fallback records `support: "inferred"` and is reported distinctly from exact admission (or is removed; see open decisions). | T178 |
+| WC-11 | No directory or newest-session inference: only the exact leased session is woken (owner decision 2026-09-30); the OpenCode directory fallback is removed. | T178 |
 | WC-12 | No capable target: desktop notice or no-push fallback, never `admitted`; mail re-wakeable on capable bind. | T178 |
 | WC-13 | Kimi `blocked` prompt status → `admitted` with `nativeStatus: "blocked"`. | T178 |
 | WC-14 | Attempt identity, outcome and receipt persist; crash after admission and before delivery update reconciles to one admitted attempt, not a second write. | T179 |
@@ -148,9 +148,14 @@ Each item names the implementing task. Fixtures MUST use synthetic native endpoi
 | WC-17 | Mute gate suppresses hints and desktop notices while mail stays unread, searchable and replayable. | T179 |
 | WC-18 | Receipt, admission and notices never advance `read`/`acked` or widen policy. | T178/T179 |
 
-## Open decisions
+## Decisions
 
-Proposed D005 is not accepted. Owner decisions pending: whether status messages with mentions may ever wake; whether the OpenCode directory fallback stays (as `inferred`) or is removed; mute scope and signing; whether `failed` refunds budget; how long an `unknown` without lookup holds before an operator notice; whether desktop notice is shown for `unknown`.
+Owner decisions, 2026-09-30:
+
+- A `status` message never wakes, with or without a mention or `needs_reply` (WC-06). Senders learn this from the skill's kind table, the `mbx_send` kind description and a send-result warning when a status message carries a mention or `needs_reply`.
+- Wakes target the exact session that currently holds the mailbox lease. The OpenCode directory fallback is removed (WC-11). An `mcp-` process binding without a real session id gets the notice fallback, and its mail is woken again once the exact session binds.
+
+Implementation defaults (T178), pending review: `failed` does not refund the wake budget. An `unknown` is held with delivery note `unknown`, with no second native write and no desktop notice, until T179 reconciliation. A Kimi `blocked` prompt is `admitted` with `nativeStatus: "blocked"`. Mute scope and signing remain open for T179.
 
 ## Non-goals
 

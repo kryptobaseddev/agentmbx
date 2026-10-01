@@ -9,7 +9,23 @@ import { kimiHostedServer } from "./kimi-web.js";
 import { MbxNode, trustLabel } from "./node.js";
 import { captureWakeIdentity } from "./wake-identity.js";
 import { policyBrief } from "./policy.js";
+import { ulid } from "./crypto.js";
 const run = promisify(execFile);
+const attemptId = () => ulid();
+const receipt = (strength, r = {}) => ({ strength, nativeId: null, sessionId: null, nativeStatus: null, providerVersion: null, ...r });
+/** Build the legacy result and the typed outcome together, so the two can never disagree. */
+function outcome(via, o, error) {
+    const full = { ...o, attemptId: attemptId(), via };
+    if (full.kind === "admitted")
+        return { ok: true, via, outcome: full };
+    return { ok: false, via, error: (error ?? full.detail ?? full.kind).slice(0, 300), ...(full.kind === "busy" ? { retry: true } : {}), outcome: full };
+}
+/** A request that failed before any byte reached the provider (refused, unresolvable) proved nothing was submitted. */
+const neverSent = (e) => {
+    const c = e?.cause ?? e;
+    return [c?.code, ...(c?.errors ?? []).map((x) => x.code)].some((x) => /^(ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN)$/.test(x ?? ""));
+};
+const timedOut = (e) => /TimeoutError|AbortError/.test(e?.name ?? "");
 const isRetry = (r) => !r.ok && r.retry === true;
 /** A wake starts agent work, so a downgraded message cannot borrow the mailbox's broad policy. */
 export const hasWakeAuthority = (node, agent, message) => node.policyFor(message, agent).level !== "ask" || node.authorityFor(message)?.ok === true;
@@ -32,13 +48,23 @@ catch {
 } };
 const CODEX = () => process.env.MBX_CODEX_BIN || which("codex") || join(homedir(), ".local/bin/codex");
 const OPENCODE = () => process.env.MBX_OPENCODE_BIN || which("opencode") || join(homedir(), ".opencode/bin/opencode");
-export async function wakeCodex(threadId, text) {
+export async function wakeCodex(threadId, text, o = {}) {
+    const via = "codex queue";
+    if (o.recheck && !o.recheck())
+        return outcome(via, { kind: "not_submitted", reason: "fenced" }, "wake authority changed");
     try {
         await run(CODEX(), ["queue", "--thread", threadId, "--message", text], { timeout: 20_000 });
-        return { ok: true, via: "codex queue" };
+        return outcome(via, { kind: "admitted", receipt: receipt("exit-status", { sessionId: threadId }) });
     }
     catch (e) {
-        return { ok: false, via: "codex queue", error: e.message.slice(0, 300) };
+        const err = e;
+        const detail = err.message.slice(0, 300);
+        if (err.code === "ENOENT" || err.code === "EACCES")
+            return outcome(via, { kind: "not_submitted", reason: "unavailable", detail });
+        // Killed by the timeout or a signal: the queue write may already have landed.
+        if (err.killed || err.signal)
+            return outcome(via, { kind: "unknown", reason: err.killed ? "timeout" : "killed", detail });
+        return outcome(via, { kind: "failed", status: typeof err.code === "number" ? err.code : null, detail });
     }
 }
 export async function opencodeService() {
@@ -55,44 +81,36 @@ export async function opencodeService() {
     }
 }
 export async function wakeOpencode(sessionId, text, o = {}) {
+    const via = "opencode synthetic";
     const svc = await (o.service ?? opencodeService)();
     if (!svc)
-        return { ok: false, via: "opencode synthetic", error: "opencode service not running" };
+        return outcome(via, { kind: "not_submitted", reason: "unavailable" }, "opencode service not running");
+    if (o.recheck && !o.recheck())
+        return outcome(via, { kind: "not_submitted", reason: "fenced" }, "wake authority changed");
+    let res;
     try {
-        if (o.recheck && !o.recheck())
-            return { ok: false, via: "opencode synthetic", error: "wake authority changed" };
-        const res = await (o.fetch ?? fetch)(`${svc.url}/api/session/${encodeURIComponent(sessionId)}/synthetic`, {
+        res = await (o.fetch ?? fetch)(`${svc.url}/api/session/${encodeURIComponent(sessionId)}/synthetic`, {
             method: "POST", headers: { "content-type": "application/json", ...(svc.auth ? { authorization: svc.auth } : {}) },
             body: JSON.stringify({ text, delivery: "queue", resume: true }), redirect: "error", signal: AbortSignal.timeout(10_000)
         });
-        if (!res.ok)
-            return { ok: false, via: "opencode synthetic", error: `${res.status} ${(await res.text()).slice(0, 300)}` };
-        const j = await res.json();
-        const receipt = j?.data;
-        if (!receipt || typeof receipt.id !== "string" || !receipt.id.startsWith("msg_")
-            || receipt.sessionID !== sessionId || receipt.type !== "synthetic" || receipt.delivery !== "queue"
-            || receipt.payload?.text !== text || typeof receipt.time?.created !== "number" || !Number.isFinite(receipt.time.created))
-            return { ok: false, via: "opencode synthetic", error: "invalid or mismatched synthetic admission receipt" };
-        // Durable admission is not evidence that the model ran or handled the mailbox message.
-        return { ok: true, via: "opencode synthetic" };
     }
     catch (e) {
-        return { ok: false, via: "opencode synthetic", error: e.message };
+        const detail = e.message;
+        if (neverSent(e))
+            return outcome(via, { kind: "not_submitted", reason: "unavailable", detail });
+        return outcome(via, { kind: "unknown", reason: timedOut(e) ? "timeout" : "lost-response", detail });
     }
-}
-/** Most recent OpenCode session for a directory (used when no hook bound one). */
-export async function opencodeSessionFor(dir) {
-    const svc = await opencodeService();
-    if (!svc)
-        return null;
-    try {
-        const res = await fetch(`${svc.url}/api/session?directory=${encodeURIComponent(dir)}&limit=1`, { headers: svc.auth ? { authorization: svc.auth } : {}, signal: AbortSignal.timeout(5_000) });
-        const j = await res.json();
-        return j.data?.[0]?.id ?? null;
-    }
-    catch {
-        return null;
-    }
+    if (!res.ok)
+        return outcome(via, { kind: "failed", status: res.status }, `${res.status} ${(await res.text().catch(() => "")).slice(0, 300)}`);
+    const j = await res.json().catch(() => null);
+    const r = j?.data;
+    // The write was accepted: a receipt that does not match proves neither admission nor rejection (never resubmit blindly).
+    if (!r || typeof r.id !== "string" || !r.id.startsWith("msg_")
+        || r.sessionID !== sessionId || r.type !== "synthetic" || r.delivery !== "queue"
+        || r.payload?.text !== text || typeof r.time?.created !== "number" || !Number.isFinite(r.time.created))
+        return outcome(via, { kind: "unknown", reason: "mismatched-receipt" }, "invalid or mismatched synthetic admission receipt");
+    // Durable admission is not evidence that the model ran or handled the mailbox message.
+    return outcome(via, { kind: "admitted", receipt: receipt("native", { nativeId: r.id, sessionId, nativeStatus: "queued" }) });
 }
 /** True when the newest hosted kimi session of this agent is mid-turn. Waking a busy session would spend the
  *  wake brake (WAKE_LIMITS) for nothing, so dispatchWakes skips the agent instead and retries on its next pass. */
@@ -142,40 +160,53 @@ async function kimiSessionStatus(srv, sessionId, f) {
  * for its next pass instead of spending wake budget (its Stop hook also surfaces new mail mid-turn).
  */
 export async function wakeKimi(s, text, o = {}) {
+    const via = "kimi web";
     const srv = o.server === undefined ? kimiHostedServer(s.pid) : o.server;
     if (!srv)
-        return { ok: false, via: "kimi web", error: "not a kimi web-hosted session" };
+        return outcome(via, { kind: "not_submitted", reason: "no-target" }, "not a kimi web-hosted session");
     const f = o.fetch ?? fetch, base = `${srv.url}/api/v1/sessions/${encodeURIComponent(s.session_id)}`;
     const headers = { authorization: `Bearer ${srv.token}`, "content-type": "application/json" };
+    let model;
     try {
         const st = await kimiSessionStatus(srv, s.session_id, f);
         if ("error" in st)
-            return { ok: false, via: "kimi web", error: st.error };
+            return outcome(via, { kind: "not_submitted", reason: "preflight" }, st.error);
         if (st.busy)
-            return { ok: false, via: "kimi web", error: "session busy", retry: true };
+            return outcome(via, { kind: "busy" }, "session busy");
         // A freshly created hosted session has no model bound: submitting a prompt then fails with "Model not set"
         // (ErrorCodes.MODEL_NOT_CONFIGURED, from the profile's model getter). The prompts endpoint accepts an optional
         // model alias and binds it before the prompt runs, so send one only when the session has none (the server's
         // configured default), and an explicit o.model always wins.
-        const model = o.model !== undefined ? o.model : st.model ? null : await kimiDefaultModel(srv, f);
-        const body = { content: [{ type: "text", text }] };
-        if (model)
-            body.model = model;
-        if (o.recheck && !o.recheck())
-            return { ok: false, via: "kimi web", error: "wake authority changed" };
-        const res = await f(`${base}/prompts`, { method: "POST", headers, body: JSON.stringify(body), redirect: "error", signal: AbortSignal.timeout(15_000) });
-        const j = await res.json().catch(() => null);
-        if (!res.ok || j?.code !== 0)
-            return { ok: false, via: "kimi web", error: `prompts ${res.status}: ${(j?.msg ?? j?.message ?? JSON.stringify(j)).slice(0, 200)}` };
-        if (!j.data || Array.isArray(j.data) || typeof j.data.prompt_id !== "string" || !j.data.prompt_id.trim()
-            || !["running", "queued", "blocked"].includes(j.data.status ?? ""))
-            return { ok: false, via: "kimi web", error: "invalid prompt submission receipt" };
-        // This confirms submission, not model execution or a mailbox read/reply/ack.
-        return { ok: true, via: "kimi web" };
+        model = o.model !== undefined ? o.model : st.model ? null : await kimiDefaultModel(srv, f);
     }
     catch (e) {
-        return { ok: false, via: "kimi web", error: e.message };
+        return outcome(via, { kind: "not_submitted", reason: "preflight" }, e.message);
     }
+    const body = { content: [{ type: "text", text }] };
+    if (model)
+        body.model = model;
+    if (o.recheck && !o.recheck())
+        return outcome(via, { kind: "not_submitted", reason: "fenced" }, "wake authority changed");
+    let res;
+    try {
+        res = await f(`${base}/prompts`, { method: "POST", headers, body: JSON.stringify(body), redirect: "error", signal: AbortSignal.timeout(15_000) });
+    }
+    catch (e) {
+        const detail = e.message;
+        if (neverSent(e))
+            return outcome(via, { kind: "not_submitted", reason: "unavailable", detail });
+        return outcome(via, { kind: "unknown", reason: timedOut(e) ? "timeout" : "lost-response", detail });
+    }
+    const j = await res.json().catch(() => null);
+    const why = `prompts ${res.status}: ${(j?.msg ?? j?.message ?? JSON.stringify(j)).slice(0, 200)}`;
+    if (!res.ok || j?.code !== 0)
+        return /model not set|model_not_configured/i.test(why)
+            ? outcome(via, { kind: "blocked", gate: "model-unconfigured" }, why) : outcome(via, { kind: "failed", status: res.status }, why);
+    if (!j.data || Array.isArray(j.data) || typeof j.data.prompt_id !== "string" || !j.data.prompt_id.trim()
+        || !["running", "queued", "blocked"].includes(j.data.status ?? ""))
+        return outcome(via, { kind: "unknown", reason: "malformed-receipt" }, "invalid prompt submission receipt");
+    // Submission, not model execution or a mailbox read/reply/ack. A "blocked" prompt is admitted and waits on a person.
+    return outcome(via, { kind: "admitted", receipt: receipt("native", { nativeId: j.data.prompt_id, sessionId: s.session_id, nativeStatus: j.data.status ?? null }) });
 }
 /** The branded notifier inside AgentMBX.app, if installed (MBX_NOTIFIER overrides, e.g. for tests). */
 export function macNotifierPath(home = homedir(), env = process.env) {
@@ -268,6 +299,8 @@ export async function dispatchWakes(node) {
         let result = { ok: false, via: "none", error: "no bound session" };
         let attempts = 0;
         let submitted, fenced = false;
+        // Exact sessions only (owner decision 2026-09-30): a provisional mcp- binding is a process, not a wakeable
+        // session, so it gets the notice fallback instead of a guessed sibling session in the same directory.
         for (const guard of automatic.length ? sessions : []) {
             const s = guard.session;
             const recheck = () => {
@@ -285,9 +318,8 @@ export async function dispatchWakes(node) {
                 fenced = true;
                 break;
             }
-            submitted = guard;
             if (s.cli === "codex")
-                result = await wakeCodex(s.session_id, text);
+                result = await wakeCodex(s.session_id, text, { recheck });
             else if (s.cli === "opencode")
                 result = await wakeOpencode(s.session_id, text, { recheck });
             else if (s.cli === "kimi")
@@ -295,51 +327,25 @@ export async function dispatchWakes(node) {
             else
                 continue;
             attempts++;
+            const o = result.outcome, kind = o?.kind;
+            if (o?.kind === "not_submitted" && o.reason === "fenced") {
+                fenced = true;
+                break;
+            }
+            if (kind !== "not_submitted")
+                submitted = guard;
             if (!recheck()) {
                 fenced = true;
                 break;
             }
-            if (result.ok || isRetry(result))
-                break; // a busy hosted session retries next pass instead of a desktop notice
-        }
-        // An OpenCode session bound only through its MCP process (the client has not attached per-session
-        // metadata yet) carries an mcp- session id: a process binding, not a wakeable service session. Resolve
-        // the service's most recent session for the binding's project directory and wake that instead of
-        // falling straight to the desktop — the same directory-based fallback bindSession already uses.
-        if (automatic.length && !attempts && !fenced) {
-            for (const guard of held) {
-                const s = guard.session;
-                if (s.cli !== "opencode" || !s.cwd)
-                    continue;
-                const recheck = () => {
-                    try {
-                        return guard.run(() => automatic.every(r => {
-                            const delivery = node.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=? AND agent=?").get(r.id, agent);
-                            return delivery?.state === "delivered" && (hasWakeAuthority(node, agent, r));
-                        }));
-                    }
-                    catch {
-                        return false;
-                    }
-                };
-                if (!recheck()) {
-                    fenced = true;
-                    break;
-                }
-                const resolved = await opencodeSessionFor(s.cwd);
-                if (!resolved || resolved.startsWith("mcp-"))
-                    continue;
-                submitted = guard;
-                result = await wakeOpencode(resolved, text, { recheck });
-                attempts++;
-                if (!recheck()) {
-                    fenced = true;
-                }
+            // admitted and busy settle this pass; unknown may already be admitted, so no second write anywhere (WC-08);
+            // blocked needs a person. Only a definite not_submitted or failed moves on to the next session.
+            if (kind === "admitted" || kind === "busy" || kind === "unknown" || kind === "blocked")
                 break;
-            }
         }
         if (fenced) {
-            if (!attempts || (attempts === 1 && !result.ok && result.error === "wake authority changed"))
+            // refund only when nothing may have reached a provider in this pass
+            if (!submitted)
                 reservation.release?.();
             node.store.audit("wake.fenced", { agent, count: automatic.length });
             out.push({ agent, result: { ok: false, via: "lease", error: "wake authority changed; delivery retained for a later pass" } });
@@ -351,6 +357,20 @@ export async function dispatchWakes(node) {
             if (attempts === 1)
                 reservation.release?.();
             node.store.audit("wake", { agent, via: result.via, ok: false, busy: true, count: wanted.length });
+            out.push({ agent, result });
+            continue;
+        }
+        if (result.outcome?.kind === "unknown") {
+            // The hint may be queued already: never resubmit it blindly (T179 reconciles). The mail stays unread and readable.
+            const finish = () => rows.forEach(r => node.setDelivery(r.id, agent, "notified", "unknown"));
+            try {
+                if (submitted)
+                    submitted.run(finish, false);
+                else
+                    node.store.tx(finish);
+            }
+            catch { /* ownership changed: delivery retained */ }
+            node.store.audit("wake.unknown", { agent, via: result.via, attempt: result.outcome.attemptId, reason: result.outcome.reason, count: wanted.length });
             out.push({ agent, result });
             continue;
         }

@@ -729,6 +729,9 @@ export class MbxNode {
   wantsWake(agent: string, m: MessageRow): boolean {
     const e = JSON.parse(m.envelope) as Envelope;
     if (checkShape(e)) return false;
+    // A status message never wakes, even with a mention or needs_reply (owner decision 2026-09-30): it waits for the
+    // next prompt. Senders who need the recipient now use request, task, decision or alert.
+    if (e.kind === "status") return false;
     return WAKE_KINDS.has(e.kind) || e.needs_reply || e.meta.mentions.some((x) => x === agent || x === `${agent}@${this.host}`);
   }
 

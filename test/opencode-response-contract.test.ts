@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { wakeOpencode } from '../src/wake.ts';
+
+/** The legacy fields; the typed outcome (T178) is asserted separately. */
+const legacy = ({ outcome: _o, ...r }: { outcome?: unknown } & Record<string, unknown>) => r;
 const session = 'ses_contract', text = 'check the mailbox';
 const service = async () => ({ url: 'http://127.0.0.1:1', auth: 'Basic fixture' });
 const valid = () => ({ id: 'msg_fixture', sessionID: session, type: 'synthetic', delivery: 'queue', payload: { text }, time: { created: 1 } });
@@ -26,7 +29,7 @@ test('matching receipt confirms admission with exactly one submission', async ()
     assert.deepEqual(JSON.parse(init!.body as string), { text, delivery: 'queue', resume: true });
     return Response.json({ data: valid() });
   }) as typeof fetch });
-  assert.deepEqual(r, { ok: true, via: 'opencode synthetic' }); assert.equal(calls, 1);
+  assert.deepEqual(legacy(r), { ok: true, via: 'opencode synthetic' }); assert.equal(r.outcome?.kind, 'admitted'); assert.equal(calls, 1);
 });
 test('HTTP rejection is failure even with a valid-looking receipt', async () => {
   const r = await wakeOpencode(session, text, { service, fetch: (async () => Response.json({ data: valid() }, { status: 409 })) as typeof fetch });

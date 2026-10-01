@@ -137,7 +137,7 @@ function opencodeStub(t: { after: (fn: () => void | Promise<void>) => unknown },
   return { calls, listen: () => new Promise<string>((r) => server.listen(0, "127.0.0.1", () => r(`http://127.0.0.1:${(server.address() as AddressInfo).port}`))) };
 }
 
-test("MCP-bound opencode agents wake through the service directory fallback", async (t) => {
+test("an MCP-only opencode binding never wakes a guessed session from its directory (exact claimed session only)", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-wake-ocdir-")), n = new MbxNode(home, { host: "alpha" });
   const stub = opencodeStub(t, "ses_resolved");
   const old = { MBX_OPENCODE_URL: process.env.MBX_OPENCODE_URL, MBX_NO_DESKTOP: process.env.MBX_NO_DESKTOP };
@@ -148,10 +148,10 @@ test("MCP-bound opencode agents wake through the service directory fallback", as
   bindWakeLease(n, { agent: "worker", cli: "opencode", session_id: "mcp-424242", pid: process.pid });
   n.store.db.prepare("UPDATE sessions SET cwd=? WHERE agent='worker'").run("/projects/demo");
   sendLeased(n, { from: "sender", to: ["worker"], subject: "wake", body: "private", kind: "request" });
-  assert.equal((await dispatchWakes(n))[0].result.ok, true);
-  assert.deepEqual(stub.calls, ["/api/session/ses_resolved/synthetic"], "the mcp- binding woke the service session for its directory");
+  assert.equal((await dispatchWakes(n))[0].result.ok, false);
+  assert.deepEqual(stub.calls, [], "no session was resolved or woken by directory");
   const d = n.store.db.prepare("SELECT state, note FROM deliveries WHERE agent='worker'").get() as { state: string; note: string | null };
-  assert.equal(d.state, "notified"); assert.equal(d.note, null, "delivered by wake, not by desktop notice");
+  assert.equal(d.note, "desktop", "notice fallback keeps the mail re-wakeable once the exact session binds");
 });
 
 test("the directory fallback is a no-op when the service knows no session there", async (t) => {
