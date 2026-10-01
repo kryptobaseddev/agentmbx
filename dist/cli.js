@@ -1234,9 +1234,11 @@ async function hook(node, event, cli) {
  * a finished background task into a new turn (Kimi Code's terminal UI, which has no external wake API) is woken by that
  * exit. Same checks as a push: wants-wake, wake authority, mute and the wake brake. While it runs the daemon defers.
  */
+export const watcherEvidenceRetryable = (e) => e?.code === "IDENTITY_STATUS_UNKNOWN"
+    || /caller process evidence became stale|process status is unknown/.test(e?.message ?? "");
 async function watch(node, selection) {
     const every = Math.max(200, Number(process.env.MBX_WATCH_INTERVAL_MS) || 2_000);
-    let watching, failures = 0;
+    let watching, failures = 0, evidenceRetries = 0;
     const clear = () => { if (watching)
         try {
             node.store.db.prepare("DELETE FROM kv WHERE k=?").run(watcherKey(watching));
@@ -1278,6 +1280,14 @@ async function watch(node, selection) {
             failures = 0;
         }
         catch (e) {
+            // Slow or unavailable process evidence is retryable and never stops the watcher (T206);
+            // only a real lease loss/move counts toward the stop.
+            if (watcherEvidenceRetryable(e)) {
+                evidenceRetries += 1;
+                await new Promise(r => setTimeout(r, Math.min(5_000, 250 * 2 ** Math.min(evidenceRetries, 4))));
+                continue;
+            }
+            evidenceRetries = 0;
             // the session's lease ended or moved: say so once instead of watching nothing
             if (++failures >= 5) {
                 clear();

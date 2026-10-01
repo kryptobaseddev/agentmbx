@@ -1,7 +1,8 @@
 // CLI ownership comes from the provider's exact current MCP lease, never from --as alone.
 import { canonical } from "./crypto.ts";
 import { findIdentityControl, identityControlKey, identityGeneration, inspectIdentityControlCaller, listIdentityControls, type IdentityControlDescriptor } from "./identity-control.ts";
-import { IdentityLeases, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
+import { IdentityLeases, inspectLeaseProcess, UNKNOWN_RETRY_DELAYS_MS, type IdentityLease } from "./identity-leases.ts";
+import { sleepSync } from "./proc.ts";
 import { kimiInstances } from "./kimi-web.ts";
 import type { MbxNode } from "./node.ts";
 
@@ -52,28 +53,46 @@ function withIdentity<T>(node: MbxNode, selection: CliIdentitySelection, descrip
   if (operation.constructor.name === "AsyncFunction") throw refused("mailbox operations must be synchronous");
   const requester = inspectLeaseProcess(process.pid);
   if (requester.alive !== true || !requester.start) throw refused("cannot verify the calling process");
-  const candidates = new Map<string, { descriptor: IdentityControlDescriptor; token: string; proof: { at: number; valid: boolean } }>();
-  for (const descriptor of descriptors) {
-    const row = rowFor(node, descriptor.agent);
-    if (!matches(descriptor, row)) continue;
-    const proof = inspectIdentityControlCaller(descriptor, process.pid, requester.start);
-    if (proof.valid) candidates.set(descriptor.control_key, { descriptor, token: row.token, proof });
-  }
-  // --as must not pick a different hosted session merely because it shares a provider parent.
-  if (candidates.size !== 1) throw Object.assign(refused(candidates.size ? "ambiguous provider sessions: specify --cli and --session" : "no current identity lease belongs to this caller. Run mailbox commands inside the provider session that holds the lease (your agent session, through its mbx tools); inspect holders with `agentmbx identity list`. The owner can replace a live holder with `agentmbx identity takeover <name> --force --cli <provider> --session <id>`"),
-    { code: candidates.size ? "IDENTITY_LEASE_REQUIRED" : "IDENTITY_NO_CALLER_LEASE" });
-  const { descriptor, token, proof } = [...candidates.values()][0];
-  const [name, host, extra] = selection.as?.split("@") ?? [descriptor.agent];
-  if (name !== descriptor.agent || (host !== undefined && host !== node.host) || extra !== undefined)
-    throw refused(`this session holds ${descriptor.agent}@${node.host}, not the requested identity`);
   const leases = new IdentityLeases(node.store);
-  return leases.prepare([descriptor.agent], [descriptor.mcp_pid], () => {
-    const guarded = () => {
-      if (!proof.valid || performance.now() - proof.at > 5000) throw refused("caller process evidence became stale; retry after inspection");
-      if (canonical(findIdentityControl(node.store, descriptor.cli, descriptor.session_id)) !== canonical(descriptor)
-        || !matches(descriptor, rowFor(node, descriptor.agent))) throw refused("identity binding changed before the operation");
-      return operation(descriptor.agent, descriptor);
-    };
-    return selection.readOnly ? leases.withHeldRead(descriptor.agent, token, guarded) : leases.withHeld(descriptor.agent, token, guarded);
-  });
+  const authorize = (): { descriptor: IdentityControlDescriptor; token: string } => {
+    const candidates = new Map<string, { descriptor: IdentityControlDescriptor; token: string }>();
+    for (const descriptor of descriptors) {
+      const row = rowFor(node, descriptor.agent);
+      if (!matches(descriptor, row)) continue;
+      const proof = inspectIdentityControlCaller(descriptor, process.pid, requester.start!);
+      if (proof.valid) candidates.set(descriptor.control_key, { descriptor, token: row.token });
+    }
+    // --as must not pick a different hosted session merely because it shares a provider parent.
+    if (candidates.size !== 1) throw Object.assign(refused(candidates.size ? "ambiguous provider sessions: specify --cli and --session" : "no current identity lease belongs to this caller. Run mailbox commands inside the provider session that holds the lease (your agent session, through its mbx tools); inspect holders with `agentmbx identity list`. The owner can replace a live holder with `agentmbx identity takeover <name> --force --cli <provider> --session <id>`"),
+      { code: candidates.size ? "IDENTITY_LEASE_REQUIRED" : "IDENTITY_NO_CALLER_LEASE" });
+    const { descriptor, token } = [...candidates.values()][0];
+    const [name, host, extra] = selection.as?.split("@") ?? [descriptor.agent];
+    if (name !== descriptor.agent || (host !== undefined && host !== node.host) || extra !== undefined)
+      throw refused(`this session holds ${descriptor.agent}@${node.host}, not the requested identity`);
+    return { descriptor, token };
+  };
+  // Unknown or stale caller evidence is retried with backoff; slow evidence collection must not
+  // fail an otherwise-valid session (T206).
+  for (let attempt = 0; ; attempt++) {
+    if (attempt) sleepSync(UNKNOWN_RETRY_DELAYS_MS[attempt - 1]);
+    try {
+      const { descriptor, token } = authorize();
+      return leases.prepare([descriptor.agent], [descriptor.mcp_pid], () => {
+        const guarded = () => {
+          // Re-collect the caller proof immediately before the operation: the freshness window then
+          // measures from evidence-taken to operation-run, excluding collection time.
+          const proof = inspectIdentityControlCaller(descriptor, process.pid, requester.start!);
+          if (!proof.valid || performance.now() - proof.at > 5000) throw refused("caller process evidence became stale; retry after inspection");
+          if (canonical(findIdentityControl(node.store, descriptor.cli, descriptor.session_id)) !== canonical(descriptor)
+            || !matches(descriptor, rowFor(node, descriptor.agent))) throw refused("identity binding changed before the operation");
+          return operation(descriptor.agent, descriptor);
+        };
+        return selection.readOnly ? leases.withHeldRead(descriptor.agent, token, guarded) : leases.withHeld(descriptor.agent, token, guarded);
+      });
+    } catch (e) {
+      const retryable = (e as NodeJS.ErrnoException).code === "IDENTITY_STATUS_UNKNOWN"
+        || /caller process evidence became stale/.test((e as Error).message);
+      if (!retryable || attempt >= UNKNOWN_RETRY_DELAYS_MS.length) throw e;
+    }
+  }
 }
