@@ -20,7 +20,7 @@ import { applyIdentityTakeover, type IdentityTakeoverApproval } from "./identity
 import { listIdentityStatus } from "./identity-status.ts";
 import { consumeIdentityControl, identityControlAliases, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl, type IdentityControlDescriptor } from "./identity-control.ts";
 import { didWarning, formatFor, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
-import { activePolicies, delegationNote, MAX_HOP } from "./policy.ts";
+import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy.ts";
 import { procStart, withProcSnapshot } from "./proc.ts";
 import { updateAvailable } from "./update.ts";
 import { installKind, version } from "./version.ts";
@@ -245,9 +245,10 @@ const text = (s: string, structured?: Record<string, unknown>) => ({ content: [{
 export const statusWakeWarning = (e: Envelope): string[] => e.kind === "status" && (e.needs_reply || e.meta.mentions.length)
   ? ["kind=status never wakes the recipient (not even with needs_reply or a mention); it waits for their next prompt. To get attention now, send kind=request with needs_reply=true."] : [];
 
-/** Mail past the relay safety depth reaches the recipient as "policy: ask" and wakes no one: say so to the sender. */
-export const depthWarning = (e: Envelope): string[] => (e.meta.hop ?? 0) > MAX_HOP
-  ? [`relay safety depth ${e.meta.hop} exceeds ${MAX_HOP}: this session has read a long agent-to-agent chain since your user last typed, so the recipient will not be woken or act under its owner policy (it can still read and answer). Your user's next prompt resets the depth.`] : [];
+/** Mail past a policy level's relay depth reaches the recipient as "policy: ask" for that level and wakes no one. The
+ *  sender can't see the recipient's level, so it is warned only past collaborate's allowance (T104). */
+export const depthWarning = (e: Envelope): string[] => (e.meta.hop ?? 0) > LEVEL_MAX_HOP.collaborate
+  ? [`relay depth ${e.meta.hop} exceeds ${LEVEL_MAX_HOP.collaborate}: this session has read a long chain from agents other than this message's recipients since your user last typed. A recipient under ask (limit ${MAX_HOP}) or collaborate (limit ${LEVEL_MAX_HOP.collaborate}) will not be woken or act on it (it can still read and answer); autonomous and yolo have no depth limit. Your user's next prompt resets the depth.`] : [];
 
 export async function runMcp(existing?: MbxNode) {
   let node: MbxNode;
@@ -266,7 +267,7 @@ export async function runMcp(existing?: MbxNode) {
   type State = { agent: string; sessionId: string; key: ReturnType<typeof generateKeyPair>; leaseToken?: string; released?: boolean;
     recoveryIdentity?: string;
     controlAliases?: string[];
-    parent: { hops: Map<number, number>; externalAt: number | null } | null };
+    parent: { hops: Map<string, { hop: number; from: string; at: number }>; externalAt: number | null } | null };
   const base: State = { agent: process.env.MBX_AGENT ? wanted : node.pickName(wanted, env.cli, env.ppid, env.sessionId),
     sessionId: env.sessionId, key: generateKeyPair(), parent: null };
   if (detached?.base.released) { base.agent = detached.base.agent; base.released = true; base.controlAliases = detached.base.aliases; }
@@ -454,26 +455,30 @@ export async function runMcp(existing?: MbxNode) {
   const noteRead = (rows: { envelope: string; from_addr: string }[]) => {
     const state = current(), { agent } = state;
     const now = Date.now();
-    if (state.parent) for (const [hop, at] of state.parent.hops) {
-      if (now - at >= 3_600_000) state.parent.hops.delete(hop);
+    if (state.parent) for (const [k, x] of state.parent.hops) {
+      if (now - x.at >= 3_600_000) state.parent.hops.delete(k);
     }
     for (const r of rows) {
       if (r.from_addr === `${agent}@${node.host}`) continue;
       const e = JSON.parse(r.envelope) as Envelope;
       // Retained malformed mail is readable, but cannot erase unknown provenance.
-      const m = checkShape(e) ? { hop: MAX_HOP + 1, origin: "external" } : e.meta;
+      const m = checkShape(e) ? { hop: MAX_RELAY_DEPTH, origin: "external" } : e.meta; // past every level's allowance (T104)
       state.parent ??= { hops: new Map(), externalAt: null };
-      // Each depth keeps its own last exposure. Lower-depth mail cannot renew a higher one.
-      state.parent.hops.set(m.hop ?? 0, now);
+      // Each (sender, depth) keeps its own last exposure. Lower-depth mail cannot renew a higher one. The sender is kept so
+      // a reply to that same sender doesn't count it (T104): a two-party conversation is not a relay chain.
+      const hop = m.hop ?? 0;
+      state.parent.hops.set(`${r.from_addr}\u0000${hop}`, { hop, from: r.from_addr, at: now });
       if (m.origin === "external") state.parent.externalAt = now;
     }
   };
-  const relay = (origin?: "agent" | "external") => {
+  const relay = (origin?: "agent" | "external", to?: string[]) => {
     const { parent, agent } = current();
     const now = Date.now();
     // A prompt the owner typed since an exposure ends that agent-to-agent chain (T104): only depth resets, never external origin.
     const human = Date.parse(node.store.get(humanPromptKey(agent)) ?? "") || 0;
-    const depths = parent ? [...parent.hops].filter(([, at]) => now - at < 3_600_000 && at > human).map(([hop]) => hop) : [];
+    // Depth counts what this session read from anyone OTHER than the recipients (T104); a broadcast or role send counts all.
+    const skip = to ? node.recipientAddrs(to) : null;
+    const depths = parent ? [...parent.hops.values()].filter((x) => now - x.at < 3_600_000 && x.at > human && !skip?.has(x.from)).map((x) => x.hop) : [];
     const external = parent?.externalAt != null && now - parent.externalAt < 3_600_000;
     return { hop: depths.length ? Math.min(MAX_RELAY_DEPTH, Math.max(...depths) + 1) : 0, origin: origin === "external" || external ? "external" as const : "agent" as const, project };
   };
@@ -669,6 +674,7 @@ export async function runMcp(existing?: MbxNode) {
       owner_grant: s.grant ? { caps: s.grant.caps, expires: s.grant.exp } : null, delivery: node.deliveryMode(agent), unread: node.unreadCount(agent),
       policies: activePolicies(node.store.db, agent, node.host).map((p) => ({ id: p.id, level: p.level, classes: p.classes, from: p.from, projects: p.projects ?? null, expires: p.exp })),
       version: version(), update_available: updateAvailable(node.store),
+      ...((sup) => sup.length ? { wakes_suppressed: `${sup.length} unread message(s) from ${[...new Set(sup.map((x) => x.from))].join(", ")} did not wake this session: relay depth ${Math.max(...sup.map((x) => x.hop))} exceeds the policy's allowance (ask 6, collaborate 20). Your user's next prompt resets it; mbx_inbox shows them.` } : {})(node.depthSuppressed(agent)),
       // Answered by the old build during a handover: the new build's version and delivery show from the next call.
       ...(handedOver ? { switching: "a newer agentmbx is installed: this server hands over to it after this call. Call mbx_whoami again for its version and delivery mode." } : {}),
       ...(state.recoveryIdentity && state.recoveryIdentity !== agent ? { recovery: { identity: state.recoveryIdentity,
@@ -695,7 +701,7 @@ export async function runMcp(existing?: MbxNode) {
     }
     let thread: string | undefined;
     if (reply_to) { const m = node.read(reply_to, agent); noteRead([m]); thread = m.thread; reply_to = m.id; }
-    const r = node.send({ from: agent, to, subject, body, kind, reply_to, thread, needs_reply, refs, ...relay(origin) }, session());
+    const r = node.send({ from: agent, to, subject, body, kind, reply_to, thread, needs_reply, refs, ...relay(origin, to) }, session());
     if (idempotency_key) node.store.set(`idem:${agent}:${idempotency_key}`, r.envelope.id);
     const out = { id: r.envelope.id, ref: `mbx:${r.envelope.id}@${node.host}`, thread: r.envelope.thread, delivered_locally: r.local, queued_for_hosts: r.remote,
       owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...statusWakeWarning(r.envelope), ...depthWarning(r.envelope)] };
@@ -715,7 +721,7 @@ export async function runMcp(existing?: MbxNode) {
     const m = node.read(id, agent);
     noteRead([m]);
     const subject = /^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`.slice(0, 200);
-    const r = node.send({ from: agent, to: [m.from_addr], subject, body, kind, reply_to: m.id, thread: m.thread, needs_reply, refs: [], ...relay(origin) }, session());
+    const r = node.send({ from: agent, to: [m.from_addr], subject, body, kind, reply_to: m.id, thread: m.thread, needs_reply, refs: [], ...relay(origin, [m.from_addr]) }, session());
     const out = { id: r.envelope.id, to: m.from_addr, thread: r.envelope.thread, reply_to: m.id, delivered_locally: r.local, queued_for_hosts: r.remote,
       owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...depthWarning(r.envelope)] };
     return text(`${JSON.stringify(out, null, 2)}\nNext: mbx_ack ${m.id} if you are done with it.`, out);

@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo, Server } from "node:net";
 import { kimiHostedServer, kimiServer } from "../src/kimi-web.ts";
-import { bindWakeLease } from "./helpers/wake-lease.ts";
+import { bindWakeLease, delegateWake } from "./helpers/wake-lease.ts";
 import { MbxNode } from "../src/node.ts";
 import { dispatchWakes, wakeKimi, type WakeResult } from "../src/wake.ts";
 
@@ -374,8 +374,10 @@ for (const downgrade of ["unverified", "relay-limit", "no-policy"]) test(`daemon
   await withKimiHome(kimiHomeWithInstance(12345), async () => {
     bindWakeLease(n, { agent: "web", cli: "kimi", session_id: "session_policy", pid: process.pid });
     if (downgrade === "no-policy") n.store.db.prepare("UPDATE policies SET revoked=1").run();
+    // autonomous has no depth limit (T104): the relay limit is exercised under collaborate, whose allowance is 20
+    if (downgrade === "relay-limit") { n.store.db.prepare("UPDATE policies SET revoked=1").run(); delegateWake(n, "web", "collaborate"); }
     const id = sendLeased(n, { from: "claimed", to: ["web"], subject: "ask", body: "private", kind: "request",
-      unverifiedSender: downgrade === "unverified", hop: downgrade === "relay-limit" ? 1000 : undefined }).envelope.id;
+      unverifiedSender: downgrade === "unverified", hop: downgrade === "relay-limit" ? 21 : undefined }).envelope.id;
     let calls = 0; t.mock.method(globalThis, "fetch", async () => { calls++; throw new Error("must not call provider"); });
     await dispatchWakes(n);
     assert.equal(calls, 0); assert.equal(n.unreadCount("web"), 1);

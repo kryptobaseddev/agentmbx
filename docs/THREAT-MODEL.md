@@ -109,7 +109,7 @@ These decisions frame everything below. They are owner decisions, not findings.
 | D3 | Denial of service | Pairing/rotation endpoints exhausted | Global per-minute limits: 30 token, 10 SAS, 30 rotate (`src/http.ts:156-186`) | Accepted (lockout for a minute) |
 | D4 | Denial of service | A5 drops or delays relayed mail | LAN stays primary; outbox persists; 72 h expiry alerts the sender (`src/http.ts:283-290`) | Accepted (ADR-035) |
 | D5 | Denial of service | Session table grows with dead processes | `pruneDeadSessions` deletes only rows whose process is provably gone or reused (`src/node.ts:405-417`) | Mitigated (T046) |
-| E1 | Elevation of privilege | Prompt injection in a body makes an agent act | Framed content, policy computed from owner records, external-origin read-only, relay depth limit 6, per-thread action cap 20 (`src/policy.ts:16-17`, `src/policy.ts:278-284`) | Accepted residual (R7) |
+| E1 | Elevation of privilege | Prompt injection in a body makes an agent act | Framed content, policy computed from owner records, external-origin read-only, relay depth allowance per level (ask 6, collaborate 20, autonomous/yolo none; depth counts reads from non-recipients only), per-thread action cap 20 (`src/policy.ts` `LEVEL_MAX_HOP`, `effectivePolicy`) | Accepted residual (R7) |
 | E2 | Elevation of privilege | Sender address or subject breaks out of the frame into a wake prompt or headers | Sender address fixed (F3); one-line headers and random body boundaries (F8, T196) | Mitigated |
 | E3 | Elevation of privilege | Relay-depth reset (T104) abused to extend agent chains | Only a hook `prompt` event whose text does not start with `[mbx` resets depth; external origin never resets (`src/wake.ts:46`, `src/cli.ts:926`, `src/mcp.ts:437-444`) | Accepted (F17) |
 | E4 | Elevation of privilege | A wake or YOLO approval for the wrong session | Exact-session binding, lease generation and authority rechecked before and after the native write (`src/wake.ts:320-347`, `src/permission.ts:38-56`) | Mitigated (T178/T179) |
@@ -292,6 +292,10 @@ and pair again with a token. Documented here and to be added to the rotation hel
 - **R7, prompt injection through message bodies.** No framing makes an LLM immune. Defenses are layered: content is
   framed and labelled as data; what an agent may do comes from owner-signed policy computed on the receiving host;
   external-origin content is read-only; relay depth and per-thread action caps stop chains; wakes carry no content.
+  Relay depth counts content read from agents other than a message's recipients (T104), so a two-agent conversation
+  never accumulates depth; a chain through further agents still does. Under autonomous and yolo there is no depth limit:
+  that is the owner's explicit choice when granting those levels, and loops are then bounded only by the wake brake and
+  the per-thread action cap.
   Under YOLO a successfully injected agent has its full permission profile; YOLO is an explicit owner choice with a kill
   switch (`agentmbx policy revoke --all`).
 - **R8, wake storms.** Per-agent brakes, batching, busy backoff, unknown holds and mute bound wakes for any one agent

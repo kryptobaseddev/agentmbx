@@ -11,6 +11,12 @@ const H = 3_600_000;
 export const TTL = { default: { ask: 168 * H, collaborate: 168 * H, autonomous: 168 * H, yolo: 8 * H }, max: { ask: 720 * H, collaborate: 720 * H, autonomous: 720 * H, yolo: 168 * H } };
 export const MAX_POLICY_ACTIONS_PER_THREAD = 20;
 export const MAX_HOP = 6;
+/** Relay depth each policy level allows (T104, owner decision 2026-10-01). ask keeps MAX_HOP (it can't act anyway);
+ *  collaborate allows long two-way work; autonomous and yolo have no depth limit by the owner's explicit choice, bounded
+ *  instead by the wake brake and MAX_POLICY_ACTIONS_PER_THREAD. */
+export const LEVEL_MAX_HOP = { ask: MAX_HOP, collaborate: 20, autonomous: Infinity, yolo: Infinity };
+export const maxHopFor = (l) => LEVEL_MAX_HOP[l];
+export const depthExceededNote = (hop, level) => `relay depth ${hop} exceeds ${maxHopFor(level)} for ${level}; your user's next prompt resets it, or the owner can grant autonomous/yolo for unlimited depth`;
 export function parseTtl(s) {
     const m = /^(\d+)\s*(m|h|d)$/.exec(s.trim());
     if (!m)
@@ -281,10 +287,12 @@ export function effectivePolicy(db, o) {
         notes.push("content from outside (origin: external): read only");
     }
     let stop = false;
-    if ((meta.hop ?? 0) > MAX_HOP) {
-        stop = true;
-        notes.push(`relay safety depth ${meta.hop} exceeds limit ${MAX_HOP}; may include recent message reads in the sending session, not just this thread: ask your user`);
-    }
+    // Each grant has its own depth allowance (T104): a deep chain can still be acted on under collaborate (20) or
+    // autonomous/yolo (no limit), while the grants it exceeds fall back to ask.
+    const hop = meta.hop ?? 0, over = new Set();
+    grants = grants.map((g) => (hop > maxHopFor(g.level) ? (over.add(g.level), { ...g, level: "ask", classes: [] }) : g));
+    for (const l of over)
+        notes.push(depthExceededNote(hop, l));
     if (e) {
         const acted = db.prepare("SELECT count(*) n FROM audit WHERE event='peer_action' AND json_extract(detail,'$.thread')=?").get(e.thread).n;
         if (acted >= MAX_POLICY_ACTIONS_PER_THREAD) {
@@ -299,7 +307,7 @@ export function effectivePolicy(db, o) {
     grants = grants.filter((g) => g.classes.length || g.level !== "ask");
     const level = grants.reduce((a, g) => (ORDER(g.level) > ORDER(a) ? g.level : a), "ask");
     const classes = CLASSES.filter((c) => grants.some((g) => g.classes.includes(c)));
-    return { level, classes, ids: ps.map((p) => p.id), exp: ps.map((p) => p.exp).sort()[0], projects: [...new Set(grants.flatMap((g) => g.projects))], grants, notes };
+    return { level, classes, ids: ps.map((p) => p.id), exp: ps.map((p) => p.exp).sort()[0], projects: [...new Set(grants.flatMap((g) => g.projects))], grants, notes, ...(e ? { hop } : {}) };
 }
 /** Canonical path; a path that doesn't exist yet resolves through its nearest existing ancestor (symlinks included). */
 function real(p) {
@@ -339,8 +347,10 @@ export function policyLine(p) {
     if (!p.grants.length)
         return [`policy: ask (owner policy ${p.ids.map((i) => i.slice(-6)).join(",")} doesn't allow acting on this message): reply, answer and ack; ask your user before acting`,
             ...p.notes.map((n) => `note: ${n}`)].join(" · ");
+    const depth = (g) => p.hop === undefined ? "" : Number.isFinite(maxHopFor(g.level))
+        ? ` · relay depth ${p.hop} of ${maxHopFor(g.level)} (autonomous or yolo: no limit)` : ` · relay depth ${p.hop} (no limit for ${g.level})`;
     const grant = (g) => `${g.level === "yolo" && g.classes.includes("permissions") ? "YOLO" : g.level} [${g.classes.join(", ") || "reply only"}]`
-        + ` in ${g.projects.length ? g.projects.join(", ") : "your session's project"} · owner-signed ${g.id.slice(-6)} · expires ${hhmm(g.exp)}`;
+        + ` in ${g.projects.length ? g.projects.join(", ") : "your session's project"} · owner-signed ${g.id.slice(-6)} · expires ${hhmm(g.exp)}${depth(g)}`;
     return [`policy: ${p.grants.map(grant).join(" ; ")}`, ...p.notes.map((n) => `note: ${n}`)].join(" · ");
 }
 /** Keep each grant's constraints together: merging classes or expiries invents authority. */

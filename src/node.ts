@@ -564,6 +564,26 @@ export class MbxNode {
     return { local, remote, warnings };
   }
 
+  /** The exact mailbox addresses (name@host) a send to `to` reaches, resolved like route(); null when any recipient is a
+   *  broadcast or a role (an open set). Relay depth (T104) excludes reads from these addresses: answering the agent you
+   *  heard from is a conversation, not a relay. */
+  recipientAddrs(to: string[]): Set<string> | null {
+    const out = new Set<string>();
+    const localAgents = new Set(this.agents().filter((a) => a.host === this.host).map((a) => a.name));
+    const approved = this.peers().filter((p) => p.state === "approved").map((p) => p.host);
+    for (const t of to) {
+      if (t === "*" || t.startsWith("role:")) return null;
+      if (t === "owner") { out.add(`owner@${this.host}`); continue; }
+      const [raw, host] = t.split("@");
+      if (host) { out.add(`${host === this.host ? this.resolveAlias(raw) : raw}@${host}`); continue; }
+      const name = this.resolveAlias(raw);
+      if (localAgents.has(name)) { out.add(`${name}@${this.host}`); continue; }
+      const hosts = this.agents().filter((a) => a.name === name && a.host !== this.host).map((a) => a.host).filter((h) => approved.includes(h));
+      out.add(`${name}@${hosts.length === 1 ? hosts[0] : this.host}`);
+    }
+    return out;
+  }
+
   // ---- send / receive ----------------------------------------------------------------------
   revoked(): Set<string> { return new Set((this.store.db.prepare("SELECT id FROM grants WHERE revoked=1").all() as { id: string }[]).map((r) => r.id)); }
 
@@ -718,6 +738,14 @@ export class MbxNode {
           ...(did.length > DID_MAX ? { did_truncated: true, did_length: did.length } : {}), level: p.level, classes: p.classes, policies: p.ids });
       }
       return m.id;
+    });
+  }
+
+  /** Unread mail whose owner policy was cut to ask by relay depth (T104): it wakes no one, so say so instead of failing silently. */
+  depthSuppressed(agent: string): { id: string; from: string; hop: number }[] {
+    return this.inbox(agent).flatMap((m) => {
+      const p = this.policyFor(m, agent);
+      return p.notes.some((n) => /^relay depth \d+ exceeds/.test(n)) ? [{ id: m.id, from: m.from_addr, hop: p.hop ?? 0 }] : [];
     });
   }
 

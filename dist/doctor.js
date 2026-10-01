@@ -175,6 +175,15 @@ export async function doctor(ctx, mbxHome, opts = {}) {
             const st = await keychainOwnerStatus(node.home);
             add(st.ok ? "ok" : "fail", `owner key ${fingerprint(owner.public_key)} (macOS Keychain, Touch ID)${st.ok ? "" : `: ${st.detail}`}`, st.ok ? undefined : "reinstall AgentMBX.app (agentmbx daemon install); if the Keychain key is gone, move owner.json aside and run agentmbx owner init");
         }
+        // T104: mail that relay depth kept from waking its mailbox
+        for (const a of node.agents().filter((x) => x.host === node.host)) {
+            try {
+                const sup = node.depthSuppressed(a.name);
+                if (sup.length)
+                    add("warn", `${a.name}: ${sup.length} unread message(s) from ${[...new Set(sup.map((x) => x.from))].join(", ")} did not wake it (relay depth ${Math.max(...sup.map((x) => x.hop))} over the policy allowance)`, "the owner's next prompt in that session resets the depth; a collaborate policy allows 20, autonomous/yolo have no limit");
+            }
+            catch { /* unreadable mailbox: other checks report it */ }
+        }
         const peers = node.peers();
         const approved = peers.filter((p) => p.state === "approved");
         if (!approved.length)
