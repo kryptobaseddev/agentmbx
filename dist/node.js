@@ -658,6 +658,9 @@ export class MbxNode {
             return "rejected:host not paired";
         if (e.sig?.host !== via || !e.from.endsWith(`@${via}`))
             return "rejected:sender host mismatch";
+        // one agent name at the sending host (T032): the sender reaches wake prompts and headers outside the framed body
+        if (!NAME_RE.test(e.from.slice(0, -via.length - 1)))
+            return "rejected:bad sender address";
         try {
             if (!verifyEnvelope(e, peer.pubkey))
                 return "rejected:bad signature";

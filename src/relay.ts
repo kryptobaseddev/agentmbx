@@ -64,15 +64,16 @@ export class RelayCore {
     return e;
   }
 
-  /** A host publishes its enc key, signed by its host key; any enrolled host can read it (T028 via relay). */
-  private encAds = new Map<string, { host: string; enc_pub: string }>();
+  /** A host publishes its enc key, signed by its host key; any enrolled host can read it (T028 via relay). The signature
+   *  is served too: senders check it against the host key they pinned at pairing, never trusting the relay (T032). */
+  private encAds = new Map<string, { host: string; enc_pub: string; sig: string }>();
   publishEncAd(host: string, pubkey: string, encPub: string, sig: string): void {
     const e = this.requireEnrolled(pubkey);
     if (e.host !== host) throw new Error("host mismatch");
     if (!verifyData(pubkey, canonical({ v: 1, host, enc_pub: encPub }), sig)) throw new Error("bad enc-key signature");
-    this.encAds.set(host, { host, enc_pub: encPub });
+    this.encAds.set(host, { host, enc_pub: encPub, sig });
   }
-  getEncAd(host: string): { host: string; enc_pub: string } | null { return this.encAds.get(host) ?? null; }
+  getEncAd(host: string): { host: string; enc_pub: string; sig: string } | null { return this.encAds.get(host) ?? null; }
 
   /** Push envelopes addressed to recipient host keys. Opaque storage; bodies must already be sealed. */
   push(from: { host: string; pubkey: string }, envelopes: Envelope[]): { stored: number; error?: string } {

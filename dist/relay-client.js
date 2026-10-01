@@ -45,10 +45,23 @@ export async function relayPublishEnc(node, relay, f = fetch) {
     const sig = signData(node.key.privateKey, canonical({ v: 1, host: node.host, enc_pub }));
     await call(node, "POST", url(relay, "/v1/relay/enc-key"), { enc_pub, sig }, f);
 }
-/** Discover a peer's enc key through the relay (LAN enc-key exchange may be unreachable for exactly the peers we relay). */
+/** A paired peer's enc key: the pinned one, else the relay's copy only if the peer's PINNED host key signed it (the LAN
+ *  enc-key exchange may be unreachable for exactly the peers we relay). The relay is untrusted: it, or anyone enrolling
+ *  the peer's host name there, could otherwise hand out its own key and read the sealed bodies (T032). */
 export async function relayPeerEnc(node, relay, peerHost, f = fetch) {
+    const p = node.approvedPeer(peerHost);
+    if (!p)
+        return null;
+    if (p.enc_pub)
+        return p.enc_pub;
     const r = await call(node, "GET", url(relay, `/v1/relay/enc-key?host=${encodeURIComponent(peerHost)}`), undefined, f);
-    return r.status === 200 && typeof r.json.enc_pub === "string" ? r.json.enc_pub : null;
+    const { enc_pub, sig } = r.json;
+    if (r.status !== 200 || typeof enc_pub !== "string" || typeof sig !== "string")
+        return null;
+    if (verifyData(p.pubkey, canonical({ v: 1, host: peerHost, enc_pub }), sig))
+        return enc_pub;
+    node.store.audit("enc_key.rejected", { host: peerHost, via: "relay", reason: "signature does not verify against the pinned host key" });
+    return null;
 }
 /** Seal an outbox envelope for a peer and push it to the relay; the local outbox row is dropped on success. */
 export async function relayDrainOutbox(node, relay, f = fetch) {

@@ -55,7 +55,8 @@ export class RelayCore {
             throw new Error("host is not enrolled");
         return e;
     }
-    /** A host publishes its enc key, signed by its host key; any enrolled host can read it (T028 via relay). */
+    /** A host publishes its enc key, signed by its host key; any enrolled host can read it (T028 via relay). The signature
+     *  is served too: senders check it against the host key they pinned at pairing, never trusting the relay (T032). */
     encAds = new Map();
     publishEncAd(host, pubkey, encPub, sig) {
         const e = this.requireEnrolled(pubkey);
@@ -63,7 +64,7 @@ export class RelayCore {
             throw new Error("host mismatch");
         if (!verifyData(pubkey, canonical({ v: 1, host, enc_pub: encPub }), sig))
             throw new Error("bad enc-key signature");
-        this.encAds.set(host, { host, enc_pub: encPub });
+        this.encAds.set(host, { host, enc_pub: encPub, sig });
     }
     getEncAd(host) { return this.encAds.get(host) ?? null; }
     /** Push envelopes addressed to recipient host keys. Opaque storage; bodies must already be sealed. */
