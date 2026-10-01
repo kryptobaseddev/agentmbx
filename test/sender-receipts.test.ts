@@ -41,8 +41,10 @@ test("the sender sees delivered → acked with the recipient's did and liveness,
   let page = (await boss("mbx_sent")).structuredContent as unknown as Page;
   const r0 = page.messages.find((m) => m.id === sent.id)!.recipients[0];
   assert.equal(r0.address, "worker@alpha"); assert.match(r0.state, /^(delivered|notified)$/); assert.match(r0.liveness, /^live: held by claude/);
-  await worker("mbx_read", { ids: [sent.id] }); // mbx_read is read-only: it does not advance the state
-  assert.match(((await boss("mbx_sent")).structuredContent as unknown as Page).messages[0].recipients[0].state, /^(delivered|notified)$/);
+  await worker("mbx_read", { ids: [sent.id] }); // opening it marks the worker's copy read, and the sender sees that
+  assert.equal(((await boss("mbx_sent")).structuredContent as unknown as Page).messages[0].recipients[0].state, "read");
+  await boss("mbx_read", { ids: [sent.id] }); // the sender reading its own sent mail changes nothing for the recipient
+  assert.equal(((await boss("mbx_sent")).structuredContent as unknown as Page).messages[0].recipients[0].state, "read");
   await worker("mbx_ack", { ids: [sent.id], did: "reviewed, two comments" });
   page = (await boss("mbx_sent")).structuredContent as unknown as Page;
   const r = page.messages[0].recipients[0];
