@@ -3,7 +3,9 @@
 // conversation, and guessing is never allowed. The conversation's own hook knows its real session id and folder, so it
 // issues a one-time ticket into that conversation's context; the conversation hands it to its own mbx server
 // (mbx_whoami bind), which links itself only when the ticket was issued under its own parent process. A ticket names the
-// session it links and nothing else: it grants no authority.
+// session it links and nothing else: it grants no authority. Trust assumption: a nonce appears only in its own conversation's
+// context; if it leaked into a sibling conversation of the same app first, that one links instead, the rightful bind fails
+// and its next prompt gets a new ticket (self-healing, never cross-app or cross-provider).
 import { randomBytes } from "node:crypto";
 import type { Store } from "./store.ts";
 
@@ -34,7 +36,8 @@ export function takeBindTicket(store: Store, nonce: string, cli: string, parentP
   return store.tx(() => {
     const raw = store.get(key(nonce));
     if (!raw) return null;
-    const t = JSON.parse(raw) as BindTicket;
+    let t: BindTicket;
+    try { t = JSON.parse(raw) as BindTicket; } catch { store.db.prepare("DELETE FROM kv WHERE k=?").run(key(nonce)); return null; }
     if (!(t.exp > now)) { store.db.prepare("DELETE FROM kv WHERE k=?").run(key(nonce)); return null; }
     if (t.cli !== cli || t.parent_pid !== parentPid) return null; // another provider process's conversation: leave it
     store.db.prepare("DELETE FROM kv WHERE k=?").run(key(nonce));
