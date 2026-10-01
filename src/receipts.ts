@@ -4,6 +4,11 @@
 import { IdentityLeases, identityLeaseStatus, type IdentityLease } from "./identity-leases.ts";
 import type { MbxNode, RouteTarget } from "./node.ts";
 import { hasWakeAuthority } from "./wake.ts";
+import { procTable } from "./proc.ts";
+import { activityKey, parseActivity, SHARED_IDLE_MS } from "./identity-availability.ts";
+
+/** A holder renews its lease every minute; three missed beats mean its session is suspended or gone. */
+const STALE_HEARTBEAT_MS = 3 * 60_000;
 
 export type RecipientState = "live-wake" | "live-next-prompt" | "offline" | "forwarded" | "remote";
 export interface RecipientReceipt { to: string; address: string; state: RecipientState; detail: string }
@@ -17,14 +22,25 @@ export function mailboxLiveness(node: MbxNode, name: string, now = Date.now()): 
   if (!row) return { live: false, detail: "no session has ever held this mailbox; it is read when an agent claims it" };
   let state: "live" | "unknown" | "expired" = "unknown", reason: string | null = null;
   try { ({ state, reason } = identityLeaseStatus(row, now, new IdentityLeases(node.store).processEvidence(row.holder_pid))); }
-  catch { /* evidence unavailable inside a transaction: judge by the lease row and heartbeat alone */
+  catch {
+    // Evidence can't be inspected inside a transaction: judge by the lease row, the process table snapshot taken before
+    // it (a vanished holder is gone) and the heartbeat, which a live holder renews every minute (T204 review).
+    const table = procTable();
     if (row.released_at !== null || now - row.heartbeat_at >= row.idle_ttl) { state = "expired"; reason = row.released_at !== null ? null : "idle"; }
+    else if (table.size && !table.has(row.holder_pid)) { state = "expired"; reason = "dead"; }
+    else if (now - row.heartbeat_at >= STALE_HEARTBEAT_MS) { state = "expired"; reason = `no heartbeat for ${Math.round((now - row.heartbeat_at) / 60_000)} min`; }
   }
-  if (state === "live") return { live: true, detail: `held by ${row.cli} session ${row.session_id.slice(0, 12)}` };
-  if (state === "unknown") return { live: true, detail: `held by ${row.cli} session ${row.session_id.slice(0, 12)} (process unconfirmed, heartbeat ${Math.round((now - row.heartbeat_at) / 1000)} s ago)` };
+  const holder = `${row.cli} session ${row.session_id.slice(0, 12)}`;
+  if (state === "live" || state === "unknown") {
+    const activity = parseActivity(node.store.get(activityKey(name)));
+    const quiet = activity?.shared && now - activity.at >= SHARED_IDLE_MS
+      ? `; its conversation has made no mbx call for ${Math.round((now - activity.at) / 60_000)} min and may have ended` : "";
+    return { live: true, detail: state === "live" ? `held by ${holder}${quiet}`
+      : `held by ${holder} (process unconfirmed, heartbeat ${Math.round((now - row.heartbeat_at) / 1000)} s ago)${quiet}` };
+  }
   const since = row.released_at ?? row.heartbeat_at;
   const why = row.release_reason ?? reason ?? "released";
-  return { live: false, detail: `no live session since ${iso(since)} (last holder ${row.cli} session ${row.session_id.slice(0, 12)}, ${why})` };
+  return { live: false, detail: `no live session since ${iso(since)} (last holder ${holder}, ${why})` };
 }
 
 /** One receipt per resolved target of a stored message. */

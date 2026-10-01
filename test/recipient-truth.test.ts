@@ -117,3 +117,23 @@ test("the CLI refuses a never-held name unless the owner deliberately creates th
   assert.equal(byAddr(r, "later-agent@alpha").state, "offline");
   assert.equal(n.inbox("later-agent").length, 1);
 });
+
+test("a crashed or silent holder reads offline at send time, and a quiet shared conversation says so (T204 review)", async (t) => {
+  const { n, session } = await world(t);
+  const lease = (name: string, pid: number, heartbeatAgo: number, cli = "claude") => {
+    n.registerAgent(name);
+    n.store.db.prepare(`INSERT INTO identity_leases (name,token,holder_pid,holder_start,key_fp,cli,session_id,claimed_at,heartbeat_at,idle_ttl,released_at,release_reason)
+      VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL)`).run(name, `tok-${name}`, pid, "ps-utc:Thu Jan 1 00:00:00 2026", "0000-0000-0000-0000", cli, `sess-${name}`, Date.now(), Date.now() - heartbeatAgo, 1_800_000);
+  };
+  lease("crashed", 2 ** 22 + 4242, 10_000);            // its process is gone, the lease was never released
+  lease("silent", process.pid, 5 * 60_000);             // alive pid, but no heartbeat for 5 minutes
+  lease("quiet", process.pid, 10_000, "opencode");      // a shared-process conversation with no mbx call for 20 minutes
+  n.store.set("lease-activity:quiet", JSON.stringify({ at: Date.now() - 20 * 60_000, shared: true }));
+  const boss = await session("boss");
+  const r = out(await boss("mbx_send", { to: ["crashed", "silent", "quiet"], subject: "s", body: "b", kind: "request" }));
+  assert.equal(byAddr(r, "crashed@alpha").state, "offline");
+  assert.match(byAddr(r, "crashed@alpha").detail, /dead/);
+  assert.equal(byAddr(r, "silent@alpha").state, "offline");
+  assert.match(byAddr(r, "silent@alpha").detail, /no heartbeat for 5 min/);
+  assert.match(byAddr(r, "quiet@alpha").detail, /no mbx call for 20 min and may have ended/);
+});

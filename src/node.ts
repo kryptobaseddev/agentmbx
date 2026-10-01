@@ -17,6 +17,7 @@ import { ownerPublicKey } from "./owner.ts";
 import { effectivePolicy, policyLine } from "./policy.ts";
 import { procStart, procTable, provenProcess, sameProcess } from "./proc.ts";
 import { privatePath } from "./private-files.ts";
+import { backfillRegistry } from "./registry.ts";
 import { Store, type DeliveryState, type MessageRow } from "./store.ts";
 
 export const DEFAULT_PORT = 7373;
@@ -80,6 +81,7 @@ export class MbxNode {
     initializeReplay(this.store);
     this.retireIdentityLinks();
     this.syncOwner();
+    if (!this.store.get("registry-backfill:v1")) this.store.tx(() => { backfillRegistry(this.store, this.host); this.store.set("registry-backfill:v1", new Date().toISOString()); });
   }
 
   /** Record this host's own owner key (if any) as the principal it takes policies from. */
@@ -331,18 +333,6 @@ export class MbxNode {
 
   /** Remember a chosen name for a CLI session id, so resuming that session keeps it. */
   keepName(cli: string, sessionId: string, agent: string) { this.store.set(`name:${cli}:${sessionId}`, agent); }
-
-  /**
-   * The name a new session should use: its remembered name when resuming, else `wanted` unless another live session of
-   * a different process holds it, then `<wanted>-<cli>`, then `<wanted>-2`…`-9`.
-   */
-  pickName(wanted: string, cli: string, pid: number, sessionId?: string): string {
-    const kept = sessionId && this.store.get(`name:${cli}:${sessionId}`);
-    if (kept) return kept;
-    const held = (n: string) => this.heldByOther(n, pid) || this.shellHeld(n);
-    const cands = [wanted, ...(wanted !== cli && !wanted.endsWith(`-${cli}`) ? [`${wanted}-${cli}`] : []), ...[2, 3, 4, 5, 6, 7, 8, 9].map((i) => `${wanted}-${i}`)];
-    return cands.map((c) => c.slice(0, 40)).find((c) => NAME_RE.test(c) && !held(c)) ?? `${wanted.slice(0, 30)}-${process.pid}`;
-  }
 
   /** Local agents with a live, tracked CLI session: the audience of `*` and `role:` (Keaton, 2026-09-26). */
   sessionAgents(): Set<string> {
