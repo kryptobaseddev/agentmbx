@@ -397,7 +397,7 @@ export class MbxNode {
             return "push (Claude channel or session socket)";
         const w = ss.find((x) => sessionWakeable(x));
         if (w)
-            return w.cli === "codex" ? "push (codex queue)" : w.cli === "kimi" ? "push (kimi web)" : "push (opencode service)";
+            return w.cli === "codex" ? "push (codex queue)" : w.cli === "kimi" ? "push (kimi web or desktop app)" : "push (opencode service)";
         const watcher = JSON.parse(this.store.get(`watcher:${agent}`) ?? "null"); // agentmbx watch (T033)
         if (watcher && Date.now() - watcher.at < 15_000)
             try {

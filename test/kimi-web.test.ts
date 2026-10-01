@@ -329,7 +329,7 @@ test("mail that only reached the desktop is retried when a hosted kimi session b
     n.setDelivery(id, "web", "notified", "desktop");
     bindWakeLease(n, { agent: "web", cli: "kimi", session_id: "session_t049", pid: process.pid });
     assert.equal((n.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=?").get(id) as { state: string }).state, "delivered", "a hosted binding re-queues desktop-only mail for a real wake");
-    assert.equal(n.deliveryMode("web"), "push (kimi web)");
+    assert.equal(n.deliveryMode("web"), "push (kimi web or desktop app)");
   });
   n.close();
   server.close();

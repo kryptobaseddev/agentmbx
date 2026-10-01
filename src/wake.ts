@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { kimiHostedServer, type KimiServer } from "./kimi-web.ts";
+import { desktopRpc, kimiDesktop, RpcError, type KimiDesktop } from "./kimi-desktop.ts";
 import { MbxNode, trustLabel } from "./node.ts";
 import { captureWakeIdentity } from "./wake-identity.ts";
 import { policyBrief } from "./policy.ts";
@@ -197,6 +198,43 @@ export async function wakeKimi(s: KimiSessionRef, text: string, o: { server?: Ki
   return outcome(via, { kind: "admitted", receipt: receipt("native", { nativeId: j.data.prompt_id, sessionId: s.session_id, nativeStatus: j.data.status ?? null }) });
 }
 
+// ---- kimi desktop --------------------------------------------------------------------------------
+type DesktopRpc = typeof desktopRpc;
+
+/**
+ * Wake a Kimi desktop conversation through the app's control socket (T033): conversations.list maps the bound kernel
+ * session id to its conversation, conversations.getBusy skips a turn in progress, conversations.send starts the turn.
+ * A session counts as desktop-hosted only when its recorded pid is the live daimon of runner.state.json.
+ */
+export async function wakeKimiDesktop(s: KimiSessionRef, text: string, o: { desktop?: KimiDesktop | null; rpc?: DesktopRpc; recheck?: () => boolean } = {}): Promise<WakeResult> {
+  const via = "kimi desktop";
+  const d = o.desktop === undefined ? kimiDesktop(s.pid) : o.desktop;
+  if (!d) return outcome(via, { kind: "not_submitted", reason: "no-target" }, "not a Kimi desktop session");
+  const rpc = o.rpc ?? desktopRpc;
+  let conversationKey: string;
+  try {
+    const [list] = await rpc(d, [["conversations.list", {}]]) as [{ conversations?: { conversationKey?: unknown; kernelSessionId?: unknown }[] }];
+    const hit = list?.conversations?.find(c => c.kernelSessionId === s.session_id && typeof c.conversationKey === "string");
+    if (!hit) return outcome(via, { kind: "not_submitted", reason: "no-target" }, "no desktop conversation for this session");
+    conversationKey = hit.conversationKey as string;
+    const [busy] = await rpc(d, [["conversations.getBusy", { conversationKey }]]) as [{ busy?: unknown }];
+    if (typeof busy?.busy !== "boolean") return outcome(via, { kind: "not_submitted", reason: "preflight" }, "invalid busy response");
+    if (busy.busy) return outcome(via, { kind: "busy" }, "conversation busy");
+  } catch (e) { return outcome(via, { kind: "not_submitted", reason: "preflight" }, (e as Error).message); }
+  if (o.recheck && !o.recheck()) return outcome(via, { kind: "not_submitted", reason: "fenced" }, "wake authority changed");
+  let sent = false, r: { accepted?: unknown; kernelSessionId?: unknown; turnId?: unknown } | undefined;
+  try { [r] = await rpc(d, [["conversations.send", { conversationKey, text }]], { timeoutMs: 15_000, sent: () => { sent = true; } }) as [typeof r]; }
+  catch (e) {
+    const detail = (e as Error).message;
+    if (e instanceof RpcError) return e.code === -32010 ? outcome(via, { kind: "busy" }, detail) : outcome(via, { kind: "failed", status: e.code }, detail);
+    return sent ? outcome(via, { kind: "unknown", reason: /timed out/.test(detail) ? "timeout" : "lost-response", detail })
+      : outcome(via, { kind: "not_submitted", reason: "unavailable", detail });
+  }
+  if (r?.accepted !== true || r.kernelSessionId !== s.session_id || typeof r.turnId !== "string" || !r.turnId)
+    return outcome(via, { kind: "unknown", reason: "malformed-receipt" }, "invalid conversations.send receipt");
+  return outcome(via, { kind: "admitted", receipt: receipt("native", { nativeId: r.turnId, sessionId: s.session_id, nativeStatus: "accepted" }) });
+}
+
 // ---- desktop notifications -------------------------------------------------------------------
 export type DesktopNote = { title?: string; subtitle?: string; body: string; id?: string; openCmd?: string };
 type Cmd = { via: string; file: string; args: string[]; timeout: number };
@@ -356,7 +394,7 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
       node.store.set(attemptKey(agent), JSON.stringify(marker)); // durable before the native write (WC-14)
       if (s.cli === "codex") result = await wakeCodex(s.session_id, text, { recheck });
       else if (s.cli === "opencode") result = await wakeOpencode(s.session_id, text, { recheck });
-      else if (s.cli === "kimi") result = await wakeKimi(s, text, { recheck });
+      else if (s.cli === "kimi") result = kimiDesktop(s.pid) ? await wakeKimiDesktop(s, text, { recheck }) : await wakeKimi(s, text, { recheck });
       else continue;
       attempts++;
       node.store.audit("wake.attempt", { agent, attempt: marker.attemptId, session: `${s.cli}:${s.session_id}`, outcome: result.outcome?.kind ?? null,

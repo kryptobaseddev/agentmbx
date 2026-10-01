@@ -1,9 +1,10 @@
 // `agentmbx doctor`: one checklist that says what works, what doesn't, and the one command that fixes it.
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fingerprint } from "./crypto.ts";
 import { signHop } from "./http.ts";
-import { kimiInstances } from "./kimi-web.ts";
+import { kimiHostedServer, kimiInstances } from "./kimi-web.ts";
+import { kimiDesktop } from "./kimi-desktop.ts";
 import { version } from "./version.ts";
 import { MbxNode } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
@@ -73,17 +74,26 @@ export function sessionReadiness(node: MbxNode, cli: string): Check {
   const channels = live.filter((s) => s.channel).length;
   const stale = rows.length - live.length;
   const onlyProvisional = !real && !channels;
-  const hostedPids = cli === "kimi" ? new Set(kimiInstances().map(instance => instance?.pid)) : new Set<number>();
+  const hostedPids = cli === "kimi" ? new Set([...kimiInstances().map(instance => instance?.pid), kimiDesktop()?.pid]) : new Set<number | undefined>();
   const hostedProvisional = live.filter(s => s.session_id.startsWith("mcp-") && hostedPids.has(s.pid!)).length;
   if (hostedProvisional) return { level: "warn",
-    label: `${cli}: ${hostedProvisional} hosted binding(s) still need explicit session identity; ${real} real session ID(s); receipt not tested`,
-    fix: "use a provider integration that supplies explicit per-session MCP identity; a shared-server hook cannot infer the session from its directory" };
+    label: `${cli}: ${hostedProvisional} hosted conversation(s) not linked to their mbx server yet; ${real} real session ID(s); receipt not tested`,
+    fix: "each hosted conversation links itself on its next prompt (the [mbx] note asks it to call mbx_whoami with a bind ticket)" };
 
   return { level: onlyProvisional ? "warn" : "info",
     label: `${cli}: ${live.length} verified live mailbox binding(s), ${real} real session ID(s), ${channels} channel binding(s)`
       + (stale ? `, ${stale} stale or unverified` : "") + "; receipt not tested",
     ...(onlyProvisional ? { fix: "run the provider session-start hook to bind its real session ID" }
       : cli === "claude" && !channels ? { fix: "start Claude with 'agentmbx claude' (adds the mbx channel) so idle sessions wake on mail; others see mail on their next prompt" } : {}) };
+}
+
+/** A `kimi web` server reads its hooks once at start: one started before AgentMBX was set up runs none (no bind, no Stop). */
+export function kimiServerHooks(home: string, kimiHome = process.env.KIMI_CODE_HOME || join(home, ".kimi-code")): Check[] {
+  let wiredAt: number;
+  try { const cfg = join(kimiHome, "config.toml"); if (!readFileSync(cfg, "utf8").includes("agentmbx hook")) return []; wiredAt = statSync(cfg).mtimeMs; } catch { return []; }
+  return kimiInstances(kimiHome).filter(i => typeof i.pid === "number" && typeof i.started_at === "number" && i.started_at < wiredAt && kimiHostedServer(i.pid, kimiHome) !== null)
+    .map(i => ({ level: "warn" as Level, label: `kimi web server pid ${i.pid} (port ${i.port}) started before its AgentMBX hooks were last written: its sessions get no mbx hooks`,
+      fix: "restart that kimi web server (stop it, then run kimi web again)" }));
 }
 
 export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeoutMs?: number } = {}): Promise<Check[]> {
@@ -115,6 +125,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
 
   if (node) {
     for (const d of detect(ctx).filter((d) => d.found)) out.push(sessionReadiness(node, d.cli));
+    for (const c of kimiServerHooks(ctx.home)) out.push(c);
   }
 
   const sk = skillStatus(ctx.home);

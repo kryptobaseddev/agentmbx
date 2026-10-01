@@ -369,7 +369,7 @@ export class MbxNode {
     const ss = this.sessionsFor(agent).filter((x) => x.pid && this.sameSession(x.pid, x));
     if (ss.some((x) => x.channel)) return "push (Claude channel or session socket)";
     const w = ss.find((x) => sessionWakeable(x));
-    if (w) return w.cli === "codex" ? "push (codex queue)" : w.cli === "kimi" ? "push (kimi web)" : "push (opencode service)";
+    if (w) return w.cli === "codex" ? "push (codex queue)" : w.cli === "kimi" ? "push (kimi web or desktop app)" : "push (opencode service)";
     const watcher = JSON.parse(this.store.get(`watcher:${agent}`) ?? "null") as { pid: number; at: number } | null; // agentmbx watch (T033)
     if (watcher && Date.now() - watcher.at < 15_000) try { process.kill(watcher.pid, 0); return "push (mbx watcher: its exit starts your next turn)"; } catch { /* gone */ }
     return "no push: new mail shows on your user's next prompt, or when your mbx watcher or [mbx-watch] self-check runs";

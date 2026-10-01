@@ -21,7 +21,9 @@ import { installKind, version } from "./version.js";
 import { installService, serviceLabel, uninstallService } from "./service.js";
 import { CLIS, defaultHostName, defaultWhich, formatRows, ownerStep, resolveCommand, runSetup, shJoin } from "./setup.js";
 import { dispatchWakes, hasWakeAuthority, humanPromptKey, inboxCommand, isHumanPrompt, macNotifierPath, muteWakes, notifyDesktop, opencodeService, wakeMutedUntil, wakeText, watcherKey, which } from "./wake.js";
-import { kimiHostedServer } from "./kimi-web.js";
+import { kimiMultiHost } from "./kimi-web.js";
+import { bindInstruction, issueBindTicket } from "./bind-ticket.js";
+import { installDesktopPlugin, kimiDesktop, kimiDesktopDir, removeDesktopPlugin, writeDesktopPlugin } from "./kimi-desktop.js";
 import { approveKimi, decidePermission, opencodePermissionPass } from "./permission.js";
 import { diagnosticSnapshot } from "./diagnostics.js";
 import { configuredRetention, prune, retentionDays } from "./retention.js";
@@ -1121,7 +1123,7 @@ async function hook(node, event, cli) {
     const choices = "[mbx] Identity choices: call mbx_whoami to confirm this session's identity. Keep it, or pass a new name to mbx_whoami to rename it. To recover an existing mailbox, use mbx_identity with action=list to inspect ownership, unread counts and last activity, then explicitly release your current identity and claim the chosen available name. Switching identities preserves the old mailbox without forwarding its mail. Live holders and unresolved historical conflicts cannot be claimed through these controls. When the owner ends this session or requests a handoff, call mbx_identity release after your final mailbox work; finishing a turn is not ending a session. Closing a hosted conversation may leave its shared MCP holder running.";
     // Inspect provider capabilities and processes before the lease transaction. No directory-based session discovery.
     const host = cli === "claude" ? detectHost(process.ppid) : null;
-    const watch = event === "session-start" && noPush(cli, !!host && (host.channel || host.socket), cli === "kimi" && !!kimiHostedServer(process.ppid));
+    const watch = event === "session-start" && noPush(cli, !!host && (host.channel || host.socket), cli === "kimi" && kimiMultiHost(process.ppid));
     let entered = false;
     try {
         return withProcSnapshot(() => withHookIdentity(node, cli, sid, (agent, descriptor, bootstrap) => {
@@ -1209,8 +1211,13 @@ async function hook(node, event, cli) {
         // Missing ownership is a quiet hook result, not a provider failure or an invitation to recreate a binding.
         if (entered)
             throw error;
+        // A conversation in a multi-conversation Kimi host can't be matched to its mbx server from here: hand it a bind ticket.
+        const link = cli === "kimi" && sid && (event === "session-start" || event === "prompt") && kimiMultiHost(process.ppid)
+            ? bindInstruction(issueBindTicket(node.store, { cli, session_id: sid, cwd, parent_pid: process.ppid })) : null;
         if (event === "session-start")
-            emit(cli, "SessionStart", choices);
+            emit(cli, "SessionStart", link ? `${choices}\n${link}` : choices);
+        else if (link)
+            emit(cli, "UserPromptSubmit", link);
     }
 }
 /**
@@ -1378,6 +1385,8 @@ async function setup(o, str) {
         await ownerStep({ mbxHome: defaultHome(), cmd: ctx.cmd, dryRun });
     if (!uninstall && !dryRun && (!only || only.includes("owner")) && existsSync(join(defaultHome(), "config.json")))
         await policyStep(str("policy"), !!o.yes);
+    if (!only || only.includes("kimi"))
+        await kimiDesktopStep(ctx.cmd, { dryRun, uninstall });
     const plan = runSetup(ctx, { mode, only, dryRun: true });
     const pending = plan.filter((r) => ["added", "updated", "removed"].includes(r.action));
     if (dryRun || !pending.length) {
@@ -1401,6 +1410,29 @@ async function setup(o, str) {
         console.log("The daemon keeps running (messages and keys stay). Stop it with: agentmbx daemon uninstall");
     else
         console.log("Restart your agent sessions so they load mbx, then run: agentmbx doctor");
+}
+/** Kimi desktop keeps its own private Kimi Code home: AgentMBX reaches it as a native plugin installed through the app. */
+async function kimiDesktopStep(cmd, o) {
+    const d = kimiDesktop();
+    if (!d) {
+        if (existsSync(kimiDesktopDir()))
+            console.log("kimi desktop: the app is not running; start Kimi, then run: agentmbx setup --only kimi");
+        return;
+    }
+    if (o.dryRun)
+        return console.log(`kimi desktop: would ${o.uninstall ? "remove" : "install"} the AgentMBX plugin (mbx MCP server + hooks)`);
+    try {
+        if (o.uninstall) {
+            await removeDesktopPlugin(d);
+            return console.log("kimi desktop: AgentMBX plugin removed");
+        }
+        const r = await installDesktopPlugin(d, writeDesktopPlugin(join(defaultHome(), "kimi-desktop-plugin"), shJoin(cmd), version()));
+        console.log(`kimi desktop: AgentMBX plugin installed (${r.mcp} MCP server, ${r.hooks} hooks); new desktop conversations get mbx`);
+    }
+    catch (e) {
+        console.log(`kimi desktop: plugin ${o.uninstall ? "removal" : "install"} failed (${e.message})`);
+        process.exitCode = 1;
+    }
 }
 /**
  * Onboarding: how much may this machine's agents do for each other? One owner-signed policy for every local agent

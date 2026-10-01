@@ -22,7 +22,9 @@ import { installKind, version } from "./version.ts";
 import { installService, serviceLabel, uninstallService } from "./service.ts";
 import { CLIS, defaultHostName, defaultWhich, formatRows, ownerStep, resolveCommand, runSetup, shJoin, type SetupCtx } from "./setup.ts";
 import { dispatchWakes, hasWakeAuthority, humanPromptKey, inboxCommand, isHumanPrompt, macNotifierPath, muteWakes, notifyDesktop, opencodeService, wakeMutedUntil, wakeText, watcherKey, which } from "./wake.ts";
-import { kimiHostedServer } from "./kimi-web.ts";
+import { kimiMultiHost } from "./kimi-web.ts";
+import { bindInstruction, issueBindTicket } from "./bind-ticket.ts";
+import { installDesktopPlugin, kimiDesktop, kimiDesktopDir, removeDesktopPlugin, writeDesktopPlugin } from "./kimi-desktop.ts";
 import { approveKimi, decidePermission, opencodePermissionPass, type Lookup } from "./permission.ts";
 import { diagnosticSnapshot, type RuntimeObservation } from "./diagnostics.ts";
 import { configuredRetention, prune, retentionDays } from "./retention.ts";
@@ -906,7 +908,7 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
   // Inspect provider capabilities and processes before the lease transaction. No directory-based session discovery.
   const host = cli === "claude" ? detectHost(process.ppid) : null;
   const watch = event === "session-start" && noPush(cli, !!host && (host.channel || host.socket),
-    cli === "kimi" && !!kimiHostedServer(process.ppid));
+    cli === "kimi" && kimiMultiHost(process.ppid));
   let entered = false;
   try {
     return withProcSnapshot(() => withHookIdentity(node, cli, sid, (agent, descriptor, bootstrap) => {
@@ -972,7 +974,11 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
   } catch (error) {
     // Missing ownership is a quiet hook result, not a provider failure or an invitation to recreate a binding.
     if (entered) throw error;
-    if (event === "session-start") emit(cli, "SessionStart", choices);
+    // A conversation in a multi-conversation Kimi host can't be matched to its mbx server from here: hand it a bind ticket.
+    const link = cli === "kimi" && sid && (event === "session-start" || event === "prompt") && kimiMultiHost(process.ppid)
+      ? bindInstruction(issueBindTicket(node.store, { cli, session_id: sid, cwd, parent_pid: process.ppid })) : null;
+    if (event === "session-start") emit(cli, "SessionStart", link ? `${choices}\n${link}` : choices);
+    else if (link) emit(cli, "UserPromptSubmit", link);
   }
 }
 
@@ -1104,6 +1110,8 @@ async function setup(o: Record<string, unknown>, str: (k: string) => string | un
     await ownerStep({ mbxHome: defaultHome(), cmd: ctx.cmd, dryRun });
   if (!uninstall && !dryRun && (!only || only.includes("owner")) && existsSync(join(defaultHome(), "config.json"))) await policyStep(str("policy"), !!o.yes);
 
+  if (!only || only.includes("kimi")) await kimiDesktopStep(ctx.cmd, { dryRun, uninstall });
+
   const plan = runSetup(ctx, { mode, only, dryRun: true });
   const pending = plan.filter((r) => ["added", "updated", "removed"].includes(r.action));
   if (dryRun || !pending.length) {
@@ -1123,6 +1131,18 @@ async function setup(o: Record<string, unknown>, str: (k: string) => string | un
   if (rows.some((r) => r.action === "error")) process.exitCode = 1;
   if (uninstall) console.log("The daemon keeps running (messages and keys stay). Stop it with: agentmbx daemon uninstall");
   else console.log("Restart your agent sessions so they load mbx, then run: agentmbx doctor");
+}
+
+/** Kimi desktop keeps its own private Kimi Code home: AgentMBX reaches it as a native plugin installed through the app. */
+async function kimiDesktopStep(cmd: string[], o: { dryRun: boolean; uninstall: boolean }) {
+  const d = kimiDesktop();
+  if (!d) { if (existsSync(kimiDesktopDir())) console.log("kimi desktop: the app is not running; start Kimi, then run: agentmbx setup --only kimi"); return; }
+  if (o.dryRun) return console.log(`kimi desktop: would ${o.uninstall ? "remove" : "install"} the AgentMBX plugin (mbx MCP server + hooks)`);
+  try {
+    if (o.uninstall) { await removeDesktopPlugin(d); return console.log("kimi desktop: AgentMBX plugin removed"); }
+    const r = await installDesktopPlugin(d, writeDesktopPlugin(join(defaultHome(), "kimi-desktop-plugin"), shJoin(cmd), version()));
+    console.log(`kimi desktop: AgentMBX plugin installed (${r.mcp} MCP server, ${r.hooks} hooks); new desktop conversations get mbx`);
+  } catch (e) { console.log(`kimi desktop: plugin ${o.uninstall ? "removal" : "install"} failed (${(e as Error).message})`); process.exitCode = 1; }
 }
 
 /**

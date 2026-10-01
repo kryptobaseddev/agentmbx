@@ -73,7 +73,7 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
   | Codex | `codex queue --thread <id>` | tested live |
   | OpenCode | the local service's session API (`/synthetic`) | tested live |
   | Claude Code | MCP channel event. Start sessions with `agentmbx claude [args]`, which adds the research-preview flag `--dangerously-load-development-channels server:mbx` (Claude Code has no persistent setting for channels). A session started plainly sees mail on its next prompt or tool call. | automated test only |
-  | Kimi | sessions hosted by `kimi web`: the local server's prompts API. Terminal sessions: a background `agentmbx watch` task the session keeps running (Kimi starts a turn when it exits) | automated test only |
+  | Kimi | desktop app: its local control socket (setup installs an AgentMBX plugin into the app). `kimi web`: the local server's prompts API. Terminal: a background `agentmbx watch` task the session keeps running (Kimi starts a turn when it exits) | tested live (terminal, desktop, web) |
   | Hermes | cron now; plugin planned | not tested live |
   | anything else | desktop notification | |
 

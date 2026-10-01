@@ -13,7 +13,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { fingerprint, generateKeyPair } from "./crypto.js";
 import { checkShape, KINDS, MAX_RELAY_DEPTH, NAME_RE } from "./envelope.js";
-import { kimiHostedServer } from "./kimi-web.js";
+import { kimiMultiHost } from "./kimi-web.js";
+import { BIND_TICKET_RE, takeBindTicket } from "./bind-ticket.js";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess } from "./identity-leases.js";
 import { applyIdentityTakeover } from "./identity-takeover.js";
 import { listIdentityStatus } from "./identity-status.js";
@@ -513,13 +514,14 @@ export async function runMcp(existing) {
         return state;
     };
     // the project this session works in (not the home folder), stamped on what it sends
-    const project = (() => { const d = process.cwd(); if (resolve(d) === resolve(homedir()) || d === "/")
+    const projectOf = (d) => { if (resolve(d) === resolve(homedir()) || d === "/")
         return undefined; try {
         return realpathSync(d);
     }
     catch {
         return d;
-    } })();
+    } };
+    let project = projectOf(process.cwd()); // a hosted conversation moves it to its own folder when it links (bind ticket)
     // relay tracking: a message this session sends after reading one is one hop further, and inherits an external origin
     const noteRead = (rows) => {
         const state = current(), { agent } = state;
@@ -559,7 +561,7 @@ export async function runMcp(existing) {
     const delegation = shared
         ? "[mbx] This transport can serve multiple sessions. Call mbx_whoami for your current mailbox identity and owner-signed policies. Read each mbx_read header for the policy that applies to that message; another mailbox's grant does not authorize this session."
         : delegationNote(node.store.db, agent, node.host);
-    const extra = [renamed, delegation, noPush(env.cli, env.channel || env.socket, env.cli === "kimi" && !!kimiHostedServer(env.ppid))
+    const extra = [renamed, delegation, noPush(env.cli, env.channel || env.socket, env.cli === "kimi" && kimiMultiHost(env.ppid))
             ? selfWatchInstruction({ delegated: activePolicies(node.store.db, agent, node.host).length > 0, cli: env.cli }) : null].filter(Boolean).join("\n");
     const session = () => {
         const { key } = current();
@@ -717,24 +719,63 @@ export async function runMcp(existing) {
         inputSchema: { action: z.enum(["list", "claim", "release"]), name: z.string().regex(NAME_RE).optional().describe("identity to claim; defaults to this session's last identity") },
         annotations: { destructiveHint: false },
     }, identityOperation);
+    /**
+     * Link this server to the conversation that holds `ticket` (hosted Kimi: one server per conversation, one shared parent).
+     * Binds the real session id with this server's key, so hooks, wakes and policy scope then use it. Returns the default
+     * name for that conversation's folder when this server still carries the name it derived from the plugin folder.
+     */
+    const linkConversation = (state, ticket) => {
+        if (state !== base || base.released || !base.leaseToken)
+            throw new Error("bind needs this server's own held identity");
+        const t = takeBindTicket(node.store, ticket, env.cli, env.ppid);
+        if (!t)
+            throw new Error("bind ticket is unknown, expired, or belongs to another app process; a new one comes with your next prompt");
+        try {
+            process.chdir(t.cwd);
+        }
+        catch { /* the folder may be gone; the binding still records it */ }
+        project = projectOf(t.cwd);
+        prepareState(base, undefined, () => node.store.tx(() => {
+            leases.renew(base.agent, base.leaseToken);
+            node.bindSession({ agent: base.agent, cli: env.cli, session_id: t.session_id, cwd: t.cwd, pid: env.ppid, session_key: base.key.publicKey, channel: false, mcp_pid: process.pid });
+            publishControl(base);
+        }));
+        node.store.audit("identity.bind-ticket", { agent: base.agent, cli: env.cli, session: t.session_id });
+        if (process.env.MBX_AGENT || !(base.agent === wanted || base.agent.startsWith(`${wanted.slice(0, 19)}-mcp-`)))
+            return undefined;
+        // the conversation's folder name, else a readable variant when another session holds it (a terminal in the same project)
+        const folder = agentName(t.cwd, env.cli).slice(0, 26), tag = createHash("sha256").update(t.session_id).digest("hex").slice(0, 4);
+        const held = (n) => !!node.store.db.prepare("SELECT 1 FROM identity_leases WHERE name=? AND released_at IS NULL").get(n);
+        return [folder, `${folder}-${env.cli}-app`, `${folder}-${env.cli}-${tag}`].find(n => NAME_RE.test(n) && n !== base.agent && !held(n));
+    };
     server.registerTool("mbx_whoami", {
         title: "Who am I on mbx",
         description: "Show this session's mbx identity (agent name, host, session key fingerprint, whether it holds an owner grant). Pass `name` to rename this session's agent (do it early if the default folder name is vague), `role`/`description` to describe it. Next: mbx_inbox for pending work; optionally mbx_replay with a saved cursor for bounded historical catch-up, or mbx_agents for peers.",
-        inputSchema: { name: z.string().regex(NAME_RE).optional().describe("new agent name, e.g. vida-dev"), role: z.string().max(40).optional(), description: z.string().max(200).optional().describe("brief agent description, at most 200 characters") },
+        inputSchema: { name: z.string().regex(NAME_RE).optional().describe("new agent name, e.g. vida-dev"), role: z.string().max(40).optional(), description: z.string().max(200).optional().describe("brief agent description, at most 200 characters"),
+            bind: z.string().regex(BIND_TICKET_RE).optional().describe("one-time ticket from an [mbx] session note that links this conversation to its mbx server") },
         annotations: { idempotentHint: true },
-    }, ({ name, role, description }) => {
+    }, ({ name, role, description, bind: ticket }) => {
         const state = current();
+        const folderName = ticket ? linkConversation(state, ticket) : undefined;
         let { agent } = state;
         const { key } = state;
-        if (name && name !== agent) {
-            checkLegacy(name, state, node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions WHERE agent=?`).all(name));
-            const lease = leases.rename(agent, state.leaseToken, name);
-            node.addAlias(agent, name, env.ppid);
-            agent = name;
-            state.agent = name;
+        const rename = (to) => {
+            checkLegacy(to, state, node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions WHERE agent=?`).all(to));
+            const lease = leases.rename(agent, state.leaseToken, to);
+            node.addAlias(agent, to, env.ppid);
+            agent = to;
+            state.agent = to;
             state.leaseToken = lease.token;
-            node.keepName(env.cli, state.sessionId, name);
-        }
+            node.keepName(env.cli, state.sessionId, to);
+        };
+        if (name && name !== agent)
+            rename(name);
+        else if (folderName)
+            try {
+                rename(folderName);
+                name = folderName;
+            }
+            catch { /* taken or contested: keep the current name */ }
         if (name || role || description) {
             node.registerAgent(agent, { role, description, cli: env.cli });
             bind(state);

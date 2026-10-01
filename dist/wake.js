@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { kimiHostedServer } from "./kimi-web.js";
+import { desktopRpc, kimiDesktop, RpcError } from "./kimi-desktop.js";
 import { MbxNode, trustLabel } from "./node.js";
 import { captureWakeIdentity } from "./wake-identity.js";
 import { policyBrief } from "./policy.js";
@@ -211,6 +212,50 @@ export async function wakeKimi(s, text, o = {}) {
     // Submission, not model execution or a mailbox read/reply/ack. A "blocked" prompt is admitted and waits on a person.
     return outcome(via, { kind: "admitted", receipt: receipt("native", { nativeId: j.data.prompt_id, sessionId: s.session_id, nativeStatus: j.data.status ?? null }) });
 }
+/**
+ * Wake a Kimi desktop conversation through the app's control socket (T033): conversations.list maps the bound kernel
+ * session id to its conversation, conversations.getBusy skips a turn in progress, conversations.send starts the turn.
+ * A session counts as desktop-hosted only when its recorded pid is the live daimon of runner.state.json.
+ */
+export async function wakeKimiDesktop(s, text, o = {}) {
+    const via = "kimi desktop";
+    const d = o.desktop === undefined ? kimiDesktop(s.pid) : o.desktop;
+    if (!d)
+        return outcome(via, { kind: "not_submitted", reason: "no-target" }, "not a Kimi desktop session");
+    const rpc = o.rpc ?? desktopRpc;
+    let conversationKey;
+    try {
+        const [list] = await rpc(d, [["conversations.list", {}]]);
+        const hit = list?.conversations?.find(c => c.kernelSessionId === s.session_id && typeof c.conversationKey === "string");
+        if (!hit)
+            return outcome(via, { kind: "not_submitted", reason: "no-target" }, "no desktop conversation for this session");
+        conversationKey = hit.conversationKey;
+        const [busy] = await rpc(d, [["conversations.getBusy", { conversationKey }]]);
+        if (typeof busy?.busy !== "boolean")
+            return outcome(via, { kind: "not_submitted", reason: "preflight" }, "invalid busy response");
+        if (busy.busy)
+            return outcome(via, { kind: "busy" }, "conversation busy");
+    }
+    catch (e) {
+        return outcome(via, { kind: "not_submitted", reason: "preflight" }, e.message);
+    }
+    if (o.recheck && !o.recheck())
+        return outcome(via, { kind: "not_submitted", reason: "fenced" }, "wake authority changed");
+    let sent = false, r;
+    try {
+        [r] = await rpc(d, [["conversations.send", { conversationKey, text }]], { timeoutMs: 15_000, sent: () => { sent = true; } });
+    }
+    catch (e) {
+        const detail = e.message;
+        if (e instanceof RpcError)
+            return e.code === -32010 ? outcome(via, { kind: "busy" }, detail) : outcome(via, { kind: "failed", status: e.code }, detail);
+        return sent ? outcome(via, { kind: "unknown", reason: /timed out/.test(detail) ? "timeout" : "lost-response", detail })
+            : outcome(via, { kind: "not_submitted", reason: "unavailable", detail });
+    }
+    if (r?.accepted !== true || r.kernelSessionId !== s.session_id || typeof r.turnId !== "string" || !r.turnId)
+        return outcome(via, { kind: "unknown", reason: "malformed-receipt" }, "invalid conversations.send receipt");
+    return outcome(via, { kind: "admitted", receipt: receipt("native", { nativeId: r.turnId, sessionId: s.session_id, nativeStatus: "accepted" }) });
+}
 /** The branded notifier inside AgentMBX.app, if installed (MBX_NOTIFIER overrides, e.g. for tests). */
 export function macNotifierPath(home = homedir(), env = process.env) {
     const candidates = [env.MBX_NOTIFIER, join(home, "Applications/AgentMBX.app/Contents/MacOS/agentmbx-notify"),
@@ -407,7 +452,7 @@ export async function dispatchWakes(node, now = Date.now()) {
             else if (s.cli === "opencode")
                 result = await wakeOpencode(s.session_id, text, { recheck });
             else if (s.cli === "kimi")
-                result = await wakeKimi(s, text, { recheck });
+                result = kimiDesktop(s.pid) ? await wakeKimiDesktop(s, text, { recheck }) : await wakeKimi(s, text, { recheck });
             else
                 continue;
             attempts++;

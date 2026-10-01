@@ -41,8 +41,8 @@ for (const hosted of [false, true]) for (const mixed of [false, true]) test(`doc
   const check = sessionReadiness(n, "kimi");
   if (hosted) {
     assert.equal(check.level, "warn");
-    assert.match(check.label, /1 hosted binding.*explicit session identity/);
-    assert.match(check.fix!, /provider integration/);
+    assert.match(check.label, /1 hosted conversation\(s\) not linked to their mbx server yet/);
+    assert.match(check.fix!, /bind ticket/);
     assert.doesNotMatch(check.fix!, /run the provider session-start hook/);
   } else if (!mixed) assert.match(check.fix!, /session-start hook/);
   assert.match(check.label, /receipt not tested/);

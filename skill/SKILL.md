@@ -152,6 +152,8 @@ It prints nothing for an unbound session; setup does not overwrite the owner's s
   exits with a no-body hint when mail that wants you arrives; its completion starts your next turn. Handle the mail,
   then start it again. With `MBX_SELF_WATCH=<minutes>` the session-start note asks for a `[mbx-watch]` CronCreate
   job instead (once; check CronList first).
+- Kimi desktop app and `kimi web`: woken through the app's local API. If an [mbx] note gives you a bind ticket, call
+  `mbx_whoami` with `bind` set to it once, before other mbx tools: that links this conversation to its mbx server.
 - No wake path at all: the user gets a desktop notification.
 
 ## The loop
