@@ -43,7 +43,7 @@ Start here
 
 Messages
   agentmbx send --as <agent> --to <a,b,role:x,*,owner> --subject "…" [-m "body" | --body-file f | stdin]
-           [--kind message|request|reply|status|decision|alert|task] [--reply-to <id>] [--needs-reply] [--ref path]…
+           [--kind message|request|reply|status|decision|alert|task] [--reply-to <id>] [--needs-reply] [--ref path]… [--new-mailbox]
   agentmbx replay [--cursor <token>] [--limit 50] [--max-bytes 65536] [--scan-limit 1000]
                   [--project <id> --project-host <host>] [--topic <tag>] [--thread <id>]
                   bounded read-only JSON; current provider lease required; bodies are data
@@ -221,7 +221,7 @@ async function run(argv) {
     const { values: o, positionals: pos } = parseArgs({ args: rest, allowPositionals: true, strict: cmd !== "hook" && cmd !== "mcp", options: {
             help: { type: "boolean", short: "h" }, force: { type: "boolean" },
             as: { type: "string" }, to: { type: "string" }, subject: { type: "string" }, m: { type: "string", short: "m" },
-            "body-file": { type: "string" }, kind: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" },
+            "body-file": { type: "string" }, kind: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" }, "new-mailbox": { type: "boolean" },
             ref: { type: "string", multiple: true }, all: { type: "boolean" }, json: { type: "boolean" }, note: { type: "string" },
             mailbox: { type: "string" }, limit: { type: "string" }, host: { type: "string" }, port: { type: "string" }, cli: { type: "string" }, session: { type: "string" }, caps: { type: "string" },
             ttl: { type: "string" }, bind: { type: "string" }, role: { type: "string" }, description: { type: "string" }, thread: { type: "string" }, from: { type: "string" }, check: { type: "boolean" }, yes: { type: "boolean", short: "y" },
@@ -461,8 +461,9 @@ async function run(argv) {
                 die("--subject is required");
             // Read external input before acquiring the lease's database lock.
             const body = str("m") ?? (str("body-file") ? readFileSync(str("body-file"), "utf8") : process.stdin.isTTY ? "" : readStdin());
-            if (!str("reply-to"))
-                assertKnownRecipients(node, (str("to") ?? "").split(",").map(s => s.trim()).filter(Boolean)); // T205
+            // T205: never create a mailbox by typo; --new-mailbox deliberately leaves mail for an agent that has not started yet
+            if (!str("reply-to") && !o["new-mailbox"])
+                assertKnownRecipients(node, (str("to") ?? "").split(",").map(s => s.trim()).filter(Boolean));
             const send = (from, unverified = false) => {
                 const reply = str("reply-to") ? node.read(str("reply-to"), from.split("@")[0]) : undefined;
                 return node.send({ from, to: (str("to") ?? die("--to is required")).split(",").map(s => s.trim()).filter(Boolean),

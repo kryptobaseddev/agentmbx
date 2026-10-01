@@ -103,3 +103,17 @@ test("a local name that never existed is refused with suggestions, and nothing i
   assert.deepEqual(suggestNames(n, "rev"), ["reviewer"]);
   assert.deepEqual(suggestNames(n, "zzzzzz"), []);
 });
+
+test("the CLI refuses a never-held name unless the owner deliberately creates the mailbox", async (t) => {
+  const { spawnSync } = await import("node:child_process");
+  const { n } = await world(t);
+  const cli = (...args: string[]) => spawnSync(process.execPath, [join(import.meta.dirname, "../bin/agentmbx.js"), ...args],
+    { encoding: "utf8", env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: n.home, MBX_NO_DESKTOP: "1", MBX_AGENT: "" } });
+  const refused = cli("send", "--as", "shell-boss", "--to", "later-agent", "--subject", "s", "-m", "b");
+  assert.equal(refused.status, 1); assert.match(refused.stderr, /not sent: "later-agent" is not an agent/);
+  const made = cli("send", "--as", "shell-boss", "--to", "later-agent", "--new-mailbox", "--subject", "s", "-m", "b", "--json");
+  assert.equal(made.status, 0, made.stderr);
+  const r = JSON.parse(made.stdout) as SendOut;
+  assert.equal(byAddr(r, "later-agent@alpha").state, "offline");
+  assert.equal(n.inbox("later-agent").length, 1);
+});
