@@ -60,7 +60,7 @@ const resolveName = async (name) => (await lookup(name, { all: true })).map((r) 
 export const selfAddrs = (node, ifaces = networkInterfaces()) => process.env.MBX_SELF_ADDRS ? process.env.MBX_SELF_ADDRS.split(",").filter(Boolean)
     : announcedIPv4(ifaces).map((ip) => joinAddr(ip, node.config.port));
 /** Container bridges and VPN tunnels: not where a LAN peer can reach us. */
-const VIRTUAL_IFACE = /^(docker|br-|veth|virbr|podman|cni|flannel|utun|tun|tap)/i;
+const VIRTUAL_IFACE = /^(docker|br-|bridge|vmnet|veth|virbr|podman|cni|flannel|utun|tun|tap|awdl|llw|anpi)/i; // bridge/vmnet: macOS VM and container hosts
 /** Non-internal IPv4 addresses worth announcing: physical interfaces first; virtual ones only when nothing else is
  *  left, so a VPN-only host still announces something. */
 export function announcedIPv4(ifaces) {

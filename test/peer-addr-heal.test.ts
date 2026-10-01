@@ -175,5 +175,7 @@ test("announced addresses skip container bridges and VPN tunnels, but never anno
   assert.deepEqual(announcedIPv4({ wlo1: nic("10.0.10.136"), docker0: nic("172.17.0.1"), "br-1a2b": nic("172.20.0.1"), veth9: nic("172.20.0.5"),
     virbr0: nic("192.168.122.1"), podman0: nic("10.88.0.1"), utun3: nic("100.64.0.2"), tun0: nic("10.8.0.2"), lo: [{ address: "127.0.0.1", family: "IPv4", internal: true }] as never }), ["10.0.10.136"]);
   assert.deepEqual(announcedIPv4({ utun3: nic("100.64.0.2"), lo: [{ address: "127.0.0.1", family: "IPv4", internal: true }] as never }), ["100.64.0.2"], "VPN-only host still announces");
+  // the MacBook's real table (OrbStack/VM bridges): only en0 is reachable from the LAN
+  assert.deepEqual(announcedIPv4({ en0: nic("10.0.10.42"), bridge100: nic("192.168.139.3"), bridge101: nic("192.168.97.0"), vmnet8: nic("172.16.1.1") }), ["10.0.10.42"]);
   assert.deepEqual(announcedIPv4({}), []);
 });
