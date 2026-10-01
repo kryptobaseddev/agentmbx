@@ -630,6 +630,8 @@ export async function runMcp(existing?: MbxNode) {
       owner_grant: s.grant ? { caps: s.grant.caps, expires: s.grant.exp } : null, delivery: node.deliveryMode(agent), unread: node.unreadCount(agent),
       policies: activePolicies(node.store.db, agent, node.host).map((p) => ({ id: p.id, level: p.level, classes: p.classes, from: p.from, projects: p.projects ?? null, expires: p.exp })),
       version: version(), update_available: updateAvailable(node.store),
+      // Answered by the old build during a handover: the new build's version and delivery show from the next call.
+      ...(handedOver ? { switching: "a newer agentmbx is installed: this server hands over to it after this call. Call mbx_whoami again for its version and delivery mode." } : {}),
       ...(state.recoveryIdentity && state.recoveryIdentity !== agent ? { recovery: { identity: state.recoveryIdentity,
         reason: "previous identity has another holder", next: "Use mbx_identity list to inspect ownership. The previous holder must release, or the owner must approve takeover, before this session can release its temporary identity and claim that mailbox." } } : {}) };
     return text(JSON.stringify(out, null, 2), out);
