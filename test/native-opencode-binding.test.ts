@@ -96,8 +96,15 @@ test("binding inspection requires a real MCP lease and exact session metadata", 
     env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: state.home, MBX_AGENT: "opencode-native", MBX_CLI: "opencode", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
   await client.callTool({ name: "mbx_whoami", arguments: {} });
   assert.equal(inspectBinding(state).verified, false, "provisional transport is not a native session");
+  // T204: a native session is unbound until it chooses an identity; an unbound session has no binding to verify.
+  const unbound = await client.callTool({ name: "mbx_whoami", arguments: {}, _meta: { "ai.opencode/sessionID": state.sessionId } });
+  assert.equal((unbound.structuredContent as { agent: string | null }).agent, null);
+  assert.equal(inspectBinding(state).verified, false, "an unbound native session is not verified");
+  const registered = await client.callTool({ name: "mbx_identity", arguments: { action: "register", name: "opencode-binding", role: "builder" }, _meta: { "ai.opencode/sessionID": state.sessionId } });
+  assert.notEqual(registered.isError, true, JSON.stringify(registered));
   const who = await client.callTool({ name: "mbx_whoami", arguments: {}, _meta: { "ai.opencode/sessionID": state.sessionId } });
   assert.notEqual(who.isError, true);
+  assert.equal((who.structuredContent as { agent: string }).agent, "opencode-binding");
   const proof = inspectBinding(state);
   assert.equal(proof.verified, true);
   assert.equal(proof.agent, (who.structuredContent as { agent: string }).agent);

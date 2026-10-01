@@ -40,7 +40,8 @@ for (const cli of ["claude", "codex", "opencode"]) test(`${cli} build handover f
   const names: string[] = [], pending: string[] = [];
   for (const [i, sid] of ids.entries()) {
     const name = `handoff-${i}`;
-    assert.notEqual((await call(sid, "mbx_whoami", { name })).isError, true);
+    // Claude renames its launch identity; a shared-transport session (unbound until it chooses, T204) registers one.
+    assert.notEqual((await call(sid, "mbx_whoami", { name, role: "builder" })).isError, true);
     names.push(name);
     pending.push(node.send({ from: "sender", to: [name], subject: "preserved", body: "history" }).envelope.id);
   }

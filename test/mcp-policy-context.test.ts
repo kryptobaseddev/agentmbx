@@ -29,7 +29,10 @@ for (const cli of ["codex", "opencode", "claude", "kimi"]) test(`${cli} initiali
   assert.match(instructions, /mbx_whoami/);
   const meta = cli === "codex" ? { threadId: "01a0e578-d883-7e93-92e3-fbef626be300" } : { sessionID: "ses_scoped" };
   const who = async () => (await c.callTool({ name: "mbx_whoami", arguments: {}, _meta: meta })).structuredContent as { agent: string; policies: { id: string }[] };
-  const before = await who(); assert.notEqual(before.agent, "provisional"); assert.deepEqual(before.policies, []);
+  // T204: a session of a shared transport starts unbound; it never inherits the transport's identity or policies.
+  const unbound = await who(); assert.equal(unbound.agent, null); assert.equal(unbound.policies, undefined);
+  assert.notEqual((await c.callTool({ name: "mbx_identity", arguments: { action: "register", name: "scoped", role: "builder" }, _meta: meta })).isError, true);
+  const before = await who(); assert.equal(before.agent, "scoped"); assert.deepEqual(before.policies, []);
   const ownPolicy = grant(before.agent, "collaborate");
   assert.deepEqual((await who()).policies.map(p => p.id), [ownPolicy]);
   const base = (await c.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { policies: { id: string }[] };

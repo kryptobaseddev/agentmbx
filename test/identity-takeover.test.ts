@@ -108,6 +108,8 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI owne
   await client.connect(transport);
   const meta = cli === "codex" ? { threadId: "44444444-4444-4444-8444-444444444444" } : cli === "opencode" ? { sessionID: "ses_takeover" } : undefined;
   const call = (name: string, args: Record<string,unknown> = {}) => client.callTool({ name, arguments: args, ...(meta ? { _meta: meta } : {}) });
+  // A shared transport's session starts unbound and registers its own identity (T204); MBX_AGENT names only the transport.
+  if (meta) assert.notEqual((await call("mbx_identity", { action: "register", name: "session-destination", role: "destination" })).isError, true);
   const me = (await call("mbx_whoami")).structuredContent as { agent: string };
   const sid = node.store.db.prepare("SELECT session_id FROM sessions WHERE agent=? AND session_key IS NOT NULL").get(me.agent)!.session_id as string;
   const history = node.send({ from: "sender", to: ["occupied"], subject: "history", body: "kept" }).envelope.id;
@@ -135,7 +137,11 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI owne
   const restored = node.store.db.prepare("SELECT token,released_at FROM identity_leases WHERE name='occupied'").get()!;
   assert.equal(restored.token, old); assert.equal(restored.released_at, null);
   assert.equal(node.store.get(`identity-takeover-used:${receipt.approval.payload.id}`), undefined);
-  assert.equal((await call("mbx_whoami")).isError, true, "failed takeover restores the destination's detached in-memory state");
+  // Failed takeover restores the destination's detached in-memory state: still released, holding nothing.
+  const detached = (await call("mbx_whoami")).structuredContent as { agent: string | null; next: string };
+  assert.equal(detached.agent, null, "failed takeover restores the destination's detached in-memory state");
+  assert.match(detached.next, /released its identity/);
+  assert.equal((await call("mbx_inbox")).isError, true, "a released destination still has no mailbox tools");
   assert.equal((await call("mbx_identity", { action: "claim", name: "occupied" })).isError, true);
   assert.deepEqual(node.store.db.prepare("SELECT * FROM messages").all(), messages);
   const result = invoke(true); assert.equal(result.status, 0, result.stderr + result.stdout);

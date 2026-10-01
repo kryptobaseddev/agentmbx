@@ -64,8 +64,10 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) for (const changed of
   await client.connect(new StdioClientTransport({ command: process.execPath, args: ["--import", preload, join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_AGENT: "reader", MBX_CLI: cli, MBX_NO_DESKTOP: "1" } as Record<string, string> }));
   assert.equal(readFileSync(marker, "utf8"), "committed");
-  const identity = (await client.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent: string };
-  assert.match(identity.agent, /^reader-mcp-[a-f0-9]{16}$/);
+  // The ambiguous legacy holder is never adopted, and no substitute name is invented: the session stays unbound (T204).
+  const identity = (await client.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent: string | null; pending: string | null };
+  assert.deepEqual([identity.agent, identity.pending], [null, "reader"]);
+  assert.equal(node.store.db.prepare("SELECT COUNT(*) n FROM identity_leases").get()!.n, 0);
   assert.equal((await client.callTool({ name: "mbx_read", arguments: { ids: [id] } })).isError, true);
   assert.equal(node.inbox("reader")[0].id, id);
   assert.equal(node.store.db.prepare("SELECT 1 FROM identity_leases WHERE name='reader'").get(), undefined);

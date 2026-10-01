@@ -35,6 +35,10 @@ Release only when explicitly ending the session or handing it off, never after e
 The replacement claims the same persona; do not transfer lease credentials.
 
 A successful send means accepted, not recipient delivery, an answer or task completion.
+Its `recipients[]` says who will see it when: `live-wake`, `live-next-prompt`, `offline` (tell your user if it is urgent),
+`forwarded` or `remote`. A misspelled name is refused with suggestions; check `mbx_agents`.
+Later, `mbx_sent` shows what happened to your mail per recipient (delivered/notified/acked, their `did`, liveness),
+and `mbx_thread` shows the same under each message.
 Queued transport retry is separate from composing a draft; there is no mailbox draft API.
 Do not manually resend an uncertain send and create duplicates. Check for a thread reply
 and report delivery uncertainty instead of claiming completion.

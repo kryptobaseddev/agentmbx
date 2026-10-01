@@ -12,7 +12,8 @@ import { identityTakeoverApprovalSchema } from "./identity-takeover.js";
 import { SCHEMA_VERSION } from "./store.js";
 const pid = z.number().int().positive(), label = z.string().min(1).max(300);
 const descriptorSchema = z.object({ v: z.literal(1), cli: label, session_id: label, lease_session_id: label, control_key: label,
-    mcp_pid: pid, mcp_start: label, parent_pid: pid, parent_start: label, agent: z.string().regex(NAME_RE),
+    // "" = an unbound session (T204): reachable for owner claim/takeover, never matched as a mailbox holder.
+    mcp_pid: pid, mcp_start: label, parent_pid: pid, parent_start: label, agent: z.union([z.string().regex(NAME_RE), z.literal("")]),
     generation: z.string().regex(/^[a-f0-9]{64}$/).nullable() }).strict();
 const requestSchema = z.object({ v: z.literal(1), id: z.string().uuid(), action: z.enum(["claim", "release", "takeover"]),
     name: z.string().regex(NAME_RE).optional(), approval: identityTakeoverApprovalSchema.optional(), target: descriptorSchema, requester_pid: pid, requester_start: label,

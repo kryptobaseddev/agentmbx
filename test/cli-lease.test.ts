@@ -42,6 +42,8 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI guar
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "reader", MBX_CLI: cli, AGENTMBX_DEV: "1" } as Record<string,string> }));
   const meta = cli === "codex" ? { threadId: "55555555-5555-4555-8555-555555555555" } : cli === "opencode" ? { sessionID: "ses_clilease" } : undefined;
   const call = (name: string, args: Record<string,unknown> = {}) => client.callTool({ name, arguments: args, ...(meta ? { _meta: meta } : {}) });
+  // A shared transport's session starts unbound and registers its own identity (T204); MBX_AGENT names only the transport.
+  if (meta) assert.notEqual((await call("mbx_identity", { action: "register", name: "session-reader", role: "reader" })).isError, true);
   const me = (await call("mbx_whoami")).structuredContent as { agent: string };
   const sid = node.store.db.prepare("SELECT session_id FROM sessions WHERE agent=? AND session_key IS NOT NULL").get(me.agent)!.session_id as string;
   const selection = { cli, session: sid, as: me.agent };
@@ -92,6 +94,7 @@ test("shell names and historical links never establish CLI ownership", t => {
   }
   assert.equal(node.store.get("ident:offline"), undefined);
   assert.ok(node.store.db.prepare("SELECT 1 FROM audit WHERE event='identity.link.retired' AND json_extract(detail,'$.name')='offline'").get());
+  node.registerAgent("recipient"); // T205: sends need an existing recipient
   const sent = cliCommand(home, "send", "--as", "offline", "--to", "recipient", "--subject", "new", "-m", "unverified", "--json");
   assert.equal(sent.status, 0, sent.stderr);
   const row = node.message(JSON.parse(sent.stdout).id)!;

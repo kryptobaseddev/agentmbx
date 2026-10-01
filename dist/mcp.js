@@ -16,11 +16,14 @@ import { checkShape, KINDS, MAX_RELAY_DEPTH, NAME_RE } from "./envelope.js";
 import { kimiMultiHost } from "./kimi-web.js";
 import { BIND_TICKET_RE, takeBindTicket } from "./bind-ticket.js";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess } from "./identity-leases.js";
+import { activityKey, identityAvailability, parseActivity } from "./identity-availability.js";
+import { AUTO_NAME_RE, linkedKey, noteProject, projectOf, registeredIdentity, registerIdentity, renameRegistration, ROLE_RE, sessionHint, UNSPECIFIED_ROLE } from "./registry.js";
 import { applyIdentityTakeover } from "./identity-takeover.js";
 import { listIdentityStatus } from "./identity-status.js";
 import { consumeIdentityControl, identityControlAliases, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl } from "./identity-control.js";
 import { didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
 import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy.js";
+import { assertKnownRecipients, deliveryReceipts, offlineWarnings, receiptLine, recipientReceipts, sentPage } from "./receipts.js";
 import { procStart, withProcSnapshot } from "./proc.js";
 import { updateAvailable } from "./update.js";
 import { installKind, version } from "./version.js";
@@ -288,14 +291,19 @@ export async function runMcp(existing) {
             throw e;
         }
     }
+    // the project this session works in (not the home folder), stamped on what it sends and recorded per identity
+    let project = projectOf(process.cwd()); // a hosted conversation moves it to its own folder when it links (bind ticket)
     const env = detectHost();
     const detached = detachedReloadState(process.env);
-    // a re-exec child reclaims the name its parent released at handover, instead of minting a provisional one
-    const wanted = process.env[REEXEC_PARENT_AGENT] ?? agentName(process.cwd(), env.cli);
+    // Chosen identities only (T204): the launch config (MBX_AGENT) or the identity this provider session held before. A
+    // re-exec child reclaims the name its parent released at handover. Nothing else ever names a session.
+    const launch = process.env.MBX_AGENT ? agentName(process.cwd(), env.cli) : null;
+    const parentAgent = process.env[REEXEC_PARENT_AGENT] || null;
     const leases = new IdentityLeases(node.store, { idleTtlMs: process.env.MBX_IDENTITY_IDLE_TTL_MS === undefined ? undefined : Number(process.env.MBX_IDENTITY_IDLE_TTL_MS) });
     const holderStart = inspectLeaseProcess(process.pid).start;
-    const base = { agent: process.env.MBX_AGENT ? wanted : node.pickName(wanted, env.cli, env.ppid, env.sessionId),
-        sessionId: env.sessionId, key: generateKeyPair(), parent: null };
+    // One MCP process serving many conversations: the Codex/OpenCode transports and hosted Kimi (desktop app, kimi web).
+    const hosted = env.cli === "kimi" && kimiMultiHost(env.ppid);
+    const base = { agent: "", sessionId: env.sessionId, key: generateKeyPair(), parent: null };
     if (detached?.base.released) {
         base.agent = detached.base.agent;
         base.released = true;
@@ -304,6 +312,9 @@ export async function runMcp(existing) {
     const states = new Map();
     const requests = new AsyncLocalStorage();
     const current = () => requests.getStore() ?? base;
+    const bound = (state) => !!state.leaseToken && !state.released;
+    // A conversation of a shared provider process: its quiet lease may be claimed by another conversation (identity-availability.ts).
+    const sharedState = (state) => hosted || ((env.cli === "codex" || env.cli === "opencode") && state !== base);
     const legacyConflicts = new Set();
     const ambiguousLegacy = new Set();
     // Read the binding and its child generation in one SQLite snapshot, before bindSession can clean either up.
@@ -329,7 +340,7 @@ export async function runMcp(existing) {
         if (node.store.db.isTransaction)
             return leases.prepare([], [], operation); // requires the enclosing prepared scope
         const rows = !state.leaseToken || target ? node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions`).all() : [];
-        const names = new Set([state.agent, ...(target ? [target] : [])]);
+        const names = new Set([state.agent, ...(target ? [target] : [])].filter(Boolean));
         if (!state.leaseToken) {
             for (const row of rows.filter(r => r.cli === env.cli && r.pid === env.ppid)) {
                 const remembered = node.store.get(`name:${env.cli}:${row.session_id}`);
@@ -399,13 +410,26 @@ export async function runMcp(existing) {
             ambiguousLegacy.add(agent);
         throw Object.assign(new Error(`identity ${agent} has unresolved legacy session holders; choose a distinct identity`), { code: "IDENTITY_IN_USE" });
     };
-    const claimFor = (state, agent) => {
+    /** Mark this session's own mbx activity on its identity: a quiet shared-process conversation can be claimed (R4). */
+    const touch = (state, force = false) => {
+        if (!state.agent || !state.leaseToken)
+            return;
+        const now = Date.now();
+        if (!force && state.activityAt && now - state.activityAt < 30_000)
+            return;
+        state.activityAt = now;
+        try {
+            node.store.set(activityKey(state.agent), JSON.stringify({ at: now, shared: sharedState(state) }));
+        }
+        catch { /* advisory */ }
+    };
+    const claimFor = (state, agent, explicit) => {
         const evidence = { pid: process.pid, start: holderStart ?? "", keyFp: fingerprint(state.key.publicKey), cli: env.cli, sessionId: state.sessionId };
         try {
             return leases.claim(agent, evidence).token;
         }
         catch (e) {
-            const prior = node.store.db.prepare("SELECT token, holder_pid, holder_start, session_id, released_at FROM identity_leases WHERE name=?").get(agent);
+            const prior = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(agent);
             const action = leaseCollisionAction(e, prior, { pid: process.pid, start: holderStart ?? null, baseSessionId: env.sessionId, stateSessionId: state.sessionId });
             if (action === "adopt" && prior)
                 return prior.token;
@@ -413,47 +437,152 @@ export async function runMcp(existing) {
                 leases.release(agent, prior.token);
                 return leases.claim(agent, evidence).token;
             }
-            throw e;
+            if (e.code !== "IDENTITY_IN_USE" || !prior || prior.released_at !== null)
+                throw e;
+            // The same availability answer the list shows (R4.3): an older process of this same session, or (explicit claims
+            // only) a conversation of a shared provider process that has gone quiet.
+            const a = identityAvailability({ lease: prior, evidence: leases.processEvidence(prior.holder_pid), activity: parseActivity(node.store.get(activityKey(agent))),
+                now: Date.now(), caller: { cli: env.cli, sessionId: state.sessionId } });
+            if (a.takeover === "same-session" || (explicit && a.takeover === "idle-conversation")) {
+                leases.release(agent, prior.token);
+                node.store.audit("identity.takeover", { name: agent, kind: a.takeover, previous: { cli: prior.cli, session: prior.session_id, pid: prior.holder_pid }, by: { cli: env.cli, session: state.sessionId } });
+                return leases.claim(agent, evidence).token;
+            }
+            throw Object.assign(new Error(`identity ${agent} is not available: ${a.reason}. The finishing holder must call mbx_identity release before ending; `
+                + "then claim this name. Closing a hosted conversation may leave its shared MCP process running. If the holder cannot release, the owner can use agentmbx identity takeover."), { code: "IDENTITY_IN_USE" });
         }
     };
-    const bind = (state = base, initial = false) => prepareState(state, undefined, () => {
+    const bind = (state, explicit = false) => prepareState(state, undefined, () => {
         const result = node.store.tx(() => {
             if (state.leaseToken)
                 leases.renew(state.agent, state.leaseToken);
             // Snapshot before bindSession can replace or consolidate any rows.
             const legacy = state.leaseToken ? [] : node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions`).all();
             const agent = node.bindSession({ agent: state.agent, cli: env.cli, session_id: state.sessionId, cwd: process.cwd(), pid: env.ppid,
-                session_key: state.key.publicKey, channel: env.channel || env.socket, mcp_pid: process.pid, restore_name: initial && !process.env.MBX_AGENT });
-            if (state.leaseToken && agent !== state.agent)
+                session_key: state.key.publicKey, channel: env.channel || env.socket, mcp_pid: process.pid });
+            if (agent !== state.agent)
                 throw new Error("bound identity changed outside a lease rename");
             if (!state.leaseToken)
                 checkLegacy(agent, state, legacy);
-            const leaseToken = state.leaseToken ?? claimFor(state, agent);
+            const leaseToken = state.leaseToken ?? claimFor(state, agent, explicit);
             node.registerAgent(agent, { cli: env.cli, role: process.env.MBX_ROLE, description: process.env.MBX_DESCRIPTION });
+            noteProject(node.store, agent, project);
             publishControl({ ...state, agent, leaseToken });
             return { agent, leaseToken };
         });
         Object.assign(state, result);
     });
+    /** Claim `name` for this session; on failure the session stays unbound and keeps `name` pending. Never another name. */
+    const resume = (state, name, o = {}) => {
+        const before = { agent: state.agent, leaseToken: state.leaseToken };
+        state.agent = name;
+        state.leaseToken = undefined;
+        try {
+            bind(state, !!o.explicit);
+            if (o.launch && !registeredIdentity(node.store, name))
+                registerIdentity(node.store, { name, role: process.env.MBX_ROLE || UNSPECIFIED_ROLE, description: process.env.MBX_DESCRIPTION, by: `${env.cli}:launch` });
+            state.released = false;
+            state.pending = undefined;
+            state.pendingReason = undefined;
+            state.lostTo = undefined;
+            touch(state, true);
+            return true;
+        }
+        catch (error) {
+            Object.assign(state, before.leaseToken ? before : { agent: "", leaseToken: undefined });
+            if (o.explicit)
+                throw error;
+            const code = error.code;
+            if (code === "IDENTITY_IN_USE")
+                for (const n of ambiguousLegacy)
+                    node.store.set(`identity-conflict:${n}`, JSON.stringify({ reason: "ambiguous legacy sessions", at: new Date().toISOString() }));
+            state.pending = name;
+            state.pendingReason = error.message;
+            return false;
+        }
+    };
+    /** The identity this session held before: by its provider session id, or by the session its own hooks reported. */
+    const rememberedName = (state) => {
+        if (!state.sessionId.startsWith("mcp-"))
+            return node.store.get(`name:${env.cli}:${state.sessionId}`) ?? null;
+        // A provisional id (terminal Kimi, a Claude session file not written yet): the provider's own hooks know the real
+        // session of this parent process, from a verified hook binding (exactly one) or a session hint. Hosted processes
+        // serve many conversations and link by bind ticket; shared transports name sessions per call.
+        if (state !== base || hosted)
+            return null;
+        const rows = node.store.db.prepare("SELECT session_id,pid_start,updated_at FROM sessions WHERE cli=? AND pid=? AND session_id NOT GLOB 'mcp-*'").all(env.cli, env.ppid).filter(r => node.sameSession(env.ppid, r, { proof: true }));
+        const real = new Set(rows.map(r => r.session_id));
+        const hint = real.size === 1 ? [...real][0] : real.size || env.cli === "codex" || env.cli === "opencode" ? null
+            : sessionHint(node.store, env.cli, env.ppid, leases.processEvidence(env.ppid).start);
+        if (!hint)
+            return null;
+        const name = node.store.get(`name:${env.cli}:${hint}`);
+        if (name)
+            state.sessionId = hint;
+        return name ?? null;
+    };
+    /** Retry a pending resume (or learn the remembered identity from a later hook); quiet unless it succeeds. */
+    const retryResume = (state) => {
+        if (bound(state) || state.released || state.lostTo)
+            return;
+        const name = state.pending ?? rememberedName(state);
+        if (!name || legacyConflicts.has(name) || node.store.get(`identity-conflict:${name}`))
+            return;
+        try {
+            if (resume(state, name))
+                process.stderr.write(`[mbx] resumed identity ${name}@${node.host}\n`);
+        }
+        catch (e) {
+            process.stderr.write(`[mbx] resume of ${name} failed: ${e.message}\n`);
+        }
+    };
+    /**
+     * Before a mailbox tool: keep this session's own identity. A lease that expired while the process was suspended (or a
+     * quiet conversation idled out) is silently re-claimed when nobody else took it; a name another session explicitly
+     * claimed is not taken back.
+     */
+    const ensureLease = (state) => {
+        if (!state.leaseToken || state.released)
+            return retryResume(state);
+        const row = node.store.db.prepare("SELECT token,released_at,release_reason,cli,session_id,heartbeat_at,idle_ttl FROM identity_leases WHERE name=?").get(state.agent);
+        const now = Date.now();
+        if (row && row.token === state.leaseToken && row.released_at === null && now - row.heartbeat_at < row.idle_ttl) {
+            touch(state);
+            return;
+        }
+        const name = state.agent;
+        if (row && row.token !== state.leaseToken && (row.released_at === null || row.release_reason === "released")) {
+            state.leaseToken = undefined;
+            state.agent = "";
+            state.lostTo = row.released_at === null ? `${row.cli} session ${row.session_id}` : "an owner release";
+            state.pending = name;
+            return;
+        }
+        state.leaseToken = undefined;
+        resume(state, name);
+    };
+    const initial = parentAgent ?? launch ?? rememberedName(base);
     try {
         if (base.released)
             prepareState(base, undefined, () => publishControl(base));
-        else
-            bind(base, true);
+        // bind() prepares its own process evidence once: an outer preparation would re-read bindings after a concurrent change.
+        else if (initial)
+            resume(base, initial, { launch: !parentAgent && !!launch });
     }
     catch (error) {
-        if (error.code !== "IDENTITY_IN_USE")
-            throw error;
-        // Keep ambiguity after old session rows migrate away. Resolving historical ownership is
-        // an explicit recovery operation, not a side effect of opening another MCP connection.
-        for (const name of ambiguousLegacy)
-            node.store.set(`identity-conflict:${name}`, JSON.stringify({ reason: "ambiguous legacy sessions", at: new Date().toISOString() }));
-        // Keep tools available on every provider without taking another holder's history. The
-        // fresh key suffix cannot accidentally recover a provisional mailbox through PID reuse.
-        base.recoveryIdentity = base.agent;
-        base.agent = `${wanted.slice(0, 19)}-mcp-${fingerprint(base.key.publicKey).replaceAll("-", "")}`;
-        bind(base);
+        // Keep the tools reachable: the session stays unbound with the name pending, never on a substitute name.
+        base.agent = "";
+        base.leaseToken = undefined;
+        base.pending = initial ?? undefined;
+        base.pendingReason = error.message;
+        process.stderr.write(`[mbx] could not resume ${initial}: ${error.message}\n`);
     }
+    // An unbound session stays reachable for the owner's CLI (identity claim/takeover --cli --session).
+    if (!bound(base) && !base.released)
+        try {
+            prepareState(base, undefined, () => publishControl(base));
+        }
+        catch { /* evidence unavailable: retried by later binds */ }
     const contextFor = (extra) => {
         if (env.cli !== "opencode" && env.cli !== "codex")
             return base;
@@ -465,7 +594,7 @@ export async function runMcp(existing) {
         // Codex threadId is the resumable thread. Its sessionId is a distinct execution ID.
         const sid = env.cli === "codex" ? meta?.threadId : namespaced !== undefined ? namespaced : documented;
         if (sid === undefined)
-            return base; // non-session provider calls keep their provisional mailbox
+            return base; // non-session provider calls use the transport's own (launch-configured) identity
         const valid = env.cli === "codex" ? /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i : /^ses_[a-zA-Z0-9]{1,128}$/;
         if (typeof sid !== "string" || !valid.test(sid))
             throw new Error(`Invalid ${env.cli} session identity metadata`);
@@ -478,35 +607,15 @@ export async function runMcp(existing) {
                 states.set(sid, state);
                 return state;
             }
-            // A service process and transport can serve many sessions. Never reuse its default
-            // mailbox/key or choose the latest session by directory. Metadata grants no authority.
-            const suffix = createHash("sha256").update(sid).digest("hex").slice(0, 10);
-            const fallback = `${wanted.slice(0, 29)}-${suffix}`;
+            // A service process and transport serve many sessions: each resumes only its own remembered identity, never the
+            // transport's or another thread's. Metadata grants no authority; the lease does.
+            state = { agent: "", sessionId: sid, key: generateKeyPair(), parent: null };
             const remembered = node.store.get(`name:${env.cli}:${sid}`);
-            // A row bound with THIS process's base key is our own provisional binding, not another live
-            // session: excluding it lets the claim below adopt the name through the intra-process transfer
-            // (claimFor releases our base's lease and re-claims for the real session).
-            const occupied = (name) => node.store.db.prepare("SELECT pid,pid_start,updated_at FROM sessions WHERE agent=? AND (cli<>? OR session_id<>?) AND session_key<>?")
-                .all(name, env.cli, sid, base.key.publicKey)
-                .some(r => r.pid && node.sameSession(r.pid, r, { proof: true }));
-            // Legacy Codex hooks may have saved the same default for several threads on a daemon.
-            // Recover a distinct name without moving any mail whose ownership is ambiguous.
-            const name = remembered && !legacyConflicts.has(remembered) && !node.store.get(`identity-conflict:${remembered}`) && !(env.cli === "codex" && occupied(remembered)) ? remembered : fallback;
-            state = { agent: name, sessionId: sid, key: generateKeyPair(), parent: null };
-            try {
-                if (occupied(name))
-                    throw Object.assign(new Error(`${env.cli} mailbox ${name} belongs to another live session`), { code: "IDENTITY_IN_USE" });
-                bind(state);
-            }
-            catch (error) {
-                if (error.code !== "IDENTITY_IN_USE")
-                    throw error;
-                // A remembered identity may still be held by an older connector. Keep recovery
-                // controls reachable on a fresh identity without touching that holder or its mail.
-                state.recoveryIdentity = name;
-                state.agent = `${wanted.slice(0, 19)}-mcp-${fingerprint(state.key.publicKey).replaceAll("-", "")}`;
-                bind(state);
-            }
+            const s = state;
+            if (remembered && !legacyConflicts.has(remembered) && !node.store.get(`identity-conflict:${remembered}`))
+                resume(s, remembered);
+            if (!bound(s))
+                prepareState(s, undefined, () => publishControl(s));
             const raced = states.get(sid); // a concurrent first call may have registered its state first
             if (raced)
                 return raced;
@@ -514,15 +623,6 @@ export async function runMcp(existing) {
         }
         return state;
     };
-    // the project this session works in (not the home folder), stamped on what it sends
-    const projectOf = (d) => { if (resolve(d) === resolve(homedir()) || d === "/")
-        return undefined; try {
-        return realpathSync(d);
-    }
-    catch {
-        return d;
-    } };
-    let project = projectOf(process.cwd()); // a hosted conversation moves it to its own folder when it links (bind ticket)
     // relay tracking: a message this session sends after reading one is one hop further, and inherits an external origin
     const noteRead = (rows) => {
         const state = current(), { agent } = state;
@@ -562,12 +662,24 @@ export async function runMcp(existing) {
     // Initialization belongs to the transport, before per-call metadata identifies its thread.
     // Never present the provisional mailbox's identity or policy as authority for every caller.
     const shared = env.cli === "codex" || env.cli === "opencode";
-    const renamed = !shared && agent !== wanted ? `[mbx] This session is ${agent}@${node.host} (default name: "${wanted}"). Pick a clearer name with mbx_whoami {"name": ...} if you like.` : null;
+    const unboundNote = !shared && !agent
+        ? `[mbx] ${base.pending ? `This session's identity ${base.pending} is held by another session (${base.pendingReason}); it resumes automatically once that holder ends.` : "This session has no mailbox identity yet."} If you will message other agents: call mbx_identity {"action":"list"} for this project's agents (role, live or offline, unread), then claim yours or register one with a name and role. Never invent a random name.`
+        : null;
     const delegation = shared
         ? "[mbx] This transport can serve multiple sessions. Call mbx_whoami for your current mailbox identity and owner-signed policies. Read each mbx_read header for the policy that applies to that message; another mailbox's grant does not authorize this session."
-        : delegationNote(node.store.db, agent, node.host);
-    const extra = [renamed, delegation, noPush(env.cli, env.channel || env.socket, env.cli === "kimi" && kimiMultiHost(env.ppid))
+        : agent ? delegationNote(node.store.db, agent, node.host) : null;
+    const extra = [unboundNote, delegation, agent && noPush(env.cli, env.channel || env.socket, hosted)
             ? selfWatchInstruction({ delegated: activePolicies(node.store.db, agent, node.host).length > 0, cli: env.cli }) : null].filter(Boolean).join("\n");
+    /** Why an ordinary mailbox tool can't run yet, and the exact next step (R1.4). */
+    const unboundMessage = (state) => {
+        if (state.lostTo)
+            return `This session lost its identity lease for ${state.pending}: ${state.lostTo} claimed it. It is not taken back automatically: call mbx_identity {"action":"list"} and claim another identity, or ask your user.`;
+        if (state.released)
+            return `This session released its identity${state.agent ? ` ${state.agent}` : ""}. Claim one with mbx_identity {"action":"claim","name":"<name>"} (see {"action":"list"}).`;
+        if (state.pending)
+            return `This session's identity ${state.pending} is not available yet: ${state.pendingReason ?? "another session holds it"}. It resumes automatically once that holder ends. Check with mbx_identity {"action":"list"}.`;
+        return `This session has no mbx identity yet. Call mbx_identity {"action":"list"} to see this project's agents, then claim yours ({"action":"claim","name":"<name>"}) or register one ({"action":"register","name":"<project>-<role>","role":"<role>"}).`;
+    };
     const session = () => {
         const { key } = current();
         const row = node.store.db.prepare("SELECT grant FROM grants WHERE sub=? AND revoked=0 AND exp>? ORDER BY exp DESC LIMIT 1")
@@ -587,8 +699,9 @@ export async function runMcp(existing) {
             const row = node.store.db.prepare("SELECT token,released_at FROM identity_leases WHERE name=?").get(state.agent);
             return row?.token === state.leaseToken && row.released_at === null;
         };
-        return { base: { agent: base.agent, released: !held(base), aliases: identityControlAliases(node.store, fingerprint(base.key.publicKey)).map(d => d.session_id) },
-            sessions: [...states.values()].filter(s => !held(s)).map(s => ({ sessionId: s.sessionId, agent: s.agent })) };
+        // An explicitly released identity stays released in the replacement; an unbound session simply resumes there.
+        return { base: { agent: base.agent, released: !!base.released || (!!base.agent && !!base.leaseToken && !held(base)), aliases: identityControlAliases(node.store, fingerprint(base.key.publicKey)).map(d => d.session_id) },
+            sessions: [...states.values()].filter(s => s.agent && (s.released || (s.leaseToken && !held(s)))).map(s => ({ sessionId: s.sessionId, agent: s.agent })) };
     };
     let handedOver = false;
     const tools = [];
@@ -614,7 +727,7 @@ export async function runMcp(existing) {
                 if (storeMismatchCode(e) && canReloadBuild(process.env, codeFingerprint(), boot)) {
                     const detached = detachedForReload();
                     retire();
-                    handOverToFreshProcess(false, base.agent, env.ppid, detached);
+                    handOverToFreshProcess(false, bound(base) ? base.agent : undefined, env.ppid, detached);
                 }
                 else
                     reloadFromDisk(e);
@@ -631,14 +744,25 @@ export async function runMcp(existing) {
                 setImmediate(() => {
                     const detached = detachedForReload();
                     retire();
-                    handOverToFreshProcess(true, base.agent, env.ppid, detached);
+                    handOverToFreshProcess(true, bound(base) ? base.agent : undefined, env.ppid, detached);
                 });
             }
-            const state = contextFor(a[1]), before = { agent: state.agent, leaseToken: state.leaseToken, released: state.released, parent: state.parent, sessionId: state.sessionId };
+            const state = contextFor(a[1]);
+            // Identity tools work for an unbound session (they are how it gets one); everything else needs this session's own lease.
+            const identityTool = name === "mbx_identity" || name === "mbx_whoami" || name === "mbx_agents";
+            if (!identityTool) {
+                withProcSnapshot(() => ensureLease(state));
+                if (!bound(state))
+                    return { ...text(unboundMessage(state)), isError: true };
+            }
+            else if (!bound(state))
+                withProcSnapshot(() => retryResume(state));
+            const before = { agent: state.agent, leaseToken: state.leaseToken, released: state.released, parent: state.parent, sessionId: state.sessionId,
+                pending: state.pending, pendingReason: state.pendingReason, lostTo: state.lostTo };
             try {
                 // Recovery controls must remain callable after lease loss. Each mutation below performs
                 // its own generation check; ordinary tools still require the current holder's lease.
-                if (name === "mbx_identity")
+                if (name === "mbx_identity" || (identityTool && !bound(state)))
                     return withProcSnapshot(() => prepareState(state, a[0]?.name, () => requests.run(state, () => cb(...a))));
                 // These handlers only query SQLite. mbx_read advances delivery state despite its
                 // readOnlyHint, and whoami can rename, so neither belongs in this snapshot set.
@@ -657,26 +781,29 @@ export async function runMcp(existing) {
             }
         });
     };
-    const handoff = (agent) => ({ agent, address: `${agent}@${node.host}`, unread: node.unreadCount(agent),
+    const handoff = (agent) => ({ agent, address: `${agent}@${node.host}`, role: registeredIdentity(node.store, agent)?.role ?? null, unread: node.unreadCount(agent),
         open_threads: Number(node.store.db.prepare("SELECT COUNT(DISTINCT m.thread) n FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state<>'acked'").get(agent).n),
         recent_notes: node.store.db.prepare("SELECT msg_id,note,updated_at FROM deliveries WHERE agent=? AND note IS NOT NULL ORDER BY updated_at DESC LIMIT 3").all(agent) });
-    const identityOperation = ({ action, name, approval, target: controlTarget }) => {
+    const identityOperation = ({ action, name, role, description, all, approval, target: controlTarget }) => {
         const state = current();
         if (action === "takeover") {
             if (!name || !approval || approval.payload.name !== name || !controlTarget)
                 throw new Error("takeover requires exact owner approval");
-            if (!state.released || state.leaseToken)
+            if (bound(state))
                 throw new Error("release the current identity before takeover");
-            const descriptor = controlDescriptor(state, controlTarget.session_id);
+            const descriptor = controlDescriptor({ ...state, agent: state.agent || name }, controlTarget.session_id);
             if (!descriptor)
                 throw new Error("takeover destination process evidence is unavailable");
             return applyIdentityTakeover(node, leases, approval, descriptor, () => identityOperation({ action: "claim", name }));
         }
-        if (action !== "claim" && name)
-            throw new Error("name is only valid for identity claim");
+        if (action !== "claim" && action !== "register" && (name || role || description))
+            throw new Error("name, role and description are only valid for claim and register");
         if (action === "list") {
-            const result = listIdentityStatus(node.home);
-            return text(JSON.stringify(result, null, 2), result);
+            const result = listIdentityStatus(node.home, { project: all ? undefined : project, caller: { cli: env.cli, sessionId: state.sessionId } });
+            const out = { ...result, you: bound(state) ? { agent: state.agent, address: `${state.agent}@${node.host}` } : { agent: null, pending: state.pending ?? null, reason: state.lostTo ?? state.pendingReason ?? null },
+                next: bound(state) ? "This session already holds an identity; release it before claiming another."
+                    : `Claim one with claimable true ({"action":"claim","name":"<name>"}), or register a new identity ({"action":"register","name":"<project>-<role>","role":"<role>"}).${!all ? " Pass all:true for every identity on this host." : ""}` };
+            return text(JSON.stringify(out, null, 2), out);
         }
         if (action === "release") {
             const released = node.store.tx(() => {
@@ -684,6 +811,7 @@ export async function runMcp(existing) {
                 const bindings = node.store.db.prepare("SELECT session_id FROM sessions WHERE cli=? AND session_key=?").all(env.cli, state.key.publicKey);
                 for (const binding of bindings)
                     node.store.db.prepare("DELETE FROM kv WHERE k=? AND v=?").run(`name:${env.cli}:${binding.session_id}`, state.agent);
+                node.store.db.prepare("DELETE FROM kv WHERE k=? AND v=?").run(`name:${env.cli}:${state.sessionId}`, state.agent);
                 node.store.db.prepare("DELETE FROM sessions WHERE cli=? AND session_key=?").run(env.cli, state.key.publicKey);
                 node.store.db.prepare("DELETE FROM kv WHERE k=?").run(`mcp-process:${state.key.publicKey}`);
                 publishControl({ ...state, leaseToken: undefined, released: true });
@@ -692,14 +820,34 @@ export async function runMcp(existing) {
             state.leaseToken = undefined;
             state.released = true;
             state.parent = null;
-            return text("Identity detached. Mail is preserved; explicitly claim an identity to resume mailbox tools.", { agent: state.agent, released, detached: true });
+            state.pending = undefined;
+            state.pendingReason = undefined;
+            state.lostTo = undefined;
+            return text("Identity detached. Mail is preserved; explicitly claim an identity to resume mailbox tools.", { agent: state.agent || null, released, detached: true });
         }
-        const target = name ?? state.agent;
-        if (state.leaseToken) {
+        const target = name ?? state.pending ?? (state.agent || undefined);
+        if (!target)
+            throw Object.assign(new Error(`name is required: see mbx_identity {"action":"list"}`), { code: "IDENTITY_NAME_REQUIRED" });
+        if (!NAME_RE.test(target))
+            throw new Error(`invalid identity name "${target}" (2-40 characters: a-z, 0-9, -)`);
+        const registration = registeredIdentity(node.store, target);
+        if (action === "register" && registration)
+            throw Object.assign(new Error(`${target} is already registered (role ${registration.role}); resume it with {"action":"claim","name":"${target}"}`), { code: "IDENTITY_REGISTERED" });
+        if (!registration && (action === "register" || !AUTO_NAME_RE.test(target))) {
+            // A new identity is chosen deliberately: a readable name and a role (R1.6). Older auto-generated mailboxes may
+            // still be claimed without one, to read their mail.
+            if (AUTO_NAME_RE.test(target))
+                throw Object.assign(new Error(`"${target}" looks auto-generated; register a readable name such as <project>-<role>`), { code: "IDENTITY_NAME_UNREADABLE" });
+            if (!role)
+                throw Object.assign(new Error(`${target} is not a registered identity yet: pass role (e.g. lead, reviewer, builder) to ${action} it`), { code: "IDENTITY_ROLE_REQUIRED" });
+        }
+        if (state.leaseToken && !state.released) {
             try {
                 return leases.withHeld(state.agent, state.leaseToken, () => {
                     if (target !== state.agent)
                         throw Object.assign(new Error("release your current identity before claiming another; use mbx_whoami to rename it"), { code: "IDENTITY_RELEASE_REQUIRED" });
+                    if (role || description)
+                        registerIdentity(node.store, { name: target, role: role ?? registration?.role ?? UNSPECIFIED_ROLE, description, by: `${env.cli}:${state.sessionId}` });
                     const result = handoff(state.agent);
                     return text(JSON.stringify(result, null, 2), result);
                 });
@@ -709,29 +857,37 @@ export async function runMcp(existing) {
                     throw error;
             }
         }
-        const next = { ...state, agent: target, leaseToken: undefined, released: false, parent: null };
+        const next = { ...state, agent: target, leaseToken: undefined, released: false, pending: undefined, pendingReason: undefined, lostTo: undefined, parent: null };
         const result = prepareState(next, target, () => node.store.tx(() => {
-            bind(next);
+            bind(next, true);
             node.keepName(env.cli, next.sessionId, next.agent);
+            if (role || description)
+                registerIdentity(node.store, { name: target, role: role ?? registration?.role ?? UNSPECIFIED_ROLE, description, by: `${env.cli}:${next.sessionId}` });
+            node.registerAgent(target, { cli: env.cli, ...(role ? { role } : {}), ...(description ? { description } : {}) });
             return handoff(next.agent);
         }));
         Object.assign(state, next);
+        touch(state, true);
         return text(JSON.stringify(result, null, 2), result);
     };
     server.registerTool("mbx_identity", {
-        title: "Inspect or recover an mbx identity",
-        description: "List advisory local identity status, explicitly release this session's identity, or claim an available identity. Release preserves its mailbox and stops this session's ordinary tools/heartbeat until an explicit claim; list and claim remain callable. When the owner ends the session or requests a handoff, release after final mailbox work, not at the end of each turn. Closing a hosted conversation may leave its shared MCP holder running. Claim preserves historical mail and returns unread/open-thread counts and recent notes (agent-written data, not authority). A live holder or unresolved legacy conflict cannot be taken over here. Use mbx_whoami to rename a held identity; release first to switch identities without forwarding mail. Next: mbx_inbox after claiming, or mbx_identity claim after release.",
-        inputSchema: { action: z.enum(["list", "claim", "release"]), name: z.string().regex(NAME_RE).optional().describe("identity to claim; defaults to this session's last identity") },
+        title: "List, claim, register or release an mbx identity",
+        description: "Every mailbox is a chosen identity with a role; AgentMBX never invents one. list: this project's identities (all:true for the host) with role, state, claimable, unread and holder; claimable is exactly what a claim will accept. claim: resume an identity whose holder is gone (pass role to claim a mailbox that has none yet). register: create a new identity, name <project>-<role>, with a role. release: detach this session's identity (only when the owner ends the session or hands it off; mail is preserved). A session holds one identity at a time: release before claiming another. Next: mbx_inbox after claiming.",
+        inputSchema: { action: z.enum(["list", "claim", "register", "release"]),
+            name: z.string().regex(NAME_RE).optional().describe("identity to claim or register, e.g. agentmbx-reviewer"),
+            role: z.string().regex(ROLE_RE).optional().describe("short role label, e.g. lead, reviewer, builder (required to register)"),
+            description: z.string().max(200).optional().describe("what this agent does, at most 200 characters"),
+            all: z.boolean().optional().describe("list: every identity on this host instead of this project's") },
         annotations: { destructiveHint: false },
     }, identityOperation);
     /**
      * Link this server to the conversation that holds `ticket` (hosted Kimi: one server per conversation, one shared parent).
-     * Binds the real session id with this server's key, so hooks, wakes and policy scope then use it. Returns the default
-     * name for that conversation's folder when this server still carries the name it derived from the plugin folder.
+     * From then on this server speaks for that conversation: it resumes the identity that conversation held before, or stays
+     * unbound until the conversation claims or registers one. A held identity is re-bound to the real session id.
      */
     const linkConversation = (state, ticket) => {
-        if (state !== base || base.released || !base.leaseToken)
-            throw new Error("bind needs this server's own held identity");
+        if (state !== base)
+            throw new Error("bind links this server's own conversation");
         const t = takeBindTicket(node.store, ticket, env.cli, env.ppid);
         if (!t)
             throw new Error("bind ticket is unknown, expired, or belongs to another app process; a new one comes with your next prompt");
@@ -740,68 +896,91 @@ export async function runMcp(existing) {
         }
         catch { /* the folder may be gone; the binding still records it */ }
         project = projectOf(t.cwd);
-        prepareState(base, undefined, () => node.store.tx(() => {
-            leases.renew(base.agent, base.leaseToken);
-            node.bindSession({ agent: base.agent, cli: env.cli, session_id: t.session_id, cwd: t.cwd, pid: env.ppid, session_key: base.key.publicKey, channel: false, mcp_pid: process.pid });
-            publishControl(base);
-        }));
-        node.store.audit("identity.bind-ticket", { agent: base.agent, cli: env.cli, session: t.session_id });
-        if (process.env.MBX_AGENT || !(base.agent === wanted || base.agent.startsWith(`${wanted.slice(0, 19)}-mcp-`)))
-            return undefined;
-        // the conversation's folder name, else a readable variant when another session holds it (a terminal in the same project)
-        const folder = agentName(t.cwd, env.cli).slice(0, 26), tag = createHash("sha256").update(t.session_id).digest("hex").slice(0, 4);
-        const held = (n) => !!node.store.db.prepare("SELECT 1 FROM identity_leases WHERE name=? AND released_at IS NULL").get(n);
-        return [folder, `${folder}-${env.cli}-app`, `${folder}-${env.cli}-${tag}`].find(n => NAME_RE.test(n) && n !== base.agent && !held(n));
+        node.store.set(linkedKey(env.cli, t.session_id), JSON.stringify({ at: new Date().toISOString(), mcp_pid: process.pid }));
+        if (bound(base)) {
+            prepareState(base, undefined, () => node.store.tx(() => {
+                leases.renew(base.agent, base.leaseToken);
+                node.bindSession({ agent: base.agent, cli: env.cli, session_id: t.session_id, cwd: t.cwd, pid: env.ppid, session_key: base.key.publicKey, channel: false, mcp_pid: process.pid });
+                noteProject(node.store, base.agent, project);
+                publishControl(base);
+            }));
+        }
+        else {
+            base.sessionId = t.session_id;
+            const remembered = node.store.get(`name:${env.cli}:${t.session_id}`);
+            if (remembered)
+                resume(base, remembered);
+        }
+        node.store.audit("identity.bind-ticket", { agent: base.agent || null, cli: env.cli, session: t.session_id });
     };
     server.registerTool("mbx_whoami", {
         title: "Who am I on mbx",
-        description: "Show this session's mbx identity (agent name, host, session key fingerprint, whether it holds an owner grant). Pass `name` to rename this session's agent (do it early if the default folder name is vague), `role`/`description` to describe it. Next: mbx_inbox for pending work; optionally mbx_replay with a saved cursor for bounded historical catch-up, or mbx_agents for peers.",
-        inputSchema: { name: z.string().regex(NAME_RE).optional().describe("new agent name, e.g. vida-dev"), role: z.string().max(40).optional(), description: z.string().max(200).optional().describe("brief agent description, at most 200 characters"),
+        description: "Show this session's mbx identity (name, role, host, session key fingerprint, owner grant, delivery). A session without an identity gets its next step and this project's identities. Pass `name` to rename this identity (or, with `role`, to register it when the session has none), `role`/`description` to describe it, `bind` to link a hosted conversation (ticket from an [mbx] note). Next: mbx_inbox for pending work; optionally mbx_replay with a saved cursor, or mbx_agents for peers.",
+        inputSchema: { name: z.string().regex(NAME_RE).optional().describe("new or chosen identity name, e.g. agentmbx-reviewer"),
+            role: z.string().regex(ROLE_RE).optional().describe("short role label, e.g. lead, reviewer, builder"),
+            description: z.string().max(200).optional().describe("brief agent description, at most 200 characters"),
             bind: z.string().regex(BIND_TICKET_RE).optional().describe("one-time ticket from an [mbx] session note that links this conversation to its mbx server") },
         annotations: { idempotentHint: true },
     }, ({ name, role, description, bind: ticket }) => {
         const state = current();
-        const folderName = ticket ? linkConversation(state, ticket) : undefined;
+        if (ticket)
+            linkConversation(state, ticket);
+        if (!bound(state)) {
+            if (name)
+                return identityOperation({ action: registeredIdentity(node.store, name) || AUTO_NAME_RE.test(name) ? "claim" : "register", name, role, description });
+            const list = listIdentityStatus(node.home, { project, caller: { cli: env.cli, sessionId: state.sessionId } });
+            const out = { agent: null, host: node.host, cli: env.cli, unbound: true, project: project ?? null, pending: state.pending ?? null,
+                reason: state.lostTo ? `claimed by ${state.lostTo}` : state.pendingReason ?? null, next: unboundMessage(state),
+                project_identities: list.identities.map(i => ({ name: i.name, role: i.role, state: i.state, claimable: i.claimable, unread: i.unread, reason: i.reason })),
+                version: version() };
+            return text(JSON.stringify(out, null, 2), out);
+        }
         let { agent } = state;
         const { key } = state;
         const rename = (to) => {
+            const taken = registeredIdentity(node.store, to);
+            if (taken)
+                throw Object.assign(new Error(`${to} is a registered identity (role ${taken.role}); to take it over, release yours and claim it with mbx_identity`), { code: "NAME_IN_USE" });
+            if (AUTO_NAME_RE.test(to))
+                throw Object.assign(new Error(`"${to}" looks auto-generated; choose a readable name such as <project>-<role>`), { code: "IDENTITY_NAME_UNREADABLE" });
             checkLegacy(to, state, node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions WHERE agent=?`).all(to));
             const lease = leases.rename(agent, state.leaseToken, to);
             node.addAlias(agent, to, env.ppid);
+            renameRegistration(node.store, agent, to);
             agent = to;
             state.agent = to;
             state.leaseToken = lease.token;
             node.keepName(env.cli, state.sessionId, to);
+            touch(state, true);
         };
         if (name && name !== agent)
             rename(name);
-        else if (folderName)
-            try {
-                rename(folderName);
-                name = folderName;
-            }
-            catch { /* taken or contested: keep the current name */ }
+        const registration = registeredIdentity(node.store, agent);
+        if (role || (description && registration))
+            registerIdentity(node.store, { name: agent, role: role ?? registration.role, description, by: `${env.cli}:${state.sessionId}` });
         if (name || role || description) {
             node.registerAgent(agent, { role, description, cli: env.cli });
             bind(state);
         }
         const s = session();
         const me = node.agents().find((a) => a.name === agent && a.host === node.host);
-        const out = { agent, host: node.host, address: `${agent}@${node.host}`, role: me?.role ?? null, description: me?.description ?? null,
-            cli: env.cli, session: fingerprint(key.publicKey),
+        const reg = registeredIdentity(node.store, agent);
+        const out = { agent, host: node.host, address: `${agent}@${node.host}`, role: reg?.role ?? me?.role ?? null, description: reg?.description ?? me?.description ?? null,
+            registered: !!reg, project: project ?? null, cli: env.cli, session: fingerprint(key.publicKey),
             owner_grant: s.grant ? { caps: s.grant.caps, expires: s.grant.exp } : null, delivery: node.deliveryMode(agent), unread: node.unreadCount(agent),
             policies: activePolicies(node.store.db, agent, node.host).map((p) => ({ id: p.id, level: p.level, classes: p.classes, from: p.from, projects: p.projects ?? null, expires: p.exp })),
             version: version(), update_available: updateAvailable(node.store),
+            ...(!reg || AUTO_NAME_RE.test(agent) ? { next: AUTO_NAME_RE.test(agent)
+                    ? `${agent} was generated by an older AgentMBX. Give this identity a readable name and a role: mbx_whoami {"name":"<project>-<role>","role":"<role>"} (mail follows the rename).`
+                    : `Register this identity's role: mbx_whoami {"role":"<role>"} (for example lead, reviewer, builder).` } : {}),
             ...((sup) => sup.length ? { wakes_suppressed: `${sup.length} unread message(s) from ${[...new Set(sup.map((x) => x.from))].join(", ")} did not wake this session: relay depth ${Math.max(...sup.map((x) => x.hop))} exceeds the policy's allowance (ask 6, collaborate 20). Your user's next prompt resets it; mbx_inbox shows them.` } : {})(node.depthSuppressed(agent)),
             // Answered by the old build during a handover: the new build's version and delivery show from the next call.
-            ...(handedOver ? { switching: "a newer agentmbx is installed: this server hands over to it after this call. Call mbx_whoami again for its version and delivery mode." } : {}),
-            ...(state.recoveryIdentity && state.recoveryIdentity !== agent ? { recovery: { identity: state.recoveryIdentity,
-                    reason: "previous identity has another holder", next: "Use mbx_identity list to inspect ownership. The previous holder must release, or the owner must approve takeover, before this session can release its temporary identity and claim that mailbox." } } : {}) };
+            ...(handedOver ? { switching: "a newer agentmbx is installed: this server hands over to it after this call. Call mbx_whoami again for its version and delivery mode." } : {}) };
         return text(JSON.stringify(out, null, 2), out);
     });
     server.registerTool("mbx_send", {
         title: "Send an mbx message",
-        description: "Start a new conversation with other agents (to answer a message, use mbx_reply instead). `to` accepts agent names (vida-dev), agent@host (vida-dev@fedora), role:<role>, * (everyone), or owner; find names with mbx_agents. Kind decides waking: request/task/decision/alert wake an idle recipient; message/reply wake only with needs_reply=true or an @mention; status NEVER wakes (it waits for the recipient's next prompt). Use kind=request/task with needs_reply=true when you need an answer. A successful send is acceptance, not recipient delivery, reply or task completion; queued transport retry is not a draft API. Avoid manually resending an uncertain send. Next: check mbx_inbox for answers.",
+        description: "Start a new conversation with other agents (to answer a message, use mbx_reply instead). `to` accepts agent names (vida-dev), agent@host (vida-dev@fedora), role:<role>, * (everyone), or owner; find names with mbx_agents. Kind decides waking: request/task/decision/alert wake an idle recipient; message/reply wake only with needs_reply=true or an @mention; status NEVER wakes (it waits for the recipient's next prompt). Use kind=request/task with needs_reply=true when you need an answer. A successful send is acceptance, not recipient delivery, reply or task completion; queued transport retry is not a draft API. Avoid manually resending an uncertain send. The result's recipients[] says per recipient: live-wake (woken now), live-next-prompt (seen on its next prompt), offline (no live session; it waits), forwarded (renamed mailbox) or remote (queued for a paired host). A name that never existed on this host is refused with suggestions. Next: check mbx_inbox for answers.",
         inputSchema: {
             to: z.array(z.string().min(1)).min(1).max(20), subject: z.string().min(1).max(200), body: z.string().max(256 * 1024),
             kind: z.enum(KINDS).default("message").describe("request/task/decision/alert wake the recipient; message/reply wake only with needs_reply or an @mention; status never wakes"),
@@ -824,11 +1003,13 @@ export async function runMcp(existing) {
             thread = m.thread;
             reply_to = m.id;
         }
+        assertKnownRecipients(node, to); // T205: never create a mailbox by typo
         const r = node.send({ from: agent, to, subject, body, kind, reply_to, thread, needs_reply, refs, ...relay(origin, to) }, session());
         if (idempotency_key)
             node.store.set(`idem:${agent}:${idempotency_key}`, r.envelope.id);
-        const out = { id: r.envelope.id, ref: `mbx:${r.envelope.id}@${node.host}`, thread: r.envelope.thread, delivered_locally: r.local, queued_for_hosts: r.remote,
-            owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...statusWakeWarning(r.envelope), ...depthWarning(r.envelope)] };
+        const recipients = recipientReceipts(node, r.envelope.id, r.targets);
+        const out = { id: r.envelope.id, ref: `mbx:${r.envelope.id}@${node.host}`, thread: r.envelope.thread, recipients, delivered_locally: r.local, queued_for_hosts: r.remote,
+            owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...offlineWarnings(recipients), ...statusWakeWarning(r.envelope), ...depthWarning(r.envelope)] };
         return text(JSON.stringify(out, null, 2), out);
     });
     server.registerTool("mbx_reply", {
@@ -845,8 +1026,9 @@ export async function runMcp(existing) {
         noteRead([m]);
         const subject = /^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`.slice(0, 200);
         const r = node.send({ from: agent, to: [m.from_addr], subject, body, kind, reply_to: m.id, thread: m.thread, needs_reply, refs: [], ...relay(origin, [m.from_addr]) }, session());
-        const out = { id: r.envelope.id, to: m.from_addr, thread: r.envelope.thread, reply_to: m.id, delivered_locally: r.local, queued_for_hosts: r.remote,
-            owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...depthWarning(r.envelope)] };
+        const recipients = recipientReceipts(node, r.envelope.id, r.targets);
+        const out = { id: r.envelope.id, to: m.from_addr, thread: r.envelope.thread, reply_to: m.id, recipients, delivered_locally: r.local, queued_for_hosts: r.remote,
+            owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...offlineWarnings(recipients), ...depthWarning(r.envelope)] };
         return text(`${JSON.stringify(out, null, 2)}\nNext: mbx_ack ${m.id} if you are done with it.`, out);
     });
     server.registerTool("mbx_inbox", {
@@ -904,7 +1086,7 @@ export async function runMcp(existing) {
     });
     server.registerTool("mbx_thread", {
         title: "Show an mbx thread",
-        description: "Every message in a thread (pass a thread id or any message id in it), oldest first, with full content. Next: mbx_reply to the latest message if you need to answer.",
+        description: "Every message in a thread (pass a thread id or any message id in it), oldest first, with full content and, under each, one line per recipient: delivery state, did/note and liveness. Next: mbx_reply to the latest message if you need to answer.",
         inputSchema: { id: z.string().min(6) },
         annotations: { readOnlyHint: true },
     }, ({ id }) => {
@@ -912,7 +1094,8 @@ export async function runMcp(existing) {
         const m = node.message(id, agent);
         const rows = node.thread(m && node.canSee(m, agent) ? m.thread : id, agent);
         noteRead(rows);
-        return text(rows.length ? rows.map((r) => formatFor(node, r, agent)).join("\n\n") : `No thread ${id}.`);
+        // T207: under each message, who has it and how far they got
+        return text(rows.length ? rows.map((r) => `${formatFor(node, r, agent)}\n${deliveryReceipts(node, r).map(receiptLine).join("\n")}`).join("\n\n") : `No thread ${id}.`);
     });
     server.registerTool("mbx_search", {
         title: "Search mbx messages",
@@ -932,6 +1115,17 @@ export async function runMcp(existing) {
     }, () => {
         const rows = node.agents();
         return text(rows.map((a) => `${a.name}@${a.host}${a.role ? `  role:${a.role}` : ""}${a.cli ? `  (${a.cli})` : ""}  last seen ${a.last_seen ?? "never"}${a.description ? `  — ${a.description}` : ""}`).join("\n") || "No agents yet.", { agents: rows });
+    });
+    server.registerTool("mbx_sent", {
+        title: "What happened to mail you sent",
+        description: "Sender receipts: the messages you sent from this host, oldest first, each with its recipients: delivered → notified → read → acked (with the recipient's note and did line), the recipient's liveness now, and for paired hosts whether the message is still queued. Page with next_cursor (opaque; persist it yourself). Next: mbx_thread for the conversation, or mbx_send a nudge to an offline recipient's successor.",
+        inputSchema: { cursor: z.string().max(1024).optional(), limit: z.number().int().min(1).max(100).default(20) },
+        annotations: { readOnlyHint: true },
+    }, ({ cursor, limit }) => {
+        const { agent } = current();
+        const page = sentPage(node, agent, { cursor, limit });
+        const lines = page.messages.map((m) => [`${m.id}  ${m.ts.slice(0, 19)}Z  [${m.kind}] ${m.subject}  → ${m.to.join(", ")}`, ...m.recipients.map(receiptLine)].join("\n"));
+        return text(`${lines.length ? lines.join("\n\n") : "No sent messages on this page."}\n\nnext_cursor: ${page.next_cursor}${page.has_more ? " (more)" : ""}`, page);
     });
     const transport = new StdioServerTransport();
     const timers = [];
@@ -1009,7 +1203,7 @@ export async function runMcp(existing) {
     if (env.channel || env.socket) {
         timers.push(setInterval(async () => {
             try {
-                if (base.released)
+                if (!bound(base))
                     return;
                 const agent = base.agent;
                 leases.withHeld(agent, base.leaseToken, () => undefined);
@@ -1061,10 +1255,21 @@ export async function runMcp(existing) {
         for (const state of [base, ...states.values()]) {
             if (state.released)
                 continue;
+            // An unbound session retries its pending identity (or learns it from a later hook); it never takes another name.
+            if (!state.leaseToken) {
+                retryResume(state);
+                continue;
+            }
             try {
                 bind(state);
             }
             catch (e) {
+                if (e.code === "IDENTITY_LEASE_LOST")
+                    try {
+                        withProcSnapshot(() => ensureLease(state));
+                        continue;
+                    }
+                    catch { /* reported below */ }
                 process.stderr.write(`[mbx] heartbeat for ${state.agent} failed: ${e.message}\n`);
             }
         }
