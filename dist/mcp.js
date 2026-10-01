@@ -1166,6 +1166,10 @@ export async function runMcp(existing) {
     // The SDK stdio transport does not forward stdin EOF to onclose.
     process.stdin.once("end", retire);
     process.once("exit", retire);
+    // A provider that ends its servers with a signal (claude -p, a closed terminal) releases the identity cleanly instead
+    // of leaving a dead holder to expire. SIGINT is left alone: a terminal's Ctrl-C interrupts a turn, not the session.
+    for (const [signal, code] of [["SIGTERM", 143], ["SIGHUP", 129]])
+        process.once(signal, () => { retire(); process.exit(code); });
     try {
         await server.connect(transport);
     }
