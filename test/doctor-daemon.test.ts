@@ -18,7 +18,7 @@ test("doctor does not call an unrelated HTTP responder a healthy daemon", async 
   await listen(server);
   const home = mkdtempSync(join(tmpdir(), "mbx-doctor-http-"));
   new MbxNode(home, { host: "alpha", port: port(server) }).close();
-  t.after(async () => { await close(server); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await close(server); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const checks = await doctor({ home, cmd: ["agentmbx"], which: () => null, useClis: false }, home);
   assert.equal(checks.some(c => c.level === "ok" && c.label.startsWith("daemon")), false);
   assert.ok(checks.some(c => c.level === "warn" && /identity unverified/.test(c.label)));
@@ -44,7 +44,7 @@ for (const defect of ["legacy", "html", "wrong-host", "wrong-key", "bad-version"
       if (defect === "version-mismatch") body.version = "999.0.0";
       res.end(JSON.stringify(body));
     }); await listen(server); n.config.port = port(server);
-    t.after(async () => { await close(server); await close(target); n.close(); rmSync(home, { recursive: true, force: true }); });
+    t.after(async () => { await close(server); await close(target); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
     const check = await daemonReadiness(n, 200);
     assert.equal(check.level, "warn", check.label);
     assert.match(check.label, defect === "version-mismatch" ? /differs from CLI/ : /identity unverified/);
@@ -55,7 +55,7 @@ for (const defect of ["legacy", "html", "wrong-host", "wrong-key", "bad-version"
 test("real status probe is bounded read-only metadata and does not spend pairing budget", async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-status-")), n = new MbxNode(home, { host: "alpha" });
   const server = await startServer(n, 0, "127.0.0.1"); n.config.port = port(server);
-  t.after(async () => { await close(server); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await close(server); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   for (let i = 0; i < 35; i++) {
     const check = await daemonReadiness(n);
     assert.equal(check.level, "ok", check.label); assert.match(check.label, /receipt not tested/);

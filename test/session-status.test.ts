@@ -14,7 +14,7 @@ import { Store, SCHEMA_VERSION } from "../src/store.ts";
 for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} status and whoami require the exact current lease and preserve metadata`, async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-status-")), n = new MbxNode(home, { host: "alpha" });
   const client = new Client({ name: "status-test", version: "1" });
-  t.after(async () => { await client.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await client.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "folder", MBX_CLI: cli, AGENTMBX_DEV: "1" } as Record<string, string> }));
   const meta = cli === "codex" ? { threadId: "66666666-6666-4666-8666-666666666666" } : cli === "opencode" ? { sessionID: "ses_statustest" } : undefined;
@@ -80,7 +80,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} status a
 
 test("a live legacy session row does not authorize status or whoami", t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-status-legacy-")), n = new MbxNode(home, { host: "alpha" });
-  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   n.registerAgent("offline", { cli: "claude", role: "original" });
   n.bindSession({ agent: "offline", cli: "claude", session_id: "legacy", pid: process.pid });
   for (const args of [["status", "--cli", "claude", "--session", "legacy", "--json"], ["whoami", "--as", "offline", "--role", "forbidden"]]) {
@@ -92,7 +92,7 @@ test("a live legacy session row does not authorize status or whoami", t => {
 
 test("sender outbox index is added to existing stores without changing mail or schema version", t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-status-index-")), n = new MbxNode(home, { host: "alpha" });
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const query = "SELECT count(DISTINCT o.msg_id) n FROM outbox o JOIN messages m ON m.id=o.msg_id WHERE m.from_addr=?";
   const columns = () => n.store.db.prepare("PRAGMA index_info(messages_sender)").all().map(r => r.name);
   assert.deepEqual(columns(), ["from_addr", "id"], "fresh stores have the covering sender index");

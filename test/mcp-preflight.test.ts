@@ -10,7 +10,7 @@ import { MbxNode } from "../src/node.ts";
 test("MCP startup, rename and heartbeat inspect processes outside SQLite transactions", async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-preflight-")), trace = join(home, "trace.jsonl"), preload = join(home, "trace.mjs");
   const client = new Client({ name: "claude", version: "test" });
-  t.after(async () => { await client.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await client.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   writeFileSync(trace, "");
   // Test-only instrumentation checks real process discovery, not an implementation mock.
   writeFileSync(preload, `import {DatabaseSync} from 'node:sqlite'; import cp from 'node:child_process'; import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
@@ -37,7 +37,7 @@ test("MCP startup, rename and heartbeat inspect processes outside SQLite transac
 for (const cli of ["claude", "codex", "kimi", "opencode"]) for (const changed of ["binding", "child"]) test(`${cli} does not adopt a legacy ${changed} replaced after process preflight`, async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-preflight-rebind-")), preload = join(home, "rebind.mjs"), marker = join(home, "rebound");
   const node = new MbxNode(home, { host: "alpha" }), client = new Client({ name: cli, version: "test" });
-  t.after(async () => { await client.close(); node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await client.close(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   node.bindSession({ agent: "reader", cli, session_id: "legacy", pid: process.pid, session_key: "previous-holder" });
   if (changed === "child") node.store.set("mcp-process:previous-holder", JSON.stringify({ pid: 2_000_000_000, start: "old-generation" }));
   const id = node.send({ from: "sender", to: ["reader"], subject: "old mail", body: "retain ownership" }).envelope.id;

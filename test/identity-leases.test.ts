@@ -10,7 +10,7 @@ import { IdentityLeases, hasHeldIdentity, inspectLeaseProcess, type ProcessEvide
 
 function fixture(t: TestContext) {
   const home = mkdtempSync(join(tmpdir(), "mbx-leases-")), node = new MbxNode(home, { host: "alpha" });
-  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   let now = 1000;
   const processes = new Map<number, ProcessEvidence>([[10, { alive: true, start: "birth-a" }], [20, { alive: true, start: "birth-b" }]]);
   const leases = new IdentityLeases(node.store, { idleTtlMs: 100, clock: () => now, inspect: pid => processes.get(pid) ?? { alive: null, start: null } });
@@ -211,7 +211,7 @@ test("independent observers in different time zones agree on lease process birth
 test("independent processes racing to claim one identity have exactly one winner", { timeout: 15000 }, async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-lease-race-")); new Store(home).close();
   const children: ChildProcess[] = [];
-  t.after(async () => { await Promise.all(children.map(c => new Promise<void>(resolve => { if (c.exitCode !== null || c.signalCode) return resolve(); c.once("exit", () => resolve()); c.kill(); }))); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await Promise.all(children.map(c => new Promise<void>(resolve => { if (c.exitCode !== null || c.signalCode) return resolve(); c.once("exit", () => resolve()); c.kill(); }))); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const participants = Array.from({ length: 2 }, () => {
     const c = fork(join(import.meta.dirname, "fixtures/lease-claimant.ts"), [home], { execArgv: [], stdio: ["ignore", "ignore", "inherit", "ipc"] }); children.push(c);
     let ready!: () => void, result!: (value: { result: string; token?: string }) => void, failed!: (error: Error) => void;

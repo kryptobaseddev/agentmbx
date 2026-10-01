@@ -29,7 +29,7 @@ const outboxCount = (n: MbxNode) => (n.store.db.prepare("SELECT count(*) n FROM 
 
 test("a rotated host keeps its pairing: peers move the pin, old mail still verifies, new mail flows both ways", async (t) => {
   const A = await up("alpha"), B = await up("beta");
-  t.after(async () => { await stop(A); await stop(B); rmSync(A.home, { recursive: true, force: true }); rmSync(B.home, { recursive: true, force: true }); });
+  t.after(async () => { await stop(A); await stop(B); rmSync(A.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); rmSync(B.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const owner = generateKeyPair();
   pair(A, B, { a: owner.publicKey });
   A.n.send({ from: "mac-dev", to: ["vida-dev@beta"], kind: "task", subject: "before", body: "signed by the old key" }, undefined, { pub: owner.publicKey, priv: owner.privateKey });
@@ -63,7 +63,7 @@ test("a peer offline during rotation catches up later; mail sealed to the retire
   const A = await up("alpha"), B = await up("beta");
   const bHome = B.home, bPort = Number(B.addr.split(":")[1]);
   let B2: Up | undefined;
-  t.after(async () => { await stop(A); if (B2) await stop(B2); rmSync(A.home, { recursive: true, force: true }); rmSync(bHome, { recursive: true, force: true }); });
+  t.after(async () => { await stop(A); if (B2) await stop(B2); rmSync(A.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); rmSync(bHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   pair(A, B);
   // beta seals a message to alpha's current enc key but has not delivered it yet
   B.n.store.db.prepare("UPDATE peers SET enc_pub=? WHERE host='alpha'").run(A.n.encKey.publicKey);
@@ -89,7 +89,7 @@ test("a peer offline during rotation catches up later; mail sealed to the retire
 
 test("forged, out-of-order and replayed rotations cannot move a pin", async (t) => {
   const A = await up("alpha"), B = await up("beta");
-  t.after(async () => { await stop(A); await stop(B); rmSync(A.home, { recursive: true, force: true }); rmSync(B.home, { recursive: true, force: true }); });
+  t.after(async () => { await stop(A); await stop(B); rmSync(A.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); rmSync(B.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   pair(A, B);
   const pinned = B.n.peer("alpha")!.pubkey;
   const mallory = generateKeyPair(), next = generateKeyPair();
@@ -139,12 +139,12 @@ test("an interrupted rotation completes only when its record was logged", () => 
     assert.deepEqual(resumed.hostKeys("alpha"), [next.publicKey, old], "the replaced key is retired, not lost");
     assert.equal(JSON.parse(readFileSync(join(home, "retired-keys.json"), "utf8")).enc.length, 1, "the old enc private key is kept to open in-flight mail");
     resumed.close();
-  } finally { rmSync(home, { recursive: true, force: true }); }
+  } finally { rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 
 test("removing a pairing tells the peer, which drops it too", async (t) => {
   const A = await up("alpha"), B = await up("beta");
-  t.after(async () => { await stop(A); await stop(B); rmSync(A.home, { recursive: true, force: true }); rmSync(B.home, { recursive: true, force: true }); });
+  t.after(async () => { await stop(A); await stop(B); rmSync(A.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); rmSync(B.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   pair(A, B);
   assert.equal(await notifyUnpair(A.n, "beta"), true);
   A.n.removePeer("beta");
@@ -168,5 +168,5 @@ test("an identity bundle carries rotation history, so a restored host still veri
     assert.deepEqual(r.hostKeys("alpha"), [current, old], "retired keys came along");
     assert.equal(JSON.parse(readFileSync(join(restored, "rotations.json"), "utf8")).records.length, 1, "pending announcements can still finish");
     r.close();
-  } finally { rmSync(home, { recursive: true, force: true }); rmSync(restored, { recursive: true, force: true }); }
+  } finally { rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); rmSync(restored, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });

@@ -26,7 +26,7 @@ for (const kind of ["unverified-service", "unverified-manual", "matching-service
   const service = process.platform === "darwin" ? join(home, "Library/LaunchAgents/com.agentmbx.daemon.plist") : join(home, ".config/systemd/user/agentmbx.service");
   if (kind.endsWith("service")) { mkdirSync(dirname(service), { recursive: true }); writeFileSync(service, "existing service definition"); }
   if (kind === "absent") await new Promise<void>(r => server.close(() => r()));
-  t.after(async () => { server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   // HOME is isolated and service-manager executables are canaries; no test can touch a real daemon service.
   const args = [resolve("bin/agentmbx.js"), "setup", "--only", "daemon", "--no-owner", "--yes", ...(kind === "absent" ? ["--dry-run"] : [])];
   let result: { stdout: string; stderr: string; code?: number };
@@ -53,7 +53,7 @@ for (const kind of ["stalled-headers", "reset", "refused"]) test(`setup probe pr
   await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
   const n = new MbxNode(home, { host: "alpha", port: (server.address() as { port: number }).port });
   if (kind === "refused") await new Promise<void>(r => server.close(() => r()));
-  t.after(async () => { server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const check = await daemonReadiness(n, 100);
   assert.equal(check.state, kind === "refused" ? "unreachable" : "unverified");
 });

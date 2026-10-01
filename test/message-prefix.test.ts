@@ -10,7 +10,7 @@ import { MbxNode } from "../src/node.ts";
 
 test("hidden prefix collisions neither disclose IDs nor hide a visible message", (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-prefix-")), n = new MbxNode(home, { host: "alpha" });
-  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const hidden = Array.from({ length: 9 }, () => n.send({ from: "other", to: ["private"], subject: "secret", body: "secret" }).envelope.id);
   const own = n.send({ from: "sender", to: ["reader"], subject: "visible", body: "visible" }).envelope.id;
   const prefix = own.slice(0, 6); assert.ok(hidden.every(id => id.startsWith(prefix)));
@@ -30,7 +30,7 @@ test("hidden prefix collisions neither disclose IDs nor hide a visible message",
 test("MCP and scoped CLI thread/reply paths resolve only visible prefixes", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-prefix-tools-")), n = new MbxNode(home, { host: "alpha" });
   const c = new Client({ name: "prefix-test", version: "1" }), bin = join(import.meta.dirname, "../bin/agentmbx.js");
-  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const hidden = Array.from({ length: 9 }, () => n.send({ from: "other", to: ["private"], subject: "secret", body: "secret" }).envelope.id);
   const env = { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "claude", MBX_AGENT: "reader", MBX_NO_DESKTOP: "1" } as Record<string, string>;
   await c.connect(new StdioClientTransport({ command: process.execPath, args: [bin, "mcp"], env }));

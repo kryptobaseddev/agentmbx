@@ -26,5 +26,5 @@ test("the launcher runs the real binary with the channel, passes arguments throu
       { env: { ...process.env, AGENTMBX_DEV: "1", MBX_CLAUDE_BIN: fake, MBX_HOME: dir }, encoding: "utf8" });
     assert.equal(r.status, 7, r.stderr);
     assert.deepEqual(JSON.parse(readFileSync(out, "utf8")), ["--dangerously-load-development-channels", "server:mbx", "--model", "opus", "-p", "hi there"]);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });

@@ -30,7 +30,7 @@ async function world(t: { after: (fn: () => Promise<void>) => void }, names: str
       env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "claude", MBX_AGENT: name, MBX_NO_DESKTOP: "1", MBX_SESSION_SOCKET: "0" } as Record<string, string> }));
     clients[name] = c;
   }
-  t.after(async () => { for (const c of Object.values(clients)) await c.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { for (const c of Object.values(clients)) await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const call = async (who: string, name: string, args: Record<string, unknown>) => {
     const r = await clients[who].callTool({ name, arguments: args });
     assert.notEqual(r.isError, true, JSON.stringify(r.content));

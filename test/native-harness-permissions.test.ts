@@ -31,7 +31,7 @@ test("wake receipt inspector observes real mailbox replies and acknowledgments w
   const { tmpdir } = await import("node:os");
   const home = mkdtempSync(join(tmpdir(), "mbx-native-receipt-"));
   const node = new MbxNode(home, { host: "e2e" });
-  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const request = node.send({ from: "tester", to: ["oc-agent"], subject: "wake", body: "PONG-exact", kind: "request" }).envelope;
   const recovered = JSON.parse(execFileSync("python3", ["-c",
     "import json,runpy,sys; print(json.dumps(runpy.run_path(sys.argv[1])['find_request'](*sys.argv[2:])))",

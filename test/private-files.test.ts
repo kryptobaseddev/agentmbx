@@ -10,7 +10,7 @@ import { privatePath } from "../src/private-files.ts";
 const mode = (path: string) => statSync(path).mode & 0o7777;
 test("startup repairs mailbox directory, keys, and store permission drift without losing mail", { skip: process.platform === "win32" }, (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-permissions-"));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const first = new MbxNode(home, { host: "alpha" });
   const id = first.send({ from: "sender", to: ["reader"], subject: "preserve", body: "private" }).envelope.id;
   first.close();
@@ -41,7 +41,7 @@ test("startup repairs mailbox directory, keys, and store permission drift withou
 test("Store repairs existing WAL and shared-memory file modes", { skip: process.platform === "win32" }, (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-wal-mode-"));
   const first = new Store(home);
-  t.after(() => { first.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { first.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   for (const file of ["mbx.db-wal", "mbx.db-shm"]) chmodSync(join(home, file), 0o666);
   const second = new Store(home);
   try { for (const file of ["mbx.db-wal", "mbx.db-shm"]) assert.equal(mode(join(home, file)), 0o600); }
@@ -50,7 +50,7 @@ test("Store repairs existing WAL and shared-memory file modes", { skip: process.
 
 test("startup refuses symlinked keys without chmoding their targets", { skip: process.platform === "win32" }, (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-key-link-"));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const target = join(home, "unrelated"); writeFileSync(target, "do not change"); chmodSync(target, 0o644);
   symlinkSync(target, join(home, "host.key"));
   assert.throws(() => new MbxNode(home), /refusing non-regular file/);

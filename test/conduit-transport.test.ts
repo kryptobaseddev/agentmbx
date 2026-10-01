@@ -246,7 +246,7 @@ class MbxTransport implements Transport {
 function fixture(t: TestContext) {
   const home = mkdtempSync(join(tmpdir(), "mbx-conduit-"));
   const node = new MbxNode(home, { host: "h1", bind: "127.0.0.1", port: 0 });
-  t.after(() => { node.store.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { node.store.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   return node;
 }
 const config = (agentId: string): TransportConnectConfig => ({ agentId, apiKey: "", apiBaseUrl: "mbx://h1" });

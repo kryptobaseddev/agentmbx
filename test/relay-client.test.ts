@@ -27,7 +27,7 @@ test("relayFor reads MBX_RELAY_URL first, then config.json", () => {
     assert.equal(relayFor(n), "http://env:8");
   } finally {
     if (old === undefined) delete process.env.MBX_RELAY_URL; else process.env.MBX_RELAY_URL = old;
-    n.close(); rmSync(home, { recursive: true, force: true });
+    n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -36,7 +36,7 @@ test("an offline paired peer receives sealed mail purely over the relay", async 
   const a = new MbxNode(homes[0], { host: "alpha" }), b = new MbxNode(homes[1], { host: "beta" });
   const core = new RelayCore();
   const server = await startRelayServer(core, 0, "127.0.0.1");
-  t.after(() => { a.close(); b.close(); homes.forEach((h) => rmSync(h, { recursive: true, force: true })); return new Promise<void>((r) => server.close(() => r())); });
+  t.after(() => { a.close(); b.close(); homes.forEach((h) => rmSync(h, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })); return new Promise<void>((r) => server.close(() => r())); });
   const relay = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   pair(a, b, "unused"); // LAN addr deliberately dead: the relay is the only path
   assert.equal(await relayEnrol(a, relay), true);
@@ -70,7 +70,7 @@ test("relayDrainOutbox refuses to push plaintext when the peer published no enc 
   const a = new MbxNode(homes[0], { host: "alpha" }), b = new MbxNode(homes[1], { host: "beta" });
   const core = new RelayCore();
   const server = await startRelayServer(core, 0, "127.0.0.1");
-  t.after(() => { a.close(); b.close(); homes.forEach((h) => rmSync(h, { recursive: true, force: true })); return new Promise<void>((r) => server.close(() => r())); });
+  t.after(() => { a.close(); b.close(); homes.forEach((h) => rmSync(h, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })); return new Promise<void>((r) => server.close(() => r())); });
   const relay = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   pair(a, b, "unused");
   await relayEnrol(a, relay);
@@ -87,7 +87,7 @@ test("relayDrainOutbox refuses to push plaintext when the peer published no enc 
 test("agentmbx relay set/unset writes config.json for the next daemon start", async (t) => {
   const { execFileSync } = await import("node:child_process");
   const home = mkdtempSync(join(tmpdir(), "mbx-relaycli-"));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const bin = join(import.meta.dirname, "../bin/agentmbx.js");
   const env = { ...process.env, MBX_HOME: home, MBX_NO_DESKTOP: "1" } as Record<string, string>;
   const read = () => JSON.parse(readFileSync(join(home, "config.json"), "utf8")) as { relay?: string };
@@ -103,7 +103,7 @@ test("a relay cannot substitute a peer's enc key: a client squatting the peer's 
   const m = new MbxNode(homes[2], { host: "beta" }); // mallory: its own key, claiming the name beta at the relay
   const core = new RelayCore();
   const server = await startRelayServer(core, 0, "127.0.0.1");
-  t.after(() => { a.close(); b.close(); m.close(); homes.forEach((h) => rmSync(h, { recursive: true, force: true })); return new Promise<void>((r) => server.close(() => r())); });
+  t.after(() => { a.close(); b.close(); m.close(); homes.forEach((h) => rmSync(h, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })); return new Promise<void>((r) => server.close(() => r())); });
   const relay = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   pair(a, b, "unused");
   assert.equal(await relayEnrol(a, relay), true);
@@ -125,7 +125,7 @@ test("a relayed enc key signed by the pinned host key is used when the LAN never
   const a = new MbxNode(homes[0], { host: "alpha" }), b = new MbxNode(homes[1], { host: "beta" });
   const core = new RelayCore();
   const server = await startRelayServer(core, 0, "127.0.0.1");
-  t.after(() => { a.close(); b.close(); homes.forEach((h) => rmSync(h, { recursive: true, force: true })); return new Promise<void>((r) => server.close(() => r())); });
+  t.after(() => { a.close(); b.close(); homes.forEach((h) => rmSync(h, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })); return new Promise<void>((r) => server.close(() => r())); });
   const relay = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   pair(a, b, "unused");
   await relayEnrol(a, relay); await relayEnrol(b, relay);

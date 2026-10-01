@@ -13,7 +13,7 @@ test("paired signed mail rejects malformed metadata before storing or waking", a
   const home = mkdtempSync(join(tmpdir(), "mbx-meta-"));
   const a = new MbxNode(join(home, "a"), { host: "alpha" });
   const b = new MbxNode(join(home, "b"), { host: "beta" });
-  t.after(() => { a.close(); b.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { a.close(); b.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   b.upsertPendingPeer({ host: "alpha", pubkey: a.key.publicKey, owner_pubkey: null, addr: "127.0.0.1:0", code: "000000", nonce_local: "n", nonce_remote: "n" });
   b.approvePeer("alpha"); b.registerAgent("worker");
   const draft = () => buildEnvelope({ from: "sender@alpha", to: ["worker@beta"], subject: "metadata", body: "hello @worker" });

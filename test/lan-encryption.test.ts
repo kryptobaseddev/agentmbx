@@ -17,7 +17,7 @@ async function up(host: string) {
   const s = await startServer(n, 0, "127.0.0.1");
   return { n, s, home, addr: `127.0.0.1:${(s.address() as AddressInfo).port}` };
 }
-const down = (...xs: { n: MbxNode; s: Server; home: string }[]) => xs.forEach((x) => { x.s.close(); x.n.close(); rmSync(x.home, { recursive: true, force: true }); });
+const down = (...xs: { n: MbxNode; s: Server; home: string }[]) => xs.forEach((x) => { x.s.close(); x.n.close(); rmSync(x.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
 
 /** Record every request body the sender puts on the wire. */
 function captureFetch(t: { after: (fn: () => void) => void }) {

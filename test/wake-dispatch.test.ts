@@ -20,7 +20,7 @@ for (const invalid of ["dead-pid", "reused-pid", "missing-birth", "expired", "no
     writeFileSync(bin, '#!/bin/sh\nprintf "%s\\n" "$3" >> "$MBX_TEST_WAKE_LOG"\n', { mode: 0o700 });
     const old = { MBX_CODEX_BIN: process.env.MBX_CODEX_BIN, MBX_TEST_WAKE_LOG: process.env.MBX_TEST_WAKE_LOG, MBX_NO_DESKTOP: process.env.MBX_NO_DESKTOP };
     Object.assign(process.env, { MBX_CODEX_BIN: bin, MBX_TEST_WAKE_LOG: log, MBX_NO_DESKTOP: "1" });
-    t.after(() => { for (const [k,v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } n.close(); rmSync(home, { recursive: true, force: true }); });
+    t.after(() => { for (const [k,v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
     if (invalid === "live-channel") bindWakeLease(n, { agent: "worker", cli: "claude", session_id: "mcp-bad", pid: process.pid, channel: true });
     else bindWakeLease(n, { agent: "worker", cli: "codex", session_id: "valid", pid: process.pid });
     const bad = (invalid === "provisional" || invalid === "live-channel") ? "mcp-bad" : "invalid";
@@ -54,7 +54,7 @@ for (const invalid of ["dead-pid", "reused-pid", "missing-birth", "expired", "no
 
 for (const defect of ["released", "generation", "key", "parent", "missing-control", "legacy"]) test(`wake refuses ${defect} mailbox bindings`, async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-wake-fence-")), n = new MbxNode(home, { host: "alpha" });
-  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const holder = bindWakeLease(n, { agent: "worker", cli: "codex", session_id: "valid", pid: process.pid });
   if (defect === "released") holder.release();
   if (defect === "generation") n.store.db.prepare("UPDATE identity_leases SET token='replacement'").run();
@@ -93,7 +93,7 @@ test("daemon routes an actual MCP holder and refuses its stale binding after rel
   writeFileSync(bin, '#!/bin/sh\nprintf "%s\n" "$3" >> "$MBX_TEST_WAKE_LOG"\n', { mode: 0o700 });
   const old = { MBX_CODEX_BIN: process.env.MBX_CODEX_BIN, MBX_TEST_WAKE_LOG: process.env.MBX_TEST_WAKE_LOG, MBX_NO_DESKTOP: process.env.MBX_NO_DESKTOP };
   Object.assign(process.env, { MBX_CODEX_BIN: bin, MBX_TEST_WAKE_LOG: log, MBX_NO_DESKTOP: "1" });
-  t.after(async () => { await client.close(); n.close(); rmSync(home, { recursive: true, force: true });
+  t.after(async () => { await client.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     for (const [k,v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "worker", MBX_CLI: "codex", AGENTMBX_DEV: "1" } as Record<string,string> }));
@@ -142,7 +142,7 @@ test("an MCP-only opencode binding never wakes a guessed session from its direct
   const stub = opencodeStub(t, "ses_resolved");
   const old = { MBX_OPENCODE_URL: process.env.MBX_OPENCODE_URL, MBX_NO_DESKTOP: process.env.MBX_NO_DESKTOP };
   Object.assign(process.env, { MBX_NO_DESKTOP: "1" });
-  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
   process.env.MBX_OPENCODE_URL = await stub.listen();
   bindWakeLease(n, { agent: "worker", cli: "opencode", session_id: "mcp-424242", pid: process.pid });
@@ -159,7 +159,7 @@ test("the directory fallback is a no-op when the service knows no session there"
   const stub = opencodeStub(t, null);
   const old = { MBX_OPENCODE_URL: process.env.MBX_OPENCODE_URL, MBX_NO_DESKTOP: process.env.MBX_NO_DESKTOP };
   Object.assign(process.env, { MBX_NO_DESKTOP: "1" });
-  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
   process.env.MBX_OPENCODE_URL = await stub.listen();
   bindWakeLease(n, { agent: "worker", cli: "opencode", session_id: "mcp-424242", pid: process.pid });

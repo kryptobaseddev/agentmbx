@@ -13,7 +13,7 @@ import { humanPromptKey, isHumanPrompt, wakeText } from "../src/wake.ts";
 for (const implicitReply of [false, true]) test(implicitReply ? "mbx_send reply_to records parent provenance" : "expired relay state cannot be revived by a fresh read", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-relay-"));
   const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "relay-test", version: "1" });
-  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const clock = join(home, "clock"), preload = join(home, "clock.mjs");
   let now = Date.now(); writeFileSync(clock, String(now));
   // Test-only child clock injection: exercise the real MCP handlers without waiting an hour.
@@ -43,7 +43,7 @@ for (const implicitReply of [false, true]) test(implicitReply ? "mbx_send reply_
 for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: unrelated reads cannot renew expired high-depth or external exposure`, async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-relay-depth-"));
   const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "relay-depth-test", version: "1" });
-  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const clock = join(home, "clock"), preload = join(home, "clock.mjs");
   let now = Date.now(); writeFileSync(clock, String(now));
   writeFileSync(preload, `import {readFileSync} from 'node:fs'; Date.now = () => Number(readFileSync(${JSON.stringify(clock)}, 'utf8'));`);
@@ -98,7 +98,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: maximum
   const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "relay-cap-test", version: "1" });
   const rec = makePolicy({ level: "collaborate", agents: ["receiver"], hosts: ["alpha"], ownerPub: owner.publicKey });
   assert.equal(acceptSigned(n.store.db, { rec, sig: signData(owner.privateKey, canonical(rec)) }, "alpha"), null);
-  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await c.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: cli, MBX_AGENT: "reader", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
   const parent = n.send({ from: "sender", to: ["reader"], subject: "max depth", body: "data", hop: 1000, origin: "external" }).envelope;
@@ -130,7 +130,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: maximum
 test("a prompt the owner typed ends the relay chain; wake prompts and external origin do not reset (T104)", async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-relay-human-"));
   const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "relay-human-test", version: "1" });
-  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const clock = join(home, "clock"), preload = join(home, "clock.mjs");
   let now = Date.now(); writeFileSync(clock, String(now));
   writeFileSync(preload, `import {readFileSync} from 'node:fs'; Date.now = () => Number(readFileSync(${JSON.stringify(clock)}, 'utf8'));`);

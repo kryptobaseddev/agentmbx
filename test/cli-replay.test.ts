@@ -13,7 +13,7 @@ const command = (home: string, ...args: string[]) => spawnSync(process.execPath,
 for (const provider of ["claude", "codex"]) test(`${provider} CLI replay parity, retries, scope errors and released holder fencing`, async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-cli-replay-")), node = new MbxNode(home, { host: "alpha" });
   const client = new Client({ name: provider, version: "test" });
-  t.after(async () => { await client.close(); node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await client.close(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "reader", MBX_CLI: provider, AGENTMBX_DEV: "1" } as Record<string,string> }));
   const meta = provider === "codex" ? { threadId: "55555555-5555-4555-8555-555555555555" } : undefined;

@@ -12,7 +12,7 @@ async function fixture(t: { after: (fn: () => void | Promise<void>) => void }, l
   const home = mkdtempSync(join(tmpdir(), "mbx-cli-"));
   const n = new MbxNode(home, { host: "test-host" });
   const client = new Client({ name: "cli-test", version: "1" });
-  t.after(async () => { if (leased) await client.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { if (leased) await client.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   if (leased) await client.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "reader", MBX_CLI: "claude", AGENTMBX_DEV: "1" } as Record<string, string> }));
   const cli = (...args: string[]) => spawnSync(process.execPath, [resolve("bin/agentmbx.js"), ...args], {

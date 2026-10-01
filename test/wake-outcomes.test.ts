@@ -22,7 +22,7 @@ function fixture(t: { after: (fn: () => void | Promise<void>) => unknown }, code
   const keys = ["MBX_CODEX_BIN", "MBX_TEST_WAKE_LOG", "MBX_NO_DESKTOP", "MBX_OPENCODE_URL"] as const;
   const old = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
   Object.assign(process.env, { MBX_CODEX_BIN: bin, MBX_TEST_WAKE_LOG: log, MBX_NO_DESKTOP: "1" });
-  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
   return { n, calls: () => existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean) : [] };
 }
@@ -54,7 +54,7 @@ test("codex exit 0 is admitted with exit-status strength; a missing binary is no
   process.env.MBX_CODEX_BIN = bad;
   const failed = await wakeCodex("22222222-2222-4222-8222-222222222222", "[mbx] hint");
   assert.equal(failed.outcome?.kind === "failed" && failed.outcome.status, 2);
-  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   let fenced = false;
   const r = await wakeCodex("22222222-2222-4222-8222-222222222222", "[mbx] hint", { recheck: () => fenced });
   assert.equal(r.outcome?.kind === "not_submitted" && r.outcome.reason, "fenced", "a fenced attempt writes nothing");
@@ -167,5 +167,5 @@ test("a wake hint names its message ids and says a handled message needs no acti
     assert.match(text, /\+2 more/);
     assert.match(text, /already read or acked them, this notice is stale: no action is needed/);
     assert.ok(!text.includes("secret body"), "never a body");
-  } finally { n.close(); rmSync(home, { recursive: true, force: true }); }
+  } finally { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });

@@ -51,7 +51,7 @@ async function up(host: string, limits: Partial<ServerLimits> = {}) {
   const s = await startServer(n, 0, "127.0.0.1", undefined, limits);
   return { n, s, home, port: (s.address() as AddressInfo).port };
 }
-const down = (...xs: { n: MbxNode; s?: Server; home: string }[]) => xs.forEach((x) => { x.s?.close(); x.n.close(); rmSync(x.home, { recursive: true, force: true }); });
+const down = (...xs: { n: MbxNode; s?: Server; home: string }[]) => xs.forEach((x) => { x.s?.close(); x.n.close(); rmSync(x.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
 function node(host: string) { const home = mkdtempSync(join(tmpdir(), "mbx-fuzz-")); return { n: new MbxNode(home, { host }), home }; }
 const pair = (a: MbxNode, b: MbxNode) => {
   a.addApprovedPeer({ host: b.host, pubkey: b.key.publicKey, owner_pubkey: null, addr: "unused" }, "fixture");

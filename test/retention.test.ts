@@ -17,7 +17,7 @@ import { exportIdentity, importIdentity, openBundle } from "../src/identity-back
 process.env.MBX_NO_DESKTOP = "1";
 const PASS = "correct horse battery staple";
 const DAY = 86_400_000;
-const tmp = (t: TestContext, prefix: string) => { const d = mkdtempSync(join(tmpdir(), prefix)); t.after(() => rmSync(d, { recursive: true, force: true })); return d; };
+const tmp = (t: TestContext, prefix: string) => { const d = mkdtempSync(join(tmpdir(), prefix)); t.after(() => rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })); return d; };
 const ago = (days: number) => new Date(Date.now() - days * DAY).toISOString();
 const tables = (n: MbxNode) => JSON.stringify(["messages", "deliveries", "mailbox_visibility", "mailbox_pruned", "outbox"].map((x) => n.store.db.prepare(`SELECT * FROM ${x}`).all()));
 

@@ -11,7 +11,7 @@ test("startup and wake notices preserve separate sender, project, class and expi
   const home = mkdtempSync(join(tmpdir(), "mbx-notice-")), owner = generateKeyPair();
   writeFileSync(join(home, "owner.json"), JSON.stringify({ backend: "keychain", public_key: owner.publicKey }), { mode: 0o600 });
   const n = new MbxNode(home, { host: "alpha" });
-  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const now = new Date(), common = { agents: ["reader"], hosts: ["alpha"], ownerPub: owner.publicKey, now };
   const read = makePolicy({ ...common, level: "autonomous", classes: ["read"], projects: ["/work/review"], ttlMs: 7200000 });
   const permission = makePolicy({ ...common, level: "yolo", classes: ["permissions"], from: ["beta"], fromAgents: ["builder"], projects: ["/work/build"], ttlMs: 60000 });

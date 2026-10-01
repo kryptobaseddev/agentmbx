@@ -15,7 +15,7 @@ test("the connector's self-report matches its live tool catalog and is visible i
   const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "connector-report-test", version: "1" });
   const transport = new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "claude", MBX_AGENT: "reporter", MBX_NO_DESKTOP: "1" } as Record<string, string> });
-  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await c.connect(transport);
   await c.callTool({ name: "mbx_whoami", arguments: {} });
   const listed = (await c.listTools()).tools.map((x) => x.name).sort();
@@ -32,7 +32,7 @@ test("the connector's self-report matches its live tool catalog and is visible i
 test("mbx_ack accepts an over-long did for a batch, acks every id and returns the truncation warning", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-ack-did-"));
   const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "ack-did-test", version: "1" });
-  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await c.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "claude", MBX_AGENT: "worker", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
   await c.callTool({ name: "mbx_whoami", arguments: {} });

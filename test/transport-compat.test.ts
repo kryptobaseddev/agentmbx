@@ -21,7 +21,7 @@ test("unsupported peers retain queued mail without legacy fallback, then deliver
     else if (redirect) res.writeHead(307, { location: "/v1/envelopes" }).end();
     else res.writeHead(404).end("old receiver: unknown endpoint");
   });
-  t.after(async () => { await new Promise<void>(resolve => server.close(() => resolve())); a.close(); b.close(); homes.forEach(h => rmSync(h, { recursive: true, force: true })); });
+  t.after(async () => { await new Promise<void>(resolve => server.close(() => resolve())); a.close(); b.close(); homes.forEach(h => rmSync(h, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })); });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port, addr = `127.0.0.1:${port}`;
   a.addApprovedPeer({ host: "beta", pubkey: b.key.publicKey, owner_pubkey: null, addr }, "fixture");

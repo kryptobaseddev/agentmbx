@@ -18,7 +18,7 @@ async function fakeInbox(t: { after: (fn: () => unknown) => void }, name = "inbo
   const dir = mkdtempSync(join(tmpdir(), "mbx-sock-")), path = join(dir, name), lines: Record<string, unknown>[] = [];
   const server: Server = createServer((c) => { let buf = ""; c.on("data", (d) => { buf += d; let i; while ((i = buf.indexOf("\n")) >= 0) { lines.push(JSON.parse(buf.slice(0, i))); buf = buf.slice(i + 1); } }); });
   await new Promise<void>((r) => server.listen(path, r));
-  t.after(() => { server.close(); rmSync(dir, { recursive: true, force: true }); });
+  t.after(() => { server.close(); rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   return { path, lines };
 }
 
@@ -34,7 +34,7 @@ test("a plain Claude session gets a no-body wake through its socket and the daem
   const inbox = await fakeInbox(t, `${process.pid}.sock`); // owned by this server's parent, as Claude Code names it
   const home = mkdtempSync(join(tmpdir(), "mbx-sock-mcp-"));
   const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "socket-wake-test", version: "1" });
-  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await c.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "claude", MBX_AGENT: "worker", MBX_NO_DESKTOP: "1",
       CLAUDE_CODE_MESSAGING_SOCKET: inbox.path, CLAUDE_CODE_MESSAGING_TOKEN: "session-token" } as Record<string, string> }));
@@ -59,7 +59,7 @@ test("a server whose parent does not own the inherited socket never pushes into 
   const inbox = await fakeInbox(t, "999999.sock"); // some other session's socket, inherited through the environment
   const home = mkdtempSync(join(tmpdir(), "mbx-sock-foreign-"));
   const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "socket-foreign-test", version: "1" });
-  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await c.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "claude", MBX_AGENT: "worker", MBX_NO_DESKTOP: "1",
       CLAUDE_CODE_MESSAGING_SOCKET: inbox.path, CLAUDE_CODE_MESSAGING_TOKEN: "other-token" } as Record<string, string> }));

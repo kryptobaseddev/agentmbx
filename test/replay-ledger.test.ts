@@ -15,7 +15,7 @@ const grants = (store: Store) => store.db.prepare("SELECT seq,mailbox,message_id
 function fixture(t: { after(fn: () => void): void }) {
   const home = mkdtempSync(join(tmpdir(), "mbx-ledger-"));
   const node = new MbxNode(home, { host: "alpha" });
-  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   return node;
 }
 const send = (node: MbxNode, to: string[] = ["reader"]) => node.send({ from: "sender", to, subject: "ledger", body: "signed mail" }).envelope;
@@ -54,7 +54,7 @@ test("paired receive grants local fanout only and deduplicates repeated remote e
   // Distinct host configuration and key required; pairing establishes the actual receive verification path.
   const remoteHome = mkdtempSync(join(tmpdir(), "mbx-ledger-peer-"));
   const remote = new MbxNode(remoteHome, { host: "remote" });
-  t.after(() => { remote.close(); rmSync(remoteHome, { recursive: true, force: true }); });
+  t.after(() => { remote.close(); rmSync(remoteHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   n.store.db.prepare("INSERT INTO peers (host,pubkey,addr,state,created_at) VALUES (?,?,?,'approved',?)")
     .run("remote", remote.key.publicKey, "http://127.0.0.1:1", new Date().toISOString());
   const e = remote.send({ from: "foreign", to: ["one@alpha", "two@alpha"], subject: "received", body: "remote" }).envelope;
@@ -109,7 +109,7 @@ test("failed rename transfer rolls back grants, routing, sessions and delivery h
 
 test("v2 migration deterministically backfills visibility without modifying signed mail or ACK receipts", t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-ledger-migrate-"));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const n = new MbxNode(home, { host: "alpha" });
   const e = send(n, ["sender", "reader"]);
   n.ack(e.id, "reader", "preserved note");
@@ -140,7 +140,7 @@ test("v2 migration deterministically backfills visibility without modifying sign
 
 test("failed ledger backfill leaves previous schema and mail unchanged", t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-ledger-abort-"));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const n = new MbxNode(home, { host: "alpha" });
   send(n);
   const mail = n.store.db.prepare("SELECT * FROM messages").all();
@@ -157,7 +157,7 @@ test("failed ledger backfill leaves previous schema and mail unchanged", t => {
 
 test("retained old writers including preprepared statements fail closed after ledger migration", t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-ledger-old-writer-"));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const n = new MbxNode(home, { host: "alpha" }), e = send(n);
   n.store.db.exec("DROP TRIGGER messages_writer_version; DROP TRIGGER deliveries_writer_version; DROP TRIGGER deliveries_visibility; DROP TABLE mailbox_visibility; PRAGMA user_version=2");
   n.close();
@@ -198,7 +198,7 @@ test("independent current Store connections append late visibility after committ
 test("MCP whoami rename ledger failure rolls back the outer held lease transaction", async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-ledger-mcp-"));
   const n = new MbxNode(home, { host: "alpha" }), client = new Client({ name: "ledger-rename", version: "1" });
-  t.after(async () => { await client.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await client.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await client.connect(new StdioClientTransport({ command: process.execPath,
     args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: n.home, MBX_CLI: "claude", MBX_AGENT: "before", MBX_NO_DESKTOP: "1" } as Record<string,string> }));
@@ -224,7 +224,7 @@ test("MCP whoami rename ledger failure rolls back the outer held lease transacti
 
 test("malformed existing host configuration rolls back ledger migration", t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-ledger-config-"));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const n = new MbxNode(home, { host: "alpha" });
   send(n);
   const mail = n.store.db.prepare("SELECT * FROM messages").all(), deliveries = n.store.db.prepare("SELECT * FROM deliveries").all();

@@ -13,7 +13,7 @@ function fixture(t: { after(fn: () => void): void }) {
   const home = mkdtempSync(join(tmpdir(), "mbx-policy-record-")), owner = generateKeyPair();
   writeFileSync(join(home, "owner.json"), JSON.stringify({ backend: "keychain", public_key: owner.publicKey }), { mode: 0o600 });
   const n = new MbxNode(home, { host: "alpha" }), db = n.store.db;
-  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const make = () => makePolicy({ level: "yolo", agents: ["trusted-worker"], hosts: ["alpha"], ownerPub: owner.publicKey, ttlMs: 3600000 });
   const accept = (rec: PolicyRecord) => acceptSigned(db, { rec, sig: signData(owner.privateKey, canonical(rec)) }, "alpha");
   return { n, db, make, accept, owner };

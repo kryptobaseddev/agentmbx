@@ -13,7 +13,7 @@ test("peers learn each other's enc keys over the authenticated channel", async (
   const homes = [mkdtempSync(join(tmpdir(), "mbx-enk-a-")), mkdtempSync(join(tmpdir(), "mbx-enk-b-"))];
   const a = new MbxNode(homes[0], { host: "alpha" }), b = new MbxNode(homes[1], { host: "beta" });
   const server = await startServer(b, 0, "127.0.0.1");
-  t.after(async () => { await new Promise<void>((r) => server.close(() => r())); a.close(); b.close(); homes.forEach((h) => rmSync(h, { recursive: true, force: true })); });
+  t.after(async () => { await new Promise<void>((r) => server.close(() => r())); a.close(); b.close(); homes.forEach((h) => rmSync(h, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })); });
   const addr = `127.0.0.1:${(server.address() as AddressInfo).port}`;
   a.addApprovedPeer({ host: "beta", pubkey: b.key.publicKey, owner_pubkey: null, addr }, "fixture");
   b.addApprovedPeer({ host: "alpha", pubkey: a.key.publicKey, owner_pubkey: null, addr: "unused" }, "fixture");
@@ -32,7 +32,7 @@ test("an enc key that does not verify against the pinned host key is refused and
   const homes = [mkdtempSync(join(tmpdir(), "mbx-enk-mitm-")), mkdtempSync(join(tmpdir(), "mbx-enk-b-"))];
   const a = new MbxNode(homes[0], { host: "alpha" }), b = new MbxNode(homes[1], { host: "beta" });
   const server = await startServer(b, 0, "127.0.0.1");
-  t.after(async () => { await new Promise<void>((r) => server.close(() => r())); a.close(); b.close(); homes.forEach((h) => rmSync(h, { recursive: true, force: true })); });
+  t.after(async () => { await new Promise<void>((r) => server.close(() => r())); a.close(); b.close(); homes.forEach((h) => rmSync(h, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })); });
   const addr = `127.0.0.1:${(server.address() as AddressInfo).port}`;
   const attacker = new MbxNode(mkdtempSync(join(tmpdir(), "mbx-enk-x-")), { host: "beta" }); // same name, different keys
   a.addApprovedPeer({ host: "beta", pubkey: attacker.key.publicKey, owner_pubkey: null, addr }, "fixture");
@@ -49,7 +49,7 @@ test("the enc-key endpoint answers only to authenticated peers", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-enk-solo-"));
   const n = new MbxNode(home, { host: "solo" });
   const server = await startServer(n, 0, "127.0.0.1");
-  t.after(async () => { await new Promise<void>((r) => server.close(() => r())); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await new Promise<void>((r) => server.close(() => r())); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const addr = `127.0.0.1:${(server.address() as AddressInfo).port}`;
   const anon = await fetch(`http://${addr}/v1/enc-key`);
   assert.equal(anon.status, 401, "no hop signature, no key material");

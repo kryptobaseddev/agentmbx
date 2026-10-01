@@ -10,7 +10,7 @@ import { prepareBinding, startBinding, observeBinding, inspectBinding, BOOTSTRAP
 const rev = () => "test-revision";
 function prepared(t: { after: (fn: () => void) => void }) {
   const value = prepareBinding("test-model", rev);
-  t.after(() => rmSync(dirname(value.path), { recursive: true, force: true }));
+  t.after(() => rmSync(dirname(value.path), { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   return value;
 }
 

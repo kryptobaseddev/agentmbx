@@ -13,7 +13,7 @@ for (const change of ["revoke", "expire", "owner-key", "host-key", "unpair"] as 
   const owner = generateKeyPair(), session = generateKeyPair();
   writeFileSync(join(homes[0], "owner.json"), JSON.stringify({ backend: "keychain", public_key: owner.publicKey }), { mode: 0o600 });
   const a = new MbxNode(homes[0], { host: "alpha" }), b = new MbxNode(homes[1], { host: "beta" });
-  t.after(() => { a.close(); b.close(); homes.forEach(h => rmSync(h, { recursive: true, force: true })); });
+  t.after(() => { a.close(); b.close(); homes.forEach(h => rmSync(h, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })); });
   b.addApprovedPeer({ host: "alpha", pubkey: a.key.publicKey, owner_pubkey: owner.publicKey, addr: "unused" }, "fixture");
   const grant = makeGrant(owner.publicKey, owner.privateKey, session.publicKey, "master", "alpha", ["task.assign"], 1);
   const e = a.send({ from: "master", to: ["worker", "worker@beta"], subject: "authorized task", body: "payload", kind: "task" },

@@ -26,7 +26,7 @@ test("source SQL inserts specify columns for additive schema compatibility", () 
 
 for (const incompatible of [false, true]) test(`future schema is rejected before startup writes (incompatible: ${incompatible})`, (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-future-"));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const path = join(home, "mbx.db"), db = new DatabaseSync(path);
   db.exec(`PRAGMA user_version=${SCHEMA_VERSION + 1}; CREATE TABLE future_data (value TEXT); INSERT INTO future_data (value) VALUES ('preserve');`);
   if (incompatible) db.exec("CREATE TABLE messages (future_id TEXT)");
@@ -48,7 +48,7 @@ test("every MCP tool refuses an upgraded schema before its callback", async (t) 
   const home = mkdtempSync(join(tmpdir(), "mbx-upgrade-"));
   const n = new MbxNode(home, { host: "alpha" });
   const client = new Client({ name: "upgrade-test", version: "1" });
-  t.after(async () => { await client.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await client.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "worker", MBX_CLI: "claude", MBX_CHANNEL: "0", AGENTMBX_DEV: "1" } as Record<string, string> }));
   const args: Record<string, Record<string, unknown>> = {
@@ -69,7 +69,7 @@ test("every MCP tool refuses an upgraded schema before its callback", async (t) 
 
 test("v1 lease migration preserves signed message bytes and pending/acked delivery history", (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-v1-leases-"));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const original = new MbxNode(home, { host: "alpha" });
   const pending = original.send({ from: "sender", to: ["worker"], subject: "pending", body: "durable" }).envelope.id;
   const acked = original.send({ from: "sender", to: ["worker"], subject: "acked", body: "durable" }).envelope.id;
@@ -92,7 +92,7 @@ test("v1 lease migration preserves signed message bytes and pending/acked delive
 
 test("failed migration rolls back the lease table and version marker together", (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-migration-abort-")), path = join(home, "mbx.db");
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const db = new DatabaseSync(path);
   db.exec("PRAGMA user_version=1; CREATE VIEW principals AS SELECT 'sentinel' AS fp"); db.close();
   assert.throws(() => new Store(home, { allowIdentityMigration: true }), /view|table/i);
@@ -106,7 +106,7 @@ test("failed migration rolls back the lease table and version marker together", 
 
 for (const existed of [false, true]) test(`concurrent legacy initialization cannot bypass migration consent (file existed: ${existed})`, t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-migration-race-")), path = join(home, "mbx.db");
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   if (existed) new DatabaseSync(path).close();
   const exec = DatabaseSync.prototype.exec;
   let initialized = false;
@@ -133,7 +133,7 @@ for (const existed of [false, true]) test(`concurrent legacy initialization cann
 
 test("migration records the upgrading version and stale peers get accurate advice", (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-upgrade-by-"));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const original = new MbxNode(home, { host: "alpha" });
   original.store.db.exec("DROP TABLE identity_leases; DELETE FROM kv WHERE k='schema-upgraded-by'; PRAGMA user_version=1");
   original.close();
@@ -213,7 +213,7 @@ test("code fingerprints detect a deployed build without a schema change", async 
 test("code fingerprints detect npm manifest updates with unchanged entry timestamps and sizes", async t => {
   const { codeFingerprint } = await import("../src/mcp.ts");
   const root = mkdtempSync(join(tmpdir(), "mbx-fingerprint-")), manifest = join(root, "package.json"), entry = join(root, "dist/cli.js");
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const cached = version(), stat = () => ({ mtimeMs: 100, size: 5 });
   writeFileSync(manifest, JSON.stringify({ version: "0.4.1" }));
   const before = codeFingerprint(entry, stat);

@@ -11,7 +11,7 @@ import { IdentityLeases, inspectLeaseProcess } from "../src/identity-leases.ts";
 for (const cli of ["codex", "opencode"]) test(`${cli} remembered holder conflict leaves identity controls usable and preserves the holder`, async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-resume-conflict-")), node = new MbxNode(home, { host: "alpha" });
   const previous = new Client({ name: "previous", version: "test" }), replacement = new Client({ name: "replacement", version: "test" });
-  t.after(async () => { await previous.close(); await replacement.close(); node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await previous.close(); await replacement.close(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const transport = () => new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "resume-default", MBX_CLI: cli, AGENTMBX_DEV: "1", MBX_NO_DESKTOP: "1" } as Record<string, string> });
   const meta = cli === "codex" ? { threadId: "11111111-1111-4111-8111-111111111111" } : { sessionID: "ses_resumeconflict" };
@@ -40,7 +40,7 @@ for (const cli of ["codex", "opencode"]) test(`${cli} remembered holder conflict
 for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} explicit release and reclaim preserves history and does not auto-reacquire`, async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-recover-")), node = new MbxNode(home, { host: "alpha" });
   const client = new Client({ name: cli, version: "test" }), preload = join(home, "heartbeat.mjs");
-  t.after(async () => { await client.close(); node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await client.close(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   writeFileSync(preload, "const interval=globalThis.setInterval; globalThis.setInterval=(fn,ms,...args)=>interval(fn,ms===60000?50:ms,...args);");
   await client.connect(new StdioClientTransport({ command: process.execPath, args: ["--import", preload, join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "reader", MBX_CLI: cli, AGENTMBX_DEV: "1", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
@@ -98,7 +98,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} explicit
 
 test("stale recovery cannot take over or release a successor, or erase its session binding", async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-recover-stale-")), node = new MbxNode(home, { host: "alpha" }), client = new Client({ name: "claude", version: "test" });
-  t.after(async () => { await client.close(); node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await client.close(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "reader", MBX_CLI: "claude", AGENTMBX_DEV: "1" } as Record<string, string> }));
   node.store.db.prepare("UPDATE identity_leases SET heartbeat_at=0 WHERE name='reader'").run();
@@ -116,7 +116,7 @@ test("stale recovery cannot take over or release a successor, or erase its sessi
 test("explicit OpenCode to Claude handoff transfers persona and mail without transferring session authority", async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-provider-handoff-")), node = new MbxNode(home, { host: "alpha" });
   const old = new Client({ name: "opencode", version: "test" }), next = new Client({ name: "claude", version: "test" });
-  t.after(async () => { await old.close(); await next.close(); node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await old.close(); await next.close(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   for (const [client, cli, agent] of [[old, "opencode", "old-default"], [next, "claude", "new-default"]] as const) {
     await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
       env: { ...process.env, MBX_HOME: home, MBX_CLI: cli, MBX_AGENT: agent, AGENTMBX_DEV: "1" } as Record<string, string> }));

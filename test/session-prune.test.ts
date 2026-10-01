@@ -11,7 +11,7 @@ import { _resetProcCache, procStart } from "../src/proc.ts";
 test("dead and PID-reused session rows are pruned; live and unprovable rows stay, and chosen names survive", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-prune-"));
   const n = new MbxNode(home, { host: "alpha" });
-  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"]);
   await new Promise((r) => child.once("spawn", r));
   const deadPid = child.pid!;

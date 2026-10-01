@@ -24,7 +24,7 @@ function fakeDaimon() {
 
 test("bind tickets are single use, reused per session while fresh, and only fit their own parent process", t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-ticket-")), n = new MbxNode(home, { host: "alpha" });
-  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const now = Date.now(), base = { cli: "kimi", session_id: "conv-1", cwd: "/work/a", parent_pid: 4242 };
   const a = issueBindTicket(n.store, base, now);
   assert.equal(issueBindTicket(n.store, base, now + 1000), a, "the same session gets the same ticket");
@@ -45,7 +45,7 @@ test("a desktop conversation links its own mbx server by ticket, takes its folde
   const n = new MbxNode(home, { host: "alpha" });
   const env = { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "kimi", MBX_AGENT: "", MBX_NO_DESKTOP: "1", MBX_KIMI_DESKTOP_DAIMON: daimon } as Record<string, string>;
   const a = new Client({ name: "conv-a", version: "1" }), b = new Client({ name: "conv-b", version: "1" });
-  t.after(async () => { await a.close(); await b.close(); n.close(); for (const d of [home, daimon, work]) rmSync(d, { recursive: true, force: true }); });
+  t.after(async () => { await a.close(); await b.close(); n.close(); for (const d of [home, daimon, work]) rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   // two conversations of one app process: both servers start in the plugin folder, under the same parent
   for (const c of [a, b]) await c.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"], env, cwd: plugin }));
   const hook = (event: string, sid: string) => spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", event, "--cli", "kimi"],
@@ -111,7 +111,7 @@ test("wakeKimiDesktop outcomes: busy, conversation busy error, no conversation, 
 test("doctor flags a kimi web server that started before its AgentMBX hooks were written", async t => {
   const { kimiServerHooks } = await import("../src/doctor.ts");
   const kimi = mkdtempSync(join(tmpdir(), "mbx-kimi-home-"));
-  t.after(() => rmSync(kimi, { recursive: true, force: true }));
+  t.after(() => rmSync(kimi, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   mkdirSync(join(kimi, "server/instances"), { recursive: true });
   writeFileSync(join(kimi, "server.token"), "tok");
   writeFileSync(join(kimi, "config.toml"), '[[hooks]]\nevent = "UserPromptSubmit"\ncommand = "agentmbx hook prompt --cli kimi"\n');

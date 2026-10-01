@@ -15,7 +15,7 @@ const cli = (home: string, ...args: string[]) => spawnSync(process.execPath, [re
 
 test("identity inventory distinguishes current, expired, unknown and legacy ownership without mutating leases", t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-identities-")), node = new MbxNode(home, { host: "alpha" });
-  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const names = ["held", "released", "idle", "dead", "reused", "unknown", "conflicted"];
   const leases = new IdentityLeases(node.store, { clock: () => 1000, idleTtlMs: 100, inspect: pid => ({ alive: true, start: `birth-${pid}` }) });
   names.forEach((name, i) => {
@@ -51,7 +51,7 @@ test("identity inventory distinguishes current, expired, unknown and legacy owne
 
 test("identity CLI inspects schema v1 without migration or registration", t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-identity-v1-")), node = new MbxNode(home, { host: "alpha" });
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   node.send({ from: "sender", to: ["historical"], subject: "unread", body: "kept" });
   node.store.db.exec("DROP TABLE identity_leases; PRAGMA user_version=1"); node.close();
   const path = join(home, "mbx.db"), before = readFileSync(path);
@@ -69,7 +69,7 @@ test("identity CLI inspects schema v1 without migration or registration", t => {
 
 test("identity CLI help and usage do not create a mailbox", t => {
   const root = mkdtempSync(join(tmpdir(), "mbx-identity-missing-")), home = join(root, "missing");
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   assert.match(cli(home, "identity", "--help").stdout, /identity list/);
   assert.equal(cli(home, "identity", "claim").status, 2);
   assert.equal(cli(home, "identity", "list").status, 3);
@@ -78,7 +78,7 @@ test("identity CLI help and usage do not create a mailbox", t => {
 
 test("identity inventory refuses future schemas without modifying them", t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-identity-future-")), node = new MbxNode(home, { host: "alpha" });
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   node.store.db.exec("PRAGMA user_version=999"); node.close();
   const before = readFileSync(join(home, "mbx.db"));
   assert.throws(() => listIdentityStatus(home), { code: "STALE_SERVER" });

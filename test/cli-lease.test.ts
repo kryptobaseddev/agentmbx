@@ -37,7 +37,7 @@ const guarded = (home: string, selection: Record<string, unknown>, action = "inb
 for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI guard binds exact current lease through reads and writes`, async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-cli-lease-")), node = new MbxNode(home, { host: "alpha" });
   const client = new Client({ name: cli, version: "test" });
-  t.after(async () => { await client.close(); node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await client.close(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "reader", MBX_CLI: cli, AGENTMBX_DEV: "1" } as Record<string,string> }));
   const meta = cli === "codex" ? { threadId: "55555555-5555-4555-8555-555555555555" } : cli === "opencode" ? { sessionID: "ses_clilease" } : undefined;
@@ -79,7 +79,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI guar
 
 test("shell names and historical links never establish CLI ownership", t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-cli-no-lease-")), node = new MbxNode(home, { host: "alpha" });
-  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const id = node.send({ from: "sender", to: ["offline"], subject: "private", body: "kept" }).envelope.id;
   node.store.set("ident:offline", "shell");
   const denied = guarded(home, { as: "offline" }, "ack", id);

@@ -23,7 +23,7 @@ for (const cli of ["claude", "codex", "opencode"]) test(`${cli} build handover f
   const node = new MbxNode(home, { host: "alpha" }), client = new Client({ name: "handoff-test", version: "1" });
   let catalogChanges = 0;
   client.setNotificationHandler(ToolListChangedNotificationSchema, () => { catalogChanges++; });
-  t.after(async () => { await client.close(); node.close(); rmSync(root, { recursive: true, force: true }); });
+  t.after(async () => { await client.close(); node.close(); rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const env: NodeJS.ProcessEnv = { ...process.env, MBX_HOME: home, MBX_AGENT: "update-reader", MBX_CLI: cli, MBX_NO_DESKTOP: "1" };
   delete env.AGENTMBX_DEV;
   delete env.MBX_MCP_REEXEC;

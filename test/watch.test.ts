@@ -19,7 +19,7 @@ const until = async (ok: () => boolean, ms = 10_000) => { for (const end = Date.
 test("agentmbx watch skips status mail, exits with a no-body hint for a request, and the daemon defers meanwhile", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-watch-"));
   const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "watch-test", version: "1" });
-  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const env = { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "kimi", MBX_AGENT: "worker", MBX_NO_DESKTOP: "1", MBX_DEBUG: "" } as Record<string, string>;
   await c.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"], env }));
   delegateWake(n, "worker");
@@ -48,7 +48,7 @@ test("agentmbx watch skips status mail, exits with a no-body hint for a request,
 test("agentmbx watch outside any session lease stops with a reason", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-watch-none-"));
   new MbxNode(home, { host: "alpha" }).close();
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const child = spawn(process.execPath, [resolve("bin/agentmbx.js"), "watch"], { env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_AGENT: "", MBX_WATCH_INTERVAL_MS: "200" } });
   let out = ""; child.stdout.on("data", d => { out += d; });
   assert.equal(await new Promise(r => child.on("exit", r)), 1);
