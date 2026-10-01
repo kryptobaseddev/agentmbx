@@ -476,6 +476,17 @@ export class MbxNode {
     this.store.audit("pair.removed", { host });
   }
 
+  /** Move an approved peer to a new address (address healing, T151). Trust is unchanged: the pinned keys stay. Queued
+   *  mail for that host becomes due at once, so it goes out on the next outbox pass instead of after its back-off. */
+  setPeerAddr(host: string, addr: string, via: string) {
+    const p = this.approvedPeer(host);
+    if (!p || p.addr === addr) return false;
+    this.store.db.prepare("UPDATE peers SET addr=? WHERE host=? AND state='approved'").run(addr, host);
+    this.store.db.prepare("UPDATE outbox SET next_at=? WHERE host=?").run(new Date(0).toISOString(), host);
+    this.store.audit("peer.addr", { host, from: p.addr, to: addr, via });
+    return true;
+  }
+
   /** Approve a peer directly (token pairing: the peer already proved it holds the token). */
   addApprovedPeer(p: { host: string; pubkey: string; owner_pubkey: string | null; addr: string }, via: string) {
     if (p.host === this.host) throw new Error("peer has the same host name as this host; rename one (config.json)");

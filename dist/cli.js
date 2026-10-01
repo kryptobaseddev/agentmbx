@@ -7,7 +7,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { canonical, fingerprint, ulid } from "./crypto.js";
 import { buildGrant, CAPS, grantPayload, NAME_RE } from "./envelope.js";
 import { advertise, browse, lanIPv4 } from "./discovery.js";
-import { announceRotations, flushOutbox, notifyUnpair, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.js";
+import { announceRotations, flushOutbox, addrSignature, healPeerAddr, healStuckPeers, notifyUnpair, sendPresence, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.js";
 import { relayDrainOutbox, relayFor, relayPull } from "./relay-client.js";
 import { RelayCore, startRelayServer } from "./relay.js";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.js";
@@ -66,6 +66,7 @@ Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …'
   agentmbx pair --compare <host:port>               manual alternative: compare a 6-digit code, then on BOTH hosts
   agentmbx pair approve <host> <code>
   agentmbx peers                                    agentmbx peers remove <host>
+  agentmbx peers addr <host> <host:port>            move a paired host to a new address (key-checked; usually automatic)
   agentmbx host rotate                              new host and encryption keys, announced to peers (pairings kept)
   agentmbx watch [--cli <cli> --session <id>]       wait for mail for this session, print the hint and exit (run in the background)
   agentmbx wake mute <agent> [--minutes 60]          pause wake hints and notices for an agent (mail keeps arriving)   agentmbx wake unmute <agent>
@@ -558,6 +559,15 @@ version ${version()} (${installKind()})`);
             return;
         }
         case "peers": {
+            if (pos[0] === "addr") {
+                const host = pos[1] ?? die("peers addr <host> <host:port>"), addr = withPort(pos[2] ?? die("peers addr <host> <host:port>"));
+                if (!node.approvedPeer(host))
+                    die(`${host} is not a paired host`);
+                const moved = await healPeerAddr(node, host, addr, "cli");
+                if (!moved)
+                    die(`${addr} did not answer as ${host} with its pinned key (or it is already the address); nothing changed`);
+                return console.log(`${host} is now at ${addr} (key verified). Queued mail goes out on the daemon's next pass.`);
+            }
             if (pos[0] === "remove") {
                 const host = pos[1] ?? die("peers remove <host>");
                 const told = await notifyUnpair(node, host);
@@ -674,7 +684,16 @@ If the codes differ, do not approve: someone is in the middle.`);
                 });
             }
             setInterval(tick, 2000);
-            setInterval(() => { void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node); try {
+            // Presence (T201): announce this host's addresses on start, within ~10 s of an address change, and every 5 min.
+            let lastAddrs = addrSignature(node), lastBeacon = 0;
+            const beacon = () => { const sig = addrSignature(node); if (sig !== lastAddrs || Date.now() - lastBeacon > 300_000) {
+                lastAddrs = sig;
+                lastBeacon = Date.now();
+                void sendPresence(node).catch(() => { });
+            } };
+            setInterval(beacon, 10_000).unref();
+            setTimeout(() => { lastBeacon = 0; beacon(); }, 2_000).unref();
+            setInterval(() => { void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node); void healStuckPeers(node, () => browse(3_000)).then(() => sendPresence(node, fetch, stuckHosts(node))).catch(() => { }); try {
                 node.pruneDeadSessions();
             }
             catch { /* db busy: next minute */ } }, 60_000);
@@ -815,6 +834,7 @@ async function identityBackup(action, file, force) {
     console.log("If this machine's address changed, peers still dial the old one: re-pair or update the peer address there. Then: agentmbx daemon install; agentmbx doctor");
 }
 // ---- token pairing ---------------------------------------------------------------------------
+const stuckHosts = (node) => node.store.db.prepare("SELECT DISTINCT host FROM outbox WHERE attempts>=2").all().map((r) => r.host);
 const withPort = (a) => (/:\d+$/.test(a) ? a : `${a}:${DEFAULT_PORT}`);
 async function pairToken(node, ttl = "10m") {
     const m = /^(\d+)(s|m|h)?$/.exec(ttl) ?? die("--ttl like 10m, 90s or 1h (at most 1h)");
