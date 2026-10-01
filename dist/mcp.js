@@ -22,6 +22,7 @@ import { activePolicies, delegationNote, MAX_HOP } from "./policy.js";
 import { procStart, withProcSnapshot } from "./proc.js";
 import { updateAvailable } from "./update.js";
 import { installKind, version } from "./version.js";
+import { connectorKey } from "./diagnostics.js";
 import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wake.js";
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
 It is shared by AI coding agents on this machine and on paired machines. Your user set it up so agents can coordinate;
@@ -549,8 +550,19 @@ export async function runMcp(existing) {
             sessions: [...states.values()].filter(s => !held(s)).map(s => ({ sessionId: s.sessionId, agent: s.agent })) };
     };
     let handedOver = false;
+    const tools = [];
+    /** What this running connector actually serves (T183): version, loaded build and tool catalog, keyed by its own
+     *  process birth so diagnostics can tell it apart from the installed CLI and from a reused PID. */
+    const publishConnector = () => {
+        try {
+            node.store.set(connectorKey(process.pid), JSON.stringify({ v: 1, pid: process.pid, start: holderStart, version: version(), build: boot,
+                tools: [...tools].sort(), cli: env.cli, at: new Date().toISOString() }));
+        }
+        catch { /* best effort: diagnostics then reports no observation */ }
+    };
     const register = server.registerTool.bind(server);
     server.registerTool = (name, config, cb) => {
+        tools.push(name);
         if (cb.constructor.name === "AsyncFunction")
             throw new Error(`MCP handler ${name} must be synchronous to preserve its lease fence`);
         return register(name, config, (...a) => {
@@ -950,8 +962,10 @@ export async function runMcp(existing) {
             }
         }, 1500).unref());
     }
+    publishConnector();
     // keep last_seen fresh while the session lives
     timers.push(setInterval(() => {
+        publishConnector();
         for (const state of [base, ...states.values()]) {
             if (state.released)
                 continue;
