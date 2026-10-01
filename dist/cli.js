@@ -14,6 +14,7 @@ import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.js";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
 import { ancestors, withProcSnapshot } from "./proc.js";
 import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.js";
+import { activeLead, leadSummary, makeLead, makeLeadRevocation, revokeLead, storeLead } from "./project-ledger.js";
 import { DEFAULT_PORT, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
 import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary } from "./policy.js";
 import { authHelperPath, createKeychainOwner, createOwnerKey, defaultOwnerBackend, ownerInfo, ownerSignCanonical, readPassphraseFromTTY } from "./owner.js";
@@ -26,7 +27,7 @@ import { kimiMultiHost } from "./kimi-web.js";
 import { bindInstruction, issueBindTicket } from "./bind-ticket.js";
 import { activityKey } from "./identity-availability.js";
 import { inspectLeaseProcess } from "./identity-leases.js";
-import { linkedKey, recordSessionHint, registeredIdentity } from "./registry.js";
+import { linkedKey, projectOf, recordSessionHint, registeredIdentity } from "./registry.js";
 import { installDesktopPlugin, kimiDesktop, kimiDesktopDir, removeDesktopPlugin, writeDesktopPlugin } from "./kimi-desktop.js";
 import { approveKimi, decidePermission, opencodePermissionPass } from "./permission.js";
 import { diagnosticSnapshot } from "./diagnostics.js";
@@ -99,6 +100,8 @@ Owner (each signature needs you: a Touch ID / password prompt on macOS with Agen
 Policy (what agents may do for each other; each change needs you, like the owner commands)
   agentmbx policy set <agent[,agent]|*> <${LEVELS.join("|")}> [--from local,<host>,principal:<fp>|*] [--host <host,…>|*] [--project <dir>]… [--classes ${CLASSES.join(",")}] [--ttl 8h]
   agentmbx policy list [--json]      agentmbx policy renew <id> [--ttl 30d]      agentmbx policy revoke <id> | --all   (--all is the kill switch, sent to every paired host)
+  agentmbx lead set <agent> --project <dir> [--ttl 30d]     agentmbx lead revoke --project <dir>     agentmbx lead show [--project <dir>]
+                  owner-signed project lead: reads every message of that project (mbx_project) and can forward them (mbx_forward)
   agentmbx audit [--since 24h] [--json]      what agents did on peer requests, YOLO approvals, policy and owner changes
 
 Install
@@ -778,6 +781,7 @@ If the codes differ, do not approve: someone is in the middle.`);
         }
         case "owner": return owner(node, pos, str, o);
         case "policy": return policy(node, pos, str, o);
+        case "lead": return lead(node, pos, str, o);
         case "wake": {
             // Owner control (T179): pause wake hints and desktop notices for one agent; its mail stays unread and searchable.
             const agent = pos[1] ?? die("wake mute <agent> [--minutes N] | wake unmute <agent>");
@@ -929,6 +933,42 @@ export async function ownerInit(home, backend = defaultOwnerBackend(), log = (s)
     }
     log(`owner key created: ${fingerprint(pub)} (${backend})\nPair (or re-pair) your other hosts so they pin this key.`);
     return pub;
+}
+/** `agentmbx lead`: owner-signed project leads (T208). Signed like policies; verified again on every read. */
+async function lead(node, pos, str, o) {
+    const sub = pos[0];
+    const dir = str("project") ?? (Array.isArray(o.project) ? o.project[0] : undefined); // --project is a multiple option
+    const project = dir ? (projectOf(resolve(dir)) ?? die(`${dir} is the home folder or /, not a project`)) : undefined;
+    if (sub === "show") {
+        const rows = node.store.db.prepare("SELECT DISTINCT project FROM project_leads" + (project ? " WHERE project=?" : "")).all(...(project ? [project] : []));
+        if (!rows.length)
+            return console.log(project ? `no lead for ${project}` : "no project leads");
+        for (const r of rows) {
+            const l = activeLead(node, r.project);
+            console.log(`${r.project}\t${l ? `${l.agent}@${l.host} until ${l.exp} (id ${l.id})` : "none (expired or revoked)"}`);
+        }
+        return;
+    }
+    if (!project)
+        die(`lead ${sub ?? "set"} needs --project <dir>`);
+    const ownerPub = node.ownerPub ?? die("no owner key on this machine: run 'agentmbx owner init'");
+    if (sub === "set") {
+        const agent = pos[1] ?? die("lead set <agent> --project <dir> [--ttl 30d]");
+        if (!node.knownLocalName(agent))
+            die(`"${agent}" is not an agent on ${node.host}`);
+        const rec = makeLead({ project: project, agent, host: node.host, ownerPub, ttlMs: str("ttl") ? parseTtl(str("ttl")) : undefined });
+        const { sig } = await ownerSignCanonical(node.home, canonical(rec), leadSummary(rec));
+        storeLead(node, rec, sig);
+        return console.log(`${agent}@${node.host} is the lead of ${project} until ${rec.exp} (id ${rec.id}).`);
+    }
+    if (sub === "revoke") {
+        const cur = activeLead(node, project) ?? die(`no active lead for ${project}`);
+        const rev = makeLeadRevocation(cur.id, ownerPub);
+        const { sig } = await ownerSignCanonical(node.home, canonical(rev), `Revoke ${cur.agent}@${cur.host} as lead of ${project}`);
+        revokeLead(node, rev, sig);
+        return console.log(`revoked: ${cur.agent}@${cur.host} is no longer the lead of ${project}.`);
+    }
+    die("lead set <agent> --project <dir> [--ttl 30d] | lead revoke --project <dir> | lead show [--project <dir>]");
 }
 async function owner(node, pos, str, o) {
     const sub = pos[0];

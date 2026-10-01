@@ -14,6 +14,7 @@ import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.ts";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.ts";
 import { ancestors, withProcSnapshot } from "./proc.ts";
 import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.ts";
+import { activeLead, leadSummary, makeLead, makeLeadRevocation, revokeLead, storeLead } from "./project-ledger.ts";
 import { DEFAULT_PORT, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.ts";
 import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary,
   type Level, type PolicyClass, type PolicyRecord, type Revocation } from "./policy.ts";
@@ -27,7 +28,7 @@ import { kimiMultiHost } from "./kimi-web.ts";
 import { bindInstruction, issueBindTicket } from "./bind-ticket.ts";
 import { activityKey } from "./identity-availability.ts";
 import { inspectLeaseProcess } from "./identity-leases.ts";
-import { linkedKey, recordSessionHint, registeredIdentity } from "./registry.ts";
+import { linkedKey, projectOf, recordSessionHint, registeredIdentity } from "./registry.ts";
 import { installDesktopPlugin, kimiDesktop, kimiDesktopDir, removeDesktopPlugin, writeDesktopPlugin } from "./kimi-desktop.ts";
 import { approveKimi, decidePermission, opencodePermissionPass, type Lookup } from "./permission.ts";
 import { diagnosticSnapshot, type RuntimeObservation } from "./diagnostics.ts";
@@ -101,6 +102,8 @@ Owner (each signature needs you: a Touch ID / password prompt on macOS with Agen
 Policy (what agents may do for each other; each change needs you, like the owner commands)
   agentmbx policy set <agent[,agent]|*> <${LEVELS.join("|")}> [--from local,<host>,principal:<fp>|*] [--host <host,…>|*] [--project <dir>]… [--classes ${CLASSES.join(",")}] [--ttl 8h]
   agentmbx policy list [--json]      agentmbx policy renew <id> [--ttl 30d]      agentmbx policy revoke <id> | --all   (--all is the kill switch, sent to every paired host)
+  agentmbx lead set <agent> --project <dir> [--ttl 30d]     agentmbx lead revoke --project <dir>     agentmbx lead show [--project <dir>]
+                  owner-signed project lead: reads every message of that project (mbx_project) and can forward them (mbx_forward)
   agentmbx audit [--since 24h] [--json]      what agents did on peer requests, YOLO approvals, policy and owner changes
 
 Install
@@ -620,6 +623,7 @@ If the codes differ, do not approve: someone is in the middle.`);
     }
     case "owner": return owner(node, pos, str, o);
     case "policy": return policy(node, pos, str, o);
+    case "lead": return lead(node, pos, str, o);
     case "wake": {
       // Owner control (T179): pause wake hints and desktop notices for one agent; its mail stays unread and searchable.
       const agent = pos[1] ?? die("wake mute <agent> [--minutes N] | wake unmute <agent>");
@@ -748,6 +752,37 @@ export async function ownerInit(home: string, backend: OwnerBackend = defaultOwn
   }
   log(`owner key created: ${fingerprint(pub)} (${backend})\nPair (or re-pair) your other hosts so they pin this key.`);
   return pub;
+}
+
+/** `agentmbx lead`: owner-signed project leads (T208). Signed like policies; verified again on every read. */
+async function lead(node: MbxNode, pos: string[], str: (k: string) => string | undefined, o: Record<string, unknown>) {
+  const sub = pos[0];
+  const dir = str("project") ?? (Array.isArray(o.project) ? (o.project as string[])[0] : undefined); // --project is a multiple option
+  const project = dir ? (projectOf(resolve(dir)) ?? die(`${dir} is the home folder or /, not a project`)) : undefined;
+  if (sub === "show") {
+    const rows = node.store.db.prepare("SELECT DISTINCT project FROM project_leads" + (project ? " WHERE project=?" : "")).all(...(project ? [project] : [])) as { project: string }[];
+    if (!rows.length) return console.log(project ? `no lead for ${project}` : "no project leads");
+    for (const r of rows) { const l = activeLead(node, r.project); console.log(`${r.project}\t${l ? `${l.agent}@${l.host} until ${l.exp} (id ${l.id})` : "none (expired or revoked)"}`); }
+    return;
+  }
+  if (!project) die(`lead ${sub ?? "set"} needs --project <dir>`);
+  const ownerPub = node.ownerPub ?? die("no owner key on this machine: run 'agentmbx owner init'");
+  if (sub === "set") {
+    const agent = pos[1] ?? die("lead set <agent> --project <dir> [--ttl 30d]");
+    if (!node.knownLocalName(agent)) die(`"${agent}" is not an agent on ${node.host}`);
+    const rec = makeLead({ project: project!, agent, host: node.host, ownerPub, ttlMs: str("ttl") ? parseTtl(str("ttl")!) : undefined });
+    const { sig } = await ownerSignCanonical(node.home, canonical(rec), leadSummary(rec));
+    storeLead(node, rec, sig);
+    return console.log(`${agent}@${node.host} is the lead of ${project} until ${rec.exp} (id ${rec.id}).`);
+  }
+  if (sub === "revoke") {
+    const cur = activeLead(node, project!) ?? die(`no active lead for ${project}`);
+    const rev = makeLeadRevocation(cur!.id, ownerPub);
+    const { sig } = await ownerSignCanonical(node.home, canonical(rev), `Revoke ${cur!.agent}@${cur!.host} as lead of ${project}`);
+    revokeLead(node, rev, sig);
+    return console.log(`revoked: ${cur!.agent}@${cur!.host} is no longer the lead of ${project}.`);
+  }
+  die("lead set <agent> --project <dir> [--ttl 30d] | lead revoke --project <dir> | lead show [--project <dir>]");
 }
 
 async function owner(node: MbxNode, pos: string[], str: (k: string) => string | undefined, o: Record<string, unknown>) {

@@ -43,7 +43,7 @@ test("MCP tools: whoami, send, inbox, read (framed), ack, thread, search, agents
   const { c: a } = await client(home, "planner");
   const { c: b } = await client(home, "builder");
   const tools = (await a.listTools()).tools.map((t) => t.name).sort();
-  assert.deepEqual(tools, ["mbx_ack", "mbx_agents", "mbx_identity", "mbx_inbox", "mbx_read", "mbx_replay", "mbx_reply", "mbx_search", "mbx_send", "mbx_sent", "mbx_thread", "mbx_whoami"]);
+  assert.deepEqual(tools, ["mbx_ack", "mbx_agents", "mbx_forward", "mbx_identity", "mbx_inbox", "mbx_project", "mbx_read", "mbx_replay", "mbx_reply", "mbx_search", "mbx_send", "mbx_sent", "mbx_thread", "mbx_whoami"]);
   const listed = (await a.listTools()).tools;
   assert.match(listed.find((t) => t.name === "mbx_inbox")!.description!, /^Start here:/);
   for (const t of listed) assert.match(t.description!, /Next:/, `${t.name} should name the next step`);
