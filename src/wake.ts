@@ -283,6 +283,17 @@ function reconcileWakes(node: MbxNode, now: number) {
     .run(new Date(now - UNKNOWN_HOLD_MS).toISOString());
 }
 
+const NOTICES_PER_MINUTE = 6;
+/** Desktop notices only for agents this host knows, and at most NOTICES_PER_MINUTE across all of them. */
+function noticeAllowed(node: MbxNode, agent: string, now: number): boolean {
+  const known = node.store.db.prepare("SELECT 1 FROM agents WHERE name=? AND host=?").get(agent, node.host) || node.sessionsFor(agent).length;
+  if (!known) return false;
+  const recent = (JSON.parse(node.store.get("desktop-notices") ?? "[]") as number[]).filter((t) => now - t < 60_000);
+  if (recent.length >= NOTICES_PER_MINUTE) return false;
+  node.store.set("desktop-notices", JSON.stringify([...recent, now]));
+  return true;
+}
+
 /** One pass of the wake dispatcher: every delivered-but-not-notified message is either woken, batched or skipped. */
 export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ agent: string; result: WakeResult | { ok: false; via: "brake"; error: string } }[]> {
   reconcileWakes(node, now);
@@ -376,6 +387,14 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
       continue;
     }
     let desktop = false;
+    // A name with no registered agent or session gets no notice, and notices are rate limited across all names (T196, F6):
+    // mail to made-up names cannot flood the desktop or stall the daemon. The mail is still re-woken once a session binds.
+    if (!result.ok && !noticeAllowed(node, agent, now)) {
+      node.store.tx(() => rows.forEach(r => node.setDelivery(r.id, agent, "notified", "desktop")));
+      node.store.audit("wake.notice_skipped", { agent, count: wanted.length });
+      out.push({ agent, result: { ok: false, via: "desktop", error: "notice skipped (unknown agent or notice rate limit)" } });
+      continue;
+    }
     if (!result.ok) result = await notifyDesktop({ subtitle: agent, body: text, openCmd: inboxCommand(agent) }).then((r) => { desktop = r.ok; return r.ok ? r : result; });
     // mail that only reached the desktop gets another wake when a wakeable session binds (node.bindSession)
     const finish = () => rows.forEach(r => node.setDelivery(r.id, agent, "notified", desktop || !result.ok ? "desktop" : null));

@@ -105,12 +105,12 @@ These decisions frame everything below. They are owner decisions, not findings.
 | I5 | Information disclosure | `/v1/status` and mDNS reveal host name, key fingerprint, version | Metadata only, no nonce or authority (`src/http.ts:152-154`, `src/discovery.ts:14-16`) | Accepted (F13) |
 | I6 | Information disclosure | Pruned mail survives on disk | `agentmbx prune` runs VACUUM; the daemon sweep does not (`src/cli.ts` retention sweep) | Accepted (F15) |
 | D1 | Denial of service | Wake storm: many messages wake an agent repeatedly | 30 s batching, 6 wakes per thread per hour, 60 per agent per day, reserved atomically (`src/node.ts:27`, `src/node.ts:744-760`); busy backoff to 60 s, unknown hold 10 min, owner mute (`src/wake.ts:248-311`); `status` never wakes (`src/node.ts:729-736`) | Mitigated per agent; F6 across names |
-| D2 | Denial of service | A3 addresses thousands of unknown names; each gets its own wake budget and a desktop notice | None beyond the per-request caps | **F6** follow-up |
+| D2 | Denial of service | A3 addresses thousands of unknown names; each gets its own wake budget and a desktop notice | Valid names only; no notice for unknown names; six notices a minute (T196) | Mitigated |
 | D3 | Denial of service | Pairing/rotation endpoints exhausted | Global per-minute limits: 30 token, 10 SAS, 30 rotate (`src/http.ts:156-186`) | Accepted (lockout for a minute) |
 | D4 | Denial of service | A5 drops or delays relayed mail | LAN stays primary; outbox persists; 72 h expiry alerts the sender (`src/http.ts:283-290`) | Accepted (ADR-035) |
 | D5 | Denial of service | Session table grows with dead processes | `pruneDeadSessions` deletes only rows whose process is provably gone or reused (`src/node.ts:405-417`) | Mitigated (T046) |
 | E1 | Elevation of privilege | Prompt injection in a body makes an agent act | Framed content, policy computed from owner records, external-origin read-only, relay depth limit 6, per-thread action cap 20 (`src/policy.ts:16-17`, `src/policy.ts:278-284`) | Accepted residual (R7) |
-| E2 | Elevation of privilege | Sender address or subject breaks out of the frame into a wake prompt or headers | Sender address fixed (F3); subject still free text inside the header block | F3 fixed; **F8** follow-up |
+| E2 | Elevation of privilege | Sender address or subject breaks out of the frame into a wake prompt or headers | Sender address fixed (F3); one-line headers and random body boundaries (F8, T196) | Mitigated |
 | E3 | Elevation of privilege | Relay-depth reset (T104) abused to extend agent chains | Only a hook `prompt` event whose text does not start with `[mbx` resets depth; external origin never resets (`src/wake.ts:46`, `src/cli.ts:926`, `src/mcp.ts:437-444`) | Accepted (F17) |
 | E4 | Elevation of privilege | A wake or YOLO approval for the wrong session | Exact-session binding, lease generation and authority rechecked before and after the native write (`src/wake.ts:320-347`, `src/permission.ts:38-56`) | Mitigated (T178/T179) |
 | E5 | Elevation of privilege | Peer owner key gains authority here | Recorded as `peer-owner` until adopted explicitly; removed with the pairing (`src/node.ts:87-112`, `src/node.ts:458-465`) | Mitigated |
@@ -126,15 +126,15 @@ commit carries a regression test that failed before the fix.
 | F1 | High | Relay-supplied body key used without verification | Fixed `f47ec53` |
 | F2 | High | Code-compare (SAS) pairing allows a man in the middle to grind matching codes | Fixed `45d3f2d` |
 | F3 | High | Free-text sender address from a paired host reaches wake prompts and channel pushes | Fixed `25f7d9b` |
-| F4 | Medium | Reference relay lets any key enrol any host name | Follow-up |
-| F5 | Medium | Host-to-host HTTP responses are unauthenticated | Follow-up |
-| F6 | Medium | Notification and wake storm across many recipient names from one peer | Follow-up |
-| F7 | Medium | Envelope metadata, including body-derived tags and mentions, is not sealed | Follow-up |
-| F8 | Medium | Subject and body can imitate header lines and the end-of-message frame | Follow-up |
+| F4 | Medium | Reference relay lets any key enrol any host name | Follow-up (T197) |
+| F5 | Medium | Host-to-host HTTP responses are unauthenticated | Follow-up (T199) |
+| F6 | Medium | Notification and wake storm across many recipient names from one peer | Fixed (T196) |
+| F7 | Medium | Envelope metadata, including body-derived tags and mentions, is not sealed | Follow-up (T198) |
+| F8 | Medium | Subject and body can imitate header lines and the end-of-message frame | Fixed (T196) |
 | F9 | Medium | Rotation cannot recover from a compromised host key | Accepted |
-| F10 | Low | Pending code-compare pairings never expire; anyone can create them | Follow-up |
+| F10 | Low | Pending code-compare pairings never expire; anyone can create them | Follow-up (T200) |
 | F11 | Low | Signed hops can be replayed inside the 5 min skew window | Accepted |
-| F12 | Low | Reference relay keeps unbounded challenge and dedupe state | Follow-up |
+| F12 | Low | Reference relay keeps unbounded challenge and dedupe state | Follow-up (T197) |
 | F13 | Low | `/v1/status` and mDNS disclose host name, key fingerprint and version | Accepted |
 | F14 | Low | Identity passphrase through `MBX_IDENTITY_PASSPHRASE` | Accepted |
 | F15 | Low | Daemon retention sweep leaves pruned bodies in free pages | Accepted |
@@ -211,14 +211,14 @@ follow redirects (no `redirect: "error"`). Policy and enc-key responses are safe
 Follow-up: sign responses with the host key over the request signature and response body hash, cap and sanitize
 directory fields, and refuse redirects everywhere.
 
-### F6 (Medium, follow-up): storm across recipient names
+### F6 (Medium, fixed in T196): storm across recipient names
 
 On receive, any bare recipient name becomes a local delivery (`src/node.ts:534`), and wake budgets are per agent name
 (`src/node.ts:744-760`). A paired host can send 200 envelopes per request with 100 distinct made-up names each; every
 name with a waking kind gets its own budget, finds no session and falls through to a desktop notice
 (`src/wake.ts:376`). Notices run one after another with up to a 45 s timeout each, so the daemon tick, which also
-flushes the outbox, stalls. Follow-up: apply `NAME_RE` to received recipient names, skip desktop notices for names with
-no registered agent, and cap notices per pass and per sending host.
+flushes the outbox, stalls. Fix (T196): received recipient names must match `NAME_RE`, names with no registered agent or
+session get no desktop notice (their mail stays re-wakeable once a session binds), and notices are capped at six a minute.
 
 ### F7 (Medium, follow-up): metadata is not sealed
 
@@ -228,14 +228,15 @@ Sealing covers the body only. On the LAN and at the relay, observers see from, t
 fields. Follow-up: seal subject and body-derived metadata inside `enc` (recomputing `meta` after opening), or document
 the exposure in ADR-035 and the user docs.
 
-### F8 (Medium, follow-up): header imitation inside framed messages
+### F8 (Medium, fixed in T196): header imitation inside framed messages
 
 `checkShape` limits the subject's length but not its characters (`src/envelope.ts:105-106`), and `formatMessage`
 prints it as the first header line (`src/node.ts:787`). A subject with newlines can add fake `trust:`/`policy:` lines
 above the real ones; a body can contain `--- end of message ---` followed by text that looks like it is outside the
 frame. The policy note that flags policy lines checks only the body (`src/policy.ts:284`). Follow-up: reject control
 characters in network subjects (and collapse them on display for stored mail), and frame bodies with a per-message
-random boundary.
+random boundary. Fix (T196): received subjects with control characters are rejected and local ones collapsed; every header
+field renders on one line; bodies sit between per-render random boundaries.
 
 ### F9 (Medium, accepted): rotation and key compromise
 

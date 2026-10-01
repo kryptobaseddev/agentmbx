@@ -551,6 +551,7 @@ version ${version()} (${installKind()})`);
             for (const a of await announceRotations(node, fetch, true))
                 console.log(`  ${a.host}: ${a.ok ? "accepted" : `pending (${a.error}); the daemon keeps retrying`}`);
             console.log("peers verify the rotation with the key they pinned at pairing; no re-pairing is needed. The daemon picks up the new keys within seconds.");
+            console.log("rotation is key hygiene, not compromise recovery: if this host's key was stolen, run 'agentmbx peers remove <host>' on every peer and pair again.");
             return;
         }
         case "peers": {

@@ -59,7 +59,7 @@ export function buildEnvelope(d: Draft, now = new Date()): Envelope {
   const id = ulid(now.getTime());
   return {
     v: 3, id, ts: now.toISOString(), from: d.from, to: d.to, thread: d.thread ?? id, reply_to: d.reply_to ?? null,
-    kind: d.kind ?? "message", subject: d.subject.slice(0, 200), body: d.body, needs_reply: d.needs_reply ?? false,
+    kind: d.kind ?? "message", subject: oneLine(d.subject).slice(0, 200), body: d.body, needs_reply: d.needs_reply ?? false,
     refs: d.refs ?? [], meta: { ...parseMeta(d.body), ...(d.unverifiedSender ? { sender_verification: "unverified" as const } : {}), ...(d.origin === "external" ? { origin: "external" as const } : {}), ...(d.hop ? { hop: d.hop } : {}), ...(d.project ? { project: d.project.slice(0, 300) } : {}) },
     authority: null, enc: null,
   };
@@ -87,6 +87,10 @@ export function verifyEnvelope(e: Envelope, hostPub: string): boolean {
 }
 
 /** Structural validation of anything that claims to be an envelope (input from the network or the store). */
+/** Line breaks and other control characters, which could make sender text look like AgentMBX header lines (T196, F8). */
+const CONTROL = /[\u0000-\u001f\u007f\u0085\u2028\u2029]/;
+export const oneLine = (s: string) => s.replace(new RegExp(CONTROL.source, "g"), " ");
+
 export function checkShape(x: unknown): string | null {
   const e = x as Envelope;
   if (!e || typeof e !== "object") return "not an object";
@@ -104,6 +108,7 @@ export function checkShape(x: unknown): string | null {
   if (Buffer.byteLength(e.body) > maxBody) return `body over ${maxBody} bytes`;
   if (typeof e.subject !== "string") return "bad subject";
   if (e.subject.length > MAX_SUBJECT) return `subject over ${MAX_SUBJECT} characters`;
+  if (CONTROL.test(e.subject)) return "subject contains control characters"; // T196 (F8): no fake header lines
   if (typeof e.ts !== "string" || Number.isNaN(Date.parse(e.ts))) return "bad ts";
   if (typeof e.thread !== "string" || e.thread.length > MAX_FIELD) return "bad thread";
   if (e.reply_to !== null && (typeof e.reply_to !== "string" || e.reply_to.length > MAX_FIELD)) return "bad reply_to";
