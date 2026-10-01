@@ -567,7 +567,12 @@ export class MbxNode {
       }
       if (elsewhere.length === 1) { remote.add(elsewhere[0]); targets.push({ to: t, name, host: elsewhere[0] }); }
       else if (elsewhere.length > 1) warnings.push(`${name} exists on ${elsewhere.join(", ")}; address it as ${name}@<host>`);
-      else { local.add(name); targets.push({ to: t, name, ...renamed, ...(this.knownLocalName(name) ? {} : { unknown: true as const }) }); warnings.push(`${name} is not a known agent; delivered to this host's inbox for ${name}`); }
+      else {
+        const known = this.knownLocalName(name);
+        local.add(name); targets.push({ to: t, name, ...renamed, ...(known ? {} : { unknown: true as const }) });
+        // A mailbox that exists (mail, a lease, an alias) is not "unknown"; recipients[] says whether anyone holds it.
+        if (!known) warnings.push(`${name} is not a known agent; delivered to this host's inbox for ${name}`);
+      }
     }
     return { local, remote, warnings, targets };
   }
