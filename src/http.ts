@@ -64,12 +64,19 @@ function acceptOffer(node: MbxNode, remote: PairOffer, localNonce: string): stri
   return code;
 }
 
-/** Initiator side of `mbx pair <addr>`. Returns the code both humans must compare. */
+/** Initiator side of `mbx pair <addr>`. Returns the code both humans must compare. Commit-reveal (T032): the initiator
+ *  commits to its offer, the responder answers with its own, then the initiator reveals. Neither side sees the other's
+ *  nonce before its own is fixed, so a party in the middle cannot grind a nonce until the two 6-digit codes match. */
 export async function pairWith(node: MbxNode, addr: string): Promise<{ host: string; code: string; key: string; owner: string | null }> {
-  const n = newNonce();
-  const res = await fetch(`http://${addr}/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(localParty(node, n)), signal: AbortSignal.timeout(10_000) });
-  if (!res.ok) throw new Error(`pairing refused by ${addr}: ${await res.text()}`);
-  const remote = await res.json() as PairOffer;
+  const n = newNonce(), offer = localParty(node, n);
+  const ask = async (body: unknown) => {
+    const res = await fetch(`http://${addr}/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) throw new Error(`pairing refused by ${addr}: ${await res.text()} (code-compare pairing needs AgentMBX with commit-reveal on both hosts)`);
+    return res.json();
+  };
+  const remote = await ask({ v: 2, commit: sha256(canonical(offer)) }) as PairOffer;
+  if (remote?.v !== 1 || !validParty(remote)) throw new Error(`${addr} sent a malformed pairing offer`);
+  await ask({ v: 2, offer });
   const code = acceptOffer(node, { ...remote, addr }, n);
   return { host: remote.host, code, key: fingerprint(remote.host_pubkey), owner: remote.owner_pubkey ? fingerprint(remote.owner_pubkey) : null };
 }
@@ -141,6 +148,7 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
   const runtime = { service: "agentmbx", v: 1, host: node.host, host_pubkey: node.key.publicKey, version: version(), started_at: new Date().toISOString() };
   let pairAttempts: number[] = [], tokenAttempts: number[] = [], rotateAttempts: number[] = [];
   const hellos = new Map<string, number>(); // hello nonce → expiry
+  const commits = new Map<string, { n: string; exp: number }>(); // SAS offer commitment → this host's nonce for it
   const server = createServer({ headersTimeout: L.headersTimeoutMs, requestTimeout: L.requestTimeoutMs, keepAliveTimeout: L.keepAliveTimeoutMs,
     connectionsCheckingInterval: Math.min(1_000, L.headersTimeoutMs) }, async (req, res) => {
     const send = (code: number, obj: unknown) => {
@@ -170,14 +178,22 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
       }
       if (req.method === "POST" && url.pathname === "/v1/pair") {
         pairAttempts = pairAttempts.filter((t) => Date.now() - t < 60_000);
-        if (pairAttempts.push(Date.now()) > 5) return send(429, { error: "too many pairing attempts" });
-        const offer = JSON.parse(body) as PairOffer;
-        if (offer?.v !== 1 || typeof offer.host !== "string" || typeof offer.host_pubkey !== "string") return send(400, { error: "bad offer" });
-        const n = newNonce();
-        const code = acceptOffer(node, offer, n);
+        if (pairAttempts.push(Date.now()) > 10) return send(429, { error: "too many pairing attempts" }); // two requests per pairing
+        const j = JSON.parse(body) as { v?: number; commit?: unknown; offer?: PairOffer };
+        if (j?.v === 2 && isStr(j.commit, 64)) { // step 1: answer with this host's party before the initiator reveals its own
+          const now = Date.now();
+          for (const [c, x] of commits) if (x.exp < now || commits.size > 256) commits.delete(c);
+          const n = newNonce(); commits.set(j.commit as string, { n, exp: now + HELLO_TTL_MS });
+          return send(200, localParty(node, n));
+        }
+        const offer = j?.v === 2 ? j.offer : undefined;
+        if (offer?.v !== 1 || !validParty(offer) || !isStr(offer.addr)) return send(400, { error: "bad offer: code-compare pairing commits before it reveals (v2); upgrade AgentMBX on the initiating host" });
+        const key = sha256(canonical(offer)), c = commits.get(key); commits.delete(key);
+        if (!c || c.exp < Date.now()) return send(401, { error: "no live commitment matches this offer; run pair --compare again" });
+        const code = acceptOffer(node, offer, c.n);
         node.store.audit("pair.request", { from: offer.host, addr: offer.addr, code });
         process.stderr.write(`\n[agentmbx] pairing request from ${offer.host} (${offer.addr}). Code ${code}. Approve with: agentmbx pair approve ${offer.host} ${code}\n`);
-        return send(200, localParty(node, n));
+        return send(200, { ok: true });
       }
       if (req.method === "POST" && url.pathname === "/v1/rotate") {
         // Self-authenticating (T030): each record is signed by the key this host pinned, so a rotated peer whose hops
