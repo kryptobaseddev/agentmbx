@@ -55,6 +55,17 @@ CREATE TABLE IF NOT EXISTS identity_leases (
   key_fp TEXT NOT NULL, cli TEXT NOT NULL, session_id TEXT NOT NULL,
   claimed_at INTEGER NOT NULL, heartbeat_at INTEGER NOT NULL, idle_ttl INTEGER NOT NULL,
   released_at INTEGER, release_reason TEXT);
+-- Chosen identities (src/registry.ts, T204): a name exists because someone chose it, with a role. Additive: older
+-- runtimes ignore both tables (no schema version change).
+CREATE TABLE IF NOT EXISTS identities (
+  name TEXT PRIMARY KEY, role TEXT NOT NULL, description TEXT, registered_at TEXT NOT NULL, registered_by TEXT);
+CREATE TABLE IF NOT EXISTS identity_projects (
+  name TEXT NOT NULL, project TEXT NOT NULL, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, PRIMARY KEY (name, project));
+CREATE INDEX IF NOT EXISTS identity_projects_project ON identity_projects(project, last_seen);
+CREATE TABLE IF NOT EXISTS project_leads (  -- owner-signed project lead records (T208); signatures re-verified on every read
+  id TEXT PRIMARY KEY, project TEXT NOT NULL, agent TEXT NOT NULL, record TEXT NOT NULL, sig TEXT NOT NULL,
+  revocation TEXT, revocation_sig TEXT, received_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS project_leads_project ON project_leads(project);
 CREATE TABLE IF NOT EXISTS peers (
   host TEXT PRIMARY KEY, pubkey TEXT NOT NULL, owner_pubkey TEXT, addr TEXT NOT NULL,
   state TEXT NOT NULL,           -- 'pending' | 'approved'

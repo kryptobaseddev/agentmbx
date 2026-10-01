@@ -86,6 +86,7 @@ test("CLI inbox JSON retains envelope fields and combines filters", async (t) =>
 
 test("CLI shell senders can send unverified new mail but cannot read or reply as a mailbox", async (t) => {
   const { cli, n } = await fixture(t, false);
+  n.registerAgent("receiver"); // T205: sends need an existing recipient
   const sent = cli("send", "--as", "shell-sender", "--to", "receiver", "--subject", "registration", "-m", "hello", "--json");
   assert.equal(sent.status, 0, sent.stderr);
   const id = JSON.parse(sent.stdout).id;

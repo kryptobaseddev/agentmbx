@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.5.2 (2026-10-01)
+
+P0 release: no more invented mailbox names, lost or invisible mail, or "who got this?". Install it on every machine; a running session switches to it on its next mbx tool call and keeps its identity. After the upgrade, a new session has no mailbox until it claims one from its project's list or registers a name and role.
+
+- **Chosen identities only (T204, P0):** AgentMBX no longer invents mailbox names. On 2026-10-01, 18 sessions of one folder resumed in the same instant after a reboot. Sessions with no remembered name took the first free default name, one of them took another session's established mailbox, and the rightful session fell back to `-mcp-<hash>`, which then overwrote its remembered name. Now:
+  - A session resumes only its launch config (`MBX_AGENT`, registered with `MBX_ROLE`) or the identity its own provider session held before. The session is found by its id, a verified hook binding, or the session id its hooks report.
+  - Otherwise it starts **unbound**: `mbx_whoami`, `mbx_identity` and `mbx_agents` work, and every other tool explains the next step.
+  - The default-name ladder and every fallback are gone: `-<cli>`, `-2…-9`, `-<pid>`, `-<10 hex>` and `-mcp-<hash>`. A remembered identity still held by another live session stays *pending* and resumes on its own once that holder ends.
+- **Registry and per-project list:** every identity has a role, and every bind records the project folder it works in. `mbx_identity` gains the following:
+  - `list` shows this project by default (`all:true` for the host), with role, state, `claimable`, unread and holder.
+  - `register` creates a new identity from a name and role.
+  - `claim` needs a role for a mailbox that has none yet.
+  - One identity per session.
+  - Names that already had a role or were rename targets are registered once at upgrade.
+- **List and claim agree:** both use one availability rule.
+  - A newer process of the same session takes its lease over.
+  - An explicit claim may take an identity from a conversation of a shared OpenCode or Codex process (or hosted Kimi) that made no mbx call for 10 minutes. That conversation learns its lease was lost and never takes it back.
+  - A session whose own lease expired while idle re-claims it silently if nobody else did.
+  - Previously the list could say "available" while the claim said "held", because a shared process kept every ended conversation's lease alive.
+- **Hosted Kimi:** a linked conversation resumes the identity it held, or claims or registers one. It is given a new bind ticket only when its server ended.
+- **Crashed holders read offline at send time:** inside a send, `recipients[]` uses the process snapshot and the heartbeat. A vanished holder, or one with no heartbeat for 3 minutes, is `offline`. A quiet shared-process conversation is flagged as possibly ended.
+- **Cleanup (T209):**
+  - `agentmbx identity prune [--days 7] [--apply]` retires mailboxes that older versions generated, with no holder, no unread mail and no recent traffic. It is a dry run by default.
+  - `agentmbx identity forward <from> <to>` moves a mailbox's unread mail to another with the owner's signature, and routes the old name to the new one.
+  - Retired names leave listings and routing and come back when claimed. Messages are never deleted.
+  - `agentmbx identity list` gains `--project` and `--all`, plus role and claimable columns.
+- **Load resilience (T206):** process evidence no longer spawns `ps` for a server's own process (its birth time is read once), other pids are inspected with one batched `ps` and cached for a second, and the per-call process table is shared for two seconds instead of re-read every call. In a measured loop of 60 held operations, the `ps` spawns went from 60 to 1. Unknown evidence is retried with backoff (never while another transaction holds the write lock) and never produces a new name. `agentmbx watch` rides out "evidence stale" and "status unknown" instead of stopping after five of them. Under a load average of 76–110 these timeouts had made claims fail and watchers stop.
+- **Doctor sees lost mail (T211):** `agentmbx doctor` lists mailboxes whose unread mail no live session will see (with the last holder, since when and the fix), sessions waiting for a remembered identity that another session holds, and how many generated mailboxes `agentmbx identity prune` would retire.
+- **Signals release identities (T210):** an mbx server ended by SIGTERM or SIGHUP (as `claude -p` and a closed terminal do) now releases its identity instead of leaving a dead holder to expire.
+- **Project ledger and lead (T208):** `mbx_project` shows the mail traffic of the project folder a session works in: messages stamped with the project, or sent to or by its identities, with each recipient's role, delivery state and liveness. Bodies are shown only for the caller's own mail. The owner designates a project lead with `agentmbx lead set <agent> --project <dir> [--ttl 30d]` (owner-signed like policies; `lead revoke`, `lead show`); the record is re-verified against the owner keys on every read. The lead sees every body of its project and can `mbx_forward` a project message to another local identity (audited as `message.forwarded`; the recipient sees "forwarded by lead X", and its policy still comes from the original sender).
+- **Sender receipts (T207):** `mbx_sent` lists the mail you sent from this host, oldest first, with each recipient's delivery state (delivered, notified, read, acked), the recipient's note and `did` line, its liveness now, and for paired hosts whether the outbox still holds it (attempts, last error) or the host accepted it. Paged by an opaque cursor that mirrors replay (finite snapshot; a completed cursor polls for newer mail; scope, tamper and store-generation checks). `mbx_thread` shows the same per-recipient line under every message.
+- **Send-time recipient truth (T205):** `mbx_send`, `mbx_reply` and `agentmbx send` return `recipients[]`, one per resolved recipient, with a state: `live-wake` (a live session is woken now), `live-next-prompt` (live, but this kind or its missing push path or policy means it sees the mail on its next prompt), `offline` (no live session, with since when, the last holder and why), `forwarded` (a renamed mailbox's successor) or `remote` (queued for a paired host). Offline recipients add a sender warning. A send to a local name that never existed is refused with up to 3 suggestions instead of silently creating a mailbox (the owner can still leave mail for an agent that has not started yet with `agentmbx send --new-mailbox`); a bare name on this host and a paired host is delivered locally with a warning. Liveness comes from the identity lease and its existing process evidence.
+
 ## 0.5.1 (2026-10-01)
 
 Upgrade both machines: sealed LAN bodies, key rotation and code-compare pairing need 0.5.1 on each side (token pairing and plain delivery from 0.5.0 senders keep working).

@@ -19,7 +19,8 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} status a
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "folder", MBX_CLI: cli, AGENTMBX_DEV: "1" } as Record<string, string> }));
   const meta = cli === "codex" ? { threadId: "66666666-6666-4666-8666-666666666666" } : cli === "opencode" ? { sessionID: "ses_statustest" } : undefined;
   const call = (name: string, args: Record<string, unknown> = {}) => client.callTool({ name, arguments: args, ...(meta ? { _meta: meta } : {}) });
-  assert.notEqual((await call("mbx_whoami", { name: "renamed" })).isError, true);
+  // Claude/Kimi rename their launch identity; a Codex/OpenCode session starts unbound and registers this one (T204).
+  assert.notEqual((await call("mbx_whoami", { name: "renamed", role: "builder" })).isError, true);
   const sid = n.store.db.prepare("SELECT session_id FROM sessions WHERE agent='renamed' AND session_key IS NOT NULL").get()!.session_id as string;
   const run = (cmd: string, extra: string[] = [], session = sid, provider = cli) => spawnSync(process.execPath,
     [resolve("bin/agentmbx.js"), cmd, "--cli", provider, "--session", session, ...extra], {

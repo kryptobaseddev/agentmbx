@@ -10,7 +10,7 @@ import { findIdentityControl } from "../../src/identity-control.ts";
 import { opencodeService } from "../../src/wake.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-export const BOOTSTRAP = "For this isolated AgentMBX integration test, call mbx_whoami once, report the returned address, and stop. Do not rename the mailbox, send or acknowledge mail, or answer permission prompts.";
+export const BOOTSTRAP = "For this isolated AgentMBX integration test, call mbx_identity once with action \"register\", name \"opencode-binding\" and role \"tester\", report the returned address, and stop. Do not send or acknowledge mail, or answer permission prompts.";
 type Api = (method: "GET" | "POST", path: string, body?: unknown) => Promise<any>;
 export interface BindingState {
   version: 1; kind: "opencode-binding"; root: string; revision: string; home: string; work: string;

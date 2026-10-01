@@ -23,6 +23,8 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI comm
   t.after(async () => { try { if (transport.pid) process.kill(transport.pid, "SIGCONT"); } catch {} await client.close(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await client.connect(transport);
   const meta = cli === "codex" ? { threadId: "33333333-3333-4333-8333-333333333333" } : cli === "opencode" ? { sessionID: "ses_clicontrol" } : undefined;
+  // A shared transport's session starts unbound and registers its own identity (T204); MBX_AGENT names only the transport.
+  if (meta) assert.notEqual((await client.callTool({ name: "mbx_identity", arguments: { action: "register", name: "session-reader", role: "reader" }, _meta: meta })).isError, true);
   const who = (await client.callTool({ name: "mbx_whoami", arguments: {}, ...(meta ? { _meta: meta } : {}) })).structuredContent as { agent: string };
   const sid = node.store.db.prepare("SELECT session_id FROM sessions WHERE agent=? AND session_key IS NOT NULL").get(who.agent)!.session_id as string;
   const token = node.store.db.prepare("SELECT token FROM identity_leases WHERE name=?").get(who.agent)!.token as string;

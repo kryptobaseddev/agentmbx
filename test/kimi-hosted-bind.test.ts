@@ -38,40 +38,59 @@ test("bind tickets are single use, reused per session while fresh, and only fit 
   assert.equal(takeBindTicket(n.store, "not-a-ticket", "kimi", 4242, now), null);
 });
 
-test("a desktop conversation links its own mbx server by ticket, takes its folder name, and its hooks then work", async t => {
+test("a desktop conversation links its own mbx server by ticket, registers its own identity, resumes it, and its hooks then work", async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-hosted-")), daimon = fakeDaimon();
   const work = mkdtempSync(join(tmpdir(), "mbx-hosted-work-")), project = join(work, "orbit"), plugin = join(work, "agentmbx");
   mkdirSync(project); mkdirSync(plugin);
   const n = new MbxNode(home, { host: "alpha" });
   const env = { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "kimi", MBX_AGENT: "", MBX_NO_DESKTOP: "1", MBX_KIMI_DESKTOP_DAIMON: daimon } as Record<string, string>;
-  const a = new Client({ name: "conv-a", version: "1" }), b = new Client({ name: "conv-b", version: "1" });
-  t.after(async () => { await a.close(); await b.close(); n.close(); for (const d of [home, daimon, work]) rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
-  // two conversations of one app process: both servers start in the plugin folder, under the same parent
-  for (const c of [a, b]) await c.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"], env, cwd: plugin }));
+  const a = new Client({ name: "conv-a", version: "1" }), b = new Client({ name: "conv-b", version: "1" }), c = new Client({ name: "conv-a-again", version: "1" });
+  t.after(async () => { for (const x of [a, b, c]) await x.close(); n.close(); for (const d of [home, daimon, work]) rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const connect = (x: Client) => x.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"], env, cwd: plugin }));
+  // two conversations of one app process: both servers start in the plugin folder, under the same parent, with no identity
+  for (const x of [a, b]) await connect(x);
+  assert.equal(n.store.db.prepare("SELECT COUNT(*) n FROM identity_leases").get()!.n, 0, "no server invents a name");
   const hook = (event: string, sid: string) => spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", event, "--cli", "kimi"],
     { input: JSON.stringify({ session_id: sid, cwd: project }), encoding: "utf8", env });
+  const ticketOf = (out: string) => /bind="([a-f0-9]{32})"/.exec(out)?.[1];
 
   const start = hook("session-start", "conv-aaa");
   assert.equal(start.status, 0, start.stderr);
-  const nonce = /bind="([a-f0-9]{32})"/.exec(start.stdout)?.[1];
+  const nonce = ticketOf(start.stdout);
   assert.ok(nonce, `the hook hands the conversation a ticket: ${start.stdout}`);
+  assert.match(start.stdout, /no mailbox identity yet/);
   assert.doesNotMatch(start.stdout, /agentmbx watch|CronCreate/, "a desktop conversation is woken by the app, not a watcher");
 
-  const who = (await a.callTool({ name: "mbx_whoami", arguments: { bind: nonce } })).structuredContent as { agent: string; delivery: string };
-  assert.equal(who.agent, "orbit", "the linked server takes the conversation's folder name");
+  const linked = (await a.callTool({ name: "mbx_whoami", arguments: { bind: nonce } })).structuredContent as { agent: string | null; project: string };
+  assert.deepEqual([linked.agent, linked.project], [null, realpathSync(project)], "linked to its conversation and folder, still without a name");
+  assert.equal((await b.callTool({ name: "mbx_whoami", arguments: { bind: nonce } })).isError, true, "a used ticket links nothing else");
+  assert.doesNotMatch(hook("prompt", "conv-aaa").stdout, /bind=/, "a linked conversation is not re-ticketed");
+  const reg = await a.callTool({ name: "mbx_identity", arguments: { action: "register", name: "orbit-kimi", role: "builder" } });
+  assert.notEqual(reg.isError, true, JSON.stringify(reg));
+  const who = (await a.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent: string; delivery: string };
+  assert.equal(who.agent, "orbit-kimi");
   assert.match(who.delivery, /^push \(kimi web or desktop app\)/);
   const row = n.store.db.prepare("SELECT agent, cwd, pid FROM sessions WHERE cli='kimi' AND session_id='conv-aaa'").get() as { agent: string; cwd: string; pid: number };
-  assert.deepEqual({ ...row }, { agent: "orbit", cwd: realpathSync(project), pid: process.pid });
-  assert.equal((await b.callTool({ name: "mbx_whoami", arguments: { bind: nonce } })).isError, true, "a used ticket links nothing else");
-  // a second conversation in the same folder: the folder name is held, so it takes a readable variant
-  const second = /bind="([a-f0-9]{32})"/.exec(hook("prompt", "conv-bbb").stdout)?.[1];
-  assert.ok(second, "the prompt hook hands an unlinked conversation its ticket (Kimi drops SessionStart context)");
-  assert.equal(((await b.callTool({ name: "mbx_whoami", arguments: { bind: second } })).structuredContent as { agent: string }).agent, "orbit-kimi-app");
+  assert.deepEqual({ ...row }, { agent: "orbit-kimi", cwd: realpathSync(project), pid: process.pid });
 
-  n.send({ from: "boss", to: ["orbit"], subject: "s", body: "b", kind: "request" });
+  // a second conversation in the same folder: its own ticket, its own chosen identity; the first one's is not offered to it
+  const second = ticketOf(hook("prompt", "conv-bbb").stdout);
+  assert.ok(second, "the prompt hook hands an unlinked conversation its ticket (Kimi drops SessionStart context)");
+  const other = (await b.callTool({ name: "mbx_whoami", arguments: { bind: second } })).structuredContent as { agent: string | null; project_identities: { name: string; claimable: boolean }[] };
+  assert.equal(other.agent, null);
+  assert.deepEqual(other.project_identities.map(i => [i.name, i.claimable]), [["orbit-kimi", false]]);
+
+  n.send({ from: "boss", to: ["orbit-kimi"], subject: "s", body: "b", kind: "request" });
   const prompt = hook("prompt", "conv-aaa");
-  assert.match(prompt.stdout, /1 unread mbx message\(s\) for orbit@alpha/, "hooks now resolve the linked conversation");
+  assert.match(prompt.stdout, /1 unread mbx message\(s\) for orbit-kimi@alpha/, "hooks now resolve the linked conversation");
   assert.doesNotMatch(prompt.stdout, /bind=/);
+
+  // the app restarts the conversation's server: a fresh ticket links the new server, which resumes the chosen identity
+  await a.close();
+  await connect(c);
+  const again = ticketOf(hook("prompt", "conv-aaa").stdout);
+  assert.ok(again, "a conversation whose server ended is ticketed again");
+  assert.equal(((await c.callTool({ name: "mbx_whoami", arguments: { bind: again } })).structuredContent as { agent: string }).agent, "orbit-kimi");
 });
 
 const desktop: KimiDesktop = { url: "ws://127.0.0.1:9/control", token: "t", pid: 1, dir: "/x" };

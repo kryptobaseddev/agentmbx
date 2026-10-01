@@ -9,6 +9,10 @@ import { version } from "./version.ts";
 import { MbxNode } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
 import { detect, edits, skillStatus, wired, type SetupCtx } from "./setup.ts";
+import { mailboxLiveness } from "./receipts.ts";
+import { listIdentityControls } from "./identity-control.ts";
+import { pruneCandidates } from "./identity-cleanup.ts";
+import type { IdentityLease } from "./identity-leases.ts";
 
 export type Level = "ok" | "fail" | "warn" | "info";
 export interface Check { level: Level; label: string; fix?: string }
@@ -96,6 +100,50 @@ export function kimiServerHooks(home: string, kimiHome = process.env.KIMI_CODE_H
       fix: "restart that kimi web server (stop it, then run kimi web again)" }));
 }
 
+const STRANDED_MAX = 10;
+
+/** Mailboxes with unhandled mail no live session will see (T211). Read-only; never claims, forwards or prunes. */
+export function strandedMail(node: MbxNode): Check[] {
+  const rows = node.store.db.prepare("SELECT agent name, COUNT(*) unread FROM deliveries WHERE state <> 'acked' GROUP BY agent HAVING unread > 0")
+    .all() as { name: string; unread: number }[];
+  const stranded = rows.filter((r) => r.name !== "owner").map((r) => ({ ...r, liveness: mailboxLiveness(node, r.name) }))
+    .filter((r) => !r.liveness.live)
+    .map((r) => ({ name: r.name, unread: r.unread, detail: r.liveness.detail }))
+    .sort((a, b) => b.unread - a.unread || a.name.localeCompare(b.name));
+  const out: Check[] = stranded.slice(0, STRANDED_MAX).map((s) => ({ level: "warn" as Level,
+    label: `${s.name}: ${s.unread} unread message(s) stranded — ${s.detail}`,
+    fix: `the owning agent resumes it with mbx_identity {"action":"claim","name":"${s.name}"}, or the owner forwards the mail: agentmbx identity forward ${s.name} <to>` }));
+  if (stranded.length > STRANDED_MAX) out.push({ level: "warn" as Level, label: `… ${stranded.length - STRANDED_MAX} more mailbox(es) with stranded unread mail` });
+  return out;
+}
+
+/** Live sessions waiting for the remembered identity another session currently holds (T211). Read-only. */
+export function pendingIdentities(node: MbxNode): Check[] {
+  const out: Check[] = [];
+  for (const d of listIdentityControls(node.store)) {
+    if (d.agent !== "") continue; // bound sessions hold their identity; only unbound ones can be waiting
+    const remembered = node.store.get(`name:${d.cli}:${d.session_id}`);
+    if (!remembered) continue;
+    const lease = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(remembered) as unknown as IdentityLease | undefined;
+    if (!lease || lease.released_at !== null) continue; // free to claim: nothing waits
+    if (lease.cli === d.cli && lease.session_id === d.session_id) continue;
+    const holder = `${lease.cli} session ${lease.session_id.slice(0, 12)}`;
+    const fresh = Date.now() - lease.heartbeat_at;
+    out.push({ level: "warn" as Level,
+      label: `${d.cli} session ${d.session_id.slice(0, 12)} is waiting for its remembered identity ${remembered}, held by ${holder} (heartbeat ${Math.max(0, Math.round(fresh / 1000))}s ago)`,
+      fix: `the holder finishes and releases (mbx_identity action=release), or the owner replaces it: agentmbx identity takeover ${remembered} --force --cli <provider> --session <id>` });
+  }
+  return out;
+}
+
+/** One line on how much `agentmbx identity prune` would retire (T211). Read-only. */
+export function pruneSummary(node: MbxNode): Check {
+  const { retire } = pruneCandidates(node);
+  return retire.length
+    ? { level: "warn", label: `${retire.length} generated mailbox(es) with no holder, no unread mail and no recent traffic would be retired`, fix: "review the list: agentmbx identity prune   (a dry run), then apply it: agentmbx identity prune --apply" }
+    : { level: "info", label: "no generated mailboxes eligible for prune" };
+}
+
 export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeoutMs?: number } = {}): Promise<Check[]> {
   const out: Check[] = [];
   const add = (level: Level, label: string, fix?: string) => out.push({ level, label, fix });
@@ -149,6 +197,10 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
           "the owner's next prompt in that session resets the depth; a collaborate policy allows 20, autonomous/yolo have no limit");
       } catch { /* unreadable mailbox: other checks report it */ }
     }
+    // T211: mailboxes nobody is holding, sessions waiting on a remembered identity, prune weight
+    for (const c of strandedMail(node)) out.push(c);
+    for (const c of pendingIdentities(node)) out.push(c);
+    out.push(pruneSummary(node));
     const peers = node.peers();
     const approved = peers.filter((p) => p.state === "approved");
     if (!approved.length) add("info", "no paired hosts (optional: agentmbx pair <host>:7373)");

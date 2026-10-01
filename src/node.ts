@@ -17,6 +17,7 @@ import { ownerPublicKey } from "./owner.ts";
 import { effectivePolicy, policyLine } from "./policy.ts";
 import { procStart, procTable, provenProcess, sameProcess } from "./proc.ts";
 import { privatePath } from "./private-files.ts";
+import { backfillRegistry } from "./registry.ts";
 import { Store, type DeliveryState, type MessageRow } from "./store.ts";
 
 export const DEFAULT_PORT = 7373;
@@ -32,6 +33,8 @@ export const WAKE_KINDS = new Set(["request", "task", "decision", "alert"]);
 export const WAKE_LIMITS = { perAgentSeconds: 30, perThreadHour: 6, perAgentDay: 60 };
 
 export interface Config { host: string; port: number; bind: string }
+/** One resolved recipient of a send (T205): a local mailbox (`name`), a paired host (`host`, with `name` when addressed). */
+export interface RouteTarget { to: string; name?: string; host?: string; renamed_from?: string; unknown?: true }
 export interface Peer { host: string; pubkey: string; owner_pubkey: string | null; addr: string; state: string; code: string | null; approved_at: string | null; enc_pub?: string | null; prev_keys?: string | null }
 export interface Session { priv: string; pub: string; grant: Grant | null }
 export type ReceiveResult = "accepted" | "duplicate" | `rejected:${string}`;
@@ -78,6 +81,7 @@ export class MbxNode {
     initializeReplay(this.store);
     this.retireIdentityLinks();
     this.syncOwner();
+    if (!this.store.get("registry-backfill:v1")) this.store.tx(() => { backfillRegistry(this.store, this.host); this.store.set("registry-backfill:v1", new Date().toISOString()); });
   }
 
   /** Record this host's own owner key (if any) as the principal it takes policies from. */
@@ -330,18 +334,6 @@ export class MbxNode {
   /** Remember a chosen name for a CLI session id, so resuming that session keeps it. */
   keepName(cli: string, sessionId: string, agent: string) { this.store.set(`name:${cli}:${sessionId}`, agent); }
 
-  /**
-   * The name a new session should use: its remembered name when resuming, else `wanted` unless another live session of
-   * a different process holds it, then `<wanted>-<cli>`, then `<wanted>-2`…`-9`.
-   */
-  pickName(wanted: string, cli: string, pid: number, sessionId?: string): string {
-    const kept = sessionId && this.store.get(`name:${cli}:${sessionId}`);
-    if (kept) return kept;
-    const held = (n: string) => this.heldByOther(n, pid) || this.shellHeld(n);
-    const cands = [wanted, ...(wanted !== cli && !wanted.endsWith(`-${cli}`) ? [`${wanted}-${cli}`] : []), ...[2, 3, 4, 5, 6, 7, 8, 9].map((i) => `${wanted}-${i}`)];
-    return cands.map((c) => c.slice(0, 40)).find((c) => NAME_RE.test(c) && !held(c)) ?? `${wanted.slice(0, 30)}-${process.pid}`;
-  }
-
   /** Local agents with a live, tracked CLI session: the audience of `*` and `role:` (Keaton, 2026-09-26). */
   sessionAgents(): Set<string> {
     const out = new Set<string>();
@@ -538,37 +530,51 @@ export class MbxNode {
 
   // ---- addressing --------------------------------------------------------------------------
   /** Split recipients into local agent names and remote hosts that must receive the envelope. */
-  route(to: string[], forReceive = false): { local: Set<string>; remote: Set<string>; warnings: string[] } {
-    const local = new Set<string>(), remote = new Set<string>(), warnings: string[] = [];
+  route(to: string[], forReceive = false): { local: Set<string>; remote: Set<string>; warnings: string[]; targets: RouteTarget[] } {
+    const local = new Set<string>(), remote = new Set<string>(), warnings: string[] = [], targets: RouteTarget[] = [];
     const localAgents = new Set(this.agents().filter((a) => a.host === this.host).map((a) => a.name));
     const live = this.sessionAgents(); // broadcasts reach tracked sessions only; shell senders get mail addressed by name
     const approved = this.peers().filter((p) => p.state === "approved").map((p) => p.host);
     for (const t of to) {
-      if (t === "*") { localAgents.forEach((a) => live.has(a) && local.add(a)); if (!forReceive) approved.forEach((h) => remote.add(h)); continue; }
-      if (t.startsWith("role:")) {
-        const role = t.slice(5);
-        this.agents().filter((a) => a.host === this.host && a.role === role && live.has(a.name)).forEach((a) => local.add(a.name));
-        if (!forReceive) approved.forEach((h) => remote.add(h));
+      if (t === "*") {
+        localAgents.forEach((a) => { if (live.has(a)) { local.add(a); targets.push({ to: t, name: a }); } });
+        if (!forReceive) approved.forEach((h) => { remote.add(h); targets.push({ to: t, host: h }); });
         continue;
       }
-      if (t === "owner") { local.add("owner"); continue; }
+      if (t.startsWith("role:")) {
+        const role = t.slice(5);
+        this.agents().filter((a) => a.host === this.host && a.role === role && live.has(a.name)).forEach((a) => { local.add(a.name); targets.push({ to: t, name: a.name }); });
+        if (!forReceive) approved.forEach((h) => { remote.add(h); targets.push({ to: t, host: h }); });
+        continue;
+      }
+      if (t === "owner") { local.add("owner"); targets.push({ to: t, name: "owner" }); continue; }
       const [raw, host] = t.split("@");
       if (forReceive && !NAME_RE.test(raw)) continue; // a peer cannot mint arbitrary local mailbox names (T196, F6)
       const name = !host || host === this.host ? this.resolveAlias(raw) : raw;
       if (name !== raw) warnings.push(`${raw} was renamed to ${name}; delivered to ${name}`);
+      const renamed = name !== raw ? { renamed_from: raw } : {};
       if (host) {
-        if (host === this.host) local.add(name);
-        else if (!forReceive) { if (approved.includes(host)) remote.add(host); else warnings.push(`${t}: host ${host} is not paired`); }
+        if (host === this.host) { local.add(name); targets.push({ to: t, name, ...renamed, ...(forReceive || this.knownLocalName(name) ? {} : { unknown: true as const }) }); }
+        else if (!forReceive) { if (approved.includes(host)) { remote.add(host); targets.push({ to: t, name, host }); } else warnings.push(`${t}: host ${host} is not paired`); }
         continue;
       }
       // bare name: local first, then a unique match on a paired host
-      if (localAgents.has(name) || forReceive) { local.add(name); continue; }
-      const hosts = this.agents().filter((a) => a.name === name && a.host !== this.host).map((a) => a.host).filter((h) => approved.includes(h));
-      if (hosts.length === 1) remote.add(hosts[0]);
-      else if (hosts.length > 1) warnings.push(`${name} exists on ${hosts.join(", ")}; address it as ${name}@<host>`);
-      else { local.add(name); warnings.push(`${name} is not a known agent; delivered to this host's inbox for ${name}`); }
+      const elsewhere = forReceive ? [] : this.agents().filter((a) => a.name === name && a.host !== this.host).map((a) => a.host).filter((h) => approved.includes(h));
+      if (localAgents.has(name) || forReceive) {
+        local.add(name); targets.push({ to: t, name, ...renamed });
+        if (elsewhere.length) warnings.push(`${name} also exists on ${elsewhere.join(", ")}: delivered to ${name}@${this.host}; use ${name}@<host> for the other`);
+        continue;
+      }
+      if (elsewhere.length === 1) { remote.add(elsewhere[0]); targets.push({ to: t, name, host: elsewhere[0] }); }
+      else if (elsewhere.length > 1) warnings.push(`${name} exists on ${elsewhere.join(", ")}; address it as ${name}@<host>`);
+      else {
+        const known = this.knownLocalName(name);
+        local.add(name); targets.push({ to: t, name, ...renamed, ...(known ? {} : { unknown: true as const }) });
+        // A mailbox that exists (mail, a lease, an alias) is not "unknown"; recipients[] says whether anyone holds it.
+        if (!known) warnings.push(`${name} is not a known agent; delivered to this host's inbox for ${name}`);
+      }
     }
-    return { local, remote, warnings };
+    return { local, remote, warnings, targets };
   }
 
   /** The exact mailbox addresses (name@host) a send to `to` reaches, resolved like route(); null when any recipient is a
@@ -591,6 +597,14 @@ export class MbxNode {
     return out;
   }
 
+  /** Has `name` ever existed on this host: an agents row, a delivery, a lease or a rename alias (T205)? */
+  knownLocalName(name: string): boolean {
+    const q = (sql: string, ...args: string[]) => !!this.store.db.prepare(sql).get(...args);
+    if (this.store.get(`retired:${name}`) !== undefined) return false; // retired by identity prune (T209)
+    return name === "owner" || q("SELECT 1 FROM agents WHERE name=? AND host=?", name, this.host) || q("SELECT 1 FROM deliveries WHERE agent=? LIMIT 1", name)
+      || q("SELECT 1 FROM identity_leases WHERE name=?", name) || this.store.get(`alias:${name}`) !== undefined;
+  }
+
   // ---- send / receive ----------------------------------------------------------------------
   revoked(): Set<string> { return new Set((this.store.db.prepare("SELECT id FROM grants WHERE revoked=1").all() as { id: string }[]).map((r) => r.id)); }
 
@@ -602,7 +616,7 @@ export class MbxNode {
     return this.send({ ...d, from: "owner" }, undefined, undefined, withOwnerSig(req.envelope, (await sign(req.payload)).sig));
   }
 
-  send(d: Draft & { from: string }, session?: Session, owner?: { pub: string; priv: string }, prebuilt?: Envelope): { envelope: Envelope; local: string[]; remote: string[]; warnings: string[] } {
+  send(d: Draft & { from: string }, session?: Session, owner?: { pub: string; priv: string }, prebuilt?: Envelope): { envelope: Envelope; local: string[]; remote: string[]; warnings: string[]; targets: RouteTarget[] } {
     const fromName = d.from.includes("@") ? d.from.split("@")[0] : d.from;
     if (!NAME_RE.test(fromName) && fromName !== "owner") throw new Error(`invalid sender name "${fromName}"`);
     let e = prebuilt ?? buildEnvelope({ ...d, from: `${fromName}@${this.host}` });
@@ -623,7 +637,7 @@ export class MbxNode {
         .run(e.id, h, new Date().toISOString(), new Date().toISOString());
     });
     if (auth && !auth.ok) r.warnings.push(`owner authority not attached: ${auth.reason}`);
-    return { envelope: e, local: [...r.local], remote: [...r.remote], warnings: r.warnings };
+    return { envelope: e, local: [...r.local], remote: [...r.remote], warnings: r.warnings, targets: r.targets };
   }
 
   /** Accept an envelope that arrived over the LAN from paired host `via`. */
@@ -830,7 +844,9 @@ export function formatFor(node: MbxNode, m: MessageRow, agent: string): string {
   // An owner-signed message is the owner's own task: "policy: ask" beside "authority: OWNER" read as a contradiction (T022).
   const policy = a?.ok ? `policy: n/a, owner authority applies${a.session === "signed by the owner" ? "" : " within its caps"} (delegation policies limit only other agents' requests)`
     : policyLine(node.policyFor(m, agent));
-  return formatMessage(row, policy);
+  // T208: a project lead re-delivered this message to `agent`; the policy above still comes from the original sender
+  const lead = node.store.get(`forwarded:${m.id}:${agent}`);
+  return formatMessage(row, lead ? `${policy}\nforwarded by lead ${lead} (project ledger; this adds no authority)` : policy);
 }
 
 /** Structural guard for legacy cached authority; this does not revalidate key revocation or expiry. */

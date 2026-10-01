@@ -5,6 +5,10 @@ import { readFileSync, readdirSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 let cache = null;
 const snapshots = new AsyncLocalStorage();
+/** Count of ps spawns for process evidence (T206 measurement); never reset by production code. */
+export const processEvidenceSpawns = { count: 0 };
+/** Synchronous sleep for retry backoff; evidence paths must stay synchronous. */
+export const sleepSync = (ms) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
 /** Capture process inventory before a database transaction; expired or escaped scopes fail closed. */
 export function withProcSnapshot(operation) {
     if (operation.constructor.name === "AsyncFunction")
@@ -14,7 +18,9 @@ export function withProcSnapshot(operation) {
         return operation();
     if (prior)
         throw new Error("process snapshot scope is closed");
-    const table = procTable(0), scope = { active: true, at: performance.now(), table };
+    // Share the short module cache instead of forcing a fresh ps -A per call: the snapshot may be at most
+    // 2 s old, and start times do not change within it, so proof decisions (start equality) cannot drift.
+    const table = procTable(), scope = { active: true, at: performance.now(), table };
     return snapshots.run(scope, () => {
         try {
             const result = operation();
@@ -65,6 +71,7 @@ export function procTable(maxAgeMs = 2_000) {
             }
         }
         else {
+            processEvidenceSpawns.count += 1;
             const out = execFileSync("ps", ["-A", "-o", "pid=,ppid=,lstart="], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, env: { ...process.env, LC_ALL: "C" } });
             for (const line of out.split("\n")) {
                 const m = /^\s*(\d+)\s+(\d+)\s+(.+?)\s*$/.exec(line);

@@ -185,18 +185,9 @@ test("delegation note, YOLO lookup, ack did → audit", () => {
   n.close();
 });
 
-test("identity: a second live session gets a free name; resumed sessions keep theirs; stale pids don't count", () => {
+test("identity: a reused pid never inherits a dead session's binding", () => {
   const n = new MbxNode(tmp(), { host: "alpha" });
   n.bindSession({ agent: "kimi", cli: "kimi", session_id: "mcp-1", pid: process.pid, session_key: "k1" }); // live (this process)
-  assert.equal(n.pickName("kimi", "kimi", 999_999), "kimi-2");
-  assert.equal(n.pickName("agentmbx", "codex", 999_999), "agentmbx", "free name stays");
-  n.bindSession({ agent: "agentmbx", cli: "claude", session_id: "c1", pid: process.pid, session_key: "k2" });
-  assert.equal(n.pickName("agentmbx", "codex", 999_999), "agentmbx-codex");
-  n.keepName("codex", "thread-9", "api-dev");
-  assert.equal(n.pickName("agentmbx", "codex", 999_999, "thread-9"), "api-dev");
-  // a dead pid holding the name doesn't block it
-  n.bindSession({ agent: "ghost", cli: "codex", session_id: "mcp-dead", pid: 2 ** 22 + 12345, session_key: "k3" });
-  assert.equal(n.pickName("ghost", "codex", 999_999), "ghost");
   // PID reuse: an MCP row recorded for an earlier process with this PID (other start time) is not adopted
   n.store.db.prepare("UPDATE sessions SET pid_start='Thu Jan  1 00:00:00 1970' WHERE session_id='mcp-1'").run();
   assert.equal(n.bindSession({ agent: "fresh", cli: "kimi", session_id: "t-new", pid: process.pid }), "fresh");
@@ -299,12 +290,8 @@ test("broadcasts reach live sessions only; a shell sender gets mail addressed by
   n.close();
 });
 
-test("a new session never takes a live or recently used shell name; CLI names never grant implicit ownership", () => {
+test("CLI names never grant implicit ownership", () => {
   const n = new MbxNode(tmp(), { host: "alpha" });
-  n.registerAgent("claude", { cli: "cli" }); // someone ran: agentmbx send --as claude (no session)
-  assert.equal(n.pickName("claude", "claude", 999_999), "claude-2", "recent shell name is held");
-  n.store.db.prepare("UPDATE agents SET last_seen=? WHERE name='claude'").run(new Date(Date.now() - 3 * 3_600_000).toISOString());
-  assert.equal(n.pickName("claude", "claude", 999_999), "claude", "an old shell name is free again");
   n.bindSession({ agent: "agentmbx", cli: "claude", session_id: "c1", pid: process.pid, session_key: "k" });
   n.linkIdentity("mac-dev", "agentmbx");
   assert.deepEqual(n.linkedNames("agentmbx"), []);

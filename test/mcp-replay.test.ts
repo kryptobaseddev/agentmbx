@@ -72,7 +72,7 @@ test("MCP replay follows actual held identity and a released/fenced session cann
   const page = parsed(await replay(c)) as ReplayPage;
   await c.callTool({ name: "mbx_identity", arguments: { action: "release" } });
   assert.equal((await replay(c, { cursor: page.next_cursor })).isError, true);
-  await c.callTool({ name: "mbx_identity", arguments: { action: "claim", name: "other" } });
+  assert.notEqual((await c.callTool({ name: "mbx_identity", arguments: { action: "claim", name: "other", role: "reader" } })).isError, true);
   const foreign = await replay(c, { cursor: page.next_cursor });
   assert.equal(foreign.isError, true); assert.equal(parsed(foreign).error.code, "CURSOR_SCOPE_MISMATCH");
   assert.deepEqual(ids(parsed(await replay(c))), []);

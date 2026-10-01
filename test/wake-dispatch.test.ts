@@ -99,7 +99,11 @@ test("daemon routes an actual MCP holder and refuses its stale binding after rel
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "worker", MBX_CLI: "codex", AGENTMBX_DEV: "1" } as Record<string,string> }));
   const threadId = "88888888-8888-4888-8888-888888888888";
   const call = (name: string, args: Record<string,unknown> = {}) => client.callTool({ name, arguments: args, _meta: { threadId } });
+  // The Codex thread starts unbound (T204) and registers its own identity; only then does it have a wake binding.
+  assert.equal(((await call("mbx_whoami")).structuredContent as { agent: string | null }).agent, null);
+  assert.notEqual((await call("mbx_identity", { action: "register", name: "worker-thread", role: "builder" })).isError, true);
   const agent = ((await call("mbx_whoami")).structuredContent as { agent: string }).agent;
+  assert.equal(agent, "worker-thread");
   delegateWake(n, agent);
   const original = n.sessionsFor(agent)[0];
   sendLeased(n, { from: "sender", to: [agent], subject: "wake", body: "private", kind: "request" });

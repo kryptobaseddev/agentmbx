@@ -2,7 +2,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { identityLeaseStatus, inspectLeaseProcess } from "./identity-leases.js";
+import { inspectLeaseProcess } from "./identity-leases.js";
+import { activityKey, identityAvailability, parseActivity } from "./identity-availability.js";
 import { SCHEMA_VERSION } from "./store.js";
 export function listIdentityStatus(home, options = {}) {
     const path = join(home, "mbx.db"), now = options.now ?? Date.now();
@@ -14,12 +15,14 @@ export function listIdentityStatus(home, options = {}) {
     if (typeof config.host !== "string" || !config.host)
         throw new Error("mailbox host configuration is invalid");
     const db = new DatabaseSync(path, { readOnly: true });
-    const rows = new Map(), leases = [], conflicts = new Set();
+    const rows = new Map(), leases = [], conflicts = new Set(), activityByName = new Map();
+    const inProject = new Set(), retired = new Set();
     let schema;
     const row = (name) => {
         let value = rows.get(name);
         if (!value) {
-            value = { name, state: "legacy", reason: "ownership has not been established by a lease", unread: 0, messages: 0, last_activity: null, holder: null };
+            value = { name, state: "legacy", claimable: true, reason: "ownership has not been established by a lease", role: null, description: null, registered: false,
+                projects: [], unread: 0, messages: 0, last_activity: null, holder: null };
             rows.set(name, value);
         }
         return value;
@@ -44,11 +47,43 @@ export function listIdentityStatus(home, options = {}) {
         }
         for (const r of db.prepare("SELECT agent,MAX(updated_at) activity FROM sessions GROUP BY agent").all())
             activity(row(r.agent), r.activity);
+        for (const r of db.prepare("SELECT k FROM kv WHERE k LIKE 'retired:%'").all()) {
+            const name = r.k.slice("retired:".length);
+            retired.add(name);
+            if (options.includeRetired) {
+                const item = row(name);
+                item.reason = "retired by identity prune; claiming it brings it back";
+            }
+        }
         for (const r of db.prepare("SELECT k FROM kv WHERE k LIKE 'identity-conflict:%'").all()) {
             const name = r.k.slice("identity-conflict:".length);
             conflicts.add(name);
             row(name);
         }
+        for (const r of db.prepare("SELECT k,v FROM kv WHERE k LIKE 'lease-activity:%'").all()) {
+            const a = parseActivity(r.v);
+            if (a)
+                activityByName.set(r.k.slice(activityKey("").length), a);
+        }
+        for (const r of db.prepare("SELECT name,role FROM agents WHERE host=? AND role IS NOT NULL").all(config.host))
+            row(r.name).role = r.role;
+        const has = (table) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table);
+        if (has("identities"))
+            for (const r of db.prepare("SELECT name,role,description FROM identities").all()) {
+                const item = row(r.name);
+                item.registered = true;
+                item.role = r.role;
+                item.description = r.description ?? item.description;
+            }
+        if (has("identity_projects"))
+            for (const r of db.prepare("SELECT name,project FROM identity_projects ORDER BY last_seen DESC").all()) {
+                row(r.name).projects.push(r.project);
+                if (options.project && r.project === options.project)
+                    inProject.add(r.name);
+            }
+        if (options.project)
+            for (const r of db.prepare("SELECT DISTINCT agent FROM sessions WHERE cwd=?").all(options.project))
+                inProject.add(r.agent);
         if (schema >= 2)
             leases.push(...db.prepare("SELECT * FROM identity_leases").all());
         db.exec("COMMIT");
@@ -70,16 +105,21 @@ export function listIdentityStatus(home, options = {}) {
             }
             catch { /* failed inspection is unknown */ }
         }
-        const status = identityLeaseStatus(lease, now, evidence);
-        item.state = status.state === "live" ? "held" : status.state === "expired" ? "available" : "unknown";
-        item.reason = status.reason ?? (lease.released_at !== null ? "released" : status.state === "live" ? "current holder observed" : "holder process could not be verified");
+        const a = identityAvailability({ lease, evidence, activity: activityByName.get(lease.name) ?? null, conflict: conflicts.has(lease.name), now, caller: options.caller });
+        item.state = a.state === "live" ? (a.claimable ? "idle" : "held") : a.state === "idle" ? "idle" : a.state === "unknown" ? "unknown" : a.state === "conflict" ? "conflict" : "available";
+        item.claimable = a.claimable;
+        item.reason = a.reason;
         item.holder = { cli: lease.cli, session_id: lease.session_id, pid: lease.holder_pid };
     }
     for (const name of conflicts) {
         const item = row(name);
         item.state = "conflict";
+        item.claimable = false;
         item.reason = "historical ownership requires explicit recovery";
     }
+    // Retired mailboxes (identity prune, T209) leave listings unless asked for; their history is still in the store.
+    const all = [...rows.values()].filter(i => options.includeRetired || !retired.has(i.name) || i.state === "held").sort((a, b) => a.name.localeCompare(b.name));
     return { host: config.host, schema_version: schema, observed_at: new Date(now).toISOString(), advisory: true,
-        identities: [...rows.values()].sort((a, b) => a.name.localeCompare(b.name)) };
+        ...(options.project ? { project: options.project } : {}),
+        identities: options.project ? all.filter(i => inProject.has(i.name)) : all };
 }

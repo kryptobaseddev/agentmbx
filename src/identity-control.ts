@@ -6,15 +6,16 @@ import { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
 import { canonical, sha256 } from "./crypto.ts";
 import { NAME_RE } from "./envelope.ts";
-import { inspectLeaseProcess } from "./identity-leases.ts";
-import { procTable, withProcSnapshot } from "./proc.ts";
+import { inspectLeaseProcess, inspectLeaseProcesses, UNKNOWN_PROCESS } from "./identity-leases.ts";
+import { procTable } from "./proc.ts";
 import type { Store } from "./store.ts";
 import { identityTakeoverApprovalSchema, type IdentityTakeoverApproval } from "./identity-takeover.ts";
 import { SCHEMA_VERSION } from "./store.ts";
 
 const pid = z.number().int().positive(), label = z.string().min(1).max(300);
 const descriptorSchema = z.object({ v: z.literal(1), cli: label, session_id: label, lease_session_id: label, control_key: label,
-  mcp_pid: pid, mcp_start: label, parent_pid: pid, parent_start: label, agent: z.string().regex(NAME_RE),
+  // "" = an unbound session (T204): reachable for owner claim/takeover, never matched as a mailbox holder.
+  mcp_pid: pid, mcp_start: label, parent_pid: pid, parent_start: label, agent: z.union([z.string().regex(NAME_RE), z.literal("")]),
   generation: z.string().regex(/^[a-f0-9]{64}$/).nullable() }).strict();
 export type IdentityControlDescriptor = z.infer<typeof descriptorSchema>;
 const requestSchema = z.object({ v: z.literal(1), id: z.string().uuid(), action: z.enum(["claim", "release", "takeover"]),
@@ -55,21 +56,23 @@ export function removeIdentityControl(store: Store, controlKey: string) {
 
 /** All process inspection precedes the operation's transaction. Missing proof never authorizes it. */
 export function inspectIdentityControlCaller(target: IdentityControlDescriptor, requesterPid: number, requesterStart: string) {
+  const evidence = inspectLeaseProcesses([requesterPid, target.parent_pid, target.mcp_pid]);
+  const requester = evidence.get(requesterPid) ?? UNKNOWN_PROCESS, parent = evidence.get(target.parent_pid) ?? UNKNOWN_PROCESS, mcp = evidence.get(target.mcp_pid) ?? UNKNOWN_PROCESS;
+  // The ancestry walk must see a requester that may have spawned after any cached process table was
+  // taken, so it bypasses the shared short cache; the three-pid evidence above stays batched and cached.
+  const freshTable = procTable(0);
+  let current = requesterPid, related = false;
+  for (let depth = 0; depth < 64; depth++) {
+    const next = freshTable.get(current)?.ppid;
+    if (!next || next === current) break;
+    // PID 1 can be the provider in a container. Its recorded birth and liveness
+    // must still match; generic shell-discovery helpers deliberately omit it.
+    if (next === target.parent_pid) { related = true; break; }
+    current = next;
+  }
+  // Freshness is measured from when the evidence was taken, not from when collection began:
+  // slow ps spawns under load must not expire proof that is fresh at hand-off.
   const at = performance.now();
-  const requester = inspectLeaseProcess(requesterPid), parent = inspectLeaseProcess(target.parent_pid), mcp = inspectLeaseProcess(target.mcp_pid);
-  const related = withProcSnapshot(() => {
-    const table = procTable();
-    let current = requesterPid;
-    for (let depth = 0; depth < 64; depth++) {
-      const parent = table.get(current)?.ppid;
-      if (!parent || parent === current) return false;
-      // PID 1 can be the provider in a container. Its recorded birth and liveness
-      // must still match; generic shell-discovery helpers deliberately omit it.
-      if (parent === target.parent_pid) return true;
-      current = parent;
-    }
-    return false;
-  });
   return { at, valid: related && requester.alive === true && requester.start === requesterStart
     && parent.alive === true && parent.start === target.parent_start && mcp.alive === true && mcp.start === target.mcp_start };
 }

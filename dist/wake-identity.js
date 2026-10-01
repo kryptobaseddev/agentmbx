@@ -1,7 +1,7 @@
 // Daemon routing authority is an exact captured lease generation, never a remembered hook name.
 import { canonical, fingerprint } from "./crypto.js";
 import { findIdentityControl, identityGeneration } from "./identity-control.js";
-import { IdentityLeases, inspectLeaseProcess } from "./identity-leases.js";
+import { IdentityLeases, inspectLeaseProcesses } from "./identity-leases.js";
 import { withProcSnapshot } from "./proc.js";
 const refused = () => Object.assign(new Error("wake identity lease or binding changed"), { code: "WAKE_IDENTITY_LOST" });
 const binding = (s) => canonical([s.agent, s.cli, s.session_id, s.pid, s.pid_start, s.session_key, s.channel]);
@@ -21,7 +21,10 @@ export function captureWakeIdentity(node, session) {
             if (operation.constructor.name === "AsyncFunction")
                 throw refused();
             return withProcSnapshot(() => {
-                const at = performance.now(), parent = inspectLeaseProcess(descriptor.parent_pid), child = inspectLeaseProcess(descriptor.mcp_pid);
+                const evidence = inspectLeaseProcesses([descriptor.parent_pid, descriptor.mcp_pid]);
+                const parent = evidence.get(descriptor.parent_pid) ?? { alive: null, start: null }, child = evidence.get(descriptor.mcp_pid) ?? { alive: null, start: null };
+                // Freshness is measured from after the evidence was taken; slow collection under load must not fence a valid wake.
+                const at = performance.now();
                 if (parent.alive !== true || parent.start !== descriptor.parent_start || child.alive !== true || child.start !== descriptor.mcp_start)
                     throw refused();
                 return leases.prepare([session.agent], [descriptor.mcp_pid], () => {
