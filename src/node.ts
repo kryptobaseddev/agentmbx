@@ -476,8 +476,6 @@ export class MbxNode {
     this.store.audit("pair.removed", { host });
   }
 
-  /** Move an approved peer to a new address (address healing, T151). Trust is unchanged: the pinned keys stay. Queued
-   *  mail for that host becomes due at once, so it goes out on the next outbox pass instead of after its back-off. */
   /** A verified hop or presence beacon from `host` proves it is reachable again: its queued mail, waiting out an
    *  exponential back-off, becomes due at once (docs/spec/cross-machine.md, presence step 4). Returns rows made due. */
   peerIsBack(host: string, now = Date.now()): number {
@@ -485,6 +483,8 @@ export class MbxNode {
     return Number(this.store.db.prepare("UPDATE outbox SET next_at=? WHERE host=? AND next_at > ?").run(at, host, at).changes);
   }
 
+  /** Move an approved peer to a new address (address healing, T151). Trust is unchanged: the pinned keys stay. Queued
+   *  mail for that host becomes due at once, so it goes out on the next outbox pass instead of after its back-off. */
   setPeerAddr(host: string, addr: string, via: string) {
     const p = this.approvedPeer(host);
     if (!p || p.addr === addr) return false;
