@@ -17,7 +17,7 @@ import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess } fro
 import { applyIdentityTakeover, type IdentityTakeoverApproval } from "./identity-takeover.ts";
 import { listIdentityStatus } from "./identity-status.ts";
 import { consumeIdentityControl, identityControlAliases, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl, type IdentityControlDescriptor } from "./identity-control.ts";
-import { formatFor, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
+import { didWarning, formatFor, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
 import { activePolicies, delegationNote, MAX_HOP } from "./policy.ts";
 import { procStart, withProcSnapshot } from "./proc.ts";
 import { updateAvailable } from "./update.ts";
@@ -703,11 +703,15 @@ export async function runMcp(existing?: MbxNode) {
 
   server.registerTool("mbx_ack", {
     title: "Acknowledge mbx messages",
-    description: "Mark messages as dealt with (optionally with a short note). Acked messages leave the unread inbox. Ack after you reply or act; no need to send a separate \"acknowledged\" message. Next: mbx_inbox for anything else.",
+    description: "Mark messages as dealt with (optionally with a short note). Acked messages leave the unread inbox. Ack after you reply or act; no need to send a separate \"acknowledged\" message. Keep `did` to one line of at most 200 characters, action first; put detail in your thread reply. Next: mbx_inbox for anything else.",
     inputSchema: { ids: z.array(z.string().min(6)).min(1).max(50), note: z.string().max(500).optional(),
-      did: z.string().max(200).optional().describe("if you acted on the request: one line saying what you did (goes to the owner's audit log)") },
+      // No schema max: an over-long line must never fail the acks themselves; node.ack keeps it bounded and marked.
+      did: z.string().max(10_000).optional().describe("if you acted on the request: one line, at most 200 characters, saying what you did, action first (owner's audit log; longer text is cut and marked truncated)") },
     annotations: { idempotentHint: true },
-  }, ({ ids, note, did }) => text(`Acked: ${ids.map((i) => node.ack(i, current().agent, note ?? null, did)).join(", ")}`));
+  }, ({ ids, note, did }) => {
+    const acked = ids.map((i) => node.ack(i, current().agent, note ?? null, did)), warning = didWarning(did);
+    return text(`Acked: ${acked.join(", ")}${warning ? `\nwarning: ${warning}` : ""}`);
+  });
 
   server.registerTool("mbx_thread", {
     title: "Show an mbx thread",

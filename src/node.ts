@@ -23,6 +23,10 @@ export const RETRY_HOURS = 72;
 export const PAIR_TOKEN_TTL_MS = 10 * 60_000;
 export const PAIR_TOKEN_MAX_TTL_MS = 60 * 60_000;
 export const PAIR_TOKEN_MAX_FAILURES = 5;
+/** The `did` audit line on an ack: one line, at most this many characters (longer input is kept truncated and marked). */
+export const DID_MAX = 200;
+export const didWarning = (did: string | undefined) => did && did.length > DID_MAX
+  ? `did was ${did.length} characters; the audit log kept the first ${DID_MAX}, marked truncated. Lead with the action in one line; put detail in the thread reply or note.` : null;
 export const WAKE_KINDS = new Set(["request", "task", "decision", "alert"]);
 export const WAKE_LIMITS = { perAgentSeconds: 30, perThreadHour: 6, perAgentDay: 60 };
 
@@ -694,7 +698,9 @@ export class MbxNode {
       this.store.setDelivery(m.id, recipient, "acked", note);
       if (did) {
         const p = this.policyFor(m, agent);
-        this.store.audit("peer_action", { agent, recipient, msg: m.id, thread: m.thread, from: m.from_addr, did: did.slice(0, 200), level: p.level, classes: p.classes, policies: p.ids });
+        // One bounded line, never a reason to lose the ack; a cut is marked so the owner sees it (council 2026-10-01).
+        this.store.audit("peer_action", { agent, recipient, msg: m.id, thread: m.thread, from: m.from_addr, did: did.slice(0, DID_MAX),
+          ...(did.length > DID_MAX ? { did_truncated: true, did_length: did.length } : {}), level: p.level, classes: p.classes, policies: p.ids });
       }
       return m.id;
     });

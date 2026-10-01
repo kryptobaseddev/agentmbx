@@ -13,7 +13,7 @@ import { RelayCore, startRelayServer } from "./relay.js";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.js";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
 import { ancestors, withProcSnapshot } from "./proc.js";
-import { DEFAULT_PORT, defaultHome, formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
+import { DEFAULT_PORT, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
 import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary } from "./policy.js";
 import { authHelperPath, createKeychainOwner, createOwnerKey, defaultOwnerBackend, ownerInfo, ownerSignCanonical, readPassphraseFromTTY } from "./owner.js";
 import { periodicUpdateCheck, updateAvailable, updateCommand } from "./update.js";
@@ -431,6 +431,9 @@ async function run(argv) {
                             failureCode = Math.max(failureCode, cliError(e, "ack"));
                         }
                     }
+                    const warning = didWarning(str("did"));
+                    if (warning)
+                        process.stderr.write(`agentmbx: ${warning}\n`);
                     if (failureCode)
                         process.exitCode = failureCode;
                     return;

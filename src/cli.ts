@@ -13,7 +13,7 @@ import { RelayCore, startRelayServer } from "./relay.ts";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.ts";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.ts";
 import { ancestors, withProcSnapshot } from "./proc.ts";
-import { DEFAULT_PORT, defaultHome, formatFor, MbxNode, summaryLine, trustLabel } from "./node.ts";
+import { DEFAULT_PORT, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.ts";
 import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary,
   type Level, type PolicyClass, type PolicyRecord, type Revocation } from "./policy.ts";
 import { authHelperPath, createKeychainOwner, createOwnerKey, defaultOwnerBackend, ownerInfo, ownerSignCanonical, readPassphraseFromTTY, type OwnerBackend } from "./owner.ts";
@@ -351,6 +351,8 @@ async function run(argv: string[]) {
             try { console.log(`acked ${node.ack(id, me, str("note") ?? null, str("did"))}`); }
             catch (e) { failureCode = Math.max(failureCode, cliError(e, "ack")); }
           }
+          const warning = didWarning(str("did"));
+          if (warning) process.stderr.write(`agentmbx: ${warning}\n`);
           if (failureCode) process.exitCode = failureCode;
           return;
         }

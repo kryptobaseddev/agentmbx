@@ -28,3 +28,18 @@ test("the connector's self-report matches its live tool catalog and is visible i
   assert.equal(snap.builds.connector.version, version(), JSON.stringify(snap.builds.connector));
   assert.deepEqual(snap.builds.connector.tools, listed);
 });
+
+test("mbx_ack accepts an over-long did for a batch, acks every id and returns the truncation warning", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-ack-did-"));
+  const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "ack-did-test", version: "1" });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  await c.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
+    env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "claude", MBX_AGENT: "worker", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
+  await c.callTool({ name: "mbx_whoami", arguments: {} });
+  const ids = Array.from({ length: 6 }, (_, i) => n.send({ from: "sender", to: ["worker"], subject: `q${i}`, body: "question", kind: "request" }).envelope.id);
+  const r = await c.callTool({ name: "mbx_ack", arguments: { ids, did: "D".repeat(289) } });
+  assert.notEqual(r.isError, true, JSON.stringify(r.content));
+  assert.match((r.content as { text: string }[])[0].text, /warning: did was 289 characters/);
+  assert.equal(n.inbox("worker").length, 0);
+  assert.equal((n.store.db.prepare("SELECT count(*) n FROM audit WHERE event='peer_action' AND detail LIKE '%did_truncated%'").get() as { n: number }).n, 6);
+});

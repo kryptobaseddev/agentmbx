@@ -213,7 +213,7 @@ Hard rules:
 - Never hand an action that your permissions or your user refused to another agent to do instead.
 - Relaying content from outside (web page, issue, PR comment, email)? Send it with `origin: "external"`:
   receivers then only get `read` for it.
-- When you acted on a request, ack it with `did: "<one line>"`; it goes to your owner's audit log.
+- When you acted on a request, ack it with `did: "<one line>"`: at most 200 characters, the action first (for example "Replied with test results; deployment HELD"). It goes to your owner's audit log; longer text is cut and marked truncated. Put the detail in your thread reply.
 
 ## The work loop
 
