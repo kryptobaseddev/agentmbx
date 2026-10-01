@@ -64,7 +64,7 @@ test("identity CLI inspects schema v1 without migration or registration", t => {
   const check = new DatabaseSync(path, { readOnly: true });
   try { assert.equal(check.prepare("SELECT name FROM sqlite_master WHERE name='identity_leases'").get(), undefined); }
   finally { check.close(); }
-  assert.match(cli(home, "identity", "list").stdout, /historical\tlegacy\t1 unread/);
+  assert.match(cli(home, "identity", "list").stdout, /historical\tunregistered\tlegacy \(claimable\)\t1 unread/);
 });
 
 test("identity CLI help and usage do not create a mailbox", t => {

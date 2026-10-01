@@ -17,6 +17,7 @@ import { kimiMultiHost } from "./kimi-web.js";
 import { BIND_TICKET_RE, takeBindTicket } from "./bind-ticket.js";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess } from "./identity-leases.js";
 import { activityKey, identityAvailability, parseActivity } from "./identity-availability.js";
+import { reviveMailbox } from "./identity-cleanup.js";
 import { AUTO_NAME_RE, linkedKey, noteProject, projectOf, registeredIdentity, registerIdentity, renameRegistration, ROLE_RE, sessionHint, UNSPECIFIED_ROLE } from "./registry.js";
 import { applyIdentityTakeover } from "./identity-takeover.js";
 import { listIdentityStatus } from "./identity-status.js";
@@ -859,6 +860,7 @@ export async function runMcp(existing) {
         }
         const next = { ...state, agent: target, leaseToken: undefined, released: false, pending: undefined, pendingReason: undefined, lostTo: undefined, parent: null };
         const result = prepareState(next, target, () => node.store.tx(() => {
+            reviveMailbox(node, target);
             bind(next, true);
             node.keepName(env.cli, next.sessionId, next.agent);
             if (role || description)

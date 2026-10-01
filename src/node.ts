@@ -595,6 +595,7 @@ export class MbxNode {
   /** Has `name` ever existed on this host: an agents row, a delivery, a lease or a rename alias (T205)? */
   knownLocalName(name: string): boolean {
     const q = (sql: string, ...args: string[]) => !!this.store.db.prepare(sql).get(...args);
+    if (this.store.get(`retired:${name}`) !== undefined) return false; // retired by identity prune (T209)
     return name === "owner" || q("SELECT 1 FROM agents WHERE name=? AND host=?", name, this.host) || q("SELECT 1 FROM deliveries WHERE agent=? LIMIT 1", name)
       || q("SELECT 1 FROM identity_leases WHERE name=?", name) || this.store.get(`alias:${name}`) !== undefined;
   }
