@@ -13,6 +13,7 @@ import { RelayCore, startRelayServer } from "./relay.ts";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.ts";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.ts";
 import { ancestors, withProcSnapshot } from "./proc.ts";
+import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.ts";
 import { DEFAULT_PORT, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.ts";
 import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary,
   type Level, type PolicyClass, type PolicyRecord, type Revocation } from "./policy.ts";
@@ -377,6 +378,7 @@ async function run(argv: string[]) {
       if (!str("subject") && !str("reply-to")) die("--subject is required");
       // Read external input before acquiring the lease's database lock.
       const body = str("m") ?? (str("body-file") ? readFileSync(str("body-file")!, "utf8") : process.stdin.isTTY ? "" : readStdin());
+      if (!str("reply-to")) assertKnownRecipients(node, (str("to") ?? "").split(",").map(s => s.trim()).filter(Boolean)); // T205
       const send = (from: string, unverified = false) => {
         const reply = str("reply-to") ? node.read(str("reply-to")!, from.split("@")[0]) : undefined;
         return node.send({ from, to: (str("to") ?? die("--to is required")).split(",").map(s => s.trim()).filter(Boolean),
@@ -402,9 +404,12 @@ async function run(argv: string[]) {
         });
         r.warnings.push("unverified-sender: no current identity lease; recipients must not treat the claimed name as delegated authority");
       }
+      const recipients = recipientReceipts(node, r.envelope.id, r.targets);
+      r.warnings.push(...offlineWarnings(recipients));
       r.warnings.forEach((w) => process.stderr.write(`warning: ${w}\n`));
-      if (o.json) return console.log(JSON.stringify({ id: r.envelope.id, thread: r.envelope.thread, ref: `mbx:${r.envelope.id}@${node.host}`, local: r.local, remote: r.remote, warnings: r.warnings }));
+      if (o.json) return console.log(JSON.stringify({ id: r.envelope.id, thread: r.envelope.thread, ref: `mbx:${r.envelope.id}@${node.host}`, recipients, local: r.local, remote: r.remote, warnings: r.warnings }));
       console.log(r.envelope.id);
+      for (const x of recipients) process.stderr.write(`  ${x.address}: ${x.state} (${x.detail})\n`);
       return;
     }
     case "whoami": {

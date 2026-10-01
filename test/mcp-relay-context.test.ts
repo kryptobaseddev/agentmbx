@@ -13,6 +13,7 @@ import { humanPromptKey, isHumanPrompt, wakeText } from "../src/wake.ts";
 for (const implicitReply of [false, true]) test(implicitReply ? "mbx_send reply_to records parent provenance" : "expired relay state cannot be revived by a fresh read", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-relay-"));
   const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "relay-test", version: "1" });
+  for (const name of ["receiver", "one", "two"]) n.registerAgent(name); // T205: sends need existing recipients
   t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const clock = join(home, "clock"), preload = join(home, "clock.mjs");
   let now = Date.now(); writeFileSync(clock, String(now));
@@ -43,6 +44,7 @@ for (const implicitReply of [false, true]) test(implicitReply ? "mbx_send reply_
 for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: unrelated reads cannot renew expired high-depth or external exposure`, async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-relay-depth-"));
   const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "relay-depth-test", version: "1" });
+  for (const name of ["receiver", "one", "two"]) n.registerAgent(name); // T205: sends need existing recipients
   t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const clock = join(home, "clock"), preload = join(home, "clock.mjs");
   let now = Date.now(); writeFileSync(clock, String(now));
@@ -96,6 +98,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: maximum
   const owner = generateKeyPair();
   writeFileSync(join(home, "owner.json"), JSON.stringify({ backend: "keychain", public_key: owner.publicKey }), { mode: 0o600 });
   const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "relay-cap-test", version: "1" });
+  for (const name of ["receiver", "one", "two"]) n.registerAgent(name); // T205: sends need existing recipients
   const rec = makePolicy({ level: "collaborate", agents: ["receiver"], hosts: ["alpha"], ownerPub: owner.publicKey });
   assert.equal(acceptSigned(n.store.db, { rec, sig: signData(owner.privateKey, canonical(rec)) }, "alpha"), null);
   t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
@@ -130,6 +133,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: maximum
 test("a prompt the owner typed ends the relay chain; wake prompts and external origin do not reset (T104)", async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-relay-human-"));
   const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "relay-human-test", version: "1" });
+  for (const name of ["receiver", "one", "two"]) n.registerAgent(name); // T205: sends need existing recipients
   t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const clock = join(home, "clock"), preload = join(home, "clock.mjs");
   let now = Date.now(); writeFileSync(clock, String(now));

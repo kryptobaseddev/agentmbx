@@ -582,26 +582,30 @@ export class MbxNode {
     // ---- addressing --------------------------------------------------------------------------
     /** Split recipients into local agent names and remote hosts that must receive the envelope. */
     route(to, forReceive = false) {
-        const local = new Set(), remote = new Set(), warnings = [];
+        const local = new Set(), remote = new Set(), warnings = [], targets = [];
         const localAgents = new Set(this.agents().filter((a) => a.host === this.host).map((a) => a.name));
         const live = this.sessionAgents(); // broadcasts reach tracked sessions only; shell senders get mail addressed by name
         const approved = this.peers().filter((p) => p.state === "approved").map((p) => p.host);
         for (const t of to) {
             if (t === "*") {
-                localAgents.forEach((a) => live.has(a) && local.add(a));
+                localAgents.forEach((a) => { if (live.has(a)) {
+                    local.add(a);
+                    targets.push({ to: t, name: a });
+                } });
                 if (!forReceive)
-                    approved.forEach((h) => remote.add(h));
+                    approved.forEach((h) => { remote.add(h); targets.push({ to: t, host: h }); });
                 continue;
             }
             if (t.startsWith("role:")) {
                 const role = t.slice(5);
-                this.agents().filter((a) => a.host === this.host && a.role === role && live.has(a.name)).forEach((a) => local.add(a.name));
+                this.agents().filter((a) => a.host === this.host && a.role === role && live.has(a.name)).forEach((a) => { local.add(a.name); targets.push({ to: t, name: a.name }); });
                 if (!forReceive)
-                    approved.forEach((h) => remote.add(h));
+                    approved.forEach((h) => { remote.add(h); targets.push({ to: t, host: h }); });
                 continue;
             }
             if (t === "owner") {
                 local.add("owner");
+                targets.push({ to: t, name: "owner" });
                 continue;
             }
             const [raw, host] = t.split("@");
@@ -610,33 +614,44 @@ export class MbxNode {
             const name = !host || host === this.host ? this.resolveAlias(raw) : raw;
             if (name !== raw)
                 warnings.push(`${raw} was renamed to ${name}; delivered to ${name}`);
+            const renamed = name !== raw ? { renamed_from: raw } : {};
             if (host) {
-                if (host === this.host)
+                if (host === this.host) {
                     local.add(name);
+                    targets.push({ to: t, name, ...renamed, ...(forReceive || this.knownLocalName(name) ? {} : { unknown: true }) });
+                }
                 else if (!forReceive) {
-                    if (approved.includes(host))
+                    if (approved.includes(host)) {
                         remote.add(host);
+                        targets.push({ to: t, name, host });
+                    }
                     else
                         warnings.push(`${t}: host ${host} is not paired`);
                 }
                 continue;
             }
             // bare name: local first, then a unique match on a paired host
+            const elsewhere = forReceive ? [] : this.agents().filter((a) => a.name === name && a.host !== this.host).map((a) => a.host).filter((h) => approved.includes(h));
             if (localAgents.has(name) || forReceive) {
                 local.add(name);
+                targets.push({ to: t, name, ...renamed });
+                if (elsewhere.length)
+                    warnings.push(`${name} also exists on ${elsewhere.join(", ")}: delivered to ${name}@${this.host}; use ${name}@<host> for the other`);
                 continue;
             }
-            const hosts = this.agents().filter((a) => a.name === name && a.host !== this.host).map((a) => a.host).filter((h) => approved.includes(h));
-            if (hosts.length === 1)
-                remote.add(hosts[0]);
-            else if (hosts.length > 1)
-                warnings.push(`${name} exists on ${hosts.join(", ")}; address it as ${name}@<host>`);
+            if (elsewhere.length === 1) {
+                remote.add(elsewhere[0]);
+                targets.push({ to: t, name, host: elsewhere[0] });
+            }
+            else if (elsewhere.length > 1)
+                warnings.push(`${name} exists on ${elsewhere.join(", ")}; address it as ${name}@<host>`);
             else {
                 local.add(name);
+                targets.push({ to: t, name, ...renamed, ...(this.knownLocalName(name) ? {} : { unknown: true }) });
                 warnings.push(`${name} is not a known agent; delivered to this host's inbox for ${name}`);
             }
         }
-        return { local, remote, warnings };
+        return { local, remote, warnings, targets };
     }
     /** The exact mailbox addresses (name@host) a send to `to` reaches, resolved like route(); null when any recipient is a
      *  broadcast or a role (an open set). Relay depth (T104) excludes reads from these addresses: answering the agent you
@@ -666,6 +681,12 @@ export class MbxNode {
             out.add(`${name}@${hosts.length === 1 ? hosts[0] : this.host}`);
         }
         return out;
+    }
+    /** Has `name` ever existed on this host: an agents row, a delivery, a lease or a rename alias (T205)? */
+    knownLocalName(name) {
+        const q = (sql, ...args) => !!this.store.db.prepare(sql).get(...args);
+        return name === "owner" || q("SELECT 1 FROM agents WHERE name=? AND host=?", name, this.host) || q("SELECT 1 FROM deliveries WHERE agent=? LIMIT 1", name)
+            || q("SELECT 1 FROM identity_leases WHERE name=?", name) || this.store.get(`alias:${name}`) !== undefined;
     }
     // ---- send / receive ----------------------------------------------------------------------
     revoked() { return new Set(this.store.db.prepare("SELECT id FROM grants WHERE revoked=1").all().map((r) => r.id)); }
@@ -705,7 +726,7 @@ export class MbxNode {
         });
         if (auth && !auth.ok)
             r.warnings.push(`owner authority not attached: ${auth.reason}`);
-        return { envelope: e, local: [...r.local], remote: [...r.remote], warnings: r.warnings };
+        return { envelope: e, local: [...r.local], remote: [...r.remote], warnings: r.warnings, targets: r.targets };
     }
     /** Accept an envelope that arrived over the LAN from paired host `via`. */
     receive(x, via) {
