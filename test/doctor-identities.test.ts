@@ -96,5 +96,5 @@ test("prune summary counts generated mailboxes prune would retire, and stays qui
   const hit = pruneSummary(n);
   assert.equal(hit.level, "warn");
   assert.match(hit.label, /1 generated mailbox\(es\).*would be retired/);
-  assert.match(hit.fix!, /agentmbx identity prune --dry-run/);
+  assert.match(hit.fix!, /agentmbx identity prune --apply/);
 });

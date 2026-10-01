@@ -168,7 +168,7 @@ export function pendingIdentities(node) {
 export function pruneSummary(node) {
     const { retire } = pruneCandidates(node);
     return retire.length
-        ? { level: "warn", label: `${retire.length} generated mailbox(es) with no holder, no unread mail and no recent traffic would be retired`, fix: "review: agentmbx identity prune --dry-run   (then without --dry-run)" }
+        ? { level: "warn", label: `${retire.length} generated mailbox(es) with no holder, no unread mail and no recent traffic would be retired`, fix: "review the list: agentmbx identity prune   (a dry run), then apply it: agentmbx identity prune --apply" }
         : { level: "info", label: "no generated mailboxes eligible for prune" };
 }
 export async function doctor(ctx, mbxHome, opts = {}) {
