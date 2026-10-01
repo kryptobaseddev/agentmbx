@@ -16,8 +16,14 @@ test("OpenCode metadata isolates sessions, binds wake IDs, and scopes cleanup", 
   t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await c.connect(new StdioClientTransport({ command: process.execPath, args: [bin, "mcp"], env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "opencode", MBX_AGENT: "oc-test", MBX_NO_DESKTOP: "1" } as Record<string,string> }));
   const call = (sid: string, name: string, args = {}) => c.callTool({ name, arguments: args, _meta: { sessionID: sid } });
+  // T204: sessions start unbound (never on the transport's launch name or a derived one); each registers its own identity.
+  const [ua, ub] = await Promise.all([call("ses_alpha", "mbx_whoami"), call("ses_beta", "mbx_whoami")]);
+  assert.deepEqual([(ua.structuredContent as {agent:string|null}).agent, (ub.structuredContent as {agent:string|null}).agent], [null, null]);
+  assert.equal(n.store.db.prepare("SELECT COUNT(*) c FROM sessions WHERE session_id LIKE 'ses_%'").get()!.c, 0, "an unbound session binds nothing");
+  for (const [sid, name] of [["ses_alpha", "alpha"], ["ses_beta", "beta"]]) assert.notEqual((await call(sid, "mbx_identity", { action: "register", name, role: "builder" })).isError, true);
   const [a,b] = await Promise.all([call("ses_alpha", "mbx_whoami"), call("ses_beta", "mbx_whoami")]);
   const aa = a.structuredContent as {agent:string;session:string}, bb=b.structuredContent as {agent:string;session:string};
+  assert.deepEqual([aa.agent, bb.agent], ["alpha", "beta"]);
   const namespaced = await c.callTool({ name: "mbx_whoami", arguments: {}, _meta: { "ai.opencode/sessionID": "ses_alpha" } });
   assert.equal((namespaced.structuredContent as {agent:string}).agent, aa.agent);
   const conflict = await c.callTool({ name: "mbx_whoami", arguments: {}, _meta: { "ai.opencode/sessionID": "ses_alpha", sessionID: "ses_beta" } });
@@ -43,18 +49,16 @@ test("OpenCode metadata isolates sessions, binds wake IDs, and scopes cleanup", 
   const privateBeta = n.send({from:"sender",to:[bb.agent],subject:"private beta",body:"beta only"}).envelope.id;
   const recovered = await call("ses_conflict", "mbx_whoami");
   assert.notEqual(recovered.isError, true, "a conflicting saved name keeps recovery controls reachable");
-  const temporary = recovered.structuredContent as {agent:string;session:string;recovery:{identity:string}};
-  assert.notEqual(temporary.agent, bb.agent, "a stale saved name cannot merge two live sessions");
-  assert.notEqual(temporary.session, bb.session);
-  assert.equal(temporary.recovery.identity, bb.agent);
+  const pending = recovered.structuredContent as {agent:string|null;pending:string;unbound:boolean};
+  assert.deepEqual([pending.agent, pending.unbound, pending.pending], [null, true, bb.agent], "a stale saved name cannot merge two live sessions, and no substitute name is minted");
   assert.notEqual((await call("ses_conflict", "mbx_identity", {action:"list"})).isError, true);
   assert.equal((await call("ses_conflict", "mbx_read", {ids:[privateBeta]})).isError, true);
   assert.deepEqual(n.store.db.prepare("SELECT token FROM identity_leases WHERE name=?").get(bb.agent), prior);
   assert.equal(((await call("ses_beta", "mbx_whoami")).structuredContent as {agent:string;session:string}).session, bb.session);
   const invalid = await call("../bad", "mbx_whoami"); assert.equal(invalid.isError,true);
   const fallback = (await c.callTool({name:"mbx_whoami",arguments:{}})).structuredContent as {agent:string};
-  assert.notEqual(fallback.agent,aa.agent); assert.notEqual(fallback.agent,bb.agent);
+  assert.equal(fallback.agent, "oc-test", "calls without session metadata use the transport's launch identity");
   await c.close();
   const rows = n.store.db.prepare("SELECT session_id,session_key FROM sessions WHERE session_id LIKE 'ses_%'").all();
-  assert.equal(rows.length,3); assert.ok(rows.every(r=>r.session_key===null));
+  assert.deepEqual(rows.map(r => r.session_id).sort(), ["ses_alpha", "ses_beta"], "the unbound conflicting session never bound"); assert.ok(rows.every(r=>r.session_key===null));
 });

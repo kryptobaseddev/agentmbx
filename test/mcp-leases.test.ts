@@ -36,10 +36,14 @@ test("a replaced MCP holder cannot mutate mail or release its successor's lease"
   const id = node.send({ from: "sender", to: ["reader"], subject: "pending", body: "preserved" }).envelope.id;
   node.store.db.prepare("UPDATE identity_leases SET heartbeat_at=0 WHERE name='reader'").run();
   const successor = new IdentityLeases(node.store).claim("reader", { pid: process.pid, start: inspectLeaseProcess(process.pid).start!, keyFp: fingerprint(generateKeyPair().publicKey), cli: "test", sessionId: "replacement" });
-  for (const [name, args] of [["mbx_send", { to: ["receiver"], subject: "forbidden", body: "lost lease" }], ["mbx_ack", { ids: [id] }], ["mbx_whoami", { name: "stolen" }]] as const) {
+  for (const [name, args] of [["mbx_send", { to: ["receiver"], subject: "forbidden", body: "lost lease" }], ["mbx_ack", { ids: [id] }]] as const) {
     const result = await c.callTool({ name, arguments: args }); assert.equal(result.isError, true, name);
-    assert.match(JSON.stringify(result), /lease.*(usable|lost)/i);
+    assert.match(JSON.stringify(result), /lost its identity lease for reader: test session replacement claimed it/);
   }
+  // The fenced session cannot rename into, or silently re-take, its successor's identity (T204: no automatic re-claim).
+  const renamed = await c.callTool({ name: "mbx_whoami", arguments: { name: "stolen" } });
+  assert.equal(renamed.isError, true, "an unbound session needs a role to register a new identity");
+  assert.equal(((await c.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent: string | null }).agent, null);
   assert.equal(node.unreadCount("reader"), 1); assert.equal(node.inbox("receiver").length, 0);
   await c.close();
   const current = node.store.db.prepare("SELECT token,released_at FROM identity_leases WHERE name='reader'").get()!;
@@ -67,7 +71,7 @@ test("MCP rename conflicts preserve the source generation, binding and pending m
   assert.equal(node.store.db.prepare("SELECT 1 FROM identity_leases WHERE name='legacy'").get(), undefined);
 });
 
-for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} legacy conflict keeps tools available without adopting ambiguous mail`, async t => {
+for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} legacy conflict keeps identity tools available, stays unbound and never adopts ambiguous mail`, async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-mcp-legacy-conflict-")), node = new MbxNode(home, { host: "alpha" });
   const c = new Client({ name: cli, version: "test" });
   t.after(async () => { await c.close(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
@@ -75,10 +79,15 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} legacy c
   const id = node.send({ from: "sender", to: ["reader"], subject: "ambiguous", body: "preserved" }).envelope.id;
   await c.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: cli, MBX_AGENT: "reader", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
-  const identity = (await c.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent: string };
-  assert.match(identity.agent, /^reader-mcp-[a-f0-9]{16}$/);
-  assert.equal((await c.callTool({ name: "mbx_read", arguments: { ids: [id] } })).isError, true);
+  // T204: no substitute name. The session stays unbound with its launch identity pending; identity tools still work.
+  const identity = (await c.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent: string | null; unbound: boolean; pending: string };
+  assert.deepEqual([identity.agent, identity.unbound, identity.pending], [null, true, "reader"]);
+  assert.notEqual((await c.callTool({ name: "mbx_identity", arguments: { action: "list" } })).isError, true);
+  const read = await c.callTool({ name: "mbx_read", arguments: { ids: [id] } });
+  assert.equal(read.isError, true);
+  assert.match(JSON.stringify(read), /reader is not available yet/);
   assert.equal(node.inbox("reader")[0].id, id);
   assert.ok(node.store.get("identity-conflict:reader"));
   assert.equal(node.store.db.prepare("SELECT 1 FROM identity_leases WHERE name='reader'").get(), undefined);
+  assert.equal(node.store.db.prepare("SELECT COUNT(*) n FROM identity_leases").get()!.n, 0, "no other identity was invented");
 });

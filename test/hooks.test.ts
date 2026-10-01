@@ -28,8 +28,8 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} startup 
   assert.equal(result.status, 0, result.stderr);
   const context = cli === "kimi" ? result.stdout : JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
   if (cli !== "kimi") assert.equal(JSON.parse(result.stdout).hookSpecificOutput.hookEventName, "SessionStart");
-  assert.match(context, /mbx_whoami/); assert.match(context, /mbx_identity.*action=list/);
-  assert.match(context, /explicitly release.*claim/);
+  assert.match(context, /no mailbox identity yet/); assert.match(context, /mbx_whoami/);
+  assert.match(context, /"action\\?":\\?"claim\\?"/); assert.match(context, /"action\\?":\\?"register\\?"/);
   assert.doesNotMatch(context, /SECRET BODY|PRIVATE SUBJECT/);
   assert.deepEqual(node.store.db.prepare("SELECT * FROM identity_leases").all(), before);
   assert.equal(node.unreadCount("historical"), 1);
@@ -43,11 +43,14 @@ async function holder(t: TestContext, cli: string) {
   const n = new MbxNode(home, { host: "alpha" }), owner = unlockOwnerKey(home, "test-only-passphrase");
   const client = new Client({ name: "hook-test", version: "1" });
   t.after(async () => { await client.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  // A shared transport (Codex, OpenCode) serves many sessions: each registers its own identity (T204).
+  const shared = cli === "codex" || cli === "opencode";
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
-    env: { ...process.env, MBX_HOME: home, MBX_AGENT: "builder", MBX_CLI: cli, AGENTMBX_DEV: "1" } as Record<string,string> }));
+    env: { ...process.env, MBX_HOME: home, MBX_AGENT: shared ? "" : "builder", MBX_CLI: cli, AGENTMBX_DEV: "1" } as Record<string,string> }));
   const sid = cli === "codex" ? "77777777-7777-4777-8777-777777777777" : cli === "opencode" ? "ses_hooktest" : "real-hook-session";
   const meta = cli === "codex" ? { threadId: sid } : cli === "opencode" ? { sessionID: sid } : undefined;
   const call = (name: string, args: Record<string,unknown> = {}) => client.callTool({ name, arguments: args, ...(meta ? { _meta: meta } : {}) });
+  if (shared) assert.notEqual((await call("mbx_identity", { action: "register", name: "builder", role: "builder" })).isError, true);
   const agent = ((await call("mbx_whoami")).structuredContent as { agent: string }).agent;
   const rec = makePolicy({ level: "autonomous", agents: [agent], hosts: ["alpha"], ownerPub: owner.publicKey });
   assert.equal(acceptSigned(n.store.db, { rec, sig: signData(owner.privateKey, canonical(rec)) }, "alpha"), null);
@@ -108,7 +111,9 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} hooks re
     const before = n.store.db.prepare("SELECT * FROM sessions").all();
     // null represents absent/invalid session identity; the helper default is intentionally avoided.
     const r = run("prompt", unknown === undefined ? null : unknown);
-    assert.equal(r.status, 0, r.stderr); assert.equal(r.stdout, "");
+    assert.equal(r.status, 0, r.stderr);
+    // An unbound Kimi session is told once how to get an identity (Kimi drops SessionStart context); nothing else speaks.
+    if (cli === "kimi" && unknown === "missing-session") assert.match(r.stdout, /no mailbox identity yet/); else assert.equal(r.stdout, "");
     assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before);
   }
   const stopped = run("stop");
@@ -130,7 +135,8 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} hooks re
   const before = n.store.db.prepare("SELECT * FROM sessions").all();
   for (const event of ["prompt", "post-tool", "stop", "session-start"]) {
     const r = run(event); assert.equal(r.status, 0, r.stderr);
-    if (event === "session-start") { assert.match(r.stdout, /Identity choices/); assert.doesNotMatch(r.stdout, /You are|autonomous|new message|1 unread/); }
+    if (event === "session-start") { assert.match(r.stdout, /no mailbox identity yet/); assert.doesNotMatch(r.stdout, /You are|autonomous|new message|1 unread/); }
+    else if (cli === "kimi" && event === "prompt") assert.match(r.stdout, /no mailbox identity yet/, "once, on the first unbound prompt");
     else assert.equal(r.stdout, "");
     assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before, "released hooks cannot recreate bindings");
   }
@@ -172,7 +178,7 @@ test("hosted Kimi does not bootstrap an unknown thread from a provisional parent
   writeFileSync(join(kimiHome, "server/instances/test.json"), JSON.stringify({ pid: process.pid, port: 12345 }));
   const before = n.store.db.prepare("SELECT * FROM sessions").all();
   const r = run("prompt", "unknown-hosted-session", "kimi", { KIMI_CODE_HOME: kimiHome });
-  assert.equal(r.status, 0, r.stderr); assert.equal(r.stdout, "");
+  assert.equal(r.status, 0, r.stderr); assert.doesNotMatch(r.stdout, /\d+ unread|PRIVATE|SECRET|You are/, "at most the generic identity guidance");
   assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before);
 });
 
