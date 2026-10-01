@@ -270,6 +270,9 @@ const text = (s, structured) => ({ content: [{ type: "text", text: s }], ...(str
 /** A status that looks like it wants attention will not get it: say so to the sender (owner decision 2026-09-30). */
 export const statusWakeWarning = (e) => e.kind === "status" && (e.needs_reply || e.meta.mentions.length)
     ? ["kind=status never wakes the recipient (not even with needs_reply or a mention); it waits for their next prompt. To get attention now, send kind=request with needs_reply=true."] : [];
+/** Mail past the relay safety depth reaches the recipient as "policy: ask" and wakes no one: say so to the sender. */
+export const depthWarning = (e) => (e.meta.hop ?? 0) > MAX_HOP
+    ? [`relay safety depth ${e.meta.hop} exceeds ${MAX_HOP}: this session has read a long agent-to-agent chain since your user last typed, so the recipient will not be woken or act under its owner policy (it can still read and answer). Your user's next prompt resets the depth.`] : [];
 export async function runMcp(existing) {
     let node;
     if (existing)
@@ -778,7 +781,7 @@ export async function runMcp(existing) {
         if (idempotency_key)
             node.store.set(`idem:${agent}:${idempotency_key}`, r.envelope.id);
         const out = { id: r.envelope.id, ref: `mbx:${r.envelope.id}@${node.host}`, thread: r.envelope.thread, delivered_locally: r.local, queued_for_hosts: r.remote,
-            owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...statusWakeWarning(r.envelope)] };
+            owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...statusWakeWarning(r.envelope), ...depthWarning(r.envelope)] };
         return text(JSON.stringify(out, null, 2), out);
     });
     server.registerTool("mbx_reply", {
@@ -796,7 +799,7 @@ export async function runMcp(existing) {
         const subject = /^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`.slice(0, 200);
         const r = node.send({ from: agent, to: [m.from_addr], subject, body, kind, reply_to: m.id, thread: m.thread, needs_reply, refs: [], ...relay(origin) }, session());
         const out = { id: r.envelope.id, to: m.from_addr, thread: r.envelope.thread, reply_to: m.id, delivered_locally: r.local, queued_for_hosts: r.remote,
-            owner_authority: !!r.envelope.authority, warnings: r.warnings };
+            owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...depthWarning(r.envelope)] };
         return text(`${JSON.stringify(out, null, 2)}\nNext: mbx_ack ${m.id} if you are done with it.`, out);
     });
     server.registerTool("mbx_inbox", {

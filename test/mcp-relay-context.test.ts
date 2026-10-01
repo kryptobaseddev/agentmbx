@@ -113,6 +113,8 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: maximum
     const policy = n.policyFor(row, "receiver");
     assert.equal(policy.level, "ask");
     assert.match(policy.notes.join(" "), /relay safety depth 1000 exceeds limit 6/);
+    assert.ok((result.structuredContent as { warnings: string[] }).warnings.some(w => /relay safety depth 1000 exceeds 6: .*will not be woken/.test(w)),
+      "the sender learns the brake applies, instead of a silent missed wake (Fedora T151 report)");
   }
 });
 
