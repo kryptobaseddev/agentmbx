@@ -10,7 +10,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { bindWakeLease } from "./helpers/wake-lease.ts";
 import { MbxNode } from "../src/node.ts";
-import { dispatchWakes, wakeCodex, wakeOpencode } from "../src/wake.ts";
+import { dispatchWakes, muteWakes, UNKNOWN_HOLD_MS, wakeCodex, wakeOpencode } from "../src/wake.ts";
 import type { WakeOutcome } from "../src/wake-contract.ts";
 import { statusWakeWarning, type Envelope } from "../src/mcp.ts";
 
@@ -113,4 +113,45 @@ test("a sender who marks a status as needing attention is told it will not wake 
   assert.equal(statusWakeWarning(e("status", false, ["worker"])).length, 1);
   assert.deepEqual(statusWakeWarning(e("status", false, [])), [], "a plain progress update needs no warning");
   assert.deepEqual(statusWakeWarning(e("request", true, [])), []);
+});
+
+test("an attempt interrupted before its result was recorded is held as unknown, not submitted twice (WC-14)", async (t) => {
+  const { n, calls } = fixture(t);
+  bindWakeLease(n, { agent: "worker", cli: "codex", session_id: "33333333-3333-4333-8333-333333333333", pid: process.pid });
+  const m = sendLeased(n, { from: "sender", to: ["worker"], subject: "wake", body: "private", kind: "request" }).envelope;
+  // what a daemon killed right after the native write leaves behind
+  n.store.set("wake-attempt:worker", JSON.stringify({ attemptId: "01ATTEMPT", agent: "worker", messageIds: [m.id], sessionId: "x", at: new Date().toISOString() }));
+  assert.deepEqual(await dispatchWakes(n), []);
+  assert.deepEqual(calls(), [], "no second write for a possibly admitted hint");
+  assert.deepEqual(delivery(n, "worker").map((d) => d.note), ["unknown"]);
+  assert.equal(n.store.get("wake-attempt:worker"), undefined);
+  assert.ok(n.store.db.prepare("SELECT 1 FROM audit WHERE event='wake.unknown' AND detail LIKE '%killed%'").get());
+  // after the hold, the mail may be woken once more, still under the brake
+  await dispatchWakes(n, Date.now() + UNKNOWN_HOLD_MS + 60_000);
+  assert.equal(calls().length, 1, "held mail is retried once the hold elapses");
+  assert.deepEqual(delivery(n, "worker").map((d) => d.note), [null]);
+});
+
+test("mute suppresses hints and notices while mail stays unread; unmute resumes (WC-17)", async (t) => {
+  const { n, calls } = fixture(t);
+  bindWakeLease(n, { agent: "worker", cli: "codex", session_id: "44444444-4444-4444-8444-444444444444", pid: process.pid });
+  muteWakes(n, "worker", new Date(Date.now() + 60_000));
+  sendLeased(n, { from: "sender", to: ["worker"], subject: "wake", body: "private", kind: "request" });
+  assert.deepEqual(await dispatchWakes(n), []);
+  assert.deepEqual(calls(), []);
+  assert.deepEqual(delivery(n, "worker").map((d) => d.state), ["delivered"], "the mail waits, unread, for the mute to end");
+  muteWakes(n, "worker", null);
+  assert.equal((await dispatchWakes(n))[0].result.ok, true);
+  assert.equal(calls().length, 1);
+});
+
+test("a busy backoff defers the next attempt instead of asking every pass", async (t) => {
+  const { n, calls } = fixture(t);
+  bindWakeLease(n, { agent: "worker", cli: "codex", session_id: "55555555-5555-4555-8555-555555555555", pid: process.pid });
+  n.store.set("wake-busy:worker", JSON.stringify({ n: 3, next: Date.now() + 16_000 }));
+  sendLeased(n, { from: "sender", to: ["worker"], subject: "wake", body: "private", kind: "request" });
+  assert.deepEqual(await dispatchWakes(n), []);
+  assert.deepEqual(calls(), []);
+  assert.equal((await dispatchWakes(n, Date.now() + 20_000))[0].result.ok, true);
+  assert.equal(n.store.get("wake-busy:worker"), undefined, "a successful wake clears the backoff");
 });

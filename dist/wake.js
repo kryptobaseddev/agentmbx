@@ -255,8 +255,52 @@ export async function notifyDesktop(n) {
     }
     return last;
 }
+// ---- wake reconciliation and pressure (T179) -------------------------------------------------------------
+/** An `unknown` attempt is held this long before its mail may be woken once more (still within WAKE_LIMITS). */
+export const UNKNOWN_HOLD_MS = 10 * 60_000;
+const BUSY_BACKOFF_MAX_MS = 60_000;
+const muteKey = (agent) => `wake-mute:${agent}`, busyKey = (agent) => `wake-busy:${agent}`, attemptKey = (agent) => `wake-attempt:${agent}`;
+/** Owner control: no wake hints or desktop notices for `agent` until `until` (mail stays unread and searchable). */
+export function muteWakes(node, agent, until) {
+    if (until)
+        node.store.set(muteKey(agent), until.toISOString());
+    else
+        node.store.db.prepare("DELETE FROM kv WHERE k=?").run(muteKey(agent));
+    node.store.audit(until ? "wake.muted" : "wake.unmuted", { agent, ...(until ? { until: until.toISOString() } : {}) });
+}
+export const wakeMutedUntil = (node, agent, now = Date.now()) => {
+    const until = node.store.get(muteKey(agent));
+    return until && Date.parse(until) > now ? until : null;
+};
+/**
+ * Before a new pass: an attempt marker left behind means the daemon stopped between submitting and recording the
+ * result. The hint may have been admitted, so its mail is held as `unknown` instead of being submitted again (WC-14).
+ * Held `unknown` mail older than UNKNOWN_HOLD_MS becomes wakeable once more: the brake still bounds every retry.
+ */
+function reconcileWakes(node, now) {
+    for (const { k, v } of node.store.db.prepare("SELECT k, v FROM kv WHERE k GLOB 'wake-attempt:*'").all()) {
+        let a;
+        try {
+            a = JSON.parse(v);
+        }
+        catch {
+            node.store.db.prepare("DELETE FROM kv WHERE k=?").run(k);
+            continue;
+        }
+        node.store.tx(() => {
+            for (const id of a.messageIds)
+                node.store.db.prepare("UPDATE deliveries SET state='notified', note='unknown', updated_at=? WHERE msg_id=? AND agent=? AND state='delivered'")
+                    .run(new Date(now).toISOString(), id, a.agent);
+            node.store.db.prepare("DELETE FROM kv WHERE k=?").run(k);
+        });
+        node.store.audit("wake.unknown", { agent: a.agent, attempt: a.attemptId, reason: "killed", count: a.messageIds.length });
+    }
+    node.store.db.prepare("UPDATE deliveries SET state='delivered', note=NULL WHERE state='notified' AND note='unknown' AND updated_at<?")
+        .run(new Date(now - UNKNOWN_HOLD_MS).toISOString());
+}
 /** One pass of the wake dispatcher: every delivered-but-not-notified message is either woken, batched or skipped. */
-export async function dispatchWakes(node) {
+export async function dispatchWakes(node, now = Date.now()) {
+    reconcileWakes(node, now);
     const pending = node.store.db.prepare(`SELECT d.agent, m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.state='delivered' ORDER BY m.ts`).all();
     const byAgent = new Map();
     for (const r of pending)
@@ -277,10 +321,16 @@ export async function dispatchWakes(node) {
             markAll();
             continue;
         }
+        if (wakeMutedUntil(node, agent, now))
+            continue; // muted: no hint and no notice; the mail stays delivered and unread
+        const busy = JSON.parse(node.store.get(busyKey(agent)) ?? "null");
+        if (busy && busy.next > now)
+            continue; // a busy session is asked again with backoff, not every pass
         // a hosted kimi session that is mid-turn is working already: leave the mail queued (its Stop hook also
         // surfaces new mail) and retry on the next pass, without spending any of the wake brake below
         const automatic = wanted.filter(r => hasWakeAuthority(node, agent, r));
         if (automatic.length && await kimiBusyNow(sessions.map(g => g.session), fetch)) {
+            node.store.set(busyKey(agent), JSON.stringify({ n: (busy?.n ?? 0) + 1, next: now + Math.min(2_000 * 2 ** (busy?.n ?? 0), BUSY_BACKOFF_MAX_MS) }));
             node.store.audit("wake", { agent, via: "kimi web", ok: false, busy: true, count: wanted.length });
             out.push({ agent, result: { ok: false, via: "kimi web", error: "session busy (retrying next pass)" } });
             continue;
@@ -318,6 +368,8 @@ export async function dispatchWakes(node) {
                 fenced = true;
                 break;
             }
+            const marker = { attemptId: ulid(), agent, messageIds: automatic.map((r) => r.id), sessionId: s.session_id, at: new Date(now).toISOString() };
+            node.store.set(attemptKey(agent), JSON.stringify(marker)); // durable before the native write (WC-14)
             if (s.cli === "codex")
                 result = await wakeCodex(s.session_id, text, { recheck });
             else if (s.cli === "opencode")
@@ -327,6 +379,8 @@ export async function dispatchWakes(node) {
             else
                 continue;
             attempts++;
+            node.store.audit("wake.attempt", { agent, attempt: marker.attemptId, session: `${s.cli}:${s.session_id}`, outcome: result.outcome?.kind ?? null,
+                ...(result.outcome?.kind === "admitted" ? { receipt: result.outcome.receipt.strength, native: result.outcome.receipt.nativeId } : {}) });
             const o = result.outcome, kind = o?.kind;
             if (o?.kind === "not_submitted" && o.reason === "fenced") {
                 fenced = true;
@@ -343,6 +397,13 @@ export async function dispatchWakes(node) {
             if (kind === "admitted" || kind === "busy" || kind === "unknown" || kind === "blocked")
                 break;
         }
+        const clearAttempt = () => node.store.db.prepare("DELETE FROM kv WHERE k=?").run(attemptKey(agent));
+        if (result.outcome?.kind !== "unknown")
+            clearAttempt();
+        if (isRetry(result))
+            node.store.set(busyKey(agent), JSON.stringify({ n: (busy?.n ?? 0) + 1, next: now + Math.min(2_000 * 2 ** (busy?.n ?? 0), BUSY_BACKOFF_MAX_MS) }));
+        else if (busy)
+            node.store.db.prepare("DELETE FROM kv WHERE k=?").run(busyKey(agent));
         if (fenced) {
             // refund only when nothing may have reached a provider in this pass
             if (!submitted)
@@ -362,14 +423,16 @@ export async function dispatchWakes(node) {
         }
         if (result.outcome?.kind === "unknown") {
             // The hint may be queued already: never resubmit it blindly (T179 reconciles). The mail stays unread and readable.
-            const finish = () => rows.forEach(r => node.setDelivery(r.id, agent, "notified", "unknown"));
+            const finish = () => { rows.forEach(r => node.setDelivery(r.id, agent, "notified", "unknown")); clearAttempt(); };
             try {
                 if (submitted)
                     submitted.run(finish, false);
                 else
                     node.store.tx(finish);
             }
-            catch { /* ownership changed: delivery retained */ }
+            catch {
+                clearAttempt(); /* ownership changed: delivery retained */
+            }
             node.store.audit("wake.unknown", { agent, via: result.via, attempt: result.outcome.attemptId, reason: result.outcome.reason, count: wanted.length });
             out.push({ agent, result });
             continue;

@@ -102,7 +102,7 @@ for (const concurrent of [false, true]) test(`busy race releases only its reserv
     assert.deepEqual(deliveries(n), [{ state: "delivered", note: null }]);
     const wakes = n.store.db.prepare("SELECT thread FROM wakes").all() as { thread: string }[];
     assert.deepEqual(wakes.map((r) => r.thread), concurrent ? ["another-thread"] : []);
-    const second = await dispatchWakes(n);
+    const second = await dispatchWakes(n, Date.now() + 3_000); // past the first busy backoff step (T179)
     if (concurrent) {
       assert.deepEqual(second, [], "the concurrent continuation still enforces the shared brake");
       assert.equal(prompts, 0);
@@ -271,7 +271,8 @@ test("a busy hosted session is skipped without spending the brake, and is woken 
     assert.deepEqual(deliveries(n), [{ state: "delivered", note: null }], "mail stays queued while the session works");
     assert.equal((n.store.db.prepare("SELECT count(*) n FROM wakes WHERE agent='web'").get() as { n: number }).n, 0, "the busy gate spends no wake budget");
     state.busy = false;
-    const second = await dispatchWakes(n);
+    assert.deepEqual(await dispatchWakes(n), [], "busy backs off: the very next pass does not ask again (T179)");
+    const second = await dispatchWakes(n, Date.now() + 3_000);
     assert.deepEqual(second.map((o) => [o.result.ok, o.result.via]), [[true, "kimi web"]]);
     assert.deepEqual(deliveries(n), [{ state: "notified", note: null }]);
     assert.equal(seen.filter((s) => s.method === "POST").length, 1, "exactly one prompt, submitted once idle");

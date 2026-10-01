@@ -21,7 +21,7 @@ import { periodicUpdateCheck, updateAvailable, updateCommand } from "./update.ts
 import { installKind, version } from "./version.ts";
 import { installService, serviceLabel, uninstallService } from "./service.ts";
 import { CLIS, defaultHostName, defaultWhich, formatRows, ownerStep, resolveCommand, runSetup, shJoin, type SetupCtx } from "./setup.ts";
-import { dispatchWakes, hasWakeAuthority, humanPromptKey, inboxCommand, isHumanPrompt, macNotifierPath, notifyDesktop, opencodeService, which } from "./wake.ts";
+import { dispatchWakes, hasWakeAuthority, humanPromptKey, inboxCommand, isHumanPrompt, macNotifierPath, muteWakes, notifyDesktop, opencodeService, which } from "./wake.ts";
 import { kimiHostedServer } from "./kimi-web.ts";
 import { approveKimi, decidePermission, opencodePermissionPass, type Lookup } from "./permission.ts";
 import { diagnosticSnapshot, type RuntimeObservation } from "./diagnostics.ts";
@@ -69,6 +69,7 @@ Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …'
   agentmbx pair approve <host> <code>
   agentmbx peers                                    agentmbx peers remove <host>
   agentmbx host rotate                              new host and encryption keys, announced to peers (pairings kept)
+  agentmbx wake mute <agent> [--minutes 60]          pause wake hints and notices for an agent (mail keeps arriving)   agentmbx wake unmute <agent>
   agentmbx daemon                                   agentmbx daemon install | uninstall   (launchd / systemd user service)
   agentmbx relay [serve [--port N]]                 run an untrusted store-and-forward relay (ADR-035 reference)
   agentmbx relay set <url> | relay unset            point this daemon at a relay (picked up on daemon start)
@@ -193,7 +194,7 @@ async function run(argv: string[]) {
     compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" },
     backend: { type: "string" }, "no-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
     project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }, "wait-ms": { type: "string" },
-    "older-than": { type: "string" } } });
+    "older-than": { type: "string" }, minutes: { type: "string" } } });
   if (o.help) return console.log(commandHelp(cmd));
   const str = (k: string) => (typeof (o as Record<string, unknown>)[k] === "string" ? (o as Record<string, unknown>)[k] as string : undefined);
 
@@ -587,6 +588,17 @@ If the codes differ, do not approve: someone is in the middle.`);
     }
     case "owner": return owner(node, pos, str, o);
     case "policy": return policy(node, pos, str, o);
+    case "wake": {
+      // Owner control (T179): pause wake hints and desktop notices for one agent; its mail stays unread and searchable.
+      const agent = pos[1] ?? die("wake mute <agent> [--minutes N] | wake unmute <agent>");
+      if (pos[0] === "unmute") { muteWakes(node, agent, null); return console.log(`wakes for ${agent} resumed`); }
+      if (pos[0] !== "mute") die("wake mute <agent> [--minutes N] | wake unmute <agent>");
+      const minutes = Number(str("minutes") ?? 60);
+      if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 7 * 24 * 60) die("--minutes must be between 1 and 10080");
+      const until = new Date(Date.now() + minutes * 60_000);
+      muteWakes(node, agent, until);
+      return console.log(`wakes for ${agent} muted until ${until.toISOString()} (mail still arrives; it shows on the next prompt)`);
+    }
     case "audit": {
       const since = new Date(Date.now() - parseTtl(str("since") ?? "24h")).toISOString();
       const rows = node.store.db.prepare(`SELECT at, event, detail FROM audit WHERE at > ? AND (event IN ('peer_action','yolo_allow') OR event LIKE 'policy.%'

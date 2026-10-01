@@ -22,7 +22,7 @@ import { activePolicies, delegationNote, MAX_HOP } from "./policy.js";
 import { procStart, withProcSnapshot } from "./proc.js";
 import { updateAvailable } from "./update.js";
 import { installKind, version } from "./version.js";
-import { hasWakeAuthority, humanPromptKey, wakeText } from "./wake.js";
+import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wake.js";
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
 It is shared by AI coding agents on this machine and on paired machines. Your user set it up so agents can coordinate;
 replying, answering questions, sharing status and acking are always fine.
@@ -914,23 +914,32 @@ export async function runMcp(existing) {
                 const agent = base.agent;
                 leases.withHeld(agent, base.leaseToken, () => undefined);
                 for (const mailbox of [agent, ...node.linkedNames(agent)]) {
-                    const { rows, wanted, brake } = leases.withHeld(agent, base.leaseToken, () => {
+                    if (wakeMutedUntil(node, mailbox))
+                        continue; // muted (T179): mail stays delivered and unread, no channel hint
+                    const { rows, wanted, reservation } = leases.withHeld(agent, base.leaseToken, () => {
                         const rows = node.store.db.prepare(`SELECT m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state='delivered' ORDER BY m.ts`).all(mailbox);
                         const wanted = rows.filter(r => node.wantsWake(mailbox, r) && hasWakeAuthority(node, mailbox, r));
-                        const brake = wanted.length ? node.takeWake(mailbox, wanted[0].thread) : null;
-                        return { rows, wanted, brake };
+                        const reservation = wanted.length ? node.reserveWake(mailbox, wanted[0].thread) : null;
+                        return { rows, wanted, reservation };
                     });
                     if (!rows.length)
                         continue;
                     if (wanted.length) {
-                        if (brake?.startsWith("batched"))
+                        if (reservation?.brake?.startsWith("batched"))
                             continue;
                         const linked = mailbox === agent ? "" : ` This is your linked mailbox: use agentmbx inbox --as ${mailbox} and agentmbx ack --as ${mailbox} <id>.`;
-                        if (!brake)
-                            await server.server.notification({ method: "notifications/claude/channel", params: {
-                                    content: wakeText(mailbox, wanted) + linked,
-                                    meta: { count: String(wanted.length), agent, mailbox },
-                                } });
+                        // a push that fails never reached the session: refund it and keep the mail delivered for the next tick
+                        if (!reservation?.brake)
+                            try {
+                                await server.server.notification({ method: "notifications/claude/channel", params: {
+                                        content: wakeText(mailbox, wanted) + linked,
+                                        meta: { count: String(wanted.length), agent, mailbox },
+                                    } });
+                            }
+                            catch (e) {
+                                reservation?.release?.();
+                                throw e;
+                            }
                     }
                     leases.withHeld(agent, base.leaseToken, () => { for (const r of rows)
                         node.setDelivery(r.id, mailbox, "notified"); });
