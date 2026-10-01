@@ -330,3 +330,17 @@ test("real helper: long security values are shown whole or refused, never cut", 
   const r = summary(canonical({ ...base, projects: [long, long] }));
   assert.equal(r.code, 5); assert.match(r.err, /too much to show/);
 });
+
+test("real helper: lead, lead revocation and identity forward prompts (T208, T209), refusing ambiguous display text", { skip }, () => {
+  const lead = { v: 1, type: "lead", id: "01J0000000000000000000000", project: "/Users/k/projects/agentmbx", agent: "agentmbx-lead", host: "macbook",
+    iat, exp: hours(24 * 7), owner_fp: "b81a-0000-0000-0000" };
+  assert.equal(ok(lead), "Make agentmbx-lead@macbook the lead of project /Users/k/projects/agentmbx for 7 days: it can read every message of that project and forward them");
+  assert.equal(summary(canonical({ ...lead, project: "/a\nMake someone else the lead" })).code, 5);
+  assert.equal(summary(canonical({ ...lead, agent: undefined })).code, 5);
+  assert.equal(ok({ v: 1, type: "lead-revoke", id: "01J0000000000000000000001", target: "01J0000000000000000000000", iat, owner_fp: "b81a-0000-0000-0000" }),
+    "Revoke project lead record 01J0000000000000000000000");
+  const forward = { v: 1, type: "identity-forward", id: "6f1b8a52-6d4c-4c8e-9a0b-5b3b8b7c2d10", owner_fp: "b81a-0000-0000-0000", host: "macbook",
+    host_fp: "dc4f-6c32-79f1-6a05", from: "orbit-mcp-0123456789abcdef", to: "orbit-lead", unread: 3, issued_at: Date.parse(iat), expires_at: Date.parse(hours(1)) };
+  assert.match(ok(forward), /^Forward 3 unread message\(s\) from orbit-mcp-0123456789abcdef@macbook to orbit-lead@macbook \(host key dc4f-6c32-79f1-6a05\); orbit-mcp-0123456789abcdef routes to orbit-lead from now on\. Approval expires /);
+  assert.equal(summary(canonical({ ...forward, to: "x‮evil" })).code, 5);
+});

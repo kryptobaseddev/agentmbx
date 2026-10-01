@@ -202,6 +202,24 @@ func summarizeRaw(_ o: [String: Any]) throws -> String {
     let key = o["owner_pub"] as? String ?? o["pub"] as? String ?? o["principal_pub"] as? String
     return "Add \(role) \(label) (owner key \(fingerprint(b64: key))) to your AgentMBX"
   }
+  if type == "lead" { // src/project-ledger.ts makeLead (T208)
+    guard o["v"] as? Int == 1, let agent = o["agent"] as? String, let host = o["host"] as? String, let project = o["project"] as? String,
+      o["owner_fp"] is String else { throw Refusal(reason: "incomplete lead record") }
+    guard [agent, host, project].allSatisfy({ !$0.isEmpty && clean($0, Int.max) == $0 }) else { throw Refusal(reason: "lead record contains ambiguous display text") }
+    return "Make \(agent)@\(host) the lead of project \(project) for \(try duration(o)): it can read every message of that project and forward them"
+  }
+  if type == "lead-revoke" { // src/project-ledger.ts makeLeadRevocation (T208)
+    guard o["v"] as? Int == 1, let target = o["target"] as? String, !target.isEmpty, clean(target, Int.max) == target else { throw Refusal(reason: "incomplete lead revocation") }
+    return "Revoke project lead record \(target)"
+  }
+  if type == "identity-forward" { // src/identity-cleanup.ts buildForward (T209)
+    guard o["v"] as? Int == 1, let from = o["from"] as? String, let to = o["to"] as? String, let host = o["host"] as? String,
+      let hostKey = o["host_fp"] as? String, let unread = o["unread"] as? Int, let expiry = o["expires_at"] as? Double
+      else { throw Refusal(reason: "incomplete identity forward") }
+    guard [from, to, host, hostKey].allSatisfy({ !$0.isEmpty && clean($0, Int.max) == $0 }) else { throw Refusal(reason: "identity forward contains ambiguous display text") }
+    let date = ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: expiry / 1000))
+    return "Forward \(unread) unread message(s) from \(from)@\(host) to \(to)@\(host) (host key \(hostKey)); \(from) routes to \(to) from now on. Approval expires \(date)."
+  }
   if type != nil { throw Refusal(reason: "unknown record type \(clean(type!, 40))") }
   // owner grant (src/envelope.ts Grant without sig)
   if o["v"] as? Int == 2, let sub = o["sub"] as? String, sub.hasPrefix("session:"), let agent = str(o["agent"]), let host = str(o["host"]) {
