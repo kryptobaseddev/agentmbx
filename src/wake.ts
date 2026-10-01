@@ -283,6 +283,15 @@ function reconcileWakes(node: MbxNode, now: number) {
     .run(new Date(now - UNKNOWN_HOLD_MS).toISOString());
 }
 
+/** A live `agentmbx watch` process for this agent (T033): the session wakes itself when it exits, so the daemon defers. */
+export const watcherKey = (agent: string) => `watcher:${agent}`;
+export const WATCHER_FRESH_MS = 15_000;
+export function liveWatcher(node: MbxNode, agent: string, now = Date.now()): boolean {
+  const w = JSON.parse(node.store.get(watcherKey(agent)) ?? "null") as { pid: number; at: number } | null;
+  if (!w || now - w.at > WATCHER_FRESH_MS) return false;
+  try { process.kill(w.pid, 0); return true; } catch { return false; }
+}
+
 const NOTICES_PER_MINUTE = 6;
 /** Desktop notices only for agents this host knows, and at most NOTICES_PER_MINUTE across all of them. */
 function noticeAllowed(node: MbxNode, agent: string, now: number): boolean {
@@ -308,6 +317,7 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
     const sessions = held.filter(g => !g.session.session_id.startsWith("mcp-"));
     // Only the current leased channel may suppress daemon delivery.
     if (held.some(g => g.session.channel)) continue;
+    if (liveWatcher(node, agent, now)) continue; // its own watcher reports the mail and marks it notified
     const wanted = rows.filter((r) => node.wantsWake(agent, r));
     const markAll = () => rows.forEach((r) => node.setDelivery(r.id, agent, "notified"));
     if (!wanted.length) { markAll(); continue; }

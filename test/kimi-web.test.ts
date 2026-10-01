@@ -313,7 +313,7 @@ test("terminal kimi sessions are never woken: the wake falls back to the desktop
     assert.equal(out[0].result.ok, false);
     assert.equal(out[0].result.via, "kimi web", "the desktop is disabled in tests, so the original failure surfaces");
     assert.deepEqual(deliveries(n), [{ state: "notified", note: "desktop" }]);
-    assert.equal(n.deliveryMode("term"), "no push: new mail shows on your user's next prompt, or when your [mbx-watch] self-check runs");
+    assert.equal(n.deliveryMode("term"), "no push: new mail shows on your user's next prompt, or when your mbx watcher or [mbx-watch] self-check runs");
   });
   n.close();
   server.close();

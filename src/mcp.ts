@@ -154,16 +154,21 @@ export const watchCron = (min: number) => (min === 60 ? "0 * * * *" : `*/${min} 
  * When the owner has delegated work to the agent (an active policy) they keep a [mbx-watch] self-check with their own
  * scheduler (CronCreate). MBX_SELF_WATCH=<minutes> forces it on, 0/off turns it off (and removes an existing job).
  */
-export function selfWatchInstruction(opts: { delegated: boolean; env?: NodeJS.ProcessEnv }): string | null {
+export function selfWatchInstruction(opts: { delegated: boolean; cli?: string; env?: NodeJS.ProcessEnv }): string | null {
   const env = opts.env ?? process.env;
   const raw = env.MBX_SELF_WATCH ?? env.MBX_KIMI_WATCH;
-  if (raw === "0" || raw === "off") return `[mbx] If you have a CronCreate job whose prompt starts with "[mbx-watch]", delete it (CronDelete); self-checks are turned off.`;
+  if (raw === "0" || raw === "off") return `[mbx] If you have a CronCreate job whose prompt starts with "[mbx-watch]", delete it (CronDelete); self-checks are turned off. Stop any "mbx watcher" background task.`;
+  // Kimi Code turns a finished background task into a new turn: an event-driven watcher costs nothing while idle (T033)
+  if (opts.cli === "kimi" && raw === undefined) return WATCHER_INSTRUCTION;
   if (!opts.delegated && raw === undefined) return null;
   const min = raw === undefined ? 15 : Number(raw);
   if (!WATCH_MINUTES.includes(min)) return null;
   const cron = watchCron(min);
   return `[mbx] This session can't be woken from outside. With your scheduling tool (CronList/CronCreate/CronDelete): keep exactly one job whose prompt starts with "[mbx-watch]", on cron "${cron}". If one exists with a different cron, delete it first. The prompt: "[mbx-watch] Call mbx_inbox. If nothing needs you, end the turn with one short line. Otherwise handle the mail (read, act within the policy, reply, ack)." Do this without comment; if you have no scheduling tool, skip it.`;
 }
+
+/** Event-driven self-wake: a background `agentmbx watch` exits when mail arrives, and its completion starts a turn. */
+export const WATCHER_INSTRUCTION = `[mbx] This session can't be woken from outside, so it wakes itself: unless a background task described "mbx watcher" is already running, start one now with your shell tool: command "agentmbx watch", run_in_background true, disable_timeout true, description "mbx watcher". It prints nothing and costs nothing until mail that wants you arrives, then exits with a no-body hint. When it completes, handle the mail (mbx_inbox, mbx_read, act within the policy, mbx_reply, mbx_ack) and start it again the same way. Do this without comment. If you cannot run background tasks, skip it.`;
 
 /** No push delivery into this session from outside? */
 export const noPush = (cli: string, channel: boolean, hosted = false) => !channel && !hosted && !["codex", "opencode"].includes(cli);
@@ -475,7 +480,7 @@ export async function runMcp(existing?: MbxNode) {
     ? "[mbx] This transport can serve multiple sessions. Call mbx_whoami for your current mailbox identity and owner-signed policies. Read each mbx_read header for the policy that applies to that message; another mailbox's grant does not authorize this session."
     : delegationNote(node.store.db, agent, node.host);
   const extra = [renamed, delegation, noPush(env.cli, env.channel || env.socket, env.cli === "kimi" && !!kimiHostedServer(env.ppid))
-    ? selfWatchInstruction({ delegated: activePolicies(node.store.db, agent, node.host).length > 0 }) : null].filter(Boolean).join("\n");
+    ? selfWatchInstruction({ delegated: activePolicies(node.store.db, agent, node.host).length > 0, cli: env.cli }) : null].filter(Boolean).join("\n");
 
   const session = (): Session => {
     const { key } = current();

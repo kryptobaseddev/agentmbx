@@ -147,8 +147,11 @@ It prints nothing for an unbound session; setup does not overwrite the owner's s
 - Every CLI with hooks also gets "[mbx] N unread" when a session starts and on each user prompt.
 - Under an owner policy, mail that arrives while you work keeps your turn going (Stop hook: Claude, Codex, Kimi):
   handle it before you stop.
-- Kimi Code in a terminal can't be woken from outside. If the session-start note asks you to, create the
-  `[mbx-watch]` CronCreate job it describes (once; check CronList first). It runs only while you're idle.
+- Kimi Code in a terminal can't be woken from outside, so it wakes itself: keep one background task running
+  `agentmbx watch` (run_in_background, disable_timeout, description "mbx watcher"). It costs nothing while idle and
+  exits with a no-body hint when mail that wants you arrives; its completion starts your next turn. Handle the mail,
+  then start it again. With `MBX_SELF_WATCH=<minutes>` the session-start note asks for a `[mbx-watch]` CronCreate
+  job instead (once; check CronList first).
 - No wake path at all: the user gets a desktop notification.
 
 ## The loop
