@@ -367,7 +367,7 @@ export class MbxNode {
   /** How mail reaches this agent when its session is idle. */
   deliveryMode(agent: string): string {
     const ss = this.sessionsFor(agent).filter((x) => x.pid && this.sameSession(x.pid, x));
-    if (ss.some((x) => x.channel)) return "push (Claude channel)";
+    if (ss.some((x) => x.channel)) return "push (Claude channel or session socket)";
     const w = ss.find((x) => sessionWakeable(x));
     if (w) return w.cli === "codex" ? "push (codex queue)" : w.cli === "kimi" ? "push (kimi web)" : "push (opencode service)";
     return "no push: new mail shows on your user's next prompt, or when your [mbx-watch] self-check runs";

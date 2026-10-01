@@ -77,13 +77,14 @@ moved without a signature. Unsigned evidence never moves an address.
 
 ## Claude session socket wake (T202)
 
-Claude Code exports `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_MESSAGING_TOKEN` to each session and its hooks. The
-SessionStart hook hands both to the local daemon with the exact session binding. They are stored privately (0600 store,
-never logged or sent to peers) and dropped when the session ends or the socket is gone. On new mail that wants a wake,
-the dispatcher queues the standard no-body `[mbx]` hint into that exact session through the wake contract
-(docs/spec/provider-wake-contract.md): admission is `transport` strength, a missing socket is `not_submitted`, and the
-hook notices remain the fallback. The protocol must be validated live from the daemon into a session other than the
-tester's own, with the owner present. Until then this path is reported as unverified.
+Claude Code exports `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_MESSAGING_TOKEN` to each session, its hooks and its
+MCP servers. By default it delivers socket messages from the session's own child processes without any setting, and the
+mbx MCP server is such a child. So the session's own mbx server, not the daemon, queues the standard no-body `[mbx]` hint
+(NDJSON: `{"type":"auth","token"}` then `{"type":"user","message":{"role":"user","content"}}`) with the same wants-wake,
+authority, mute and brake checks as the channel path, and registers as the push holder so the daemon defers. The token
+never leaves that process's environment. A server uses the socket only when it is `<its Claude parent pid>.sock`, so a
+server started by a command inside a session never pushes into it. Validated live on the MacBook on 2026-10-01 (a child
+process posted into its session and the line arrived as a teammate message); Fedora validation is part of T202.
 
 ## Transports beyond the LAN (T146/T147, next release)
 

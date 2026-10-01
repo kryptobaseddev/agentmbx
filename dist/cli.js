@@ -1097,7 +1097,8 @@ async function hook(node, event, cli) {
     }
     const choices = "[mbx] Identity choices: call mbx_whoami to confirm this session's identity. Keep it, or pass a new name to mbx_whoami to rename it. To recover an existing mailbox, use mbx_identity with action=list to inspect ownership, unread counts and last activity, then explicitly release your current identity and claim the chosen available name. Switching identities preserves the old mailbox without forwarding its mail. Live holders and unresolved historical conflicts cannot be claimed through these controls. When the owner ends this session or requests a handoff, call mbx_identity release after your final mailbox work; finishing a turn is not ending a session. Closing a hosted conversation may leave its shared MCP holder running.";
     // Inspect provider capabilities and processes before the lease transaction. No directory-based session discovery.
-    const watch = event === "session-start" && noPush(cli, cli === "claude" && detectHost(process.ppid).channel, cli === "kimi" && !!kimiHostedServer(process.ppid));
+    const host = cli === "claude" ? detectHost(process.ppid) : null;
+    const watch = event === "session-start" && noPush(cli, !!host && (host.channel || host.socket), cli === "kimi" && !!kimiHostedServer(process.ppid));
     let entered = false;
     try {
         return withProcSnapshot(() => withHookIdentity(node, cli, sid, (agent, descriptor, bootstrap) => {

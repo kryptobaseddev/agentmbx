@@ -394,7 +394,7 @@ export class MbxNode {
     deliveryMode(agent) {
         const ss = this.sessionsFor(agent).filter((x) => x.pid && this.sameSession(x.pid, x));
         if (ss.some((x) => x.channel))
-            return "push (Claude channel)";
+            return "push (Claude channel or session socket)";
         const w = ss.find((x) => sessionWakeable(x));
         if (w)
             return w.cli === "codex" ? "push (codex queue)" : w.cli === "kimi" ? "push (kimi web)" : "push (opencode service)";

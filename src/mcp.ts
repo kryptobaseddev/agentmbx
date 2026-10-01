@@ -1,5 +1,6 @@
 // `mbx mcp`: the stdio MCP server one agent session runs. It owns an in-memory session key (the only thing that can
 // use an owner grant) and, inside a Claude session started with the mbx channel enabled, pushes wake-ups itself.
+import { createConnection } from "node:net";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
@@ -196,10 +197,31 @@ export function detectHost(ppid = process.ppid) {
     : /opencode/i.test(args) ? "opencode" : /kimi/i.test(args) ? "kimi" : /hermes/i.test(args) ? "hermes" : "unknown");
   if (cli !== "unknown" && !process.env.MBX_CLI) process.env.MBX_CLI = cli; // re-exec children inherit a stable classification
   const channel = process.env.MBX_CHANNEL === "1" || (cli === "claude" && hasMbxChannel(args));
+  // Claude Code gives each session an inbox socket; this server is its child, so its posts are delivered without any
+  // launch flag or setting (T202). The token stays in this process's environment: it is never stored or logged.
+  // Only the socket of the Claude process that started this server: a server launched by some command inside a session
+  // (tests, scripts) inherits the variables but must never push into that unrelated session. Sockets are named <pid>.sock.
+  const sock = process.env.CLAUDE_CODE_MESSAGING_SOCKET;
+  const socket = cli === "claude" && !channel && !!sock && process.env.MBX_SESSION_SOCKET !== "0" && basename(sock) === `${ppid}.sock`;
   let sessionId = `mcp-${process.pid}`;
   const cs = join(homedir(), ".claude/sessions", `${ppid}.json`);
   if (cli === "claude" && existsSync(cs)) { try { sessionId = JSON.parse(readFileSync(cs, "utf8")).sessionId ?? sessionId; } catch { /* keep default */ } }
-  return { cli, channel, sessionId, ppid };
+  return { cli, channel, socket, sessionId, ppid };
+}
+
+/** Queue a no-body wake hint into this Claude session through its inbox socket (NDJSON: auth line, then a user line). */
+export function socketPush(text: string, env: NodeJS.ProcessEnv = process.env): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const path = env.CLAUDE_CODE_MESSAGING_SOCKET, token = env.CLAUDE_CODE_MESSAGING_TOKEN;
+    if (!path) return reject(new Error("no session socket"));
+    const s = createConnection(path), done = (e?: Error) => { s.destroy(); if (e) reject(e); else resolve(); };
+    s.setTimeout(3_000, () => done(new Error("session socket timed out")));
+    s.on("error", (e) => done(e));
+    s.on("connect", () => {
+      if (token) s.write(JSON.stringify({ type: "auth", token }) + "\n");
+      s.end(JSON.stringify({ type: "user", message: { role: "user", content: text } }) + "\n", () => done());
+    });
+  });
 }
 
 /** Default agent name: $MBX_AGENT, else the project folder; a session started in the home folder (or /) is named after
@@ -337,7 +359,7 @@ export async function runMcp(existing?: MbxNode) {
       // Snapshot before bindSession can replace or consolidate any rows.
       const legacy = state.leaseToken ? [] : node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions`).all() as LegacyBinding[];
       const agent = node.bindSession({ agent: state.agent, cli: env.cli, session_id: state.sessionId, cwd: process.cwd(), pid: env.ppid,
-        session_key: state.key.publicKey, channel: env.channel, mcp_pid: process.pid, restore_name: initial && !process.env.MBX_AGENT });
+        session_key: state.key.publicKey, channel: env.channel || env.socket, mcp_pid: process.pid, restore_name: initial && !process.env.MBX_AGENT });
       if (state.leaseToken && agent !== state.agent) throw new Error("bound identity changed outside a lease rename");
       if (!state.leaseToken) checkLegacy(agent, state, legacy);
       const leaseToken = state.leaseToken ?? claimFor(state, agent);
@@ -452,7 +474,7 @@ export async function runMcp(existing?: MbxNode) {
   const delegation = shared
     ? "[mbx] This transport can serve multiple sessions. Call mbx_whoami for your current mailbox identity and owner-signed policies. Read each mbx_read header for the policy that applies to that message; another mailbox's grant does not authorize this session."
     : delegationNote(node.store.db, agent, node.host);
-  const extra = [renamed, delegation, noPush(env.cli, env.channel, env.cli === "kimi" && !!kimiHostedServer(env.ppid))
+  const extra = [renamed, delegation, noPush(env.cli, env.channel || env.socket, env.cli === "kimi" && !!kimiHostedServer(env.ppid))
     ? selfWatchInstruction({ delegated: activePolicies(node.store.db, agent, node.host).length > 0 }) : null].filter(Boolean).join("\n");
 
   const session = (): Session => {
@@ -800,8 +822,9 @@ export async function runMcp(existing?: MbxNode) {
     } catch (error) { process.stderr.write(`[mbx] identity control polling failed: ${(error as Error).message}\n`); }
   }, 250).unref());
 
-  // Channel push (Claude started with --dangerously-load-development-channels server:mbx): wake this session ourselves.
-  if (env.channel) {
+  // Push into this Claude session ourselves: the channel (started with --dangerously-load-development-channels server:mbx)
+  // or, with no flag at all, the session inbox socket (T202). Either way the daemon defers to this process.
+  if (env.channel || env.socket) {
     timers.push(setInterval(async () => {
       try {
         if (base.released) return;
@@ -821,10 +844,12 @@ export async function runMcp(existing?: MbxNode) {
             const linked = mailbox === agent ? "" : ` This is your linked mailbox: use agentmbx inbox --as ${mailbox} and agentmbx ack --as ${mailbox} <id>.`;
             // a push that fails never reached the session: refund it and keep the mail delivered for the next tick
             if (!reservation?.brake) try {
-              await server.server.notification({ method: "notifications/claude/channel", params: {
+              if (env.channel) await server.server.notification({ method: "notifications/claude/channel", params: {
                 content: wakeText(mailbox, wanted) + linked,
                 meta: { count: String(wanted.length), agent, mailbox },
               } });
+              else await socketPush(wakeText(mailbox, wanted) + linked);
+              node.store.audit("wake.attempt", { agent: mailbox, session: `claude:${env.sessionId}`, outcome: "admitted", receipt: "transport", via: env.channel ? "claude channel" : "session socket" });
             } catch (e) { reservation?.release?.(); throw e; }
           }
           leases.withHeld(agent, base.leaseToken!, () => { for (const r of rows) node.setDelivery(r.id, mailbox, "notified"); });
