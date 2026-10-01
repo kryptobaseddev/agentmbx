@@ -115,3 +115,71 @@ export function assertKnownRecipients(node, to) {
     const lines = unknown.map((n) => { const s = suggestNames(node, n); return `"${n}" is not an agent on ${node.host}${s.length ? `; did you mean ${s.join(", ")}?` : ""}`; });
     throw Object.assign(new Error(`not sent: ${lines.join("; ")}. List agents with mbx_agents; a mailbox exists once an agent has held it.`), { code: "UNKNOWN_RECIPIENT" });
 }
+export function deliveryReceipts(node, m, now = Date.now()) {
+    const dids = new Map(node.store.db.prepare("SELECT json_extract(detail,'$.recipient') r, json_extract(detail,'$.did') d FROM audit WHERE event='peer_action' AND json_extract(detail,'$.msg')=? ORDER BY at")
+        .all(m.id).map((x) => [x.r, x.d]));
+    const local = node.store.db.prepare("SELECT agent,state,updated_at,note FROM deliveries WHERE msg_id=? ORDER BY agent").all(m.id).map((d) => {
+        const live = d.agent === "owner" ? { live: true, detail: "the owner" } : mailboxLiveness(node, d.agent, now);
+        return { address: `${d.agent}@${node.host}`, state: d.state, updated_at: d.updated_at, note: d.note, did: dids.get(d.agent) ?? null,
+            liveness: live.live ? `live: ${live.detail}` : `offline: ${live.detail}` };
+    });
+    // Remote recipients: the envelope's addressees on other hosts; a queued outbox row means not yet accepted there.
+    const e = JSON.parse(m.envelope);
+    const outbox = new Map(node.store.db.prepare("SELECT host,attempts,last_error,next_at FROM outbox WHERE msg_id=?").all(m.id).map((o) => [o.host, o]));
+    const hosts = new Set([...e.to.filter((t) => t.includes("@") && !t.endsWith(`@${node.host}`)).map((t) => t.split("@")[1]), ...outbox.keys()]);
+    const remote = [...hosts].sort().map((h) => {
+        const o = outbox.get(h);
+        const names = e.to.filter((t) => t.endsWith(`@${h}`));
+        return { address: names.length ? names.join(",") : `*@${h}`, state: o ? "queued" : "handed-over", updated_at: null, note: null, did: null,
+            liveness: o ? `paired host ${h}: not accepted yet` : `accepted by paired host ${h}; its daemon tracks read/ack`,
+            ...(o ? { outbox: { attempts: o.attempts, last_error: o.last_error, next_at: o.next_at } } : {}) };
+    });
+    return [...local, ...remote];
+}
+/** One line per recipient, for thread views. */
+export const receiptLine = (r) => `  → ${r.address}: ${r.state}${r.updated_at ? ` ${r.updated_at.slice(0, 19)}Z` : ""}`
+    + `${r.did ? ` · did: ${r.did}` : ""}${r.note ? ` · note: ${r.note}` : ""}${r.outbox ? ` · attempts ${r.outbox.attempts}${r.outbox.last_error ? ` (${r.outbox.last_error.slice(0, 60)})` : ""}` : ""} · ${r.liveness}`;
+const fail = (code, message) => { throw Object.assign(new Error(message), { code }); };
+const encodeFrame = (f) => Buffer.from(JSON.stringify(f)).toString("base64url");
+/** Mail `agent` sent from this host, oldest first, paged by an opaque cursor that mirrors replay: a frame over a finite
+ *  snapshot (message ids are ULIDs, so id order is send order and survives VACUUM); a completed cursor polls for newer. */
+export function sentPage(node, agent, o = {}) {
+    const limit = o.limit ?? 20;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
+        fail("CURSOR_INVALID", "Sent bounds are invalid");
+    const sender = `${agent}@${node.host}`;
+    const epoch = node.store.get("replay:epoch") ?? fail("CURSOR_EXPIRED", "Store generation is unavailable");
+    const max = node.store.db.prepare("SELECT COALESCE(MAX(id),'') m FROM messages WHERE from_addr=? AND origin='local'").get(sender).m;
+    let frame = { v: 1, epoch: epoch, sender, position: "", end: max };
+    if (o.cursor !== undefined) {
+        if (typeof o.cursor !== "string" || o.cursor.length > 1024 || !/^[A-Za-z0-9_-]+$/.test(o.cursor))
+            fail("CURSOR_INVALID", "Sent cursor is invalid");
+        let f = null;
+        try {
+            const data = Buffer.from(o.cursor, "base64url");
+            if (data.toString("base64url") === o.cursor)
+                f = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(data));
+        }
+        catch { /* invalid below */ }
+        if (!f || typeof f !== "object" || Object.keys(f).sort().join(",") !== "end,epoch,position,sender,v" || f.v !== 1
+            || typeof f.position !== "string" || typeof f.end !== "string" || typeof f.epoch !== "string" || f.position > f.end)
+            fail("CURSOR_INVALID", "Sent cursor is invalid");
+        if (f.sender !== sender)
+            fail("CURSOR_SCOPE_MISMATCH", "Sent cursor belongs to a different sender");
+        if (f.epoch !== epoch)
+            fail("CURSOR_EXPIRED", "Store generation changed; restart from the beginning");
+        frame = { ...f };
+        if (frame.position === frame.end)
+            frame.end = max; // a completed frame polls for newer mail
+    }
+    const rows = node.store.db.prepare("SELECT * FROM messages WHERE from_addr=? AND origin='local' AND id>? AND id<=? ORDER BY id LIMIT ?")
+        .all(sender, frame.position, frame.end, limit + 1);
+    const page = rows.slice(0, limit);
+    const position = page.length ? page[page.length - 1].id : frame.position;
+    const messages = page.map((m) => {
+        const e = JSON.parse(m.envelope);
+        return { id: m.id, ts: m.ts, kind: m.kind, subject: m.subject, thread: m.thread, to: e.to, recipients: deliveryReceipts(node, m) };
+    });
+    const done = rows.length <= limit;
+    return { messages, next_cursor: encodeFrame({ ...frame, position: done ? frame.end : position }), has_more: !done };
+}
