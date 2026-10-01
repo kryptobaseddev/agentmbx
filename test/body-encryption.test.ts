@@ -96,5 +96,5 @@ test("receive opens sealed bodies, stores plaintext locally, and rejects tampere
     const badBytes = Buffer.from(sealed2.body, "base64"); badBytes[10] ^= 0xff;
     const tampered = signEnvelope({ ...draft2, enc: { ...sealed2, body: badBytes.toString("base64") }, body: badBytes.toString("base64") }, "alpha", a.key.publicKey, a.key.privateKey);
     assert.equal(b.receive(tampered, "alpha"), "rejected:undecryptable body");
-  } finally { a.close(); b.close(); homes.forEach((h) => rmSync(h, { recursive: true, force: true })); }
+  } finally { a.close(); b.close(); homes.forEach((h) => rmSync(h, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })); }
 });

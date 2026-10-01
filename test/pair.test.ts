@@ -6,7 +6,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo, Server } from "node:net";
-import { generateKeyPair, joinTranscript, nonce, normalizePairToken, pairMac, pairTokenKey, newPairToken } from "../src/crypto.ts";
+import { generateKeyPair, joinTranscript, nonce, normalizePairToken, pairingCode, pairMac, pairTokenKey, newPairToken } from "../src/crypto.ts";
 import { advertise, browse, decodeTxt, encodeTxt } from "../src/discovery.ts";
 import { flushOutbox, pairJoin, pairWith, startServer, type JoinRequest, type PairHello } from "../src/http.ts";
 import { MbxNode } from "../src/node.ts";
@@ -175,6 +175,40 @@ test("SAS compare flow still works alongside tokens", async () => {
   A.n.send({ from: "mac-dev", to: ["vida-dev@beta"], subject: "sas", body: "x" });
   assert.deepEqual(await flushOutbox(A.n), { sent: 1, failed: 0 });
   down(A, B);
+});
+
+test("SAS: a responder in the middle cannot grind its nonce to show the code the other host shows (T032)", async () => {
+  // Mallory answers alpha's pair --compare while posing as beta. Its session with the real beta already fixed the code
+  // beta displays (`target`); whenever alpha's party is visible before mallory must commit to its own, it grinds a nonce.
+  const A = await up("alpha"), mallory = generateKeyPair(), target = "424242";
+  const party = (n: string) => ({ v: 1, host: "beta", host_pubkey: mallory.publicKey, owner_pubkey: null, nonce: n, addr: "127.0.0.1:1" });
+  let sent: ReturnType<typeof party> | null = null;
+  const answer = (j: { commit?: string; offer?: unknown }) => {
+    if (j.commit) return sent = party(nonce()); // must answer before alpha's party is known: nothing to grind against
+    if (j.offer) return { ok: true };
+    for (let i = 0; i < 3e7 && !sent; i++) if (pairingCode(j as never, party(`g${i}`)) === target) sent = party(`g${i}`);
+    return sent;
+  };
+  const srv = createServer((req, res) => {
+    let b = ""; req.on("data", (c) => b += c);
+    req.on("end", () => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(answer(JSON.parse(b)))); });
+  });
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+  try {
+    const r = await pairWith(A.n, `127.0.0.1:${(srv.address() as AddressInfo).port}`).catch((e: Error) => ({ code: `refused: ${e.message}` }));
+    assert.notEqual(r.code, target, "the code alpha shows must not be steerable by the party it pairs with");
+  } finally { srv.close(); down(A); }
+});
+
+test("SAS: a reveal without a matching commitment is refused and pairs nothing (T032)", async () => {
+  const B = await up("beta"), A = new MbxNode(tmp(), { host: "alpha" });
+  try {
+    const offer = { v: 1, host: "alpha", host_pubkey: A.key.publicKey, owner_pubkey: null, nonce: nonce(), addr: "127.0.0.1:1" };
+    const post = (body: unknown) => fetch(`http://${B.addr}/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    assert.equal((await post(offer)).status, 400, "a bare v1 offer (no commitment) is refused");
+    assert.equal((await post({ v: 2, offer })).status, 401, "a reveal nobody committed to is refused");
+    assert.equal(B.n.peer("alpha"), undefined);
+  } finally { down(B); A.close(); }
 });
 
 test("discovery TXT records round-trip", () => {

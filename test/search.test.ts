@@ -8,7 +8,7 @@ import { MbxNode } from "../src/node.ts";
 function fixture(t: TestContext) {
   const home = mkdtempSync(join(tmpdir(), "mbx-search-"));
   const n = new MbxNode(home, { host: "alpha" });
-  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   return n;
 }
 
@@ -44,7 +44,7 @@ test("remote senders with the same name do not gain local sender visibility", (t
   const n = fixture(t);
   const home = mkdtempSync(join(tmpdir(), "mbx-search-peer-"));
   const peer = new MbxNode(home, { host: "beta" });
-  t.after(() => { peer.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { peer.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const foreign = peer.send({ from: "primary", to: ["elsewhere"], subject: "needle", body: "remote private" }).envelope;
   const received = peer.send({ from: "primary", to: ["primary"], subject: "needle", body: "remote delivered" }).envelope;
   n.store.insertMessage(foreign, "beta", "verified", null);

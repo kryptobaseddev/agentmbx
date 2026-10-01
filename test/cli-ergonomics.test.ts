@@ -12,7 +12,7 @@ async function fixture(t: { after: (fn: () => void | Promise<void>) => void }, l
   const home = mkdtempSync(join(tmpdir(), "mbx-cli-"));
   const n = new MbxNode(home, { host: "test-host" });
   const client = new Client({ name: "cli-test", version: "1" });
-  t.after(async () => { if (leased) await client.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { if (leased) await client.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   if (leased) await client.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "reader", MBX_CLI: "claude", AGENTMBX_DEV: "1" } as Record<string, string> }));
   const cli = (...args: string[]) => spawnSync(process.execPath, [resolve("bin/agentmbx.js"), ...args], {
@@ -95,4 +95,22 @@ test("CLI shell senders can send unverified new mail but cannot read or reply as
   assert.equal(cli("send", "--as", "receiver", "--to", "shell-sender", "--reply-to", id, "-m", "reply").status, 1);
   assert.equal(cli("inbox", "--as", "receiver", "--json").status, 1);
   assert.equal(n.inbox("receiver")[0].state, "delivered");
+});
+
+test("an over-long did never fails the acks: CLI and MCP keep 200 characters, mark the cut and warn (council 2026-10-01)", async (t) => {
+  const { cli, send, n } = await fixture(t);
+  const did = "Point-blank questions answered holding the record: " + "x".repeat(238);
+  assert.equal(did.length, 289);
+  const ids = Array.from({ length: 6 }, (_, i) => send(`m${i}`).id);
+  const r = cli("ack", ...ids, "--as", "reader", "--did", did);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /did was 289 characters; the audit log kept the first 200, marked truncated/);
+  assert.equal(n.inbox("reader").length, 0, "all six acked");
+  const rows = (n.store.db.prepare("SELECT detail FROM audit WHERE event='peer_action'").all() as { detail: string }[]).map((x) => JSON.parse(x.detail));
+  assert.equal(rows.length, 6);
+  for (const row of rows) { assert.equal(row.did, did.slice(0, 200)); assert.equal(row.did_truncated, true); assert.equal(row.did_length, 289); }
+  const short = send("short").id;
+  assert.equal(cli("ack", short, "--as", "reader", "--did", "Replied with results").stderr, "", "a one-line did needs no warning");
+  const last = JSON.parse((n.store.db.prepare("SELECT detail FROM audit WHERE event='peer_action' ORDER BY rowid DESC LIMIT 1").get() as { detail: string }).detail);
+  assert.equal(last.did_truncated, undefined, "an untouched line carries no marker");
 });

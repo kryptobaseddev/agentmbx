@@ -2,8 +2,7 @@
 // seal for us, push undeliverable outbox envelopes to the relay (sealed — the relay never sees bodies),
 // and poll for incoming relay mail through the normal node.receive path (signature-verified, decrypted).
 import { canonical, signData, verifyData } from "./crypto.ts";
-import { sealBody } from "./body-encryption.ts";
-import { signEnvelope, type Envelope } from "./envelope.ts";
+import { sealEnvelope, type Envelope } from "./envelope.ts";
 import type { MbxNode } from "./node.ts";
 
 export interface RelayRef { url: string }
@@ -26,10 +25,11 @@ const call = async (node: MbxNode, method: string, path: string, obj: unknown, f
 const url = (relay: string, path: string) => `${relay.replace(/\/$/, "")}${path}`;
 
 /** Enrolment state per relay, so restarts don't re-run the challenge dance. */
-const enrolledFlag = (relay: string) => `relay-enrolled:${relay}`;
+// keyed by the host key too: a rotated host (T030) enrols its new key
+const enrolledFlag = (relay: string, hostPub: string) => `relay-enrolled:${relay}:${hostPub}`;
 
 export async function relayEnrol(node: MbxNode, relay: string, f: typeof fetch = fetch): Promise<boolean> {
-  if (node.store.get(enrolledFlag(relay))) return true;
+  if (node.store.get(enrolledFlag(relay, node.key.publicKey))) return true;
   const ownerFp = fingerprintOf(node);
   const chal = await call(node, "POST", url(relay, "/v1/relay/challenge"), { host: node.host, pubkey: node.key.publicKey }, f);
   const challenge = chal.json.challenge as string | undefined;
@@ -37,7 +37,7 @@ export async function relayEnrol(node: MbxNode, relay: string, f: typeof fetch =
   const sig = signData(node.key.privateKey, canonical({ v: 1, challenge, host: node.host, pubkey: node.key.publicKey, owner_fp: ownerFp }));
   const r = await call(node, "POST", url(relay, "/v1/relay/enrol"), { host: node.host, pubkey: node.key.publicKey, owner_fp: ownerFp, sig }, f);
   if (r.status === 200) {
-    node.store.set(enrolledFlag(relay), new Date().toISOString());
+    node.store.set(enrolledFlag(relay, node.key.publicKey), new Date().toISOString());
     await relayPublishEnc(node, relay, f);
     return true;
   }
@@ -51,10 +51,19 @@ export async function relayPublishEnc(node: MbxNode, relay: string, f: typeof fe
   await call(node, "POST", url(relay, "/v1/relay/enc-key"), { enc_pub, sig }, f);
 }
 
-/** Discover a peer's enc key through the relay (LAN enc-key exchange may be unreachable for exactly the peers we relay). */
+/** A paired peer's enc key: the pinned one, else the relay's copy only if the peer's PINNED host key signed it (the LAN
+ *  enc-key exchange may be unreachable for exactly the peers we relay). The relay is untrusted: it, or anyone enrolling
+ *  the peer's host name there, could otherwise hand out its own key and read the sealed bodies (T032). */
 export async function relayPeerEnc(node: MbxNode, relay: string, peerHost: string, f: typeof fetch = fetch): Promise<string | null> {
+  const p = node.approvedPeer(peerHost);
+  if (!p) return null;
+  if (p.enc_pub) return p.enc_pub;
   const r = await call(node, "GET", url(relay, `/v1/relay/enc-key?host=${encodeURIComponent(peerHost)}`), undefined, f);
-  return r.status === 200 && typeof r.json.enc_pub === "string" ? r.json.enc_pub : null;
+  const { enc_pub, sig } = r.json;
+  if (r.status !== 200 || typeof enc_pub !== "string" || typeof sig !== "string") return null;
+  if (verifyData(p.pubkey, canonical({ v: 1, host: peerHost, enc_pub }), sig)) return enc_pub;
+  node.store.audit("enc_key.rejected", { host: peerHost, via: "relay", reason: "signature does not verify against the pinned host key" });
+  return null;
 }
 
 /** Seal an outbox envelope for a peer and push it to the relay; the local outbox row is dropped on success. */
@@ -67,8 +76,7 @@ export async function relayDrainOutbox(node: MbxNode, relay: string, f: typeof f
     const peerEnc = await relayPeerEnc(node, relay, row.host, f);
     if (!peerEnc) { failed++; continue; } // never push plaintext bodies to the relay (ADR-035)
     const e = JSON.parse(row.envelope) as Envelope;
-    const sealed = sealBody(e.body, peerEnc, e.id);
-    const wire = signEnvelope({ ...e, enc: sealed, body: sealed.body }, node.host, node.key.publicKey, node.key.privateKey);
+    const wire = sealEnvelope(e, peerEnc, node.host, node.key.publicKey, node.key.privateKey);
     const r = await call(node, "POST", url(relay, "/v1/relay/messages"), { envelopes: [wire] }, f);
     if (r.status === 200) { node.store.db.prepare("DELETE FROM outbox WHERE msg_id=? AND host=?").run(row.msg_id, row.host); pushed++; }
     else failed++;

@@ -9,7 +9,7 @@ import { sessionReadiness } from "../src/doctor.ts";
 for (const state of ["absent", "stale", "provisional", "real", "channel", "mixed"]) test(`doctor reports ${state} binding evidence without claiming receipt`, (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-doctor-"));
   const n = new MbxNode(home, { host: "alpha" });
-  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   n.bindSession({ agent: "other", cli: "kimi", session_id: "other", pid: process.pid });
   if (state !== "absent") n.bindSession({ agent: "worker", cli: "codex", session_id: state === "real" || state === "mixed" ? "thread" : "mcp-test", pid: process.pid, channel: state === "channel" });
   if (state === "stale") n.store.db.prepare("UPDATE sessions SET pid_start='previous-process' WHERE cli='codex'").run();
@@ -32,7 +32,7 @@ for (const hosted of [false, true]) for (const mixed of [false, true]) test(`doc
   const n = new MbxNode(home, { host: "alpha" });
   const prior = process.env.KIMI_CODE_HOME;
   process.env.KIMI_CODE_HOME = join(home, "kimi");
-  t.after(() => { if (prior === undefined) delete process.env.KIMI_CODE_HOME; else process.env.KIMI_CODE_HOME = prior; n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { if (prior === undefined) delete process.env.KIMI_CODE_HOME; else process.env.KIMI_CODE_HOME = prior; n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   mkdirSync(join(process.env.KIMI_CODE_HOME, "server/instances"), { recursive: true });
   if (hosted) writeFileSync(join(process.env.KIMI_CODE_HOME, "server/instances/server.json"), JSON.stringify({ pid: process.pid, port: 12345 }));
   n.bindSession({ agent: "worker", cli: "kimi", session_id: "mcp-test", pid: process.pid });
@@ -41,8 +41,8 @@ for (const hosted of [false, true]) for (const mixed of [false, true]) test(`doc
   const check = sessionReadiness(n, "kimi");
   if (hosted) {
     assert.equal(check.level, "warn");
-    assert.match(check.label, /1 hosted binding.*explicit session identity/);
-    assert.match(check.fix!, /provider integration/);
+    assert.match(check.label, /1 hosted conversation\(s\) not linked to their mbx server yet/);
+    assert.match(check.fix!, /bind ticket/);
     assert.doesNotMatch(check.fix!, /run the provider session-start hook/);
   } else if (!mixed) assert.match(check.fix!, /session-start hook/);
   assert.match(check.label, /receipt not tested/);

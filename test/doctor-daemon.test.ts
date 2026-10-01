@@ -18,7 +18,7 @@ test("doctor does not call an unrelated HTTP responder a healthy daemon", async 
   await listen(server);
   const home = mkdtempSync(join(tmpdir(), "mbx-doctor-http-"));
   new MbxNode(home, { host: "alpha", port: port(server) }).close();
-  t.after(async () => { await close(server); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await close(server); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const checks = await doctor({ home, cmd: ["agentmbx"], which: () => null, useClis: false }, home);
   assert.equal(checks.some(c => c.level === "ok" && c.label.startsWith("daemon")), false);
   assert.ok(checks.some(c => c.level === "warn" && /identity unverified/.test(c.label)));
@@ -44,7 +44,7 @@ for (const defect of ["legacy", "html", "wrong-host", "wrong-key", "bad-version"
       if (defect === "version-mismatch") body.version = "999.0.0";
       res.end(JSON.stringify(body));
     }); await listen(server); n.config.port = port(server);
-    t.after(async () => { await close(server); await close(target); n.close(); rmSync(home, { recursive: true, force: true }); });
+    t.after(async () => { await close(server); await close(target); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
     const check = await daemonReadiness(n, 200);
     assert.equal(check.level, "warn", check.label);
     assert.match(check.label, defect === "version-mismatch" ? /differs from CLI/ : /identity unverified/);
@@ -55,7 +55,7 @@ for (const defect of ["legacy", "html", "wrong-host", "wrong-key", "bad-version"
 test("real status probe is bounded read-only metadata and does not spend pairing budget", async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-status-")), n = new MbxNode(home, { host: "alpha" });
   const server = await startServer(n, 0, "127.0.0.1"); n.config.port = port(server);
-  t.after(async () => { await close(server); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await close(server); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   for (let i = 0; i < 35; i++) {
     const check = await daemonReadiness(n);
     assert.equal(check.level, "ok", check.label); assert.match(check.label, /receipt not tested/);
@@ -70,4 +70,15 @@ test("real status probe is bounded read-only metadata and does not spend pairing
   assert.equal((n.store.db.prepare("SELECT count(*) n FROM messages").get() as { n: number }).n, 0);
   await close(server);
   const check = await daemonReadiness(n, 200); assert.equal(check.level, "fail"); assert.match(check.label, /not answering/);
+});
+
+test("doctor reports each peer's presence age and how its address was last healed (T201)", async t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-doctor-heal-")), n = new MbxNode(home, { host: "alpha", port: 1 });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  n.store.db.prepare("INSERT INTO peers (host,pubkey,addr,state,created_at,approved_at) VALUES ('beta','k','127.0.0.1:9','approved',?,?)").run(new Date().toISOString(), new Date().toISOString());
+  n.store.set("peer-heal:beta", JSON.stringify({ via: "verified-hop", at: "2026-10-01T16:47:43.137Z", from: "10.0.10.29:7373", to: "127.0.0.1:9" }));
+  n.store.set("peer-presence-at:beta", "2026-10-01T16:43:09.116Z");
+  const checks = await doctor({ home, cmd: ["agentmbx"], which: () => null, useClis: false }, home, { peerTimeoutMs: 300 });
+  assert.ok(checks.some(c => c.label === "peer beta: address healed 10.0.10.29:7373 -> 127.0.0.1:9 via verified-hop at 2026-10-01T16:47:43.137Z; last presence 2026-10-01T16:43:09.116Z"),
+    checks.map(c => c.label).join("\n"));
 });

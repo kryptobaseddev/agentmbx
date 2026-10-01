@@ -15,6 +15,13 @@ const H = 3_600_000;
 export const TTL = { default: { ask: 168 * H, collaborate: 168 * H, autonomous: 168 * H, yolo: 8 * H }, max: { ask: 720 * H, collaborate: 720 * H, autonomous: 720 * H, yolo: 168 * H } };
 export const MAX_POLICY_ACTIONS_PER_THREAD = 20;
 export const MAX_HOP = 6;
+/** Relay depth each policy level allows (T104, owner decision 2026-10-01). ask keeps MAX_HOP (it can't act anyway);
+ *  collaborate allows long two-way work; autonomous and yolo have no depth limit by the owner's explicit choice, bounded
+ *  instead by the wake brake and MAX_POLICY_ACTIONS_PER_THREAD. */
+export const LEVEL_MAX_HOP: Record<Level, number> = { ask: MAX_HOP, collaborate: 20, autonomous: Infinity, yolo: Infinity };
+export const maxHopFor = (l: Level) => LEVEL_MAX_HOP[l];
+export const depthExceededNote = (hop: number, level: Level) =>
+  `relay depth ${hop} exceeds ${maxHopFor(level)} for ${level}; your user's next prompt resets it, or the owner can grant autonomous/yolo for unlimited depth`;
 
 export interface PolicyRecord {
   v: 1; type: "policy"; id: string; level: Level; classes: PolicyClass[];
@@ -247,7 +254,7 @@ export function activePolicies(db: DatabaseSync, agent: string, host: string, no
 
 /** One policy's grant: its classes only apply within its own projects (no mixing scopes across policies). */
 export interface Grant { id: string; level: Level; classes: PolicyClass[]; projects: string[]; exp: string }
-export interface Effective { level: Level; classes: PolicyClass[]; ids: string[]; exp: string | null; projects: string[]; grants: Grant[]; notes: string[] }
+export interface Effective { level: Level; classes: PolicyClass[]; ids: string[]; exp: string | null; projects: string[]; grants: Grant[]; notes: string[]; hop?: number }
 
 const ORDER = (l: Level) => LEVELS.indexOf(l);
 
@@ -262,11 +269,12 @@ export function effectivePolicy(db: DatabaseSync, o: { agent: string; host: stri
     if (isLocal) return ownerKeys(db).some(key => fingerprint(key) === fp);
     // A retained principals row or a message's owner claim is not a current pairing. Recheck
     // the envelope against the pinned host key so re-pairing cannot relabel old signed mail.
-    const peer = db.prepare("SELECT pubkey,owner_pubkey FROM peers WHERE host=? AND state='approved'").get(o.fromHost) as
-      { pubkey: string; owner_pubkey: string | null } | undefined;
+    const peer = db.prepare("SELECT pubkey,owner_pubkey,prev_keys FROM peers WHERE host=? AND state='approved'").get(o.fromHost) as
+      { pubkey: string; owner_pubkey: string | null; prev_keys: string | null } | undefined;
     const e = o.envelope;
-    return !!peer?.owner_pubkey && fingerprint(peer.owner_pubkey) === fp && !!e
-      && e.from === `${o.fromAgent}@${o.fromHost}` && e.sig?.host === o.fromHost && verifyEnvelope(e, peer.pubkey);
+    // retired keys (T030) still verify mail that arrived before the peer rotated
+    return !!peer?.owner_pubkey && fingerprint(peer.owner_pubkey) === fp && !!e && e.from === `${o.fromAgent}@${o.fromHost}` && e.sig?.host === o.fromHost
+      && [peer.pubkey, ...(JSON.parse(peer.prev_keys ?? "[]") as string[])].some((k) => verifyEnvelope(e, k));
   };
   const hostOk = (h: string[]) => h.includes("*") || (isLocal ? h.includes("local") || h.includes(o.host) : h.includes(o.fromHost)) || h.some(principalOk);
   const ps = activePolicies(db, o.agent, o.host, o.now).filter((p) => matches(p.from.agents, o.fromAgent) && hostOk(p.from.hosts));
@@ -276,7 +284,11 @@ export function effectivePolicy(db: DatabaseSync, o: { agent: string; host: stri
   const e = o.envelope, meta = (e?.meta ?? {}) as { origin?: string; hop?: number };
   if (meta.origin === "external") { grants = grants.map((g) => ({ ...g, classes: g.classes.filter((c) => c === "read") })); notes.push("content from outside (origin: external): read only"); }
   let stop = false;
-  if ((meta.hop ?? 0) > MAX_HOP) { stop = true; notes.push(`relay safety depth ${meta.hop} exceeds limit ${MAX_HOP}; may include recent message reads in the sending session, not just this thread: ask your user`); }
+  // Each grant has its own depth allowance (T104): a deep chain can still be acted on under collaborate (20) or
+  // autonomous/yolo (no limit), while the grants it exceeds fall back to ask.
+  const hop = meta.hop ?? 0, over = new Set<Level>();
+  grants = grants.map((g) => (hop > maxHopFor(g.level) ? (over.add(g.level), { ...g, level: "ask" as Level, classes: [] }) : g));
+  for (const l of over) notes.push(depthExceededNote(hop, l));
   if (e) {
     const acted = (db.prepare("SELECT count(*) n FROM audit WHERE event='peer_action' AND json_extract(detail,'$.thread')=?").get(e.thread) as { n: number }).n;
     if (acted >= MAX_POLICY_ACTIONS_PER_THREAD) { stop = true; notes.push(`this thread already had ${acted} actions under policy: ask your user`); }
@@ -286,7 +298,7 @@ export function effectivePolicy(db: DatabaseSync, o: { agent: string; host: stri
   grants = grants.filter((g) => g.classes.length || g.level !== "ask");
   const level = grants.reduce((a, g) => (ORDER(g.level) > ORDER(a) ? g.level : a), "ask" as Level);
   const classes = CLASSES.filter((c) => grants.some((g) => g.classes.includes(c)));
-  return { level, classes, ids: ps.map((p) => p.id), exp: ps.map((p) => p.exp).sort()[0], projects: [...new Set(grants.flatMap((g) => g.projects))], grants, notes };
+  return { level, classes, ids: ps.map((p) => p.id), exp: ps.map((p) => p.exp).sort()[0], projects: [...new Set(grants.flatMap((g) => g.projects))], grants, notes, ...(e ? { hop } : {}) };
 }
 
 /** Canonical path; a path that doesn't exist yet resolves through its nearest existing ancestor (symlinks included). */
@@ -323,8 +335,10 @@ export function policyLine(p: Effective): string {
   if (!p.ids.length) return "policy: ask (no owner policy covers this sender): reply, answer and ack freely; ask your user before acting";
   if (!p.grants.length) return [`policy: ask (owner policy ${p.ids.map((i) => i.slice(-6)).join(",")} doesn't allow acting on this message): reply, answer and ack; ask your user before acting`,
     ...p.notes.map((n) => `note: ${n}`)].join(" · ");
+  const depth = (g: Grant) => p.hop === undefined ? "" : Number.isFinite(maxHopFor(g.level))
+    ? ` · relay depth ${p.hop} of ${maxHopFor(g.level)} (autonomous or yolo: no limit)` : ` · relay depth ${p.hop} (no limit for ${g.level})`;
   const grant = (g: Grant) => `${g.level === "yolo" && g.classes.includes("permissions") ? "YOLO" : g.level} [${g.classes.join(", ") || "reply only"}]`
-    + ` in ${g.projects.length ? g.projects.join(", ") : "your session's project"} · owner-signed ${g.id.slice(-6)} · expires ${hhmm(g.exp)}`;
+    + ` in ${g.projects.length ? g.projects.join(", ") : "your session's project"} · owner-signed ${g.id.slice(-6)} · expires ${hhmm(g.exp)}${depth(g)}`;
   return [`policy: ${p.grants.map(grant).join(" ; ")}`, ...p.notes.map((n) => `note: ${n}`)].join(" · ");
 }
 

@@ -14,7 +14,7 @@ async function fixture(t: TestContext) {
       if (child.exitCode !== null || child.signalCode) return resolve();
       child.once("exit", () => resolve()); child.kill("SIGKILL");
     })));
-    store.close(); rmSync(home, { recursive: true, force: true });
+    store.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
   async function worker() {
     const child = fork(join(import.meta.dirname, "fixtures/lease-worker.ts"), [home], { execArgv: [], stdio: ["ignore", "ignore", "inherit", "ipc"] }); children.push(child);

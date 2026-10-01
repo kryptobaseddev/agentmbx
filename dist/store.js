@@ -31,6 +31,10 @@ CREATE TABLE IF NOT EXISTS mailbox_visibility (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, mailbox TEXT NOT NULL,
   message_id TEXT NOT NULL REFERENCES messages(id), UNIQUE(mailbox, message_id));
 CREATE INDEX IF NOT EXISTS mailbox_visibility_mailbox_seq ON mailbox_visibility(mailbox, seq);
+-- Retention tombstones (src/retention.ts): visibility positions whose settled message was pruned. Replay reports them
+-- as an explicit gap. Additive: stores without it simply have nothing pruned (no schema version change).
+CREATE TABLE IF NOT EXISTS mailbox_pruned (
+  mailbox TEXT NOT NULL, seq INTEGER NOT NULL, message_id TEXT NOT NULL, pruned_at TEXT NOT NULL, PRIMARY KEY (mailbox, seq)) WITHOUT ROWID;
 CREATE TRIGGER IF NOT EXISTS deliveries_visibility AFTER INSERT ON deliveries BEGIN
   INSERT OR IGNORE INTO mailbox_visibility (mailbox,message_id) VALUES (new.agent,new.msg_id); END;
 CREATE TABLE IF NOT EXISTS outbox (       -- envelopes waiting to reach a paired host
@@ -152,7 +156,7 @@ export class Store {
             ORDER BY m.received_at,m.id,visible.mailbox`).run(this.localHost);
                 }
                 // CREATE TABLE IF NOT EXISTS does not add columns; suppress only confirmed existing columns.
-                for (const [table, column] of [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"]]) {
+                for (const [table, column] of [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"]]) {
                     if (!this.db.prepare(`PRAGMA table_info(${table})`).all().some(r => r.name === column))
                         this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
                 }

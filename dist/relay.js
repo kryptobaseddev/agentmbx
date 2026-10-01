@@ -55,7 +55,8 @@ export class RelayCore {
             throw new Error("host is not enrolled");
         return e;
     }
-    /** A host publishes its enc key, signed by its host key; any enrolled host can read it (T028 via relay). */
+    /** A host publishes its enc key, signed by its host key; any enrolled host can read it (T028 via relay). The signature
+     *  is served too: senders check it against the host key they pinned at pairing, never trusting the relay (T032). */
     encAds = new Map();
     publishEncAd(host, pubkey, encPub, sig) {
         const e = this.requireEnrolled(pubkey);
@@ -63,7 +64,7 @@ export class RelayCore {
             throw new Error("host mismatch");
         if (!verifyData(pubkey, canonical({ v: 1, host, enc_pub: encPub }), sig))
             throw new Error("bad enc-key signature");
-        this.encAds.set(host, { host, enc_pub: encPub });
+        this.encAds.set(host, { host, enc_pub: encPub, sig });
     }
     getEncAd(host) { return this.encAds.get(host) ?? null; }
     /** Push envelopes addressed to recipient host keys. Opaque storage; bodies must already be sealed. */
@@ -121,7 +122,22 @@ export class RelayCore {
     inspect(pubkey) { return [...(this.queues.get(pubkey) ?? [])]; }
 }
 // ---- HTTP adapter --------------------------------------------------------------------------------
-const readBody = (req) => new Promise((r) => { let b = ""; req.on("data", (c) => b += c); req.on("end", () => r(b)); });
+/** Bodies stop at RELAY_MAX_BODY while streaming (T029): an oversized upload is refused before it is buffered. */
+export const RELAY_MAX_BODY = 8 * 1024 * 1024;
+const readBody = (req, max = RELAY_MAX_BODY) => new Promise((r, rej) => {
+    if (Number(req.headers["content-length"]) > max)
+        return r(null);
+    let n = 0;
+    const chunks = [];
+    req.on("data", (c) => { if ((n += c.length) > max) {
+        chunks.length = 0;
+        r(null);
+    }
+    else
+        chunks.push(c); });
+    req.on("end", () => r(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", rej);
+});
 /** Hop-style auth for enrolled hosts, reusing the same signed-hop shape as host-to-host HTTP. */
 export const relayHop = (host, priv, method, path, body, now = Date.now()) => ({
     "x-mbx-host": host, "x-mbx-ts": String(now), "x-mbx-sig": signData(priv, canonical({ method, path, ts: String(now), body: `${method}:${path}:${now}:${body}` })),
@@ -133,6 +149,11 @@ export function startRelayServer(core, port = 0, bind = "127.0.0.1") {
         try {
             const url = new URL(req.url ?? "/", "http://x");
             const body = await readBody(req);
+            if (body === null) { // answer, then discard (never buffer) the rest for up to 2 s so the client reads the 413, not a reset
+                send(413, { error: `request body over ${RELAY_MAX_BODY} bytes` });
+                req.resume();
+                return void setTimeout(() => req.complete || req.destroy(), 2_000).unref();
+            }
             if (req.method === "POST" && url.pathname === "/v1/relay/challenge") {
                 const { host, pubkey } = JSON.parse(body);
                 if (!host || !pubkey)
@@ -197,5 +218,6 @@ export function startRelayServer(core, port = 0, bind = "127.0.0.1") {
             return send(400, { error: e.message });
         }
     });
+    Object.assign(server, { headersTimeout: 10_000, requestTimeout: 30_000, keepAliveTimeout: 5_000 }); // slow clients cannot hold sockets open
     return new Promise((resolve, reject) => { server.once("error", reject); server.listen(port, bind, () => resolve(server)); });
 }

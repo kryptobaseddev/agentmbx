@@ -1,9 +1,10 @@
 // `agentmbx doctor`: one checklist that says what works, what doesn't, and the one command that fixes it.
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fingerprint } from "./crypto.ts";
 import { signHop } from "./http.ts";
-import { kimiInstances } from "./kimi-web.ts";
+import { kimiHostedServer, kimiInstances } from "./kimi-web.ts";
+import { kimiDesktop } from "./kimi-desktop.ts";
 import { version } from "./version.ts";
 import { MbxNode } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
@@ -73,16 +74,26 @@ export function sessionReadiness(node: MbxNode, cli: string): Check {
   const channels = live.filter((s) => s.channel).length;
   const stale = rows.length - live.length;
   const onlyProvisional = !real && !channels;
-  const hostedPids = cli === "kimi" ? new Set(kimiInstances().map(instance => instance?.pid)) : new Set<number>();
+  const hostedPids = cli === "kimi" ? new Set([...kimiInstances().map(instance => instance?.pid), kimiDesktop()?.pid]) : new Set<number | undefined>();
   const hostedProvisional = live.filter(s => s.session_id.startsWith("mcp-") && hostedPids.has(s.pid!)).length;
   if (hostedProvisional) return { level: "warn",
-    label: `${cli}: ${hostedProvisional} hosted binding(s) still need explicit session identity; ${real} real session ID(s); receipt not tested`,
-    fix: "use a provider integration that supplies explicit per-session MCP identity; a shared-server hook cannot infer the session from its directory" };
+    label: `${cli}: ${hostedProvisional} hosted conversation(s) not linked to their mbx server yet; ${real} real session ID(s); receipt not tested`,
+    fix: "each hosted conversation links itself on its next prompt (the [mbx] note asks it to call mbx_whoami with a bind ticket)" };
 
   return { level: onlyProvisional ? "warn" : "info",
     label: `${cli}: ${live.length} verified live mailbox binding(s), ${real} real session ID(s), ${channels} channel binding(s)`
       + (stale ? `, ${stale} stale or unverified` : "") + "; receipt not tested",
-    ...(onlyProvisional ? { fix: "run the provider session-start hook to bind its real session ID" } : {}) };
+    ...(onlyProvisional ? { fix: "run the provider session-start hook to bind its real session ID" }
+      : cli === "claude" && !channels ? { fix: "start Claude with 'agentmbx claude' (adds the mbx channel) so idle sessions wake on mail; others see mail on their next prompt" } : {}) };
+}
+
+/** A `kimi web` server reads its hooks once at start: one started before AgentMBX was set up runs none (no bind, no Stop). */
+export function kimiServerHooks(home: string, kimiHome = process.env.KIMI_CODE_HOME || join(home, ".kimi-code")): Check[] {
+  let wiredAt: number;
+  try { const cfg = join(kimiHome, "config.toml"); if (!readFileSync(cfg, "utf8").includes("agentmbx hook")) return []; wiredAt = statSync(cfg).mtimeMs; } catch { return []; }
+  return kimiInstances(kimiHome).filter(i => typeof i.pid === "number" && typeof i.started_at === "number" && i.started_at < wiredAt && kimiHostedServer(i.pid, kimiHome) !== null)
+    .map(i => ({ level: "warn" as Level, label: `kimi web server pid ${i.pid} (port ${i.port}) started before its AgentMBX hooks were last written: its sessions get no mbx hooks`,
+      fix: "restart that kimi web server (stop it, then run kimi web again)" }));
 }
 
 export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeoutMs?: number } = {}): Promise<Check[]> {
@@ -114,6 +125,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
 
   if (node) {
     for (const d of detect(ctx).filter((d) => d.found)) out.push(sessionReadiness(node, d.cli));
+    for (const c of kimiServerHooks(ctx.home)) out.push(c);
   }
 
   const sk = skillStatus(ctx.home);
@@ -129,6 +141,14 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
       add(st.ok ? "ok" : "fail", `owner key ${fingerprint(owner.public_key)} (macOS Keychain, Touch ID)${st.ok ? "" : `: ${st.detail}`}`,
         st.ok ? undefined : "reinstall AgentMBX.app (agentmbx daemon install); if the Keychain key is gone, move owner.json aside and run agentmbx owner init");
     }
+    // T104: mail that relay depth kept from waking its mailbox
+    for (const a of node.agents().filter((x) => x.host === node!.host)) {
+      try {
+        const sup = node.depthSuppressed(a.name);
+        if (sup.length) add("warn", `${a.name}: ${sup.length} unread message(s) from ${[...new Set(sup.map((x) => x.from))].join(", ")} did not wake it (relay depth ${Math.max(...sup.map((x) => x.hop))} over the policy allowance)`,
+          "the owner's next prompt in that session resets the depth; a collaborate policy allows 20, autonomous/yolo have no limit");
+      } catch { /* unreadable mailbox: other checks report it */ }
+    }
     const peers = node.peers();
     const approved = peers.filter((p) => p.state === "approved");
     if (!approved.length) add("info", "no paired hosts (optional: agentmbx pair <host>:7373)");
@@ -138,7 +158,17 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
         const res = await fetch(`http://${p.addr}${path}`, { headers: signHop(node!, "GET", path, ""), signal: AbortSignal.timeout(opts.peerTimeoutMs ?? 3000) });
         if (res.ok) add("ok", `peer ${p.host} (${p.addr}) reachable and accepts our signature`);
         else add("warn", `peer ${p.host} (${p.addr}) answered ${res.status}: ${(await res.text()).slice(0, 120)}`, `re-pair: agentmbx peers remove ${p.host} && agentmbx pair ${p.addr}`);
-      } catch (e) { add("warn", `peer ${p.host} (${p.addr}) unreachable: ${(e as Error).message}`, `check that its daemon runs and TCP ${p.addr.split(":").pop()} is open`); }
+      } catch (e) {
+        const seen = node!.store.get(`peer-lastseen:${p.host}`);
+        add("warn", `peer ${p.host} (${p.addr}) unreachable: ${(e as Error).message}${seen && seen !== p.addr ? `; last seen at ${seen}` : ""}`,
+          seen && seen !== p.addr ? `the daemon re-checks it every minute; to move it now: agentmbx peers addr ${p.host} ${seen}` : `check that its daemon runs and TCP ${p.addr.split(":").pop()} is open`);
+      }
+      // T201: how this peer's address was last healed, and how fresh its presence beacon is
+      try {
+        const heal = JSON.parse(node!.store.get(`peer-heal:${p.host}`) ?? "null") as { via: string; at: string; from: string; to: string } | null;
+        const pres = node!.store.get(`peer-presence-at:${p.host}`);
+        if (heal || pres) add("info", `peer ${p.host}: ${heal ? `address healed ${heal.from} -> ${heal.to} via ${heal.via} at ${heal.at}` : "address never healed"}; ${pres ? `last presence ${pres}` : "no presence beacon yet (peer runs an older AgentMBX)"}`);
+      } catch { /* malformed kv: nothing to report */ }
     }));
     for (const p of peers.filter((x) => x.state === "pending")) add("warn", `pairing with ${p.host} pending (code ${p.code})`, `if ${p.host} shows the same code: agentmbx pair approve ${p.host} ${p.code}`);
     const relay = process.env.MBX_RELAY_URL ?? (node.config as { relay?: string }).relay ?? null;

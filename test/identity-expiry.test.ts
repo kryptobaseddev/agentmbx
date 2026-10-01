@@ -11,7 +11,7 @@ import { identityRequestKey, readIdentityControlReceipt, resolveIdentityControlR
 
 function fixture(t: { after: (fn: () => void) => void }) {
   const home = mkdtempSync(join(tmpdir(), "mbx-expiry-")), node = new MbxNode(home, { host: "alpha" });
-  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const request: IdentityControlRequest = { v: 1, id: randomUUID(), action: "release", status: "pending", requester_pid: process.pid,
     requester_start: "fixture", created_at: Date.now() - 2000, expires_at: Date.now() - 1000,
     target: { v: 1, cli: "claude", session_id: "test", lease_session_id: "test", control_key: "fixture", mcp_pid: process.pid, mcp_start: "fixture",

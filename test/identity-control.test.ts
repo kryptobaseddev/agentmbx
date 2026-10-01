@@ -20,7 +20,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI comm
   writeFileSync(preload, "const interval=globalThis.setInterval; globalThis.setInterval=(fn,ms,...args)=>interval(fn,ms===60000?50:ms,...args);");
   const transport = new StdioClientTransport({ command: process.execPath, args: ["--import", preload, resolve("bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "reader", MBX_CLI: cli, AGENTMBX_DEV: "1" } as Record<string, string> });
-  t.after(async () => { try { if (transport.pid) process.kill(transport.pid, "SIGCONT"); } catch {} await client.close(); node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { try { if (transport.pid) process.kill(transport.pid, "SIGCONT"); } catch {} await client.close(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await client.connect(transport);
   const meta = cli === "codex" ? { threadId: "33333333-3333-4333-8333-333333333333" } : cli === "opencode" ? { sessionID: "ses_clicontrol" } : undefined;
   const who = (await client.callTool({ name: "mbx_whoami", arguments: {}, ...(meta ? { _meta: meta } : {}) })).structuredContent as { agent: string };
@@ -71,7 +71,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI comm
 
 test("control requests reject changed generations and roll back failed operations before recording receipts", t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-control-atomic-")), node = new MbxNode(home, { host: "alpha" });
-  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const descriptor: IdentityControlDescriptor = { v: 1, cli: "claude", session_id: "test", lease_session_id: "test", control_key: "test-key", agent: "reader", generation: identityGeneration("old"),
     mcp_pid: process.pid, mcp_start: inspectLeaseProcess(process.pid).start!, parent_pid: process.ppid, parent_start: inspectLeaseProcess(process.ppid).start! };
   publishIdentityControl(node.store, descriptor);

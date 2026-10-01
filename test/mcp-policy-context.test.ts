@@ -13,7 +13,7 @@ for (const cli of ["codex", "opencode", "claude", "kimi"]) test(`${cli} initiali
   const home = mkdtempSync(join(tmpdir(), "mbx-context-")), owner = generateKeyPair();
   writeFileSync(join(home, "owner.json"), JSON.stringify({ backend: "keychain", public_key: owner.publicKey }), { mode: 0o600 });
   const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: cli, version: "test" });
-  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const grant = (agent: string, level: "yolo" | "collaborate") => {
     const rec = makePolicy({ level, agents: [agent], hosts: ["alpha"], ownerPub: owner.publicKey });
     assert.equal(acceptSigned(n.store.db, { rec, sig: signData(owner.privateKey, canonical(rec)) }, "alpha"), null);

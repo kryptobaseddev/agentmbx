@@ -11,7 +11,7 @@ import { sendLeased } from "./helpers/leased-send.ts";
 
 test("message policies require signed positive sender evidence locally and across paired hosts", async t => {
   const homes: string[] = [], nodes: MbxNode[] = [];
-  t.after(() => { nodes.forEach(n => n.close()); homes.forEach(h => rmSync(h, { recursive: true, force: true })); });
+  t.after(() => { nodes.forEach(n => n.close()); homes.forEach(h => rmSync(h, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })); });
   const host = (name: string) => {
     const home = mkdtempSync(join(tmpdir(), "mbx-sender-proof-")); homes.push(home);
     const owner = generateKeyPair();

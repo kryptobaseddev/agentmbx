@@ -8,7 +8,7 @@ import { MbxNode } from "../src/node.ts";
 function fixture(t: TestContext) {
   const home = mkdtempSync(join(tmpdir(), "mbx-ack-"));
   const n = new MbxNode(home, { host: "alpha" });
-  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   n.linkIdentity("shell-one", "primary"); n.linkIdentity("shell-two", "primary");
   return n;
 }

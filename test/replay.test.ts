@@ -11,7 +11,7 @@ import { resetReplayEpoch, type ReplayPage } from "../src/replay.ts";
 
 function fixture(t: TestContext) {
   const home = mkdtempSync(join(tmpdir(), "mbx-replay-")), node = new MbxNode(home, { host: "alpha" });
-  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const leases = new IdentityLeases(node.store);
   const holder = { pid: process.pid, start: inspectLeaseProcess(process.pid).start!, keyFp: "aaaa-aaaa-aaaa-aaaa", cli: "test", sessionId: "test" };
   const lease = leases.claim("reader", holder);

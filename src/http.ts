@@ -1,18 +1,20 @@
 // Host-to-host HTTP: pairing, envelope exchange, agent directory. Every request except /v1/pair* and read-only /v1/status carries a
 // signed hop (X-Mbx-Host / -Ts / -Sig over method, path, ts, sha256(body)); freshness is checked on the hop only.
 import { createServer, type IncomingMessage, type Server } from "node:http";
-import { hostname } from "node:os";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
+import { hostname, networkInterfaces } from "node:os";
 import {
   canonical, fingerprint, joinTranscript, nonce as newNonce, pairingCode, pairMac, pairTokenKey, safeEqual, sha256, signData, verifyData, type PairParty,
 } from "./crypto.ts";
-import { NAME_RE, type Envelope } from "./envelope.ts";
+import { NAME_RE, sealEnvelope, type Envelope } from "./envelope.ts";
 import { MbxNode, RETRY_HOURS } from "./node.ts";
 import { notifyDesktop } from "./wake.ts";
 import { version } from "./version.ts";
+import { rotationLog, saveRotationLog, type SignedRotation } from "./key-rotation.ts";
 import { storedPolicies, acceptSigned, type AnyRecord, type Signed } from "./policy.ts";
 
 export const HOP_SKEW_MS = 5 * 60_000;
-const MAX_REQ = 4 * 1024 * 1024;
 const HELLO_TTL_MS = 2 * 60_000;
 const TOKEN_REQS_PER_MIN = 30;
 
@@ -20,7 +22,9 @@ const hopPayload = (method: string, path: string, ts: string, body: string) => `
 
 export function signHop(node: MbxNode, method: string, path: string, body: string): Record<string, string> {
   const ts = new Date().toISOString();
-  return { "x-mbx-host": node.host, "x-mbx-ts": ts, "x-mbx-sig": signData(node.key.privateKey, hopPayload(method, path, ts, body)), "content-type": "application/json" };
+  // x-mbx-port is an unsigned hint for address healing (learnPeerAddr): it is only ever used after a key-checked probe.
+  return { "x-mbx-host": node.host, "x-mbx-ts": ts, "x-mbx-sig": signData(node.key.privateKey, hopPayload(method, path, ts, body)),
+    "x-mbx-port": String(node.config.port), "content-type": "application/json" };
 }
 
 /** Returns the paired peer host name, or throws with the reason. */
@@ -34,11 +38,198 @@ export function verifyHop(node: MbxNode, headers: Record<string, string | string
   return h;
 }
 
+// ---- address healing and presence (T151) -------------------------------------------------------
+// A peer's address is pinned at pairing, but DHCP moves machines. Trust never depends on the address (hops are signed,
+// bodies sealed to pinned keys), so the address may move, but only to a place that proves it is the peer: a challenge
+// probe (GET /v1/status?challenge=N) must come back signed by the PINNED host key over the fresh challenge and the
+// addresses the peer itself reports, and the candidate's IP must be one of those signed addresses. A replayed hop or a
+// proxied status can't pass: the proxy can't sign, and a relayed answer names the real peer's IPs, not the proxy's.
+// Candidates come from: a verified hop from a new IP; a signed presence beacon (POST /v1/presence); alternates stored
+// from earlier beacons; mDNS; or `agentmbx peers addr`. Plain /v1/status stays public and unsigned.
+
+/** Split "host:port", "[v6]:port" or "host". */
+export function splitAddr(addr: string): { host: string; port: number | null } {
+  const v6 = /^\[([^\]]+)\](?::(\d+))?$/.exec(addr);
+  if (v6) return { host: v6[1], port: v6[2] ? Number(v6[2]) : null };
+  const i = addr.lastIndexOf(":");
+  if (i > 0 && addr.indexOf(":") === i && /^\d+$/.test(addr.slice(i + 1))) return { host: addr.slice(0, i), port: Number(addr.slice(i + 1)) };
+  return { host: addr, port: null };
+}
+export const joinAddr = (host: string, port: number) => (isIP(host) === 6 ? `[${host}]:${port}` : `${host}:${port}`);
+const validPort = (p: unknown) => { const n = Number(p); return Number.isInteger(n) && n > 0 && n < 65536 ? n : null; };
+const unmap = (ip: string) => ip.replace(/^::ffff:/i, "");
+const resolveName = async (name: string) => (await lookup(name, { all: true })).map((r) => r.address);
+
+/** This host's own reachable addresses (LAN IPv4 + the listening port), for presence and signed status. */
+export const selfAddrs = (node: MbxNode, ifaces: ReturnType<typeof networkInterfaces> = networkInterfaces()): string[] =>
+  process.env.MBX_SELF_ADDRS ? process.env.MBX_SELF_ADDRS.split(",").filter(Boolean)
+    : announcedIPv4(ifaces).map((ip) => joinAddr(ip, node.config.port));
+
+/** Container bridges and VPN tunnels: not where a LAN peer can reach us. */
+const VIRTUAL_IFACE = /^(docker|br-|bridge|vmnet|veth|virbr|podman|cni|flannel|utun|tun|tap|awdl|llw|anpi)/i; // bridge/vmnet: macOS VM and container hosts
+/** Non-internal IPv4 addresses worth announcing: physical interfaces first; virtual ones only when nothing else is
+ *  left, so a VPN-only host still announces something. */
+export function announcedIPv4(ifaces: ReturnType<typeof networkInterfaces>): string[] {
+  const all = Object.entries(ifaces).flatMap(([name, list]) => (list ?? []).filter((i) => i.family === "IPv4" && !i.internal).map((i) => ({ name, ip: i.address })));
+  const real = all.filter((x) => !VIRTUAL_IFACE.test(x.name));
+  return (real.length ? real : all).map((x) => x.ip);
+}
+
+const statusPayload = (s: { host: string; host_pubkey: string; challenge: string; addrs: string[]; version: string; at: string }) =>
+  canonical({ v: 1, kind: "status", host: s.host, host_pubkey: s.host_pubkey, challenge: s.challenge, addrs: s.addrs, version: s.version, at: s.at });
+
+/** Answer a status challenge: the same public fields, plus addrs, signed by this host's key. */
+export function signedStatus(node: MbxNode, challenge: string) {
+  const s = { host: node.host, host_pubkey: node.key.publicKey, challenge, addrs: selfAddrs(node), version: version(), at: new Date().toISOString() };
+  return { v: 1, service: "agentmbx", ...s, sig: signData(node.key.privateKey, statusPayload(s)) };
+}
+
+/** Challenge-probe `addr`: true only if it answers as `host`, signed by the pinned key over our fresh challenge, and
+ *  lists `addr`'s IP among its own signed addresses. Peers without challenge support never pass (no unsigned moves). */
+export async function probePeer(node: MbxNode, host: string, addr: string, f: typeof fetch = fetch, opts: { ownerTyped?: boolean; resolve?: (name: string) => Promise<string[]> } = {}): Promise<boolean> {
+  const p = node.approvedPeer(host);
+  if (!p) return false;
+  const challenge = newNonce();
+  try {
+    const res = await f(`http://${addr}/v1/status?challenge=${encodeURIComponent(challenge)}`, { redirect: "error", signal: AbortSignal.timeout(3_000) });
+    if (!res.ok) { await res.body?.cancel(); return false; }
+    const s = await res.json() as { host?: unknown; host_pubkey?: unknown; challenge?: unknown; addrs?: unknown; version?: unknown; at?: unknown; sig?: unknown };
+    if (s.host !== host || s.host_pubkey !== p.pubkey || s.challenge !== challenge || typeof s.sig !== "string") return false;
+    if (!Array.isArray(s.addrs) || !s.addrs.every((a) => typeof a === "string") || typeof s.version !== "string" || typeof s.at !== "string") return false;
+    if (!verifyData(p.pubkey, statusPayload({ host, host_pubkey: p.pubkey, challenge, addrs: s.addrs as string[], version: s.version, at: s.at }), s.sig)) return false;
+    const want = unmap(splitAddr(addr).host);
+    const signed = new Set((s.addrs as string[]).map((a) => unmap(splitAddr(a).host)));
+    if (isIP(want)) return signed.has(want);
+    // A name: a relaying proxy would pass the signature, so its IPs must be among the signed addrs too. Only an
+    // owner-typed `peers addr` may point at a name the peer doesn't list (e.g. a DNS name for a NAT or tunnel).
+    if (opts.ownerTyped) return true;
+    const ips = await (opts.resolve ?? resolveName)(want).catch(() => [] as string[]);
+    return ips.some((ip) => signed.has(unmap(ip)));
+  } catch { return false; }
+}
+
+/** Point `host` at `addr` if a challenge probe there proves it is that host. Returns the new address or null. */
+export async function healPeerAddr(node: MbxNode, host: string, addr: string, via: string, f: typeof fetch = fetch): Promise<string | null> {
+  const p = node.approvedPeer(host);
+  if (!p || p.addr === addr || !(await probePeer(node, host, addr, f, { ownerTyped: via === "cli" }))) return null;
+  if (!node.setPeerAddr(host, addr, via)) return null;
+  node.store.set(`peer-heal:${host}`, JSON.stringify({ via, at: new Date().toISOString(), from: p.addr, to: addr }));
+  process.stderr.write(`[agentmbx] ${host} moved: ${p.addr} -> ${addr} (${via}, challenge verified)\n`);
+  return addr;
+}
+
+const failing = (node: MbxNode, host: string) => !!node.store.db.prepare("SELECT 1 FROM outbox WHERE host=? AND attempts>0 LIMIT 1").get(host);
+const listKv = (node: MbxNode, k: string): string[] => { try { const v = JSON.parse(node.store.get(k) ?? "[]"); return Array.isArray(v) ? v.filter((x) => typeof x === "string") : []; } catch { return []; } };
+/** Should a candidate replace the pinned address? A pinned IP that the peer no longer reports, or mail that fails. A
+ *  working pinned name (x.local) is kept: it survives DHCP better than an IP. */
+function shouldMove(node: MbxNode, host: string, pinned: string, reported: string[] | null): boolean {
+  if (failing(node, host)) return true;
+  const ph = splitAddr(pinned).host;
+  if (!isIP(ph)) return false;
+  return reported ? !reported.some((a) => splitAddr(a).host === ph) : true;
+}
+
+const learnTried = new Map<string, number>();
+/** After a verified hop from `host`: remember the source IP, and if it differs from the pinned one, try it (port from
+ *  the peer's hint, else the pinned port, else 7373). One probe a minute per peer. */
+export async function learnPeerAddr(node: MbxNode, host: string, remoteIp: string, portHint?: unknown, f: typeof fetch = fetch, now = Date.now()): Promise<string | null> {
+  const p = node.approvedPeer(host);
+  const ip = unmap(remoteIp);
+  if (!p || !isIP(ip)) return null;
+  const pinned = splitAddr(p.addr);
+  const cand = joinAddr(ip, validPort(portHint) ?? pinned.port ?? 7373);
+  node.store.set(`peer-lastseen:${host}`, cand);
+  if (pinned.host === ip || !shouldMove(node, host, p.addr, null)) return null;
+  if (now - (learnTried.get(host) ?? 0) < 60_000) return null;
+  learnTried.set(host, now);
+  return healPeerAddr(node, host, cand, "verified-hop", f);
+}
+const presenceTried = new Map<string, number>();
+export const resetLearnThrottle = () => { learnTried.clear(); presenceTried.clear(); };
+
+/** Receiver of POST /v1/presence (hop already verified). Answers at once after the replay and shape checks; candidates
+ *  are challenge-probed in the background (at most one healing run a minute per peer), so a slow or dead candidate never
+ *  holds the sender's request open. `healing` resolves to the new address, if any (tests await it). */
+export function acceptPresence(node: MbxNode, host: string, body: unknown, remoteIp: string, f: typeof fetch = fetch, now = Date.now()): { ok: boolean; error?: string; healing?: Promise<string | null> } {
+  const b = body as { v?: unknown; seq?: unknown; port?: unknown; addrs?: unknown };
+  if (b?.v !== 1 || !Number.isSafeInteger(b.seq) || !Array.isArray(b.addrs) || b.addrs.length > 16 || !b.addrs.every((a) => typeof a === "string" && a.length <= 64))
+    return { ok: false, error: "bad presence" };
+  const last = Number(node.store.get(`peer-presence-seq:${host}`) ?? 0);
+  if ((b.seq as number) <= last) return { ok: false, error: "stale presence (seq)" };
+  node.store.set(`peer-presence-seq:${host}`, String(b.seq));
+  node.store.set(`peer-presence-at:${host}`, new Date().toISOString());
+  const addrs = b.addrs as string[];
+  node.store.set(`peer-alts:${host}`, JSON.stringify(addrs));
+  const p = node.approvedPeer(host);
+  if (!p || !shouldMove(node, host, p.addr, addrs)) return { ok: true };
+  if (now - (presenceTried.get(host) ?? 0) < 60_000) return { ok: true };
+  presenceTried.set(host, now);
+  const ip = unmap(remoteIp), port = validPort(b.port);
+  const cands = [...new Set([...(isIP(ip) && port ? [joinAddr(ip, port)] : []), ...addrs])].filter((a) => a !== p.addr);
+  const healing = (async () => {
+    for (const c of cands) { const moved = await healPeerAddr(node, host, c, "presence", f); if (moved) return moved; }
+    return null;
+  })().catch(() => null);
+  return { ok: true, healing };
+}
+
+/** Send a signed presence beacon to peers: to the pinned address, and for peers with failing mail to every known
+ *  alternate too. Old peers (404) are ignored. Returns the hosts that accepted it. */
+export async function sendPresence(node: MbxNode, f: typeof fetch = fetch, only?: string[]): Promise<string[]> {
+  const body = JSON.stringify({ v: 1, seq: Date.now(), port: node.config.port, addrs: selfAddrs(node), version: version() });
+  const ok: string[] = [];
+  await Promise.all(node.peers().filter((p) => p.state === "approved" && (!only || only.includes(p.host))).map(async (p) => {
+    const targets = [...new Set([p.addr, ...(failing(node, p.host) ? [...listKv(node, `peer-alts:${p.host}`), node.store.get(`peer-lastseen:${p.host}`) ?? ""] : [])])].filter(Boolean);
+    for (const t of targets) {
+      try {
+        const res = await f(`http://${t}/v1/presence`, { method: "POST", headers: signHop(node, "POST", "/v1/presence", body), body, redirect: "error", signal: AbortSignal.timeout(3_000) });
+        await res.body?.cancel();
+        if (res.ok) { ok.push(p.host); return; }
+      } catch { /* next target */ }
+    }
+  }));
+  return ok;
+}
+
+/** Failure ladder for peers whose mail keeps failing: last inbound IP, stored alternates, then mDNS. Each rung is a
+ *  challenge probe. Run once a minute by the daemon; costs nothing while mail flows. */
+export async function healStuckPeers(node: MbxNode, find: () => Promise<{ host: string; fp: string; addr: string }[]>, f: typeof fetch = fetch): Promise<string[]> {
+  const stuck = (node.store.db.prepare("SELECT DISTINCT host FROM outbox WHERE attempts>=2").all() as { host: string }[])
+    .map((r) => node.approvedPeer(r.host)).filter((p) => !!p);
+  const moved: string[] = [];
+  let seen: { host: string; fp: string; addr: string }[] | null = null;
+  for (const p of stuck) {
+    const ladder = [node.store.get(`peer-lastseen:${p.host}`) ?? "", ...listKv(node, `peer-alts:${p.host}`)];
+    let done = false;
+    for (const c of [...new Set(ladder)].filter((c) => c && c !== p.addr)) if (await healPeerAddr(node, p.host, c, "ladder", f)) { done = true; break; }
+    if (!done) {
+      seen ??= await find();
+      const hit = seen.find((s) => s.host === p.host && s.fp === fingerprint(p.pubkey));
+      if (hit && await healPeerAddr(node, p.host, hit.addr, "mdns", f)) done = true;
+    }
+    if (done) moved.push(p.host);
+  }
+  return moved;
+}
+/** @deprecated name kept for callers of the first T151 patch. */
+export const healPeersViaDiscovery = healStuckPeers;
+
+/** A fingerprint of this host's addresses: the daemon re-announces presence when it changes (DHCP, Wi-Fi switch). */
+export const addrSignature = (node: MbxNode) => selfAddrs(node).slice().sort().join(",");
+
 export const advertisedAddr = (node: MbxNode) => process.env.MBX_ADVERTISE || `${hostname().replace(/\.local$/, "").toLowerCase()}.local:${node.config.port}`;
 
-const readBody = (req: IncomingMessage) => new Promise<string>((res, rej) => {
+/** Server limits (T029). Timeouts bound slowloris clients; the body cap is enforced while streaming; the per-peer
+ *  rate covers every signed-hop request (a daemon polls a peer roughly 30-60 times a minute). */
+export interface ServerLimits { maxRequestBytes: number; peerReqsPerMin: number; headersTimeoutMs: number; requestTimeoutMs: number; keepAliveTimeoutMs: number }
+export const DEFAULT_LIMITS: ServerLimits = { maxRequestBytes: 4 * 1024 * 1024, peerReqsPerMin: 600, headersTimeoutMs: 10_000, requestTimeoutMs: 30_000, keepAliveTimeoutMs: 5_000 };
+
+const httpError = (status: number, message: string) => Object.assign(new Error(message), { status });
+const readBody = (req: IncomingMessage, max: number) => new Promise<string>((res, rej) => {
+  const tooBig = () => httpError(413, `request body over ${max} bytes`);
+  if (Number(req.headers["content-length"]) > max) return rej(tooBig());
   let n = 0; const chunks: Buffer[] = [];
-  req.on("data", (c: Buffer) => { n += c.length; if (n > MAX_REQ) { rej(new Error("request too large")); req.destroy(); } else chunks.push(c); });
+  req.on("data", (c: Buffer) => { if ((n += c.length) > max) { chunks.length = 0; rej(tooBig()); } else chunks.push(c); });
   req.on("end", () => res(Buffer.concat(chunks).toString("utf8"))); req.on("error", rej);
 });
 
@@ -56,12 +247,19 @@ function acceptOffer(node: MbxNode, remote: PairOffer, localNonce: string): stri
   return code;
 }
 
-/** Initiator side of `mbx pair <addr>`. Returns the code both humans must compare. */
+/** Initiator side of `mbx pair <addr>`. Returns the code both humans must compare. Commit-reveal (T032): the initiator
+ *  commits to its offer, the responder answers with its own, then the initiator reveals. Neither side sees the other's
+ *  nonce before its own is fixed, so a party in the middle cannot grind a nonce until the two 6-digit codes match. */
 export async function pairWith(node: MbxNode, addr: string): Promise<{ host: string; code: string; key: string; owner: string | null }> {
-  const n = newNonce();
-  const res = await fetch(`http://${addr}/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(localParty(node, n)), signal: AbortSignal.timeout(10_000) });
-  if (!res.ok) throw new Error(`pairing refused by ${addr}: ${await res.text()}`);
-  const remote = await res.json() as PairOffer;
+  const n = newNonce(), offer = localParty(node, n);
+  const ask = async (body: unknown) => {
+    const res = await fetch(`http://${addr}/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) throw new Error(`pairing refused by ${addr}: ${await res.text()} (code-compare pairing needs AgentMBX with commit-reveal on both hosts)`);
+    return res.json();
+  };
+  const remote = await ask({ v: 2, commit: sha256(canonical(offer)) }) as PairOffer;
+  if (remote?.v !== 1 || !validParty(remote)) throw new Error(`${addr} sent a malformed pairing offer`);
+  await ask({ v: 2, offer });
   const code = acceptOffer(node, { ...remote, addr }, n);
   return { host: remote.host, code, key: fingerprint(remote.host_pubkey), owner: remote.owner_pubkey ? fingerprint(remote.owner_pubkey) : null };
 }
@@ -127,17 +325,29 @@ function handleJoin(node: MbxNode, j: JoinRequest, hellos: Map<string, number>, 
 }
 
 // ---- server ----------------------------------------------------------------------------------
-export function startServer(node: MbxNode, port = node.config.port, bind = node.config.bind, onEnvelope?: () => void): Promise<Server> {
+export function startServer(node: MbxNode, port = node.config.port, bind = node.config.bind, onEnvelope?: () => void, limits: Partial<ServerLimits> = {}): Promise<Server> {
+  const L = { ...DEFAULT_LIMITS, ...limits };
+  const peerReqs = new Map<string, number[]>(); // authenticated host → request times in the last minute
   const runtime = { service: "agentmbx", v: 1, host: node.host, host_pubkey: node.key.publicKey, version: version(), started_at: new Date().toISOString() };
-  let pairAttempts: number[] = [], tokenAttempts: number[] = [];
+  let pairAttempts: number[] = [], tokenAttempts: number[] = [], rotateAttempts: number[] = [];
   const hellos = new Map<string, number>(); // hello nonce → expiry
-  const server = createServer(async (req, res) => {
-    const send = (code: number, obj: unknown) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
+  const commits = new Map<string, { n: string; exp: number }>(); // SAS offer commitment → this host's nonce for it
+  const server = createServer({ headersTimeout: L.headersTimeoutMs, requestTimeout: L.requestTimeoutMs, keepAliveTimeout: L.keepAliveTimeoutMs,
+    connectionsCheckingInterval: Math.min(1_000, L.headersTimeoutMs) }, async (req, res) => {
+    const send = (code: number, obj: unknown) => {
+      if (res.headersSent) return void res.end();
+      res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(obj));
+    };
     try {
-      const url = new URL(req.url ?? "/", "http://x"); const body = await readBody(req);
+      const url = new URL(req.url ?? "/", "http://x"); const body = await readBody(req, L.maxRequestBytes);
       // Public diagnostic metadata only: this neither issues pairing nonces nor grants authority.
-      if (url.pathname === "/v1/status") return req.method === "GET"
-        ? send(200, runtime) : send(405, { error: "method not allowed" });
+      if (url.pathname === "/v1/status") {
+        if (req.method !== "GET") return send(405, { error: "method not allowed" });
+        const challenge = url.searchParams.get("challenge");
+        if (challenge === null) return send(200, runtime);
+        if (!isStr(challenge, 64)) return send(400, { error: "bad challenge" });
+        return send(200, signedStatus(node, challenge)); // proves this host's key and its own addresses (T151)
+      }
       if (url.pathname === "/v1/pair/hello" || url.pathname === "/v1/pair/join") {
         tokenAttempts = tokenAttempts.filter((t) => Date.now() - t < 60_000);
         if (tokenAttempts.push(Date.now()) > TOKEN_REQS_PER_MIN) return send(429, { error: "too many pairing attempts; wait a minute" });
@@ -156,26 +366,59 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
       }
       if (req.method === "POST" && url.pathname === "/v1/pair") {
         pairAttempts = pairAttempts.filter((t) => Date.now() - t < 60_000);
-        if (pairAttempts.push(Date.now()) > 5) return send(429, { error: "too many pairing attempts" });
-        const offer = JSON.parse(body) as PairOffer;
-        if (offer?.v !== 1 || typeof offer.host !== "string" || typeof offer.host_pubkey !== "string") return send(400, { error: "bad offer" });
-        const n = newNonce();
-        const code = acceptOffer(node, offer, n);
+        if (pairAttempts.push(Date.now()) > 10) return send(429, { error: "too many pairing attempts" }); // two requests per pairing
+        const j = JSON.parse(body) as { v?: number; commit?: unknown; offer?: PairOffer };
+        if (j?.v === 2 && isStr(j.commit, 64)) { // step 1: answer with this host's party before the initiator reveals its own
+          const now = Date.now();
+          for (const [c, x] of commits) if (x.exp < now || commits.size > 256) commits.delete(c);
+          const n = newNonce(); commits.set(j.commit as string, { n, exp: now + HELLO_TTL_MS });
+          return send(200, localParty(node, n));
+        }
+        const offer = j?.v === 2 ? j.offer : undefined;
+        if (offer?.v !== 1 || !validParty(offer) || !isStr(offer.addr)) return send(400, { error: "bad offer: code-compare pairing commits before it reveals (v2); upgrade AgentMBX on the initiating host" });
+        const key = sha256(canonical(offer)), c = commits.get(key); commits.delete(key);
+        if (!c || c.exp < Date.now()) return send(401, { error: "no live commitment matches this offer; run pair --compare again" });
+        const code = acceptOffer(node, offer, c.n);
         node.store.audit("pair.request", { from: offer.host, addr: offer.addr, code });
         process.stderr.write(`\n[agentmbx] pairing request from ${offer.host} (${offer.addr}). Code ${code}. Approve with: agentmbx pair approve ${offer.host} ${code}\n`);
-        return send(200, localParty(node, n));
+        return send(200, { ok: true });
+      }
+      if (req.method === "POST" && url.pathname === "/v1/rotate") {
+        // Self-authenticating (T030): each record is signed by the key this host pinned, so a rotated peer whose hops
+        // no longer verify can still move its pin. Nothing else is reachable without a verified hop.
+        rotateAttempts = rotateAttempts.filter((t) => Date.now() - t < 60_000);
+        if (rotateAttempts.push(Date.now()) > 30) return send(429, { error: "too many key rotation announcements; retry later" });
+        const { records } = JSON.parse(body) as { records: SignedRotation[] };
+        if (!Array.isArray(records) || records.length > 50) return send(400, { error: "bad batch" });
+        return send(200, { results: records.map((r) => node.acceptRotation(r)) });
       }
       const peer = verifyHop(node, req.headers, req.method ?? "GET", url.pathname, body);
+      if (url.pathname !== "/v1/presence") void learnPeerAddr(node, peer, req.socket.remoteAddress ?? "", req.headers["x-mbx-port"]).catch(() => {});
+      try { node.peerIsBack(peer); } catch { /* db busy: the back-off retry still delivers */ }
+      const now = Date.now(), recent = (peerReqs.get(peer) ?? []).filter((t) => now - t < 60_000);
+      peerReqs.set(peer, recent);
+      if (recent.push(now) > L.peerReqsPerMin) return send(429, { error: `rate limit: over ${L.peerReqsPerMin} requests a minute from ${peer}; retry later` });
+      if (req.method === "POST" && url.pathname === "/v1/presence") {
+        const { healing: _h, ...r } = acceptPresence(node, peer, JSON.parse(body), req.socket.remoteAddress ?? "");
+        return send(r.ok ? 202 : 400, r);
+      }
+      if (req.method === "POST" && url.pathname === "/v1/unpair") {
+        // The peer removed this pairing: drop it here too, so mail stops queueing for a host that refuses it.
+        node.removePeer(peer);
+        node.store.audit("pair.removed_by_peer", { host: peer });
+        process.stderr.write(`\n[agentmbx] ${peer} removed its pairing with this host; removed ${peer} here too\n`);
+        return send(200, { ok: true });
+      }
       if (req.method === "POST" && ["/v1/envelopes", "/v2/envelopes"].includes(url.pathname)) {
         const { envelopes } = JSON.parse(body) as { envelopes: unknown[] };
-        if (!Array.isArray(envelopes) || envelopes.length > 200) return send(400, { error: "bad batch" });
+        if (!Array.isArray(envelopes) || envelopes.length > 200) return send(400, { error: "bad batch: envelopes must be an array of at most 200" });
         const results = envelopes.map((e) => ({ id: (e as Envelope)?.id, result: node.receive(e, peer) }));
         if (results.some((r) => r.result === "accepted")) onEnvelope?.();
         return send(200, { results });
       }
       if (req.method === "POST" && url.pathname === "/v1/policy") {
         const { items } = JSON.parse(body) as { items: Signed<AnyRecord>[] };
-        if (!Array.isArray(items) || items.length > 200) return send(400, { error: "bad batch" });
+        if (!Array.isArray(items) || items.length > 200) return send(400, { error: "bad batch: items must be an array of at most 200" });
         return send(200, { results: items.map((it) => ({ id: it?.rec?.id, error: acceptSigned(node.store.db, it, node.host, { hostPub: node.key.publicKey }) })) });
       }
       if (req.method === "GET" && url.pathname === "/v1/policies") {
@@ -195,8 +438,10 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
       }
       return send(404, { error: "not found" });
     } catch (e) {
-      const msg = (e as Error).message;
-      send(/paired|signature|timestamp/.test(msg) ? 401 : 400, { error: msg });
+      const { message: msg, status } = e as Error & { status?: number };
+      // oversized body: answer, then discard (never buffer) the rest for up to 2 s so the client reads the 413, not a reset
+      if (status === 413) { send(413, { error: msg }); req.resume(); return void setTimeout(() => req.complete || req.destroy(), 2_000).unref(); }
+      send(status ?? (/paired|signature|timestamp/.test(msg) ? 401 : 400), { error: msg });
     }
   });
   return new Promise((resolve, reject) => { server.once("error", reject); server.listen(port, bind, () => resolve(server)); });
@@ -229,12 +474,17 @@ export async function flushOutbox(node: MbxNode, now = Date.now()): Promise<{ se
     node.send({ from: "mbx", to: [e.from.split("@")[0]], kind: "alert", subject: `Undelivered to ${r.host}: ${e.subject}`, body: `Message ${e.id} could not be delivered to host ${r.host}: ${why}` });
   };
   for (const [host, rows] of byHost) {
-    const peer = node.approvedPeer(host);
+    let peer = node.approvedPeer(host);
     try {
       if (!peer) throw new Error("host is no longer paired");
+      if (!peer.enc_pub) { await refreshPeerEncKeys(node, fetch, host); peer = node.approvedPeer(host); }
+      // Bodies never cross the LAN in plaintext (T028): without the peer's pinned enc key, keep retrying.
+      const encPub = peer?.enc_pub;
+      if (!peer || !encPub) throw new Error(`${host} has not published a body-encryption key; upgrade AgentMBX there (bodies are never sent in plaintext)`);
       // This endpoint requires sender-proof-aware receivers. Never retry via v1: older
       // receivers can grant policy authority to unverified or missing-marker envelopes.
-      const { results } = await post(node, peer.addr, "/v2/envelopes", { envelopes: rows.map((r) => JSON.parse(r.envelope)) }) as { results: { id: string; result: string }[] };
+      const envelopes = rows.map((r) => sealEnvelope(JSON.parse(r.envelope) as Envelope, encPub, node.host, node.key.publicKey, node.key.privateKey));
+      const { results } = await post(node, peer.addr, "/v2/envelopes", { envelopes }) as { results: { id: string; result: string }[] };
       for (const r of rows) {
         const res = results.find((x) => x.id === r.msg_id)?.result ?? "rejected:missing result";
         done(r.msg_id, host);
@@ -250,6 +500,38 @@ export async function flushOutbox(node: MbxNode, now = Date.now()): Promise<{ se
     }
   }
   return { sent, failed };
+}
+
+/** Deliver this host's key rotations to every peer that has not accepted them yet (T030). */
+const rotationTried = new Map<string, number>();
+export async function announceRotations(node: MbxNode, f: typeof fetch = fetch, force = false, now = Date.now()): Promise<{ host: string; ok: boolean; error?: string }[]> {
+  const log = rotationLog(node.home);
+  if (!log.records.length) return [];
+  const out: { host: string; ok: boolean; error?: string }[] = [];
+  for (const p of node.peers().filter((x) => x.state === "approved" && (log.delivered[x.host] ?? 0) < log.records.length)) {
+    if (!force && now - (rotationTried.get(p.host) ?? 0) < 60_000) continue; // an offline peer is retried once a minute
+    rotationTried.set(p.host, now);
+    try {
+      const body = JSON.stringify({ records: log.records.slice(log.delivered[p.host] ?? 0) });
+      const res = await f(`http://${p.addr}/v1/rotate`, { method: "POST", headers: { "content-type": "application/json" }, body, redirect: "error", signal: AbortSignal.timeout(5_000) });
+      if (!res.ok) throw new Error(res.status === 404 ? "peer does not support key rotation; upgrade AgentMBX there" : `${res.status} ${await res.text()}`);
+      const { results } = await res.json() as { results: string[] };
+      const bad = results.find((r) => r.startsWith("rejected"));
+      if (bad) throw new Error(bad);
+      const fresh = rotationLog(node.home); // re-read: another process may have rotated again meanwhile
+      fresh.delivered[p.host] = Math.max(fresh.delivered[p.host] ?? 0, log.records.length);
+      saveRotationLog(node.home, fresh);
+      out.push({ host: p.host, ok: true });
+    } catch (e) { out.push({ host: p.host, ok: false, error: (e as Error).message }); }
+  }
+  return out;
+}
+
+/** Tell a peer this host is removing their pairing (best effort: an offline peer learns when its hops start failing). */
+export async function notifyUnpair(node: MbxNode, host: string): Promise<boolean> {
+  const p = node.approvedPeer(host);
+  if (!p) return false;
+  try { return (await post(node, p.addr, "/v1/unpair", {}) as { ok?: boolean }).ok === true; } catch { return false; }
 }
 
 /** Pull each paired host's agent list so bare names and `mbx agents` work across machines. */
@@ -273,13 +555,13 @@ export async function refreshDirectory(node: MbxNode) {
 /**
  * Learn each approved peer's body-encryption key (T028 Option A) over the already-authenticated
  * host channel. The response signature is checked against the peer's PINNED host signing key, so a
- * man-in-the-middle cannot substitute its own enc key. Inert until the send path seals for enc.
+ * man-in-the-middle cannot substitute its own enc key. The LAN send path seals every body with it.
  */
-export async function refreshPeerEncKeys(node: MbxNode, f: typeof fetch = fetch): Promise<void> {
-  for (const p of node.peers().filter((x) => x.state === "approved" && !(x as { enc_pub?: string | null }).enc_pub)) {
+export async function refreshPeerEncKeys(node: MbxNode, f: typeof fetch = fetch, only?: string): Promise<void> {
+  for (const p of node.peers().filter((x) => x.state === "approved" && !x.enc_pub && (only === undefined || x.host === only))) {
     try {
       const path = "/v1/enc-key";
-      const res = await f(`http://${p.addr}${path}`, { headers: signHop(node, "GET", path, ""), signal: AbortSignal.timeout(5_000) });
+      const res = await f(`http://${p.addr}${path}`, { headers: signHop(node, "GET", path, ""), redirect: "error", signal: AbortSignal.timeout(5_000) });
       if (!res.ok) continue;
       const j = await res.json() as { v?: number; host?: string; enc_pub?: string; sig?: string };
       if (j.v !== 1 || j.host !== p.host || typeof j.enc_pub !== "string" || typeof j.sig !== "string") continue;

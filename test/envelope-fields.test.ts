@@ -31,7 +31,7 @@ const invalid: Record<string, unknown[]> = {
 for (const [field, values] of Object.entries(invalid)) test(`paired signed envelope rejects malformed ${field}`, t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-fields-"));
   const a = new MbxNode(join(home, "a"), { host: "alpha" }), b = new MbxNode(join(home, "b"), { host: "beta" });
-  t.after(() => { a.close(); b.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { a.close(); b.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   b.addApprovedPeer({ host: "alpha", pubkey: a.key.publicKey, owner_pubkey: a.key.publicKey, addr: "unused" }, "fixture");
   for (const value of values) {
     const raw = buildEnvelope({ from: "sender@alpha", to: ["worker@beta"], subject: "core fields", body: "retained content" });

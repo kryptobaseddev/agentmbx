@@ -12,7 +12,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} v2 impor
   const home = mkdtempSync(join(tmpdir(), "mbx-import-")), archive = join(home, "archive");
   mkdirSync(join(archive, "messages"), { recursive: true }); mkdirSync(join(archive, "acks"));
   const n = new MbxNode(home, { host: "alpha" }), clients: Client[] = [];
-  t.after(async () => { for (const c of clients) await c.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { for (const c of clients) await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const write = (id: string, to: string[], subject = id) => writeFileSync(join(archive, "messages", `${id}.json`), JSON.stringify({
     id, ts: new Date().toISOString(), from: "old-sender", to, thread: id, type: "request", subject, body: "old body", reply_to: null, needs_reply: true, refs: [],
   }));

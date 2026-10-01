@@ -15,7 +15,7 @@ import { IdentityLeases } from "../src/identity-leases.ts";
 
 for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} startup offers recovery choices without claiming historical mail`, t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-startup-choice-")), node = new MbxNode(home, { host: "alpha" });
-  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const leases = new IdentityLeases(node.store, { inspect: () => ({ alive: true, start: "fixture" }) });
   const lease = leases.claim("historical", { pid: process.pid, start: "fixture", keyFp: "aaaa-bbbb-cccc-dddd", cli, sessionId: "previous" });
   leases.release("historical", lease.token);
@@ -42,7 +42,7 @@ async function holder(t: TestContext, cli: string) {
   createOwnerKey(home, "test-only-passphrase");
   const n = new MbxNode(home, { host: "alpha" }), owner = unlockOwnerKey(home, "test-only-passphrase");
   const client = new Client({ name: "hook-test", version: "1" });
-  t.after(async () => { await client.close(); n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await client.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "builder", MBX_CLI: cli, AGENTMBX_DEV: "1" } as Record<string,string> }));
   const sid = cli === "codex" ? "77777777-7777-4777-8777-777777777777" : cli === "opencode" ? "ses_hooktest" : "real-hook-session";
@@ -82,7 +82,7 @@ test("Claude SessionEnd releases only the exact exiting holder and preserves mai
 
 test("unbound SessionEnd hooks cannot release historical mailboxes", t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-end-unbound-")), node = new MbxNode(home, { host: "alpha" });
-  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const leases = new IdentityLeases(node.store, { inspect: () => ({ alive: true, start: "fixture" }) });
   leases.claim("historical", { pid: process.pid, start: "fixture", keyFp: "aaaa-bbbb-cccc-dddd", cli: "claude", sessionId: "previous" });
   const before = node.store.db.prepare("SELECT * FROM identity_leases").all();
@@ -119,8 +119,13 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} hooks re
   n.ack(id, agent);
   n.send({ from: "claimed", to: [agent], subject: "unverified", body: "not delegated", kind: "request", unverifiedSender: true });
   const unverified = run("stop"); assert.equal(unverified.status, 0, unverified.stderr); assert.equal(unverified.stdout, "");
-  sendLeased(n, { from: "sender", to: [agent], subject: "over relay limit", body: "not delegated", kind: "request", hop: 1000 });
-  assert.equal(run("stop").stdout, "");
+  // autonomous has no relay depth limit (T104): even depth-1000 mail keeps the turn going like any delegated request
+  const deep = sendLeased(n, { from: "sender", to: [agent], subject: "deep chain", body: "delegated", kind: "request", hop: 1000 }).envelope.id;
+  const deepStop = run("stop");
+  if (cli === "kimi") assert.equal(deepStop.status, 2);
+  else if (cli !== "opencode") assert.equal(JSON.parse(deepStop.stdout).decision, "block");
+  else assert.equal(deepStop.stdout, "");
+  n.ack(deep, agent);
   assert.notEqual((await call("mbx_identity", { action: "release" })).isError, true);
   const before = n.store.db.prepare("SELECT * FROM sessions").all();
   for (const event of ["prompt", "post-tool", "stop", "session-start"]) {
@@ -129,7 +134,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} hooks re
     else assert.equal(r.stdout, "");
     assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before, "released hooks cannot recreate bindings");
   }
-  assert.equal(n.inbox(agent).length, 2); assert.ok(n.inbox(agent).every(m => m.state === "delivered"));
+  assert.equal(n.inbox(agent).length, 1, "the unverified message (the deep one was acked)"); assert.ok(n.inbox(agent).every(m => m.state === "delivered"));
 });
 
 test("Claude post-tool deduplicates exact leased mailbox arrivals and ignores retired links", async t => {
@@ -147,7 +152,7 @@ test("Claude post-tool deduplicates exact leased mailbox arrivals and ignores re
 
 test("unleased hooks neither rebind legacy sessions nor reveal mailbox counts", t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-hook-legacy-")), n = new MbxNode(home, { host: "alpha" });
-  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   n.bindSession({ agent: "builder", cli: "kimi", session_id: "legacy", pid: process.pid });
   sendLeased(n, { from: "sender", to: ["builder"], subject: "private", body: "private" });
   const before = n.store.db.prepare("SELECT * FROM sessions").all();

@@ -13,7 +13,7 @@ const parsed = (result: unknown) => JSON.parse((result as { content: { text: str
 function fixture(t: TestContext) {
   const home = mkdtempSync(join(tmpdir(), "mbx-mcp-replay-")), node = new MbxNode(home, { host: "alpha" });
   const clients: Client[] = [];
-  t.after(async () => { for (const c of clients) await c.close(); node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { for (const c of clients) await c.close(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const connect = async (cli = "claude", name = "reader") => {
     const c = new Client({ name: "replay-test", version: "1" }); clients.push(c);
     await c.connect(new StdioClientTransport({ command: process.execPath, args: [BIN, "mcp"],

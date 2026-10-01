@@ -16,7 +16,7 @@ for (const defect of ["json", "signature", "expiry-cache"]) test(`valid lease ca
   Object.assign(process.env, { MBX_CODEX_BIN: bin, MBX_TEST_WAKE_LOG: log, MBX_NO_DESKTOP: "1" });
   t.after(() => {
     for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
-    n.close(); rmSync(home, { recursive: true, force: true });
+    n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
   bindWakeLease(n, { agent: "worker", cli: "codex", session_id: "exact-session", pid: process.pid });
   const policy = n.store.db.prepare("SELECT id,record,sig,exp FROM policies").get() as { id: string; record: string; sig: string; exp: string };

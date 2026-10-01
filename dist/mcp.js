@@ -1,5 +1,6 @@
 // `mbx mcp`: the stdio MCP server one agent session runs. It owns an in-memory session key (the only thing that can
 // use an owner grant) and, inside a Claude session started with the mbx channel enabled, pushes wake-ups itself.
+import { createConnection } from "node:net";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
@@ -12,17 +13,19 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { fingerprint, generateKeyPair } from "./crypto.js";
 import { checkShape, KINDS, MAX_RELAY_DEPTH, NAME_RE } from "./envelope.js";
-import { kimiHostedServer } from "./kimi-web.js";
+import { kimiMultiHost } from "./kimi-web.js";
+import { BIND_TICKET_RE, takeBindTicket } from "./bind-ticket.js";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess } from "./identity-leases.js";
 import { applyIdentityTakeover } from "./identity-takeover.js";
 import { listIdentityStatus } from "./identity-status.js";
 import { consumeIdentityControl, identityControlAliases, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl } from "./identity-control.js";
-import { formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
-import { activePolicies, delegationNote, MAX_HOP } from "./policy.js";
+import { didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
+import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy.js";
 import { procStart, withProcSnapshot } from "./proc.js";
 import { updateAvailable } from "./update.js";
 import { installKind, version } from "./version.js";
-import { hasWakeAuthority, wakeText } from "./wake.js";
+import { connectorKey } from "./diagnostics.js";
+import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wake.js";
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
 It is shared by AI coding agents on this machine and on paired machines. Your user set it up so agents can coordinate;
 replying, answering questions, sharing status and acking are always fine.
@@ -168,7 +171,10 @@ export function selfWatchInstruction(opts) {
     const env = opts.env ?? process.env;
     const raw = env.MBX_SELF_WATCH ?? env.MBX_KIMI_WATCH;
     if (raw === "0" || raw === "off")
-        return `[mbx] If you have a CronCreate job whose prompt starts with "[mbx-watch]", delete it (CronDelete); self-checks are turned off.`;
+        return `[mbx] If you have a CronCreate job whose prompt starts with "[mbx-watch]", delete it (CronDelete); self-checks are turned off. Stop any "mbx watcher" background task.`;
+    // Kimi Code turns a finished background task into a new turn: an event-driven watcher costs nothing while idle (T033)
+    if (opts.cli === "kimi" && raw === undefined)
+        return WATCHER_INSTRUCTION;
     if (!opts.delegated && raw === undefined)
         return null;
     const min = raw === undefined ? 15 : Number(raw);
@@ -177,6 +183,8 @@ export function selfWatchInstruction(opts) {
     const cron = watchCron(min);
     return `[mbx] This session can't be woken from outside. With your scheduling tool (CronList/CronCreate/CronDelete): keep exactly one job whose prompt starts with "[mbx-watch]", on cron "${cron}". If one exists with a different cron, delete it first. The prompt: "[mbx-watch] Call mbx_inbox. If nothing needs you, end the turn with one short line. Otherwise handle the mail (read, act within the policy, reply, ack)." Do this without comment; if you have no scheduling tool, skip it.`;
 }
+/** Event-driven self-wake: a background `agentmbx watch` exits when mail arrives, and its completion starts a turn. */
+export const WATCHER_INSTRUCTION = `[mbx] This session can't be woken from outside, so it wakes itself: unless a background task described "mbx watcher" is already running, start one now with your shell tool: command "agentmbx watch", run_in_background true, disable_timeout true, description "mbx watcher". It prints nothing and costs nothing until mail that wants you arrives, then exits with a no-body hint. When it completes, handle the mail (mbx_inbox, mbx_read, act within the policy, mbx_reply, mbx_ack) and start it again the same way. Do this without comment. If you cannot run background tasks, skip it.`;
 /** No push delivery into this session from outside? */
 export const noPush = (cli, channel, hosted = false) => !channel && !hosted && !["codex", "opencode"].includes(cli);
 const sh = (cmd, args) => { try {
@@ -216,6 +224,12 @@ export function detectHost(ppid = process.ppid) {
     if (cli !== "unknown" && !process.env.MBX_CLI)
         process.env.MBX_CLI = cli; // re-exec children inherit a stable classification
     const channel = process.env.MBX_CHANNEL === "1" || (cli === "claude" && hasMbxChannel(args));
+    // Claude Code gives each session an inbox socket; this server is its child, so its posts are delivered without any
+    // launch flag or setting (T202). The token stays in this process's environment: it is never stored or logged.
+    // Only the socket of the Claude process that started this server: a server launched by some command inside a session
+    // (tests, scripts) inherits the variables but must never push into that unrelated session. Sockets are named <pid>.sock.
+    const sock = process.env.CLAUDE_CODE_MESSAGING_SOCKET;
+    const socket = cli === "claude" && !channel && !!sock && process.env.MBX_SESSION_SOCKET !== "0" && basename(sock) === `${ppid}.sock`;
     let sessionId = `mcp-${process.pid}`;
     const cs = join(homedir(), ".claude/sessions", `${ppid}.json`);
     if (cli === "claude" && existsSync(cs)) {
@@ -224,7 +238,26 @@ export function detectHost(ppid = process.ppid) {
         }
         catch { /* keep default */ }
     }
-    return { cli, channel, sessionId, ppid };
+    return { cli, channel, socket, sessionId, ppid };
+}
+/** Queue a no-body wake hint into this Claude session through its inbox socket (NDJSON: auth line, then a user line). */
+export function socketPush(text, env = process.env) {
+    return new Promise((resolve, reject) => {
+        const path = env.CLAUDE_CODE_MESSAGING_SOCKET, token = env.CLAUDE_CODE_MESSAGING_TOKEN;
+        if (!path)
+            return reject(new Error("no session socket"));
+        const s = createConnection(path), done = (e) => { s.destroy(); if (e)
+            reject(e);
+        else
+            resolve(); };
+        s.setTimeout(3_000, () => done(new Error("session socket timed out")));
+        s.on("error", (e) => done(e));
+        s.on("connect", () => {
+            if (token)
+                s.write(JSON.stringify({ type: "auth", token }) + "\n");
+            s.end(JSON.stringify({ type: "user", message: { role: "user", content: text } }) + "\n", () => done());
+        });
+    });
 }
 /** Default agent name: $MBX_AGENT, else the project folder; a session started in the home folder (or /) is named after
  *  its CLI ("claude", "codex", "kimi", "opencode"), because "keatonhoskins" says nothing about which agent it is. */
@@ -235,6 +268,13 @@ export function agentName(cwd = process.cwd(), cli) {
     return NAME_RE.test(n) ? n : "agent";
 }
 const text = (s, structured) => ({ content: [{ type: "text", text: s }], ...(structured ? { structuredContent: structured } : {}) });
+/** A status that looks like it wants attention will not get it: say so to the sender (owner decision 2026-09-30). */
+export const statusWakeWarning = (e) => e.kind === "status" && (e.needs_reply || e.meta.mentions.length)
+    ? ["kind=status never wakes the recipient (not even with needs_reply or a mention); it waits for their next prompt. To get attention now, send kind=request with needs_reply=true."] : [];
+/** Mail past a policy level's relay depth reaches the recipient as "policy: ask" for that level and wakes no one. The
+ *  sender can't see the recipient's level, so it is warned only past collaborate's allowance (T104). */
+export const depthWarning = (e) => (e.meta.hop ?? 0) > LEVEL_MAX_HOP.collaborate
+    ? [`relay depth ${e.meta.hop} exceeds ${LEVEL_MAX_HOP.collaborate}: this session has read a long chain from agents other than this message's recipients since your user last typed. A recipient under ask (limit ${MAX_HOP}) or collaborate (limit ${LEVEL_MAX_HOP.collaborate}) will not be woken or act on it (it can still read and answer); autonomous and yolo have no depth limit. Your user's next prompt resets the depth.`] : [];
 export async function runMcp(existing) {
     let node;
     if (existing)
@@ -383,7 +423,7 @@ export async function runMcp(existing) {
             // Snapshot before bindSession can replace or consolidate any rows.
             const legacy = state.leaseToken ? [] : node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions`).all();
             const agent = node.bindSession({ agent: state.agent, cli: env.cli, session_id: state.sessionId, cwd: process.cwd(), pid: env.ppid,
-                session_key: state.key.publicKey, channel: env.channel, mcp_pid: process.pid, restore_name: initial && !process.env.MBX_AGENT });
+                session_key: state.key.publicKey, channel: env.channel || env.socket, mcp_pid: process.pid, restore_name: initial && !process.env.MBX_AGENT });
             if (state.leaseToken && agent !== state.agent)
                 throw new Error("bound identity changed outside a lease rename");
             if (!state.leaseToken)
@@ -475,39 +515,46 @@ export async function runMcp(existing) {
         return state;
     };
     // the project this session works in (not the home folder), stamped on what it sends
-    const project = (() => { const d = process.cwd(); if (resolve(d) === resolve(homedir()) || d === "/")
+    const projectOf = (d) => { if (resolve(d) === resolve(homedir()) || d === "/")
         return undefined; try {
         return realpathSync(d);
     }
     catch {
         return d;
-    } })();
+    } };
+    let project = projectOf(process.cwd()); // a hosted conversation moves it to its own folder when it links (bind ticket)
     // relay tracking: a message this session sends after reading one is one hop further, and inherits an external origin
     const noteRead = (rows) => {
         const state = current(), { agent } = state;
         const now = Date.now();
         if (state.parent)
-            for (const [hop, at] of state.parent.hops) {
-                if (now - at >= 3_600_000)
-                    state.parent.hops.delete(hop);
+            for (const [k, x] of state.parent.hops) {
+                if (now - x.at >= 3_600_000)
+                    state.parent.hops.delete(k);
             }
         for (const r of rows) {
             if (r.from_addr === `${agent}@${node.host}`)
                 continue;
             const e = JSON.parse(r.envelope);
             // Retained malformed mail is readable, but cannot erase unknown provenance.
-            const m = checkShape(e) ? { hop: MAX_HOP + 1, origin: "external" } : e.meta;
+            const m = checkShape(e) ? { hop: MAX_RELAY_DEPTH, origin: "external" } : e.meta; // past every level's allowance (T104)
             state.parent ??= { hops: new Map(), externalAt: null };
-            // Each depth keeps its own last exposure. Lower-depth mail cannot renew a higher one.
-            state.parent.hops.set(m.hop ?? 0, now);
+            // Each (sender, depth) keeps its own last exposure. Lower-depth mail cannot renew a higher one. The sender is kept so
+            // a reply to that same sender doesn't count it (T104): a two-party conversation is not a relay chain.
+            const hop = m.hop ?? 0;
+            state.parent.hops.set(`${r.from_addr}\u0000${hop}`, { hop, from: r.from_addr, at: now });
             if (m.origin === "external")
                 state.parent.externalAt = now;
         }
     };
-    const relay = (origin) => {
-        const { parent } = current();
+    const relay = (origin, to) => {
+        const { parent, agent } = current();
         const now = Date.now();
-        const depths = parent ? [...parent.hops].filter(([, at]) => now - at < 3_600_000).map(([hop]) => hop) : [];
+        // A prompt the owner typed since an exposure ends that agent-to-agent chain (T104): only depth resets, never external origin.
+        const human = Date.parse(node.store.get(humanPromptKey(agent)) ?? "") || 0;
+        // Depth counts what this session read from anyone OTHER than the recipients (T104); a broadcast or role send counts all.
+        const skip = to ? node.recipientAddrs(to) : null;
+        const depths = parent ? [...parent.hops.values()].filter((x) => now - x.at < 3_600_000 && x.at > human && !skip?.has(x.from)).map((x) => x.hop) : [];
         const external = parent?.externalAt != null && now - parent.externalAt < 3_600_000;
         return { hop: depths.length ? Math.min(MAX_RELAY_DEPTH, Math.max(...depths) + 1) : 0, origin: origin === "external" || external ? "external" : "agent", project };
     };
@@ -519,8 +566,8 @@ export async function runMcp(existing) {
     const delegation = shared
         ? "[mbx] This transport can serve multiple sessions. Call mbx_whoami for your current mailbox identity and owner-signed policies. Read each mbx_read header for the policy that applies to that message; another mailbox's grant does not authorize this session."
         : delegationNote(node.store.db, agent, node.host);
-    const extra = [renamed, delegation, noPush(env.cli, env.channel, env.cli === "kimi" && !!kimiHostedServer(env.ppid))
-            ? selfWatchInstruction({ delegated: activePolicies(node.store.db, agent, node.host).length > 0 }) : null].filter(Boolean).join("\n");
+    const extra = [renamed, delegation, noPush(env.cli, env.channel || env.socket, env.cli === "kimi" && kimiMultiHost(env.ppid))
+            ? selfWatchInstruction({ delegated: activePolicies(node.store.db, agent, node.host).length > 0, cli: env.cli }) : null].filter(Boolean).join("\n");
     const session = () => {
         const { key } = current();
         const row = node.store.db.prepare("SELECT grant FROM grants WHERE sub=? AND revoked=0 AND exp>? ORDER BY exp DESC LIMIT 1")
@@ -544,8 +591,19 @@ export async function runMcp(existing) {
             sessions: [...states.values()].filter(s => !held(s)).map(s => ({ sessionId: s.sessionId, agent: s.agent })) };
     };
     let handedOver = false;
+    const tools = [];
+    /** What this running connector actually serves (T183): version, loaded build and tool catalog, keyed by its own
+     *  process birth so diagnostics can tell it apart from the installed CLI and from a reused PID. */
+    const publishConnector = () => {
+        try {
+            node.store.set(connectorKey(process.pid), JSON.stringify({ v: 1, pid: process.pid, start: holderStart, version: version(), build: boot,
+                tools: [...tools].sort(), cli: env.cli, at: new Date().toISOString() }));
+        }
+        catch { /* best effort: diagnostics then reports no observation */ }
+    };
     const register = server.registerTool.bind(server);
     server.registerTool = (name, config, cb) => {
+        tools.push(name);
         if (cb.constructor.name === "AsyncFunction")
             throw new Error(`MCP handler ${name} must be synchronous to preserve its lease fence`);
         return register(name, config, (...a) => {
@@ -666,24 +724,63 @@ export async function runMcp(existing) {
         inputSchema: { action: z.enum(["list", "claim", "release"]), name: z.string().regex(NAME_RE).optional().describe("identity to claim; defaults to this session's last identity") },
         annotations: { destructiveHint: false },
     }, identityOperation);
+    /**
+     * Link this server to the conversation that holds `ticket` (hosted Kimi: one server per conversation, one shared parent).
+     * Binds the real session id with this server's key, so hooks, wakes and policy scope then use it. Returns the default
+     * name for that conversation's folder when this server still carries the name it derived from the plugin folder.
+     */
+    const linkConversation = (state, ticket) => {
+        if (state !== base || base.released || !base.leaseToken)
+            throw new Error("bind needs this server's own held identity");
+        const t = takeBindTicket(node.store, ticket, env.cli, env.ppid);
+        if (!t)
+            throw new Error("bind ticket is unknown, expired, or belongs to another app process; a new one comes with your next prompt");
+        try {
+            process.chdir(t.cwd);
+        }
+        catch { /* the folder may be gone; the binding still records it */ }
+        project = projectOf(t.cwd);
+        prepareState(base, undefined, () => node.store.tx(() => {
+            leases.renew(base.agent, base.leaseToken);
+            node.bindSession({ agent: base.agent, cli: env.cli, session_id: t.session_id, cwd: t.cwd, pid: env.ppid, session_key: base.key.publicKey, channel: false, mcp_pid: process.pid });
+            publishControl(base);
+        }));
+        node.store.audit("identity.bind-ticket", { agent: base.agent, cli: env.cli, session: t.session_id });
+        if (process.env.MBX_AGENT || !(base.agent === wanted || base.agent.startsWith(`${wanted.slice(0, 19)}-mcp-`)))
+            return undefined;
+        // the conversation's folder name, else a readable variant when another session holds it (a terminal in the same project)
+        const folder = agentName(t.cwd, env.cli).slice(0, 26), tag = createHash("sha256").update(t.session_id).digest("hex").slice(0, 4);
+        const held = (n) => !!node.store.db.prepare("SELECT 1 FROM identity_leases WHERE name=? AND released_at IS NULL").get(n);
+        return [folder, `${folder}-${env.cli}-app`, `${folder}-${env.cli}-${tag}`].find(n => NAME_RE.test(n) && n !== base.agent && !held(n));
+    };
     server.registerTool("mbx_whoami", {
         title: "Who am I on mbx",
         description: "Show this session's mbx identity (agent name, host, session key fingerprint, whether it holds an owner grant). Pass `name` to rename this session's agent (do it early if the default folder name is vague), `role`/`description` to describe it. Next: mbx_inbox for pending work; optionally mbx_replay with a saved cursor for bounded historical catch-up, or mbx_agents for peers.",
-        inputSchema: { name: z.string().regex(NAME_RE).optional().describe("new agent name, e.g. vida-dev"), role: z.string().max(40).optional(), description: z.string().max(200).optional().describe("brief agent description, at most 200 characters") },
+        inputSchema: { name: z.string().regex(NAME_RE).optional().describe("new agent name, e.g. vida-dev"), role: z.string().max(40).optional(), description: z.string().max(200).optional().describe("brief agent description, at most 200 characters"),
+            bind: z.string().regex(BIND_TICKET_RE).optional().describe("one-time ticket from an [mbx] session note that links this conversation to its mbx server") },
         annotations: { idempotentHint: true },
-    }, ({ name, role, description }) => {
+    }, ({ name, role, description, bind: ticket }) => {
         const state = current();
+        const folderName = ticket ? linkConversation(state, ticket) : undefined;
         let { agent } = state;
         const { key } = state;
-        if (name && name !== agent) {
-            checkLegacy(name, state, node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions WHERE agent=?`).all(name));
-            const lease = leases.rename(agent, state.leaseToken, name);
-            node.addAlias(agent, name, env.ppid);
-            agent = name;
-            state.agent = name;
+        const rename = (to) => {
+            checkLegacy(to, state, node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions WHERE agent=?`).all(to));
+            const lease = leases.rename(agent, state.leaseToken, to);
+            node.addAlias(agent, to, env.ppid);
+            agent = to;
+            state.agent = to;
             state.leaseToken = lease.token;
-            node.keepName(env.cli, state.sessionId, name);
-        }
+            node.keepName(env.cli, state.sessionId, to);
+        };
+        if (name && name !== agent)
+            rename(name);
+        else if (folderName)
+            try {
+                rename(folderName);
+                name = folderName;
+            }
+            catch { /* taken or contested: keep the current name */ }
         if (name || role || description) {
             node.registerAgent(agent, { role, description, cli: env.cli });
             bind(state);
@@ -695,16 +792,20 @@ export async function runMcp(existing) {
             owner_grant: s.grant ? { caps: s.grant.caps, expires: s.grant.exp } : null, delivery: node.deliveryMode(agent), unread: node.unreadCount(agent),
             policies: activePolicies(node.store.db, agent, node.host).map((p) => ({ id: p.id, level: p.level, classes: p.classes, from: p.from, projects: p.projects ?? null, expires: p.exp })),
             version: version(), update_available: updateAvailable(node.store),
+            ...((sup) => sup.length ? { wakes_suppressed: `${sup.length} unread message(s) from ${[...new Set(sup.map((x) => x.from))].join(", ")} did not wake this session: relay depth ${Math.max(...sup.map((x) => x.hop))} exceeds the policy's allowance (ask 6, collaborate 20). Your user's next prompt resets it; mbx_inbox shows them.` } : {})(node.depthSuppressed(agent)),
+            // Answered by the old build during a handover: the new build's version and delivery show from the next call.
+            ...(handedOver ? { switching: "a newer agentmbx is installed: this server hands over to it after this call. Call mbx_whoami again for its version and delivery mode." } : {}),
             ...(state.recoveryIdentity && state.recoveryIdentity !== agent ? { recovery: { identity: state.recoveryIdentity,
                     reason: "previous identity has another holder", next: "Use mbx_identity list to inspect ownership. The previous holder must release, or the owner must approve takeover, before this session can release its temporary identity and claim that mailbox." } } : {}) };
         return text(JSON.stringify(out, null, 2), out);
     });
     server.registerTool("mbx_send", {
         title: "Send an mbx message",
-        description: "Start a new conversation with other agents (to answer a message, use mbx_reply instead). `to` accepts agent names (vida-dev), agent@host (vida-dev@fedora), role:<role>, * (everyone), or owner; find names with mbx_agents. Use kind=request/task with needs_reply=true when you need an answer. A successful send is acceptance, not recipient delivery, reply or task completion; queued transport retry is not a draft API. Avoid manually resending an uncertain send. Next: check mbx_inbox for answers.",
+        description: "Start a new conversation with other agents (to answer a message, use mbx_reply instead). `to` accepts agent names (vida-dev), agent@host (vida-dev@fedora), role:<role>, * (everyone), or owner; find names with mbx_agents. Kind decides waking: request/task/decision/alert wake an idle recipient; message/reply wake only with needs_reply=true or an @mention; status NEVER wakes (it waits for the recipient's next prompt). Use kind=request/task with needs_reply=true when you need an answer. A successful send is acceptance, not recipient delivery, reply or task completion; queued transport retry is not a draft API. Avoid manually resending an uncertain send. Next: check mbx_inbox for answers.",
         inputSchema: {
             to: z.array(z.string().min(1)).min(1).max(20), subject: z.string().min(1).max(200), body: z.string().max(256 * 1024),
-            kind: z.enum(KINDS).default("message"), reply_to: z.string().optional().describe("id of the message you are answering; keeps the thread"),
+            kind: z.enum(KINDS).default("message").describe("request/task/decision/alert wake the recipient; message/reply wake only with needs_reply or an @mention; status never wakes"),
+            reply_to: z.string().optional().describe("id of the message you are answering; keeps the thread"),
             needs_reply: z.boolean().default(false), refs: z.array(z.string()).max(20).default([]),
             idempotency_key: z.string().max(100).optional().describe("same key twice sends only once"),
             origin: z.enum(["agent", "external"]).optional().describe("external when the content comes from outside (web page, issue, PR comment, email)"),
@@ -723,11 +824,11 @@ export async function runMcp(existing) {
             thread = m.thread;
             reply_to = m.id;
         }
-        const r = node.send({ from: agent, to, subject, body, kind, reply_to, thread, needs_reply, refs, ...relay(origin) }, session());
+        const r = node.send({ from: agent, to, subject, body, kind, reply_to, thread, needs_reply, refs, ...relay(origin, to) }, session());
         if (idempotency_key)
             node.store.set(`idem:${agent}:${idempotency_key}`, r.envelope.id);
         const out = { id: r.envelope.id, ref: `mbx:${r.envelope.id}@${node.host}`, thread: r.envelope.thread, delivered_locally: r.local, queued_for_hosts: r.remote,
-            owner_authority: !!r.envelope.authority, warnings: r.warnings };
+            owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...statusWakeWarning(r.envelope), ...depthWarning(r.envelope)] };
         return text(JSON.stringify(out, null, 2), out);
     });
     server.registerTool("mbx_reply", {
@@ -743,9 +844,9 @@ export async function runMcp(existing) {
         const m = node.read(id, agent);
         noteRead([m]);
         const subject = /^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`.slice(0, 200);
-        const r = node.send({ from: agent, to: [m.from_addr], subject, body, kind, reply_to: m.id, thread: m.thread, needs_reply, refs: [], ...relay(origin) }, session());
+        const r = node.send({ from: agent, to: [m.from_addr], subject, body, kind, reply_to: m.id, thread: m.thread, needs_reply, refs: [], ...relay(origin, [m.from_addr]) }, session());
         const out = { id: r.envelope.id, to: m.from_addr, thread: r.envelope.thread, reply_to: m.id, delivered_locally: r.local, queued_for_hosts: r.remote,
-            owner_authority: !!r.envelope.authority, warnings: r.warnings };
+            owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...depthWarning(r.envelope)] };
         return text(`${JSON.stringify(out, null, 2)}\nNext: mbx_ack ${m.id} if you are done with it.`, out);
     });
     server.registerTool("mbx_inbox", {
@@ -792,11 +893,15 @@ export async function runMcp(existing) {
     });
     server.registerTool("mbx_ack", {
         title: "Acknowledge mbx messages",
-        description: "Mark messages as dealt with (optionally with a short note). Acked messages leave the unread inbox. Ack after you reply or act; no need to send a separate \"acknowledged\" message. Next: mbx_inbox for anything else.",
+        description: "Mark messages as dealt with (optionally with a short note). Acked messages leave the unread inbox. Ack after you reply or act; no need to send a separate \"acknowledged\" message. Keep `did` to one line of at most 200 characters, action first; put detail in your thread reply. Next: mbx_inbox for anything else.",
         inputSchema: { ids: z.array(z.string().min(6)).min(1).max(50), note: z.string().max(500).optional(),
-            did: z.string().max(200).optional().describe("if you acted on the request: one line saying what you did (goes to the owner's audit log)") },
+            // No schema max: an over-long line must never fail the acks themselves; node.ack keeps it bounded and marked.
+            did: z.string().max(10_000).optional().describe("if you acted on the request: one line, at most 200 characters, saying what you did, action first (owner's audit log; longer text is cut and marked truncated)") },
         annotations: { idempotentHint: true },
-    }, ({ ids, note, did }) => text(`Acked: ${ids.map((i) => node.ack(i, current().agent, note ?? null, did)).join(", ")}`));
+    }, ({ ids, note, did }) => {
+        const acked = ids.map((i) => node.ack(i, current().agent, note ?? null, did)), warning = didWarning(did);
+        return text(`Acked: ${acked.join(", ")}${warning ? `\nwarning: ${warning}` : ""}`);
+    });
     server.registerTool("mbx_thread", {
         title: "Show an mbx thread",
         description: "Every message in a thread (pass a thread id or any message id in it), oldest first, with full content. Next: mbx_reply to the latest message if you need to answer.",
@@ -899,8 +1004,9 @@ export async function runMcp(existing) {
             process.stderr.write(`[mbx] identity control polling failed: ${error.message}\n`);
         }
     }, 250).unref());
-    // Channel push (Claude started with --dangerously-load-development-channels server:mbx): wake this session ourselves.
-    if (env.channel) {
+    // Push into this Claude session ourselves: the channel (started with --dangerously-load-development-channels server:mbx)
+    // or, with no flag at all, the session inbox socket (T202). Either way the daemon defers to this process.
+    if (env.channel || env.socket) {
         timers.push(setInterval(async () => {
             try {
                 if (base.released)
@@ -908,23 +1014,36 @@ export async function runMcp(existing) {
                 const agent = base.agent;
                 leases.withHeld(agent, base.leaseToken, () => undefined);
                 for (const mailbox of [agent, ...node.linkedNames(agent)]) {
-                    const { rows, wanted, brake } = leases.withHeld(agent, base.leaseToken, () => {
+                    if (wakeMutedUntil(node, mailbox))
+                        continue; // muted (T179): mail stays delivered and unread, no channel hint
+                    const { rows, wanted, reservation } = leases.withHeld(agent, base.leaseToken, () => {
                         const rows = node.store.db.prepare(`SELECT m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state='delivered' ORDER BY m.ts`).all(mailbox);
                         const wanted = rows.filter(r => node.wantsWake(mailbox, r) && hasWakeAuthority(node, mailbox, r));
-                        const brake = wanted.length ? node.takeWake(mailbox, wanted[0].thread) : null;
-                        return { rows, wanted, brake };
+                        const reservation = wanted.length ? node.reserveWake(mailbox, wanted[0].thread) : null;
+                        return { rows, wanted, reservation };
                     });
                     if (!rows.length)
                         continue;
                     if (wanted.length) {
-                        if (brake?.startsWith("batched"))
+                        if (reservation?.brake?.startsWith("batched"))
                             continue;
                         const linked = mailbox === agent ? "" : ` This is your linked mailbox: use agentmbx inbox --as ${mailbox} and agentmbx ack --as ${mailbox} <id>.`;
-                        if (!brake)
-                            await server.server.notification({ method: "notifications/claude/channel", params: {
-                                    content: wakeText(mailbox, wanted) + linked,
-                                    meta: { count: String(wanted.length), agent, mailbox },
-                                } });
+                        // a push that fails never reached the session: refund it and keep the mail delivered for the next tick
+                        if (!reservation?.brake)
+                            try {
+                                if (env.channel)
+                                    await server.server.notification({ method: "notifications/claude/channel", params: {
+                                            content: wakeText(mailbox, wanted) + linked,
+                                            meta: { count: String(wanted.length), agent, mailbox },
+                                        } });
+                                else
+                                    await socketPush(wakeText(mailbox, wanted) + linked);
+                                node.store.audit("wake.attempt", { agent: mailbox, session: `claude:${env.sessionId}`, outcome: "admitted", receipt: "transport", via: env.channel ? "claude channel" : "session socket" });
+                            }
+                            catch (e) {
+                                reservation?.release?.();
+                                throw e;
+                            }
                     }
                     leases.withHeld(agent, base.leaseToken, () => { for (const r of rows)
                         node.setDelivery(r.id, mailbox, "notified"); });
@@ -935,8 +1054,10 @@ export async function runMcp(existing) {
             }
         }, 1500).unref());
     }
+    publishConnector();
     // keep last_seen fresh while the session lives
     timers.push(setInterval(() => {
+        publishConnector();
         for (const state of [base, ...states.values()]) {
             if (state.released)
                 continue;

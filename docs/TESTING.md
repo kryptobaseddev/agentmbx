@@ -8,6 +8,7 @@ Runs in about ten seconds, and needs no network or model (the mDNS test uses loo
 | `test/envelope.test.ts` | canonical JSON, ULIDs, signatures and tamper detection, the body metadata parser, size limits |
 | `test/trust.test.ts` | the council's four trust tests, plus forged, expired and revoked grants, spoofing, local delivery, the wake brake, and the owner-key file |
 | `test/lan.test.ts` | two hosts over real HTTP: pairing code on both sides, approval, both directions, directory sync, an offline peer catching up, stale or forged hops rejected |
+| `test/retention.test.ts` | pruning keeps the window, unacked mail and the outbox; the dry run writes nothing; VACUUM; replay reports pruned gaps; identity export/import between two hosts over real HTTP keeps signed, sealed mail flowing; import refuses to overwrite without `--force` and backs up first |
 | `test/pair.test.ts` | token pairing both ways with messages flowing; wrong token (burned after 5), expired, reused, replayed hello, tampered transcript (owner key, host key, name, addr, rewritten hello), a fake token holder; SAS still works; mDNS TXT round-trip and a loopback advertise + browse |
 | `test/desktop.test.ts` | launchd plist (in-app launcher + `AssociatedBundleIdentifiers` when AgentMBX.app is present), systemd unit, app bundle discovery/install, notifier selection (AgentMBX.app, osascript, notify-send). The Swift build is not part of `npm test` |
 | `test/mcp.test.ts` | the real MCP client over stdio: every tool, framing, idempotency, and the Claude channel push (without the message body) |

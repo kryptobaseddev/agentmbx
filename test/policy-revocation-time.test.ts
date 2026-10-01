@@ -13,7 +13,7 @@ function fixture(t: TestContext) {
   const home = mkdtempSync(join(tmpdir(), "mbx-revocation-time-")), owner = generateKeyPair();
   writeFileSync(join(home, "owner.json"), JSON.stringify({ backend: "keychain", public_key: owner.publicKey }), { mode: 0o600 });
   const n = new MbxNode(home, { host: "alpha" }), db = n.store.db;
-  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const policy = (delta = 0) => makePolicy({ level: "autonomous", agents: ["worker"], hosts: ["alpha"], ownerPub: owner.publicKey, now: new Date(instant + delta) });
   const accept = (rec: AnyRecord, signer = owner) => acceptSigned(db, { rec, sig: signData(signer.privateKey, canonical(rec)) }, "alpha");
   const active = () => activePolicies(db, "worker", "alpha", new Date(instant + 60000));

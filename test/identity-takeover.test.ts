@@ -15,7 +15,7 @@ import type { IdentityControlDescriptor } from "../src/identity-control.ts";
 function setup(t: { after: (fn: () => void) => void }) {
   const home = mkdtempSync(join(tmpdir(), "mbx-takeover-")), node = new MbxNode(home, { host: "alpha" }), owner = generateKeyPair();
   writeFileSync(join(home, "owner.json"), JSON.stringify({ v: 1, backend: "keychain", public_key: owner.publicKey }), { mode: 0o600 });
-  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const leases = new IdentityLeases(node.store, { inspect: () => ({ alive: true, start: "fixture" }) });
   const oldKey = generateKeyPair();
   const old = leases.claim("occupied", { pid: process.pid, start: "fixture", keyFp: fingerprint(oldKey.publicKey), cli: "claude", sessionId: "old" });

@@ -11,7 +11,7 @@ import { decidePermission, approveKimi, opencodePermissionPass } from "../src/pe
 const yes = () => ({ ok: true, policy_id: "test-policy" });
 function fixture(t: TestContext, cli: string, sessionId = "s1") {
   const home = mkdtempSync(join(tmpdir(), "mbx-permission-lease-")), node = new MbxNode(home, { host: "alpha" });
-  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const key = generateKeyPair(), leases = new IdentityLeases(node.store);
   const holder = { pid: process.pid, start: inspectLeaseProcess(process.pid).start!, keyFp: fingerprint(key.publicKey), cli, sessionId };
   node.bindSession({ agent: "worker", cli, session_id: sessionId, pid: process.pid, session_key: key.publicKey, cwd: "/work" });

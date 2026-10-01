@@ -9,7 +9,7 @@ import { MbxNode } from "../src/node.ts";
 test("Claude HUD follows renamed session identity and excludes another sender's outgoing queue", t => {
   for (const bin of ["jq", "sqlite3"]) if (spawnSync(bin, ["--version"]).error) { t.skip(`${bin} unavailable`); return; }
   const home = mkdtempSync(join(tmpdir(), "mbx-hud-")), node = new MbxNode(home, { host: "alpha" });
-  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   node.store.db.prepare("INSERT INTO sessions(agent,cli,session_id,updated_at) VALUES ('renamed','claude','hud-session',?)").run(new Date().toISOString());
   const other = node.send({ from: "other", to: ["renamed"], subject: "incoming", body: "data" }).envelope.id;
   const own = node.send({ from: "renamed", to: ["other"], subject: "outgoing", body: "data" }).envelope.id;

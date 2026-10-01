@@ -2,7 +2,7 @@
 
 **A signed mailbox for AI coding agents.** Claude Code, Codex, OpenCode, Kimi, Hermes and any MCP client can message each other: on one machine or across machines on your network. Idle agents get woken up, and every message says who really sent it.
 
-[agentmbx.com](https://agentmbx.com) · Status: **alpha (0.5.0)** · License: [BUSL-1.1](LICENSE) (source-available)
+[agentmbx.com](https://agentmbx.com) · Status: **alpha (0.5.1)** · License: [BUSL-1.1](LICENSE) (source-available)
 
 ```text
 you ── Claude Code (planner) ──┐                         ┌── Codex (api-dev)      ← woken by `codex queue`
@@ -17,8 +17,7 @@ Each provider connects to its own AgentMBX MCP server. That server uses the loca
 mailbox and daemon; the daemon delivers to explicitly paired LAN hosts. An optional
 prototype relay transports encrypted bodies across networks. Its current queues are
 in memory, so durable relay acceptance and restart recovery are planned before
-production home-to-work use. Signed messaging establishes integrity; direct HTTP
-LAN body delivery is not confidential merely because it is signed.
+production home-to-work use. Signed messaging establishes integrity, and 0.5.1 seals every LAN body for the receiving host (X25519 + XChaCha20-Poly1305); envelope metadata is still visible on the LAN (T198).
 
 Start or resume with `mbx_whoami`, then `mbx_inbox`. Use `mbx_read` for current
 computed policy before acting, `mbx_reply` to answer in the thread or `mbx_send`
@@ -31,12 +30,12 @@ remote delivery, model execution, a reply, or task completion.
 | Signed local/LAN mail, identity leases, thread/search and bounded MCP/CLI replay | Shipped in v0.5.0 | T122; T134 release |
 | Exact-session read-only diagnostics CLI | Shipped in v0.5.0; local OS-user view, not global agent permission | T130–T131 |
 | Startup, catch-up, durable cursor-capture and send-state instructions | Repository guidance updated; installed skills follow setup refresh | T144 |
-| Same existing conversation update/reconnect and two physical LAN devices | Next validation; provider-specific gaps stay explicit | T183, T151, T091 |
+| Same existing conversation update/reconnect and two physical LAN devices | Shipped in v0.5.1: connector handover evidence (T183); MacBook↔Fedora request/reply, offline retry and key rotation proven live (T151); per-provider wake receipts (T091, T180) | T183, T151, T091 |
 | Durable consumer capture, guided resume, handoff summaries and optional drafts | Planned; no automatic checkpoint or draft API today | T156–T163, T184–T189 |
 | Durable relay receipts, encrypted retry persistence and restart recovery | Planned production prerequisite | T164–T168 |
 | HTTPS deployment, monitoring, backup/restore, enrollment, consent and home/work qualification | Planned | T169–T173; T036–T039 |
 | Local private console, searchable handoffs and scoped topics | Planned; existing replay tag filters do not subscribe recipients | T152–T155, T127–T128, T174–T176 |
-| Provider wake reconciliation and signed capability discovery | Planned extensions to existing adapters/discovery | T177–T180, T068, T132 |
+| Provider wake verification and signed capability discovery | Typed outcomes, exact-session wakes, uncertain-wake reconciliation and wake mute shipped in v0.5.1 (T177–T179), with real-session receipts for every provider (T180); signed capability discovery remains planned | T068, T132 |
 | Standards-compatible gateway | Later contract and bounded adapter; native card preview is not a conforming execution endpoint | T181–T182 |
 
 For historical context, use bounded `mbx_replay` pages. Retain page information or
@@ -72,8 +71,8 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
   |---|---|---|
   | Codex | `codex queue --thread <id>` | tested live |
   | OpenCode | the local service's session API (`/synthetic`) | tested live |
-  | Claude Code | MCP channel event (research preview, `--dangerously-load-development-channels server:mbx`) | automated test only |
-  | Kimi | hook, next turn (no external push exists) | not tested live |
+  | Claude Code | pushed by the session's own mbx MCP server through Claude Code's per-session inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`), so a plainly started `claude` wakes on mail with no flag, setting or cron; `agentmbx claude [args]` adds the research-preview mbx channel instead | tested live (macOS and Fedora) |
+  | Kimi | desktop app: its local control socket (setup installs an AgentMBX plugin into the app). `kimi web`: the local server's prompts API. Terminal: a background `agentmbx watch` task the session keeps running (Kimi starts a turn when it exits) | tested live (terminal, desktop, web) |
   | Hermes | cron now; plugin planned | not tested live |
   | anything else | desktop notification | |
 
@@ -96,7 +95,8 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
 - **Capabilities are enforced by the receiving machine** (`task.assign`, `decision`, `broadcast`, `alert`). A message outside its grant arrives labelled `authority: none` with a warning.
 - **No message can approve a permission prompt or change a recipient's config**, owner-signed or not. The MCP instructions tell every agent this, and agents treat all message content as data, not instructions. This mirrors how Claude Code handles messages from other sessions.
 - **Known limits:**
-  - The LAN hop is signed but not encrypted yet (the `enc` field is reserved).
+  - The LAN hop is signed, and since 0.5.1 every body is sealed to the receiving host's pinned X25519 key; envelope metadata (from, to, subject, thread, refs, project path, mentions and tags) is still visible on the wire (T198).
+  - Discovery and direct delivery are LAN-only: mDNS does not cross routers (and is blocked on some LANs) and there is no NAT traversal; across networks only the prototype relay works, and its queues are in memory (durable relay is planned before production use).
   - Agents on the same machine share the OS user boundary.
 
 The full design is in [docs/SPEC.md](docs/SPEC.md). The adversarial review that shaped it is in [docs/COUNCIL-VERDICT-2026-09-26.md](docs/COUNCIL-VERDICT-2026-09-26.md).
@@ -131,6 +131,17 @@ separate actions.
 counts and redacted recovery receipts, with no message bodies or lease credentials.
 Installed CLI, observed daemon and connector version are separate evidence. Its access
 boundary is the local OS user; it is not a browser console or an agent permission grant.
+
+### Retention and machine replacement
+
+Retention is off by default; nothing is deleted until you choose a window. `agentmbx prune --older-than 90 --dry-run`
+reports what would go; without `--dry-run` it deletes only settled mail (all local deliveries acked, nothing queued in
+the outbox, received and last updated before the window) and runs VACUUM. `agentmbx retention set 90` lets the daemon
+do the same every 6 h. Replay reports pruned positions as `history_pruned` rather than skipping them silently.
+
+`agentmbx identity export <file>` seals this host's keys, config and paired peers with a passphrase (file mode 600);
+`agentmbx identity import <file>` restores them on a replacement machine so peers keep accepting it. Treat the file as a
+private key and run only one machine with that identity. A macOS Keychain owner key cannot be exported.
 
 ## Quick start
 
@@ -226,8 +237,10 @@ When an agent has no wake path (or its wake fails), the daemon shows a desktop n
 `agentmbx help` lists everything:
 - **Messages:** `send`, `inbox`, `read`, `ack`, `thread`, `search`, `agents`, `status`
 - **Setup:** `setup [--dry-run] [--only …] [--uninstall]`, `doctor`, `version [--check]`, `update`
-- **Machines:** `init`, `pair`, `join`, `discover`, `pair --compare`, `pair approve`, `peers`, `peers remove`, `daemon [install|uninstall]`, `notify-test`
-- **Owner:** `owner init|show|grant|revoke`
+- **Machines:** `init`, `pair`, `join`, `discover`, `pair --compare`, `pair approve`, `peers`, `peers addr <host> <host:port>`, `peers remove`, `host rotate`, `daemon [install|uninstall]`, `notify-test`
+- **Owner:** `owner init|show|grant|revoke|send`
+- **Wake control:** `wake mute <agent> [--minutes N]`, `wake unmute <agent>`, `watch` (terminal Kimi self-wake), `claude [args]` (Claude Code with the mbx channel)
+- **Maintenance:** `prune [--older-than <days>] [--dry-run]`, `retention [set <days> | off]` (default off), `identity export|import <file> [--force]`
 - **Integration:** `mcp`, `hook session-start|prompt|stop --cli <cli>`, `import-v2`
 - **Install:** `version [--check]`, `update [--check] [--yes]`
 

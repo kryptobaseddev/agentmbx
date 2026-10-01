@@ -14,9 +14,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo, Server } from "node:net";
 import { kimiHostedServer, kimiServer } from "../src/kimi-web.ts";
-import { bindWakeLease } from "./helpers/wake-lease.ts";
+import { bindWakeLease, delegateWake } from "./helpers/wake-lease.ts";
 import { MbxNode } from "../src/node.ts";
 import { dispatchWakes, wakeKimi, type WakeResult } from "../src/wake.ts";
+
+/** The legacy fields; the typed outcome (T178) is asserted separately. */
+const legacy = ({ outcome: _o, ...r }: { outcome?: unknown } & Record<string, unknown>) => r;
 
 process.env.MBX_NO_DESKTOP = "1";
 const tmp = () => mkdtempSync(join(tmpdir(), "mbx-kimi-"));
@@ -99,7 +102,7 @@ for (const concurrent of [false, true]) test(`busy race releases only its reserv
     assert.deepEqual(deliveries(n), [{ state: "delivered", note: null }]);
     const wakes = n.store.db.prepare("SELECT thread FROM wakes").all() as { thread: string }[];
     assert.deepEqual(wakes.map((r) => r.thread), concurrent ? ["another-thread"] : []);
-    const second = await dispatchWakes(n);
+    const second = await dispatchWakes(n, Date.now() + 3_000); // past the first busy backoff step (T179)
     if (concurrent) {
       assert.deepEqual(second, [], "the concurrent continuation still enforces the shared brake");
       assert.equal(prompts, 0);
@@ -166,7 +169,7 @@ test("kimiHostedServer: only a live instances row for this very pid counts as ho
 test("wakeKimi submits the wake text as a user prompt with the bearer token", async () => {
   const { server, url, seen } = await fakeKimiServer({ model: "kimi-code/kimi-for-coding" });
   const r = await wakeKimi({ session_id: "session_t", pid: null }, "wake text here", { server: { url, token: "tok" } });
-  assert.deepEqual(r, { ok: true, via: "kimi web" });
+  assert.deepEqual(legacy(r), { ok: true, via: "kimi web" }); assert.equal(r.outcome?.kind, "admitted");
   assert.equal(seen.length, 2);
   assert.equal(seen[0].method, "GET");
   assert.match(seen[0].url, /\/api\/v1\/sessions\/session_t\/status$/);
@@ -183,7 +186,7 @@ test("wakeKimi submits the wake text as a user prompt with the bearer token", as
 test("wakeKimi on a busy session returns retry and submits no prompt", async () => {
   const { server, url, seen } = await fakeKimiServer({ busy: true, model: "m" });
   const r = await wakeKimi({ session_id: "session_t", pid: null }, "wake", { server: { url, token: "tok" } });
-  assert.deepEqual(r, { ok: false, via: "kimi web", error: "session busy", retry: true });
+  assert.deepEqual(legacy(r), { ok: false, via: "kimi web", error: "session busy", retry: true }); assert.equal(r.outcome?.kind, "busy");
   assert.equal(seen.filter((s) => s.method === "POST").length, 0, "no prompt submitted while the session is mid-turn");
   server.close();
 });
@@ -191,7 +194,7 @@ test("wakeKimi on a busy session returns retry and submits no prompt", async () 
 test("wakeKimi passes the server default model when the session has none bound (the 'Model not set' fix)", async () => {
   const { server, url, seen } = await fakeKimiServer({ model: null, defaultModel: "kimi-code/kimi-for-coding" });
   const r = await wakeKimi({ session_id: "session_t", pid: null }, "wake", { server: { url, token: "tok" } });
-  assert.deepEqual(r, { ok: true, via: "kimi web" });
+  assert.deepEqual(legacy(r), { ok: true, via: "kimi web" }); assert.equal(r.outcome?.kind, "admitted");
   const post = seen.find((s) => s.method === "POST")!;
   assert.equal((JSON.parse(post.body) as { model?: string }).model, "kimi-code/kimi-for-coding");
   server.close();
@@ -224,7 +227,7 @@ test("wakeKimi refuses terminal TUI sessions (no instances row for the pid) with
   server.on("request", () => { httpCalls++; });
   await withKimiHome(home, async () => {
     const r = await wakeKimi({ session_id: "session_t", pid: 2 ** 22 + 12345 }, "wake");
-    assert.deepEqual(r, { ok: false, via: "kimi web", error: "not a kimi web-hosted session" });
+    assert.deepEqual(legacy(r), { ok: false, via: "kimi web", error: "not a kimi web-hosted session" }); assert.equal(r.outcome?.kind, "not_submitted");
   });
   assert.equal(httpCalls, 0, "terminal sessions are rejected before any request");
   server.close();
@@ -268,7 +271,8 @@ test("a busy hosted session is skipped without spending the brake, and is woken 
     assert.deepEqual(deliveries(n), [{ state: "delivered", note: null }], "mail stays queued while the session works");
     assert.equal((n.store.db.prepare("SELECT count(*) n FROM wakes WHERE agent='web'").get() as { n: number }).n, 0, "the busy gate spends no wake budget");
     state.busy = false;
-    const second = await dispatchWakes(n);
+    assert.deepEqual(await dispatchWakes(n), [], "busy backs off: the very next pass does not ask again (T179)");
+    const second = await dispatchWakes(n, Date.now() + 3_000);
     assert.deepEqual(second.map((o) => [o.result.ok, o.result.via]), [[true, "kimi web"]]);
     assert.deepEqual(deliveries(n), [{ state: "notified", note: null }]);
     assert.equal(seen.filter((s) => s.method === "POST").length, 1, "exactly one prompt, submitted once idle");
@@ -309,7 +313,7 @@ test("terminal kimi sessions are never woken: the wake falls back to the desktop
     assert.equal(out[0].result.ok, false);
     assert.equal(out[0].result.via, "kimi web", "the desktop is disabled in tests, so the original failure surfaces");
     assert.deepEqual(deliveries(n), [{ state: "notified", note: "desktop" }]);
-    assert.equal(n.deliveryMode("term"), "no push: new mail shows on your user's next prompt, or when your [mbx-watch] self-check runs");
+    assert.equal(n.deliveryMode("term"), "no push: new mail shows on your user's next prompt, or when your mbx watcher or [mbx-watch] self-check runs");
   });
   n.close();
   server.close();
@@ -325,7 +329,7 @@ test("mail that only reached the desktop is retried when a hosted kimi session b
     n.setDelivery(id, "web", "notified", "desktop");
     bindWakeLease(n, { agent: "web", cli: "kimi", session_id: "session_t049", pid: process.pid });
     assert.equal((n.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=?").get(id) as { state: string }).state, "delivered", "a hosted binding re-queues desktop-only mail for a real wake");
-    assert.equal(n.deliveryMode("web"), "push (kimi web)");
+    assert.equal(n.deliveryMode("web"), "push (kimi web or desktop app)");
   });
   n.close();
   server.close();
@@ -370,8 +374,10 @@ for (const downgrade of ["unverified", "relay-limit", "no-policy"]) test(`daemon
   await withKimiHome(kimiHomeWithInstance(12345), async () => {
     bindWakeLease(n, { agent: "web", cli: "kimi", session_id: "session_policy", pid: process.pid });
     if (downgrade === "no-policy") n.store.db.prepare("UPDATE policies SET revoked=1").run();
+    // autonomous has no depth limit (T104): the relay limit is exercised under collaborate, whose allowance is 20
+    if (downgrade === "relay-limit") { n.store.db.prepare("UPDATE policies SET revoked=1").run(); delegateWake(n, "web", "collaborate"); }
     const id = sendLeased(n, { from: "claimed", to: ["web"], subject: "ask", body: "private", kind: "request",
-      unverifiedSender: downgrade === "unverified", hop: downgrade === "relay-limit" ? 1000 : undefined }).envelope.id;
+      unverifiedSender: downgrade === "unverified", hop: downgrade === "relay-limit" ? 21 : undefined }).envelope.id;
     let calls = 0; t.mock.method(globalThis, "fetch", async () => { calls++; throw new Error("must not call provider"); });
     await dispatchWakes(n);
     assert.equal(calls, 0); assert.equal(n.unreadCount("web"), 1);

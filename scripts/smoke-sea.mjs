@@ -3,7 +3,7 @@
 // Runs version, init, send, inbox (exercises node:sqlite inside the SEA) and an MCP initialize + tools/list +
 // mbx_whoami over stdio, all against a throwaway MBX_HOME. Exits non-zero on the first failure.
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -72,7 +72,10 @@ try {
   const retry = await replay({ limit: 1, max_bytes: 2048 });
   check(JSON.stringify(page) === JSON.stringify(retry), "replay retry preserves page and cursor");
   const diagnostic = JSON.parse(run("diagnostics", "--mailbox", "smoker", "--json"));
-  check(diagnostic.builds.installed.version === "0.5.0" && diagnostic.builds.connector.version === null, "diagnostics distinguishes installed and unknown connector versions");
+  // The held MCP process reports its own build (T183): installed and connector versions are separate fields that agree here.
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+  check(diagnostic.builds.installed.version === pkg && diagnostic.builds.connector.version === pkg && diagnostic.builds.connector.tools?.includes("mbx_replay"),
+    "diagnostics reports installed and running connector builds separately");
   check(diagnostic.ownership.state === "held" && diagnostic.messages.unread === 1, "diagnostics observes holder and unread fixture without consuming mail");
   check(!JSON.stringify(diagnostic).includes("smoke test"), "diagnostics omits message subjects and bodies");
   check(snapshot() === beforeReplay, "replay and diagnostics preserve every temporary database row");

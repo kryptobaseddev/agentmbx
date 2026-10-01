@@ -10,7 +10,7 @@ import { acceptSigned, effectivePolicy, hasClass, makePolicy } from "../src/poli
 
 test("principal policies use verified local ownership and current signed peer envelopes", (t) => {
   const homes: string[] = [], nodes: MbxNode[] = [];
-  t.after(() => { nodes.forEach(n => n.close()); homes.forEach(h => rmSync(h, { recursive: true, force: true })); });
+  t.after(() => { nodes.forEach(n => n.close()); homes.forEach(h => rmSync(h, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })); });
   const host = (name: string) => {
     const home = mkdtempSync(join(tmpdir(), "mbx-principal-")); homes.push(home);
     const owner = generateKeyPair();

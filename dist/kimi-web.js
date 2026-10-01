@@ -7,6 +7,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { setKimiHostedCheck } from "./wake-check.js";
+import { kimiDesktop } from "./kimi-desktop.js";
 export const kimiCodeHome = () => process.env.KIMI_CODE_HOME || join(homedir(), ".kimi-code");
 const alive = (pid) => { try {
     process.kill(pid, 0);
@@ -65,5 +66,8 @@ export function kimiHostedServer(pid, kimiHome = kimiCodeHome(), isAlive = alive
     }
     return null;
 }
+/** Is `pid` a Kimi process hosting several conversations (a `kimi web` server or the desktop daimon)? Their sessions are
+ *  woken through the host's API, and their conversations link to their mbx servers by bind ticket (bind-ticket.ts). */
+export const kimiMultiHost = (pid) => !!pid && (kimiHostedServer(pid) !== null || kimiDesktop(pid) !== null);
 // Register the real hosted check for node core (T067): node.ts asks wake-check, never this adapter.
-setKimiHostedCheck((pid) => kimiHostedServer(pid) !== null);
+setKimiHostedCheck(kimiMultiHost);

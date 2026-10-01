@@ -4,6 +4,9 @@ import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { wakeKimi } from '../src/wake.ts';
 
+/** The legacy fields; the typed outcome (T178) is asserted separately. */
+const legacy = ({ outcome: _o, ...r }: { outcome?: unknown } & Record<string, unknown>) => r;
+
 const session = { session_id: 'session_contract', pid: null };
 const server = { url: 'http://127.0.0.1:1', token: 'fixture-token' };
 const receipt = { code: 0, data: { prompt_id: 'prompt_fixture', status: 'running' } };
@@ -31,7 +34,8 @@ for (const accepted of ['running', 'queued', 'blocked']) {
   test(`valid ${accepted} receipt means accepted submission only`, async () => {
     const result = await wakeKimi(session, 'check inbox', { server, fetch: (async (_url, init) =>
       Response.json(init?.method === 'POST' ? { code: 0, data: { prompt_id: 'p', status: accepted } } : status)) as typeof fetch });
-    assert.deepEqual(result, { ok: true, via: 'kimi web' });
+    assert.deepEqual(legacy(result), { ok: true, via: 'kimi web' }); assert.equal(result.outcome?.kind, 'admitted');
+    assert.equal(result.outcome?.kind === 'admitted' && result.outcome.receipt.nativeStatus, accepted, 'the native state is kept, not hidden (WC-13)');
   });
 }
 for (const stage of ['status', 'config', 'prompts']) {

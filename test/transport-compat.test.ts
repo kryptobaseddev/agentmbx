@@ -21,11 +21,12 @@ test("unsupported peers retain queued mail without legacy fallback, then deliver
     else if (redirect) res.writeHead(307, { location: "/v1/envelopes" }).end();
     else res.writeHead(404).end("old receiver: unknown endpoint");
   });
-  t.after(async () => { await new Promise<void>(resolve => server.close(() => resolve())); a.close(); b.close(); homes.forEach(h => rmSync(h, { recursive: true, force: true })); });
+  t.after(async () => { await new Promise<void>(resolve => server.close(() => resolve())); a.close(); b.close(); homes.forEach(h => rmSync(h, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })); });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port, addr = `127.0.0.1:${port}`;
   a.addApprovedPeer({ host: "beta", pubkey: b.key.publicKey, owner_pubkey: null, addr }, "fixture");
   b.addApprovedPeer({ host: "alpha", pubkey: a.key.publicKey, owner_pubkey: null, addr: "unused" }, "fixture");
+  a.store.db.prepare("UPDATE peers SET enc_pub=? WHERE host='beta'").run(b.encKey.publicKey); // learned earlier (T028): exercise the v2 path
   const unverified = a.send({ from: "sender", to: ["recipient@beta"], subject: "unverified", body: "readable" }).envelope;
   const leased = sendLeased(a, { from: "sender", to: ["recipient@beta"], subject: "leased", body: "verified holder" }).envelope;
   assert.deepEqual(await flushOutbox(a), { sent: 0, failed: 0 });

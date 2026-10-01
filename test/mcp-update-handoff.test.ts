@@ -23,7 +23,7 @@ for (const cli of ["claude", "codex", "opencode"]) test(`${cli} build handover f
   const node = new MbxNode(home, { host: "alpha" }), client = new Client({ name: "handoff-test", version: "1" });
   let catalogChanges = 0;
   client.setNotificationHandler(ToolListChangedNotificationSchema, () => { catalogChanges++; });
-  t.after(async () => { await client.close(); node.close(); rmSync(root, { recursive: true, force: true }); });
+  t.after(async () => { await client.close(); node.close(); rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const env: NodeJS.ProcessEnv = { ...process.env, MBX_HOME: home, MBX_AGENT: "update-reader", MBX_CLI: cli, MBX_NO_DESKTOP: "1" };
   delete env.AGENTMBX_DEV;
   delete env.MBX_MCP_REEXEC;
@@ -49,8 +49,10 @@ for (const cli of ["claude", "codex", "opencode"]) test(`${cli} build handover f
     const messages = node.store.db.prepare("SELECT * FROM messages ORDER BY id").all();
     if (generation === 1) writeFileSync(mcpPath, currentMcp);
     appendFileSync(join(install, "dist/cli.js"), "\n// deployed build\n");
-    const final = await call(ids[0], "mbx_inbox");
+    const final = await call(ids[0], generation === 1 ? "mbx_whoami" : "mbx_inbox");
     assert.notEqual(final.isError, true, "the final call must finish under the old lease");
+    if (generation === 1) assert.match(String((final.structuredContent as { switching?: string }).switching), /hands over to it after this call/,
+      "the old build says its answer is about to be superseded");
     const deadline = Date.now() + 10_000;
     while (node.store.db.prepare("SELECT released_at FROM identity_leases WHERE name=?").get(names[0])!.released_at === null) {
       assert.ok(Date.now() < deadline, "old generation did not retire");
@@ -65,6 +67,7 @@ for (const cli of ["claude", "codex", "opencode"]) test(`${cli} build handover f
     for (const [i, sid] of ids.entries()) {
       const who = await call(sid, "mbx_whoami");
       assert.notEqual(who.isError, true, JSON.stringify(who));
+      assert.equal((who.structuredContent as { switching?: string }).switching, undefined, "the replacement reports no pending switch");
       assert.equal((who.structuredContent as { agent: string }).agent, names[i]);
       const lease = node.store.db.prepare("SELECT holder_pid,token,released_at FROM identity_leases WHERE name=?").get(names[i])!;
       assert.notEqual(lease.holder_pid, old.holder_pid);

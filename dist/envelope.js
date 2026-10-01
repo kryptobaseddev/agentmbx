@@ -1,10 +1,14 @@
 // The signed message envelope, owner grants, and the body metadata parser.
 import { canonical, fingerprint, nonce, sha256, signData, ulid, verifyData } from "./crypto.js";
-import { checkEnc } from "./body-encryption.js";
+import { checkEnc, sealBody } from "./body-encryption.js";
 export const KINDS = ["message", "request", "reply", "status", "decision", "alert", "task"];
 export const MAX_BODY = 256 * 1024;
 // Saturating wire counter: this value means at least this many relay steps.
 export const MAX_RELAY_DEPTH = 1000;
+// Per-envelope caps for input from the network (T029). The senders' own limits are tighter (MCP: 20 recipients, 20 refs).
+export const MAX_SUBJECT = 200, MAX_RECIPIENTS = 100, MAX_REFS = 100, MAX_FIELD = 300, MAX_REF = 2048;
+/** A sealed body on the wire: base64 of the MAX_BODY plaintext plus the 16-byte AEAD tag. */
+export const MAX_SEALED_BODY = 4 * Math.ceil((MAX_BODY + 16) / 3);
 export const NAME_RE = /^[a-z0-9][a-z0-9-]{1,39}$/;
 export function parseMeta(body) {
     const uniq = (xs) => [...new Set(xs)];
@@ -26,7 +30,7 @@ export function buildEnvelope(d, now = new Date()) {
     const id = ulid(now.getTime());
     return {
         v: 3, id, ts: now.toISOString(), from: d.from, to: d.to, thread: d.thread ?? id, reply_to: d.reply_to ?? null,
-        kind: d.kind ?? "message", subject: d.subject.slice(0, 200), body: d.body, needs_reply: d.needs_reply ?? false,
+        kind: d.kind ?? "message", subject: oneLine(d.subject).slice(0, 200), body: d.body, needs_reply: d.needs_reply ?? false,
         refs: d.refs ?? [], meta: { ...parseMeta(d.body), ...(d.unverifiedSender ? { sender_verification: "unverified" } : {}), ...(d.origin === "external" ? { origin: "external" } : {}), ...(d.hop ? { hop: d.hop } : {}), ...(d.project ? { project: d.project.slice(0, 300) } : {}) },
         authority: null, enc: null,
     };
@@ -40,10 +44,18 @@ const unsigned = (e) => { const { sig: _s, body, ...rest } = e; return canonical
 export function signEnvelope(e, host, hostPub, hostPriv) {
     return { ...e, sig: { alg: "ed25519", host, key: fingerprint(hostPub), value: signData(hostPriv, unsigned(e)) } };
 }
+/** Seal the body for one recipient host's enc key and host-sign the wire form (T028). Local copies stay plaintext (D001). */
+export function sealEnvelope(e, recipientEncPub, host, hostPub, hostPriv) {
+    const sealed = sealBody(e.body, recipientEncPub, e.id);
+    return signEnvelope({ ...e, enc: sealed, body: sealed.body }, host, hostPub, hostPriv);
+}
 export function verifyEnvelope(e, hostPub) {
     return !!e.sig && e.sig.alg === "ed25519" && e.sig.key === fingerprint(hostPub) && verifyData(hostPub, unsigned(e), e.sig.value);
 }
 /** Structural validation of anything that claims to be an envelope (input from the network or the store). */
+/** Line breaks and other control characters, which could make sender text look like AgentMBX header lines (T196, F8). */
+const CONTROL = /[\u0000-\u001f\u007f\u0085\u2028\u2029]/;
+export const oneLine = (s) => s.replace(new RegExp(CONTROL.source, "g"), " ");
 export function checkShape(x) {
     const e = x;
     if (!e || typeof e !== "object")
@@ -54,28 +66,48 @@ export function checkShape(x) {
         return "bad id";
     if (typeof e.from !== "string" || !e.from.includes("@"))
         return "bad from";
+    if (e.from.length > MAX_FIELD)
+        return `from over ${MAX_FIELD} characters`;
     if (!Array.isArray(e.to) || !e.to.length || e.to.some((t) => typeof t !== "string"))
         return "bad to";
+    if (e.to.length > MAX_RECIPIENTS)
+        return `more than ${MAX_RECIPIENTS} recipients`;
+    if (e.to.some((t) => t.length > MAX_FIELD))
+        return `recipient over ${MAX_FIELD} characters`;
     if (!KINDS.includes(e.kind))
         return "bad kind";
-    if (typeof e.body !== "string" || Buffer.byteLength(e.body) > MAX_BODY)
+    if (e.enc === undefined)
+        return "bad enc";
+    if (typeof e.body !== "string")
         return "bad body";
+    const maxBody = e.enc === null ? MAX_BODY : MAX_SEALED_BODY; // wire form of a sealed body is its base64 ciphertext
+    if (Buffer.byteLength(e.body) > maxBody)
+        return `body over ${maxBody} bytes`;
     if (typeof e.subject !== "string")
         return "bad subject";
+    if (e.subject.length > MAX_SUBJECT)
+        return `subject over ${MAX_SUBJECT} characters`;
+    if (CONTROL.test(e.subject))
+        return "subject contains control characters"; // T196 (F8): no fake header lines
     if (typeof e.ts !== "string" || Number.isNaN(Date.parse(e.ts)))
         return "bad ts";
-    if (typeof e.thread !== "string")
+    if (typeof e.thread !== "string" || e.thread.length > MAX_FIELD)
         return "bad thread";
-    if (e.reply_to !== null && typeof e.reply_to !== "string")
+    if (e.reply_to !== null && (typeof e.reply_to !== "string" || e.reply_to.length > MAX_FIELD))
         return "bad reply_to";
     if (typeof e.needs_reply !== "boolean")
         return "bad needs_reply";
     if (!Array.isArray(e.refs) || e.refs.some(value => typeof value !== "string"))
         return "bad refs";
-    if (e.enc === undefined)
-        return "bad enc";
-    if (e.enc !== null)
-        return checkEnc(e.enc);
+    if (e.refs.length > MAX_REFS || e.refs.some((r) => r.length > MAX_REF))
+        return `more than ${MAX_REFS} refs or a ref over ${MAX_REF} characters`;
+    if (e.enc !== null) { // sealed envelopes still get the authority/meta checks below
+        const bad = checkEnc(e.enc);
+        if (bad)
+            return bad;
+        if (e.enc.body.length > MAX_SEALED_BODY)
+            return `sealed body over ${MAX_SEALED_BODY} bytes`;
+    }
     const a = e.authority;
     if (a !== null) {
         if (!a || typeof a !== "object" || Array.isArray(a))
@@ -131,14 +163,18 @@ export function makeGrant(ownerPub, ownerPriv, sessionPub, agent, host, caps, ho
     const g = buildGrant(ownerPub, sessionPub, agent, host, caps, hours, now);
     return { ...g, sig: signData(ownerPriv, grantPayload(g)) };
 }
+// Authority signatures commit to the pre-sealing form: transport sealing (T028) fills `enc` and swaps the
+// body for ciphertext after signing, so verifiers pass the opened envelope and a filled `enc` reads as the
+// `enc: null` it was signed with. Envelopes without the field keep canonicalizing without it.
+const presealed = (rest) => (rest.enc ? { ...rest, enc: null } : rest);
 /** What the session key signs: the envelope without its host signature and without the session signature itself. */
 const sessionPayload = (e) => {
     const { sig: _s, authority, ...rest } = e;
-    return canonical({ ...rest, authority: authority?.grant ? { grant: authority.grant } : null });
+    return canonical({ ...presealed(rest), authority: authority?.grant ? { grant: authority.grant } : null });
 };
 const ownerPayload = (e) => {
     const { sig: _s, authority, ...rest } = e;
-    return canonical({ ...rest, authority: { owner_fp: authority?.owner_fp ?? null } });
+    return canonical({ ...presealed(rest), authority: { owner_fp: authority?.owner_fp ?? null } });
 };
 /** Step 1 of an owner-signed envelope: `payload` is the exact bytes the owner key signs (via ownerSignCanonical). */
 export function ownerSignRequest(e, ownerPub) {
