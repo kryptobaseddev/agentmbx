@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { main } from "../src/cli.ts";
 import { canonical, fingerprint, generateKeyPair, verifyData } from "../src/crypto.ts";
 import { buildEnvelope, buildGrant, checkAuthority, grantPayload, ownerSignRequest, type Envelope, type Grant } from "../src/envelope.ts";
-import { MbxNode } from "../src/node.ts";
+import { MbxNode, formatFor } from "../src/node.ts";
 import {
   authHelperPath, createKeychainOwner, createOwnerKey, defaultOwnerBackend, helperError, keychainOwnerStatus, ownerInfo, ownerJsonPath,
   ownerPublicKey, ownerSignCanonical, runAuthHelper,
@@ -151,6 +151,11 @@ test("owner send (CLI) signs through the helper; local and paired receivers veri
   for (const row of rows) b.receive(JSON.parse(row.envelope), "alpha");
   const got = JSON.parse(b.inbox("worker")[0].authority!);
   assert.equal(got.ok, true); assert.equal(got.session, "signed by the owner");
+  // T022 field report: the owner's own task never shows "policy: ask" beside "authority: OWNER"
+  const framed = formatFor(b, b.inbox("worker")[0], "worker");
+  assert.match(framed, /authority: OWNER \(signed by the owner directly\)/);
+  assert.match(framed, /policy: n\/a, owner authority applies \(delegation policies limit only other agents' requests\)/);
+  assert.doesNotMatch(framed, /policy: ask/);
   const e = JSON.parse(rows[0].envelope) as Envelope;
   assert.equal(checkAuthority(e, a.ownerPub, new Set()).ok, true);
   assert.equal(checkAuthority({ ...e, subject: "tampered" }, a.ownerPub, new Set()).ok, false);

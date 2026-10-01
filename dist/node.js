@@ -398,7 +398,14 @@ export class MbxNode {
         const w = ss.find((x) => sessionWakeable(x));
         if (w)
             return w.cli === "codex" ? "push (codex queue)" : w.cli === "kimi" ? "push (kimi web)" : "push (opencode service)";
-        return "no push: new mail shows on your user's next prompt, or when your [mbx-watch] self-check runs";
+        const watcher = JSON.parse(this.store.get(`watcher:${agent}`) ?? "null"); // agentmbx watch (T033)
+        if (watcher && Date.now() - watcher.at < 15_000)
+            try {
+                process.kill(watcher.pid, 0);
+                return "push (mbx watcher: its exit starts your next turn)";
+            }
+            catch { /* gone */ }
+        return "no push: new mail shows on your user's next prompt, or when your mbx watcher or [mbx-watch] self-check runs";
     }
     sessionsFor(agent) {
         return this.store.db.prepare("SELECT * FROM sessions WHERE agent=? ORDER BY updated_at DESC").all(agent);
@@ -863,7 +870,13 @@ export class MbxNode {
 }
 // ---- presentation (shared by CLI and MCP) -----------------------------------------------------
 /** A message framed for `agent`, with the policy line computed on this host. */
-export const formatFor = (node, m, agent) => formatMessage(node.currentAuthority(m), policyLine(node.policyFor(m, agent)));
+export function formatFor(node, m, agent) {
+    const row = node.currentAuthority(m), a = storedAuthority(row);
+    // An owner-signed message is the owner's own task: "policy: ask" beside "authority: OWNER" read as a contradiction (T022).
+    const policy = a?.ok ? `policy: n/a, owner authority applies${a.session === "signed by the owner" ? "" : " within its caps"} (delegation policies limit only other agents' requests)`
+        : policyLine(node.policyFor(m, agent));
+    return formatMessage(row, policy);
+}
 /** Structural guard for legacy cached authority; this does not revalidate key revocation or expiry. */
 export function storedAuthority(m) {
     if (!m.authority)
