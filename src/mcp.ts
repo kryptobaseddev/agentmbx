@@ -21,7 +21,7 @@ import { listIdentityStatus } from "./identity-status.ts";
 import { consumeIdentityControl, identityControlAliases, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl, type IdentityControlDescriptor } from "./identity-control.ts";
 import { didWarning, formatFor, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
 import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy.ts";
-import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.ts";
+import { assertKnownRecipients, deliveryReceipts, offlineWarnings, receiptLine, recipientReceipts, sentPage } from "./receipts.ts";
 import { procStart, withProcSnapshot } from "./proc.ts";
 import { updateAvailable } from "./update.ts";
 import { installKind, version } from "./version.ts";
@@ -788,7 +788,7 @@ export async function runMcp(existing?: MbxNode) {
 
   server.registerTool("mbx_thread", {
     title: "Show an mbx thread",
-    description: "Every message in a thread (pass a thread id or any message id in it), oldest first, with full content. Next: mbx_reply to the latest message if you need to answer.",
+    description: "Every message in a thread (pass a thread id or any message id in it), oldest first, with full content and, under each, one line per recipient: delivery state, did/note and liveness. Next: mbx_reply to the latest message if you need to answer.",
     inputSchema: { id: z.string().min(6) },
     annotations: { readOnlyHint: true },
   }, ({ id }) => {
@@ -796,7 +796,8 @@ export async function runMcp(existing?: MbxNode) {
     const m = node.message(id, agent);
     const rows = node.thread(m && node.canSee(m, agent) ? m.thread : id, agent);
     noteRead(rows);
-    return text(rows.length ? rows.map((r) => formatFor(node, r, agent)).join("\n\n") : `No thread ${id}.`);
+    // T207: under each message, who has it and how far they got
+    return text(rows.length ? rows.map((r) => `${formatFor(node, r, agent)}\n${deliveryReceipts(node, r).map(receiptLine).join("\n")}`).join("\n\n") : `No thread ${id}.`);
   });
 
   server.registerTool("mbx_search", {
@@ -819,6 +820,18 @@ export async function runMcp(existing?: MbxNode) {
     const rows = node.agents();
     return text(rows.map((a) => `${a.name}@${a.host}${a.role ? `  role:${a.role}` : ""}${a.cli ? `  (${a.cli})` : ""}  last seen ${a.last_seen ?? "never"}${a.description ? `  — ${a.description}` : ""}`).join("\n") || "No agents yet.",
       { agents: rows });
+  });
+
+  server.registerTool("mbx_sent", {
+    title: "What happened to mail you sent",
+    description: "Sender receipts: the messages you sent from this host, oldest first, each with its recipients: delivered → notified → read → acked (with the recipient's note and did line), the recipient's liveness now, and for paired hosts whether the message is still queued. Page with next_cursor (opaque; persist it yourself). Next: mbx_thread for the conversation, or mbx_send a nudge to an offline recipient's successor.",
+    inputSchema: { cursor: z.string().max(1024).optional(), limit: z.number().int().min(1).max(100).default(20) },
+    annotations: { readOnlyHint: true },
+  }, ({ cursor, limit }) => {
+    const { agent } = current();
+    const page = sentPage(node, agent, { cursor, limit });
+    const lines = page.messages.map((m) => [`${m.id}  ${m.ts.slice(0, 19)}Z  [${m.kind}] ${m.subject}  → ${m.to.join(", ")}`, ...m.recipients.map(receiptLine)].join("\n"));
+    return text(`${lines.length ? lines.join("\n\n") : "No sent messages on this page."}\n\nnext_cursor: ${page.next_cursor}${page.has_more ? " (more)" : ""}`, page as unknown as Record<string, unknown>);
   });
 
   const transport = new StdioServerTransport();
