@@ -1,6 +1,7 @@
 // LAN discovery: advertise this host as _agentmbx._tcp over mDNS/DNS-SD and browse for other hosts.
 // Discovery only finds addresses. Trust never comes from mDNS: it comes from the pairing token and the host keys
 // pinned at pairing. When multicast is blocked, everything still works with explicit addresses.
+import { announcedIPv4 } from "./http.ts";
 import makeMdns from "multicast-dns";
 import { networkInterfaces } from "node:os";
 
@@ -30,8 +31,9 @@ export function decodeTxt(data: unknown): Partial<Advert> {
 }
 
 /** Non-internal IPv4 addresses of this machine (LAN addresses to print and advertise). */
+/** LAN IPv4 addresses worth offering to peers (pairing lines, mDNS): container, VM and VPN interfaces only as a last resort. */
 export function lanIPv4(): string[] {
-  return Object.values(networkInterfaces()).flat().filter((i) => i && i.family === "IPv4" && !i.internal).map((i) => i!.address);
+  return announcedIPv4(networkInterfaces());
 }
 
 const lc = (s: unknown) => String(s ?? "").toLowerCase();
