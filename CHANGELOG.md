@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.5.1 (2026-10-01)
+
+Upgrade both machines: sealed LAN bodies, key rotation and code-compare pairing need 0.5.1 on each side (token pairing and plain delivery from 0.5.0 senders keep working).
 
 - **Encrypted LAN bodies (upgrade both hosts):** direct LAN delivery now seals every body for the receiving host (X25519 + XChaCha20-Poly1305, as the relay already did) and never falls back to plaintext. A peer that has not published a body-encryption key keeps mail queued with an upgrade hint. Owner and session authority now verify on sealed mail. A 0.5.0 receiver opens sealed bodies, but it cannot verify owner authority on them: it labels them unverified (fails closed), so upgrade both machines for owner-signed requests. Local storage stays plaintext (D001).
 - **Host key rotation:** `agentmbx host rotate` replaces this host's signing and encryption keys without re-pairing. The old key signs the new keys, the new key countersigns, and each peer moves its pin only for a record that starts from the key it pinned. The daemon retries announcements until accepted. Retired keys keep stored mail verifiable and open mail sealed in flight. `agentmbx peers remove` now tells the peer, which drops this host too. Peers on 0.5.0 cannot accept a rotation; upgrade them first.
