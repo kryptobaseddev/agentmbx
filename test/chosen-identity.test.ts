@@ -166,3 +166,15 @@ test("identityAvailability: one answer for list and claim", () => {
   assert.equal(identityAvailability({ lease, evidence: live, activity: null, now, caller: { cli: "codex", sessionId: "thread-1" } }).takeover, "same-session");
   assert.equal(identityAvailability({ lease, evidence: live, activity: null, now, conflict: true }).state, "conflict");
 });
+
+test("a server ended with SIGTERM releases its identity instead of leaving a dead holder", async (t) => {
+  const { node, connect } = fixture(t);
+  const c = await connect("sess-term", { MBX_AGENT: "orbit-term", MBX_ROLE: "tester" });
+  assert.equal(json(await c.callTool({ name: "mbx_whoami", arguments: {} })).agent, "orbit-term");
+  const pid = (node.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE name='orbit-term'").get() as { holder_pid: number }).holder_pid;
+  process.kill(pid, "SIGTERM");
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline && !(node.store.db.prepare("SELECT released_at FROM identity_leases WHERE name='orbit-term'").get() as { released_at: number | null }).released_at)
+    await new Promise(r => setTimeout(r, 50));
+  assert.equal((node.store.db.prepare("SELECT release_reason FROM identity_leases WHERE name='orbit-term'").get() as { release_reason: string }).release_reason, "released");
+});

@@ -839,7 +839,9 @@ export function formatFor(node: MbxNode, m: MessageRow, agent: string): string {
   // An owner-signed message is the owner's own task: "policy: ask" beside "authority: OWNER" read as a contradiction (T022).
   const policy = a?.ok ? `policy: n/a, owner authority applies${a.session === "signed by the owner" ? "" : " within its caps"} (delegation policies limit only other agents' requests)`
     : policyLine(node.policyFor(m, agent));
-  return formatMessage(row, policy);
+  // T208: a project lead re-delivered this message to `agent`; the policy above still comes from the original sender
+  const lead = node.store.get(`forwarded:${m.id}:${agent}`);
+  return formatMessage(row, lead ? `${policy}\nforwarded by lead ${lead} (project ledger; this adds no authority)` : policy);
 }
 
 /** Structural guard for legacy cached authority; this does not revalidate key revocation or expiry. */

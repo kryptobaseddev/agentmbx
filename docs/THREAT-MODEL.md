@@ -298,6 +298,11 @@ and pair again with a token. Documented here and to be added to the rotation hel
   the per-thread action cap.
   Under YOLO a successfully injected agent has its full permission profile; YOLO is an explicit owner choice with a kill
   switch (`agentmbx policy revoke --all`).
+- **R9, project lead visibility (T208).** A project lead reads every message of its project, including bodies addressed
+  to other agents, and can re-deliver them locally. It exists only through an owner-signed, expiring, revocable record
+  that is re-verified on every read; a tampered row or a forged revocation changes nothing. Forwarding never adds
+  authority: the recipient's policy still comes from the original sender. Other project members see metadata (senders,
+  recipients, roles, states) but no bodies they were not sent.
 - **R8, wake storms.** Per-agent brakes, batching, busy backoff, unknown holds and mute bound wakes for any one agent
   (D1). F6 remains open across many names. A woken session spends model turns even when it decides to do nothing.
 

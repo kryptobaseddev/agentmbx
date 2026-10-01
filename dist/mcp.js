@@ -25,6 +25,7 @@ import { consumeIdentityControl, identityControlAliases, identityGeneration, ins
 import { didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
 import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy.js";
 import { assertKnownRecipients, deliveryReceipts, offlineWarnings, receiptLine, recipientReceipts, sentPage } from "./receipts.js";
+import { forwardMessage, ledgerPage } from "./project-ledger.js";
 import { procStart, withProcSnapshot } from "./proc.js";
 import { updateAvailable } from "./update.js";
 import { installKind, version } from "./version.js";
@@ -771,7 +772,7 @@ export async function runMcp(existing) {
                 // These handlers only query SQLite. mbx_read advances delivery state despite its
                 // readOnlyHint, and whoami can rename, so neither belongs in this snapshot set.
                 // mbx_read and mbx_thread mark the reader's copies read (T207), so they take the write path.
-                const readOnly = ["mbx_inbox", "mbx_replay", "mbx_search", "mbx_agents", "mbx_sent"].includes(name);
+                const readOnly = ["mbx_inbox", "mbx_replay", "mbx_search", "mbx_agents", "mbx_sent", "mbx_project"].includes(name);
                 // Replay prepares its own process evidence before taking the held-read snapshot.
                 // Wrapping it again would inspect a fresh lease instance inside an open transaction.
                 const invoke = () => requests.run(state, () => name === "mbx_replay" ? cb(...a) : readOnly
@@ -1134,6 +1135,34 @@ export async function runMcp(existing) {
         const lines = page.messages.map((m) => [`${m.id}  ${m.ts.slice(0, 19)}Z  [${m.kind}] ${m.subject}  → ${m.to.join(", ")}`, ...m.recipients.map(receiptLine)].join("\n"));
         return text(`${lines.length ? lines.join("\n\n") : "No sent messages on this page."}\n\nnext_cursor: ${page.next_cursor}${page.has_more ? " (more)" : ""}`, page);
     });
+    server.registerTool("mbx_project", {
+        title: "Project ledger",
+        description: "The mail traffic of the project folder this session works in: messages stamped with the project or sent to or by its agents, oldest first, each with its recipients' roles, delivery states and liveness. Bodies are shown for your own mail only; the owner-designated project lead sees every body. Page with next_cursor. Next: mbx_thread for one conversation; a lead can mbx_forward a message.",
+        inputSchema: { cursor: z.string().max(4096).optional(), limit: z.number().int().min(1).max(100).default(20),
+            project: z.string().max(1024).optional().describe("must be the folder this session works in (the default)") },
+        annotations: { readOnlyHint: true },
+    }, ({ cursor, limit, project: asked }) => {
+        const { agent } = current();
+        if (!project)
+            throw Object.assign(new Error("this session works in no project folder (home or /): no project ledger"), { code: "NO_PROJECT" });
+        if (asked !== undefined && asked !== project)
+            throw Object.assign(new Error(`a session sees only the ledger of the project it works in (${project})`), { code: "PROJECT_SCOPE" });
+        const page = ledgerPage(node, agent, project, { cursor, limit });
+        const lines = page.messages.map((m) => [`${m.id}  ${m.ts.slice(0, 19)}Z  ${m.from} → ${m.to.join(", ")}  [${m.kind}] ${m.subject}${m.forwarded_by ? `  (forwarded by ${m.forwarded_by.join(", ")})` : ""}`,
+            ...m.recipients.map((r) => `${receiptLine(r)}${r.role ? ` · role: ${r.role}` : ""}`),
+            m.body === null ? `  body withheld: ${m.body_withheld}` : `  --- body (data) ---\n${m.body}\n  --- end ---`].join("\n"));
+        return text(`project ${page.project} · lead: ${page.lead ?? "none"}\n\n${lines.length ? lines.join("\n\n") : "No project messages on this page."}\n\nnext_cursor: ${page.next_cursor}${page.has_more ? " (more)" : ""}`, page);
+    });
+    server.registerTool("mbx_forward", {
+        title: "Forward a project message (lead only)",
+        description: "Project lead only: re-deliver a message of your project to another agent on this host, for example when its recipient's session ended. Audited; the recipient sees \"forwarded by lead <you>\", and its policy for the message still comes from the original sender. Next: mbx_project to check the new recipient's state.",
+        inputSchema: { id: z.string().min(6), to: z.string().min(2).max(81) },
+    }, ({ id, to }) => {
+        const { agent } = current();
+        const m = node.message(id, agent) ?? node.message(id);
+        const r = forwardMessage(node, agent, project, m?.id ?? id, to);
+        return text(`Forwarded ${r.id} to ${r.to}.`, r);
+    });
     const transport = new StdioServerTransport();
     const timers = [];
     let closed = false;
@@ -1166,6 +1195,10 @@ export async function runMcp(existing) {
     // The SDK stdio transport does not forward stdin EOF to onclose.
     process.stdin.once("end", retire);
     process.once("exit", retire);
+    // A provider that ends its servers with a signal (claude -p, a closed terminal) releases the identity cleanly instead
+    // of leaving a dead holder to expire. SIGINT is left alone: a terminal's Ctrl-C interrupts a turn, not the session.
+    for (const [signal, code] of [["SIGTERM", 143], ["SIGHUP", 129]])
+        process.once(signal, () => { retire(); process.exit(code); });
     try {
         await server.connect(transport);
     }
