@@ -10,7 +10,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { bindWakeLease } from "./helpers/wake-lease.ts";
 import { MbxNode } from "../src/node.ts";
-import { dispatchWakes, muteWakes, UNKNOWN_HOLD_MS, wakeCodex, wakeOpencode } from "../src/wake.ts";
+import { dispatchWakes, muteWakes, UNKNOWN_HOLD_MS, wakeCodex, wakeOpencode, wakeText } from "../src/wake.ts";
 import type { WakeOutcome } from "../src/wake-contract.ts";
 import { statusWakeWarning, type Envelope } from "../src/mcp.ts";
 
@@ -154,4 +154,18 @@ test("a busy backoff defers the next attempt instead of asking every pass", asyn
   assert.deepEqual(calls(), []);
   assert.equal((await dispatchWakes(n, Date.now() + 20_000))[0].result.ok, true);
   assert.equal(n.store.get("wake-busy:worker"), undefined, "a successful wake clears the backoff");
+});
+
+test("a wake hint names its message ids and says a handled message needs no action (T195)", () => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-hint-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  try {
+    const ms = Array.from({ length: 7 }, (_, i) => n.message(n.send({ from: "sender", to: ["worker"], subject: `s${i}`, body: `secret body ${i}`, kind: "request" }).envelope.id)!);
+    const text = wakeText("worker", ms);
+    assert.match(text, /^\[mbx\]/, "still an AgentMBX prompt: never resets relay depth");
+    for (const m of ms.slice(0, 5)) assert.ok(text.includes(m.id));
+    assert.match(text, /\+2 more/);
+    assert.match(text, /already read or acked them, this notice is stale: no action is needed/);
+    assert.ok(!text.includes("secret body"), "never a body");
+  } finally { n.close(); rmSync(home, { recursive: true, force: true }); }
 });
