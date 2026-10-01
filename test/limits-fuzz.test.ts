@@ -125,6 +125,7 @@ test("random bodies to every HTTP endpoint never crash the server or produce a 5
     pair(A.n, B.n);
     const r = prng(290), base = `http://127.0.0.1:${B.port}`, valid = { envelopes: [envFrom(A.n, B.n)], items: [], v: 1, host: "gamma" };
     const statuses: Record<number, number> = {};
+    let races = 0;
     for (let i = 0; i < 1500; i++) {
       const [method, path] = pick(r, ROUTES);
       const raw = int(r, 4) === 0 ? Buffer.from(Array.from({ length: int(r, 200) }, () => int(r, 256)))
@@ -132,13 +133,21 @@ test("random bodies to every HTTP endpoint never crash the server or produce a 5
       const body = method === "GET" && r() < 0.7 ? "" : raw.toString("utf8");
       const headers = r() < 0.8 ? signHop(A.n, method, path, body) : { "content-type": pick(r, ["application/json", "text/plain"]) };
       if (r() < 0.1) headers["x-mbx-ts"] = str(r).replace(/[^\x20-\x7e]/g, "");
+      // A socket the server closes while a pooled request is still writing surfaces as EPIPE/ECONNRESET on the client.
+      // That is not a server failure, provided the server answers straight away; count such races and keep them rare.
       const res = await fetch(`${base}${path}${r() < 0.2 ? "?after=" + encodeURIComponent(str(r).toWellFormed()) + "&limit=" + str(r).replace(/[^\x20-\x7e]/g, "") : ""}`,
-        { method, headers, ...(method === "GET" ? {} : { body }) });
+        { method, headers, ...(method === "GET" ? {} : { body }) }).catch(async (e: Error & { cause?: { code?: string } }) => {
+        if (!/EPIPE|ECONNRESET|UND_ERR_SOCKET/.test(String(e.cause?.code ?? e.cause ?? e))) throw e;
+        assert.equal((await fetch(`${base}/v1/status`)).status, 200, `server answers after a dropped socket (case ${i})`);
+        races++; return null;
+      });
+      if (!res) continue;
       await res.arrayBuffer();
       statuses[res.status] = (statuses[res.status] ?? 0) + 1;
       assert.ok(res.status < 500, `${method} ${path} case ${i} gave ${res.status}`);
     }
     assert.ok(statuses[200] && statuses[400] && statuses[401], JSON.stringify(statuses));
+    assert.ok(races <= 15, `client-side socket races stay rare (${races} of 1500)`);
     assert.equal((await fetch(`${base}/v1/status`)).status, 200, "server still answers");
   } finally { down(B, A); }
 });
