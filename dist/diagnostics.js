@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { NAME_RE } from "./envelope.js";
 import { SCHEMA_VERSION } from "./store.js";
 import { version } from "./version.js";
+import { procStart } from "./proc.js";
 import { identityLeaseStatus, inspectLeaseProcess } from "./identity-leases.js";
 const fail = (code, message) => Object.assign(new Error(message), { code });
 const label = (x) => typeof x === "string" && x.length > 0 && x.length <= 300 && !/[\x00-\x1f\x7f]/.test(x);
@@ -53,7 +54,7 @@ export function diagnosticSnapshot(home, scope, options = {}) {
     let sessions;
     let queues;
     let receipts;
-    let outgoing, totals, conflict;
+    let outgoing, totals, conflict, connectorRaw = null;
     try {
         db.exec("PRAGMA busy_timeout=1000; PRAGMA query_only=ON; BEGIN");
         schema = Number(db.prepare("PRAGMA user_version").get().user_version);
@@ -76,12 +77,33 @@ export function diagnosticSnapshot(home, scope, options = {}) {
         const predicate = `k GLOB 'identity-request:*' AND CASE WHEN json_valid(v) THEN json_extract(v,'$.target.agent')=? ${scope.cli ? "AND json_extract(v,'$.target.cli')=? AND json_extract(v,'$.target.session_id')=?" : ""} ELSE 0 END`;
         receipts = db.prepare(`SELECT v FROM kv WHERE ${predicate} ORDER BY k LIMIT ?`).all(scope.mailbox, ...sessionArgs, limit + 1);
         conflict = !!db.prepare("SELECT 1 FROM kv WHERE k=?").get(`identity-conflict:${scope.mailbox}`);
+        connectorRaw = lease ? db.prepare("SELECT v FROM kv WHERE k=?").get(connectorKey(lease.holder_pid))?.v ?? null : null;
         db.exec("COMMIT");
     }
     finally {
         db.close();
     }
     const inspect = options.inspect ?? inspectLeaseProcess;
+    // Session rows record birth in the process-table format (bindSession), not the lease format: compare like with like.
+    const inspectSession = options.inspectSession ?? options.inspect ?? ((pid) => {
+        let alive = true;
+        try {
+            process.kill(pid, 0);
+        }
+        catch (e) {
+            if (e.code === "ESRCH")
+                return { alive: false, start: null };
+            alive = null;
+        }
+        return { alive, start: procStart(pid) };
+    });
+    const sessionEvidence = (pid) => { if (!pid)
+        return { alive: null, start: null }; try {
+        return inspectSession(pid);
+    }
+    catch {
+        return { alive: null, start: null };
+    } };
     const evidence = (pid) => { if (!pid)
         return { alive: null, start: null }; try {
         return inspect(pid);
@@ -110,10 +132,36 @@ export function diagnosticSnapshot(home, scope, options = {}) {
     });
     return { v: 1, advisory: true, observed_at: new Date(now).toISOString(), host, schema_version: schema,
         scope: { mailbox: scope.mailbox, cli: scope.cli ?? null, session_id: scope.session_id ?? null },
-        builds: { installed: { version: version() }, daemon: { version: daemonValid ? daemon.version : null, observed_at: daemonValid ? new Date(daemonTime).toISOString() : null, reason: daemonValid ? null : "no fresh host-matched daemon observation" }, connector: { version: null, binding_exists: sessions.length > 0, reason: "connector build has no verified runtime observation" } },
+        builds: { installed: { version: version() }, daemon: { version: daemonValid ? daemon.version : null, observed_at: daemonValid ? new Date(daemonTime).toISOString() : null, reason: daemonValid ? null : "no fresh host-matched daemon observation" }, connector: connectorBuild(connectorRaw, lease, processState(p, lease?.holder_start ?? null), now, sessions.length > 0) },
         ownership: { state: conflict ? "conflict" : assessment?.state === "live" ? "held" : assessment?.state === "expired" ? "available" : lease ? "unknown" : "legacy", reason: conflict ? "historical ownership requires explicit recovery" : assessment?.reason ?? (lease?.released_at != null ? "released" : assessment?.state === "live" ? "current holder observed" : "holder process could not be verified"), holder: lease ? { cli: lease.cli, session_id: lease.session_id, pid: lease.holder_pid } : null, process: processState(p, lease?.holder_start ?? null) },
-        sessions: sessions.slice(0, limit).map(s => ({ cli: s.cli, session_id: s.session_id, pid: s.pid, updated_at: s.updated_at, process: processState(evidence(s.pid), s.pid_start), connector_version: null })),
+        sessions: sessions.slice(0, limit).map(s => ({ cli: s.cli, session_id: s.session_id, pid: s.pid, updated_at: s.updated_at, process: processState(sessionEvidence(s.pid), s.pid_start), connector_version: null })),
         messages: { received: totals.messages, unread: totals.unread, queued_outgoing: outgoing, task_status: "not-reported" },
         outbox: queues.slice(0, limit).map(q => ({ message_id: q.message_id, peer: q.peer, attempts: q.attempts, next_retry_at: q.next_retry_at, last_error_code: retryErrorClass(q.last_error) })), recovery,
         page: { limit, truncated: { sessions: sessions.length > limit, outbox: queues.length > limit, recovery: receipts.length > limit } }, };
+}
+/** kv key of a running MCP connector's self-report (published by that process, keyed by its PID). */
+export const connectorKey = (pid) => `connector:${pid}`;
+const CONNECTOR_FRESH_MS = 5 * 60_000;
+/** The lease holder's own report counts only when the holder process is verified and the report is from that same birth. */
+function connectorBuild(raw, lease, holder, now, bindingExists) {
+    const none = (reason) => ({ version: null, build: null, tools: null, observed_at: null, binding_exists: bindingExists, reason });
+    if (!lease || raw === null)
+        return none("connector build has no verified runtime observation");
+    let r;
+    try {
+        r = JSON.parse(raw);
+    }
+    catch {
+        return none("connector report is malformed");
+    }
+    if (holder !== "verified")
+        return none("connector holder process is not verified");
+    if (r?.v !== 1 || r.pid !== lease.holder_pid || r.start !== lease.holder_start)
+        return none("connector report is not from the current holder process");
+    const at = typeof r.at === "string" ? Date.parse(r.at) : NaN;
+    if (!Number.isFinite(at) || at > now + 60_000 || now - at > CONNECTOR_FRESH_MS)
+        return none("connector report is stale");
+    if (!runtimeVersion(r.version) || typeof r.build !== "string" || !Array.isArray(r.tools) || r.tools.some((t) => typeof t !== "string"))
+        return none("connector report is malformed");
+    return { version: r.version, build: r.build.slice(0, 120), tools: r.tools.slice(0, 50), observed_at: new Date(at).toISOString(), binding_exists: bindingExists, reason: null };
 }

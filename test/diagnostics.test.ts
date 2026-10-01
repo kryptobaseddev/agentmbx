@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { MbxNode } from "../src/node.ts";
 import { SCHEMA_VERSION } from "../src/store.ts";
-import { diagnosticSnapshot, retryErrorClass } from "../src/diagnostics.ts";
+import { connectorKey, diagnosticSnapshot, retryErrorClass } from "../src/diagnostics.ts";
 
 function fixture(t: {after(fn:()=>void):void}) {
   const home=mkdtempSync(join(tmpdir(),"mbx-diagnostic-"));
@@ -75,4 +75,29 @@ test("missing/config invalid/future schema inspection does not initialize or mig
 
 test("error classifier emits only fixed classes",()=>{
  assert.equal(retryErrorClass("ETIMEDOUT secret"),"TIMEOUT");assert.equal(retryErrorClass("403 secret"),"PEER_REFUSED");assert.equal(retryErrorClass("arbitrary secret"),"DELIVERY_FAILED");assert.equal(retryErrorClass(null),null);
+});
+
+test("session rows compare process birth in their own format, not the lease format (T183)",t=>{
+ const {home,now}=fixture(t);
+ // the lease records "ps-utc:" birth, a session row the process-table form: each is compared like with like
+ const snap=diagnosticSnapshot(home,{mailbox:"alice"},{now,inspect:()=>({alive:true,start:"ps-utc:other-form"}),inspectSession:()=>({alive:true,start:"birth"})});
+ assert.equal(snap.sessions[0].process,"verified");
+});
+
+test("the running connector's version, build and tools are reported only for the verified current holder (T183)",t=>{
+ const {home,node,now}=fixture(t);
+ const report=(r:Record<string,unknown>)=>node.store.set(connectorKey(123),JSON.stringify({v:1,pid:123,start:"birth",version:"0.5.1",build:"0.5.1:1:2",tools:["mbx_send","mbx_inbox"],cli:"codex",at:new Date(now-1000).toISOString(),...r}));
+ const live={now,inspect:()=>({alive:true,start:"birth"})};
+ assert.equal(diagnosticSnapshot(home,{mailbox:"alice"},live).builds.connector.reason,"connector build has no verified runtime observation");
+ report({});
+ const c=diagnosticSnapshot(home,{mailbox:"alice"},live).builds.connector;
+ assert.deepEqual([c.version,c.build,c.tools,c.reason],["0.5.1","0.5.1:1:2",["mbx_send","mbx_inbox"],null]);
+ assert.equal(diagnosticSnapshot(home,{mailbox:"alice"},live).builds.installed.version!==undefined,true,"installed stays a separate field");
+ assert.equal(diagnosticSnapshot(home,{mailbox:"alice"},{now,inspect:()=>({alive:true,start:"newbirth"})}).builds.connector.version,null,"a reused PID's report does not count");
+ report({start:"older"});
+ assert.equal(diagnosticSnapshot(home,{mailbox:"alice"},live).builds.connector.reason,"connector report is not from the current holder process");
+ report({at:new Date(now-10*60_000).toISOString()});
+ assert.equal(diagnosticSnapshot(home,{mailbox:"alice"},live).builds.connector.reason,"connector report is stale");
+ report({version:"evil string"});
+ assert.equal(diagnosticSnapshot(home,{mailbox:"alice"},live).builds.connector.reason,"connector report is malformed");
 });

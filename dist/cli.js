@@ -268,13 +268,17 @@ async function run(argv) {
         const home = defaultHome(), daemon = await observeDiagnosticDaemon(home);
         const snapshot = diagnosticSnapshot(home, { mailbox, cli, session_id: sid, limit }, { daemon: daemon.observation });
         const result = { ...snapshot, daemon_connection: { state: daemon.state },
-            recovery_guidance: ["Call mbx_whoami in the current provider thread to verify its actual connector and identity.",
+            recovery_guidance: [
+                ...(snapshot.builds.connector.version && snapshot.builds.connector.version !== snapshot.builds.installed.version
+                    ? [`The holder's connector runs ${snapshot.builds.connector.version} while ${snapshot.builds.installed.version} is installed: its next mbx tool call switches it to the installed build in the same conversation. If it cannot (an older connector that fails closed), reconnect the mbx MCP server in that conversation; no release or takeover is needed.`] : []),
+                "Call mbx_whoami in the current provider thread to verify its actual connector and identity.",
                 "If its connector is disconnected or stale, reconnect the mbx MCP server before changing ownership.",
-                "Inspect the exact holder before release or owner-approved takeover; this diagnostic command changes nothing."] };
+                "Inspect the exact holder before release or owner-approved takeover; this diagnostic command changes nothing."
+            ] };
         if (o.json)
             return console.log(JSON.stringify(result, null, 2));
         console.log(`Diagnostics for ${mailbox}@${snapshot.host} (read-only advisory snapshot)`);
-        console.log(`Installed ${snapshot.builds.installed.version}; daemon ${snapshot.builds.daemon.version ?? "unknown"} (${daemon.state}); connector unknown (${snapshot.builds.connector.binding_exists ? "binding recorded" : "no binding recorded"})`);
+        console.log(`Installed ${snapshot.builds.installed.version}; daemon ${snapshot.builds.daemon.version ?? "unknown"} (${daemon.state}); connector ${snapshot.builds.connector.version ? `${snapshot.builds.connector.version} (${snapshot.builds.connector.tools?.length ?? 0} tools, observed ${snapshot.builds.connector.observed_at})` : `unknown (${snapshot.builds.connector.binding_exists ? "binding recorded" : "no binding recorded"})`}`);
         console.log(`Ownership ${snapshot.ownership.state}: ${snapshot.ownership.reason}`);
         if (snapshot.ownership.holder)
             console.log(`Holder ${snapshot.ownership.holder.cli} session ${snapshot.ownership.holder.session_id}; process ${snapshot.ownership.process}`);

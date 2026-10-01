@@ -411,6 +411,11 @@ export class MbxNode {
       return !!r.pid_start && !!start && start !== r.pid_start;
     });
     for (const r of dead) this.store.db.prepare("DELETE FROM sessions WHERE cli=? AND session_id=? AND pid=?").run(r.cli, r.session_id, r.pid);
+    // connector self-reports (T183) of exited MCP processes
+    for (const { k } of this.store.db.prepare("SELECT k FROM kv WHERE k GLOB 'connector:*'").all() as { k: string }[]) {
+      const pid = Number(k.slice("connector:".length));
+      try { process.kill(pid, 0); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ESRCH") this.store.db.prepare("DELETE FROM kv WHERE k=?").run(k); }
+    }
     if (dead.length) this.store.audit("sessions.pruned", { count: dead.length, sessions: dead.slice(0, 50).map((r) => `${r.cli}:${r.session_id}`) });
     return dead.length;
   }
