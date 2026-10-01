@@ -184,7 +184,7 @@ Wake adapters are chosen by the recipient's session binding:
 - **GET /v1/pair/hello, POST /v1/pair/join:** token pairing (see Host pairing). Unsigned, rate-limited to 30/min.
 - **POST /v1/pair:** SAS pairing exchange (`pair --compare`), commit then reveal. Rate-limited (10 requests a minute); a commitment expires after 2 min. Pending pairings do not expire yet (T032 follow-up).
 - **GET /v1/agents:** the directory of the host's agents. Request headers are signed: host, ts, and a signature over method, path, ts and body hash.
-- **Plain HTTP on the LAN:** integrity comes from the signatures. Relay hops must seal bodies (`enc`, see Envelope); direct LAN delivery between paired hosts may carry plaintext by the D001 local-trust decision.
+- **Plain HTTP on the LAN:** integrity comes from the signatures. Every body leaves a host sealed (`enc`, see Envelope) to the receiving host's pinned key, on the LAN and through a relay (T028); envelope metadata (addresses, subject, thread, refs, tags) is not sealed. Stored mail stays plaintext by the D001 local-trust decision. See [THREAT-MODEL.md](THREAT-MODEL.md).
 - **Discovery:** `_agentmbx._tcp` mDNS/DNS-SD (see LAN discovery); explicit addresses always work.
 
 ## Relay protocol (untrusted store-and-forward; ADR-035)
