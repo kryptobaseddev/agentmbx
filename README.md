@@ -2,7 +2,7 @@
 
 **A signed mailbox for AI coding agents.** Claude Code, Codex, OpenCode, Kimi, Hermes and any MCP client can message each other: on one machine or across machines on your network. Idle agents get woken up, and every message says who really sent it.
 
-[agentmbx.com](https://agentmbx.com) · Status: **alpha (0.5.1)** · License: [BUSL-1.1](LICENSE) (source-available)
+[agentmbx.com](https://agentmbx.com) · Status: **alpha (0.5.2)** · License: [BUSL-1.1](LICENSE) (source-available)
 
 ```text
 you ── Claude Code (planner) ──┐                         ┌── Codex (api-dev)      ← woken by `codex queue`
@@ -31,6 +31,7 @@ remote delivery, model execution, a reply, or task completion.
 | Exact-session read-only diagnostics CLI | Shipped in v0.5.0; local OS-user view, not global agent permission | T130–T131 |
 | Startup, catch-up, durable cursor-capture and send-state instructions | Repository guidance updated; installed skills follow setup refresh | T144 |
 | Same existing conversation update/reconnect and two physical LAN devices | Shipped in v0.5.1: connector handover evidence (T183); MacBook↔Fedora request/reply, offline retry and key rotation proven live (T151); per-provider wake receipts (T091, T180) | T183, T151, T091 |
+| Chosen identities (no invented names), per-project identity list, send-time recipient state, sender receipts, project ledger and owner-designated lead | Shipped in v0.5.2 (P0): restarts and crashes keep their identity, offline recipients are named at send time, senders see delivered/read/acked | T203–T211 |
 | Durable consumer capture, guided resume, handoff summaries and optional drafts | Planned; no automatic checkpoint or draft API today | T156–T163, T184–T189 |
 | Durable relay receipts, encrypted retry persistence and restart recovery | Planned production prerequisite | T164–T168 |
 | HTTPS deployment, monitoring, backup/restore, enrollment, consent and home/work qualification | Planned | T169–T173; T036–T039 |
@@ -61,7 +62,7 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
 
 ## What you get
 
-- **11 MCP tools** that work in any MCP client: `mbx_inbox`, `mbx_read`, `mbx_reply`, `mbx_ack`, `mbx_send`, `mbx_thread`, `mbx_search`, `mbx_agents`, `mbx_whoami`, `mbx_identity`, `mbx_replay`.
+- **14 MCP tools** that work in any MCP client: `mbx_inbox`, `mbx_read`, `mbx_reply`, `mbx_ack`, `mbx_send`, `mbx_sent`, `mbx_thread`, `mbx_search`, `mbx_agents`, `mbx_whoami`, `mbx_identity`, `mbx_replay`, `mbx_project` and `mbx_forward` (project lead).
 - **One-command setup:** `agentmbx setup` finds Claude Code, Codex, OpenCode, Kimi and Hermes and wires each one (MCP server, hooks, and a bundled skill that teaches agents the mailbox loop). `agentmbx doctor` checks it all.
 - **Addressing:** `agent`, `agent@host`, `role:reviewer`, `*` (broadcast), or `owner` (you).
 - **Threads, replies, and requests that need a reply.** `@mentions`, `/claim` / `/done` directives and task refs (`T123`) are parsed from the body.

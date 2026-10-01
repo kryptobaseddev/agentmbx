@@ -34,6 +34,9 @@ export function mailboxLiveness(node, name, now = Date.now()) {
             state = "expired";
             reason = `no heartbeat for ${Math.round((now - row.heartbeat_at) / 60_000)} min`;
         }
+        // Its pid is running and it renewed within three minutes: as live as an advisory receipt can tell.
+        else if (table.has(row.holder_pid))
+            state = "live";
     }
     const holder = `${row.cli} session ${row.session_id.slice(0, 12)}`;
     if (state === "live" || state === "unknown") {
@@ -137,7 +140,8 @@ export function deliveryReceipts(node, m, now = Date.now()) {
     return [...local, ...remote];
 }
 /** One line per recipient, for thread views. */
-export const receiptLine = (r) => `  → ${r.address}: ${r.state}${r.updated_at ? ` ${r.updated_at.slice(0, 19)}Z` : ""}`
+// "notified" with note "desktop" means only the owner saw a desktop notice: no agent session was told.
+export const receiptLine = (r) => `  → ${r.address}: ${r.state === "notified" && r.note === "desktop" ? "notified (owner desktop notice only)" : r.state}${r.updated_at ? ` ${r.updated_at.slice(0, 19)}Z` : ""}`
     + `${r.did ? ` · did: ${r.did}` : ""}${r.note ? ` · note: ${r.note}` : ""}${r.outbox ? ` · attempts ${r.outbox.attempts}${r.outbox.last_error ? ` (${r.outbox.last_error.slice(0, 60)})` : ""}` : ""} · ${r.liveness}`;
 const fail = (code, message) => { throw Object.assign(new Error(message), { code }); };
 const encodeFrame = (f) => Buffer.from(JSON.stringify(f)).toString("base64url");

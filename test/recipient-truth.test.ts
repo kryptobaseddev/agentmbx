@@ -136,4 +136,8 @@ test("a crashed or silent holder reads offline at send time, and a quiet shared 
   assert.equal(byAddr(r, "silent@alpha").state, "offline");
   assert.match(byAddr(r, "silent@alpha").detail, /no heartbeat for 5 min/);
   assert.match(byAddr(r, "quiet@alpha").detail, /no mbx call for 20 min and may have ended/);
+  lease("fresh", process.pid, 10_000);                  // running pid, heartbeat 10 s ago: plainly held (fedora RC finding)
+  const f = out(await boss("mbx_send", { to: ["fresh"], subject: "s", body: "b", kind: "status" }));
+  assert.equal(byAddr(f, "fresh@alpha").state, "live-next-prompt");
+  assert.doesNotMatch(byAddr(f, "fresh@alpha").detail, /unconfirmed/);
 });
