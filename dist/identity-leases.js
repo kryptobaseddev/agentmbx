@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { NAME_RE } from "./envelope.js";
-import { readLinuxProcess } from "./proc.js";
+import { processEvidenceSpawns, readLinuxProcess, sleepSync } from "./proc.js";
 // Only a synchronous, open write operation may attest which sender it currently holds.
 const heldOperation = new AsyncLocalStorage();
 export function hasHeldIdentity(store, name) {
@@ -16,7 +16,10 @@ export function hasHeldIdentity(store, name) {
 }
 export const DEFAULT_IDENTITY_IDLE_TTL_MS = 30 * 60_000;
 const UNKNOWN_PROCESS = { alive: null, start: null };
+export { UNKNOWN_PROCESS };
 const EVIDENCE_MAX_AGE_MS = 5000;
+/** Unknown evidence is retried with this backoff before an operation fails (T206). */
+export const UNKNOWN_RETRY_DELAYS_MS = [250, 500, 1_000];
 const error = (code, message) => Object.assign(new Error(message), { code });
 /** A point-in-time assessment, not authority to claim or operate as this holder. */
 export function identityLeaseStatus(row, now, p) {
@@ -28,45 +31,108 @@ export function identityLeaseStatus(row, now, p) {
 }
 /** Missing ps data is unknown, not evidence that a process died. */
 export function inspectLeaseProcess(pid) {
-    let alive = true;
-    try {
-        process.kill(pid, 0);
-    }
-    catch (e) {
-        if (e.code === "ESRCH")
-            return { alive: false, start: null };
-        alive = null; // EPERM can still provide birth evidence for detecting PID reuse.
-    }
-    try {
-        if (process.platform === "linux") {
-            const p = readLinuxProcess(pid);
-            return p?.dead ? { alive: false, start: null } : { alive, start: p?.start ?? null };
+    return inspectLeaseProcesses([pid]).get(pid) ?? UNKNOWN_PROCESS;
+}
+/** A short shared cache so a hot loop re-checking one holder costs no ps spawns (T206). */
+const EVIDENCE_CACHE_MS = 1_000;
+const EVIDENCE_CACHE_STALE_MS = 10 * EVIDENCE_CACHE_MS;
+const evidenceCache = new Map();
+let selfEvidenceCache = null;
+/** Own pid is alive by definition; its birth time is computed once per process, never per call. */
+function inspectSelf() {
+    if (selfEvidenceCache)
+        return selfEvidenceCache;
+    const value = psInspectBatch([process.pid]).get(process.pid) ?? UNKNOWN_PROCESS;
+    // Cache only a complete answer: a ps timeout under load must not pin "unknown" for the life of the process.
+    if (value.alive === true && value.start)
+        selfEvidenceCache = value;
+    return value;
+}
+/** One ps spawn for every requested pid (BSD one-second birth resolution; coordination fence, not a boundary). */
+function psInspectBatch(pids) {
+    const found = new Map();
+    const probe = (pid) => {
+        try {
+            process.kill(pid, 0);
+            return true;
         }
-        // Target only this PID, bypass caches, and normalize locale/TZ across independent providers.
-        // BSD ps has one-second birth resolution; this is a coordination fence, not a security boundary.
-        const out = execFileSync("ps", ["-p", String(pid), "-o", "stat=,lstart="], {
+        catch (e) {
+            return e.code === "ESRCH" ? false : null;
+        }
+    };
+    if (process.platform === "linux") {
+        for (const pid of pids) {
+            const alive = probe(pid);
+            if (alive === false) {
+                found.set(pid, { alive: false, start: null });
+                continue;
+            }
+            const p = readLinuxProcess(pid);
+            found.set(pid, p?.dead ? { alive: false, start: null } : { alive, start: p?.start ?? null });
+        }
+        return found;
+    }
+    processEvidenceSpawns.count += 1;
+    try {
+        const out = execFileSync("ps", ["-p", pids.join(","), "-o", "pid=,stat=,lstart="], {
             encoding: "utf8", timeout: 1000, stdio: ["ignore", "pipe", "ignore"],
             env: { ...process.env, TZ: "UTC", LC_ALL: "C", LANG: "C" },
         }).trim();
-        const match = /^(\S+)\s+([A-Z][a-z]{2} [A-Z][a-z]{2}\s+\d{1,2} \d{2}:\d{2}:\d{2} \d{4})$/.exec(out);
-        if (match?.[1].includes("Z"))
-            return { alive: false, start: null };
-        return { alive, start: match ? `ps-utc:${match[2].replace(/\s+/g, " ")}` : null };
+        for (const line of out.split("\n")) {
+            const m = /^\s*(\d+)\s+(\S+)\s+([A-Z][a-z]{2} [A-Z][a-z]{2}\s+\d{1,2} \d{2}:\d{2}:\d{2} \d{4})\s*$/.exec(line);
+            if (!m)
+                continue;
+            const pid = Number(m[1]);
+            found.set(pid, m[2].includes("Z") ? { alive: false, start: null } : { alive: probe(pid), start: `ps-utc:${m[3].replace(/\s+/g, " ")}` });
+        }
     }
-    catch {
-        return { alive, start: null };
-    }
+    catch { /* unavailable inventory: probed liveness below, start stays unknown */ }
+    for (const pid of pids)
+        if (!found.has(pid))
+            found.set(pid, { alive: probe(pid), start: null });
+    return found;
 }
+/** Batched, cached process evidence for other pids: one spawn per cache miss set, never one per pid. */
+export function inspectLeaseProcesses(pids) {
+    const now = performance.now();
+    const out = new Map();
+    const missing = [];
+    for (const pid of new Set(pids.filter(p => Number.isSafeInteger(p) && p > 0))) {
+        if (pid === process.pid) {
+            out.set(pid, inspectSelf());
+            continue;
+        }
+        const cached = evidenceCache.get(pid);
+        if (cached && now - cached.at <= EVIDENCE_CACHE_MS)
+            out.set(pid, cached.value);
+        else
+            missing.push(pid);
+    }
+    if (missing.length) {
+        const takenAt = performance.now();
+        for (const [pid, value] of psInspectBatch(missing)) {
+            evidenceCache.set(pid, { value, at: takenAt });
+            out.set(pid, value);
+        }
+    }
+    for (const [pid, cached] of evidenceCache)
+        if (now - cached.at > EVIDENCE_CACHE_STALE_MS)
+            evidenceCache.delete(pid);
+    return out;
+}
+export const _resetEvidenceCacheForTests = () => { evidenceCache.clear(); selfEvidenceCache = null; };
 export class IdentityLeases {
     #prepared = new AsyncLocalStorage();
     store;
     clock;
     inspect;
+    customInspect;
     ttl;
     constructor(store, options = {}) {
         this.store = store;
         this.clock = options.clock ?? Date.now;
         this.inspect = options.inspect ?? inspectLeaseProcess;
+        this.customInspect = options.inspect !== undefined;
         this.ttl = options.idleTtlMs ?? DEFAULT_IDENTITY_IDLE_TTL_MS;
         if (!Number.isSafeInteger(this.ttl) || this.ttl <= 0)
             throw error("IDENTITY_LEASE_CONFIG", "identity idle TTL must be a positive integer in milliseconds");
@@ -105,10 +171,32 @@ export class IdentityLeases {
         if (prior || this.store.db.isTransaction)
             throw error("IDENTITY_PREPARATION_REQUIRED", "process evidence must be prepared outside a transaction");
         const scope = { active: true, observations: new Map(), processes: new Map() };
+        const wanted = new Set();
+        for (const name of new Set(names)) {
+            const row = this.row(name);
+            if (row && row.released_at === null)
+                wanted.add(row.holder_pid);
+        }
+        for (const pid of new Set(pids))
+            if (Number.isSafeInteger(pid) && pid > 0)
+                wanted.add(pid);
+        // An injected inspect (tests) keeps the per-pid call shape; the default batches one ps for all pids.
+        const batch = this.customInspect ? null : inspectLeaseProcesses([...wanted]);
+        const takenAt = performance.now();
         const inspect = (pid) => {
             let observed = scope.processes.get(pid);
             if (!observed) {
-                observed = { value: this.evidence(pid), at: performance.now() };
+                let value = UNKNOWN_PROCESS;
+                if (batch)
+                    value = batch.get(pid) ?? UNKNOWN_PROCESS;
+                else
+                    try {
+                        value = this.inspect(pid);
+                    }
+                    catch {
+                        value = UNKNOWN_PROCESS;
+                    }
+                observed = { value, at: batch ? takenAt : performance.now() };
                 scope.processes.set(pid, observed);
             }
             return observed;
@@ -209,23 +297,29 @@ export class IdentityLeases {
     }
     /** No automatic reacquisition: callers must explicitly claim after losing a lease. */
     renew(name, token) {
-        const observed = this.observe(name);
-        const result = this.store.tx(() => {
-            const row = this.row(name), now = this.now();
-            if (!row || row.token !== token)
-                return { status: "expired" };
-            const status = this.expire(row, now, this.observedProcess(row, observed));
-            if (status !== "live")
-                return { status };
-            // A backwards wall-clock step cannot shorten the recorded heartbeat.
-            this.store.db.prepare("UPDATE identity_leases SET heartbeat_at=MAX(heartbeat_at,?) WHERE name=? AND token=?").run(now, name, token);
-            return { status: "live", row: this.row(name) };
-        });
-        if (result.status === "unknown")
-            throw error("IDENTITY_STATUS_UNKNOWN", `identity ${name} process status is unknown; retry this lease token after inspection recovers`);
-        if (!result.row)
-            throw error("IDENTITY_LEASE_LOST", `identity ${name} lease is no longer usable; explicitly reclaim it`);
-        return result.row;
+        for (let attempt = 0;; attempt++) {
+            const observed = attempt === 0 ? this.observe(name) : this.freshObservation(name);
+            const result = this.store.tx(() => {
+                const row = this.row(name), now = this.now();
+                if (!row || row.token !== token)
+                    return { status: "expired" };
+                const status = this.expire(row, now, this.observedProcess(row, observed));
+                if (status !== "live")
+                    return { status };
+                // A backwards wall-clock step cannot shorten the recorded heartbeat.
+                this.store.db.prepare("UPDATE identity_leases SET heartbeat_at=MAX(heartbeat_at,?) WHERE name=? AND token=?").run(now, name, token);
+                return { status: "live", row: this.row(name) };
+            });
+            if (result.status !== "unknown") {
+                if (!result.row)
+                    throw error("IDENTITY_LEASE_LOST", `identity ${name} lease is no longer usable; explicitly reclaim it`);
+                return result.row;
+            }
+            // Never inspect or sleep while an outer transaction holds the write lock: fail fast there, as before.
+            if (attempt >= UNKNOWN_RETRY_DELAYS_MS.length || this.store.db.isTransaction)
+                throw error("IDENTITY_STATUS_UNKNOWN", `identity ${name} process status is unknown; retry this lease token after inspection recovers`);
+            sleepSync(UNKNOWN_RETRY_DELAYS_MS[attempt]);
+        }
     }
     release(name, token) {
         return this.store.tx(() => {
@@ -264,6 +358,21 @@ export class IdentityLeases {
         return this.withObserved(name, token, this.observe(name), operation, true);
     }
     withObserved(name, token, observed, operation, readOnly = false) {
+        for (let attempt = 0;; attempt++) {
+            try {
+                return this.withObservedOnce(name, token, attempt === 0 ? observed : this.freshObservation(name), operation, readOnly);
+            }
+            catch (e) {
+                if (e.code !== "IDENTITY_STATUS_UNKNOWN")
+                    throw e;
+                if (attempt >= UNKNOWN_RETRY_DELAYS_MS.length || this.store.db.isTransaction)
+                    throw e; // no sleeping under an outer write lock
+                sleepSync(UNKNOWN_RETRY_DELAYS_MS[attempt]);
+            }
+        }
+    }
+    /** One authorize-and-run attempt. Unknown process status is the caller's retry signal. */
+    withObservedOnce(name, token, observed, operation, readOnly = false) {
         const run = () => {
             const row = this.row(name);
             const status = row && row.token === token ? readOnly
@@ -293,5 +402,22 @@ export class IdentityLeases {
             throw error("IDENTITY_LEASE_LOST", `identity ${name} lease is no longer usable`);
         }
         return result.value;
+    }
+    /** Re-collect evidence for one name outside any prepared snapshot; retries must see fresh data. */
+    freshObservation(name) {
+        const row = this.row(name);
+        if (!row || row.released_at !== null)
+            return { row, process: UNKNOWN_PROCESS, at: performance.now() };
+        let process = UNKNOWN_PROCESS;
+        if (!this.customInspect)
+            process = inspectLeaseProcesses([row.holder_pid]).get(row.holder_pid) ?? UNKNOWN_PROCESS;
+        else
+            try {
+                process = this.inspect(row.holder_pid);
+            }
+            catch {
+                process = UNKNOWN_PROCESS;
+            }
+        return { row, process, at: performance.now() };
     }
 }
