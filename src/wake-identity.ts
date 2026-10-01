@@ -1,7 +1,7 @@
 // Daemon routing authority is an exact captured lease generation, never a remembered hook name.
 import { canonical, fingerprint } from "./crypto.ts";
 import { findIdentityControl, identityGeneration } from "./identity-control.ts";
-import { IdentityLeases, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
+import { IdentityLeases, inspectLeaseProcesses, type IdentityLease } from "./identity-leases.ts";
 import { withProcSnapshot } from "./proc.ts";
 import type { MbxNode } from "./node.ts";
 
@@ -23,7 +23,10 @@ export function captureWakeIdentity(node: MbxNode, session: WakeSession) {
     const run = <T>(operation: () => T, readOnly = true): T => {
       if (operation.constructor.name === "AsyncFunction") throw refused();
       return withProcSnapshot(() => {
-      const at = performance.now(), parent = inspectLeaseProcess(descriptor.parent_pid), child = inspectLeaseProcess(descriptor.mcp_pid);
+      const evidence = inspectLeaseProcesses([descriptor.parent_pid, descriptor.mcp_pid]);
+      const parent = evidence.get(descriptor.parent_pid) ?? { alive: null, start: null }, child = evidence.get(descriptor.mcp_pid) ?? { alive: null, start: null };
+      // Freshness is measured from after the evidence was taken; slow collection under load must not fence a valid wake.
+      const at = performance.now();
       if (parent.alive !== true || parent.start !== descriptor.parent_start || child.alive !== true || child.start !== descriptor.mcp_start) throw refused();
       return leases.prepare([session.agent], [descriptor.mcp_pid], () => {
         const operationWithBinding = () => {

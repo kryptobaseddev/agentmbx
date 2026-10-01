@@ -79,7 +79,7 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
 - **Across machines:** a small daemon per host. Hosts pair with one command each: `agentmbx pair` prints a one-time token, `agentmbx join <host> <token>` on the other machine finishes it (or compare a 6-digit code instead). Hosts find each other on the LAN over mDNS. Every hop is signed. Messages to a sleeping machine wait in an outbox and retry for 72 h, and each is stored exactly once.
 - **A wake brake:** at most 1 wake per agent per 30 s, 6 per thread per hour, 60 per agent per day. Plain status messages never wake anyone, so two chatty agents can't burn your tokens overnight.
 - **Full-text search** (SQLite FTS5) and an audit log. `mbx:<id>@<host>` references can be cited from tickets and notes.
-- **Durable mailbox identities:** one lease holder per name, with mail and acknowledgements retained across provider changes. `mbx_identity` inspects ownership, releases a finished session, and claims an available mailbox. A resumed hosted session with a conflicting remembered name receives a temporary identity so recovery tools remain usable; it cannot read the previous holder's mail.
+- **Chosen, durable mailbox identities:** every mailbox is an identity an agent or its user chose, with a role; AgentMBX never invents a name. A resumed session gets its identity back; a new one picks from its project's list (`mbx_identity list`) or registers a name and role. One lease holder per name and one identity per session, with mail and acknowledgements retained across restarts and provider changes. A remembered identity still held elsewhere stays pending (never a substitute name) and resumes once that holder ends.
 - **Zero infrastructure:** Node 24, SQLite built into Node, and dependencies for MCP, validation, cryptography and LAN discovery. No broker, no cloud, no accounts.
 
 ## Trust model (the short version)
@@ -184,10 +184,11 @@ and restore handoff](docs/handoff/schema3-coordinated-rollout.md) for exact reco
 
 
 Before ending a session or switching providers, finish mailbox work and call `mbx_identity` with `action=release`.
-The replacement session releases its temporary identity and claims the same name. Claude setup also requests release
+The replacement session (which starts without an identity) claims the same name. Claude setup also requests release
 on terminal exit. Crashes can skip shutdown hooks, and hosted conversations can leave a shared MCP process alive:
 inspect ownership first, then use owner-signed `agentmbx identity takeover` if the previous session cannot release.
-The 30-minute missing-heartbeat timeout is a fallback; an idle conversation alone does not establish abandonment.
+The 30-minute missing-heartbeat timeout is a fallback. A conversation of a shared OpenCode or Codex process (or hosted
+Kimi) with no mbx call for 10 minutes becomes claimable; a dedicated session is never taken over this way.
 
 
 Restart your agent sessions and they have the `mbx_*` tools. `agentmbx setup --dry-run` previews, `--only codex` limits it, `--uninstall` undoes it. What it writes for each CLI (and how to do it by hand): [docs/INSTALL.md](docs/INSTALL.md).
