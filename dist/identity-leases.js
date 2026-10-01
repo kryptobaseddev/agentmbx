@@ -40,9 +40,13 @@ const evidenceCache = new Map();
 let selfEvidenceCache = null;
 /** Own pid is alive by definition; its birth time is computed once per process, never per call. */
 function inspectSelf() {
-    if (!selfEvidenceCache)
-        selfEvidenceCache = psInspectBatch([process.pid]).get(process.pid) ?? UNKNOWN_PROCESS;
-    return selfEvidenceCache;
+    if (selfEvidenceCache)
+        return selfEvidenceCache;
+    const value = psInspectBatch([process.pid]).get(process.pid) ?? UNKNOWN_PROCESS;
+    // Cache only a complete answer: a ps timeout under load must not pin "unknown" for the life of the process.
+    if (value.alive === true && value.start)
+        selfEvidenceCache = value;
+    return value;
 }
 /** One ps spawn for every requested pid (BSD one-second birth resolution; coordination fence, not a boundary). */
 function psInspectBatch(pids) {
@@ -311,7 +315,8 @@ export class IdentityLeases {
                     throw error("IDENTITY_LEASE_LOST", `identity ${name} lease is no longer usable; explicitly reclaim it`);
                 return result.row;
             }
-            if (attempt >= UNKNOWN_RETRY_DELAYS_MS.length)
+            // Never inspect or sleep while an outer transaction holds the write lock: fail fast there, as before.
+            if (attempt >= UNKNOWN_RETRY_DELAYS_MS.length || this.store.db.isTransaction)
                 throw error("IDENTITY_STATUS_UNKNOWN", `identity ${name} process status is unknown; retry this lease token after inspection recovers`);
             sleepSync(UNKNOWN_RETRY_DELAYS_MS[attempt]);
         }
@@ -360,8 +365,8 @@ export class IdentityLeases {
             catch (e) {
                 if (e.code !== "IDENTITY_STATUS_UNKNOWN")
                     throw e;
-                if (attempt >= UNKNOWN_RETRY_DELAYS_MS.length)
-                    throw e;
+                if (attempt >= UNKNOWN_RETRY_DELAYS_MS.length || this.store.db.isTransaction)
+                    throw e; // no sleeping under an outer write lock
                 sleepSync(UNKNOWN_RETRY_DELAYS_MS[attempt]);
             }
         }
