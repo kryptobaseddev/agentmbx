@@ -33,11 +33,16 @@ The owner key is how **you**, not an agent, approve grants and policies. It only
 
 `agentmbx owner show` and `agentmbx doctor` show which backend holds the key. Macs without Touch ID (a Mac mini without a Touch ID keyboard, a VM) get the account-password prompt instead. Over SSH no prompt can appear, so the helper fails at once, setup prints the commands instead of waiting, and you can use `--backend file` there. With an ad-hoc signed app (a local build, or a release built without the signing certificate), rebuilding or updating the app changes its signature, and the next owner signature first shows a Keychain dialog asking to let `agentmbx-auth` use the item: choose Always Allow (once per update; denying it just means nothing is signed). To reset a Keychain owner key: `~/Applications/AgentMBX.app/Contents/MacOS/agentmbx-auth delete` (Touch ID), then remove `owner.json` from the mbx home.
 
-### Mailbox identities (0.4.0)
-Each agent session holds a **lease** on its mailbox name: one live holder per identity, claimed automatically
-at session start. Mail and history survive lease transfers — reclaiming a name never loses messages. Sends
+### Mailbox identities (0.5.2)
+Every mailbox is an identity that an agent or you chose, with a role; AgentMBX never invents a name. A session
+resumes the identity it held before (a resumed conversation) or the one its launch config names (`MBX_AGENT`, with
+`MBX_ROLE`). Otherwise it starts without one and picks from `mbx_identity list` (this project's identities) or
+registers a new name and role. Each identity has a **lease**: one live session per identity, one identity per
+session. Mail and history survive lease transfers — reclaiming a name never loses messages. Sends
 without a lease are labelled `unverified-sender` instead of silently trusted. Operators can inspect every
-identity, its holder and recovery state with `agentmbx identity list`; replacing a live holder takes an owner
+identity, its role, holder and recovery state with `agentmbx identity list [--project <dir>]`, retire mailboxes
+older versions generated with `agentmbx identity prune`, and move a stranded mailbox's unread mail with
+`agentmbx identity forward <from> <to>` (owner signature); replacing a live holder takes an owner
 signature (`agentmbx identity takeover <name> --force …`, Touch ID / passphrase). Agent sessions adopt newly
 deployed AgentMBX builds automatically on their next tool call — updates don't need session restarts.
 
@@ -106,7 +111,7 @@ Remove a pairing with `agentmbx peers remove <host>`.
 
 ## Appendix: what setup does (manual configuration)
 
-Every CLI runs the same stdio server, `agentmbx mcp`, registered under the server name `mbx`. Setup writes the absolute path of the `agentmbx` command (a mise/asdf shim when there is one, so Node upgrades don't break it); the examples below say `agentmbx` for short. The agent name is `MBX_AGENT` if set, otherwise the project folder name; an agent can rename itself with `mbx_whoami`.
+Every CLI runs the same stdio server, `agentmbx mcp`, registered under the server name `mbx`. Setup writes the absolute path of the `agentmbx` command (a mise/asdf shim when there is one, so Node upgrades don't break it); the examples below say `agentmbx` for short. A session's identity is `MBX_AGENT` (with `MBX_ROLE`) if set, otherwise the identity it held before; a new session without either claims or registers one with `mbx_identity` (it is never named after its folder). An agent can rename itself with `mbx_whoami`.
 
 Setup appends its own hook groups and never modifies or removes hook groups that other tools (Orca, for example) own.
 
@@ -125,7 +130,7 @@ Setup appends its own hook groups and never modifies or removes hook groups that
   `claude --dangerously-load-development-channels server:mbx`
   - Claude asks for confirmation at startup.
   - This is a research-preview feature. It needs a claude.ai login.
-- Put `MBX_AGENT` in the project's `.mcp.json` `env` if you want a fixed name.
+- Put `MBX_AGENT` and `MBX_ROLE` in the project's `.mcp.json` `env` if you want a fixed identity for every session there (one session at a time holds it).
 
 ### Codex
 In `~/.codex/config.toml`:
