@@ -92,6 +92,7 @@ test("shell names and historical links never establish CLI ownership", t => {
   }
   assert.equal(node.store.get("ident:offline"), undefined);
   assert.ok(node.store.db.prepare("SELECT 1 FROM audit WHERE event='identity.link.retired' AND json_extract(detail,'$.name')='offline'").get());
+  node.registerAgent("recipient"); // T205: sends need an existing recipient
   const sent = cliCommand(home, "send", "--as", "offline", "--to", "recipient", "--subject", "new", "-m", "unverified", "--json");
   assert.equal(sent.status, 0, sent.stderr);
   const row = node.message(JSON.parse(sent.stdout).id)!;

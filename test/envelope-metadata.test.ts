@@ -15,7 +15,7 @@ test("paired signed mail rejects malformed metadata before storing or waking", a
   const b = new MbxNode(join(home, "b"), { host: "beta" });
   t.after(() => { a.close(); b.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   b.upsertPendingPeer({ host: "alpha", pubkey: a.key.publicKey, owner_pubkey: null, addr: "127.0.0.1:0", code: "000000", nonce_local: "n", nonce_remote: "n" });
-  b.approvePeer("alpha"); b.registerAgent("worker");
+  b.approvePeer("alpha"); b.registerAgent("worker"); b.registerAgent("receiver"); // T205: sends need an existing recipient
   const draft = () => buildEnvelope({ from: "sender@alpha", to: ["worker@beta"], subject: "metadata", body: "hello @worker" });
   const valid = draft().meta;
   const malformed: unknown[] = [undefined, null, [], "bad", 1, true, {}];

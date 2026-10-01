@@ -11,6 +11,7 @@ const bin = join(import.meta.dirname, "../bin/agentmbx.js");
 test("OpenCode metadata isolates sessions, binds wake IDs, and scopes cleanup", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-oc-"));
   const n = new MbxNode(home, { host: "alpha" });
+  n.registerAgent("receiver"); // T205: sends need an existing recipient
   const c = new Client({ name: "opencode", version: "test" });
   t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await c.connect(new StdioClientTransport({ command: process.execPath, args: [bin, "mcp"], env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "opencode", MBX_AGENT: "oc-test", MBX_NO_DESKTOP: "1" } as Record<string,string> }));

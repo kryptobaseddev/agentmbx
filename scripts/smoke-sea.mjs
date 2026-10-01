@@ -19,7 +19,10 @@ try {
   const v = run("version");
   check(/^agentmbx \d+\.\d+\.\d+\S* \(sea,/.test(v), `version reports a SEA build: ${v}`);
   check(run("init", "--host", "smoke").includes("host: smoke"), "init");
-  const id = run("send", "--as", "alice", "--to", "smoker", "--subject", "smoke test", "-m", "hi");
+  // T205: a name no agent has ever held is refused, not created
+  const early = spawnSync(bin, ["send", "--as", "alice", "--to", "smoker", "--subject", "smoke test", "-m", "hi"], { env, encoding: "utf8", timeout: 5000 });
+  check(early.status === 1 && /not sent: "smoker" is not an agent/.test(early.stderr), "send to a never-held name is refused");
+  const id = run("send", "--as", "alice", "--to", "smoker", "--new-mailbox", "--subject", "smoke test", "-m", "hi");
   check(/^[0-9A-Z]{26}$/.test(id), `send -> ${id}`);
   const refused = () => spawnSync(bin, ["inbox", "--as", "smoker"], { env, encoding: "utf8", timeout: 5000 });
   const before = refused();

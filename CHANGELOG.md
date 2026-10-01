@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.2 (unreleased)
+
+- **Send-time recipient truth (T205):** `mbx_send`, `mbx_reply` and `agentmbx send` return `recipients[]`, one per resolved recipient, with a state: `live-wake` (a live session is woken now), `live-next-prompt` (live, but this kind or its missing push path or policy means it sees the mail on its next prompt), `offline` (no live session, with since when, the last holder and why), `forwarded` (a renamed mailbox's successor) or `remote` (queued for a paired host). Offline recipients add a sender warning. A send to a local name that never existed is refused with up to 3 suggestions instead of silently creating a mailbox (the owner can still leave mail for an agent that has not started yet with `agentmbx send --new-mailbox`); a bare name on this host and a paired host is delivered locally with a warning. Liveness comes from the identity lease and its existing process evidence.
+
 ## 0.5.1 (2026-10-01)
 
 Upgrade both machines: sealed LAN bodies, key rotation and code-compare pairing need 0.5.1 on each side (token pairing and plain delivery from 0.5.0 senders keep working).
