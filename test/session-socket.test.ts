@@ -48,7 +48,10 @@ test("a plain Claude session gets a no-body wake through its socket and the daem
   const hint = (inbox.lines[1] as { message: { content: string } }).message.content;
   assert.match(hint, /^\[mbx\] 1 new message\(s\) for worker/);
   assert.ok(hint.includes(m.id) && !hint.includes("secret body"), "ids, never bodies");
-  assert.equal((n.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=?").get(m.id) as { state: string }).state, "notified");
+  // the server records the delivery and audit right after the push resolves, a moment after the socket saw the lines
+  const state = () => (n.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=?").get(m.id) as { state: string }).state;
+  for (let i = 0; i < 40 && state() !== "notified"; i++) await new Promise((r) => setTimeout(r, 100));
+  assert.equal(state(), "notified");
   assert.ok(n.store.db.prepare("SELECT 1 FROM audit WHERE event='wake.attempt' AND detail LIKE '%session socket%'").get());
 });
 
