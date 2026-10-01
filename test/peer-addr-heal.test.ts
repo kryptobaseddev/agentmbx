@@ -179,3 +179,24 @@ test("announced addresses skip container bridges and VPN tunnels, but never anno
   assert.deepEqual(announcedIPv4({ en0: nic("10.0.10.42"), bridge100: nic("192.168.139.3"), bridge101: nic("192.168.97.0"), vmnet8: nic("172.16.1.1") }), ["10.0.10.42"]);
   assert.deepEqual(announcedIPv4({}), []);
 });
+
+test("a peer that comes back is sent its queued mail at once, not after the back-off", async () => {
+  const { A, B } = await paired();
+  B.n.send({ from: "vida-dev", to: ["mac-dev@alpha"], subject: "waiting", body: "x" });
+  // alpha was down: five failures pushed the next retry far out
+  const later = new Date(Date.now() + 3_600_000).toISOString();
+  B.n.store.db.prepare("UPDATE outbox SET attempts=5, next_at=?").run(later);
+  assert.deepEqual(await flushOutbox(B.n), { sent: 0, failed: 0 }, "not due yet");
+  // alpha's daemon starts and beacons (any verified hop does the same)
+  assert.deepEqual(await sendPresence(A.n), ["beta"]);
+  assert.deepEqual(await flushOutbox(B.n), { sent: 1, failed: 0 }, "due immediately after the beacon");
+  assert.equal(A.n.inbox("mac-dev")[0].subject, "waiting");
+  // a plain verified hop works too
+  B.n.send({ from: "vida-dev", to: ["mac-dev@alpha"], subject: "again", body: "y" });
+  B.n.store.db.prepare("UPDATE outbox SET attempts=5, next_at=?").run(later);
+  A.n.send({ from: "mac-dev", to: ["vida-dev@beta"], subject: "hello", body: "z" });
+  await flushOutbox(A.n);
+  assert.deepEqual(await flushOutbox(B.n), { sent: 1, failed: 0 });
+  assert.equal(B.n.peerIsBack("alpha"), 0, "nothing left to hurry");
+  down(A, B);
+});

@@ -394,6 +394,7 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
       }
       const peer = verifyHop(node, req.headers, req.method ?? "GET", url.pathname, body);
       if (url.pathname !== "/v1/presence") void learnPeerAddr(node, peer, req.socket.remoteAddress ?? "", req.headers["x-mbx-port"]).catch(() => {});
+      try { node.peerIsBack(peer); } catch { /* db busy: the back-off retry still delivers */ }
       const now = Date.now(), recent = (peerReqs.get(peer) ?? []).filter((t) => now - t < 60_000);
       peerReqs.set(peer, recent);
       if (recent.push(now) > L.peerReqsPerMin) return send(429, { error: `rate limit: over ${L.peerReqsPerMin} requests a minute from ${peer}; retry later` });
