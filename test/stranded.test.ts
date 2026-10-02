@@ -124,3 +124,49 @@ test("real mailboxes without a lease are never returned, and a copy is returned 
   assert.equal(n.inbox("boss").filter((m) => m.subject === "Returned unread: to typo-two").length, 1);
   assert.match(n.inbox("boss").find((m) => m.subject === "Returned unread: to typo-two")!.body, /there is no agent named typo-two on alpha/);
 });
+
+test("a bare name on both hosts: the sender names its local copies in the envelope and the receiver skips exactly those", (t) => {
+  const { a, b, from } = pair(t);
+  // sender side: alpha has its own claude, so bare `claude` is delivered on alpha and named in meta.local_names
+  a.registerAgent("claude");
+  a.upsertPendingPeer({ host: "beta", pubkey: b.key.publicKey, owner_pubkey: null, addr: "127.0.0.1:0", code: "000000", nonce_local: "n", nonce_remote: "n" });
+  a.approvePeer("beta");
+  const sent = a.send({ from: "lead", to: ["claude", "worker@beta"], subject: "s", body: "b" }).envelope;
+  assert.deepEqual(sent.meta.local_names, ["claude"]);
+  assert.equal(a.inbox("claude").length, 1);
+  assert.deepEqual(a.send({ from: "lead", to: ["claude"], subject: "local only", body: "b" }).envelope.meta.local_names, undefined, "not stamped when nothing leaves the host");
+  // receiver side: beta also has an established claude
+  b.registerAgent("claude"); b.registerAgent("worker");
+  assert.equal(b.receive(sent, "alpha"), "accepted");
+  assert.equal(b.inbox("worker").length, 1);
+  assert.equal(b.inbox("claude").length, 0, "alpha's own claude got it: no second copy on beta");
+  assert.match(String((b.store.db.prepare("SELECT detail FROM audit WHERE event='receive.skipped' ORDER BY rowid DESC").get() as { detail: string }).detail),
+    /claude: delivered on the sending host to its own claude; not delivered here again/);
+  // a stale directory row (alpha used to have foo) never causes a loss: without the sender's stamp, foo is delivered here
+  b.registerAgent("foo");
+  b.store.db.prepare("INSERT INTO agents (name,host,role,cli,description,last_seen) VALUES ('foo','alpha',NULL,'claude',NULL,?)").run(new Date().toISOString());
+  b.receive(from(["foo"]), "alpha");
+  assert.equal(b.inbox("foo").length, 1);
+  // an explicit claude@beta is for beta's claude
+  b.receive(from(["claude@beta"]), "alpha");
+  assert.equal(b.inbox("claude").length, 1);
+});
+
+test("retiring a phantom sends no cross-host receipt for it", (t) => {
+  const { b, from } = pair(t);
+  b.store.db.prepare("INSERT INTO agents (name,host,role,cli,description,last_seen) VALUES ('drum','alpha',NULL,'kimi',NULL,?)").run(new Date().toISOString());
+  const e = from(["drum"], "shipped");
+  b.store.insertMessage(e, "alpha", "verified", null); b.store.addDelivery(e.id, "drum"); // the legacy phantom copy
+  const owed = () => (b.store.db.prepare("SELECT count(*) n FROM receipt_outbox WHERE agent='drum'").get() as { n: number }).n;
+  assert.equal(owed(), 1, "the trigger queued a 'delivered' receipt when the phantom copy was made");
+  retirePhantoms(b, true);
+  assert.equal(owed(), 0, "no 'drum@beta delivered/acked' reaches alpha");
+  assert.equal(b.inbox("drum").length, 0);
+});
+
+test("meta.local_names is shape-checked like every signed meta field", async () => {
+  const { checkShape } = await import("../src/envelope.ts");
+  const e = buildEnvelope({ from: "lead@alpha", to: ["x"], subject: "s", body: "b" });
+  for (const bad of ["claude", [1], ["bad name"], Array.from({ length: 101 }, (_, i) => `n${i}x`)]) assert.equal(checkShape({ ...e, meta: { ...e.meta, local_names: bad } }), "bad local names");
+  assert.equal(checkShape({ ...e, meta: { ...e.meta, local_names: ["claude", "drum"] } }), null);
+});

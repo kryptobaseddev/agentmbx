@@ -15,7 +15,7 @@ export const NAME_RE = /^[a-z0-9][a-z0-9-]{1,39}$/;
 
 /** `origin`: where the content came from (external = a web page, issue, PR comment, email relayed by an agent);
  *  `hop`: agent-to-agent relay depth, saturated at MAX_RELAY_DEPTH. Both are signed with the envelope. */
-export interface Meta { mentions: string[]; directives: string[]; tags: string[]; task_refs: string[]; origin?: "agent" | "external"; hop?: number; project?: string; project_key?: string; sender_verification?: "unverified" | "leased" }
+export interface Meta { mentions: string[]; directives: string[]; tags: string[]; task_refs: string[]; origin?: "agent" | "external"; hop?: number; project?: string; project_key?: string; local_names?: string[]; sender_verification?: "unverified" | "leased" }
 
 /** Owner-signed delegation to ONE live session: `sub` is that session's in-memory key, so nothing else on the
  *  host (even a process using the same agent name) can use it. */
@@ -146,6 +146,8 @@ export function checkShape(x: unknown): string | null {
   if (m?.origin !== undefined && m.origin !== "agent" && m.origin !== "external") return "bad origin";
   if (m?.project !== undefined && (typeof m.project !== "string" || m.project.length > 300)) return "bad project";
   if (m?.project_key !== undefined && (typeof m.project_key !== "string" || m.project_key.length > 300)) return "bad project key";
+  // bare `to` entries the sending host delivered to its own agents; receivers skip exactly these (S2 follow-up)
+  if (m?.local_names !== undefined && (!Array.isArray(m.local_names) || m.local_names.length > 100 || m.local_names.some((n: unknown) => typeof n !== "string" || !NAME_RE.test(n)))) return "bad local names";
   return null;
 }
 
