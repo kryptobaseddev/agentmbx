@@ -95,6 +95,8 @@ export const isLead = (node: MbxNode, agent: string, project: string | undefined
 export interface LedgerRecipient extends DeliveryReceipt { role: string | null }
 export interface LedgerItem {
   id: string; ts: string; from: string; to: string[]; kind: string; subject: string; thread: string; project: string | null;
+  /** the sender's repository (normalized git origin): how mail from a paired host's own folder joins this ledger (T219) */
+  project_key: string | null;
   body: string | null; body_withheld?: string; recipients: LedgerRecipient[]; forwarded_by?: string[];
 }
 export interface LedgerPage { project: string; lead: string | null; messages: LedgerItem[]; next_cursor: string; has_more: boolean }
@@ -160,6 +162,7 @@ export function ledgerPage(node: MbxNode, caller: string, project: string, o: { 
     const forwarded = forwardedBy(node, m.id);
     return {
       id: m.id, ts: m.ts, from: m.from_addr, to: e.to, kind: m.kind, subject: m.subject, thread: m.thread, project: e.meta.project ?? null,
+      project_key: typeof e.meta.project_key === "string" ? e.meta.project_key : null,
       body: own || callerIsLead ? m.body : null,
       ...(own || callerIsLead ? {} : { body_withheld: "not your mail; the project lead can read it" }),
       recipients: deliveryReceipts(node, m).map((r) => ({ ...r, role: roleOf(node, r.address) })),

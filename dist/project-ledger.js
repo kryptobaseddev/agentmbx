@@ -157,6 +157,7 @@ export function ledgerPage(node, caller, project, o = {}) {
         const forwarded = forwardedBy(node, m.id);
         return {
             id: m.id, ts: m.ts, from: m.from_addr, to: e.to, kind: m.kind, subject: m.subject, thread: m.thread, project: e.meta.project ?? null,
+            project_key: typeof e.meta.project_key === "string" ? e.meta.project_key : null,
             body: own || callerIsLead ? m.body : null,
             ...(own || callerIsLead ? {} : { body_withheld: "not your mail; the project lead can read it" }),
             recipients: deliveryReceipts(node, m).map((r) => ({ ...r, role: roleOf(node, r.address) })),

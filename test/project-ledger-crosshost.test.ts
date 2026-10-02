@@ -57,6 +57,7 @@ test("a repository's mail from a paired host's own folder joins this host's proj
 
   const page = ledgerPage(A, "mac-lead", mac);
   assert.deepEqual(page.messages.map((m) => m.subject), ["same repo, other folder", "ship it"]);
+  assert.deepEqual(page.messages.map((m) => [m.project, m.project_key]), [[fed, "github.com/org/agentmbx"], [mac, "github.com/org/agentmbx"]], "each row says which repository matched");
   const shipped = page.messages.find((m) => m.id === out)!;
   assert.deepEqual(shipped.recipients.map((r) => [r.address, r.state, r.did]), [["fedora-dev@beta", "acked", "tagged v0.5.3"]]);
   assert.equal(page.messages[0].body, null, "not the caller's own mail and the caller is not the lead: body withheld");
