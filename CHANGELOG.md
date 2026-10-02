@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.3 (unreleased)
+
+- **Self-healing skill (S1):** the agentmbx skill now always matches the running AgentMBX without anyone managing it. A copy AgentMBX wrote carries a marker (`.agentmbx-skill.json`, the hash of the files it wrote); an unchanged copy is refreshed at every session start (hook) and daemon start, so upgrades no longer leave the 0.5.0 skill behind. An edited copy, a removed skill, and one installed with `npx skills` (an `agentmbx` entry in `~/.agents/.skill-lock.json`) are left alone; doctor says which, and an outdated own copy is info, not a warning. The skills CLI already lists our copy as a local skill; no lock entry is written, so `npx skills update` never swaps in a different version from GitHub. `npx skills add kryptobaseddev/agentmbx -g` remains an alternative install.
+- **The guide over MCP (S1):** the mbx server serves the version-matched guide as the resource `mbx://guide` and the prompt `mbx_guide`, so any MCP client can read it with no skill file installed.
+
 ## 0.5.2 (2026-10-01)
 
 P0 release: no more invented mailbox names, lost or invisible mail, or "who got this?". Install it on every machine; a running session switches to it on its next mbx tool call and keeps its identity. After the upgrade, a new session has no mailbox until it claims one from its project's list or registers a name and role.

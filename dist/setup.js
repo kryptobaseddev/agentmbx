@@ -3,6 +3,7 @@
 // pure text transform (current file text -> desired text), which makes it idempotent, previewable, reversible, and
 // lets `agentmbx doctor` reuse the same code to decide whether a CLI is wired.
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { accessSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync, } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir, hostname } from "node:os";
@@ -10,6 +11,7 @@ import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { insertMember, member, parseJsonc, removeMember, replaceValue, valueOf } from "./jsonc.js";
 import { fingerprint } from "./crypto.js";
+import { version } from "./version.js";
 import { authHelperPath, canPrompt, createKeychainOwner, ownerInfo } from "./owner.js";
 export const CLIS = ["claude", "codex", "opencode", "kimi", "hermes"];
 /** The bundled skill as {relative path: content}: embedded in the single executable (SEA asset), else read from ../skill. */
@@ -457,11 +459,77 @@ const skillLinks = (home) => [join(home, ".claude/skills"), join(home, ".codex/s
 function filesIn(dir, rel = "") {
     return readdirSync(join(dir, rel), { withFileTypes: true }).flatMap((e) => e.isDirectory() ? filesIn(dir, join(rel, e.name)) : [join(rel, e.name)]);
 }
+// Self-healing skill (S1, owner decision 2026-10-02): the skill always matches the running AgentMBX without anyone
+// managing it. A copy AgentMBX wrote carries a marker with the hash of what it wrote; an unchanged copy is refreshed on
+// every session start and daemon start, a copy someone edited is left alone, and a copy installed with `npx skills`
+// (an agentmbx entry in ~/.agents/.skill-lock.json) is that tool's to update. The skills CLI already lists our copy as a
+// local skill; no lock entry is written, so `npx skills update` never replaces it with a different version from GitHub.
+const SKILL_MARKER = ".agentmbx-skill.json";
+const skillHash = (files) => createHash("sha256").update(JSON.stringify(Object.keys(files).sort().map((f) => [f, files[f]]))).digest("hex");
+const installedFiles = (dest, names) => Object.fromEntries(names.map((f) => [f, read(join(dest, f)) ?? ""]));
+const skillsCliOwns = (home) => { try {
+    return !!JSON.parse(read(join(home, ".agents/.skill-lock.json")) ?? "{}")?.skills?.agentmbx;
+}
+catch {
+    return false;
+} };
+export function skillState(home) {
+    const dest = skillDest(home), src = skillFiles(), names = Object.keys(src);
+    if (!existsSync(join(dest, "SKILL.md")))
+        return { state: "missing", detail: "not installed" };
+    const current = names.every((f) => read(join(dest, f)) === src[f]);
+    if (skillsCliOwns(home))
+        return { state: "skills-cli", detail: current ? "installed with npx skills, current" : "installed with npx skills and older than this AgentMBX: npx skills update agentmbx" };
+    if (current)
+        return { state: "current", detail: `installed, current (${version()})` };
+    let marker = null;
+    try {
+        marker = JSON.parse(read(join(dest, SKILL_MARKER)) ?? "null");
+    }
+    catch { /* unreadable marker: treat as edited */
+        marker = { hash: "" };
+    }
+    // the hash covers exactly the files that copy was written with, so a newer bundle with more files still matches
+    const written = Array.isArray(marker?.files) && marker.files.every((f) => typeof f === "string") ? marker.files : ["SKILL.md"];
+    if (marker && marker.hash !== skillHash(installedFiles(dest, written)))
+        return { state: "modified", detail: "installed, edited locally; left as is (agentmbx setup --only skill replaces it)" };
+    // our unchanged copy, or one an older AgentMBX wrote before markers existed (its frontmatter names it)
+    if (marker || /^name:\s*agentmbx\s*$/m.test(read(join(dest, "SKILL.md")) ?? ""))
+        return { state: "outdated", detail: "installed, older than this AgentMBX (refreshed automatically at the next session or daemon start)" };
+    return { state: "modified", detail: "installed, not written by AgentMBX; left as is (agentmbx setup --only skill replaces it)" };
+}
+/** Write the bundled skill and its marker. A pre-marker copy keeps a .bak of what it replaced. */
+function writeSkill(home) {
+    const dest = skillDest(home), src = skillFiles();
+    if (!existsSync(join(dest, SKILL_MARKER)) && existsSync(join(dest, "SKILL.md")))
+        writeFileSync(join(dest, "SKILL.md.bak"), read(join(dest, "SKILL.md")) ?? "");
+    for (const [f, c] of Object.entries(src)) {
+        mkdirSync(dirname(join(dest, f)), { recursive: true });
+        writeFileSync(join(dest, f), c);
+    }
+    writeFileSync(join(dest, SKILL_MARKER), JSON.stringify({ version: version(), files: Object.keys(src).sort(), hash: skillHash(src), written_at: new Date().toISOString() }, null, 2) + "\n");
+}
+/** Refresh our own outdated copy; never install a removed skill, touch an edited one, or one `npx skills` manages. */
+export function selfHealSkill(home, env = process.env) {
+    // test and dev runs use throwaway mailbox homes but the real home folder: never rewrite the developer's own skill
+    if (env.AGENTMBX_DEV === "1" && env.AGENTMBX_SKILL_SELFHEAL !== "1")
+        return "current";
+    try {
+        const s = skillState(home).state;
+        if (s !== "outdated")
+            return s;
+        writeSkill(home);
+        return "current";
+    }
+    catch {
+        return "outdated";
+    } // read-only home or a race with another session: the next start tries again
+}
 export function skillStatus(home) {
     const dest = skillDest(home);
-    const src = skillFiles();
-    const installed = Object.entries(src).every(([f, c]) => read(join(dest, f)) === c);
-    return { installed, links: skillLinks(home).map((p) => { let ok = false; try {
+    const st = skillState(home);
+    return { installed: st.state === "current" || st.state === "skills-cli", ...st,
+        links: skillLinks(home).map((p) => { let ok = false; try {
             ok = readlinkSync(p) === dest;
         }
         catch { /* missing */ } return { path: p, ok }; }) };
@@ -472,11 +540,8 @@ function skill(ctx, mode, dryRun) {
     if (mode === "install") {
         const src = skillFiles();
         const diff = Object.keys(src).filter((f) => read(join(dest, f)) !== src[f]);
-        if (diff.length && !dryRun)
-            for (const f of diff) {
-                mkdirSync(dirname(join(dest, f)), { recursive: true });
-                writeFileSync(join(dest, f), src[f]);
-            }
+        if (!dryRun && (diff.length || !existsSync(join(dest, SKILL_MARKER))))
+            writeSkill(ctx.home); // also stamps the marker
         rows.push({ cli: "skill", item: "agentmbx skill", path: dest, action: !diff.length ? "unchanged" : existsSync(join(dest, "SKILL.md")) || dryRun && existsSync(dest) ? "updated" : "added" });
     }
     for (const link of skillLinks(ctx.home)) {

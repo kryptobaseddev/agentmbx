@@ -26,6 +26,7 @@ import { didWarning, formatFor, MbxNode, summaryLine, trustLabel, type Session }
 import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy.ts";
 import { assertKnownRecipients, deliveryReceipts, offlineWarnings, receiptLine, recipientReceipts, sentPage } from "./receipts.ts";
 import { forwardMessage, ledgerPage } from "./project-ledger.ts";
+import { skillFiles } from "./setup.ts";
 import { procStart, withProcSnapshot } from "./proc.ts";
 import { updateAvailable } from "./update.ts";
 import { installKind, version } from "./version.ts";
@@ -1012,6 +1013,18 @@ export async function runMcp(existing?: MbxNode) {
     const r = forwardMessage(node, agent, project, m?.id ?? id, to);
     return text(`Forwarded ${r.id} to ${r.to}.`, r);
   });
+
+  // S1: the full guide, served by the running build, so any MCP client reads the version-matched manual with no skill
+  // file installed (the skill stays as the trigger; this is its content).
+  const guide = () => (skillFiles()["SKILL.md"] ?? "").replace(/^---\n[\s\S]*?\n---\n+/, "");
+  server.registerResource("agentmbx-guide", "mbx://guide", {
+    title: "AgentMBX guide", mimeType: "text/markdown",
+    description: `How to use AgentMBX (mbx_* tools): addressing, kinds, trust and policy, identities, receipts, project ledger. Matches this server (agentmbx ${version()}).`,
+  }, (uri) => ({ contents: [{ uri: uri.href, mimeType: "text/markdown", text: guide() }] }));
+  server.registerPrompt("mbx_guide", {
+    title: "AgentMBX guide",
+    description: "Load the AgentMBX guide for this version: how to read, answer, address and coordinate with other agents.",
+  }, () => ({ messages: [{ role: "user" as const, content: { type: "text" as const, text: guide() } }] }));
 
   const transport = new StdioServerTransport();
   const timers: ReturnType<typeof setInterval>[] = [];

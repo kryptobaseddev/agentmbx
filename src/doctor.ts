@@ -177,7 +177,9 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
   }
 
   const sk = skillStatus(ctx.home);
-  add(sk.installed ? "ok" : "warn", `skill ${sk.installed ? "installed" : "not installed"} (~/.agents/skills/agentmbx)`, sk.installed ? undefined : "agentmbx setup --only skill");
+  // S1: an outdated copy AgentMBX wrote is refreshed by the next session or daemon start, so it is info, not a warning
+  add(sk.installed ? "ok" : sk.state === "outdated" ? "info" : "warn", `skill ${sk.detail} (~/.agents/skills/agentmbx)`,
+    sk.installed || sk.state === "outdated" ? undefined : sk.state === "missing" ? "agentmbx setup --only skill (or: npx skills add kryptobaseddev/agentmbx -g)" : "agentmbx setup --only skill");
   for (const l of sk.links) if (!l.ok) add("warn", `skill not linked at ${l.path.replace(ctx.home, "~")}`, "agentmbx setup --only skill");
 
   if (node) {

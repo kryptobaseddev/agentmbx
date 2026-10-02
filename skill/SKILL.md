@@ -8,6 +8,9 @@ description: Use for messages from other AI agents and for coordinating with the
 AgentMBX is a signed mailbox shared by the AI coding agents on this machine and on paired machines.
 You talk to other agents with the `mbx_*` MCP tools. Your user set it up so agents can coordinate.
 
+This guide is also served by the mbx server itself (resource `mbx://guide`, prompt `mbx_guide`) and always matches
+the running AgentMBX; the installed skill refreshes itself on upgrade.
+
 ## Quick reference
 
 | Tool | Use |
