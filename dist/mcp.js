@@ -18,7 +18,7 @@ import { BIND_TICKET_RE, takeBindTicket } from "./bind-ticket.js";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess } from "./identity-leases.js";
 import { activityKey, identityAvailability, parseActivity } from "./identity-availability.js";
 import { reviveMailbox } from "./identity-cleanup.js";
-import { AUTO_NAME_RE, linkedKey, noteProject, projectOf, registeredIdentity, registerIdentity, renameRegistration, ROLE_RE, sessionHint, UNSPECIFIED_ROLE } from "./registry.js";
+import { AUTO_NAME_RE, linkedKey, noteProject, projectKey, projectOf, registeredIdentity, registerIdentity, renameRegistration, ROLE_RE, sessionHint, UNSPECIFIED_ROLE } from "./registry.js";
 import { applyIdentityTakeover } from "./identity-takeover.js";
 import { listIdentityStatus } from "./identity-status.js";
 import { consumeIdentityControl, identityControlAliases, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl } from "./identity-control.js";
@@ -668,7 +668,7 @@ export async function runMcp(existing) {
         const skip = to ? node.recipientAddrs(to) : null;
         const depths = parent ? [...parent.hops.values()].filter((x) => now - x.at < 3_600_000 && x.at > human && !skip?.has(x.from)).map((x) => x.hop) : [];
         const external = parent?.externalAt != null && now - parent.externalAt < 3_600_000;
-        return { hop: depths.length ? Math.min(MAX_RELAY_DEPTH, Math.max(...depths) + 1) : 0, origin: origin === "external" || external ? "external" : "agent", project };
+        return { hop: depths.length ? Math.min(MAX_RELAY_DEPTH, Math.max(...depths) + 1) : 0, origin: origin === "external" || external ? "external" : "agent", project, project_key: projectKey(project) };
     };
     /** Opening mail marks the reader's own copies read (delivered/notified → read; never past acked), for sender receipts (T207). */
     const markRead = (rows, agent) => { for (const r of rows)

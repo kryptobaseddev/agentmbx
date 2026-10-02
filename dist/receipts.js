@@ -5,6 +5,7 @@ import { IdentityLeases, identityLeaseStatus } from "./identity-leases.js";
 import { hasWakeAuthority } from "./wake.js";
 import { procTable } from "./proc.js";
 import { activityKey, parseActivity, SHARED_IDLE_MS } from "./identity-availability.js";
+import { remoteReceipts } from "./remote-receipts.js";
 /** A holder renews its lease every minute; three missed beats mean its session is suspended or gone. */
 const STALE_HEARTBEAT_MS = 3 * 60_000;
 const iso = (ms) => new Date(ms).toISOString();
@@ -129,13 +130,22 @@ export function deliveryReceipts(node, m, now = Date.now()) {
     // Remote recipients: the envelope's addressees on other hosts; a queued outbox row means not yet accepted there.
     const e = JSON.parse(m.envelope);
     const outbox = new Map(node.store.db.prepare("SELECT host,attempts,last_error,next_at FROM outbox WHERE msg_id=?").all(m.id).map((o) => [o.host, o]));
-    const hosts = new Set([...e.to.filter((t) => t.includes("@") && !t.endsWith(`@${node.host}`)).map((t) => t.split("@")[1]), ...outbox.keys()]);
-    const remote = [...hosts].sort().map((h) => {
+    // Signed receipts from those hosts (T218) replace "handed-over" with the recipient's own state, did and note.
+    const signed = remoteReceipts(node, m.id);
+    const hosts = new Set([...e.to.filter((t) => t.includes("@") && !t.endsWith(`@${node.host}`)).map((t) => t.split("@")[1]), ...outbox.keys(),
+        ...signed.map((r) => r.recipient.split("@")[1])]);
+    const remote = [...hosts].sort().flatMap((h) => {
         const o = outbox.get(h);
         const names = e.to.filter((t) => t.endsWith(`@${h}`));
-        return { address: names.length ? names.join(",") : `*@${h}`, state: o ? "queued" : "handed-over", updated_at: null, note: null, did: null,
-            liveness: o ? `paired host ${h}: not accepted yet` : `accepted by paired host ${h}; its daemon tracks read/ack`,
-            ...(o ? { outbox: { attempts: o.attempts, last_error: o.last_error, next_at: o.next_at } } : {}) };
+        // A signed receipt proves delivery even while the outbox still retries (the peer's answer to the push was lost).
+        const got = signed.filter((r) => r.recipient.endsWith(`@${h}`));
+        const pending = names.filter((n) => !got.some((r) => r.recipient === n));
+        return [
+            ...got.map((r) => ({ address: r.recipient, state: r.state, updated_at: r.at, note: r.note, did: r.did, liveness: `on paired host ${h} (signed receipt)` })),
+            ...(got.length && !pending.length ? [] : [{ address: (got.length ? pending : names).join(",") || `*@${h}`, state: o ? "queued" : "handed-over", updated_at: null, note: null, did: null,
+                    liveness: o ? `paired host ${h}: not accepted yet` : `accepted by paired host ${h}; no receipt from it yet`,
+                    ...(o ? { outbox: { attempts: o.attempts, last_error: o.last_error, next_at: o.next_at } } : {}) }]),
+        ];
     });
     return [...local, ...remote];
 }

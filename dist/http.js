@@ -11,6 +11,7 @@ import { notifyDesktop } from "./wake.js";
 import { version } from "./version.js";
 import { rotationLog, saveRotationLog } from "./key-rotation.js";
 import { storedPolicies, acceptSigned } from "./policy.js";
+import { acceptReceipt, dueReceipts, RECEIPT_BATCH, receiptsDeferred, receiptsSent, signReceipt } from "./remote-receipts.js";
 export const HOP_SKEW_MS = 5 * 60_000;
 const HELLO_TTL_MS = 2 * 60_000;
 const TOKEN_REQS_PER_MIN = 30;
@@ -468,6 +469,13 @@ export function startServer(node, port = node.config.port, bind = node.config.bi
                     onEnvelope?.();
                 return send(200, { results });
             }
+            if (req.method === "POST" && url.pathname === "/v1/receipts") {
+                // Delivery receipts for mail this host sent (T218): each is signed by the recipient host, which must be this peer.
+                const { receipts } = JSON.parse(body);
+                if (!Array.isArray(receipts) || receipts.length > RECEIPT_BATCH)
+                    return send(400, { error: `bad batch: receipts must be an array of at most ${RECEIPT_BATCH}` });
+                return send(200, { results: receipts.map((r) => acceptReceipt(node, r, peer)) });
+            }
             if (req.method === "POST" && url.pathname === "/v1/policy") {
                 const { items } = JSON.parse(body);
                 if (!Array.isArray(items) || items.length > 200)
@@ -573,6 +581,35 @@ export async function flushOutbox(node, now = Date.now()) {
         }
     }
     return { sent, failed };
+}
+/** Push the delivery receipts this host owes the hosts its received mail came from (T218). Receipts are advisory: a peer
+ *  without the endpoint (an older AgentMBX) is retried hourly and its receipts expire after RETRY_HOURS, with no alert. */
+export async function flushReceipts(node, now = Date.now()) {
+    let sent = 0, deferred = 0;
+    for (const [host, rows] of dueReceipts(node, now)) {
+        const peer = node.approvedPeer(host);
+        if (!peer) {
+            receiptsDeferred(node, host, "host is not paired", now);
+            deferred += rows.length;
+            continue;
+        }
+        try {
+            const { results } = await post(node, peer.addr, "/v1/receipts", { receipts: rows.map((r) => signReceipt(node, r)) });
+            if (!Array.isArray(results) || results.length !== rows.length)
+                throw new Error("bad receipts response");
+            const rejected = rows.map((r, i) => ({ seq: r.seq, msg: r.msg_id, result: String(results[i]) })).filter((r) => r.result.startsWith("rejected"));
+            if (rejected.length)
+                node.store.audit("receipt.rejected", { host, items: rejected.slice(0, 10) });
+            receiptsSent(node, rows.map((r) => r.seq));
+            sent += rows.length;
+        }
+        catch (e) {
+            const msg = e.message, unsupported = /^(404|405|501) /.test(msg);
+            receiptsDeferred(node, host, unsupported ? `${host} does not accept receipts yet (older AgentMBX)` : msg, now, unsupported);
+            deferred += rows.length;
+        }
+    }
+    return { sent, deferred };
 }
 /** Deliver this host's key rotations to every peer that has not accepted them yet (T030). */
 const rotationTried = new Map();

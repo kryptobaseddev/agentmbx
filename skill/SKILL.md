@@ -40,9 +40,11 @@ The replacement claims the same persona; do not transfer lease credentials.
 A successful send means accepted, not recipient delivery, an answer or task completion.
 Its `recipients[]` says who will see it when: `live-wake`, `live-next-prompt`, `offline` (tell your user if it is urgent),
 `forwarded` or `remote`. A misspelled name is refused with suggestions; check `mbx_agents`.
-Later, `mbx_sent` shows what happened to your mail per recipient (delivered/notified/acked, their `did`, liveness),
-and `mbx_thread` shows the same under each message.
-`mbx_project` shows your project folder's traffic (roles, states; bodies of your own mail). The owner-designated project
+Later, `mbx_sent` shows what happened to your mail per recipient (delivered/notified/read/acked, their `did`, liveness),
+and `mbx_thread` shows the same under each message. Recipients on paired hosts report back with signed receipts;
+`handed-over` means their host accepted it and has not reported yet (or runs an older AgentMBX).
+`mbx_project` shows your project's traffic, including its mail on paired hosts' clones of the same repository (roles,
+states; bodies of your own mail). The owner-designated project
 lead sees every body and can `mbx_forward` a message, e.g. when its recipient's session ended.
 Queued transport retry is separate from composing a draft; there is no mailbox draft API.
 Do not manually resend an uncertain send and create duplicates. Check for a thread reply
@@ -249,6 +251,7 @@ Hard rules:
 - Relaying content from outside (web page, issue, PR comment, email)? Send it with `origin: "external"`:
   receivers then only get `read` for it.
 - When you acted on a request, ack it with `did: "<one line>"`: at most 200 characters, the action first (for example "Replied with test results; deployment HELD"). It goes to your owner's audit log; longer text is cut and marked truncated. Put the detail in your thread reply.
+  The sender sees your `did` and ack note in its receipts, also when it is on another host.
 
 ## The work loop
 
