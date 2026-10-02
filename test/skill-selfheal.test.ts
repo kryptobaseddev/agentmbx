@@ -85,3 +85,17 @@ test("the MCP server serves the version-matched guide as a resource and a prompt
   const p = await c.getPrompt({ name: "mbx_guide" });
   assert.equal((p.messages[0].content as { text: string }).text, text);
 });
+
+test("concurrent refreshes leave a whole skill and no temp files behind", async (t) => {
+  const h = home(t);
+  put(h, OLD);
+  const { spawn } = await import("node:child_process");
+  const script = `import { selfHealSkill } from ${JSON.stringify(join(import.meta.dirname, "../src/setup.ts"))}; selfHealSkill(${JSON.stringify(h)}, {});`;
+  const runs = Array.from({ length: 6 }, () => new Promise<number>((res) => spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: "ignore" }).on("exit", (c) => res(c ?? 1))));
+  // a reader during the race only ever sees the old or the new file
+  for (let i = 0; i < 50; i++) { const c = skillMd(h); assert.ok(c === OLD || c === bundled, "never a partial file"); await new Promise((r) => setTimeout(r, 2)); }
+  assert.deepEqual(await Promise.all(runs), [0, 0, 0, 0, 0, 0]);
+  assert.equal(skillMd(h), bundled); assert.equal(skillState(h).state, "current");
+  const { readdirSync } = await import("node:fs");
+  assert.deepEqual(readdirSync(skillDest(h)).filter((f) => f.endsWith(".tmp")), []);
+});

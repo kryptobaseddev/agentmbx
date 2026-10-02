@@ -4,7 +4,7 @@
 // lets `agentmbx doctor` reuse the same code to decide whether a CLI is wired.
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { accessSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync, } from "node:fs";
+import { accessSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync, } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir, hostname } from "node:os";
 import { delimiter, dirname, join } from "node:path";
@@ -499,15 +499,28 @@ export function skillState(home) {
     return { state: "modified", detail: "installed, not written by AgentMBX; left as is (agentmbx setup --only skill replaces it)" };
 }
 /** Write the bundled skill and its marker. A pre-marker copy keeps a .bak of what it replaced. */
+/** Write one file so a concurrent reader sees the old or the new content, never a partial one: a unique temp file in the
+ *  same directory, then an atomic rename over the target. */
+function writeAtomic(path, content) {
+    mkdirSync(dirname(path), { recursive: true });
+    const tmp = `${path}.${process.pid}.${Date.now().toString(36)}.tmp`;
+    try {
+        writeFileSync(tmp, content);
+        renameSync(tmp, path);
+    }
+    finally {
+        if (existsSync(tmp))
+            rmSync(tmp, { force: true });
+    }
+}
 function writeSkill(home) {
     const dest = skillDest(home), src = skillFiles();
     if (!existsSync(join(dest, SKILL_MARKER)) && existsSync(join(dest, "SKILL.md")))
-        writeFileSync(join(dest, "SKILL.md.bak"), read(join(dest, "SKILL.md")) ?? "");
-    for (const [f, c] of Object.entries(src)) {
-        mkdirSync(dirname(join(dest, f)), { recursive: true });
-        writeFileSync(join(dest, f), c);
-    }
-    writeFileSync(join(dest, SKILL_MARKER), JSON.stringify({ version: version(), files: Object.keys(src).sort(), hash: skillHash(src), written_at: new Date().toISOString() }, null, 2) + "\n");
+        writeAtomic(join(dest, "SKILL.md.bak"), read(join(dest, "SKILL.md")) ?? "");
+    // two sessions starting together may both refresh: each file is replaced atomically, and the marker is written last
+    for (const [f, c] of Object.entries(src))
+        writeAtomic(join(dest, f), c);
+    writeAtomic(join(dest, SKILL_MARKER), JSON.stringify({ version: version(), files: Object.keys(src).sort(), hash: skillHash(src), written_at: new Date().toISOString() }, null, 2) + "\n");
 }
 /** Refresh our own outdated copy; never install a removed skill, touch an edited one, or one `npx skills` manages. */
 export function selfHealSkill(home, env = process.env) {
