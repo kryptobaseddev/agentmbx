@@ -21,7 +21,7 @@ import { authHelperPath, createKeychainOwner, createOwnerKey, defaultOwnerBacken
 import { periodicUpdateCheck, updateAvailable, updateCommand } from "./update.js";
 import { installKind, version } from "./version.js";
 import { installService, serviceLabel, uninstallService } from "./service.js";
-import { CLIS, defaultHostName, defaultWhich, formatRows, ownerStep, resolveCommand, runSetup, shJoin } from "./setup.js";
+import { CLIS, defaultHostName, defaultWhich, formatRows, ownerStep, resolveCommand, runSetup, selfHealSkill, shJoin } from "./setup.js";
 import { dispatchWakes, hasWakeAuthority, humanPromptKey, inboxCommand, isHumanPrompt, macNotifierPath, muteWakes, notifyDesktop, opencodeService, liveWatcher, wakeMutedUntil, wakeText, watcherKey, which } from "./wake.js";
 import { kimiMultiHost } from "./kimi-web.js";
 import { bindInstruction, issueBindTicket } from "./bind-ticket.js";
@@ -738,6 +738,7 @@ If the codes differ, do not approve: someone is in the middle.`);
                 }
             };
             await startServer(node, node.config.port, node.config.bind, () => void tick());
+            selfHealSkill(homedir()); // S1: an upgrade restarts the daemon, which refreshes our own skill copy
             console.log(`[agentmbx] daemon for ${node.host} listening on ${node.config.bind}:${node.config.port}`);
             if (!process.env.MBX_NO_MDNS && node.config.bind !== "127.0.0.1") {
                 let warned = false;
@@ -1195,6 +1196,8 @@ async function hook(node, event, cli) {
     }
     if (!["session-start", "session-end", "prompt", "post-tool", "stop"].includes(event ?? ""))
         die("hook session-start | session-end | prompt | post-tool | stop | permission --cli <cli>");
+    if (event === "session-start")
+        selfHealSkill(homedir()); // S1: the skill always matches the running AgentMBX (file reads only when current)
     const cwd = typeof input.cwd === "string" && input.cwd ? input.cwd : process.cwd();
     const rawSid = input.session_id ?? input.sessionId ?? input.thread_id;
     const sid = typeof rawSid === "string" && rawSid.trim() ? rawSid : undefined;
