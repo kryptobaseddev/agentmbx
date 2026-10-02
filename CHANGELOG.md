@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.5.4 (unreleased)
+## 0.5.4 (2026-10-02)
+
+Identity and noise fixes reported by the owner's agents: a Claude session keeps its mailbox through /clear, statuslines never show another agent's mail, shorter mbx notices, no duplicate copies for names that exist on both hosts, and private project keys for self-hosted remotes.
 
 - **Claude /clear keeps your mailbox (T309):** /clear, /resume and compaction give the same Claude process a new session id while its mbx server lives on. The session hooks used to refuse to rebind it, so the new conversation was told it had no identity, and a statusline that fell back to the folder name showed another agent's mail. The hook now rebinds the holder when Claude's own session file names the new id. A session id that file doesn't name is still refused.
 - **Status displays resolve exactly (T310):** a shared resolver for statuslines and `agentmbx status` matches the session id, then that provider process's live holder; otherwise it reports unbound or ambiguous. It never uses a folder name.
