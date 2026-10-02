@@ -9,7 +9,7 @@ import { buildGrant, CAPS, grantPayload, NAME_RE, type Envelope, type Grant } fr
 import { advertise, browse, lanIPv4 } from "./discovery.ts";
 import { announceRotations, flushOutbox, flushReceipts, addrSignature, healPeerAddr, healStuckPeers, notifyUnpair, sendPresence, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.ts";
 import { relayDrainOutbox, relayFor, relayPull } from "./relay-client.ts";
-import { relayOpen, relayPushOutbox, relayPushReceipts, relayReceive, relaySettle } from "./relay-v2.ts";
+import { relayPushOutbox, relayPushReceipts, relayReceive, relayRoute, relaySettle } from "./relay-v2.ts";
 import { DEFAULT_QUOTA, parseRelayKey, RelayCore, startRelayServer } from "./relay.ts";
 import { SqliteRelayStore } from "./relay-store.ts";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.ts";
@@ -642,11 +642,13 @@ If the codes differ, do not approve: someone is in the middle.`);
           await announceRotations(node);
           // T166: a v2 relay takes rows the LAN failed twice before the LAN pass (one shared backoff); receive and settle after
           const relay = relayFor(node);
-          const v2 = relay ? await relayOpen(node, relay).catch((e) => { process.stderr.write(`[mbx] relay: ${(e as Error).message}\n`); return null; }) : null;
+          const route = relay ? await relayRoute(node, relay).catch((e) => ({ mode: "skip" as const, why: (e as Error).message })) : null;
+          const v2 = route?.mode === "v2" ? route.session : null;
           if (v2) { await relayPushOutbox(node, v2); await relayPushReceipts(node, v2); }
           await flushOutbox(node); await flushReceipts(node); await dispatchWakes(node); await opencodePermissionPass(node, yoloLookup(node), opencodeService);
-          if (v2) { await relayReceive(node, v2); relaySettle(node); }
-          else if (relay) { await relayDrainOutbox(node, relay); await relayPull(node, relay); } // a v1-only relay
+          if (v2) await relayReceive(node, v2);
+          else if (relay && route?.mode === "v1") { await relayDrainOutbox(node, relay); await relayPull(node, relay); } // a relay that only speaks v1
+          relaySettle(node); // the sender-side deadline runs whatever the relay's state
         } catch (e) { process.stderr.write(`[mbx] ${(e as Error).message}\n`); } finally { busy = false; }
       };
       await startServer(node, node.config.port, node.config.bind, () => void tick());

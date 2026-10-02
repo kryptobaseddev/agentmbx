@@ -102,6 +102,9 @@ CREATE INDEX IF NOT EXISTS relay_sent_state ON relay_sent(state, deadline_at);
 -- relay_position: how far this host has durably processed its relay queue, per relay and epoch.
 CREATE TABLE IF NOT EXISTS relay_position (
   relay TEXT PRIMARY KEY, epoch TEXT NOT NULL, received_through INTEGER NOT NULL, updated_at TEXT NOT NULL);
+-- relay_receipt_wire: a delivery receipt signed once for the relay and reused on every retry (a re-signed receipt would
+-- be a conflict there).
+CREATE TABLE IF NOT EXISTS relay_receipt_wire (seq INTEGER PRIMARY KEY, item_id TEXT NOT NULL, wire BLOB NOT NULL, created_at TEXT NOT NULL);
 -- relay_quarantine: relay items this host could not accept; kept, never dropped silently.
 CREATE TABLE IF NOT EXISTS relay_quarantine (
   relay TEXT NOT NULL, epoch TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL, item_id TEXT NOT NULL,

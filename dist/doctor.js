@@ -1,4 +1,5 @@
 // `agentmbx doctor`: one checklist that says what works, what doesn't, and the one command that fixes it.
+import { rotationLog } from "./key-rotation.js";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { phantomMailboxes, returnDays } from "./stranded.js";
 import { join } from "node:path";
@@ -295,6 +296,10 @@ export async function doctor(ctx, mbxHome, opts = {}) {
             const unconfirmed = n("SELECT COUNT(*) c FROM relay_sent WHERE relay=? AND state='unconfirmed'", relay);
             if (unconfirmed)
                 add("warn", `${unconfirmed} relay delivery(ies) never confirmed by the recipient host (their senders were alerted)`);
+            const rotFail = db.prepare("SELECT at, detail FROM audit WHERE event='relay.rotate_failed' ORDER BY at DESC LIMIT 1").get();
+            const rotDone = Number(node.store.get(`relay-rotations:${relay}`) ?? 0);
+            if (rotFail && rotDone < rotationLog(node.home).records.length)
+                add("warn", `the relay has not taken this host's key rotation yet (last try ${rotFail.at}: ${rotFail.detail})`, "the daemon retries every pass; check the relay is reachable and runs a v2 relay");
             const quarantined = n("SELECT COUNT(*) c FROM relay_quarantine WHERE relay=?", relay);
             if (quarantined)
                 add("warn", `${quarantined} relay item(s) this host could not accept are in quarantine`, "agentmbx relay quarantine");

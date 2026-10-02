@@ -33,21 +33,36 @@ async function call(s, node, method, pathAndQuery, obj) {
         node.store.db.prepare("DELETE FROM kv WHERE k LIKE ?").run(`relay-enrolled-v2:${s.relay}:%`); // re-enrol next pass (G6)
     return { status: res.status, json: await res.json().catch(() => ({})) };
 }
-/** GET /v2/relay/info; null for a v1-only relay (or none at all). */
-export async function relayInfo(relay, f = fetch) {
+/** GET /v2/relay/info: the info, or the HTTP status that came instead (0 = unreachable). */
+async function fetchInfo(relay, f) {
     const res = await f(`${base(relay)}/v2/relay/info`, { signal: AbortSignal.timeout(10_000) }).catch(() => null);
-    if (!res || res.status !== 200)
-        return null;
+    if (!res)
+        return { info: null, status: 0 };
+    if (res.status !== 200)
+        return { info: null, status: res.status };
     const j = await res.json().catch(() => null);
-    return j && j.v === 2 && typeof j.relay_pubkey === "string" && typeof j.epoch === "string" && j.limits ? j : null;
+    return { info: j && j.v === 2 && typeof j.relay_pubkey === "string" && typeof j.epoch === "string" && j.limits ? j : null, status: 200 };
+}
+export async function relayInfo(relay, f = fetch) { return (await fetchInfo(relay, f)).info; }
+/**
+ * How to use this relay this tick. v1 is allowed only for a relay that answers 404 to /v2/relay/info and never spoke v2
+ * to us (no pinned key): v1 senders drop a row on any 200, so falling back after a key change, an enrolment failure
+ * or an error would lose mail silently. Anything else that is not a usable v2 session skips the relay for this tick.
+ */
+export async function relayRoute(node, relay, f = fetch) {
+    const { info, status } = await fetchInfo(relay, f);
+    if (!info)
+        return status === 404 && !kv(node, `relay-key:${relay}`) ? { mode: "v1" } : { mode: "skip", why: status ? `relay info answered ${status}` : "relay unreachable" };
+    const session = await relayOpen(node, relay, f, info).catch(() => null);
+    return session ? { mode: "v2", session } : { mode: "skip", why: "relay session could not open (see doctor)" };
 }
 /**
  * Open a v2 session for this tick: pin the relay key (trust on first use until `relay set --key`, T168; a changed key
  * stops relay use), notice an epoch change, make sure this host is enrolled with its enc key published, and hand the
  * relay any key rotation it has not seen. Null: use v1 (or nothing) this tick.
  */
-export async function relayOpen(node, relay, f = fetch) {
-    const info = await relayInfo(relay, f);
+export async function relayOpen(node, relay, f = fetch, given) {
+    const info = given ?? await relayInfo(relay, f);
     if (!info)
         return null;
     const pinned = kv(node, `relay-key:${relay}`);
@@ -118,7 +133,10 @@ async function announceRotationsToRelay(node, s) {
 /** Tell the relay which sender keys we accept: our approved peers (spec §2). Only fake keys are kept out; republished
  *  whenever the peer set changes. */
 async function publishSenders(node, s) {
-    const senders = [...new Set(node.peers().filter((p) => p.state === "approved").map((p) => p.pubkey))].sort().slice(0, 256);
+    const all = [...new Set(node.peers().filter((p) => p.state === "approved").map((p) => p.pubkey))].sort();
+    if (all.length > 1024)
+        node.store.audit("relay.senders_truncated", { relay: s.relay, peers: all.length, kept: 1024 });
+    const senders = all.slice(0, 1024);
     const digest = createHash("sha256").update(`${node.key.publicKey}:${senders.join(",")}`).digest("hex"), k = `relay-senders:${s.relay}`;
     if (kv(node, k) === digest)
         return;
@@ -224,16 +242,25 @@ export async function relayPushReceipts(node, s, now = Date.now()) {
         const peer = node.approvedPeer(row.host);
         if (!peer)
             continue;
-        const signed = signReceipt(node, row);
-        items.push({ seq: row.seq, id: `receipt:${signed.rec.msg}:${signed.rec.recipient}:${signed.rec.seq}`, target: peer.pubkey, wire: Buffer.from(canonical(signed)) });
+        // signed once and kept: a re-signed receipt (e.g. a did recorded later) would be a conflict at the relay
+        let w = node.store.db.prepare("SELECT item_id, wire FROM relay_receipt_wire WHERE seq=?").get(row.seq);
+        if (!w) {
+            const signed = signReceipt(node, row);
+            w = { item_id: `receipt:${signed.rec.msg}:${signed.rec.recipient}:${signed.rec.seq}`, wire: Buffer.from(canonical(signed)) };
+            node.store.db.prepare("INSERT INTO relay_receipt_wire (seq,item_id,wire,created_at) VALUES (?,?,?,?)").run(row.seq, w.item_id, w.wire, iso(now));
+        }
+        items.push({ seq: row.seq, id: w.item_id, target: peer.pubkey, wire: Buffer.from(w.wire) });
     }
     if (!items.length)
         return 0;
     const r = await call(s, node, "POST", "/v2/relay/items", { items: items.map((i) => ({ kind: "receipt", item_id: i.id, targets: [{ host_pubkey: i.target, wire_b64: i.wire.toString("base64") }] })) });
     const results = Array.isArray(r.json.results) ? r.json.results : [];
     const sent = r.status === 200 ? items.filter((i) => validAccept(s, node, results.find((x) => x?.item_id === i.id), i.id, i.target, sha256hex(i.wire))) : [];
-    if (sent.length)
+    if (sent.length) {
         receiptsSent(node, sent.map((i) => i.seq));
+        for (const i of sent)
+            node.store.db.prepare("DELETE FROM relay_receipt_wire WHERE seq=?").run(i.seq);
+    }
     return sent.length;
 }
 /**
@@ -291,9 +318,23 @@ function processItem(node, relay, epoch, it) {
     }
     return result;
 }
+/** Items quarantined only because their sender was not paired yet get another chance once it is. */
+function retryUnpairedQuarantine(node, relay) {
+    let n = 0;
+    const rows = node.store.db.prepare("SELECT epoch, seq, kind, item_id, sender_pubkey, wire FROM relay_quarantine WHERE relay=? AND reason='rejected:host not paired' LIMIT 100").all(relay);
+    for (const r of rows) {
+        if (!node.peers().some((p) => p.state === "approved" && p.pubkey === r.sender_pubkey))
+            continue;
+        node.store.db.prepare("DELETE FROM relay_quarantine WHERE relay=? AND epoch=? AND seq=?").run(relay, r.epoch, r.seq);
+        const res = processItem(node, relay, r.epoch, { seq: r.seq, kind: r.kind, item_id: r.item_id, sender_pubkey: r.sender_pubkey, wire_b64: Buffer.from(r.wire).toString("base64") });
+        if (res === "accepted")
+            n++;
+    }
+    return n;
+}
 /** Pull, process in seq order, checkpoint, then ack (spec §4). Returns how many items were accepted. */
 export async function relayReceive(node, s) {
-    let accepted = 0;
+    let accepted = retryUnpairedQuarantine(node, s.relay);
     for (let page = 0; page < PAGES_PER_TICK; page++) {
         const pos = position(node, s);
         const r = await call(s, node, "GET", `/v2/relay/items?after=${pos.through}&limit=${s.info.limits.max_pull}&epoch=${encodeURIComponent(pos.epoch)}`);
@@ -361,6 +402,7 @@ export function relaySettle(node, now = Date.now()) {
             : "the relay accepted it, but there is no delivery confirmation (the recipient's host may run AgentMBX older than 0.5.3, which sends none)";
         node.store.tx(() => {
             node.store.db.prepare("UPDATE relay_sent SET state='unconfirmed', settled_at=? WHERE msg_id=? AND host=?").run(iso(now), r.msg_id, r.host);
+            node.store.db.prepare("DELETE FROM relay_wire WHERE msg_id=? AND host=?").run(r.msg_id, r.host);
             node.send({ from: "mbx", to: [e.from.split("@")[0]], kind: "alert", subject: `Undelivered/unconfirmed to ${r.host}: ${e.subject}`,
                 body: `Message ${e.id} to host ${r.host}: ${why}.` });
         });

@@ -236,3 +236,55 @@ test("a daemon publishes its paired peers as the senders it accepts; a stranger'
   await open(b); // unchanged peer set: no republish
   assert.equal(count(b, "SELECT COUNT(*) c FROM audit WHERE event='relay.senders_failed'"), 0);
 });
+
+test("v1 only for a relay that answers 404 and never spoke v2; anything else skips the relay (no silent v1 deletes)", async (t) => {
+  const { relayRoute } = await import("../src/relay-v2.ts");
+  const { a, relay } = await world(t);
+  const v1only: typeof fetch = async () => new Response("{}", { status: 404 });
+  const broken: typeof fetch = async () => new Response("{}", { status: 502 });
+  const home = mkdtempSync(join(tmpdir(), "mbx-r2-route-")), fresh = new MbxNode(home, { host: "gamma" });
+  t.after(() => { fresh.close(); rmSync(home, { recursive: true, force: true }); });
+  assert.deepEqual(await relayRoute(fresh, "http://old:7374", v1only), { mode: "v1" });
+  assert.equal((await relayRoute(fresh, "http://old:7374", broken)).mode, "skip", "a 502 is not a v1 relay");
+  assert.equal((await relayRoute(a, relay)).mode, "v2");
+  assert.equal((await relayRoute(a, relay, v1only)).mode, "skip", "a relay that spoke v2 (pinned key) never drops to v1");
+  a.store.set(`relay-key:${relay}`, generateKeyPair().publicKey);
+  assert.equal((await relayRoute(a, relay)).mode, "skip", "a changed relay key skips; it never falls back to v1");
+});
+
+test("a receipt is signed once for the relay and its bytes reused, even if the did changes between attempts", async (t) => {
+  let fail = true;
+  const lossy: typeof fetch = async (input, init) => {
+    const res = await fetch(input, init);
+    if (fail && String(input).includes("/v2/relay/items") && init?.method === "POST" && String(init.body).includes("\"receipt\"")) { fail = false; throw new Error("lost"); }
+    return res;
+  };
+  const { a, b, open } = await world(t, { f: lossy });
+  a.send({ from: "alice", to: ["bob@beta"], subject: "s", body: "b" }); lanFailedTwice(a);
+  await relayPushOutbox(a, await open(a));
+  const sb = await open(b);
+  await relayReceive(b, sb);
+  receiptsLanFailedTwice(b);
+  assert.equal(await relayPushReceipts(b, sb), 0, "first attempt lost");
+  const kept = (b.store.db.prepare("SELECT wire FROM relay_receipt_wire LIMIT 1").get() as { wire: Uint8Array }).wire;
+  b.store.audit("peer_action", { msg: "x", recipient: "bob", did: "changed my mind" }); // a later did must not change the bytes
+  receiptsLanFailedTwice(b);
+  assert.ok(await relayPushReceipts(b, sb) >= 1, "the retry is accepted, not a conflict");
+  assert.ok(Buffer.from(kept).length > 0);
+  assert.equal(count(b, "SELECT COUNT(*) c FROM relay_receipt_wire"), 0, "dropped once accepted");
+});
+
+test("an item quarantined because its sender was not paired yet is retried once the pairing exists", async (t) => {
+  const { a, b, core, open } = await world(t);
+  const sb = await open(b);
+  b.store.db.prepare("DELETE FROM peers WHERE host='alpha'").run(); // beta forgets alpha
+  a.send({ from: "alice", to: ["bob@beta"], subject: "early", body: "x" }); lanFailedTwice(a);
+  await relayPushOutbox(a, await open(a));
+  await relayReceive(b, sb);
+  assert.equal(count(b, "SELECT COUNT(*) c FROM relay_quarantine WHERE reason='rejected:host not paired'"), 1);
+  b.addApprovedPeer({ host: "alpha", pubkey: a.key.publicKey, owner_pubkey: null, addr: "127.0.0.1:1" }, "fixture");
+  assert.equal(await relayReceive(b, sb), 1);
+  assert.equal(b.inbox("bob").length, 1);
+  assert.equal(count(b, "SELECT COUNT(*) c FROM relay_quarantine"), 0);
+  void core;
+});
