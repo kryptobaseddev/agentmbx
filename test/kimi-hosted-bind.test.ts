@@ -82,7 +82,7 @@ test("a desktop conversation links its own mbx server by ticket, registers its o
 
   n.send({ from: "boss", to: ["orbit-kimi"], subject: "s", body: "b", kind: "request" });
   const prompt = hook("prompt", "conv-aaa");
-  assert.match(prompt.stdout, /1 unread mbx message\(s\) for orbit-kimi@alpha/, "hooks now resolve the linked conversation");
+  assert.match(prompt.stdout, /1 unread for orbit-kimi@alpha: mbx_inbox/, "hooks now resolve the linked conversation");
   assert.doesNotMatch(prompt.stdout, /bind=/);
 
   // the app restarts the conversation's server: a fresh ticket links the new server, which resumes the chosen identity
