@@ -167,7 +167,7 @@ agentmbx update              # verify the signed manifest, download, check sha25
 
 The daemon checks once a day and shows one desktop notification per new version; `agentmbx status` and `mbx_whoami`
 show `update available: x.y.z`. Prefer an npm-managed installation (Node >= 24)? Install the tagged GitHub source:
-`npm i -g https://github.com/kryptobaseddev/agentmbx/archive/refs/tags/v0.5.0.tar.gz`.
+`npm i -g https://github.com/kryptobaseddev/agentmbx/archive/refs/tags/v0.5.3.tar.gz`.
 The npm registry package is not published yet; registry publication requires a maintainer publishing credential.
 Check the running connector with `mbx_whoami`: the installed CLI's version may differ from a long-running MCP process.
 Current connectors reload after an update; older connectors affected by the one-reload limit need an MCP restart once.
