@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Status surface (T312/T313):** `agentmbx statusline <claude|codex|kimi|opencode|grok>` renders one MBX segment from HUD snapshots the daemon writes every tick — one `cat`, no store access by the adapter; pid snapshots only when the identity resolver proves a single holder, keyed by process birth time; nothing renders when the daemon is down (a `hud/.alive` heartbeat) or the identity is ambiguous. Output format: `mbx <name> [<n>↑ unread] [<n>↺ needs-reply] [owner:<n>] [<n> unsent] [*v<version> update]`. The bundled `skill/scripts/claude-statusline.sh` is now a thin exec of the adapter; it no longer reads the store.
+
+
 ## 0.5.5 (2026-10-02)
 
 The durable relay: a relay restart, crash or restore never loses mail, and a sender always learns when mail could not be confirmed. Self-hosted relays work today; the hosted relay at relay.agentmbx.com follows.

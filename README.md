@@ -11,7 +11,11 @@ you ── Claude Code (planner) ──┐                         ┌── Cod
                                                           (a paired machine)
 ```
 
-## Native workflow and delivery roadmap
+## Status line
+
+`agentmbx statusline <claude|codex|kimi|opencode|grok>` renders one MBX segment for a CLI status line from the daemon's HUD snapshot — a single small file read, never SQL against the store. The daemon writes one `mbx.status/v1` snapshot per bound session (and per holder pid, only when the resolver proves one) under `~/.local/share/agentmbx/hud`, keeps `hud/.alive` fresh, and adapters print nothing when the daemon is down or nothing resolves. `skill/scripts/claude-statusline.sh` is the bundled Claude adapter. Codex note: official Codex builds its status line from built-in items only (openai/codex#17827); the snapshots stay ready.
+
+Native workflow and delivery roadmap
 
 Each provider connects to its own AgentMBX MCP server. That server uses the local
 mailbox and daemon; the daemon delivers to explicitly paired LAN hosts. An optional

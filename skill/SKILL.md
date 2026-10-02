@@ -163,9 +163,8 @@ named mailbox and destination session to the owner for the signed takeover comma
 ### Claude status line
 
 The bundled `scripts/claude-statusline.sh` provides an optional MBX segment for an existing
-Claude status line. It reads Claude's status JSON on stdin and requires `jq` and `sqlite3`.
-It resolves the exact Claude session binding and counts only that mailbox's unsent messages.
-It prints nothing for an unbound session; setup does not overwrite the owner's status line.
+Claude status line. It reads Claude's status JSON on stdin and renders from the daemon-written HUD snapshot (`agentmbx statusline claude`) — one small file read, no `jq`, no `sqlite3`, no store access. It resolves the exact Claude session binding and counts only that mailbox's messages; it prints
+nothing for an unbound session, and setup does not overwrite the owner's status line.
 
 ## How mail reaches you
 
