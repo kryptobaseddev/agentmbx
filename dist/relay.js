@@ -19,8 +19,10 @@ export const DEFAULT_QUOTA = {
     maxPull: 500, maxPullBytes: 8 * 1024 * 1024, maxTargets: 64, retentionDays: 14,
     maxEnrolments: 100_000, maxPendingChallenges: 10_000, challengeTtlMs: 300_000, enrolPerMinutePerIp: 30, maxPerName: 16,
 };
-const MAX_SENDERS = 256;
+export const MAX_SENDERS = 1024;
 const IP_TABLE_MAX = 50_000;
+export const HEARTBEAT_MS = 30_000;
+export const HEARTBEAT_STALE_MS = 10 * 60_000;
 /** Lowercase hex SHA-256 of the exact wire bytes. */
 export const wireHash = (b) => createHash("sha256").update(b).digest("hex");
 const err = (code, message) => Object.assign(new Error(message), { code });
@@ -78,7 +80,17 @@ export class RelayCore {
             throw err("RELAY_KEY", "this relay store belongs to another relay key: keep relay.key with its store");
         if (!pinned)
             this.store.setMeta("relay_pubkey", this.key.publicKey);
+        // A store whose heartbeat is stale may be a restored copy (a volume restore restarts the service): rotate the epoch so
+        // senders re-push and receivers re-pull at once. A long outage rotates too, which dedup makes harmless (spec §5).
+        const now = (o.now ?? Date.now)(), beat = Number(this.store.meta("heartbeat") ?? NaN);
+        if (Number.isFinite(beat) && now - beat > (o.heartbeatStaleMs ?? HEARTBEAT_STALE_MS)) {
+            const from = this.store.epoch(), to = this.store.rotateEpoch();
+            this.store.setMeta("epoch_rotated", JSON.stringify({ from, to, at: new Date(now).toISOString(), reason: "stale heartbeat (restore or long outage)" }));
+        }
+        this.beat(now);
     }
+    /** The running relay records that it is alive; startRelayServer calls this every HEARTBEAT_MS. */
+    beat(now = Date.now()) { this.store.setMeta("heartbeat", String(now)); }
     /** Public relay facts for `relay set` pinning and client feature detection (§1). With a caller, also its queue head. */
     info(caller) {
         const q = this.quota;
@@ -143,8 +155,6 @@ export class RelayCore {
             const known = this.store.getEnrolment(pubkey);
             if (!known && this.store.liveEnrolmentCount() >= this.quota.maxEnrolments)
                 throw err("FULL", "relay enrolment capacity reached");
-            if (!known && this.store.enrolmentsByName(host).length >= this.quota.maxPerName)
-                throw err("NAME_CROWDED", `too many hosts share the name ${host} here; use a more specific host name`);
             this.store.putEnrolment({ host, pubkey, owner_fp, at: new Date().toISOString(), authorized_by: "host-key-challenge" });
         });
     }
@@ -174,6 +184,8 @@ export class RelayCore {
      *  never wins (v1 senders drop their row on a 200, so a wrong guess would lose mail silently). */
     resolveName(host, viewer) {
         const all = this.store.enrolmentsByName(host);
+        if (all.length > this.quota.maxPerName)
+            return { enrolment: null, ambiguous: true }; // crowded counts as ambiguous
         if (all.length === 1)
             return { enrolment: all[0], ambiguous: false };
         const mine = viewer?.account ? all.filter((e) => e.account === viewer.account) : [];
@@ -187,6 +199,8 @@ export class RelayCore {
         if (list?.v !== 1 || list.type !== "relay-senders" || list.host_pubkey !== target.pubkey || typeof list.iat !== "string" || !Number.isFinite(Date.parse(list.iat))
             || !Array.isArray(list.senders) || list.senders.length > MAX_SENDERS || !list.senders.every(isPubkey))
             throw err("BAD_REQUEST", "bad sender list");
+        if (Date.parse(list.iat) > Date.now() + 5 * 60_000)
+            throw err("BAD_REQUEST", "sender list iat is in the future");
         if (typeof sig !== "string" || !verifyData(target.pubkey, canonical(list), sig))
             throw err("BAD_SIGNATURE", "sender list is not signed by the target");
         const cur = this.store.senderList(target.pubkey);
@@ -206,8 +220,10 @@ export class RelayCore {
             return null;
         const payload = canonical({ method, path: signedPath, ts, body: `${method}:${signedPath}:${ts}:${body}` });
         const key = headers["x-mbx-key"], name = headers["x-mbx-host"];
-        const candidates = key ? [this.store.getEnrolment(key)].filter((e) => !!e && !e.revoked_at)
-            : name ? this.store.enrolmentsByName(name) : [];
+        const byName = !key && name ? this.store.enrolmentsByName(name) : [];
+        if (byName.length > this.quota.maxPerName)
+            return null; // a crowded name: v1 callers must upgrade to key headers
+        const candidates = key ? [this.store.getEnrolment(key)].filter((e) => !!e && !e.revoked_at) : byName;
         return candidates.find((e) => verifyData(e.pubkey, payload, sig)) ?? null;
     }
     /** A host publishes its enc key, signed by its host key; any enrolled host can read it (T028 via relay). The signature
@@ -542,7 +558,7 @@ export function startRelayServer(core, port = 0, bind = "127.0.0.1", o = {}) {
                 }
                 catch (e) {
                     const c = e.code;
-                    return send(c === "REVOKED" ? 403 : c === "NAME_TAKEN" || c === "NAME_CROWDED" ? 409 : c === "FULL" ? 503 : c === "BAD_REQUEST" ? 400 : 401, { error: e.message });
+                    return send(c === "REVOKED" ? 403 : c === "NAME_TAKEN" ? 409 : c === "FULL" ? 503 : c === "BAD_REQUEST" ? 400 : 401, { error: e.message });
                 }
             }
             // below here requires an enrolled, hop-authenticated host
@@ -627,5 +643,11 @@ export function startRelayServer(core, port = 0, bind = "127.0.0.1", o = {}) {
         }
     });
     Object.assign(server, { headersTimeout: 10_000, requestTimeout: 30_000, keepAliveTimeout: 5_000 }); // slow clients cannot hold sockets open
+    const beat = setInterval(() => { try {
+        core.beat();
+    }
+    catch { /* store closed */ } }, HEARTBEAT_MS);
+    beat.unref();
+    server.on("close", () => clearInterval(beat));
     return new Promise((resolve, reject) => { server.once("error", reject); server.listen(port, bind, () => resolve(server)); });
 }

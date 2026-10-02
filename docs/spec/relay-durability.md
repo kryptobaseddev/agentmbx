@@ -79,22 +79,28 @@ writer process). Every successful response MUST be sent only after its transacti
   for live rows), so two owners' `macbook` coexist on a shared relay and nobody can lock a name out. `owner_fp` is the
   host's own unproven claim and decides nothing. Re-enrolment MUST NOT clear `revoked_at`: a revoked key stays
   revoked, and a weaker authority (the host-key challenge) MUST NOT overwrite the `account` or `authorized_by` a
-  stronger one recorded. Names match case-insensitively; at most 16 live enrolments may share a name. F4 is closed
+  stronger one recorded. Names match case-insensitively. A name carried by more than 16 live enrolments is *crowded*: v1 name lookups and v1 hops by name treat it as ambiguous, but an enrolment is never refused for it (common names could otherwise be pre-squatted; v2 is by key). F4 is closed
   by key addressing: v2 routing, hop authentication (`x-mbx-key`) and enc-ad lookup are by key. v1 lookups by name
   resolve only when exactly one live enrolment carries the name (or exactly one inside the caller's proven account);
   otherwise the lookup is ambiguous: a v1 push answers `recipient host ambiguous` and stores nothing, and an enc-ad
   lookup answers nothing. A v1 hop by name is authenticated by whichever enrolment of that name verifies the signature.
 - **Sender allowlist.** `POST /v2/relay/senders {list:{v:1, type:"relay-senders", host_pubkey, senders[≤256], iat},
-  sig}` (signed by the target's host key, newer `iat` replaces older) lists the sender keys a target accepts,
-  normally its pinned peers. Once a target published one, pushes from other keys are refused (`rejected:sender not
+  sig}` (signed by the target's host key, newer `iat` replaces older) lists the sender keys a target accepts
+  (at most 1,024), normally its pinned peers. An `iat` more than 5 minutes ahead of the relay clock is refused, so a
+  future-dated list cannot freeze the allowlist. Once a target published one, pushes from other keys are refused (`rejected:sender not
   accepted by target`), v1 and v2 alike: enrolment is free, so without it many fake sender keys could each take a
   share of the target's queue. Stored in `sender_lists(target_pubkey PK, senders, iat, record, sig)`.
 - **Rotation (T030).** `POST /v2/relay/rotate {rotation}` takes the signed rotation record (old and new key both
   signed it; self-authenticating, since a rotated host already signs hops with its new key). The relay moves the
   name, account and queued items to the new key (re-sequenced in order, dedup rows kept), moves its sender allowlist,
-  swaps the old key for the new in other targets' allowlists, and revokes the old key. The new key MUST be fresh (not
-  revoked, empty queue), so a rotation never pushes a queue past its quota. The rotated host MUST reset its own
+  swaps the old key for the new in other targets' allowlists, and revokes the old key. The new key MUST NOT be revoked; if it
+  already has queued items, the old queue is appended after them (both keys signed the record, so nothing is stranded). The rotated host MUST reset its own
   receive position for that relay to 0 (its items were re-sequenced; dedup makes repeats harmless).
+  A peer's own T030 rotation reaches this host over the LAN; a peer reachable only through the relay is rebound there
+  (its new key replaces the old in our allowlist), but this host learns the new key only when the LAN rotation record
+  arrives. Until then a republished allowlist names the old key and the peer's relay pushes are refused; the rows wait
+  (backoff, deadline), nothing is lost, and the LAN record or a relay-carried rotation notice (later, same item
+  mechanism) resolves it.
 - `enc_ads(host_pubkey PK, enc_pub, sig, at)`. Only signed advertisements are stored, as today.
 - `items(target_pubkey, seq, kind, item_id, sender_pubkey, wire BLOB, wire_hash, bytes, accepted_at, expires_at,
   PRIMARY KEY(target_pubkey, seq))`. `wire` is the exact bytes received; `wire_hash` is lowercase hex SHA-256 of those
@@ -201,7 +207,10 @@ state retryable: the next pull starts at `received_through`, and the relay simpl
   other restore (a volume snapshot, a file copy) MUST be followed by `agentmbx relay rotate-epoch --store-dir <dir>`
   before the relay serves again. If that is missed, the seq floor (§2) still keeps every post-restore item above the
   receivers' checkpoints, and receivers that pull before any push detect the rewind (`head_seq < received_through`,
-  §4). On seeing a new epoch, in either a push or a pull response:
+  §4). The relay also writes a heartbeat to its store every 30 s and, at startup, rotates the epoch itself when the
+  stored heartbeat is more than 10 minutes old: a volume restore restarts the service on old data, and so does a long
+  outage (an extra rotation only costs a re-push and a re-pull, which dedup absorbs). On seeing a new epoch, in either
+  a push or a pull response:
   - A sender re-pushes every outbox row in `relay-accepted` state whose delivery receipt hasn't arrived. Dedup
     makes this safe even where the restored store still has the item.
   - A receiver resets its relay position for that relay to 0 and pulls everything. Receiver dedup by message id

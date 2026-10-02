@@ -376,18 +376,42 @@ test("sender allowlists: a target accepts only the keys it signed; newer lists r
   assert.equal(push(next, "alpha"), "accepted");
 });
 
-test("enrolment hygiene: a challenge never downgrades a proven account; a crowded name is refused; rotation needs a fresh key", (t) => {
+test("enrolment hygiene: a challenge never downgrades a proven account; a crowded name never refuses enrolment; rotation appends", (t) => {
   const core = new RelayCore({ ...DEFAULT_QUOTA, maxPerName: 2 }, { store: seqStore() }); t.after(() => core.store.close());
   const k = keys(), store = core.store as SqliteRelayStore;
   store.putEnrolment({ host: "studio", pubkey: k.gamma.publicKey, owner_fp: "", at: new Date().toISOString(), account: "acct-1", authorized_by: "jwks" });
   enrol(core, "studio", k.gamma, "whatever");
   assert.deepEqual([core.requireEnrolled(k.gamma.publicKey).account, core.requireEnrolled(k.gamma.publicKey).authorized_by], ["acct-1", "jwks"]);
-  enrol(core, "dup", k.alpha); enrol(core, "DUP", k.beta);
-  assert.throws(() => enrol(core, "dup", generateKeyPair()), /too many hosts share the name/);
+  // three junk "dup" enrolments: a fourth real host still enrols (v2 by key works); only v1 name lookups go ambiguous
+  enrol(core, "dup", k.alpha); enrol(core, "DUP", k.beta); enrol(core, "dup", generateKeyPair());
+  const real = generateKeyPair(); enrol(core, "dup", real);
+  assert.equal(core.requireEnrolled(real.publicKey).host, "dup");
+  assert.deepEqual(core.resolveName("dup"), { enrolment: null, ambiguous: true });
+  // rotation into a key that already has mail: the old queue is appended after it, nothing stranded
   const busy = generateKeyPair(); enrol(core, "busy", busy);
-  core.pushItems({ host: "dup", pubkey: k.alpha.publicKey }, [item(sealedFor({ host: "dup", key: k.alpha }, ["x@busy"]), [busy])]);
+  const first = sealedFor({ host: "dup", key: k.alpha }, ["x@busy"]), moved = sealedFor({ host: "dup", key: k.alpha }, ["x@studio"]);
+  core.pushItems({ host: "dup", pubkey: k.alpha.publicKey }, [item(first, [busy])]);
+  core.pushItems({ host: "dup", pubkey: k.alpha.publicKey }, [item(moved, [k.gamma])]);
   const rec = { v: 1 as const, type: "host-rotation" as const, host: "studio", old_pub: k.gamma.publicKey, new_pub: busy.publicKey, new_enc_pub: generateKeyPair().publicKey, iat: new Date().toISOString() };
-  assert.throws(() => core.rotate({ rec, old_sig: signData(k.gamma.privateKey, canonical(rec)), new_sig: signData(busy.privateKey, canonical(rec)) }), /must be fresh/);
+  assert.deepEqual(core.rotate({ rec, old_sig: signData(k.gamma.privateKey, canonical(rec)), new_sig: signData(busy.privateKey, canonical(rec)) }), { moved: 1 });
+  assert.deepEqual(core.pullItems(busy.publicKey).items.map((i) => i.item_id), [first.id, moved.id]);
+});
+
+test("a future-dated sender list is refused; a stale heartbeat rotates the epoch at startup, a fresh one does not", (t) => {
+  const core = new RelayCore(DEFAULT_QUOTA, { store: seqStore() }); t.after(() => core.store.close());
+  const k = keys(); enrol(core, "beta", k.beta);
+  const l: SenderList = { v: 1, type: "relay-senders", host_pubkey: k.beta.publicKey, senders: [], iat: new Date(Date.now() + 3_600_000).toISOString() };
+  assert.throws(() => core.publishSenders(core.requireEnrolled(k.beta.publicKey), l, signData(k.beta.privateKey, canonical(l))), /in the future/);
+  const store = seqStore(), key = generateKeyPair();
+  t.after(() => store.close());
+  const a = new RelayCore(DEFAULT_QUOTA, { store, key, now: () => 1_000_000 });
+  const epoch = store.epoch();
+  new RelayCore(DEFAULT_QUOTA, { store, key, now: () => 1_000_000 + 60_000 });
+  assert.equal(store.epoch(), epoch, "a quick restart keeps the epoch");
+  new RelayCore(DEFAULT_QUOTA, { store, key, now: () => 1_000_000 + 60_000 + 11 * 60_000 });
+  assert.notEqual(store.epoch(), epoch, "a stale heartbeat (restore or long outage) rotates it");
+  assert.match(store.meta("epoch_rotated") ?? "", /stale heartbeat/);
+  void a;
 });
 
 test("client address behind a proxy: the rightmost X-Forwarded-For hop or CF-Connecting-IP; spoofed entries do not help", async (t) => {
