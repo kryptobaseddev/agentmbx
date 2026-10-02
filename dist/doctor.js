@@ -1,5 +1,6 @@
 // `agentmbx doctor`: one checklist that says what works, what doesn't, and the one command that fixes it.
 import { existsSync, readFileSync, statSync } from "node:fs";
+import { phantomMailboxes, returnDays } from "./stranded.js";
 import { join } from "node:path";
 import { fingerprint } from "./crypto.js";
 import { signHop } from "./http.js";
@@ -127,17 +128,27 @@ export function kimiServerHooks(home, kimiHome = process.env.KIMI_CODE_HOME || j
         fix: "restart that kimi web server (stop it, then run kimi web again)" }));
 }
 const STRANDED_MAX = 10;
-/** Mailboxes with unhandled mail no live session will see (T211). Read-only; never claims, forwards or prunes. */
+/** Mailboxes with unhandled mail no live session will see (T211). Read-only; never claims, forwards or prunes.
+ *  Phantom mailboxes (S2) get their own line and the `doctor --fix` hint. */
 export function strandedMail(node) {
+    const phantoms = new Map(phantomMailboxes(node).map((p) => [p.name, p]));
     const rows = node.store.db.prepare("SELECT agent name, COUNT(*) unread FROM deliveries WHERE state <> 'acked' GROUP BY agent HAVING unread > 0")
         .all();
     const stranded = rows.filter((r) => r.name !== "owner").map((r) => ({ ...r, liveness: mailboxLiveness(node, r.name) }))
         .filter((r) => !r.liveness.live)
         .map((r) => ({ name: r.name, unread: r.unread, detail: r.liveness.detail }))
         .sort((a, b) => b.unread - a.unread || a.name.localeCompare(b.name));
-    const out = stranded.slice(0, STRANDED_MAX).map((s) => ({ level: "warn",
-        label: `${s.name}: ${s.unread} unread message(s) stranded — ${s.detail}`,
-        fix: `the owning agent resumes it with mbx_identity {"action":"claim","name":"${s.name}"}, or the owner forwards the mail: agentmbx identity forward ${s.name} <to>` }));
+    const days = returnDays(node);
+    const out = stranded.slice(0, STRANDED_MAX).map((s) => {
+        const p = phantoms.get(s.name);
+        return p
+            ? { level: "warn", label: `${s.name}: phantom mailbox — ${s.unread} message(s) addressed to ${s.name}@${p.hosts.join(", ")}, which received them there; nobody holds ${s.name} here`,
+                fix: "agentmbx doctor --fix   (marks these copies handled; nothing is deleted)" }
+            : { level: "warn",
+                label: `${s.name}: ${s.unread} unread message(s) stranded — ${s.detail}`,
+                fix: `the owning agent resumes it with mbx_identity {"action":"claim","name":"${s.name}"}, or the owner forwards the mail: agentmbx identity forward ${s.name} <to>`
+                    + (days && !node.establishedLocalName(s.name) ? `; ${s.name} is not an agent here, so new mail to it goes back to its sender after ${days} days` : "") };
+    });
     if (stranded.length > STRANDED_MAX)
         out.push({ level: "warn", label: `… ${stranded.length - STRANDED_MAX} more mailbox(es) with stranded unread mail` });
     return out;
