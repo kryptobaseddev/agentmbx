@@ -120,7 +120,7 @@ export function strandedMail(node: MbxNode): Check[] {
     : { level: "warn" as Level,
     label: `${s.name}: ${s.unread} unread message(s) stranded — ${s.detail}`,
     fix: `the owning agent resumes it with mbx_identity {"action":"claim","name":"${s.name}"}, or the owner forwards the mail: agentmbx identity forward ${s.name} <to>`
-      + (days && /never held/.test(s.detail) ? `; new mail to a never-held mailbox goes back to its sender after ${days} days` : "") }; });
+      + (days && !node.establishedLocalName(s.name) ? `; ${s.name} is not an agent here, so new mail to it goes back to its sender after ${days} days` : "") }; });
   if (stranded.length > STRANDED_MAX) out.push({ level: "warn" as Level, label: `… ${stranded.length - STRANDED_MAX} more mailbox(es) with stranded unread mail` });
   return out;
 }

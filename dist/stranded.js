@@ -42,9 +42,12 @@ export function returnDays(node) {
     return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : DEFAULT_RETURN_DAYS;
 }
 /**
- * Return mail that waited `days` in a mailbox no session has ever held: the sender gets an alert in the same thread and
- * the copy is marked handled with a "returned to sender" note, which the sender's mbx_sent shows. Only mail delivered
- * after this feature first ran is returned; older stranded mail stays for its owner to decide (doctor lists it).
+ * Return mail that waited `days` in a mailbox that is not established here (no agents row, lease, registration or alias:
+ * an explicit name@thishost typo, or a legacy delivery-only name). Real mailboxes that never hold a lease (CLI/shell
+ * senders, backfilled identities, aliases) are never returned. The sender gets an alert in the same thread and the copy
+ * is marked handled with a "returned to sender" note, which the sender's mbx_sent shows. Exactly once: a kv marker is
+ * written before the notice, so a crash between the notice and the ack never returns the same copy twice. Only mail
+ * delivered after this feature first ran is returned; older stranded mail stays for its owner to decide (doctor lists it).
  */
 export function returnNeverClaimed(node, now = Date.now(), days = returnDays(node)) {
     if (!days)
@@ -61,21 +64,30 @@ export function returnNeverClaimed(node, now = Date.now(), days = returnDays(nod
       AND NOT EXISTS (SELECT 1 FROM identity_leases l WHERE l.name=d.agent)`).all(since, cutoff);
     const out = [];
     for (const r of rows) {
+        if (node.establishedLocalName(r.mailbox))
+            continue; // a real mailbox, even without a lease: its owner reads it
+        const marker = `returned:${r.id}:${r.mailbox}`;
+        if (node.store.get(marker)) {
+            node.store.setDelivery(r.id, r.mailbox, "acked", `returned to sender after ${days} days (mailbox never established)`);
+            continue;
+        }
         const [sname] = r.sender.split("@");
         if (sname === NOTICE_FROM || sname === "owner" || sname === r.mailbox) {
             node.store.setDelivery(r.id, r.mailbox, "acked", "stranded: no sender to return it to");
             continue;
         }
         const e = JSON.parse(r.envelope);
+        node.store.set(marker, new Date(now).toISOString()); // before the notice: at most one notice per copy
         try {
             node.send({ from: NOTICE_FROM, to: [r.sender], kind: "alert", subject: `Returned unread: ${r.subject}`.slice(0, 200), reply_to: r.id, thread: r.thread,
-                body: `Your message ${r.id} to ${r.mailbox}@${node.host} was returned after ${days} days: no agent has ever held that mailbox on ${node.host}, so nobody will read it there. `
+                body: `Your message ${r.id} to ${r.mailbox}@${node.host} was returned after ${days} days: there is no agent named ${r.mailbox} on ${node.host}, so nobody will read it there. `
                     + `Check the name with mbx_agents and send it again to the right recipient. Original recipients: ${e.to.join(", ")}.` });
         }
         catch {
+            node.store.db.prepare("DELETE FROM kv WHERE k=?").run(marker);
             continue;
-        } // sender unreachable by name (unpaired host): keep it stranded; doctor still lists it
-        node.store.setDelivery(r.id, r.mailbox, "acked", `returned to sender after ${days} days (mailbox never claimed)`);
+        } // not sent (unpaired host): stays stranded; doctor lists it
+        node.store.setDelivery(r.id, r.mailbox, "acked", `returned to sender after ${days} days (mailbox never established)`);
         node.store.audit("mailbox.returned", { msg: r.id, mailbox: r.mailbox, sender: r.sender, days });
         out.push({ id: r.id, mailbox: r.mailbox, sender: r.sender });
     }

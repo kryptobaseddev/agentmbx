@@ -775,8 +775,9 @@ export class MbxNode {
             return "duplicate";
         const auth = storedEnv.authority ? checkAuthority(storedEnv, peer.owner_pubkey, this.revoked()) : null;
         const r = this.route(e.to, true);
-        if (r.warnings.length)
-            this.store.audit("receive.skipped", { msg: e.id, from: e.from, notes: r.warnings.slice(0, 10) });
+        const skipped = r.warnings.filter((w) => w.includes("not delivered here"));
+        if (skipped.length)
+            this.store.audit("receive.skipped", { msg: e.id, from: e.from, notes: skipped.slice(0, 10) });
         const stored = this.store.tx(() => {
             if (!this.store.insertMessage(storedEnv, via, "verified", auth))
                 return false;

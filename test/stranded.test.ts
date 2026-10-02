@@ -80,9 +80,9 @@ test("never-claimed mail goes back to its sender after N days; older mail, held 
   assert.deepEqual(r.map((x) => x.id), [stale]);
   const notice = n.inbox("boss").find((m) => m.subject.startsWith("Returned unread"))!;
   assert.match(notice.subject, /Returned unread: typo'd recipient/);
-  assert.equal(notice.reply_to, stale); assert.match(notice.body, /no agent has ever held that mailbox/);
+  assert.equal(notice.reply_to, stale); assert.match(notice.body, /there is no agent named ghost on alpha/);
   const d = n.store.db.prepare("SELECT state,note FROM deliveries WHERE msg_id=? AND agent='ghost'").get(stale) as { state: string; note: string };
-  assert.equal(d.state, "acked"); assert.match(d.note, /returned to sender after 7 days/);
+  assert.equal(d.state, "acked"); assert.match(d.note, /returned to sender after 7 days \(mailbox never established\)/);
   assert.deepEqual(n.inbox("ghost").map((m) => m.id).sort(), [fresh, ancient].sort());
   assert.deepEqual(returnNeverClaimed(n, now, 7), [], "idempotent: nothing returned twice");
   // a mailbox a session once held is the owner's to decide (doctor lists it), never returned
@@ -90,4 +90,37 @@ test("never-claimed mail goes back to its sender after N days; older mail, held 
     VALUES ('held-once','t',1,'s','k','claude','sid',0,0,1,1,'released')`).run();
   send("held-once", 9, "to a released mailbox");
   assert.deepEqual(returnNeverClaimed(n, now, 7), []);
+});
+
+test("real mailboxes without a lease are never returned, and a copy is returned exactly once", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-return2-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  const now = Date.now(), day = 86_400_000, iso = (ms: number) => new Date(ms).toISOString();
+  n.store.set("stranded-return-since", iso(now - 30 * day));
+  n.registerAgent("boss");
+  const send = (to: string) => {
+    const id = n.send({ from: "boss", to: [to], subject: `to ${to}`, body: "b" }).envelope.id;
+    n.store.db.prepare("UPDATE messages SET received_at=? WHERE id=?").run(iso(now - 9 * day), id);
+    return id;
+  };
+  // a script that reads with `agentmbx inbox`: registered by the CLI, never leased
+  n.registerAgent("nightly-script", { cli: "cli" });
+  registerIdentity(n.store, { name: "backfilled", role: "ops" });
+  n.store.set("alias:old-name", "boss");
+  for (const to of ["nightly-script", "backfilled"]) send(to);
+  n.store.addDelivery(send("boss"), "old-name");
+  assert.deepEqual(returnNeverClaimed(n, now, 7), [], "established mailboxes keep their mail");
+  assert.equal(n.inbox("nightly-script").length, 1);
+  // exactly once: a marker written before a crash means no second notice, only the ack
+  const typo = send("typo");
+  n.store.set(`returned:${typo}:typo`, iso(now));
+  assert.deepEqual(returnNeverClaimed(n, now, 7), []);
+  assert.equal(n.inbox("boss").filter((m) => m.subject.startsWith("Returned unread")).length, 0);
+  assert.equal((n.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=? AND agent='typo'").get(typo) as { state: string }).state, "acked");
+  const typo2 = send("typo-two");
+  assert.deepEqual(returnNeverClaimed(n, now, 7).map((x) => x.id), [typo2]);
+  assert.deepEqual(returnNeverClaimed(n, now, 7), []);
+  assert.equal(n.inbox("boss").filter((m) => m.subject === "Returned unread: to typo-two").length, 1);
+  assert.match(n.inbox("boss").find((m) => m.subject === "Returned unread: to typo-two")!.body, /there is no agent named typo-two on alpha/);
 });
