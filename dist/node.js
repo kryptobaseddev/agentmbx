@@ -572,7 +572,7 @@ export class MbxNode {
     }
     // ---- addressing --------------------------------------------------------------------------
     /** Split recipients into local agent names and remote hosts that must receive the envelope. */
-    route(to, forReceive = false, fromHost) {
+    route(to, forReceive = false, senderLocal) {
         const local = new Set(), remote = new Set(), warnings = [], targets = [];
         const localAgents = new Set(this.agents().filter((a) => a.host === this.host).map((a) => a.name));
         const live = this.sessionAgents(); // broadcasts reach tracked sessions only; shell senders get mail addressed by name
@@ -629,10 +629,11 @@ export class MbxNode {
                 warnings.push(`${name}: not an agent on ${this.host}; not delivered here (bare names resolve on the sender's host)`);
                 continue;
             }
-            // The sending host resolves a bare name locally first: if it has its own `name`, that agent got the message, and a
-            // copy here would be a second, wrong delivery (an established `name` on both hosts; S2 follow-up).
-            if (forReceive && fromHost && this.store.db.prepare("SELECT 1 FROM agents WHERE name=? AND host=?").get(name, fromHost)) {
-                warnings.push(`${name}: delivered to ${name}@${fromHost} on the sending host; not delivered here again`);
+            // The sending host resolves a bare name locally first and says so in the signed envelope (meta.local_names): its own
+            // agent got the message, and a copy here would be a second, wrong delivery (S2 follow-up). Decided by the sender, so a
+            // stale directory here can never turn this into lost mail.
+            if (forReceive && senderLocal?.has(raw)) {
+                warnings.push(`${name}: delivered on the sending host to its own ${raw}; not delivered here again`);
                 continue;
             }
             if (localAgents.has(name) || forReceive) {
@@ -724,12 +725,17 @@ export class MbxNode {
             throw new Error("prebuilt sender attestation requires the current identity lease");
         if (!prebuilt)
             e.meta.sender_verification = !d.unverifiedSender && hasHeldIdentity(this.store, fromName) ? "leased" : "unverified";
+        const r = this.route(e.to);
+        // Name the bare recipients this host delivered to its own agents, inside the signed envelope, so a paired host that
+        // also has an agent of that name skips its copy exactly (no reliance on its possibly stale directory of this host).
+        const localBare = [...new Set(r.targets.filter((t) => !t.host && t.name && t.name !== "owner" && !t.to.includes("@") && !t.to.startsWith("role:") && t.to !== "*").map((t) => t.to))];
+        if (!prebuilt && localBare.length && r.remote.size)
+            e.meta.local_names = localBare.slice(0, 100);
         if (owner)
             e = ownerSign(e, owner.pub, owner.priv);
         else if (session?.grant)
             e = attachAuthority(e, session.grant, session.priv);
         e = signEnvelope(e, this.host, this.key.publicKey, this.key.privateKey);
-        const r = this.route(e.to);
         const auth = e.authority ? checkAuthority(e, this.ownerPub, this.revoked()) : null;
         this.store.tx(() => {
             this.store.insertMessage(e, "local", "local", auth);
@@ -780,7 +786,7 @@ export class MbxNode {
         if (this.store.hasMessage(e.id))
             return "duplicate";
         const auth = storedEnv.authority ? checkAuthority(storedEnv, peer.owner_pubkey, this.revoked()) : null;
-        const r = this.route(e.to, true, via);
+        const r = this.route(e.to, true, new Set(e.meta.local_names ?? []));
         const skipped = r.warnings.filter((w) => w.includes("not delivered here"));
         if (skipped.length)
             this.store.audit("receive.skipped", { msg: e.id, from: e.from, notes: skipped.slice(0, 10) });

@@ -2,7 +2,7 @@
 
 ## 0.5.4 (unreleased)
 
-- **No duplicate copy of a bare name that lives on both hosts (S2 follow-up):** the sending host resolves a bare name locally first, so when it has its own agent of that name, a received envelope no longer also delivers it to this host's same-named mailbox (audited as `receive.skipped`). An explicit `name@thishost` still arrives.
+- **No duplicate copy of a bare name that lives on both hosts (S2 follow-up):** the sending host resolves a bare name locally first; when it delivers one to its own agent and the message also goes to paired hosts, it names it in the signed envelope (`meta.local_names`), and receivers skip exactly those names instead of delivering a second copy to their own same-named mailbox (audited as `receive.skipped`). Decided by the sender, so a stale directory can never turn this into lost mail; messages from older senders behave as before. An explicit `name@thishost` still arrives.
 - **Retired phantoms send no receipt (S2 follow-up):** `doctor --fix` removes the cross-host receipts its own acks would queue, so the sender never sees "drum@fedora acked" for a mailbox nobody holds.
 
 ## 0.5.3 (2026-10-02)
