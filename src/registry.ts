@@ -30,9 +30,12 @@ export function projectOf(dir: string): string | undefined {
  * The same repository has a different folder on every host, so a project's mail is matched across paired hosts by its
  * git origin, normalized to `host/path` without scheme, credentials or `.git` (T219): `git@github.com:org/repo.git` and
  * `https://github.com/org/repo` are both `github.com/org/repo`. None for a folder without an origin or with a
- * local-path origin (which means nothing on another host). Cached per process.
+ * local-path origin (which means nothing on another host). A key is cached for the process (a later `git remote
+ * set-url` shows after a restart); "no key" is cached for a minute only, so a `git` call that timed out on a loaded host
+ * heals without a restart.
  */
-const keys = new Map<string, string | undefined>();
+const keys = new Map<string, { key: string | undefined; at: number }>();
+const NO_KEY_TTL_MS = 60_000;
 export function normalizeRemote(url: string): string | undefined {
   const u = url.trim();
   const scp = /^(?:[^@/\s]+@)?([A-Za-z0-9.-]+):(?!\/\/)(.+)$/.exec(u); // git@host:org/repo
@@ -46,14 +49,15 @@ export function normalizeRemote(url: string): string | undefined {
   path = path.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "");
   return path ? `${host}/${path}`.toLowerCase().slice(0, 300) : undefined;
 }
-export function projectKey(project: string | undefined): string | undefined {
+export function projectKey(project: string | undefined, now = Date.now()): string | undefined {
   if (!project) return undefined;
-  if (keys.has(project)) return keys.get(project);
+  const hit = keys.get(project);
+  if (hit && (hit.key !== undefined || now - hit.at < NO_KEY_TTL_MS)) return hit.key;
   let key: string | undefined;
   try {
     key = normalizeRemote(execFileSync("git", ["-C", project, "config", "--get", "remote.origin.url"], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] }));
-  } catch { key = undefined; } // not a repository, no origin, or no git
-  keys.set(project, key);
+  } catch { key = undefined; } // not a repository, no origin, no git, or a timeout under load
+  keys.set(project, { key, at: now });
   return key;
 }
 

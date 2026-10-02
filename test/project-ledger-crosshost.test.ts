@@ -32,6 +32,13 @@ test("a repository's mail from a paired host's own folder joins this host's proj
   assert.equal(projectKey(mac), "github.com/org/agentmbx");
   assert.equal(projectKey(fed), projectKey(mac), "the same origin is the same project on every host");
   assert.equal(projectKey(join(root, "a")), undefined, "a folder that is no repository has no key");
+  // "no key" is retried after a minute (a git call that timed out under load heals without a restart)
+  const late = repo(join(root, "late"), "git@github.com:org/late.git");
+  execFileSync("git", ["-C", late, "remote", "remove", "origin"]);
+  assert.equal(projectKey(late), undefined);
+  execFileSync("git", ["-C", late, "remote", "add", "origin", "git@github.com:org/late.git"]);
+  assert.equal(projectKey(late), undefined, "cached for a minute");
+  assert.equal(projectKey(late, Date.now() + 61_000), "github.com/org/late");
   assert.equal(normalizeRemote("/srv/git/agentmbx.git"), undefined, "a local-path origin means nothing on another host");
 
   registerIdentity(A.store, { name: "mac-lead", role: "lead" }); A.registerAgent("mac-lead"); noteProject(A.store, "mac-lead", mac);
