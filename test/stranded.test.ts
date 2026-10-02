@@ -124,3 +124,29 @@ test("real mailboxes without a lease are never returned, and a copy is returned 
   assert.equal(n.inbox("boss").filter((m) => m.subject === "Returned unread: to typo-two").length, 1);
   assert.match(n.inbox("boss").find((m) => m.subject === "Returned unread: to typo-two")!.body, /there is no agent named typo-two on alpha/);
 });
+
+test("a bare name established on both hosts goes only to the sending host's agent; explicit addresses still arrive", (t) => {
+  const { b, from } = pair(t);
+  b.registerAgent("claude"); b.registerAgent("worker");
+  // beta knows that alpha has its own claude (directory sync)
+  b.store.db.prepare("INSERT INTO agents (name,host,role,cli,description,last_seen) VALUES ('claude','alpha',NULL,'claude',NULL,?)").run(new Date().toISOString());
+  assert.equal(b.receive(from(["claude", "worker@beta"]), "alpha"), "accepted");
+  assert.equal(b.inbox("worker").length, 1);
+  assert.equal(b.inbox("claude").length, 0, "alpha's own claude got it there: no second copy on beta");
+  assert.match(String((b.store.db.prepare("SELECT detail FROM audit WHERE event='receive.skipped' ORDER BY rowid DESC").get() as { detail: string }).detail),
+    /claude: delivered to claude@alpha on the sending host; not delivered here again/);
+  b.receive(from(["claude@beta"]), "alpha");
+  assert.equal(b.inbox("claude").length, 1, "an explicit claude@beta is for beta's claude");
+});
+
+test("retiring a phantom sends no cross-host receipt for it", (t) => {
+  const { b, from } = pair(t);
+  b.store.db.prepare("INSERT INTO agents (name,host,role,cli,description,last_seen) VALUES ('drum','alpha',NULL,'kimi',NULL,?)").run(new Date().toISOString());
+  const e = from(["drum"], "shipped");
+  b.store.insertMessage(e, "alpha", "verified", null); b.store.addDelivery(e.id, "drum"); // the legacy phantom copy
+  const owed = () => (b.store.db.prepare("SELECT count(*) n FROM receipt_outbox WHERE agent='drum'").get() as { n: number }).n;
+  assert.equal(owed(), 1, "the trigger queued a 'delivered' receipt when the phantom copy was made");
+  retirePhantoms(b, true);
+  assert.equal(owed(), 0, "no 'drum@beta delivered/acked' reaches alpha");
+  assert.equal(b.inbox("drum").length, 0);
+});

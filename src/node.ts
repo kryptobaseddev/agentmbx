@@ -530,7 +530,7 @@ export class MbxNode {
 
   // ---- addressing --------------------------------------------------------------------------
   /** Split recipients into local agent names and remote hosts that must receive the envelope. */
-  route(to: string[], forReceive = false): { local: Set<string>; remote: Set<string>; warnings: string[]; targets: RouteTarget[] } {
+  route(to: string[], forReceive = false, fromHost?: string): { local: Set<string>; remote: Set<string>; warnings: string[]; targets: RouteTarget[] } {
     const local = new Set<string>(), remote = new Set<string>(), warnings: string[] = [], targets: RouteTarget[] = [];
     const localAgents = new Set(this.agents().filter((a) => a.host === this.host).map((a) => a.name));
     const live = this.sessionAgents(); // broadcasts reach tracked sessions only; shell senders get mail addressed by name
@@ -564,6 +564,12 @@ export class MbxNode {
       // its own host, so an unknown one was meant for an agent there, not for a new phantom mailbox on this host.
       if (forReceive && !localAgents.has(name) && !this.establishedLocalName(name)) {
         warnings.push(`${name}: not an agent on ${this.host}; not delivered here (bare names resolve on the sender's host)`);
+        continue;
+      }
+      // The sending host resolves a bare name locally first: if it has its own `name`, that agent got the message, and a
+      // copy here would be a second, wrong delivery (an established `name` on both hosts; S2 follow-up).
+      if (forReceive && fromHost && this.store.db.prepare("SELECT 1 FROM agents WHERE name=? AND host=?").get(name, fromHost)) {
+        warnings.push(`${name}: delivered to ${name}@${fromHost} on the sending host; not delivered here again`);
         continue;
       }
       if (localAgents.has(name) || forReceive) {
@@ -675,7 +681,7 @@ export class MbxNode {
     }
     if (this.store.hasMessage(e.id)) return "duplicate";
     const auth = storedEnv.authority ? checkAuthority(storedEnv, peer.owner_pubkey, this.revoked()) : null;
-    const r = this.route(e.to, true);
+    const r = this.route(e.to, true, via);
     const skipped = r.warnings.filter((w) => w.includes("not delivered here"));
     if (skipped.length) this.store.audit("receive.skipped", { msg: e.id, from: e.from, notes: skipped.slice(0, 10) });
     const stored = this.store.tx(() => {

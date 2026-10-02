@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.4 (unreleased)
+
+- **No duplicate copy of a bare name that lives on both hosts (S2 follow-up):** the sending host resolves a bare name locally first, so when it has its own agent of that name, a received envelope no longer also delivers it to this host's same-named mailbox (audited as `receive.skipped`). An explicit `name@thishost` still arrives.
+- **Retired phantoms send no receipt (S2 follow-up):** `doctor --fix` removes the cross-host receipts its own acks would queue, so the sender never sees "drum@fedora acked" for a mailbox nobody holds.
+
 ## 0.5.3 (2026-10-02)
 
 Follow-up to the 0.5.2 P0 release: mail you send to another machine now reports back, mail nobody can read no longer piles up, and a resumed identity can catch up on what it missed. Install it on every machine; receipts flow once both ends run 0.5.3.
