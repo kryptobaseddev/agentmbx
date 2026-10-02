@@ -137,3 +137,10 @@ test("v1 mail is durable too, and the HTTP v2 endpoints sign the query string", 
   const tampered = await fetch(`${base}/v2/relay/items?after=5&limit=10`, { headers: relayHop("beta", k.beta.privateKey, "GET", signedPath, "") });
   assert.equal(tampered.status, 401, "the pull cursor is covered by the signature");
 });
+
+test("an injected relay key (MBX_RELAY_KEY) yields the same key pair as the generated one", async () => {
+  const { generateKeyPair, keyPairFromPrivate } = await import("../src/crypto.ts");
+  const k = generateKeyPair();
+  assert.deepEqual(keyPairFromPrivate(k.privateKey), k);
+  assert.throws(() => keyPairFromPrivate("c2hvcnQ="), /32-byte/);
+});

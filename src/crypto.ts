@@ -30,6 +30,14 @@ const privObj = (b64: string) => createPrivateKey({ key: Buffer.concat([PKCS8_PR
 
 const bytes = (data: string | Uint8Array) => (typeof data === "string" ? Buffer.from(data) : data);
 
+// The key pair for a 32-byte Ed25519 private seed (base64), e.g. a relay key injected as a secret.
+export function keyPairFromPrivate(privateKey: string): KeyPair {
+  const seed = Buffer.from(privateKey, "base64");
+  if (seed.length !== 32) throw new Error("expected a base64 32-byte Ed25519 private key");
+  const pub = createPublicKey(createPrivateKey({ key: Buffer.concat([PKCS8_PREFIX, seed]), format: "der", type: "pkcs8" }));
+  return { publicKey: pub.export({ format: "der", type: "spki" }).subarray(SPKI_PREFIX.length).toString("base64"), privateKey: seed.toString("base64") };
+}
+
 export function signData(privateKey: string, data: string | Uint8Array): string {
   return sign(null, bytes(data), privObj(privateKey)).toString("base64");
 }

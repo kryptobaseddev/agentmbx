@@ -78,7 +78,9 @@ sees plaintext bodies — envelopes are sealed for the recipient before they lea
 1. Run a relay on any always-on machine: `agentmbx relay serve --port 7374` (or `PORT`). It keeps its store and its
    signing key in `--store-dir` (default `~/.local/share/agentmbx-relay`, or `MBX_RELAY_DIR`): `relay.db` and
    `relay.key` (mode 0600). Back them up together; the relay refuses to start with a key that isn't its store's. The
-   startup line prints the store epoch and the key fingerprint.
+   startup line prints the store epoch and the key fingerprint. Hosted deployments can inject the key instead:
+   `agentmbx relay keygen` prints `MBX_RELAY_KEY=<base64 private key>` (store it as a secret) and the fingerprint;
+   when `MBX_RELAY_KEY` is set it wins over `relay.key`.
 2. Point each daemon at it: `agentmbx relay set http://<relay-host>:7374`, then restart the daemon
    (`agentmbx daemon install` hosts: `launchctl kickstart -k gui/$(id -u)/com.agentmbx.daemon`).
 3. That's it: mail to unreachable peers flows through the relay and is pulled by the peer; `agentmbx doctor`

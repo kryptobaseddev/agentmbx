@@ -4,7 +4,7 @@ import { constants as osConstants, homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { execFileSync, spawn } from "node:child_process";
-import { canonical, fingerprint, generateKeyPair, ulid, type KeyPair } from "./crypto.ts";
+import { canonical, fingerprint, generateKeyPair, keyPairFromPrivate, ulid, type KeyPair } from "./crypto.ts";
 import { buildGrant, CAPS, grantPayload, NAME_RE, type Envelope, type Grant } from "./envelope.ts";
 import { advertise, browse, lanIPv4 } from "./discovery.ts";
 import { announceRotations, flushOutbox, flushReceipts, addrSignature, healPeerAddr, healStuckPeers, notifyUnpair, sendPresence, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.ts";
@@ -590,18 +590,29 @@ If the codes differ, do not approve: someone is in the middle.`);
         console.log("the daemon reads it on start: agentmbx daemon install, or launchctl kickstart -k gui/$(id -u)/com.agentmbx.daemon");
         return;
       }
-      if (sub !== undefined && sub !== "serve") die("relay [serve [--port N] [--store-dir DIR]] | relay set <url> | relay unset");
+      if (sub === "keygen") {
+        const k = generateKeyPair();
+        console.log(`MBX_RELAY_KEY=${k.privateKey}`);
+        console.error(`[agentmbx] relay key fingerprint ${fingerprint(k.publicKey)}: store the value as a secret, record the fingerprint for clients`);
+        return;
+      }
+      if (sub !== undefined && sub !== "serve") die("relay [serve [--port N] [--store-dir DIR]] | relay keygen | relay set <url> | relay unset");
       // T165: durable store and a persistent relay key in one directory (a Railway volume in production: MBX_RELAY_DIR=/data)
       const port = Number(str("port") ?? process.env.PORT ?? 7374);
       const dir = str("store-dir") ?? process.env.MBX_RELAY_DIR ?? join(homedir(), ".local/share/agentmbx-relay");
       mkdirSync(dir, { recursive: true, mode: 0o700 });
+      // MBX_RELAY_KEY (a deploy secret: the base64 private key `agentmbx relay keygen` prints) wins over relay.key on the volume
       const keyPath = join(dir, "relay.key");
-      if (!existsSync(keyPath)) writeFileSync(keyPath, JSON.stringify(generateKeyPair()) + "\n", { mode: 0o600 });
-      const relayKey = JSON.parse(readFileSync(keyPath, "utf8")) as KeyPair;
+      const envKey = process.env.MBX_RELAY_KEY?.trim();
+      if (!envKey && !existsSync(keyPath)) writeFileSync(keyPath, JSON.stringify(generateKeyPair()) + "\n", { mode: 0o600 });
+      const relayKey = ((): KeyPair => {
+        try { return envKey ? keyPairFromPrivate(envKey) : JSON.parse(readFileSync(keyPath, "utf8")) as KeyPair; }
+        catch (e) { return die(`relay key ${envKey ? "MBX_RELAY_KEY" : keyPath}: ${(e as Error).message}`); }
+      })();
       const core = new RelayCore(DEFAULT_QUOTA, { store: new SqliteRelayStore(join(dir, "relay.db")), key: relayKey });
       const server = await startRelayServer(core, port, str("bind") ?? "0.0.0.0");
       console.log(`[agentmbx] untrusted store-and-forward relay listening on :${port} (ADR-035; durable store ${join(dir, "relay.db")}, epoch ${core.store.epoch()})`);
-      console.log(`[agentmbx] relay key ${fingerprint(relayKey.publicKey)} (keep relay.key with its store; record this fingerprint for clients)`);
+      console.log(`[agentmbx] relay key ${fingerprint(relayKey.publicKey)} (${envKey ? "from MBX_RELAY_KEY" : "keep relay.key with its store"}; record this fingerprint for clients)`);
       return new Promise(() => void server);
     }
     case "daemon": {
