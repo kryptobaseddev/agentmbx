@@ -40,6 +40,10 @@ test("a repository's mail from a paired host's own folder joins this host's proj
   assert.equal(projectKey(late), undefined, "cached for a minute");
   assert.equal(projectKey(late, Date.now() + 61_000), "github.com/org/late");
   assert.equal(normalizeRemote("/srv/git/agentmbx.git"), undefined, "a local-path origin means nothing on another host");
+  // a self-hosted remote's path never leaves the machine in clear: both hosts compute the same digest
+  const nas = normalizeRemote("keaton@nas.local:/volume1/homes/keaton/git/foo.git")!;
+  assert.match(nas, /^h:[0-9a-f]{32}$/); assert.doesNotMatch(nas, /keaton|volume1|nas/);
+  assert.equal(normalizeRemote("ssh://keaton@NAS.local/volume1/homes/keaton/git/foo"), nas, "same repository, same digest on every host");
 
   registerIdentity(A.store, { name: "mac-lead", role: "lead" }); A.registerAgent("mac-lead"); noteProject(A.store, "mac-lead", mac);
   A.registerAgent("bystander"); // works elsewhere: only the project key ties this mail to the project

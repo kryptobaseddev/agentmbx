@@ -3,6 +3,7 @@
 // stays unbound until it claims one from its project's list or registers a new one. The registry records each chosen
 // identity's role and which project folders it has worked in, so a restarted agent can find its own mailbox by role.
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
@@ -59,8 +60,15 @@ export function normalizeRemote(url) {
     else
         return undefined;
     path = path.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "");
-    return path ? `${host}/${path}`.toLowerCase().slice(0, 300) : undefined;
+    if (!path)
+        return undefined;
+    const key = `${host}/${path}`.toLowerCase();
+    // A public forge's org/repo is not private. A self-hosted remote's path can name a machine, a user and a folder
+    // (nas.local/volume1/homes/keaton/git/foo), and the key travels in envelopes and to the cloud read model: those are
+    // reduced to a digest that both hosts still compute identically, so cross-host matching keeps working.
+    return FORGES.has(host.toLowerCase()) ? key.slice(0, 300) : `h:${createHash("sha256").update(key).digest("hex").slice(0, 32)}`;
 }
+const FORGES = new Set(["github.com", "gitlab.com", "bitbucket.org", "codeberg.org", "git.sr.ht", "dev.azure.com", "ssh.dev.azure.com", "gitee.com"]);
 export function projectKey(project, now = Date.now()) {
     if (!project)
         return undefined;
