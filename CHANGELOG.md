@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.4 (unreleased)
+
+- **Lean notices (S3, owner request):** a wake is one line (`[mbx] N new message(s) for X from Y [trust] (ids …). mbx_inbox or mbx_read, reply, ack. Already handled: no action needed.`) instead of four sentences; the trust rules stay in the MCP instructions, the session-start note and every `mbx_read` header. The prompt hook adds nothing on the wake prompt itself (it is the notice), and the policy recap is sent once per session and again only when policies change; otherwise the unread notice is `[mbx] N unread for X: mbx_inbox.` About 280 words per incoming message become about 40 (plus Claude Code's own socket framing, which AgentMBX does not control).
+
 ## 0.5.3 (2026-10-02)
 
 Follow-up to the 0.5.2 P0 release: mail you send to another machine now reports back, mail nobody can read no longer piles up, and a resumed identity can catch up on what it missed. Install it on every machine; receipts flow once both ends run 0.5.3.
