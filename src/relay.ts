@@ -23,14 +23,20 @@ export interface RelayQuota {
   maxEnvelopeBytes: number; maxBatch: number; pushesPerMinute: number; maxPull: number; maxPullBytes: number; maxTargets: number; retentionDays: number;
   /** Public-relay hygiene: enrolled keys, open challenges and their lifetime, enrolment calls per client address per minute. */
   maxEnrolments: number; maxPendingChallenges: number; challengeTtlMs: number; enrolPerMinutePerIp: number;
+  /** Live enrolments sharing one host name (bounds v1 name lookups and hop checks). */
+  maxPerName: number;
 }
 /** Owner decision 2026-10-02: 14 days, 50 MB / 10,000 queued per owner (charged per host key until accounts prove owners). */
 export const DEFAULT_QUOTA: RelayQuota = {
   maxQueueDepth: 10_000, maxQueueBytes: 50 * 1024 * 1024, maxSenderItems: 2_000, maxSenderBytes: 20 * 1024 * 1024,
   maxOwnerDepth: 10_000, maxOwnerBytes: 50 * 1024 * 1024, maxEnvelopeBytes: 256 * 1024 * 2, maxBatch: 200, pushesPerMinute: 120,
   maxPull: 500, maxPullBytes: 8 * 1024 * 1024, maxTargets: 64, retentionDays: 14,
-  maxEnrolments: 100_000, maxPendingChallenges: 10_000, challengeTtlMs: 300_000, enrolPerMinutePerIp: 30,
+  maxEnrolments: 100_000, maxPendingChallenges: 10_000, challengeTtlMs: 300_000, enrolPerMinutePerIp: 30, maxPerName: 16,
 };
+/** A target's signed list of the sender keys it accepts (its pinned peers). Once published, only those may push to it. */
+export interface SenderList { v: 1; type: "relay-senders"; host_pubkey: string; senders: string[]; iat: string }
+const MAX_SENDERS = 256;
+const IP_TABLE_MAX = 50_000;
 
 export type { Enrolment } from "./relay-store.ts";
 interface QueueRow { seq: number; envelope: Envelope; from: string; at: string }
@@ -100,7 +106,10 @@ export class RelayCore {
     const now = Date.now(), recent = (map.get(key) ?? []).filter((t) => now - t < 60_000);
     if (recent.length >= limit) { map.set(key, recent); return false; }
     recent.push(now); map.set(key, recent);
-    if (map.size > 50_000) for (const [k, v] of map) if (!v.some((t) => now - t < 60_000)) map.delete(k); // forget idle keys
+    if (map.size > IP_TABLE_MAX) {
+      for (const [k, v] of map) if (!v.some((t) => now - t < 60_000)) map.delete(k); // forget idle keys
+      for (const k of map.keys()) { if (map.size <= IP_TABLE_MAX) break; map.delete(k); } // hard cap: spoofed keys cannot grow it
+    }
     return true;
   }
   /** Challenge and enrolment calls per client address (HTTP adapter passes it; in-process callers are trusted). */
@@ -129,6 +138,7 @@ export class RelayCore {
     this.store.transaction(() => {
       const known = this.store.getEnrolment(pubkey);
       if (!known && this.store.liveEnrolmentCount() >= this.quota.maxEnrolments) throw err("FULL", "relay enrolment capacity reached");
+      if (!known && this.store.enrolmentsByName(host).length >= this.quota.maxPerName) throw err("NAME_CROWDED", `too many hosts share the name ${host} here; use a more specific host name`);
       this.store.putEnrolment({ host, pubkey, owner_fp, at: new Date().toISOString(), authorized_by: "host-key-challenge" });
     });
   }
@@ -142,7 +152,7 @@ export class RelayCore {
     const bad = checkRotation(s, old.pubkey);
     if (bad) throw err("BAD_ROTATION", bad);
     if (s.rec.host !== old.host || !isPubkey(s.rec.new_pub)) throw err("BAD_ROTATION", "rotation names another host");
-    const moved = this.store.rebind(old.pubkey, { ...old, pubkey: s.rec.new_pub, at: new Date().toISOString(), authorized_by: "host-rotation", revoked_at: null });
+    const moved = this.store.rebind(old.pubkey, { ...old, pubkey: s.rec.new_pub, at: new Date().toISOString(), authorized_by: old.authorized_by ?? "host-rotation", revoked_at: null });
     return { moved };
   }
 
@@ -151,10 +161,30 @@ export class RelayCore {
     if (!e || e.revoked_at) throw new Error("host is not enrolled");
     return e;
   }
-  /** v1 name routing: names are not unique, so prefer the caller's own owner claim, then the newest enrolment. */
-  enrolmentByName(host: string, viewer?: Enrolment): Enrolment | null {
+  /** v1 name routing: a name resolves only when exactly one live enrolment carries it, or exactly one inside the
+   *  caller's proven account. Anything else is ambiguous and routes nowhere: an unproven owner claim or a newer squatter
+   *  never wins (v1 senders drop their row on a 200, so a wrong guess would lose mail silently). */
+  resolveName(host: string, viewer?: Enrolment): { enrolment: Enrolment | null; ambiguous: boolean } {
     const all = this.store.enrolmentsByName(host);
-    return (viewer ? all.find((e) => viewer.account ? e.account === viewer.account : e.owner_fp === viewer.owner_fp) : undefined) ?? all[0] ?? null;
+    if (all.length === 1) return { enrolment: all[0]!, ambiguous: false };
+    const mine = viewer?.account ? all.filter((e) => e.account === viewer.account) : [];
+    if (mine.length === 1) return { enrolment: mine[0]!, ambiguous: false };
+    return { enrolment: null, ambiguous: all.length > 1 };
+  }
+  enrolmentByName(host: string, viewer?: Enrolment): Enrolment | null { return this.resolveName(host, viewer).enrolment; }
+
+  /** A target publishes the sender keys it accepts, signed by its host key; a newer list replaces an older one. */
+  publishSenders(target: Enrolment, list: SenderList, sig: string): void {
+    if (list?.v !== 1 || list.type !== "relay-senders" || list.host_pubkey !== target.pubkey || typeof list.iat !== "string" || !Number.isFinite(Date.parse(list.iat))
+      || !Array.isArray(list.senders) || list.senders.length > MAX_SENDERS || !list.senders.every(isPubkey)) throw err("BAD_REQUEST", "bad sender list");
+    if (typeof sig !== "string" || !verifyData(target.pubkey, canonical(list), sig)) throw err("BAD_SIGNATURE", "sender list is not signed by the target");
+    const cur = this.store.senderList(target.pubkey);
+    if (cur && Date.parse(cur.iat) >= Date.parse(list.iat)) throw err("STALE", "a newer sender list is already stored");
+    this.store.transaction(() => this.store.putSenderList(target.pubkey, [...new Set(list.senders)], list.iat, canonical(list), sig));
+  }
+  private senderAllowed(target: Enrolment, sender: string): boolean {
+    const l = this.store.senderList(target.pubkey);
+    return !l || l.senders.includes(sender);
   }
   /** Hop authentication: by key when the caller sends x-mbx-key (v2), else by name, letting the signature pick among
    *  the enrolments that carry the name (v1). */
@@ -177,7 +207,7 @@ export class RelayCore {
     this.store.transaction(() => this.store.putEncAd({ host, host_pubkey: pubkey, enc_pub: encPub, sig, at: new Date().toISOString() }));
   }
   getEncAd(host: string, viewer?: Enrolment): { host: string; enc_pub: string; sig: string } | null {
-    const e = this.enrolmentByName(host, viewer);
+    const e = this.resolveName(host, viewer).enrolment;
     return e ? this.getEncAdByKey(e.pubkey) : null;
   }
   getEncAdByKey(pubkey: string): { host: string; host_pubkey: string; enc_pub: string; sig: string } | null {
@@ -215,8 +245,11 @@ export class RelayCore {
       const names = [...new Set(e.to.map((r) => r.split("@")[1]))];
       const targets: Enrolment[] = [];
       for (const hostPart of names) {
-        const target = hostPart ? this.enrolmentByName(hostPart, sender) : null;
+        const r = hostPart ? this.resolveName(hostPart, sender) : { enrolment: null, ambiguous: false };
+        if (r.ambiguous) return { stored, error: `recipient host ambiguous: ${hostPart} (several hosts use that name here; upgrade to address hosts by key)` };
+        const target = r.enrolment;
         if (!target) return { stored, error: `recipient host not enrolled: ${hostPart}` };
+        if (!this.senderAllowed(target, sender.pubkey)) return { stored, error: `sender not accepted by ${hostPart}` };
         if (!targets.some((t) => t.pubkey === target.pubkey)) targets.push(target);
       }
       // v1 dedup: an envelope id this sender already stored counts as stored for every target (exactly-once storage)
@@ -266,6 +299,7 @@ export class RelayCore {
       for (const t of it.targets) {
         const target = typeof t?.host_pubkey === "string" ? this.store.getEnrolment(t.host_pubkey) : null;
         if (!target || target.revoked_at) return reject("target not enrolled");
+        if (!this.senderAllowed(target, sender.pubkey)) return reject("sender not accepted by target");
         if (prepared.some((p) => p.target.pubkey === target.pubkey)) return reject("duplicate target"); // the sender merges a host's recipients
         if (typeof t.wire_b64 !== "string" || !B64_RE.test(t.wire_b64)) return reject("bad wire");
         const wire = Buffer.from(t.wire_b64, "base64"), bytes = wire.length;
@@ -383,7 +417,16 @@ export const relayHop = (host: string, priv: string, method: string, path: strin
   "x-mbx-sig": signData(priv, canonical({ method, path, ts: String(now), body: `${method}:${path}:${now}:${body}` })),
 });
 
-export interface RelayServerOptions { /** Use the first X-Forwarded-For hop as the client address (behind Railway/Cloudflare). */ trustProxy?: boolean }
+export interface RelayServerOptions {
+  /** How to find the client address behind a proxy: "xff" = the rightmost X-Forwarded-For entry (the one the trusted
+   *  proxy appended; earlier entries are client-controlled), "cloudflare" = CF-Connecting-IP. Default: the socket. */
+  trustProxy?: false | "xff" | "cloudflare";
+}
+export function clientAddress(headers: IncomingHttpHeaders, socketAddr: string | undefined, mode: RelayServerOptions["trustProxy"]): string {
+  if (mode === "cloudflare") { const cf = headers["cf-connecting-ip"]; if (typeof cf === "string" && cf.trim()) return cf.trim().slice(0, 64); }
+  if (mode === "xff") { const parts = String(headers["x-forwarded-for"] ?? "").split(",").map((x) => x.trim()).filter(Boolean); if (parts.length) return parts[parts.length - 1]!.slice(0, 64); }
+  return socketAddr ?? "unknown";
+}
 
 export function startRelayServer(core: RelayCore, port = 0, bind = "127.0.0.1", o: RelayServerOptions = {}): Promise<Server> {
   const server = createServer(async (req, res) => {
@@ -402,12 +445,11 @@ export function startRelayServer(core: RelayCore, port = 0, bind = "127.0.0.1", 
         return send(200, core.info(caller ?? undefined));
       }
       if (enrolCall) {
-        const xff = o.trustProxy ? String(req.headers["x-forwarded-for"] ?? "").split(",")[0]!.trim() : "";
-        if (!core.allowEnrolCall(xff || req.socket.remoteAddress || "unknown")) return send(429, { error: "too many enrolment calls; retry in a minute" });
+        if (!core.allowEnrolCall(clientAddress(req.headers, req.socket.remoteAddress, o.trustProxy))) return send(429, { error: "too many enrolment calls; retry in a minute" });
         if (url.pathname === "/v2/relay/rotate") { // self-authenticating: both keys signed the record (a rotated host signs hops with its new key)
           const { rotation } = JSON.parse(body) as { rotation?: SignedRotation };
           try { return send(200, core.rotate(rotation as SignedRotation)); }
-          catch (e) { const c = (e as { code?: string }).code; return send(c === "NOT_ENROLLED" ? 404 : 400, { error: (e as Error).message }); }
+          catch (e) { const c = (e as { code?: string }).code; return send(c === "NOT_ENROLLED" ? 404 : c === "ROTATION_TARGET" ? 409 : 400, { error: (e as Error).message }); }
         }
         const j = JSON.parse(body) as { host?: string; pubkey?: string; owner_fp?: string; sig?: string };
         if (url.pathname === "/v1/relay/challenge") {
@@ -419,7 +461,7 @@ export function startRelayServer(core: RelayCore, port = 0, bind = "127.0.0.1", 
         try { core.enrol(j.host, j.pubkey, j.owner_fp, j.sig); return send(200, { ok: true }); }
         catch (e) {
           const c = (e as { code?: string }).code;
-          return send(c === "REVOKED" ? 403 : c === "NAME_TAKEN" ? 409 : c === "FULL" ? 503 : c === "BAD_REQUEST" ? 400 : 401, { error: (e as Error).message });
+          return send(c === "REVOKED" ? 403 : c === "NAME_TAKEN" || c === "NAME_CROWDED" ? 409 : c === "FULL" ? 503 : c === "BAD_REQUEST" ? 400 : 401, { error: (e as Error).message });
         }
       }
       // below here requires an enrolled, hop-authenticated host
@@ -452,6 +494,11 @@ export function startRelayServer(core: RelayCore, port = 0, bind = "127.0.0.1", 
         const { epoch, through } = JSON.parse(body) as { epoch?: string; through?: number };
         try { return send(200, core.ackItems(enrol.pubkey, String(epoch ?? ""), Number(through))); }
         catch (e) { const c = (e as { code?: string }).code; return send(c === "EPOCH" ? 409 : 400, { error: (e as Error).message, code: c, epoch: core.store.epoch(), head_seq: core.store.lastSeq(enrol.pubkey) }); }
+      }
+      if (req.method === "POST" && url.pathname === "/v2/relay/senders") {
+        const { list, sig } = JSON.parse(body) as { list?: SenderList; sig?: string };
+        try { core.publishSenders(enrol, list as SenderList, String(sig ?? "")); return send(200, { ok: true }); }
+        catch (e) { const c = (e as { code?: string }).code; return send(c === "STALE" ? 409 : c === "BAD_SIGNATURE" ? 401 : 400, { error: (e as Error).message }); }
       }
       if (req.method === "POST" && url.pathname === "/v1/relay/enc-key") {
         const j = JSON.parse(body) as { enc_pub?: string; sig?: string };

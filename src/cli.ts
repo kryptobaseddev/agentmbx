@@ -617,7 +617,7 @@ If the codes differ, do not approve: someone is in the middle.`);
         catch (e) { return die(`relay key ${envKey ? "MBX_RELAY_KEY" : keyPath}: ${(e as Error).message}`); }
       })();
       const core = new RelayCore(DEFAULT_QUOTA, { store: new SqliteRelayStore(join(dir, "relay.db")), key: relayKey });
-      const trustProxy = o["trust-proxy"] === true || process.env.MBX_RELAY_TRUST_PROXY === "1";
+      const envProxy = process.env.MBX_RELAY_TRUST_PROXY, trustProxy = envProxy === "cloudflare" ? "cloudflare" as const : o["trust-proxy"] === true || envProxy === "xff" || envProxy === "1" ? "xff" as const : false;
       const server = await startRelayServer(core, port, str("bind") ?? "0.0.0.0", { trustProxy });
       console.log(`[agentmbx] untrusted store-and-forward relay listening on :${port} (ADR-035; durable store ${join(dir, "relay.db")}, epoch ${core.store.epoch()})`);
       console.log(`[agentmbx] relay key ${fingerprint(relayKey.publicKey)} (${envKey ? "from MBX_RELAY_KEY" : "keep relay.key with its store"}; record this fingerprint for clients)`);

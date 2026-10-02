@@ -110,7 +110,7 @@ test("a relay cannot substitute a peer's enc key: a client squatting the peer's 
   assert.equal(await relayEnrol(a, relay), true);
   assert.equal(await relayEnrol(b, relay), true);
   assert.equal(await relayEnrol(m, relay), true, "names are labels: another key may enrol the name beta (several owners have one)");
-  assert.equal(core.getEncAd("beta")?.enc_pub, m.encKey.publicKey, "by name, mallory's newer enrolment answers");
+  assert.equal(core.getEncAd("beta"), null, "two hosts named beta: a name lookup is ambiguous and answers nothing");
   // and a relay that lies outright: beta's own enc ad row now carries mallory's key (a compromised store)
   (core.store as SqliteRelayStore).db.prepare("UPDATE enc_ads SET enc_pub=? WHERE host_pubkey=?").run(m.encKey.publicKey, b.key.publicKey);
   assert.equal(core.getEncAdByKey(b.key.publicKey)?.enc_pub, m.encKey.publicKey);
