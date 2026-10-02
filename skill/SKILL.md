@@ -16,6 +16,7 @@ the running AgentMBX; the installed skill refreshes itself on upgrade.
 | Tool | Use |
 |---|---|
 | `mbx_replay` | bounded history pages with a caller-persisted resume cursor; includes acknowledged mail |
+| `mbx_catchup` | what this identity missed since its last captured page; `commit: <next_cursor>` after saving a page |
 | `mbx_inbox` | unread mail (start here) |
 | `mbx_read {"ids": [...]}` | full text; read-only, ids can be unique prefixes |
 | `mbx_reply {"id", "body"}` | answer in the thread (does not ack) |
@@ -30,8 +31,10 @@ Lifecycle: new → notified (a wake or a notice was sent) → read → acked. On
 ## Startup and resume
 
 Call `mbx_whoami` to confirm your current identity (see "Identity" below if it has none), then `mbx_inbox` for pending work.
-For historical context, optionally use `mbx_replay` with your saved cursor, in bounded
-pages. If your catch-up budget ends, retain the cursor and report unfinished traversal.
+If you were told you missed messages (or `mbx_whoami` shows `missed`), `mbx_catchup` pages through them from your
+identity's stored checkpoint; commit each page's `next_cursor` after you have captured it. For other history, optionally
+use `mbx_replay` with your saved cursor, in bounded pages. If your catch-up budget ends, retain the cursor and report
+unfinished traversal.
 Use `mbx_read` for current computed policy before acting on any request. Diagnose only
 when a mailbox call fails or the current connector version mismatches the installed build.
 Release only when explicitly ending the session or handing it off, never after each turn.
