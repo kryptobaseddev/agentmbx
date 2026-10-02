@@ -560,6 +560,12 @@ export class MbxNode {
       }
       // bare name: local first, then a unique match on a paired host
       const elsewhere = forReceive ? [] : this.agents().filter((a) => a.name === name && a.host !== this.host).map((a) => a.host).filter((h) => approved.includes(h));
+      // On receive, a bare name is delivered only to a mailbox that exists here (S2): the sender resolved bare names on
+      // its own host, so an unknown one was meant for an agent there, not for a new phantom mailbox on this host.
+      if (forReceive && !localAgents.has(name) && !this.establishedLocalName(name)) {
+        warnings.push(`${name}: not an agent on ${this.host}; not delivered here (bare names resolve on the sender's host)`);
+        continue;
+      }
       if (localAgents.has(name) || forReceive) {
         local.add(name); targets.push({ to: t, name, ...renamed });
         if (elsewhere.length) warnings.push(`${name} also exists on ${elsewhere.join(", ")}: delivered to ${name}@${this.host}; use ${name}@<host> for the other`);
@@ -595,6 +601,14 @@ export class MbxNode {
       out.add(`${name}@${hosts.length === 1 ? hosts[0] : this.host}`);
     }
     return out;
+  }
+
+  /** A mailbox that was deliberately created here: an agents row, a lease, a registration or a rename alias. Unlike
+   *  knownLocalName it ignores deliveries, so a phantom mailbox (S2) never makes itself look established. */
+  establishedLocalName(name: string): boolean {
+    const q = (sql: string, ...args: string[]) => !!this.store.db.prepare(sql).get(...args);
+    return name === "owner" || q("SELECT 1 FROM agents WHERE name=? AND host=?", name, this.host) || q("SELECT 1 FROM identity_leases WHERE name=?", name)
+      || q("SELECT 1 FROM identities WHERE name=?", name) || this.store.get(`alias:${name}`) !== undefined;
   }
 
   /** Has `name` ever existed on this host: an agents row, a delivery, a lease or a rename alias (T205)? */
@@ -662,6 +676,7 @@ export class MbxNode {
     if (this.store.hasMessage(e.id)) return "duplicate";
     const auth = storedEnv.authority ? checkAuthority(storedEnv, peer.owner_pubkey, this.revoked()) : null;
     const r = this.route(e.to, true);
+    if (r.warnings.length) this.store.audit("receive.skipped", { msg: e.id, from: e.from, notes: r.warnings.slice(0, 10) });
     const stored = this.store.tx(() => {
       if (!this.store.insertMessage(storedEnv, via, "verified", auth)) return false;
       for (const a of r.local) this.store.addDelivery(e.id, a);

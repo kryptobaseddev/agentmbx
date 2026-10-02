@@ -14,6 +14,7 @@ import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.ts";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.ts";
 import { ancestors, withProcSnapshot } from "./proc.ts";
 import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.ts";
+import { retirePhantoms, returnNeverClaimed } from "./stranded.ts";
 import { activeLead, leadSummary, makeLead, makeLeadRevocation, revokeLead, storeLead } from "./project-ledger.ts";
 import { DEFAULT_PORT, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.ts";
 import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary,
@@ -45,7 +46,7 @@ const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, 
 Start here
   agentmbx setup [--yes] [--dry-run] [--only claude,codex,opencode,kimi,hermes,skill,owner] [--host <name>] [--no-owner] [--policy ask|collaborate|autonomous|yolo] [--uninstall]
                   init this host, install the daemon, wire every detected agent CLI (MCP + hooks + skill), create the owner key
-  agentmbx doctor   checklist: host, daemon, each CLI's wiring, skill, peers, pending pairings
+  agentmbx doctor [--fix]   checklist: host, daemon, each CLI's wiring, skill, peers, pending pairings, stranded mail (--fix retires phantom mailboxes)
   agentmbx claude [claude args…]   start Claude Code with the mbx channel, so the idle session wakes when mail arrives
 
 Messages
@@ -208,7 +209,7 @@ async function run(argv: string[]) {
     compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" },
     backend: { type: "string" }, "no-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
     project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }, "wait-ms": { type: "string" },
-    "older-than": { type: "string" }, minutes: { type: "string" }, apply: { type: "boolean" }, days: { type: "string" } } });
+    "older-than": { type: "string" }, minutes: { type: "string" }, apply: { type: "boolean" }, days: { type: "string" }, fix: { type: "boolean" } } });
   if (o.help) return console.log(commandHelp(cmd));
   const str = (k: string) => (typeof (o as Record<string, unknown>)[k] === "string" ? (o as Record<string, unknown>)[k] as string : undefined);
 
@@ -221,6 +222,13 @@ async function run(argv: string[]) {
   if (cmd === "update") { process.exitCode = await updateCommand({ check: !!o.check, yes: !!o.yes }); return; }
   if (cmd === "setup") return setup(o, str);
   if (cmd === "doctor") {
+    if (o.fix) { // S2: retire phantom mailboxes (the only automatic repair doctor offers; it deletes nothing)
+      const fixNode = new MbxNode();
+      try {
+        const done = retirePhantoms(fixNode, true);
+        console.log(done.length ? done.map((p) => `retired phantom mailbox ${p.name}: ${p.messages.length} message(s), received by ${p.name}@${p.hosts.join(", ")}`).join("\n") : "no phantom mailboxes to retire");
+      } finally { fixNode.close(); }
+    }
     const checks = await doctor(setupCtx(), defaultHome());
     console.log(formatChecks(checks));
     if (failed(checks)) process.exitCode = 1;
@@ -621,6 +629,9 @@ If the codes differ, do not approve: someone is in the middle.`);
       const remind = () => { try { if (!node.ownerPub) return; for (const p of dueReminders(node.store.db)) void notifyDesktop({ subtitle: "Policy expires soon",
         body: `${policySummary(p)} expires ${p.exp.slice(0, 16).replace("T", " ")}Z. Renew: agentmbx policy renew ${p.id.slice(-6)}` }); } catch { /* db busy */ } };
       setInterval(remind, 3600_000).unref(); remind();
+      // S2: mail that waited too long in a mailbox no session ever held goes back to its sender
+      const returns = () => { try { returnNeverClaimed(node); } catch { /* db busy: next hour */ } };
+      setInterval(returns, 3600_000).unref(); setTimeout(returns, 90_000).unref();
       const updCheck = () => void periodicUpdateCheck(node.store, (title, text) => notifyDesktop({ subtitle: title, body: text })); // gated to once per 24 h via kv
       setInterval(updCheck, 3600_000).unref(); updCheck();
       // Retention is opt-in (config retention_days). No VACUUM here: it would lock out live writers; `agentmbx prune` does it.

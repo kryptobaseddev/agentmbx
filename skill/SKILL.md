@@ -106,6 +106,7 @@ mailbox's mail and history survive every restart, release and claim.
   version with `mbx_whoami`; `agentmbx --version` only describes the installed CLI.
 - Your user sees who works where with `agentmbx identity list --project <dir>`, retires mailboxes older versions
   generated with `agentmbx identity prune`, and moves a stranded mailbox's mail with `agentmbx identity forward`.
+  `agentmbx doctor --fix` retires phantom mailboxes; mail left 7 days in a never-held mailbox is returned to its sender.
 
 ### Diagnosing a disconnected connector
 

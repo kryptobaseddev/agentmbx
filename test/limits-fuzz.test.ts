@@ -226,11 +226,11 @@ test("peers cannot mint local mailbox names, and mail to unknown names never flo
     assert.equal(B.n.receive(envFrom(A.n, B.n, "x", true, { to, kind: "request" }), "alpha"), "accepted");
     const names = (B.n.store.db.prepare("SELECT DISTINCT agent FROM deliveries").all() as { agent: string }[]).map((r) => r.agent);
     assert.ok(!names.includes("bad name") && !names.includes("../x"), "invalid recipient names create no mailbox");
+    // S2: bare names are resolved on the sender's host, so unknown ones create no mailbox here at all
+    assert.deepEqual(names.filter((n) => n.startsWith("ghost-") || n === "worker"), [], "unknown bare names are not delivered on the receiving host");
     process.env.MBX_NO_DESKTOP = "1";
     const results = await dispatchWakes(B.n);
-    assert.ok(results.length >= 31);
-    assert.ok(results.every((r) => r.result.ok === false && /notice skipped/.test((r.result as { error: string }).error)), "unknown names get no notice at all");
-    assert.equal((B.n.store.db.prepare("SELECT count(*) n FROM deliveries WHERE note='desktop'").get() as { n: number }).n, results.length, "kept re-wakeable once a real session binds");
+    assert.equal(results.length, 0, "nothing to notify for names that were never delivered");
     for (let i = 0; i < 8; i++) { B.n.registerAgent(`known-${i}`); B.n.send({ from: "boss", to: [`known-${i}`], subject: "s", body: "b", kind: "request" }); }
     const known = await dispatchWakes(B.n);
     assert.equal(known.filter((r) => /notice skipped/.test((r.result as { error?: string }).error ?? "")).length, 2, "at most six notices a minute across all agents");
