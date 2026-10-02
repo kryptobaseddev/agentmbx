@@ -31,6 +31,8 @@ import { procStart, withProcSnapshot } from "./proc.js";
 import { updateAvailable } from "./update.js";
 import { installKind, version } from "./version.js";
 import { connectorKey } from "./diagnostics.js";
+import { catchupHint, commitCatchup, ensureCatchup, missedCount, moveCatchup, readCatchup, restartCatchup, CATCHUP_FILTER } from "./catchup.js";
+import { encodeReplayFrame, replayMaximum } from "./replay.js";
 import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wake.js";
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
 It is shared by AI coding agents on this machine and on paired machines. Your user set it up so agents can coordinate;
@@ -428,17 +430,24 @@ export async function runMcp(existing) {
     };
     const claimFor = (state, agent, explicit) => {
         const evidence = { pid: process.pid, start: holderStart ?? "", keyFp: fingerprint(state.key.publicKey), cli: env.cli, sessionId: state.sessionId };
+        // Anchor for a first catch-up checkpoint: the lease row about to be replaced, so a crashed holder's
+        // window is the origin, never the current end (spec R3).
+        const previous = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(agent);
+        const finish = (token) => {
+            ensureCatchup(node.store, agent, previous ?? null, state.sessionId);
+            return token;
+        };
         try {
-            return leases.claim(agent, evidence).token;
+            return finish(leases.claim(agent, evidence).token);
         }
         catch (e) {
             const prior = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(agent);
             const action = leaseCollisionAction(e, prior, { pid: process.pid, start: holderStart ?? null, baseSessionId: env.sessionId, stateSessionId: state.sessionId });
             if (action === "adopt" && prior)
-                return prior.token;
+                return finish(prior.token);
             if (action === "transfer" && prior) {
                 leases.release(agent, prior.token);
-                return leases.claim(agent, evidence).token;
+                return finish(leases.claim(agent, evidence).token);
             }
             if (e.code !== "IDENTITY_IN_USE" || !prior || prior.released_at !== null)
                 throw e;
@@ -449,7 +458,7 @@ export async function runMcp(existing) {
             if (a.takeover === "same-session" || (explicit && a.takeover === "idle-conversation")) {
                 leases.release(agent, prior.token);
                 node.store.audit("identity.takeover", { name: agent, kind: a.takeover, previous: { cli: prior.cli, session: prior.session_id, pid: prior.holder_pid }, by: { cli: env.cli, session: state.sessionId } });
-                return leases.claim(agent, evidence).token;
+                return finish(leases.claim(agent, evidence).token);
             }
             throw Object.assign(new Error(`identity ${agent} is not available: ${a.reason}. The finishing holder must call mbx_identity release before ending; `
                 + "then claim this name. Closing a hosted conversation may leave its shared MCP process running. If the holder cannot release, the owner can use agentmbx identity takeover."), { code: "IDENTITY_IN_USE" });
@@ -674,7 +683,9 @@ export async function runMcp(existing) {
     const delegation = shared
         ? "[mbx] This transport can serve multiple sessions. Call mbx_whoami for your current mailbox identity and owner-signed policies. Read each mbx_read header for the policy that applies to that message; another mailbox's grant does not authorize this session."
         : agent ? delegationNote(node.store.db, agent, node.host) : null;
-    const extra = [unboundNote, delegation, agent && noPush(env.cli, env.channel || env.socket, hosted)
+    // T158: dedicated sessions get the bounded catch-up hint; shared transports read `missed` from handoff/whoami instead.
+    const catchupNote = agent && !shared ? catchupHint(node.store, agent) : null;
+    const extra = [unboundNote, delegation, catchupNote, agent && noPush(env.cli, env.channel || env.socket, hosted)
             ? selfWatchInstruction({ delegated: activePolicies(node.store.db, agent, node.host).length > 0, cli: env.cli }) : null].filter(Boolean).join("\n");
     /** Why an ordinary mailbox tool can't run yet, and the exact next step (R1.4). */
     const unboundMessage = (state) => {
@@ -776,7 +787,9 @@ export async function runMcp(existing) {
                 const readOnly = ["mbx_inbox", "mbx_replay", "mbx_search", "mbx_agents", "mbx_sent", "mbx_project"].includes(name);
                 // Replay prepares its own process evidence before taking the held-read snapshot.
                 // Wrapping it again would inspect a fresh lease instance inside an open transaction.
-                const invoke = () => requests.run(state, () => name === "mbx_replay" ? cb(...a) : readOnly
+                // Catch-up pages through replay and takes its own held lease per path (read for fetch,
+                // write for commit), so it runs unwrapped exactly like replay.
+                const invoke = () => requests.run(state, () => name === "mbx_replay" || name === "mbx_catchup" ? cb(...a) : readOnly
                     ? leases.withHeldRead(state.agent, state.leaseToken, () => cb(...a))
                     : leases.withHeld(state.agent, state.leaseToken, () => cb(...a)));
                 const target = a[0]?.name;
@@ -789,6 +802,7 @@ export async function runMcp(existing) {
         });
     };
     const handoff = (agent) => ({ agent, address: `${agent}@${node.host}`, role: registeredIdentity(node.store, agent)?.role ?? null, unread: node.unreadCount(agent),
+        missed: missedCount(node.store, agent).missed,
         open_threads: Number(node.store.db.prepare("SELECT COUNT(DISTINCT m.thread) n FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state<>'acked'").get(agent).n),
         recent_notes: node.store.db.prepare("SELECT msg_id,note,updated_at FROM deliveries WHERE agent=? AND note IS NOT NULL ORDER BY updated_at DESC LIMIT 3").all(agent) });
     const identityOperation = ({ action, name, role, description, all, approval, target: controlTarget }) => {
@@ -955,6 +969,7 @@ export async function runMcp(existing) {
             const lease = leases.rename(agent, state.leaseToken, to);
             node.addAlias(agent, to, env.ppid);
             renameRegistration(node.store, agent, to);
+            moveCatchup(node.store, agent, to);
             agent = to;
             state.agent = to;
             state.leaseToken = lease.token;
@@ -976,6 +991,7 @@ export async function runMcp(existing) {
         const out = { agent, host: node.host, address: `${agent}@${node.host}`, role: reg?.role ?? me?.role ?? null, description: reg?.description ?? me?.description ?? null,
             registered: !!reg, project: project ?? null, cli: env.cli, session: fingerprint(key.publicKey),
             owner_grant: s.grant ? { caps: s.grant.caps, expires: s.grant.exp } : null, delivery: node.deliveryMode(agent), unread: node.unreadCount(agent),
+            missed: missedCount(node.store, agent).missed,
             policies: activePolicies(node.store.db, agent, node.host).map((p) => ({ id: p.id, level: p.level, classes: p.classes, from: p.from, projects: p.projects ?? null, expires: p.exp })),
             version: version(), update_available: updateAvailable(node.store),
             ...(!reg || AUTO_NAME_RE.test(agent) ? { next: AUTO_NAME_RE.test(agent)
@@ -985,6 +1001,36 @@ export async function runMcp(existing) {
             // Answered by the old build during a handover: the new build's version and delivery show from the next call.
             ...(handedOver ? { switching: "a newer agentmbx is installed: this server hands over to it after this call. Call mbx_whoami again for its version and delivery mode." } : {}) };
         return text(JSON.stringify(out, null, 2), out);
+    });
+    server.registerTool("mbx_catchup", {
+        title: "Catch up on what this identity missed",
+        description: "Bounded history replay for this identity's mailbox, independent of ack: pages from the stored checkpoint (or an explicit cursor) like mbx_replay. Fetching never advances the checkpoint; after durably capturing a page, pass its next_cursor as `commit` to advance (monotonic, never a rewind; re-committing the same cursor is a no-op). Catch-up never acks, never marks read, and grants no authority; mbx_inbox stays the what-needs-handling view. `restart` re-anchors after a store restore/reset: \"all\" replays from the beginning, \"now\" skips to the current end. Next: mbx_inbox for what needs handling, then mbx_reply/mbx_ack per message.",
+        inputSchema: { cursor: z.string().regex(/^[A-Za-z0-9_-]+$/).max(2048).optional().describe("page cursor from a previous mbx_catchup or mbx_replay page of this mailbox"),
+            limit: z.number().int().min(1).max(200).optional(), max_bytes: z.number().int().min(2048).max(262144).optional(),
+            commit: z.string().max(2048).optional().describe("next_cursor of a page you have durably captured; advances the checkpoint"),
+            restart: z.enum(["all", "now"]).optional().describe("explicit re-anchor after CURSOR_EXPIRED (store restored or reset)") },
+        annotations: { idempotentHint: false },
+    }, ({ cursor, limit, max_bytes: maxBytes, commit, restart }) => {
+        const state = current();
+        if (!bound(state))
+            throw Object.assign(new Error("catch-up needs this session's own held identity; claim or register one first (mbx_identity)"), { code: "IDENTITY_LEASE_REQUIRED" });
+        if (restart) {
+            const out = prepareState(state, undefined, () => leases.withHeld(state.agent, state.leaseToken, () => ({ restarted: restart, ...restartCatchup(node.store, state.agent, restart, state.sessionId) })));
+            return text(JSON.stringify(out, null, 2), out);
+        }
+        if (commit !== undefined) {
+            const out = prepareState(state, undefined, () => leases.withHeld(state.agent, state.leaseToken, () => ({ ...commitCatchup(node.store, state.agent, commit, state.sessionId), missed: missedCount(node.store, state.agent).missed })));
+            return text(JSON.stringify(out, null, 2), out);
+        }
+        const record = readCatchup(node.store, state.agent)
+            ?? prepareState(state, undefined, () => leases.withHeld(state.agent, state.leaseToken, () => {
+                const lease = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(state.agent);
+                return ensureCatchup(node.store, state.agent, lease ?? null, state.sessionId);
+            }));
+        const from = cursor ?? encodeReplayFrame({ v: 1, epoch: record.epoch, mailbox: state.agent, filter: CATCHUP_FILTER, position: record.position, end: replayMaximum(node.store, state.agent) });
+        const page = node.replay(state.agent, state.leaseToken, { cursor: from, limit, maxBytes });
+        const missed = missedCount(node.store, state.agent);
+        return text(JSON.stringify({ ...page, catchup: { position: record.position, missed: missed.missed } }, null, 2), { ...page, catchup: { position: record.position, missed: missed.missed } });
     });
     server.registerTool("mbx_send", {
         title: "Send an mbx message",

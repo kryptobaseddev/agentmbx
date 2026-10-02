@@ -55,6 +55,7 @@ test("every MCP tool refuses an upgraded schema before its callback", async (t) 
     mbx_identity: { action: "list" }, mbx_whoami: {}, mbx_agents: {}, mbx_inbox: {}, mbx_replay: {}, mbx_read: { ids: ["missing"] }, mbx_ack: { ids: ["missing"] },
     mbx_reply: { id: "missing", body: "test" }, mbx_send: { to: ["other"], subject: "test", body: "test" },
     mbx_thread: { id: "missing" }, mbx_search: { query: "test" }, mbx_sent: {}, mbx_project: {}, mbx_forward: { id: "missing", to: "nobody" },
+    mbx_catchup: {},
   };
   const tools = (await client.listTools()).tools;
   n.store.db.exec(`PRAGMA user_version=${SCHEMA_VERSION + 1}`);
