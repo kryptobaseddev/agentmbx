@@ -14,6 +14,8 @@ key compiled into the binary.
    npm run build                               # dist/ is committed; npm installs run it
    git commit -am "release: v0.2.0"
    ```
+   In the same commit, date the `CHANGELOG.md` section and update `README.md`: the status line, the roadmap rows and the
+   tag in the npm source-install example (`archive/refs/tags/vX.Y.Z.tar.gz`).
 3. Tag and push:
    ```sh
    git tag v0.2.0 && git push origin main v0.2.0
