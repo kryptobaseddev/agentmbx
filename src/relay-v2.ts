@@ -74,6 +74,7 @@ export async function relayOpen(node: MbxNode, relay: string, f: typeof fetch = 
   }
   await announceRotationsToRelay(node, s);
   if (!await ensureEnrolled(node, s)) return null;
+  await publishSenders(node, s);
   return s;
 }
 
@@ -102,7 +103,23 @@ async function announceRotationsToRelay(node: MbxNode, s: RelaySession) {
     if (!res) return;
     if (res.status !== 200 && res.status !== 404) { node.store.audit("relay.rotate_failed", { relay: s.relay, status: res.status }); return; }
     node.store.set(k, String(i + 1)); // 404: the old key was never enrolled there; the new key enrols normally
+    if (res.status === 200) { // our queue was re-sequenced under the new key: read it again from the start
+      node.store.db.prepare("UPDATE relay_position SET received_through=0, updated_at=? WHERE relay=?").run(new Date().toISOString(), s.relay);
+      node.store.db.prepare("DELETE FROM kv WHERE k LIKE ?").run(`relay-acked:${s.relay}:%`);
+    }
   }
+}
+
+/** Tell the relay which sender keys we accept: our approved peers (spec §2). Only fake keys are kept out; republished
+ *  whenever the peer set changes. */
+async function publishSenders(node: MbxNode, s: RelaySession) {
+  const senders = [...new Set(node.peers().filter((p) => p.state === "approved").map((p) => p.pubkey))].sort().slice(0, 256);
+  const digest = createHash("sha256").update(`${node.key.publicKey}:${senders.join(",")}`).digest("hex"), k = `relay-senders:${s.relay}`;
+  if (kv(node, k) === digest) return;
+  const list = { v: 1, type: "relay-senders", host_pubkey: node.key.publicKey, senders, iat: new Date().toISOString() };
+  const r = await call(s, node, "POST", "/v2/relay/senders", { list, sig: signData(node.key.privateKey, canonical(list)) });
+  if (r.status === 200) node.store.set(k, digest);
+  else node.store.audit("relay.senders_failed", { relay: s.relay, status: r.status, error: String(r.json.error ?? "") });
 }
 
 /** A peer's enc key: the pinned one, else the relay's copy only if the peer's pinned host key signed it (T032). */

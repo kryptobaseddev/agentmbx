@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS enrolments (
   host_pubkey TEXT PRIMARY KEY, host_name TEXT NOT NULL, owner_fp TEXT NOT NULL, account TEXT, authorized_by TEXT,
   enrolled_at TEXT NOT NULL, revoked_at TEXT);
-CREATE INDEX IF NOT EXISTS enrolments_name ON enrolments(host_name) WHERE revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS enrolments_name ON enrolments(lower(host_name)) WHERE revoked_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS enrolments_account_name ON enrolments(account, host_name) WHERE revoked_at IS NULL AND account IS NOT NULL;
 CREATE TABLE IF NOT EXISTS enc_ads (host_pubkey TEXT PRIMARY KEY, host_name TEXT NOT NULL, enc_pub TEXT NOT NULL, sig TEXT NOT NULL, at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS items (
@@ -26,8 +26,10 @@ CREATE TABLE IF NOT EXISTS dedup (
 CREATE INDEX IF NOT EXISTS dedup_age ON dedup(accepted_at);
 CREATE TABLE IF NOT EXISTS seqs (target_pubkey TEXT PRIMARY KEY, next_seq INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS acked (target_pubkey TEXT PRIMARY KEY, acked_through INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS sender_lists (target_pubkey TEXT PRIMARY KEY, senders TEXT NOT NULL, iat TEXT NOT NULL, record TEXT NOT NULL, sig TEXT NOT NULL);
 `;
-/** 1: T165 draft (wire TEXT, globally unique names). 2: wire BLOB, names unique per account, sender index. */
+/** 1: T165 draft (wire TEXT, globally unique names). 2: wire BLOB, names unique per account, sender index.
+ *  (Sequence numbers have a time floor and sender allowlists are additive: no version change.) */
 export const SCHEMA_VERSION = 2;
 /** Upgrades from older schema versions, each in its own transaction. */
 const MIGRATIONS = {
@@ -39,13 +41,16 @@ const MIGRATIONS = {
     INSERT INTO items_v2 (target_pubkey, seq, kind, item_id, sender_pubkey, sender_host, wire, wire_hash, bytes, accepted_at, expires_at)
       SELECT target_pubkey, seq, kind, item_id, sender_pubkey, sender_host, CAST(wire AS BLOB), wire_hash, bytes, accepted_at, expires_at FROM items;
     DROP TABLE items;
-    ALTER TABLE items_v2 RENAME TO items;`,
+    ALTER TABLE items_v2 RENAME TO items;
+    DROP INDEX IF EXISTS enrolments_name;`,
 };
 const coded = (code, message) => Object.assign(new Error(message), { code });
 export class SqliteRelayStore {
     db;
+    #now;
     #depth = 0;
-    constructor(path = ":memory:") {
+    constructor(path = ":memory:", o = {}) {
+        this.#now = o.now ?? Date.now;
         if (path !== ":memory:")
             mkdirSync(dirname(path), { recursive: true });
         this.db = new DatabaseSync(path);
@@ -92,7 +97,7 @@ export class SqliteRelayStore {
         at: r.enrolled_at, account: r.account ?? null, authorized_by: r.authorized_by ?? null, revoked_at: r.revoked_at ?? null } : null;
     getEnrolment(pubkey) { return this.#enrol(this.db.prepare("SELECT * FROM enrolments WHERE host_pubkey=?").get(pubkey)); }
     enrolmentsByName(host) {
-        return this.db.prepare("SELECT * FROM enrolments WHERE host_name=? AND revoked_at IS NULL ORDER BY enrolled_at DESC, rowid DESC").all(host).map((r) => this.#enrol(r));
+        return this.db.prepare("SELECT * FROM enrolments WHERE lower(host_name)=lower(?) AND revoked_at IS NULL ORDER BY enrolled_at DESC, rowid DESC").all(host).map((r) => this.#enrol(r));
     }
     enrolments() { return this.db.prepare("SELECT * FROM enrolments WHERE revoked_at IS NULL ORDER BY host_name").all().map((r) => this.#enrol(r)); }
     liveEnrolmentCount() { return Number(this.db.prepare("SELECT COUNT(*) n FROM enrolments WHERE revoked_at IS NULL").get().n); }
@@ -101,19 +106,24 @@ export class SqliteRelayStore {
         if (cur?.revoked_at)
             throw coded("REVOKED", "this host key was revoked on this relay");
         if (e.account) {
-            const taken = this.db.prepare("SELECT host_pubkey FROM enrolments WHERE account=? AND host_name=? AND revoked_at IS NULL AND host_pubkey<>?").get(e.account, e.host, e.pubkey);
+            const taken = this.db.prepare("SELECT host_pubkey FROM enrolments WHERE account=? AND lower(host_name)=lower(?) AND revoked_at IS NULL AND host_pubkey<>?").get(e.account, e.host, e.pubkey);
             if (taken)
                 throw coded("NAME_TAKEN", `host name ${e.host} is already enrolled in this account with another key`);
         }
         this.db.prepare(`INSERT INTO enrolments (host_pubkey,host_name,owner_fp,account,authorized_by,enrolled_at,revoked_at) VALUES (?,?,?,?,?,?,NULL)
-      ON CONFLICT(host_pubkey) DO UPDATE SET host_name=excluded.host_name, owner_fp=excluded.owner_fp, account=excluded.account,
-        authorized_by=excluded.authorized_by, enrolled_at=excluded.enrolled_at`).run(e.pubkey, e.host, e.owner_fp, e.account ?? null, e.authorized_by ?? null, e.at);
+      ON CONFLICT(host_pubkey) DO UPDATE SET host_name=excluded.host_name, owner_fp=excluded.owner_fp,
+        account=COALESCE(excluded.account, enrolments.account),
+        authorized_by=CASE WHEN excluded.account IS NULL AND enrolments.account IS NOT NULL THEN enrolments.authorized_by ELSE excluded.authorized_by END,
+        enrolled_at=excluded.enrolled_at`).run(e.pubkey, e.host, e.owner_fp, e.account ?? null, e.authorized_by ?? null, e.at);
     }
     revokeEnrolment(pubkey, at) {
         this.db.prepare("UPDATE enrolments SET revoked_at=COALESCE(revoked_at, ?) WHERE host_pubkey=?").run(at, pubkey);
     }
     rebind(oldPub, next) {
         return this.transaction(() => {
+            const cur = this.getEnrolment(next.pubkey);
+            if (cur && (cur.revoked_at || this.targetUsage(next.pubkey).items > 0))
+                throw coded("ROTATION_TARGET", "the new key must be fresh (unrevoked, with an empty queue)");
             this.revokeEnrolment(oldPub, next.at);
             this.putEnrolment(next);
             // queued items follow the host: re-sequenced in order under the new key (the receiver keeps its retired enc keys)
@@ -124,6 +134,11 @@ export class SqliteRelayStore {
             }
             this.db.prepare("DELETE FROM items WHERE target_pubkey=?").run(oldPub);
             this.db.prepare("DELETE FROM enc_ads WHERE host_pubkey=?").run(oldPub);
+            this.db.prepare("UPDATE sender_lists SET target_pubkey=? WHERE target_pubkey=?").run(next.pubkey, oldPub);
+            for (const l of this.db.prepare("SELECT target_pubkey, senders FROM sender_lists WHERE instr(senders, ?) > 0").all(oldPub)) {
+                const senders = JSON.parse(l.senders).map((k) => k === oldPub ? next.pubkey : k);
+                this.db.prepare("UPDATE sender_lists SET senders=? WHERE target_pubkey=?").run(JSON.stringify([...new Set(senders)]), l.target_pubkey);
+            }
             return rows.length;
         });
     }
@@ -136,13 +151,22 @@ export class SqliteRelayStore {
       WHERE a.host_pubkey=? AND e.revoked_at IS NULL`).get(pubkey);
         return r ? { ...r } : null;
     }
+    senderList(target) {
+        const r = this.db.prepare("SELECT senders, iat FROM sender_lists WHERE target_pubkey=?").get(target);
+        return r ? { senders: JSON.parse(r.senders), iat: r.iat } : null;
+    }
+    putSenderList(target, senders, iat, record, sig) {
+        this.db.prepare(`INSERT INTO sender_lists (target_pubkey,senders,iat,record,sig) VALUES (?,?,?,?,?)
+      ON CONFLICT(target_pubkey) DO UPDATE SET senders=excluded.senders, iat=excluded.iat, record=excluded.record, sig=excluded.sig`).run(target, JSON.stringify(senders), iat, record, sig);
+    }
     dedup(sender, itemId, target) {
         const r = this.db.prepare("SELECT wire_hash, seq FROM dedup WHERE sender_pubkey=? AND item_id=? AND target_pubkey=?").get(sender, itemId, target);
         return r ? { ...r } : null;
     }
     insertItem(i) {
         return this.transaction(() => {
-            const cur = this.db.prepare("SELECT next_seq FROM seqs WHERE target_pubkey=?").get(i.target_pubkey)?.next_seq ?? 1;
+            const stored = this.db.prepare("SELECT next_seq FROM seqs WHERE target_pubkey=?").get(i.target_pubkey)?.next_seq ?? 1;
+            const cur = Math.max(stored, Math.floor(this.#now()));
             this.db.prepare("INSERT INTO seqs (target_pubkey,next_seq) VALUES (?,?) ON CONFLICT(target_pubkey) DO UPDATE SET next_seq=excluded.next_seq").run(i.target_pubkey, cur + 1);
             this.db.prepare(`INSERT INTO items (target_pubkey,seq,kind,item_id,sender_pubkey,sender_host,wire,wire_hash,bytes,accepted_at,expires_at)
         VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(i.target_pubkey, cur, i.kind, i.item_id, i.sender_pubkey, i.sender_host, i.wire, i.wire_hash, i.bytes, i.accepted_at, i.expires_at);

@@ -14,8 +14,10 @@ import type { AddressInfo } from "node:net";
 import { canonical, generateKeyPair, keyPairFromPrivate, signData, verifyData, type KeyPair } from "../src/crypto.ts";
 import { generateEncKeyPair } from "../src/body-encryption.ts";
 import { buildEnvelope, sealEnvelope } from "../src/envelope.ts";
-import { DEFAULT_QUOTA, parseRelayKey, RelayCore, relayHop, startRelayServer, wireHash, type PushItem } from "../src/relay.ts";
+import { clientAddress, DEFAULT_QUOTA, parseRelayKey, RelayCore, relayHop, startRelayServer, wireHash, type PushItem, type SenderList } from "../src/relay.ts";
 import { SCHEMA_VERSION, SqliteRelayStore } from "../src/relay-store.ts";
+/** Small sequential seqs for readable assertions (production seqs have a time floor). */
+const seqStore = (path = ":memory:") => new SqliteRelayStore(path, { now: () => 0 });
 import type { SignedRotation } from "../src/key-rotation.ts";
 
 function enrol(core: RelayCore, host: string, key: KeyPair, owner = "owner-1") {
@@ -45,7 +47,7 @@ test("a restart loses nothing: enrolments, enc ads, queued items, sequence numbe
   const dir = mkdtempSync(join(tmpdir(), "mbx-relaystore-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const path = join(dir, "relay.db"), relayKey = generateKeyPair(), k = keys();
-  let core = new RelayCore(DEFAULT_QUOTA, { store: new SqliteRelayStore(path), key: relayKey });
+  let core = new RelayCore(DEFAULT_QUOTA, { store: seqStore(path), key: relayKey });
   enrol(core, "alpha", k.alpha); enrol(core, "beta", k.beta);
   core.publishEncAd("beta", k.beta.publicKey, "ENCPUB", signData(k.beta.privateKey, canonical({ v: 1, host: "beta", enc_pub: "ENCPUB" })));
   const e1 = sealedFor({ host: "alpha", key: k.alpha }, ["bob@beta"]);
@@ -53,7 +55,7 @@ test("a restart loses nothing: enrolments, enc ads, queued items, sequence numbe
   const epoch = core.store.epoch();
   core.store.close();
   // the process dies; a new one opens the same store with the same key
-  core = new RelayCore(DEFAULT_QUOTA, { store: new SqliteRelayStore(path), key: relayKey });
+  core = new RelayCore(DEFAULT_QUOTA, { store: seqStore(path), key: relayKey });
   t.after(() => core.store.close());
   assert.equal(core.store.epoch(), epoch, "a restart is not a restore: the epoch stays");
   assert.equal(core.requireEnrolled(k.beta.publicKey).host, "beta");
@@ -130,7 +132,7 @@ test("fan-out is all-or-nothing per item; one target per host; only sealed envel
 });
 
 test("pull pages by last returned seq within a byte budget and shows the head; ack is per epoch and never past the head", (t) => {
-  const core = new RelayCore({ ...DEFAULT_QUOTA, maxPull: 2 }); t.after(() => core.store.close());
+  const core = new RelayCore({ ...DEFAULT_QUOTA, maxPull: 2 }, { store: seqStore() }); t.after(() => core.store.close());
   const k = keys(); enrol(core, "alpha", k.alpha); enrol(core, "beta", k.beta);
   const from = { host: "alpha", pubkey: k.alpha.publicKey };
   for (let i = 0; i < 3; i++) core.pushItems(from, [item(sealedFor({ host: "alpha", key: k.alpha }, ["bob@beta"]), [k.beta])]);
@@ -181,7 +183,10 @@ test("names are labels: hosts are found by key, two owners may share a name, a r
   assert.equal(core.requireEnrolled(k.alpha.publicKey).host, "macbook");
   assert.equal(core.requireEnrolled(otherMac.publicKey).host, "macbook");
   enrol(core, "beta", k.beta, "owner-2");
-  assert.equal(core.enrolmentByName("macbook", core.requireEnrolled(k.beta.publicKey))!.pubkey, otherMac.publicKey, "v1 name routing prefers the caller's own owner claim");
+  assert.deepEqual(core.resolveName("MacBook", core.requireEnrolled(k.beta.publicKey)), { enrolment: null, ambiguous: true }, "an owner claim decides nothing; names match case-insensitively");
+  const v1 = sealedFor({ host: "beta", key: k.beta }, ["x@macbook"]);
+  assert.match(core.push({ host: "beta", pubkey: k.beta.publicKey }, [v1]).error ?? "", /recipient host ambiguous: macbook/, "v1 by name stores nothing when ambiguous");
+  assert.equal(core.pullItems(k.alpha.publicKey).items.length + core.pullItems(otherMac.publicKey).items.length, 0);
   // a proven account (set by the JWKS authority, §8) keeps names unique inside it
   const store = core.store as SqliteRelayStore, at = new Date().toISOString();
   store.putEnrolment({ host: "studio", pubkey: k.gamma.publicKey, owner_fp: "", at, account: "acct-1", authorized_by: "jwks" });
@@ -297,9 +302,10 @@ test("HTTP: v1 mail is durable, v2 finds callers by key, signs the query, shows 
   const dir = mkdtempSync(join(tmpdir(), "mbx-relayhttp-"));
   const path = join(dir, "relay.db"), relayKey = generateKeyPair(), k = keys(), twin = generateKeyPair();
   let core = new RelayCore(DEFAULT_QUOTA, { store: new SqliteRelayStore(path), key: relayKey });
-  enrol(core, "alpha", k.alpha); enrol(core, "beta", k.beta, "owner-1"); enrol(core, "beta", twin, "owner-3"); // two hosts named beta; v1 routing picks the sender's owner
+  enrol(core, "alpha", k.alpha); enrol(core, "beta", k.beta, "owner-1");
   const v1 = sealedFor({ host: "alpha", key: k.alpha }, ["bob@beta"]);
-  assert.deepEqual(core.push({ host: "alpha", pubkey: k.alpha.publicKey }, [v1]), { stored: 1 });
+  assert.deepEqual(core.push({ host: "alpha", pubkey: k.alpha.publicKey }, [v1]), { stored: 1 }, "one beta: v1 routes by name");
+  enrol(core, "beta", twin, "owner-3"); // now two hosts named beta
   core.store.close();
   core = new RelayCore(DEFAULT_QUOTA, { store: new SqliteRelayStore(path), key: relayKey });
   const server = await startRelayServer(core, 0, "127.0.0.1");
@@ -323,4 +329,76 @@ test("HTTP: v1 mail is durable, v2 finds callers by key, signs the query, shows 
   assert.deepEqual([rotated.status, await rotated.json()], [200, { moved: 1 }]);
   assert.equal((await get(signedPath, next)).status, 200, "the new key is in");
   assert.equal((await get(signedPath, k.beta)).status, 401, "the old key is out");
+});
+
+test("seqs are restore-proof: a store restored from an older copy allocates above everything handed out before", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "mbx-relayfloor-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, "relay.db"), backup = join(dir, "b.db"), relayKey = generateKeyPair(), k = keys();
+  let clock = 1_000;
+  let core = new RelayCore(DEFAULT_QUOTA, { store: new SqliteRelayStore(path, { now: () => clock }), key: relayKey });
+  enrol(core, "alpha", k.alpha); enrol(core, "beta", k.beta);
+  const from = { host: "alpha", pubkey: k.alpha.publicKey };
+  const push = () => core.pushItems(from, [item(sealedFor({ host: "alpha", key: k.alpha }, ["bob@beta"]), [k.beta])])[0]!.targets[0]!.seq;
+  push(); (core.store as SqliteRelayStore).db.exec(`VACUUM INTO '${backup}'`);
+  clock = 2_000; push(); push();
+  const checkpoint = core.pullItems(k.beta.publicKey, 0).last_seq;
+  core.store.close();
+  copyFileSync(backup, path); rmSync(`${path}-wal`, { force: true }); rmSync(`${path}-shm`, { force: true });
+  clock = 3_000; // later: senders push to the restored store before the receiver pulls (the case head_seq alone cannot catch)
+  core = new RelayCore(DEFAULT_QUOTA, { store: new SqliteRelayStore(path, { now: () => clock }), key: relayKey });
+  t.after(() => core.store.close());
+  const seqs = [push(), push(), push()];
+  assert.ok(seqs.every((s) => s > checkpoint), `${seqs} all above checkpoint ${checkpoint}`);
+  assert.equal(core.pullItems(k.beta.publicKey, checkpoint).items.length, 3, "the receiver sees every post-restore item");
+});
+
+test("sender allowlists: a target accepts only the keys it signed; newer lists replace older; rotation updates them", (t) => {
+  const core = new RelayCore(DEFAULT_QUOTA, { store: seqStore() }); t.after(() => core.store.close());
+  const k = keys(), fake = generateKeyPair();
+  enrol(core, "alpha", k.alpha); enrol(core, "beta", k.beta); enrol(core, "fake", fake);
+  const beta = core.requireEnrolled(k.beta.publicKey);
+  const list = (senders: string[], iat: string): SenderList => ({ v: 1, type: "relay-senders", host_pubkey: k.beta.publicKey, senders, iat });
+  const signed = (l: SenderList, key = k.beta) => signData(key.privateKey, canonical(l));
+  const l1 = list([k.alpha.publicKey], "2026-10-02T10:00:00.000Z");
+  assert.throws(() => core.publishSenders(beta, l1, signed(l1, k.alpha)), /not signed by the target/);
+  core.publishSenders(beta, l1, signed(l1));
+  const push = (key: KeyPair, host: string) => core.pushItems({ host, pubkey: key.publicKey }, [item(sealedFor({ host, key }, ["bob@beta"]), [k.beta])])[0]!.status;
+  assert.equal(push(fake, "fake"), "rejected:sender not accepted by target", "a fake sender key cannot fill beta's queue");
+  assert.equal(push(k.alpha, "alpha"), "accepted");
+  assert.match(core.push({ host: "fake", pubkey: fake.publicKey }, [sealedFor({ host: "fake", key: fake }, ["bob@beta"])]).error ?? "", /sender not accepted by beta/, "v1 too");
+  assert.throws(() => core.publishSenders(beta, l1, signed(l1)), /newer sender list/);
+  // alpha rotates: beta's list follows the new key
+  const next = generateKeyPair();
+  const rec = { v: 1 as const, type: "host-rotation" as const, host: "alpha", old_pub: k.alpha.publicKey, new_pub: next.publicKey, new_enc_pub: generateKeyPair().publicKey, iat: new Date().toISOString() };
+  core.rotate({ rec, old_sig: signData(k.alpha.privateKey, canonical(rec)), new_sig: signData(next.privateKey, canonical(rec)) });
+  assert.deepEqual(core.store.senderList(k.beta.publicKey)!.senders, [next.publicKey]);
+  assert.equal(push(next, "alpha"), "accepted");
+});
+
+test("enrolment hygiene: a challenge never downgrades a proven account; a crowded name is refused; rotation needs a fresh key", (t) => {
+  const core = new RelayCore({ ...DEFAULT_QUOTA, maxPerName: 2 }, { store: seqStore() }); t.after(() => core.store.close());
+  const k = keys(), store = core.store as SqliteRelayStore;
+  store.putEnrolment({ host: "studio", pubkey: k.gamma.publicKey, owner_fp: "", at: new Date().toISOString(), account: "acct-1", authorized_by: "jwks" });
+  enrol(core, "studio", k.gamma, "whatever");
+  assert.deepEqual([core.requireEnrolled(k.gamma.publicKey).account, core.requireEnrolled(k.gamma.publicKey).authorized_by], ["acct-1", "jwks"]);
+  enrol(core, "dup", k.alpha); enrol(core, "DUP", k.beta);
+  assert.throws(() => enrol(core, "dup", generateKeyPair()), /too many hosts share the name/);
+  const busy = generateKeyPair(); enrol(core, "busy", busy);
+  core.pushItems({ host: "dup", pubkey: k.alpha.publicKey }, [item(sealedFor({ host: "dup", key: k.alpha }, ["x@busy"]), [busy])]);
+  const rec = { v: 1 as const, type: "host-rotation" as const, host: "studio", old_pub: k.gamma.publicKey, new_pub: busy.publicKey, new_enc_pub: generateKeyPair().publicKey, iat: new Date().toISOString() };
+  assert.throws(() => core.rotate({ rec, old_sig: signData(k.gamma.privateKey, canonical(rec)), new_sig: signData(busy.privateKey, canonical(rec)) }), /must be fresh/);
+});
+
+test("client address behind a proxy: the rightmost X-Forwarded-For hop or CF-Connecting-IP; spoofed entries do not help", async (t) => {
+  assert.equal(clientAddress({ "x-forwarded-for": "6.6.6.6, 1.2.3.4" }, "10.0.0.1", "xff"), "1.2.3.4");
+  assert.equal(clientAddress({ "cf-connecting-ip": "5.5.5.5", "x-forwarded-for": "6.6.6.6" }, "10.0.0.1", "cloudflare"), "5.5.5.5");
+  assert.equal(clientAddress({ "x-forwarded-for": "6.6.6.6" }, "10.0.0.1", false), "10.0.0.1");
+  const core = new RelayCore({ ...DEFAULT_QUOTA, enrolPerMinutePerIp: 2 }); t.after(() => core.store.close());
+  const server = await startRelayServer(core, 0, "127.0.0.1", { trustProxy: "xff" });
+  t.after(() => new Promise<void>((r) => server.close(() => r())));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const statuses: number[] = [];
+  for (let i = 0; i < 4; i++) statuses.push((await fetch(`${base}/v1/relay/challenge`, { method: "POST", headers: { "x-forwarded-for": `9.9.9.${i}, 1.2.3.4` }, body: JSON.stringify({ host: "z", pubkey: generateKeyPair().publicKey }) })).status);
+  assert.deepEqual(statuses, [200, 200, 429, 429], "a client rotating the left of XFF is still one address");
 });

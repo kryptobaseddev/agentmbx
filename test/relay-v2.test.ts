@@ -77,7 +77,7 @@ test("a lost push response keeps the row; the retry reuses the same bytes and is
   assert.deepEqual(await relayPushOutbox(a, sa), { accepted: 1, rejected: 0 });
   const accept = JSON.parse((a.store.db.prepare("SELECT accept FROM relay_sent").get() as { accept: string }).accept);
   assert.equal(accept.targets[0].wire_hash, hash, "the same persisted bytes");
-  assert.equal(accept.targets[0].seq, 1);
+  assert.equal(accept.targets.length, 1);
 });
 
 test("a rejected result or an accept that is not ours keeps the row: 200 alone means nothing", async (t) => {
@@ -138,7 +138,7 @@ test("the receiver quarantines what it cannot accept, still advances and acks; a
   assert.equal(await relayReceive(b, sb), 1);
   assert.equal(count(b, "SELECT COUNT(*) c FROM relay_quarantine"), 1);
   assert.match((b.store.db.prepare("SELECT reason r FROM relay_quarantine").get() as { r: string }).r, /undecryptable/);
-  assert.equal((b.store.db.prepare("SELECT received_through t FROM relay_position").get() as { t: number }).t, 2);
+  assert.equal((b.store.db.prepare("SELECT received_through t FROM relay_position").get() as { t: number }).t, core.pullItems(b.key.publicKey).head_seq, "the checkpoint covers both items");
   assert.equal(core.pullItems(b.key.publicKey).items.length, 2, "the ack was lost; the relay still holds both");
   await relayReceive(b, sb);
   assert.equal(core.pullItems(b.key.publicKey).items.length, 0, "the next ack covered them");
@@ -168,7 +168,7 @@ test("an epoch change (restore) makes the sender re-push and the receiver re-pul
 });
 
 test("a queue head below the checkpoint in the same epoch is treated as a rewind", async (t) => {
-  const { a, b, core, open } = await world(t);
+  const { a, b, core, open } = await world(t, { core: new RelayCore({}, { store: new SqliteRelayStore(":memory:", { now: () => 0 }) }) });
   for (let i = 0; i < 2; i++) a.send({ from: "alice", to: ["bob@beta"], subject: `m${i}`, body: "x" });
   lanFailedTwice(a);
   await relayPushOutbox(a, await open(a));
@@ -220,4 +220,19 @@ test("doctor sees v2 enrolment (G13 fixed), waiting relay deliveries and quarant
     assert.ok(da.some((l) => /1 message\(s\) accepted by the relay, waiting/.test(l)));
     assert.ok(db.some((l) => /^warn 1 relay item\(s\) .* quarantine/.test(l)), db.join("\n"));
   } finally { if (old === undefined) delete process.env.MBX_RELAY_URL; else process.env.MBX_RELAY_URL = old; }
+});
+
+test("a daemon publishes its paired peers as the senders it accepts; a stranger's key is refused by the relay", async (t) => {
+  const { a, b, core, open } = await world(t);
+  assert.deepEqual(core.store.senderList(b.key.publicKey)?.senders, [a.key.publicKey], "beta accepts alpha only");
+  const stranger = generateKeyPair();
+  const challenge = core.challenge("stranger", stranger.publicKey);
+  const { canonical, signData } = await import("../src/crypto.ts");
+  core.enrol("stranger", stranger.publicKey, "", signData(stranger.privateKey, canonical({ v: 1, challenge, host: "stranger", pubkey: stranger.publicKey, owner_fp: "" })));
+  const r = core.pushItems({ host: "stranger", pubkey: stranger.publicKey }, [{ kind: "receipt", item_id: "receipt:x:y@z:1", targets: [{ host_pubkey: b.key.publicKey, wire_b64: "e30=" }] }]);
+  assert.equal(r[0]!.status, "rejected:sender not accepted by target");
+  a.send({ from: "alice", to: ["bob@beta"], subject: "still works", body: "x" }); lanFailedTwice(a);
+  assert.equal((await relayPushOutbox(a, await open(a))).accepted, 1);
+  await open(b); // unchanged peer set: no republish
+  assert.equal(count(b, "SELECT COUNT(*) c FROM audit WHERE event='relay.senders_failed'"), 0);
 });
