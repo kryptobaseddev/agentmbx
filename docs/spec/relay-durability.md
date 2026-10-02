@@ -65,8 +65,12 @@ fingerprint and MUST accept an optional `--key <fingerprint>` to pin it without 
 
 ### 2. Server store (T165)
 
-The relay MUST keep all state in one SQLite database (WAL, `synchronous=FULL`, a single writer process). Every
-successful response MUST be sent only after its transaction commits. Required tables:
+The relay core MUST talk to its state only through a `RelayStore` interface: enrolments, enc-key ads, item insert
+with dedup and seq allocation, pull, ack, expiry sweep, quotas, epoch and meta, and `transaction(fn)`. This lets a
+later backend (a Railway database container or Neon) replace it without touching the protocol. The first and only
+implementation (owner decision, 2026-10-02) is `node:sqlite` on a persistent volume path (Railway volume): no
+Postgres dependency now. The relay MUST keep all state in that one database (WAL, `synchronous=FULL`, a single
+writer process). Every successful response MUST be sent only after its transaction commits. Required tables:
 
 - `enrolments(host_pubkey PK, host_name UNIQUE, owner_fp, device_record, enrolled_at, revoked_at)`. The host name is
   unique, which closes F4: a second key for the same name is rejected until the owner revokes the first one.
@@ -173,7 +177,8 @@ notice, because receipts are advisory.
 
 ### 7. Quotas and bounds
 
-Per target: `max_queue_items` and `max_queue_bytes`. Per owner fingerprint: depth and pushes per minute, as today.
+Per target: `max_queue_items` and `max_queue_bytes`. Per owner fingerprint (per account once §8's account authority
+exists): 50 MB and 10,000 queued items (decision 3), plus pushes per minute, as today.
 Per request: `max_batch` and the body cap (`RELAY_MAX_BODY`), checked while streaming. Per pull: `max_pull`. The
 dedup horizon is retention + 7 days. A quota failure rejects the whole item (§3) with `rejected:quota:<which>`, and
 the sender keeps its row and retries with backoff.
@@ -185,9 +190,17 @@ the sender keeps its row and retries with backoff.
   enrol and enc-key publish. The kv enrolled flag becomes a cache keyed by `(relay, relay_pubkey, epoch,
   host_pubkey)`, never a permanent short-circuit (G6). The `doctor` key mismatch is fixed with it (G13).
 - The client MUST republish its enc-key ad after its own key rotation (T030), and MUST check the result.
-- Enrolment authority is an owner decision (below). With the recommended option, `enrol` requires an owner-signed
-  device record (the existing `owner add-device` record) for the host key, verified against the owner key the relay
-  was configured with. A self-asserted `owner_fp` is then no longer enough.
+- **Enrolment authority is pluggable.** `enrol` asks an `EnrolmentAuthority` whether a host key may enrol:
+  `authorize({host_name, host_pubkey, owner_fp, proof}) → {ok, account?, reason?}`. Two implementations are in
+  scope:
+  - **host-key challenge:** today's behavior, the default.
+  - **an extension point** where "this host is authorized by an account" plugs in. The account/device design is
+    being planned as its own saga (multi-user accounts that own devices and agents, device authorization, API keys,
+    a web console). Its implementation is not part of T165–T168.
+
+  The authority's answer is stored with the enrolment (`account`, `authorized_by`), so revoking an account or
+  device can revoke its enrolments. Quotas are then counted per account instead of per self-asserted
+  `owner_fp`.
 
 ### 9. Receipts over the relay (T166, with T218)
 
@@ -212,27 +225,18 @@ The `/v1/relay/*` endpoints stay for one minor release with their current behavi
 relay keeps working with v1 semantics. A v2 client uses `/v2` when `GET /v2/relay/info` answers, and falls back to
 v1 otherwise. Mixed hosts work because items are opaque to the relay, and receivers dedup by id.
 
-## Owner decisions (pending; recommendation first)
+## Owner decisions (2026-10-02)
 
-1. **Where the relay runs.**
-   - (A, rec.) A small always-on container (Railway or Fly) with a persistent volume, running `agentmbx relay serve`.
-   - (B) Cloudflare Workers + Durable Objects (a rewrite).
-   - (C) A home box behind a tunnel. Doesn't help with home-to-work when home is down.
-2. **Domain and TLS.**
-   - (A, rec.) A subdomain the owner controls, with managed TLS.
-   - (B) The provider's default hostname.
-3. **Retention.**
-   - (A, rec.) 14 days, then an expiry notice to the sender.
-   - (B) 72 h, like the LAN outbox.
-   - (C) 30 days.
-4. **Backups.**
-   - (A, rec.) Daily online backup kept 7 days; ciphertext only.
-   - (B) None, relying on sender copies (§3) only.
-5. **Accounts and secrets the owner creates.** The hosting account and payment method, the DNS record, and the relay
-   key fingerprint recorded for `relay set --key`.
-6. **Who may enrol.**
-   - (A, rec.) Only hosts with an owner-signed device record (§8).
-   - (B) Any host with a valid host-key challenge, as today.
+1. **Hosting:** Railway. One always-on service running `agentmbx relay serve`, with a persistent volume for the
+   `node:sqlite` store (§2).
+2. **Domain and TLS:** `relay.agentmbx.com` in the owner's Cloudflare DNS, with managed TLS.
+3. **Retention:** 14 days, then a signed expiry notice to the sender (§6). Per-owner (later per-account) caps of
+   50 MB and 10,000 queued messages (§7).
+4. **Backups:** daily online backup, 7 kept (§5); ciphertext only.
+5. **Accounts and secrets:** the owner authorized the release lead to create the Railway project and the DNS
+   record. The relay key fingerprint is recorded at deploy time for `relay set --key` (§1).
+6. **Who may enrol:** **pending: account/device design (saga).** Until then the default authority is the host-key
+   challenge, behind the pluggable `EnrolmentAuthority` (§8).
 
 ## Tasks and acceptance
 
@@ -247,8 +251,10 @@ v1 otherwise. Mixed hosts work because items are opaque to the relay, and receiv
   - Tests: real child-process crashes at every commit, response and checkpoint boundary; backup while running; a
     restore that rotates the epoch, re-pushes from senders and lets receivers re-pull without duplicates; the expiry
     sweep and the expiry notice to the sender.
-- **T168: enrolment and enc-ad recovery.** §1, §8, the G13 doctor fix.
+- **T168: enrolment and enc-ad recovery.** §1, §8 (`EnrolmentAuthority` with the host-key implementation), the G13
+  doctor fix.
   - Tests: re-enrolment after a restart and after a restore; host-name squatting rejected; a relay key change stops
-    use; enc-ad republish after rotation; device-record enforcement (if decision 6A).
-- **T147 (with the owner):** deploy per decisions 1–5 and run the home-to-work proof. Mail both ways with each host
+    use; enc-ad republish after rotation; a stub authority denying or granting by account recorded on the
+    enrolment.
+- **T147 (with the owner):** deploy per decisions 1–5 (Railway, `relay.agentmbx.com`) and run the home-to-work proof. Mail both ways with each host
   on a different network, the relay restarted mid-flight, and one restore drill.
