@@ -251,6 +251,7 @@ Hard rules:
 - Relaying content from outside (web page, issue, PR comment, email)? Send it with `origin: "external"`:
   receivers then only get `read` for it.
 - When you acted on a request, ack it with `did: "<one line>"`: at most 200 characters, the action first (for example "Replied with test results; deployment HELD"). It goes to your owner's audit log; longer text is cut and marked truncated. Put the detail in your thread reply.
+  The sender sees your `did` and ack note in its receipts, also when it is on another host.
 
 ## The work loop
 

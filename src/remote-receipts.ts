@@ -46,10 +46,11 @@ export function signReceipt(node: MbxNode, row: Pick<OutRow, "seq" | "msg_id" | 
 export function dueReceipts(node: MbxNode, now = Date.now()): Map<string, OutRow[]> {
   const expired = node.store.db.prepare("DELETE FROM receipt_outbox WHERE at < ?").run(new Date(now - RETRY_HOURS * 3_600_000).toISOString()).changes;
   if (expired) node.store.audit("receipt.expired", { count: Number(expired), hours: RETRY_HOURS });
-  const rows = node.store.db.prepare("SELECT seq,msg_id,agent,host,state,note,at,attempts FROM receipt_outbox WHERE next_at <= ? ORDER BY seq LIMIT ?")
-    .all(new Date(now).toISOString(), RECEIPT_BATCH * 5) as unknown as OutRow[];
-  const by = new Map<string, OutRow[]>();
-  for (const r of rows) { const list = by.get(r.host) ?? []; if (list.length < RECEIPT_BATCH) by.set(r.host, [...list, r]); }
+  const due = new Date(now).toISOString(), by = new Map<string, OutRow[]>();
+  // one batch per host per pass, so a host with a large backlog never starves the others
+  for (const { host } of node.store.db.prepare("SELECT DISTINCT host FROM receipt_outbox WHERE next_at <= ?").all(due) as { host: string }[])
+    by.set(host, node.store.db.prepare("SELECT seq,msg_id,agent,host,state,note,at,attempts FROM receipt_outbox WHERE host=? AND next_at <= ? ORDER BY seq LIMIT ?")
+      .all(host, due, RECEIPT_BATCH) as unknown as OutRow[]);
   return by;
 }
 
@@ -79,11 +80,16 @@ export function acceptReceipt(node: MbxNode, item: unknown, hop: string | null):
   if (!parsed.success || typeof it?.sig !== "string" || it.sig.length > 200) return "rejected:invalid receipt";
   const rec = parsed.data, host = rec.recipient.split("@")[1];
   if (hop !== null && host !== hop) return `rejected:receipt for ${rec.recipient} did not come from ${host}`;
-  const peer = node.approvedPeer(host);
-  if (!peer) return `rejected:${host} is not a paired host`;
-  if (!verifyData(peer.pubkey, canonical(rec), it.sig)) return "rejected:bad signature";
-  const m = node.store.db.prepare("SELECT origin FROM messages WHERE id=?").get(rec.msg) as { origin: string } | undefined;
+  if (!node.approvedPeer(host)) return `rejected:${host} is not a paired host`;
+  // its current key or one it retired (T030): a receipt signed before a rotation may arrive after it (LAN retry, relay hold)
+  const sig = it.sig, payload = canonical(rec);
+  if (!node.hostKeys(host).some((k) => verifyData(k, payload, sig))) return "rejected:bad signature";
+  const m = node.store.db.prepare("SELECT origin,envelope FROM messages WHERE id=?").get(rec.msg) as { origin: string; envelope: string } | undefined;
   if (!m || m.origin !== "local") return "rejected:not a message this host sent";
+  // Only a host this message was routed to reports on it: an entry @host, or a bare name, role: or * that could have
+  // resolved there. A paired host can't claim receipts for mail sent only to another host (review on #65).
+  const to = (JSON.parse(m.envelope) as { to: string[] }).to;
+  if (!to.some((t) => t.endsWith(`@${host}`) || (!t.includes("@") && t !== "owner"))) return `rejected:message was not sent to ${host}`;
   return node.store.tx((): AcceptResult => {
     const old = node.store.db.prepare("SELECT state,seq FROM remote_receipts WHERE msg_id=? AND recipient=?").get(rec.msg, rec.recipient) as { state: string; seq: number } | undefined;
     if (old) {

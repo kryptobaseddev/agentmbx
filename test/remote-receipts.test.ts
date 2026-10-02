@@ -87,6 +87,16 @@ test("receipts apply only when signed by the recipient host for this host's own 
   assert.equal(acceptReceipt(A.n, { rec: { ...make().rec, extra: 1 }, sig: "x" }, "beta"), "rejected:invalid receipt");
   assert.equal(acceptReceipt(A.n, make({ state: "acked", seq: 6 }), "beta"), "accepted");
   assert.deepEqual(remoteReceipts(A.n, id).map((r) => [r.recipient, r.state]), [["worker@beta", "acked"]]);
+  // only a host the message was routed to reports on it: mail sent only to gamma takes no receipt from beta
+  const toGamma = A.n.send({ from: "boss", to: ["someone@gamma"], subject: "s", body: "b" }).envelope.id;
+  assert.equal(acceptReceipt(A.n, make({ msg: toGamma, seq: 8 }), "beta"), "rejected:message was not sent to beta");
+  const bare = A.n.send({ from: "boss", to: ["worker"], subject: "s", body: "b" }).envelope.id;
+  assert.equal(acceptReceipt(A.n, make({ msg: bare, seq: 8 }), "beta"), "accepted", "a bare name could have resolved to beta");
+  // a receipt signed before beta rotated its host key still verifies after the rotation (retired keys count)
+  const early = make({ msg: bare, state: "acked", seq: 9 }), signedWith = B.n.key.publicKey;
+  assert.equal(A.n.acceptRotation(B.n.rotateKeys()), "rotated");
+  assert.notEqual(A.n.approvedPeer("beta")!.pubkey, signedWith, "beta's pinned key moved on");
+  assert.equal(acceptReceipt(A.n, early, "beta"), "accepted");
   // a received message (not ours) never takes receipts, even signed by its own host
   B.n.registerAgent("boss2");
   const theirs = B.n.send({ from: "boss2", to: ["x@alpha"], subject: "s", body: "b" }).envelope.id;
