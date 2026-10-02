@@ -109,17 +109,19 @@ test("a relay cannot substitute a peer's enc key: a client squatting the peer's 
   pair(a, b, "unused");
   assert.equal(await relayEnrol(a, relay), true);
   assert.equal(await relayEnrol(b, relay), true);
-  // F4 (T165): the relay binds a host name to its first key, so mallory cannot enrol as beta or replace beta's enc ad
-  assert.equal(await relayEnrol(m, relay), false, "a second key for an enrolled host name is refused");
-  assert.equal(core.getEncAd("beta")?.enc_pub, b.encKey.publicKey, "beta's own signed enc ad stays");
+  assert.equal(await relayEnrol(m, relay), true, "names are labels: another key may enrol the name beta (several owners have one)");
+  assert.equal(core.getEncAd("beta")?.enc_pub, m.encKey.publicKey, "by name, mallory's newer enrolment answers");
+  // and a relay that lies outright: beta's own enc ad row now carries mallory's key (a compromised store)
+  (core.store as SqliteRelayStore).db.prepare("UPDATE enc_ads SET enc_pub=? WHERE host_pubkey=?").run(m.encKey.publicKey, b.key.publicKey);
+  assert.equal(core.getEncAdByKey(b.key.publicKey)?.enc_pub, m.encKey.publicKey);
   a.send({ from: "alice", to: ["bob@beta"], subject: "x", body: "for beta only" });
   await relayDrainOutbox(a, relay);
-  for (const { envelope: e } of core.inspect(b.key.publicKey)) {
+  for (const pub of [b.key.publicKey, m.key.publicKey]) for (const { envelope: e } of core.inspect(pub)) {
     let opened: string | null = null;
     try { opened = openBody(e.enc!, m.encKey.privateKey, e.id); } catch { /* sealed for someone else */ }
     assert.equal(opened, null, "mail for beta is never sealed to mallory's key");
   }
-  assert.equal(core.inspect(b.key.publicKey).length, 1, "the mail went to beta, sealed for beta");
+  assert.equal(a.store.db.prepare("SELECT COUNT(*) n FROM outbox").get()!.n, 1, "an unverifiable key keeps the mail queued");
 });
 
 test("a relayed enc key signed by the pinned host key is used when the LAN never supplied one (T032)", async (t) => {

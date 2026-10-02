@@ -4,12 +4,12 @@ import { constants as osConstants, homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { execFileSync, spawn } from "node:child_process";
-import { canonical, fingerprint, generateKeyPair, keyPairFromPrivate, ulid } from "./crypto.js";
+import { canonical, fingerprint, generateKeyPair, ulid } from "./crypto.js";
 import { buildGrant, CAPS, grantPayload, NAME_RE } from "./envelope.js";
 import { advertise, browse, lanIPv4 } from "./discovery.js";
 import { announceRotations, flushOutbox, flushReceipts, addrSignature, healPeerAddr, healStuckPeers, notifyUnpair, sendPresence, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.js";
 import { relayDrainOutbox, relayFor, relayPull } from "./relay-client.js";
-import { DEFAULT_QUOTA, RelayCore, startRelayServer } from "./relay.js";
+import { DEFAULT_QUOTA, parseRelayKey, RelayCore, startRelayServer } from "./relay.js";
 import { SqliteRelayStore } from "./relay-store.js";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.js";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
@@ -239,7 +239,7 @@ async function run(argv) {
             cursor: { type: "string" }, "max-bytes": { type: "string" }, "scan-limit": { type: "string" }, "project-host": { type: "string" }, topic: { type: "string" },
             compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" },
             backend: { type: "string" }, "no-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
-            project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }, "wait-ms": { type: "string" }, "store-dir": { type: "string" },
+            project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }, "wait-ms": { type: "string" }, "store-dir": { type: "string" }, "trust-proxy": { type: "boolean" },
             "older-than": { type: "string" }, minutes: { type: "string" }, apply: { type: "boolean" }, days: { type: "string" }, fix: { type: "boolean" }
         } });
     if (o.help)
@@ -717,27 +717,40 @@ If the codes differ, do not approve: someone is in the middle.`);
                 console.error(`[agentmbx] relay key fingerprint ${fingerprint(k.publicKey)}: store the value as a secret, record the fingerprint for clients`);
                 return;
             }
+            const dir = str("store-dir") ?? process.env.MBX_RELAY_DIR ?? join(homedir(), ".local/share/agentmbx-relay");
+            if (sub === "rotate-epoch") {
+                // after any restore not made by agentmbx (volume snapshot, file copy): receivers re-pull from 0 and senders re-push (spec §5)
+                const store = new SqliteRelayStore(join(dir, "relay.db"));
+                try {
+                    console.log(`relay epoch ${store.epoch()} -> ${store.rotateEpoch()}`);
+                }
+                finally {
+                    store.close();
+                }
+                return;
+            }
             if (sub !== undefined && sub !== "serve")
-                die("relay [serve [--port N] [--store-dir DIR]] | relay keygen | relay set <url> | relay unset");
+                die("relay [serve [--port N] [--store-dir DIR] [--trust-proxy]] | relay keygen | relay rotate-epoch [--store-dir DIR] | relay set <url> | relay unset");
             // T165: durable store and a persistent relay key in one directory (a Railway volume in production: MBX_RELAY_DIR=/data)
             const port = Number(str("port") ?? process.env.PORT ?? 7374);
-            const dir = str("store-dir") ?? process.env.MBX_RELAY_DIR ?? join(homedir(), ".local/share/agentmbx-relay");
             mkdirSync(dir, { recursive: true, mode: 0o700 });
             // MBX_RELAY_KEY (a deploy secret: the base64 private key `agentmbx relay keygen` prints) wins over relay.key on the volume
             const keyPath = join(dir, "relay.key");
             const envKey = process.env.MBX_RELAY_KEY?.trim();
+            delete process.env.MBX_RELAY_KEY; // read once; never inherited by anything this process starts
             if (!envKey && !existsSync(keyPath))
                 writeFileSync(keyPath, JSON.stringify(generateKeyPair()) + "\n", { mode: 0o600 });
             const relayKey = (() => {
                 try {
-                    return envKey ? keyPairFromPrivate(envKey) : JSON.parse(readFileSync(keyPath, "utf8"));
+                    return parseRelayKey(envKey ?? readFileSync(keyPath, "utf8"));
                 }
                 catch (e) {
                     return die(`relay key ${envKey ? "MBX_RELAY_KEY" : keyPath}: ${e.message}`);
                 }
             })();
             const core = new RelayCore(DEFAULT_QUOTA, { store: new SqliteRelayStore(join(dir, "relay.db")), key: relayKey });
-            const server = await startRelayServer(core, port, str("bind") ?? "0.0.0.0");
+            const trustProxy = o["trust-proxy"] === true || process.env.MBX_RELAY_TRUST_PROXY === "1";
+            const server = await startRelayServer(core, port, str("bind") ?? "0.0.0.0", { trustProxy });
             console.log(`[agentmbx] untrusted store-and-forward relay listening on :${port} (ADR-035; durable store ${join(dir, "relay.db")}, epoch ${core.store.epoch()})`);
             console.log(`[agentmbx] relay key ${fingerprint(relayKey.publicKey)} (${envKey ? "from MBX_RELAY_KEY" : "keep relay.key with its store"}; record this fingerprint for clients)`);
             return new Promise(() => void server);
