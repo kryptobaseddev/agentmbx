@@ -91,3 +91,6 @@ process posted into its session and the line arrived as a teammate message); Fed
 Each peer keeps an ordered transport list: direct LAN address(es), then the durable relay. Delivery fails over
 automatically; pairing works through the relay so two networks can pair without a LAN. The relay sees only sealed bodies
 and the metadata listed in docs/THREAT-MODEL.md.
+
+The relay's persistence, acceptance, receive checkpoint, restart/restore recovery, retention and enrolment recovery are
+specified in [relay-durability.md](relay-durability.md) (T164).
