@@ -43,7 +43,8 @@ Its `recipients[]` says who will see it when: `live-wake`, `live-next-prompt`, `
 Later, `mbx_sent` shows what happened to your mail per recipient (delivered/notified/read/acked, their `did`, liveness),
 and `mbx_thread` shows the same under each message. Recipients on paired hosts report back with signed receipts;
 `handed-over` means their host accepted it and has not reported yet (or runs an older AgentMBX).
-`mbx_project` shows your project folder's traffic (roles, states; bodies of your own mail). The owner-designated project
+`mbx_project` shows your project's traffic, including its mail on paired hosts' clones of the same repository (roles,
+states; bodies of your own mail). The owner-designated project
 lead sees every body and can `mbx_forward` a message, e.g. when its recipient's session ended.
 Queued transport retry is separate from composing a draft; there is no mailbox draft API.
 Do not manually resend an uncertain send and create duplicates. Check for a thread reply

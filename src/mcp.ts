@@ -18,7 +18,7 @@ import { BIND_TICKET_RE, takeBindTicket } from "./bind-ticket.ts";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
 import { activityKey, identityAvailability, parseActivity } from "./identity-availability.ts";
 import { reviveMailbox } from "./identity-cleanup.ts";
-import { AUTO_NAME_RE, linkedKey, noteProject, projectOf, registeredIdentity, registerIdentity, renameRegistration, ROLE_RE, sessionHint, UNSPECIFIED_ROLE } from "./registry.ts";
+import { AUTO_NAME_RE, linkedKey, noteProject, projectKey, projectOf, registeredIdentity, registerIdentity, renameRegistration, ROLE_RE, sessionHint, UNSPECIFIED_ROLE } from "./registry.ts";
 import { applyIdentityTakeover, type IdentityTakeoverApproval } from "./identity-takeover.ts";
 import { listIdentityStatus } from "./identity-status.ts";
 import { consumeIdentityControl, identityControlAliases, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl, type IdentityControlDescriptor } from "./identity-control.ts";
@@ -565,7 +565,7 @@ export async function runMcp(existing?: MbxNode) {
     const skip = to ? node.recipientAddrs(to) : null;
     const depths = parent ? [...parent.hops.values()].filter((x) => now - x.at < 3_600_000 && x.at > human && !skip?.has(x.from)).map((x) => x.hop) : [];
     const external = parent?.externalAt != null && now - parent.externalAt < 3_600_000;
-    return { hop: depths.length ? Math.min(MAX_RELAY_DEPTH, Math.max(...depths) + 1) : 0, origin: origin === "external" || external ? "external" as const : "agent" as const, project };
+    return { hop: depths.length ? Math.min(MAX_RELAY_DEPTH, Math.max(...depths) + 1) : 0, origin: origin === "external" || external ? "external" as const : "agent" as const, project, project_key: projectKey(project) };
   };
   /** Opening mail marks the reader's own copies read (delivered/notified → read; never past acked), for sender receipts (T207). */
   const markRead = (rows: { id: string }[], agent: string) => { for (const r of rows) node.setDelivery(r.id, agent, "read"); };

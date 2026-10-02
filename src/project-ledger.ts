@@ -8,7 +8,7 @@ import type { Envelope } from "./envelope.ts";
 import type { MbxNode } from "./node.ts";
 import { ownerKeys } from "./policy.ts";
 import { deliveryReceipts, type DeliveryReceipt } from "./receipts.ts";
-import { projectIdentities, registeredIdentity } from "./registry.ts";
+import { projectIdentities, projectKey, registeredIdentity } from "./registry.ts";
 import type { MessageRow } from "./store.ts";
 
 export const LEAD_DEFAULT_TTL_MS = 30 * 86_400_000;
@@ -105,14 +105,16 @@ const roleOf = (node: MbxNode, address: string) => {
   return host === node.host ? registeredIdentity(node.store, name)?.role ?? null : null;
 };
 
-/** SQL condition (and parameters) for "a message of this project": stamped with meta.project, or sent by / delivered to
- *  an identity associated with the project. */
+/** SQL condition (and parameters) for "a message of this project": stamped with meta.project, stamped with the same git
+ *  origin from a paired host's own folder of this repository (T219), or sent by / delivered to an identity associated
+ *  with the project. */
 function ledgerWhere(node: MbxNode, project: string): { sql: string; args: string[] } {
   const members = [...projectIdentities(node.store, project)];
   const addrs = members.map((n) => `${n}@${node.host}`);
   const inList = (xs: string[]) => (xs.length ? xs.map(() => "?").join(",") : "NULL");
-  return { sql: `(json_extract(envelope,'$.meta.project')=? OR from_addr IN (${inList(addrs)})
-      OR id IN (SELECT msg_id FROM deliveries WHERE agent IN (${inList(members)})))`, args: [project, ...addrs, ...members] };
+  const key = projectKey(project);
+  return { sql: `(json_extract(envelope,'$.meta.project')=?${key ? " OR json_extract(envelope,'$.meta.project_key')=?" : ""} OR from_addr IN (${inList(addrs)})
+      OR id IN (SELECT msg_id FROM deliveries WHERE agent IN (${inList(members)})))`, args: [project, ...(key ? [key] : []), ...addrs, ...members] };
 }
 function ledgerIds(node: MbxNode, project: string, after: string, upTo: string, limit: number): string[] {
   const w = ledgerWhere(node, project);

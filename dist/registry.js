@@ -2,6 +2,7 @@
 // with a role: AgentMBX never invents one. A session resumes the identity it held before (same provider session id), or
 // stays unbound until it claims one from its project's list or registers a new one. The registry records each chosen
 // identity's role and which project folders it has worked in, so a restarted agent can find its own mailbox by role.
+import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
@@ -23,6 +24,54 @@ export function projectOf(dir) {
     catch {
         return resolve(dir);
     }
+}
+/**
+ * The same repository has a different folder on every host, so a project's mail is matched across paired hosts by its
+ * git origin, normalized to `host/path` without scheme, credentials or `.git` (T219): `git@github.com:org/repo.git` and
+ * `https://github.com/org/repo` are both `github.com/org/repo`. None for a folder without an origin or with a
+ * local-path origin (which means nothing on another host). Cached per process.
+ */
+const keys = new Map();
+export function normalizeRemote(url) {
+    const u = url.trim();
+    const scp = /^(?:[^@/\s]+@)?([A-Za-z0-9.-]+):(?!\/\/)(.+)$/.exec(u); // git@host:org/repo
+    let host, path;
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) {
+        let parsed;
+        try {
+            parsed = new URL(u);
+        }
+        catch {
+            return undefined;
+        }
+        if (parsed.protocol === "file:" || !parsed.hostname)
+            return undefined;
+        host = parsed.hostname;
+        path = parsed.pathname;
+    }
+    else if (scp && !u.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(u)) {
+        host = scp[1];
+        path = scp[2];
+    }
+    else
+        return undefined;
+    path = path.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "");
+    return path ? `${host}/${path}`.toLowerCase().slice(0, 300) : undefined;
+}
+export function projectKey(project) {
+    if (!project)
+        return undefined;
+    if (keys.has(project))
+        return keys.get(project);
+    let key;
+    try {
+        key = normalizeRemote(execFileSync("git", ["-C", project, "config", "--get", "remote.origin.url"], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] }));
+    }
+    catch {
+        key = undefined;
+    } // not a repository, no origin, or no git
+    keys.set(project, key);
+    return key;
 }
 export function registeredIdentity(store, name) {
     return store.db.prepare("SELECT name,role,description,registered_at,registered_by FROM identities WHERE name=?").get(name) ?? null;

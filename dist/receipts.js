@@ -137,7 +137,8 @@ export function deliveryReceipts(node, m, now = Date.now()) {
     const remote = [...hosts].sort().flatMap((h) => {
         const o = outbox.get(h);
         const names = e.to.filter((t) => t.endsWith(`@${h}`));
-        const got = o ? [] : signed.filter((r) => r.recipient.endsWith(`@${h}`));
+        // A signed receipt proves delivery even while the outbox still retries (the peer's answer to the push was lost).
+        const got = signed.filter((r) => r.recipient.endsWith(`@${h}`));
         const pending = names.filter((n) => !got.some((r) => r.recipient === n));
         return [
             ...got.map((r) => ({ address: r.recipient, state: r.state, updated_at: r.at, note: r.note, did: r.did, liveness: `on paired host ${h} (signed receipt)` })),
