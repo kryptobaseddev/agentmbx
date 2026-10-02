@@ -80,7 +80,9 @@ sees plaintext bodies — envelopes are sealed for the recipient before they lea
    `relay.key` (mode 0600). Back them up together; the relay refuses to start with a key that isn't its store's. The
    startup line prints the store epoch and the key fingerprint. Hosted deployments can inject the key instead:
    `agentmbx relay keygen` prints `MBX_RELAY_KEY=<base64 private key>` (store it as a secret) and the fingerprint;
-   when `MBX_RELAY_KEY` is set it wins over `relay.key`.
+   when `MBX_RELAY_KEY` is set it wins over `relay.key`. Behind a proxy (Railway, Cloudflare) add `--trust-proxy` so
+   enrolment rate limits see client addresses. After restoring the store any way other than `agentmbx relay restore`
+   (a volume snapshot, a file copy), run `agentmbx relay rotate-epoch --store-dir <dir>` before serving again.
 2. Point each daemon at it: `agentmbx relay set http://<relay-host>:7374`, then restart the daemon
    (`agentmbx daemon install` hosts: `launchctl kickstart -k gui/$(id -u)/com.agentmbx.daemon`).
 3. That's it: mail to unreachable peers flows through the relay and is pulled by the peer; `agentmbx doctor`
