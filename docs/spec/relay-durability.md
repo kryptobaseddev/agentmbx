@@ -35,31 +35,33 @@ mechanism), account UI, billing, multi-relay federation.
 
 ## Current state (0.5.3) and the gaps this spec closes
 
-All references are to `main` at the time of writing.
+All references are symbols on `main` (0.5.3) at the time of writing.
 
 | # | Gap | Where |
 |---|---|---|
-| G1 | Every piece of relay state (queues, enrolments, enc-key ads, sequence counters, dedup set, challenges) is in-process memory. A restart loses all of it. | `src/relay.ts:18-23,69` |
-| G2 | The sender deletes its outbox row on any HTTP 200, before anything is durable, and without reading `stored`/`error`. A partial batch also answers 200. | `src/relay-client.ts:81`, `src/relay.ts:172` |
-| G3 | Fan-out to several recipient hosts is not atomic: a failure on recipient k leaves earlier rows queued, and the id is not marked seen, so a retry duplicates them. | `src/relay.ts:79-105` |
-| G4 | Dedup is a global set of envelope ids, unbound to sender or target, unbounded, in memory. | `src/relay.ts:21`, F12 |
-| G5 | Routing matches the recipient host by name (first match); another key can enrol the same name. | `src/relay.ts:89-99`, F4 |
-| G6 | After a relay restart the client never re-enrols (a permanent kv flag) and never republishes its enc-key ad: 401 forever. | `src/relay-client.ts:27-52` |
-| G7 | Sequence numbers restart at 1 after a restart while clients keep their old cursor: new items stay invisible. | `src/relay.ts:96`, `src/relay-client.ts:88-107` |
-| G8 | The pull cursor returned is the last allocated seq, not the last returned one; pull has no page size; the `after` query is not covered by the hop signature. | `src/relay.ts:108-113,136-139` |
-| G9 | Items the receiver rejects (undecryptable, bad signature, host not paired) are acked and dropped silently. | `src/relay-client.ts:95-106` |
-| G10 | Broadcast, role and bare-name mail cannot go through the relay (no `@host`), and is retried every tick. | `src/relay.ts:91` |
-| G11 | Delivery receipts (T218) are LAN-only. | `src/http.ts:514-536` |
-| G12 | No retention: an item for a host that never comes back stays forever; nothing tells the sender. | `src/relay.ts` |
-| G13 | `doctor` checks `relay-enrolled:<relay>` while the client writes `relay-enrolled:<relay>:<hostPub>`, so it always says "not yet enrolled". | `src/doctor.ts:238` |
+| G1 | Every piece of relay state (queues, enrolments, enc-key ads, sequence counters, dedup set, challenges) is in-process memory. A restart loses all of it. | `RelayCore` fields `queues`, `cursors`, `seen`, `pending`, `encAds` |
+| G2 | The sender deletes its outbox row on any HTTP 200, before anything is durable, and without reading `stored`/`error`. A partial batch also answers 200. | `relayDrainOutbox`, `startRelayServer` (`POST /v1/relay/messages`) |
+| G3 | Fan-out to several recipient hosts is not atomic: a failure on recipient k leaves earlier rows queued, and the id is not marked seen, so a retry duplicates them. | `RelayCore.push` |
+| G4 | Dedup is a global set of envelope ids, unbound to sender or target, unbounded, in memory. | `RelayCore.seen`, F12 |
+| G5 | Routing matches the recipient host by name (first match); another key can enrol the same name. | `RelayCore.push`, `RelayCore.enrol`, F4 |
+| G6 | After a relay restart the client never re-enrols (a permanent kv flag) and never republishes its enc-key ad: 401 forever. | `relayEnrol`, `relayPublishEnc` |
+| G7 | Sequence numbers restart at 1 after a restart while clients keep their old cursor: new items stay invisible. | `RelayCore.cursors`, `relayPull` |
+| G8 | The pull cursor returned is the last allocated seq, not the last returned one; pull has no page size; the `after` query is not covered by the hop signature. | `RelayCore.pull`, `relayHop`, `startRelayServer` |
+| G9 | Items the receiver rejects (undecryptable, bad signature, host not paired) are acked and dropped silently. | `relayPull` |
+| G10 | Broadcast, role and bare-name mail cannot go through the relay (no `@host`), and is retried every tick. | `RelayCore.push`, `relayDrainOutbox` |
+| G11 | Delivery receipts (T218) are LAN-only. | `http.ts` `POST /v1/receipts`, `dueReceipts` |
+| G12 | No retention: an item for a host that never comes back stays forever; nothing tells the sender. | `RelayCore.queues` |
+| G13 | `doctor` checks `relay-enrolled:<relay>` while the client writes `relay-enrolled:<relay>:<hostPub>`, so it always says "not yet enrolled". | `doctor` relay check, `relayEnrol` |
 
 ## Design
 
 ### 1. Relay identity and discovery
 
 The relay MUST have its own Ed25519 key, generated on first start and kept in its store directory. `GET
-/v2/relay/info` returns `{v:2, relay_pubkey, epoch, limits:{max_item_bytes, max_batch, max_pull, retention_days},
-version}`. A host pins the relay key when the owner runs `agentmbx relay set <url>`. The command shows the key's
+/v2/relay/info` returns `{v:2, relay_pubkey, epoch, limits:{…}, version}`; with a signed hop it also returns `you:{host,
+pubkey, head_seq, acked_through}` for the caller. The key comes from `MBX_RELAY_KEY` (a deploy secret: the base64
+private key `agentmbx relay keygen` prints) or from `relay.key` next to the store; a store MUST refuse a key that is
+not its own, and errors MUST NOT echo key material. A host pins the relay key when the owner runs `agentmbx relay set <url>`. The command shows the key's
 fingerprint and MUST accept an optional `--key <fingerprint>` to pin it without trust on first use. A later change of
 `relay_pubkey` MUST stop relay use and be reported by `doctor` until the owner confirms the new key.
 
@@ -72,24 +74,38 @@ implementation (owner decision, 2026-10-02) is `node:sqlite` on a persistent vol
 Postgres dependency now. The relay MUST keep all state in that one database (WAL, `synchronous=FULL`, a single
 writer process). Every successful response MUST be sent only after its transaction commits. Required tables:
 
-- `enrolments(host_pubkey PK, host_name UNIQUE, owner_fp, device_record, enrolled_at, revoked_at)`. The host name is
-  unique, which closes F4: a second key for the same name is rejected until the owner revokes the first one.
+- `enrolments(host_pubkey PK, host_name, owner_fp, account, authorized_by, enrolled_at, revoked_at)`. **Hosts are
+  identified by key; a name is a label.** A name is unique only inside a proven account (`UNIQUE(account, host_name)`
+  for live rows), so two owners' `macbook` coexist on a shared relay and nobody can lock a name out. `owner_fp` is the
+  host's own unproven claim and decides nothing. Re-enrolment MUST NOT clear `revoked_at`: a revoked key stays
+  revoked. F4 is closed by key addressing: v2 routing, hop authentication (`x-mbx-key`) and enc-ad lookup are by key;
+  v1 lookups by name prefer the caller's own owner claim, then the newest enrolment, and a v1 hop by name is
+  authenticated by whichever enrolment of that name verifies the signature.
+- **Rotation (T030).** `POST /v2/relay/rotate {rotation}` takes the signed rotation record (old and new key both
+  signed it; self-authenticating, since a rotated host already signs hops with its new key). The relay moves the
+  name, account and queued items to the new key (re-sequenced in order, dedup rows kept) and revokes the old key.
 - `enc_ads(host_pubkey PK, enc_pub, sig, at)`. Only signed advertisements are stored, as today.
 - `items(target_pubkey, seq, kind, item_id, sender_pubkey, wire BLOB, wire_hash, bytes, accepted_at, expires_at,
-  PRIMARY KEY(target_pubkey, seq))`.
+  PRIMARY KEY(target_pubkey, seq))`. `wire` is the exact bytes received; `wire_hash` is lowercase hex SHA-256 of those
+  bytes (never of a decoded or re-encoded string).
 - `dedup(sender_pubkey, item_id, target_pubkey, wire_hash, seq, accepted_at, PRIMARY KEY(sender_pubkey, item_id,
   target_pubkey))`. It is kept for the dedup horizon (§7) after its item is acked or expired, which closes G4 and F12.
 - `seqs(target_pubkey PK, next_seq)`. Sequence numbers never restart and are never reused (G7).
 - `acked(target_pubkey PK, acked_through)`.
-- `meta(epoch, relay_pubkey, schema_version)`.
+- `meta(epoch, relay_pubkey, schema_version)`. A store MUST refuse to open when `schema_version` is newer than the
+  binary, and MUST migrate older versions in a transaction (a migration keeps the epoch).
 
-Challenges and rate windows MAY stay in memory. A restart only invalidates outstanding challenges, and clients
-retry them.
+Challenges and rate windows MAY stay in memory, bounded: challenges expire (5 min) and are capped (10,000 open); host
+names match `HOST_RE`, keys are 32-byte Ed25519, `owner_fp` is at most 64 safe characters; challenge and enrol are
+rate-limited per client address (behind a proxy, the first `X-Forwarded-For` hop with `--trust-proxy`); enrolment
+bodies are small; live enrolments are capped. A restart only invalidates outstanding challenges, and clients retry
+them. Dedup rows are swept after the dedup horizon (§7, T167).
 
 ### 3. Push and acceptance (T165, T166)
 
 `POST /v2/relay/items` with a signed hop. The hop signature MUST cover the method, the path **including the query
-string**, the timestamp and the body hash (G8). Body: `{items:[{kind, item_id, targets:[{host_pubkey, wire_b64}]}]}`,
+string**, the timestamp and the full body (the same signed-hop shape as host-to-host HTTP; G8). v2 callers send
+`x-mbx-key` and are found by key. Body: `{items:[{kind, item_id, targets:[{host_pubkey, wire_b64}]}]}`,
 at most `max_batch` items.
 
 - **Senders resolve targets.** A sender MUST address items by the pinned host key of each target and MUST NOT send
@@ -97,7 +113,10 @@ at most `max_batch` items.
   the LAN (closes G5 for routing, and G10). Wire bytes are sealed for each target separately, as today.
 - **One transaction per item.** The relay validates every target (enrolled, not revoked, quotas, size) before
   writing anything. If any target fails, the whole item is rejected and nothing is stored (G3). Several addresses on
-  the same host are one target.
+  the same host are one target: **the sender merges them** into one target per host, and the relay rejects a repeated
+  target (`rejected:duplicate target`).
+- **Receipts** MUST be well-formed T218 records signed by the pushing host, with `item_id =
+  receipt:<msg>:<recipient>:<seq>`; envelopes MUST be sealed and carry `item_id` as their id.
 - **Dedup.** For each target, `(sender_pubkey, item_id, target_pubkey)`:
   - absent → insert the item and the dedup row, and allocate a seq;
   - present with the same `wire_hash` → `duplicate`, returning the original seq;
@@ -117,11 +136,24 @@ at most `max_batch` items.
 - Keep the accepted row in state `relay-accepted` (with seq, epoch and the receipt) until the target's T218
   delivery receipt for that message arrives, or retention expires (§6). This is what makes a relay restore (§5)
   recoverable: the sender still holds the bytes.
+- **Own its deadline.** A `relay-accepted` row whose delivery receipt has not arrived by `accepted_at + retention +
+  grace` (grace 24 h) is marked unconfirmed and the local sender gets "Undelivered/unconfirmed to <host>", without
+  waiting for anything from the relay. The relay's expiry notice (§6) is an early signal, never the only one, because
+  a relay that lost the item (wipe, bad restore) cannot send it. A target whose host reports a version without
+  receipts (before 0.5.3) never sends delivery receipts: for such targets the row settles on the relay's ack evidence
+  (the target's `acked_through` passing the item's seq, visible to the sender only through a later receipt or the
+  deadline), and the deadline alert says "no delivery confirmation (peer too old)" instead of "undelivered".
 
 ### 4. Pull, receive and ack (T166)
 
-`GET /v2/relay/items?after=<seq>&limit=<n>` (signed hop, `n ≤ max_pull`) returns `{epoch, items:[{seq, kind,
-item_id, sender_pubkey, wire_b64}], last_seq, more}`. `last_seq` is the last seq **returned** (G8).
+`GET /v2/relay/items?after=<seq>&limit=<n>&epoch=<epoch>` (signed hop, `n ≤ max_pull`) returns `{epoch, head_seq,
+items:[{seq, kind, item_id, sender_pubkey, wire_b64}], last_seq, more}`. `last_seq` is the last seq **returned** (G8);
+`head_seq` is the last seq allocated for the caller. A page stops at `max_pull` items or about `max_pull_bytes`
+(always at least one item). An `epoch` that is not current answers 409 with the current epoch.
+
+**Going back in time is an epoch change.** If, in the same epoch, `head_seq < received_through`, or an ack answers
+`BAD_ACK` (beyond the head), the store went back in time (a restore that kept its epoch). The receiver MUST handle it
+exactly like a new epoch (§5): reset its position to 0 and re-pull; dedup makes repeats harmless.
 
 The receiving host MUST process items in seq order:
 
@@ -151,7 +183,9 @@ state retryable: the next pull starts at `received_through`, and the relay simpl
   - Receiver commits but the checkpoint isn't written → it pulls again, the item is a `duplicate` at `receive()`, and
     the checkpoint advances.
   - Receiver checkpoints but the ack is lost → the next ack covers it.
-- **Restore from backup.** A restore MUST rotate the epoch. On seeing a new epoch, in either a push or a pull
+- **Restore from backup.** A restore MUST rotate the epoch. Restores made by `agentmbx relay restore` do this; any
+  other restore (a volume snapshot, a file copy) MUST be followed by `agentmbx relay rotate-epoch --store-dir <dir>`
+  before the relay serves again. If that is missed, receivers still detect it (`head_seq < received_through`, §4). On seeing a new epoch, in either a push or a pull
   response:
   - A sender re-pushes every outbox row in `relay-accepted` state whose delivery receipt hasn't arrived. Dedup
     makes this safe even where the restored store still has the item.
@@ -173,13 +207,17 @@ When an envelope item expires, the relay enqueues for the **sender** a `kind:"ex
 type:"relay-expired", item_id, target_pubkey, accepted_at, expired_at}`, signed by the relay key. On pull, the
 sender's daemon marks its `relay-accepted` row expired and sends the local sender the same alert the LAN outbox
 sends after 72 h ("Undelivered to <host>"). Nothing expires silently (G12). Expired receipt items are dropped without
-notice, because receipts are advisory.
+notice, because receipts are advisory. The notice is best effort: senders also enforce their own deadline (§3).
 
 ### 7. Quotas and bounds
 
-Per target: `max_queue_items` and `max_queue_bytes`. Per owner fingerprint (per account once §8's account authority
-exists): 50 MB and 10,000 queued items (decision 3), plus pushes per minute, as today.
-Per request: `max_batch` and the body cap (`RELAY_MAX_BODY`), checked while streaming. Per pull: `max_pull`. The
+Quotas charge what the relay can prove. Per target host key: `max_queue_items` and `max_queue_bytes` (10,000 and
+50 MB, decision 3). Per sender per target: a share (2,000 items, 20 MB), so one sender cannot fill another host's
+queue. Per proven account (§8): 10,000 items and 50 MB across its hosts. A self-asserted `owner_fp` is never charged:
+anyone could claim another owner's fingerprint and exhaust that owner's quota. Pushes per minute are counted per
+sender key.
+Per request: `max_batch` and the body cap (`RELAY_MAX_BODY`), checked while streaming. Per pull: `max_pull` and
+`max_pull_bytes`. v1 pulls are bounded the same way. The
 dedup horizon is retention + 7 days. A quota failure rejects the whole item (§3) with `rejected:quota:<which>`, and
 the sender keeps its row and retries with backoff.
 
@@ -191,16 +229,24 @@ the sender keeps its row and retries with backoff.
   host_pubkey)`, never a permanent short-circuit (G6). The `doctor` key mismatch is fixed with it (G13).
 - The client MUST republish its enc-key ad after its own key rotation (T030), and MUST check the result.
 - **Enrolment authority is pluggable.** `enrol` asks an `EnrolmentAuthority` whether a host key may enrol:
-  `authorize({host_name, host_pubkey, owner_fp, proof}) → {ok, account?, reason?}`. Two implementations are in
-  scope:
-  - **host-key challenge:** today's behavior, the default.
-  - **an extension point** where "this host is authorized by an account" plugs in. The account/device design is
-    being planned as its own saga (multi-user accounts that own devices and agents, device authorization, API keys,
-    a web console). Its implementation is not part of T165–T168.
-
-  The authority's answer is stored with the enrolment (`account`, `authorized_by`), so revoking an account or
-  device can revoke its enrolments. Quotas are then counted per account instead of per self-asserted
-  `owner_fp`.
+  `authorize({host_name, host_pubkey, owner_fp, proof}) → {ok, account?, org?, reason?}`. The answer is stored with
+  the enrolment (`account`, `authorized_by`); quotas and name uniqueness then use the account.
+- **Owner decision (2026-10-02, PLAN D7/D9 and §4.5):**
+  - **Hosted relay (relay.agentmbx.com): account tokens.** A host enrols with a short-lived access token issued by
+    accounts.agentmbx.com after `agentmbx login`, requested for the relay with an RFC 8707 resource indicator. The
+    relay verifies it offline against the issuer's JWKS. Claims: `iss` (the accounts issuer), `aud` (the relay URL;
+    the api's tokens are refused), `sub` (the host id), `account` and `org` (tenancy), `cnf.jkt` (the thumbprint of
+    the host's cloud key, which the host key certified at enrolment, so the token is bound to the host), `client_id`,
+    `iat`, `exp` (≤ 15 min), `jti`. The hop is still signed by the host key, and the relay checks that the token's
+    host binding matches the hop key. JWKS is cached by `kid` and refreshed on an unknown `kid` (at most once per
+    minute) and every 10 minutes; a key that leaves the JWKS stops verifying at once. If JWKS cannot be fetched, the
+    relay keeps using cached keys until their cache expires (1 h), then fails closed for new enrolments while
+    already-enrolled hosts keep pulling and pushing within their token lifetime.
+  - **Revocation.** Revoking a host's cloud credential, or removing an account or organization, pushes a deny-list
+    entry to the relay keyed by `host_fp` and `client_id`, kept at least as long as the longest token TTL, and
+    closes the host's open relay sessions. LAN pairing is never touched.
+  - **Per-account quotas** (decision 3) apply to the `account` claim.
+  - **Self-hosted relays: host-key challenge**, the default `EnrolmentAuthority`, with key/sender quotas (§7).
 
 ### 9. Receipts over the relay (T166, with T218)
 
@@ -234,17 +280,21 @@ v1 otherwise. Mixed hosts work because items are opaque to the relay, and receiv
    50 MB and 10,000 queued messages (§7).
 4. **Backups:** daily online backup, 7 kept (§5); ciphertext only.
 5. **Accounts and secrets:** the owner authorized the release lead to create the Railway project and the DNS
-   record. The relay key fingerprint is recorded at deploy time for `relay set --key` (§1).
-6. **Who may enrol:** **pending: account/device design (saga).** Until then the default authority is the host-key
-   challenge, behind the pluggable `EnrolmentAuthority` (§8).
+   record. The lead generates the relay key at deploy (`agentmbx relay keygen`, stored as the `MBX_RELAY_KEY`
+   secret) and records its fingerprint for `relay set --key` and account auto-config (§1).
+6. **Who may enrol:** hosted relay: account-issued, host-key-bound tokens verified offline through JWKS; self-hosted
+   relays: the host-key challenge (§8, PLAN D7/D9).
 
 ## Tasks and acceptance
 
 - **T165: persist the relay store.** §2 and §3 server side, §7.
   - Tests: restart after commit and before response, and before commit; partial fan-out and quota failure; conflicting
-    id reuse; duplicate retries; several addresses on one host; schema creation and upgrade.
+    id reuse; duplicate retries; several addresses on one host; schema creation and upgrade; a restore that kept its
+    epoch is visible through `head_seq`; names shared across owners; revoked keys stay revoked; rotation moves the
+    queue; key and sender quotas; bounded enrolment state; exact wire bytes.
 - **T166: durable acceptance and the receive checkpoint.** §3 sender side, §4, §9, §10.
-  - Tests: a lost push response; 200 with a rejected result; a reordered or duplicate pull; a rejected item in
+  - Tests: a lost push response; 200 with a rejected result; the sender deadline without any relay notice; a pre-0.5.3
+    target; a reordered or duplicate pull; a rejected item in
     quarantine; an ack failure; a receipt item end to end; a relay-accepted row settled by its delivery receipt;
     `next_at` respected.
 - **T167: crash recovery, backup, retention.** §5, §6.
@@ -253,7 +303,7 @@ v1 otherwise. Mixed hosts work because items are opaque to the relay, and receiv
     sweep and the expiry notice to the sender.
 - **T168: enrolment and enc-ad recovery.** §1, §8 (`EnrolmentAuthority` with the host-key implementation), the G13
   doctor fix.
-  - Tests: re-enrolment after a restart and after a restore; host-name squatting rejected; a relay key change stops
+  - Tests: re-enrolment after a restart and after a restore; a name squatter never receives a host's mail (key routing); a relay key change stops
     use; enc-ad republish after rotation; a stub authority denying or granting by account recorded on the
     enrolment.
 - **T147 (with the owner):** deploy per decisions 1–5 (Railway, `relay.agentmbx.com`) and run the home-to-work proof. Mail both ways with each host
