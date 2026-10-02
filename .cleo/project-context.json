@@ -30,7 +30,34 @@
     ],
     "avoidPatterns": [
       "Do not use CommonJS require()",
-      "Do not use any type — strict mode is enabled"
+      "Do not use any type \u2014 strict mode is enabled"
     ]
+  },
+  "release": {
+    "prRequiredWorkflows": [
+      {
+        "name": "test (macos-14)",
+        "app": "github-actions",
+        "workflow": ".github/workflows/ci.yml"
+      },
+      {
+        "name": "test (ubuntu-24.04)",
+        "app": "github-actions",
+        "workflow": ".github/workflows/ci.yml"
+      }
+    ]
+  },
+  "evidence": {
+    "ciSatisfies": true,
+    "ciChecks": {
+      "tests": [
+        "test (macos-14)",
+        "test (ubuntu-24.04)"
+      ],
+      "qa": [
+        "test (macos-14)",
+        "test (ubuntu-24.04)"
+      ]
+    }
   }
 }
