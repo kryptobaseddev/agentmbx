@@ -26,7 +26,7 @@ export interface IdentityStatus {
 }
 
 export function listIdentityStatus(home: string, options: { now?: number; inspect?: (pid: number) => ProcessEvidence;
-  project?: string; caller?: { cli: string; sessionId: string }; includeRetired?: boolean } = {}) {
+  project?: string; caller?: { cli: string; sessionId: string; pid?: number }; includeRetired?: boolean } = {}) {
   const path = join(home, "mbx.db"), now = options.now ?? Date.now();
   if (!Number.isSafeInteger(now) || now < 0 || now > 8.64e15) throw new Error("invalid identity observation time");
   if (!existsSync(path)) throw Object.assign(new Error("mailbox is not initialized; run agentmbx setup"), { code: "NOT_FOUND" });
@@ -85,7 +85,14 @@ export function listIdentityStatus(home: string, options: { now?: number; inspec
     if (lease.released_at === null && now - lease.heartbeat_at < lease.idle_ttl) {
       try { evidence = inspect(lease.holder_pid); } catch { /* failed inspection is unknown */ }
     }
-    const a = identityAvailability({ lease, evidence, activity: activityByName.get(lease.name) ?? null, conflict: conflicts.has(lease.name), now, caller: options.caller });
+    // The caller's own lease (its MCP server is the holder process) is simply held by it: not "an older process of this
+    // same session", and not something it should claim again (T316).
+    // A shared transport (Codex, OpenCode) serves many conversations from one process, so the process alone is not the
+    // caller: the lease must also name this conversation's session.
+    const own = options.caller?.pid !== undefined && lease.released_at === null && lease.holder_pid === options.caller.pid
+      && lease.cli === options.caller.cli && lease.session_id === options.caller.sessionId && evidence.alive !== false;
+    const a = own ? { state: "live" as const, claimable: false, reason: "held by this session" }
+      : identityAvailability({ lease, evidence, activity: activityByName.get(lease.name) ?? null, conflict: conflicts.has(lease.name), now, caller: options.caller });
     item.state = a.state === "live" ? (a.claimable ? "idle" : "held") : a.state === "idle" ? "idle" : a.state === "unknown" ? "unknown" : a.state === "conflict" ? "conflict" : "available";
     item.claimable = a.claimable;
     item.reason = a.reason;
