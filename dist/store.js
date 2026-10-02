@@ -82,6 +82,26 @@ CREATE TRIGGER IF NOT EXISTS deliveries_receipt_update AFTER UPDATE OF state ON 
 CREATE TABLE IF NOT EXISTS remote_receipts (  -- what paired hosts reported for mail this host sent; signed record kept
   msg_id TEXT NOT NULL, recipient TEXT NOT NULL, state TEXT NOT NULL, at TEXT NOT NULL, note TEXT, did TEXT, seq INTEGER NOT NULL,
   record TEXT NOT NULL, sig TEXT NOT NULL, received_at TEXT NOT NULL, PRIMARY KEY (msg_id, recipient));
+-- Durable relay client (T166, docs/spec/relay-durability.md §3, §4). Additive: older runtimes ignore them.
+-- relay_wire: the exact sealed bytes for one (message, host, relay), written before the first push and reused on every
+-- retry, so a retry is a duplicate at the relay, never a conflict.
+CREATE TABLE IF NOT EXISTS relay_wire (
+  msg_id TEXT NOT NULL, host TEXT NOT NULL, relay TEXT NOT NULL, target_pubkey TEXT NOT NULL, wire BLOB NOT NULL,
+  wire_hash TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (msg_id, host, relay));
+-- relay_sent: mail the relay signed an accept for; kept until the target's delivery receipt, an epoch change (re-push)
+-- or the sender-side deadline.
+CREATE TABLE IF NOT EXISTS relay_sent (
+  msg_id TEXT NOT NULL, host TEXT NOT NULL, relay TEXT NOT NULL, target_pubkey TEXT NOT NULL, epoch TEXT NOT NULL,
+  seq INTEGER NOT NULL, accept TEXT NOT NULL, sig TEXT NOT NULL, queued_at TEXT NOT NULL, accepted_at TEXT NOT NULL,
+  deadline_at TEXT NOT NULL, state TEXT NOT NULL, settled_at TEXT, PRIMARY KEY (msg_id, host));
+CREATE INDEX IF NOT EXISTS relay_sent_state ON relay_sent(state, deadline_at);
+-- relay_position: how far this host has durably processed its relay queue, per relay and epoch.
+CREATE TABLE IF NOT EXISTS relay_position (
+  relay TEXT PRIMARY KEY, epoch TEXT NOT NULL, received_through INTEGER NOT NULL, updated_at TEXT NOT NULL);
+-- relay_quarantine: relay items this host could not accept; kept, never dropped silently.
+CREATE TABLE IF NOT EXISTS relay_quarantine (
+  relay TEXT NOT NULL, epoch TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL, item_id TEXT NOT NULL,
+  sender_pubkey TEXT NOT NULL, reason TEXT NOT NULL, wire BLOB NOT NULL, at TEXT NOT NULL, PRIMARY KEY (relay, epoch, seq));
 CREATE TABLE IF NOT EXISTS peers (
   host TEXT PRIMARY KEY, pubkey TEXT NOT NULL, owner_pubkey TEXT, addr TEXT NOT NULL,
   state TEXT NOT NULL,           -- 'pending' | 'approved'

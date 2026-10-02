@@ -9,6 +9,7 @@ import { buildGrant, CAPS, grantPayload, NAME_RE } from "./envelope.js";
 import { advertise, browse, lanIPv4 } from "./discovery.js";
 import { announceRotations, flushOutbox, flushReceipts, addrSignature, healPeerAddr, healStuckPeers, notifyUnpair, sendPresence, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.js";
 import { relayDrainOutbox, relayFor, relayPull } from "./relay-client.js";
+import { relayOpen, relayPushOutbox, relayPushReceipts, relayReceive, relaySettle } from "./relay-v2.js";
 import { DEFAULT_QUOTA, parseRelayKey, RelayCore, startRelayServer } from "./relay.js";
 import { SqliteRelayStore } from "./relay-store.js";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.js";
@@ -711,6 +712,16 @@ If the codes differ, do not approve: someone is in the middle.`);
                 console.log("the daemon reads it on start: agentmbx daemon install, or launchctl kickstart -k gui/$(id -u)/com.agentmbx.daemon");
                 return;
             }
+            if (sub === "quarantine") { // T166: relay items this host could not accept (kept, never dropped silently)
+                const rows = node.store.db.prepare("SELECT relay, epoch, seq, kind, item_id, reason, at FROM relay_quarantine ORDER BY at DESC LIMIT 200").all();
+                if (o.json)
+                    return console.log(JSON.stringify(rows, null, 2));
+                if (!rows.length)
+                    return console.log("relay quarantine is empty");
+                for (const r of rows)
+                    console.log(`${r.at}  ${r.kind} ${r.item_id}  seq ${r.seq} (${r.relay})  ${r.reason}`);
+                return;
+            }
             if (sub === "keygen") {
                 const k = generateKeyPair();
                 console.log(`MBX_RELAY_KEY=${k.privateKey}`);
@@ -730,7 +741,7 @@ If the codes differ, do not approve: someone is in the middle.`);
                 return;
             }
             if (sub !== undefined && sub !== "serve")
-                die("relay [serve [--port N] [--store-dir DIR] [--trust-proxy]] | relay keygen | relay rotate-epoch [--store-dir DIR] | relay set <url> | relay unset");
+                die("relay [serve [--port N] [--store-dir DIR] [--trust-proxy]] | relay keygen | relay rotate-epoch [--store-dir DIR] | relay quarantine [--json] | relay set <url> | relay unset");
             // T165: durable store and a persistent relay key in one directory (a Railway volume in production: MBX_RELAY_DIR=/data)
             const port = Number(str("port") ?? process.env.PORT ?? 7374);
             mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -769,15 +780,25 @@ If the codes differ, do not approve: someone is in the middle.`);
                     if (node.reloadKeys())
                         process.stderr.write("[mbx] host keys rotated; using the new keys\n");
                     await announceRotations(node);
+                    // T166: a v2 relay takes rows the LAN failed twice before the LAN pass (one shared backoff); receive and settle after
+                    const relay = relayFor(node);
+                    const v2 = relay ? await relayOpen(node, relay).catch((e) => { process.stderr.write(`[mbx] relay: ${e.message}\n`); return null; }) : null;
+                    if (v2) {
+                        await relayPushOutbox(node, v2);
+                        await relayPushReceipts(node, v2);
+                    }
                     await flushOutbox(node);
                     await flushReceipts(node);
                     await dispatchWakes(node);
                     await opencodePermissionPass(node, yoloLookup(node), opencodeService);
-                    const relay = relayFor(node);
-                    if (relay) {
+                    if (v2) {
+                        await relayReceive(node, v2);
+                        relaySettle(node);
+                    }
+                    else if (relay) {
                         await relayDrainOutbox(node, relay);
                         await relayPull(node, relay);
-                    }
+                    } // a v1-only relay
                 }
                 catch (e) {
                     process.stderr.write(`[mbx] ${e.message}\n`);
