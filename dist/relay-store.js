@@ -122,11 +122,12 @@ export class SqliteRelayStore {
     rebind(oldPub, next) {
         return this.transaction(() => {
             const cur = this.getEnrolment(next.pubkey);
-            if (cur && (cur.revoked_at || this.targetUsage(next.pubkey).items > 0))
-                throw coded("ROTATION_TARGET", "the new key must be fresh (unrevoked, with an empty queue)");
+            if (cur?.revoked_at)
+                throw coded("ROTATION_TARGET", "the new key was revoked here");
             this.revokeEnrolment(oldPub, next.at);
             this.putEnrolment(next);
-            // queued items follow the host: re-sequenced in order under the new key (the receiver keeps its retired enc keys)
+            // queued items follow the host: re-sequenced in order under the new key, after anything already queued for it (both
+            // keys signed the rotation; the receiver keeps its retired enc keys)
             const rows = this.db.prepare("SELECT * FROM items WHERE target_pubkey=? ORDER BY seq").all(oldPub);
             for (const r of rows) {
                 this.insertItem({ ...r, target_pubkey: next.pubkey, wire: Buffer.from(r.wire) }); // also writes the dedup row under the new key

@@ -23,7 +23,8 @@ export interface RelayQuota {
   maxEnvelopeBytes: number; maxBatch: number; pushesPerMinute: number; maxPull: number; maxPullBytes: number; maxTargets: number; retentionDays: number;
   /** Public-relay hygiene: enrolled keys, open challenges and their lifetime, enrolment calls per client address per minute. */
   maxEnrolments: number; maxPendingChallenges: number; challengeTtlMs: number; enrolPerMinutePerIp: number;
-  /** Live enrolments sharing one host name (bounds v1 name lookups and hop checks). */
+  /** Live enrolments sharing one host name beyond which a v1 name lookup or v1 hop check treats the name as ambiguous.
+   *  Never refuses an enrolment (common names could otherwise be pre-squatted); v2 is by key. */
   maxPerName: number;
 }
 /** Owner decision 2026-10-02: 14 days, 50 MB / 10,000 queued per owner (charged per host key until accounts prove owners). */
@@ -35,10 +36,12 @@ export const DEFAULT_QUOTA: RelayQuota = {
 };
 /** A target's signed list of the sender keys it accepts (its pinned peers). Once published, only those may push to it. */
 export interface SenderList { v: 1; type: "relay-senders"; host_pubkey: string; senders: string[]; iat: string }
-const MAX_SENDERS = 256;
+export const MAX_SENDERS = 1024;
 const IP_TABLE_MAX = 50_000;
 
 export type { Enrolment } from "./relay-store.ts";
+export const HEARTBEAT_MS = 30_000;
+export const HEARTBEAT_STALE_MS = 10 * 60_000;
 interface QueueRow { seq: number; envelope: Envelope; from: string; at: string }
 
 /** A v2 item as a sender submits it: one wire blob per target host key (docs/spec/relay-durability.md §3). A sender
@@ -82,12 +85,22 @@ export class RelayCore {
   private pushes = new Map<string, number[]>();                   // sender pubkey -> push timestamps (rate window)
   private ipCalls = new Map<string, number[]>();                  // client address -> challenge/enrol timestamps
 
-  constructor(quota: Partial<RelayQuota> = DEFAULT_QUOTA, o: { store?: RelayStore; key?: KeyPair } = {}) {
+  constructor(quota: Partial<RelayQuota> = DEFAULT_QUOTA, o: { store?: RelayStore; key?: KeyPair; heartbeatStaleMs?: number; now?: () => number } = {}) {
     this.quota = { ...DEFAULT_QUOTA, ...quota }; this.store = o.store ?? new SqliteRelayStore(); this.key = o.key ?? generateKeyPair();
     const pinned = this.store.meta("relay_pubkey");
     if (pinned && pinned !== this.key.publicKey) throw err("RELAY_KEY", "this relay store belongs to another relay key: keep relay.key with its store");
     if (!pinned) this.store.setMeta("relay_pubkey", this.key.publicKey);
+    // A store whose heartbeat is stale may be a restored copy (a volume restore restarts the service): rotate the epoch so
+    // senders re-push and receivers re-pull at once. A long outage rotates too, which dedup makes harmless (spec §5).
+    const now = (o.now ?? Date.now)(), beat = Number(this.store.meta("heartbeat") ?? NaN);
+    if (Number.isFinite(beat) && now - beat > (o.heartbeatStaleMs ?? HEARTBEAT_STALE_MS)) {
+      const from = this.store.epoch(), to = this.store.rotateEpoch();
+      this.store.setMeta("epoch_rotated", JSON.stringify({ from, to, at: new Date(now).toISOString(), reason: "stale heartbeat (restore or long outage)" }));
+    }
+    this.beat(now);
   }
+  /** The running relay records that it is alive; startRelayServer calls this every HEARTBEAT_MS. */
+  beat(now = Date.now()) { this.store.setMeta("heartbeat", String(now)); }
 
   /** Public relay facts for `relay set` pinning and client feature detection (§1). With a caller, also its queue head. */
   info(caller?: Enrolment) {
@@ -138,7 +151,6 @@ export class RelayCore {
     this.store.transaction(() => {
       const known = this.store.getEnrolment(pubkey);
       if (!known && this.store.liveEnrolmentCount() >= this.quota.maxEnrolments) throw err("FULL", "relay enrolment capacity reached");
-      if (!known && this.store.enrolmentsByName(host).length >= this.quota.maxPerName) throw err("NAME_CROWDED", `too many hosts share the name ${host} here; use a more specific host name`);
       this.store.putEnrolment({ host, pubkey, owner_fp, at: new Date().toISOString(), authorized_by: "host-key-challenge" });
     });
   }
@@ -166,6 +178,7 @@ export class RelayCore {
    *  never wins (v1 senders drop their row on a 200, so a wrong guess would lose mail silently). */
   resolveName(host: string, viewer?: Enrolment): { enrolment: Enrolment | null; ambiguous: boolean } {
     const all = this.store.enrolmentsByName(host);
+    if (all.length > this.quota.maxPerName) return { enrolment: null, ambiguous: true }; // crowded counts as ambiguous
     if (all.length === 1) return { enrolment: all[0]!, ambiguous: false };
     const mine = viewer?.account ? all.filter((e) => e.account === viewer.account) : [];
     if (mine.length === 1) return { enrolment: mine[0]!, ambiguous: false };
@@ -177,6 +190,7 @@ export class RelayCore {
   publishSenders(target: Enrolment, list: SenderList, sig: string): void {
     if (list?.v !== 1 || list.type !== "relay-senders" || list.host_pubkey !== target.pubkey || typeof list.iat !== "string" || !Number.isFinite(Date.parse(list.iat))
       || !Array.isArray(list.senders) || list.senders.length > MAX_SENDERS || !list.senders.every(isPubkey)) throw err("BAD_REQUEST", "bad sender list");
+    if (Date.parse(list.iat) > Date.now() + 5 * 60_000) throw err("BAD_REQUEST", "sender list iat is in the future");
     if (typeof sig !== "string" || !verifyData(target.pubkey, canonical(list), sig)) throw err("BAD_SIGNATURE", "sender list is not signed by the target");
     const cur = this.store.senderList(target.pubkey);
     if (cur && Date.parse(cur.iat) >= Date.parse(list.iat)) throw err("STALE", "a newer sender list is already stored");
@@ -193,8 +207,9 @@ export class RelayCore {
     if (!ts || !sig || !Number.isFinite(Number(ts)) || Math.abs(Date.now() - Number(ts)) > 300_000) return null;
     const payload = canonical({ method, path: signedPath, ts, body: `${method}:${signedPath}:${ts}:${body}` });
     const key = headers["x-mbx-key"] as string | undefined, name = headers["x-mbx-host"] as string | undefined;
-    const candidates = key ? [this.store.getEnrolment(key)].filter((e): e is Enrolment => !!e && !e.revoked_at)
-      : name ? this.store.enrolmentsByName(name) : [];
+    const byName = !key && name ? this.store.enrolmentsByName(name) : [];
+    if (byName.length > this.quota.maxPerName) return null; // a crowded name: v1 callers must upgrade to key headers
+    const candidates = key ? [this.store.getEnrolment(key)].filter((e): e is Enrolment => !!e && !e.revoked_at) : byName;
     return candidates.find((e) => verifyData(e.pubkey, payload, sig)) ?? null;
   }
 
@@ -461,7 +476,7 @@ export function startRelayServer(core: RelayCore, port = 0, bind = "127.0.0.1", 
         try { core.enrol(j.host, j.pubkey, j.owner_fp, j.sig); return send(200, { ok: true }); }
         catch (e) {
           const c = (e as { code?: string }).code;
-          return send(c === "REVOKED" ? 403 : c === "NAME_TAKEN" || c === "NAME_CROWDED" ? 409 : c === "FULL" ? 503 : c === "BAD_REQUEST" ? 400 : 401, { error: (e as Error).message });
+          return send(c === "REVOKED" ? 403 : c === "NAME_TAKEN" ? 409 : c === "FULL" ? 503 : c === "BAD_REQUEST" ? 400 : 401, { error: (e as Error).message });
         }
       }
       // below here requires an enrolled, hop-authenticated host
@@ -515,5 +530,7 @@ export function startRelayServer(core: RelayCore, port = 0, bind = "127.0.0.1", 
     } catch (e) { return send(400, { error: (e as Error).message }); }
   });
   Object.assign(server, { headersTimeout: 10_000, requestTimeout: 30_000, keepAliveTimeout: 5_000 }); // slow clients cannot hold sockets open
+  const beat = setInterval(() => { try { core.beat(); } catch { /* store closed */ } }, HEARTBEAT_MS);
+  beat.unref(); server.on("close", () => clearInterval(beat));
   return new Promise((resolve, reject) => { server.once("error", reject); server.listen(port, bind, () => resolve(server)); });
 }
