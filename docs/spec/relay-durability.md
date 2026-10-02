@@ -78,27 +78,42 @@ writer process). Every successful response MUST be sent only after its transacti
   identified by key; a name is a label.** A name is unique only inside a proven account (`UNIQUE(account, host_name)`
   for live rows), so two owners' `macbook` coexist on a shared relay and nobody can lock a name out. `owner_fp` is the
   host's own unproven claim and decides nothing. Re-enrolment MUST NOT clear `revoked_at`: a revoked key stays
-  revoked. F4 is closed by key addressing: v2 routing, hop authentication (`x-mbx-key`) and enc-ad lookup are by key;
-  v1 lookups by name prefer the caller's own owner claim, then the newest enrolment, and a v1 hop by name is
-  authenticated by whichever enrolment of that name verifies the signature.
+  revoked, and a weaker authority (the host-key challenge) MUST NOT overwrite the `account` or `authorized_by` a
+  stronger one recorded. Names match case-insensitively; at most 16 live enrolments may share a name. F4 is closed
+  by key addressing: v2 routing, hop authentication (`x-mbx-key`) and enc-ad lookup are by key. v1 lookups by name
+  resolve only when exactly one live enrolment carries the name (or exactly one inside the caller's proven account);
+  otherwise the lookup is ambiguous: a v1 push answers `recipient host ambiguous` and stores nothing, and an enc-ad
+  lookup answers nothing. A v1 hop by name is authenticated by whichever enrolment of that name verifies the signature.
+- **Sender allowlist.** `POST /v2/relay/senders {list:{v:1, type:"relay-senders", host_pubkey, senders[≤256], iat},
+  sig}` (signed by the target's host key, newer `iat` replaces older) lists the sender keys a target accepts,
+  normally its pinned peers. Once a target published one, pushes from other keys are refused (`rejected:sender not
+  accepted by target`), v1 and v2 alike: enrolment is free, so without it many fake sender keys could each take a
+  share of the target's queue. Stored in `sender_lists(target_pubkey PK, senders, iat, record, sig)`.
 - **Rotation (T030).** `POST /v2/relay/rotate {rotation}` takes the signed rotation record (old and new key both
   signed it; self-authenticating, since a rotated host already signs hops with its new key). The relay moves the
-  name, account and queued items to the new key (re-sequenced in order, dedup rows kept) and revokes the old key.
+  name, account and queued items to the new key (re-sequenced in order, dedup rows kept), moves its sender allowlist,
+  swaps the old key for the new in other targets' allowlists, and revokes the old key. The new key MUST be fresh (not
+  revoked, empty queue), so a rotation never pushes a queue past its quota. The rotated host MUST reset its own
+  receive position for that relay to 0 (its items were re-sequenced; dedup makes repeats harmless).
 - `enc_ads(host_pubkey PK, enc_pub, sig, at)`. Only signed advertisements are stored, as today.
 - `items(target_pubkey, seq, kind, item_id, sender_pubkey, wire BLOB, wire_hash, bytes, accepted_at, expires_at,
   PRIMARY KEY(target_pubkey, seq))`. `wire` is the exact bytes received; `wire_hash` is lowercase hex SHA-256 of those
   bytes (never of a decoded or re-encoded string).
 - `dedup(sender_pubkey, item_id, target_pubkey, wire_hash, seq, accepted_at, PRIMARY KEY(sender_pubkey, item_id,
   target_pubkey))`. It is kept for the dedup horizon (§7) after its item is acked or expired, which closes G4 and F12.
-- `seqs(target_pubkey PK, next_seq)`. Sequence numbers never restart and are never reused (G7).
+- `seqs(target_pubkey PK, next_seq)`. Sequence numbers never restart and are never reused (G7). A new seq is
+  `max(next_seq, now_ms)`: a store restored from an older copy keeps allocating above anything it handed out before
+  the restore, so receivers never miss post-restore items even when senders push before they pull (§5).
 - `acked(target_pubkey PK, acked_through)`.
 - `meta(epoch, relay_pubkey, schema_version)`. A store MUST refuse to open when `schema_version` is newer than the
   binary, and MUST migrate older versions in a transaction (a migration keeps the epoch).
 
 Challenges and rate windows MAY stay in memory, bounded: challenges expire (5 min) and are capped (10,000 open); host
 names match `HOST_RE`, keys are 32-byte Ed25519, `owner_fp` is at most 64 safe characters; challenge and enrol are
-rate-limited per client address (behind a proxy, the first `X-Forwarded-For` hop with `--trust-proxy`); enrolment
-bodies are small; live enrolments are capped. A restart only invalidates outstanding challenges, and clients retry
+rate-limited per client address (behind a proxy: the rightmost `X-Forwarded-For` entry, the one the trusted proxy
+appended, with `--trust-proxy` / `MBX_RELAY_TRUST_PROXY=xff`, or `CF-Connecting-IP` with
+`MBX_RELAY_TRUST_PROXY=cloudflare`; earlier XFF entries are client-controlled), and that rate table is hard-capped;
+enrolment bodies are small; live enrolments are capped. A restart only invalidates outstanding challenges, and clients retry
 them. Dedup rows are swept after the dedup horizon (§7, T167).
 
 ### 3. Push and acceptance (T165, T166)
@@ -139,10 +154,9 @@ at most `max_batch` items.
 - **Own its deadline.** A `relay-accepted` row whose delivery receipt has not arrived by `accepted_at + retention +
   grace` (grace 24 h) is marked unconfirmed and the local sender gets "Undelivered/unconfirmed to <host>", without
   waiting for anything from the relay. The relay's expiry notice (§6) is an early signal, never the only one, because
-  a relay that lost the item (wipe, bad restore) cannot send it. A target whose host reports a version without
-  receipts (before 0.5.3) never sends delivery receipts: for such targets the row settles on the relay's ack evidence
-  (the target's `acked_through` passing the item's seq, visible to the sender only through a later receipt or the
-  deadline), and the deadline alert says "no delivery confirmation (peer too old)" instead of "undelivered".
+  a relay that lost the item (wipe, bad restore) cannot send it. A target older than 0.5.3 never sends delivery
+  receipts, so for it **the deadline settles the row**: when no receipt has ever arrived from that host, the alert
+  says there is no delivery confirmation and the peer may be older than 0.5.3, instead of calling the mail lost.
 
 ### 4. Pull, receive and ack (T166)
 
@@ -185,8 +199,9 @@ state retryable: the next pull starts at `received_through`, and the relay simpl
   - Receiver checkpoints but the ack is lost → the next ack covers it.
 - **Restore from backup.** A restore MUST rotate the epoch. Restores made by `agentmbx relay restore` do this; any
   other restore (a volume snapshot, a file copy) MUST be followed by `agentmbx relay rotate-epoch --store-dir <dir>`
-  before the relay serves again. If that is missed, receivers still detect it (`head_seq < received_through`, §4). On seeing a new epoch, in either a push or a pull
-  response:
+  before the relay serves again. If that is missed, the seq floor (§2) still keeps every post-restore item above the
+  receivers' checkpoints, and receivers that pull before any push detect the rewind (`head_seq < received_through`,
+  §4). On seeing a new epoch, in either a push or a pull response:
   - A sender re-pushes every outbox row in `relay-accepted` state whose delivery receipt hasn't arrived. Dedup
     makes this safe even where the restored store still has the item.
   - A receiver resets its relay position for that relay to 0 and pulls everything. Receiver dedup by message id
@@ -213,7 +228,8 @@ notice, because receipts are advisory. The notice is best effort: senders also e
 
 Quotas charge what the relay can prove. Per target host key: `max_queue_items` and `max_queue_bytes` (10,000 and
 50 MB, decision 3). Per sender per target: a share (2,000 items, 20 MB), so one sender cannot fill another host's
-queue. Per proven account (§8): 10,000 items and 50 MB across its hosts. A self-asserted `owner_fp` is never charged:
+queue; a target's sender allowlist (§2) closes the remaining gap of many fake sender keys. Per proven account (§8):
+10,000 items and 50 MB across its hosts. A self-asserted `owner_fp` is never charged:
 anyone could claim another owner's fingerprint and exhaust that owner's quota. Pushes per minute are counted per
 sender key.
 Per request: `max_batch` and the body cap (`RELAY_MAX_BODY`), checked while streaming. Per pull: `max_pull` and
