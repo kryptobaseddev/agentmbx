@@ -40,8 +40,9 @@ The replacement claims the same persona; do not transfer lease credentials.
 A successful send means accepted, not recipient delivery, an answer or task completion.
 Its `recipients[]` says who will see it when: `live-wake`, `live-next-prompt`, `offline` (tell your user if it is urgent),
 `forwarded` or `remote`. A misspelled name is refused with suggestions; check `mbx_agents`.
-Later, `mbx_sent` shows what happened to your mail per recipient (delivered/notified/acked, their `did`, liveness),
-and `mbx_thread` shows the same under each message.
+Later, `mbx_sent` shows what happened to your mail per recipient (delivered/notified/read/acked, their `did`, liveness),
+and `mbx_thread` shows the same under each message. Recipients on paired hosts report back with signed receipts;
+`handed-over` means their host accepted it and has not reported yet (or runs an older AgentMBX).
 `mbx_project` shows your project folder's traffic (roles, states; bodies of your own mail). The owner-designated project
 lead sees every body and can `mbx_forward` a message, e.g. when its recipient's session ended.
 Queued transport retry is separate from composing a draft; there is no mailbox draft API.

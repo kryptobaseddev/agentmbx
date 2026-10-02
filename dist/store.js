@@ -62,6 +62,26 @@ CREATE TABLE IF NOT EXISTS project_leads (  -- owner-signed project lead records
   id TEXT PRIMARY KEY, project TEXT NOT NULL, agent TEXT NOT NULL, record TEXT NOT NULL, sig TEXT NOT NULL,
   revocation TEXT, revocation_sig TEXT, received_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS project_leads_project ON project_leads(project);
+-- Cross-host delivery receipts (src/remote-receipts.ts, T218). Every delivery state change of a message from a paired host
+-- is queued for that host by these triggers, so every path that moves a delivery (old runtimes included) is covered; the
+-- daemon signs and pushes them. Additive: older runtimes ignore the tables (no schema version change).
+CREATE TABLE IF NOT EXISTS receipt_outbox (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT, msg_id TEXT NOT NULL, agent TEXT NOT NULL, host TEXT NOT NULL, state TEXT NOT NULL,
+  note TEXT, at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at TEXT NOT NULL, last_error TEXT);
+CREATE INDEX IF NOT EXISTS receipt_outbox_due ON receipt_outbox(next_at);
+CREATE TRIGGER IF NOT EXISTS deliveries_receipt_insert AFTER INSERT ON deliveries BEGIN
+  INSERT INTO receipt_outbox (msg_id,agent,host,state,note,at,next_at)
+    SELECT new.msg_id,new.agent,substr(m.from_addr,instr(m.from_addr,'@')+1),new.state,new.note,new.updated_at,new.updated_at
+    FROM messages m WHERE m.id=new.msg_id AND m.origin<>'local' AND instr(m.from_addr,'@')>0
+      AND new.state IN ('delivered','notified','read','acked'); END;
+CREATE TRIGGER IF NOT EXISTS deliveries_receipt_update AFTER UPDATE OF state ON deliveries WHEN new.state<>old.state BEGIN
+  INSERT INTO receipt_outbox (msg_id,agent,host,state,note,at,next_at)
+    SELECT new.msg_id,new.agent,substr(m.from_addr,instr(m.from_addr,'@')+1),new.state,new.note,new.updated_at,new.updated_at
+    FROM messages m WHERE m.id=new.msg_id AND m.origin<>'local' AND instr(m.from_addr,'@')>0
+      AND new.state IN ('delivered','notified','read','acked'); END;
+CREATE TABLE IF NOT EXISTS remote_receipts (  -- what paired hosts reported for mail this host sent; signed record kept
+  msg_id TEXT NOT NULL, recipient TEXT NOT NULL, state TEXT NOT NULL, at TEXT NOT NULL, note TEXT, did TEXT, seq INTEGER NOT NULL,
+  record TEXT NOT NULL, sig TEXT NOT NULL, received_at TEXT NOT NULL, PRIMARY KEY (msg_id, recipient));
 CREATE TABLE IF NOT EXISTS peers (
   host TEXT PRIMARY KEY, pubkey TEXT NOT NULL, owner_pubkey TEXT, addr TEXT NOT NULL,
   state TEXT NOT NULL,           -- 'pending' | 'approved'

@@ -7,7 +7,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { canonical, fingerprint, ulid } from "./crypto.ts";
 import { buildGrant, CAPS, grantPayload, NAME_RE, type Envelope, type Grant } from "./envelope.ts";
 import { advertise, browse, lanIPv4 } from "./discovery.ts";
-import { announceRotations, flushOutbox, addrSignature, healPeerAddr, healStuckPeers, notifyUnpair, sendPresence, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.ts";
+import { announceRotations, flushOutbox, flushReceipts, addrSignature, healPeerAddr, healStuckPeers, notifyUnpair, sendPresence, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.ts";
 import { relayDrainOutbox, relayFor, relayPull } from "./relay-client.ts";
 import { RelayCore, startRelayServer } from "./relay.ts";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.ts";
@@ -604,7 +604,7 @@ If the codes differ, do not approve: someone is in the middle.`);
         if (busy) return; busy = true;
         try {
           if (node.reloadKeys()) process.stderr.write("[mbx] host keys rotated; using the new keys\n");
-          await announceRotations(node); await flushOutbox(node); await dispatchWakes(node); await opencodePermissionPass(node, yoloLookup(node), opencodeService);
+          await announceRotations(node); await flushOutbox(node); await flushReceipts(node); await dispatchWakes(node); await opencodePermissionPass(node, yoloLookup(node), opencodeService);
           const relay = relayFor(node);
           if (relay) { await relayDrainOutbox(node, relay); await relayPull(node, relay); }
         } catch (e) { process.stderr.write(`[mbx] ${(e as Error).message}\n`); } finally { busy = false; }
