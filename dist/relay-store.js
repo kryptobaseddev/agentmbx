@@ -36,7 +36,8 @@ const MIGRATIONS = {
       target_pubkey TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL, item_id TEXT NOT NULL, sender_pubkey TEXT NOT NULL,
       sender_host TEXT NOT NULL, wire BLOB NOT NULL, wire_hash TEXT NOT NULL, bytes INTEGER NOT NULL, accepted_at TEXT NOT NULL,
       expires_at TEXT, PRIMARY KEY (target_pubkey, seq));
-    INSERT INTO items_v2 SELECT target_pubkey, seq, kind, item_id, sender_pubkey, sender_host, CAST(wire AS BLOB), wire_hash, bytes, accepted_at, expires_at FROM items;
+    INSERT INTO items_v2 (target_pubkey, seq, kind, item_id, sender_pubkey, sender_host, wire, wire_hash, bytes, accepted_at, expires_at)
+      SELECT target_pubkey, seq, kind, item_id, sender_pubkey, sender_host, CAST(wire AS BLOB), wire_hash, bytes, accepted_at, expires_at FROM items;
     DROP TABLE items;
     ALTER TABLE items_v2 RENAME TO items;`,
 };
