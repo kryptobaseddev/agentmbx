@@ -2,6 +2,10 @@
 
 ## 0.5.4 (unreleased)
 
+- **Claude /clear keeps your mailbox (T309):** /clear, /resume and compaction give the same Claude process a new session id while its mbx server lives on. The session hooks used to refuse to rebind it, so the new conversation was told it had no identity, and a statusline that fell back to the folder name showed another agent's mail. The hook now rebinds the holder when Claude's own session file names the new id. A session id that file doesn't name is still refused.
+- **Status displays resolve exactly (T310):** a shared resolver for statuslines and `agentmbx status` matches the session id, then that provider process's live holder; otherwise it reports unbound or ambiguous. It never uses a folder name.
+- **Claim a known mailbox by name (T315):** a released mailbox from before chosen identities can be claimed without passing a role again; it keeps the role it was known by. A brand-new name still needs one.
+- **Your own lease reads as yours (T316):** the identity list in the holding session says "held by this session" instead of "held by an older process of this same session … claimable".
 - **No duplicate copy of a bare name that lives on both hosts (S2 follow-up):** the sending host resolves a bare name locally first; when it delivers one to its own agent and the message also goes to paired hosts, it names it in the signed envelope (`meta.local_names`), and receivers skip exactly those names instead of delivering a second copy to their own same-named mailbox (audited as `receive.skipped`). Decided by the sender, so a stale directory can never turn this into lost mail; messages from older senders behave as before. An explicit `name@thishost` still arrives.
 - **Retired phantoms send no receipt (S2 follow-up):** `doctor --fix` removes the cross-host receipts its own acks would queue, so the sender never sees "drum@fedora acked" for a mailbox nobody holds.
 
