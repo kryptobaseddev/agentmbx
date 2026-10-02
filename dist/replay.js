@@ -12,12 +12,42 @@ export function initializeReplay(store) {
  */
 export function resetReplayEpoch(store) { store.set(EPOCH_KEY, randomUUID()); }
 const encode = (frame) => Buffer.from(JSON.stringify(frame)).toString("base64url");
+/** Frame encoding for callers that build a cursor from a stored position (catch-up). */
+export const encodeReplayFrame = encode;
 const bytes = (value) => Buffer.byteLength(JSON.stringify(value), "utf8");
 function bounded(value, fallback, min, max) {
     const n = value ?? fallback;
     if (!Number.isSafeInteger(n) || n < min || n > max)
         fail("CURSOR_INVALID", "Replay bounds are invalid");
     return n;
+}
+/** Highest retained or pruned visibility position for a mailbox; the replay snapshot's end bound. */
+export function replayMaximum(store, mailbox) {
+    const maximum = Math.max(Number(store.db.prepare("SELECT COALESCE(MAX(seq),0) n FROM mailbox_visibility WHERE mailbox=?").get(mailbox).n), Number(store.db.prepare("SELECT COALESCE(MAX(seq),0) n FROM mailbox_pruned WHERE mailbox=?").get(mailbox).n));
+    if (!Number.isSafeInteger(maximum) || maximum < 0)
+        fail("CURSOR_INVALID", "Replay history exceeds supported bounds");
+    return maximum;
+}
+/** Strict structural validation and decode of one replay frame; scope, epoch and end checks are the caller's. */
+export function parseReplayFrame(cursor) {
+    if (typeof cursor !== "string" || cursor.length > 2048 || !/^[A-Za-z0-9_-]+$/.test(cursor))
+        fail("CURSOR_INVALID", "Replay cursor is invalid");
+    let decoded;
+    try {
+        const data = Buffer.from(cursor, "base64url");
+        if (data.toString("base64url") !== cursor)
+            fail("CURSOR_INVALID", "Replay cursor is invalid");
+        decoded = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(data));
+    }
+    catch {
+        fail("CURSOR_INVALID", "Replay cursor is invalid");
+    }
+    const f = decoded;
+    if (!f || typeof f !== "object" || Array.isArray(f) || Object.keys(f).sort().join(",") !== "end,epoch,filter,mailbox,position,v"
+        || f.v !== 1 || typeof f.epoch !== "string" || typeof f.mailbox !== "string" || typeof f.filter !== "string"
+        || !Number.isSafeInteger(f.position) || !Number.isSafeInteger(f.end) || f.position < 0 || f.end < f.position)
+        fail("CURSOR_INVALID", "Replay cursor is invalid");
+    return f;
 }
 /** Caller MUST wrap this query in its actual held-lease read operation; visibility is checked again here. */
 export function replayQuery(store, mailbox, options, visible, projectHost, project) {
@@ -34,28 +64,10 @@ export function replayQuery(store, mailbox, options, visible, projectHost, proje
         if (!epoch)
             fail("CURSOR_EXPIRED", "Replay generation is unavailable; initialize this store before replay");
         // Pruned positions still count as history: a cursor past them stays valid and AUTOINCREMENT never reuses them.
-        const maximum = Math.max(Number(store.db.prepare("SELECT COALESCE(MAX(seq),0) n FROM mailbox_visibility WHERE mailbox=?").get(mailbox).n), Number(store.db.prepare("SELECT COALESCE(MAX(seq),0) n FROM mailbox_pruned WHERE mailbox=?").get(mailbox).n));
-        if (!Number.isSafeInteger(maximum) || maximum < 0)
-            fail("CURSOR_INVALID", "Replay history exceeds supported bounds");
+        const maximum = replayMaximum(store, mailbox);
         let frame = { v: 1, epoch: epoch, mailbox, filter, position: 0, end: maximum };
         if (options.cursor !== undefined) {
-            if (typeof options.cursor !== "string" || options.cursor.length > 2048 || !/^[A-Za-z0-9_-]+$/.test(options.cursor))
-                fail("CURSOR_INVALID", "Replay cursor is invalid");
-            let decoded;
-            try {
-                const data = Buffer.from(options.cursor, "base64url");
-                if (data.toString("base64url") !== options.cursor)
-                    fail("CURSOR_INVALID", "Replay cursor is invalid");
-                decoded = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(data));
-            }
-            catch {
-                fail("CURSOR_INVALID", "Replay cursor is invalid");
-            }
-            const f = decoded;
-            if (!f || typeof f !== "object" || Array.isArray(f) || Object.keys(f).sort().join(",") !== "end,epoch,filter,mailbox,position,v"
-                || f.v !== 1 || typeof f.epoch !== "string" || typeof f.mailbox !== "string" || typeof f.filter !== "string"
-                || !Number.isSafeInteger(f.position) || !Number.isSafeInteger(f.end) || f.position < 0 || f.end < f.position)
-                fail("CURSOR_INVALID", "Replay cursor is invalid");
+            const f = parseReplayFrame(options.cursor);
             if (f.mailbox !== mailbox || f.filter !== filter)
                 fail("CURSOR_SCOPE_MISMATCH", "Replay cursor belongs to a different mailbox or filter");
             if (f.epoch !== epoch)

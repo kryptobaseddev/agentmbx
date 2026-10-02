@@ -81,8 +81,10 @@ states, ACK semantics, or policy.
 ### Guided start and resume (T158)
 
 11. A dedicated session that binds or claims an identity and has missed messages MUST get a
-    bounded hint: "N messages since <updated_at>; call mbx_catchup". The count is a seq-max
-    difference (O(1)); zero means no hint (no noise).
+    bounded hint: "N messages since <updated_at>; call mbx_catchup". The count is an indexed count
+    of the mailbox's own visibility rows after the stored position (seq is a global autoincrement,
+    so a raw max-difference would count other mailboxes' interleaved positions); zero means no
+    hint (no noise).
 12. **Bounded hint.** When the gap exceeds 500 messages or 7 days, the hint MUST instead suggest
     `mbx_inbox` first and state that catch-up is optional, so a long-dormant identity is not
     pushed into replaying weeks of history.
