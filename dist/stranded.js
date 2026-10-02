@@ -30,6 +30,8 @@ export function retirePhantoms(node, apply) {
             for (const id of p.messages) {
                 const host = node.message(id)?.origin ?? p.hosts[0];
                 node.store.setDelivery(id, p.name, "acked", `phantom mailbox retired: addressed to ${p.name}@${host}, which received it there`);
+                // no cross-host receipt for a phantom: "drum@fedora acked" would tell the sender an agent here handled it (T218)
+                node.store.db.prepare("DELETE FROM receipt_outbox WHERE msg_id=? AND agent=?").run(id, p.name);
             }
             node.store.audit("mailbox.phantom_retired", { name: p.name, messages: p.messages.length, hosts: p.hosts });
         });
