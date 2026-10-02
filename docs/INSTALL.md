@@ -75,7 +75,10 @@ Prefer comparing codes instead? `agentmbx pair --compare <host>:7373`, check bot
 Paired hosts that can't reach each other over the LAN (different networks, NAT, a machine that's off) exchange
 mail through an **untrusted store-and-forward relay**: it holds no keys, decides no authorization, and never
 sees plaintext bodies — envelopes are sealed for the recipient before they leave the sender.
-1. Run a relay on any always-on machine: `agentmbx relay serve --port 7374`.
+1. Run a relay on any always-on machine: `agentmbx relay serve --port 7374` (or `PORT`). It keeps its store and its
+   signing key in `--store-dir` (default `~/.local/share/agentmbx-relay`, or `MBX_RELAY_DIR`): `relay.db` and
+   `relay.key` (mode 0600). Back them up together; the relay refuses to start with a key that isn't its store's. The
+   startup line prints the store epoch and the key fingerprint.
 2. Point each daemon at it: `agentmbx relay set http://<relay-host>:7374`, then restart the daemon
    (`agentmbx daemon install` hosts: `launchctl kickstart -k gui/$(id -u)/com.agentmbx.daemon`).
 3. That's it: mail to unreachable peers flows through the relay and is pulled by the peer; `agentmbx doctor`

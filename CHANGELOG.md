@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Durable relay store (T165):** `agentmbx relay serve` now keeps everything in SQLite (`relay.db`, WAL, `synchronous=FULL`) in `--store-dir` / `MBX_RELAY_DIR` (default `~/.local/share/agentmbx-relay`), so a restart loses no enrolment, encryption ad or queued mail. The relay has its own signing key (`relay.key`, 0600, created on first start; the relay refuses a key that isn't its store's) and a store epoch. New `/v2/relay/*` endpoints (spec: docs/spec/relay-durability.md): `GET /v2/relay/info`; `POST /v2/relay/items` accepts sealed envelopes and receipts, each item atomically with a never-reused per-recipient sequence, deduplicated by (sender, item id, recipient) with a conflict on different bytes, and answers with a relay-signed accept statement; `GET /v2/relay/items` pages by sequence; `POST /v2/relay/ack` acknowledges through a sequence within the current epoch. Per-owner quotas (10,000 items, 50 MB), 14-day retention setting, and an enrolled name can no longer be taken by another key. `/v1/relay/*` keeps its behaviour on the same store. Daemons don't use v2 yet (T166).
+
 ## 0.5.3 (2026-10-02)
 
 Follow-up to the 0.5.2 P0 release: mail you send to another machine now reports back, mail nobody can read no longer piles up, and a resumed identity can catch up on what it missed. Install it on every machine; receipts flow once both ends run 0.5.3.

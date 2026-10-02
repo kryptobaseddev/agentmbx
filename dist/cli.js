@@ -1,15 +1,16 @@
 // mbx command line. Humans, hooks and scripts use this; agents use the MCP tools (mbx mcp).
-import { existsSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { constants as osConstants, homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { execFileSync, spawn } from "node:child_process";
-import { canonical, fingerprint, ulid } from "./crypto.js";
+import { canonical, fingerprint, generateKeyPair, ulid } from "./crypto.js";
 import { buildGrant, CAPS, grantPayload, NAME_RE } from "./envelope.js";
 import { advertise, browse, lanIPv4 } from "./discovery.js";
 import { announceRotations, flushOutbox, flushReceipts, addrSignature, healPeerAddr, healStuckPeers, notifyUnpair, sendPresence, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.js";
 import { relayDrainOutbox, relayFor, relayPull } from "./relay-client.js";
-import { RelayCore, startRelayServer } from "./relay.js";
+import { DEFAULT_QUOTA, RelayCore, startRelayServer } from "./relay.js";
+import { SqliteRelayStore } from "./relay-store.js";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.js";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
 import { ancestors, withProcSnapshot } from "./proc.js";
@@ -238,7 +239,7 @@ async function run(argv) {
             cursor: { type: "string" }, "max-bytes": { type: "string" }, "scan-limit": { type: "string" }, "project-host": { type: "string" }, topic: { type: "string" },
             compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" },
             backend: { type: "string" }, "no-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
-            project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }, "wait-ms": { type: "string" },
+            project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }, "wait-ms": { type: "string" }, "store-dir": { type: "string" },
             "older-than": { type: "string" }, minutes: { type: "string" }, apply: { type: "boolean" }, days: { type: "string" }, fix: { type: "boolean" }
         } });
     if (o.help)
@@ -711,11 +712,19 @@ If the codes differ, do not approve: someone is in the middle.`);
                 return;
             }
             if (sub !== undefined && sub !== "serve")
-                die("relay [serve [--port N]] | relay set <url> | relay unset");
-            const port = Number(str("port") ?? 7374);
-            const core = new RelayCore();
+                die("relay [serve [--port N] [--store-dir DIR]] | relay set <url> | relay unset");
+            // T165: durable store and a persistent relay key in one directory (a Railway volume in production: MBX_RELAY_DIR=/data)
+            const port = Number(str("port") ?? process.env.PORT ?? 7374);
+            const dir = str("store-dir") ?? process.env.MBX_RELAY_DIR ?? join(homedir(), ".local/share/agentmbx-relay");
+            mkdirSync(dir, { recursive: true, mode: 0o700 });
+            const keyPath = join(dir, "relay.key");
+            if (!existsSync(keyPath))
+                writeFileSync(keyPath, JSON.stringify(generateKeyPair()) + "\n", { mode: 0o600 });
+            const relayKey = JSON.parse(readFileSync(keyPath, "utf8"));
+            const core = new RelayCore(DEFAULT_QUOTA, { store: new SqliteRelayStore(join(dir, "relay.db")), key: relayKey });
             const server = await startRelayServer(core, port, str("bind") ?? "0.0.0.0");
-            console.log(`[agentmbx] untrusted store-and-forward relay listening on :${port} (ADR-035 reference; holds no keys, decides nothing)`);
+            console.log(`[agentmbx] untrusted store-and-forward relay listening on :${port} (ADR-035; durable store ${join(dir, "relay.db")}, epoch ${core.store.epoch()})`);
+            console.log(`[agentmbx] relay key ${fingerprint(relayKey.publicKey)} (keep relay.key with its store; record this fingerprint for clients)`);
             return new Promise(() => void server);
         }
         case "daemon": {

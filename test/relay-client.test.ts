@@ -7,6 +7,7 @@ import type { AddressInfo } from "node:net";
 import { MbxNode } from "../src/node.ts";
 import { openBody } from "../src/body-encryption.ts";
 import { RelayCore, startRelayServer } from "../src/relay.ts";
+import type { SqliteRelayStore } from "../src/relay-store.ts";
 import { relayDrainOutbox, relayEnrol, relayFor, relayPull } from "../src/relay-client.ts";
 
 const pair = (a: MbxNode, b: MbxNode, addr: string) => {
@@ -76,7 +77,7 @@ test("relayDrainOutbox refuses to push plaintext when the peer published no enc 
   await relayEnrol(a, relay);
   await relayEnrol(b, relay);
   // strip beta's enc advertisement: without it the relay must not carry bodies
-  (core as unknown as { encAds: Map<string, unknown> }).encAds.delete("beta");
+  (core.store as SqliteRelayStore).db.prepare("DELETE FROM enc_ads WHERE host_name='beta'").run();
   a.send({ from: "alice", to: ["bob@beta"], subject: "x", body: "plaintext must not flow" });
   const drained = await relayDrainOutbox(a, relay);
   assert.deepEqual(drained, { pushed: 0, failed: 1 });
@@ -108,8 +109,9 @@ test("a relay cannot substitute a peer's enc key: a client squatting the peer's 
   pair(a, b, "unused");
   assert.equal(await relayEnrol(a, relay), true);
   assert.equal(await relayEnrol(b, relay), true);
-  assert.equal(await relayEnrol(m, relay), true); // the reference relay lets any key enrol any host name
-  assert.equal(core.getEncAd("beta")?.enc_pub, m.encKey.publicKey, "mallory now advertises its own enc key as beta's");
+  // F4 (T165): the relay binds a host name to its first key, so mallory cannot enrol as beta or replace beta's enc ad
+  assert.equal(await relayEnrol(m, relay), false, "a second key for an enrolled host name is refused");
+  assert.equal(core.getEncAd("beta")?.enc_pub, b.encKey.publicKey, "beta's own signed enc ad stays");
   a.send({ from: "alice", to: ["bob@beta"], subject: "x", body: "for beta only" });
   await relayDrainOutbox(a, relay);
   for (const { envelope: e } of core.inspect(b.key.publicKey)) {
@@ -117,7 +119,7 @@ test("a relay cannot substitute a peer's enc key: a client squatting the peer's 
     try { opened = openBody(e.enc!, m.encKey.privateKey, e.id); } catch { /* sealed for someone else */ }
     assert.equal(opened, null, "mail for beta is never sealed to mallory's key");
   }
-  assert.equal(a.store.db.prepare("SELECT COUNT(*) n FROM outbox").get()!.n, 1, "an unverifiable key keeps the mail queued");
+  assert.equal(core.inspect(b.key.publicKey).length, 1, "the mail went to beta, sealed for beta");
 });
 
 test("a relayed enc key signed by the pinned host key is used when the LAN never supplied one (T032)", async (t) => {
