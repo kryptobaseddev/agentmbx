@@ -1,131 +1,422 @@
-// Untrusted store-and-forward relay — reference implementation (ADR-035, T007).
-// The relay holds no private keys and decides nothing: it stores opaque envelopes in per-host queues,
-// authenticates hosts by their existing host signing keys (challenge-signature enrolment), enforces
-// per-owner quotas, and never sees plaintext bodies (wire envelopes carry sealed bodies, T028).
-import { createServer, type Server } from "node:http";
-import { canonical, signData, verifyData, nonce as newNonce } from "./crypto.ts";
+// Untrusted store-and-forward relay — reference implementation (ADR-035, T007; durable since T165).
+// The relay decides nothing about authority: it stores opaque items (sealed envelopes, delivery receipts) in per-host
+// queues, authenticates hosts by their host signing keys, enforces quotas, and never sees plaintext bodies.
+// All state lives in a RelayStore (src/relay-store.ts): every successful answer follows a committed transaction, so a
+// restart loses nothing (docs/spec/relay-durability.md). The relay has its own key, which signs accept receipts (§3).
+// Hosts are identified by key; a host name is a label (unique only inside a proven account, §2).
+import { createHash } from "node:crypto";
+import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
+import { canonical, generateKeyPair, keyPairFromPrivate, signData, verifyData, nonce as newNonce, type KeyPair } from "./crypto.ts";
 import { checkShape, type Envelope } from "./envelope.ts";
+import { checkRotation, type SignedRotation } from "./key-rotation.ts";
+import { ReceiptRecord } from "./remote-receipts.ts";
+import { SqliteRelayStore, type Enrolment, type ItemKind, type RelayStore, type StoredItem } from "./relay-store.ts";
+import { version } from "./version.ts";
 
-export interface RelayQuota { maxQueueDepth: number; maxEnvelopeBytes: number; maxBatch: number;
-  /** ADR-035: quotas are per OWNER, aggregated across that owner's enrolled hosts. */
-  maxOwnerDepth: number; pushesPerMinute: number }
-export const DEFAULT_QUOTA: RelayQuota = { maxQueueDepth: 1000, maxEnvelopeBytes: 256 * 1024 * 2, maxBatch: 200, maxOwnerDepth: 2000, pushesPerMinute: 120 };
+export interface RelayQuota {
+  /** Per target host key: queued items and bytes. */
+  maxQueueDepth: number; maxQueueBytes: number;
+  /** Per sender key per target key, so one sender cannot fill another host's queue. */
+  maxSenderItems: number; maxSenderBytes: number;
+  /** Per proven account (JWKS authority, §8), aggregated across its hosts. Unproven owner_fp claims are never charged. */
+  maxOwnerDepth: number; maxOwnerBytes: number;
+  maxEnvelopeBytes: number; maxBatch: number; pushesPerMinute: number; maxPull: number; maxPullBytes: number; maxTargets: number; retentionDays: number;
+  /** Public-relay hygiene: enrolled keys, open challenges and their lifetime, enrolment calls per client address per minute. */
+  maxEnrolments: number; maxPendingChallenges: number; challengeTtlMs: number; enrolPerMinutePerIp: number;
+  /** Live enrolments sharing one host name beyond which a v1 name lookup or v1 hop check treats the name as ambiguous.
+   *  Never refuses an enrolment (common names could otherwise be pre-squatted); v2 is by key. */
+  maxPerName: number;
+}
+/** Owner decision 2026-10-02: 14 days, 50 MB / 10,000 queued per owner (charged per host key until accounts prove owners). */
+export const DEFAULT_QUOTA: RelayQuota = {
+  maxQueueDepth: 10_000, maxQueueBytes: 50 * 1024 * 1024, maxSenderItems: 2_000, maxSenderBytes: 20 * 1024 * 1024,
+  maxOwnerDepth: 10_000, maxOwnerBytes: 50 * 1024 * 1024, maxEnvelopeBytes: 256 * 1024 * 2, maxBatch: 200, pushesPerMinute: 120,
+  maxPull: 500, maxPullBytes: 8 * 1024 * 1024, maxTargets: 64, retentionDays: 14,
+  maxEnrolments: 100_000, maxPendingChallenges: 10_000, challengeTtlMs: 300_000, enrolPerMinutePerIp: 30, maxPerName: 16,
+};
+/** A target's signed list of the sender keys it accepts (its pinned peers). Once published, only those may push to it. */
+export interface SenderList { v: 1; type: "relay-senders"; host_pubkey: string; senders: string[]; iat: string }
+export const MAX_SENDERS = 1024;
+const IP_TABLE_MAX = 50_000;
 
-interface Enrolment { host: string; pubkey: string; owner_fp: string; at: string }
+export type { Enrolment } from "./relay-store.ts";
+export const HEARTBEAT_MS = 30_000;
+export const HEARTBEAT_STALE_MS = 10 * 60_000;
 interface QueueRow { seq: number; envelope: Envelope; from: string; at: string }
 
+/** A v2 item as a sender submits it: one wire blob per target host key (docs/spec/relay-durability.md §3). A sender
+ *  with several recipients on one host sends one target for that host. */
+export interface PushItem { kind: "envelope" | "receipt"; item_id: string; targets: { host_pubkey: string; wire_b64: string }[] }
+export interface AcceptStatement { v: 1; type: "relay-accept"; relay_pubkey: string; epoch: string; sender_pubkey: string; item_id: string;
+  targets: { host_pubkey: string; seq: number; wire_hash: string }[]; at: string }
+export interface PushResult { item_id: string; status: "accepted" | "duplicate" | `rejected:${string}`; targets: { host_pubkey: string; seq: number }[]; accept?: AcceptStatement; sig?: string }
+
+/** Lowercase hex SHA-256 of the exact wire bytes. */
+export const wireHash = (b: Buffer | string) => createHash("sha256").update(b).digest("hex");
+const err = (code: string, message: string) => Object.assign(new Error(message), { code });
+const HOST_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
+const OWNER_FP_RE = /^[A-Za-z0-9._-]{0,64}$/;
+const B64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+const isPubkey = (k: unknown): k is string => typeof k === "string" && k.length === 44 && B64_RE.test(k) && Buffer.from(k, "base64").length === 32;
+const ITEM_ID_MAX = 300;
+
+/** The relay signing key from MBX_RELAY_KEY or relay.key: a raw base64 private key (what `agentmbx relay keygen` prints)
+ *  or the JSON key pair `relay serve` writes. The pair is always derived from the private key, and a stored public key
+ *  must match it. Errors never echo key material. */
+export function parseRelayKey(text: string): KeyPair {
+  const t = text.trim();
+  if (t.startsWith("{")) {
+    let j: Partial<KeyPair>;
+    try { j = JSON.parse(t) as Partial<KeyPair>; } catch { throw new Error("not a valid relay key file"); }
+    if (typeof j.privateKey !== "string") throw new Error("not a valid relay key file");
+    let pair: KeyPair;
+    try { pair = keyPairFromPrivate(j.privateKey); } catch { throw new Error("not a valid relay key file"); }
+    if (j.publicKey !== undefined && j.publicKey !== pair.publicKey) throw new Error("the stored public key does not match the private key");
+    return pair;
+  }
+  try { return keyPairFromPrivate(t); } catch { throw new Error("not a valid relay key (expected the value agentmbx relay keygen prints)"); }
+}
+
 export class RelayCore {
-  readonly enrolments = new Map<string, Enrolment>(); // pubkey -> enrolment
-  private queues = new Map<string, QueueRow[]>();     // recipient host pubkey -> queue
-  private cursors = new Map<string, number>();
-  private seen = new Set<string>();                   // global id dedupe: exactly-once storage
-  private pending = new Map<string, string>();        // host -> enrolment challenge nonce
-  private pushes = new Map<string, number[]>();       // owner_fp -> push timestamps (rate window)
+  readonly store: RelayStore;
   readonly quota: RelayQuota;
+  readonly key: KeyPair;
+  private pending = new Map<string, { n: string; at: number }>(); // host pubkey -> enrolment challenge (bounded, expiring)
+  private pushes = new Map<string, number[]>();                   // sender pubkey -> push timestamps (rate window)
+  private ipCalls = new Map<string, number[]>();                  // client address -> challenge/enrol timestamps
 
-  constructor(quota: RelayQuota = DEFAULT_QUOTA) { this.quota = quota; }
+  constructor(quota: Partial<RelayQuota> = DEFAULT_QUOTA, o: { store?: RelayStore; key?: KeyPair; heartbeatStaleMs?: number; now?: () => number } = {}) {
+    this.quota = { ...DEFAULT_QUOTA, ...quota }; this.store = o.store ?? new SqliteRelayStore(); this.key = o.key ?? generateKeyPair();
+    const pinned = this.store.meta("relay_pubkey");
+    if (pinned && pinned !== this.key.publicKey) throw err("RELAY_KEY", "this relay store belongs to another relay key: keep relay.key with its store");
+    if (!pinned) this.store.setMeta("relay_pubkey", this.key.publicKey);
+    // A store whose heartbeat is stale may be a restored copy (a volume restore restarts the service): rotate the epoch so
+    // senders re-push and receivers re-pull at once. A long outage rotates too, which dedup makes harmless (spec §5).
+    const now = (o.now ?? Date.now)(), beat = Number(this.store.meta("heartbeat") ?? NaN);
+    if (Number.isFinite(beat) && now - beat > (o.heartbeatStaleMs ?? HEARTBEAT_STALE_MS)) {
+      const from = this.store.epoch(), to = this.store.rotateEpoch();
+      this.store.setMeta("epoch_rotated", JSON.stringify({ from, to, at: new Date(now).toISOString(), reason: "stale heartbeat (restore or long outage)" }));
+    }
+    this.beat(now);
+  }
+  /** The running relay records that it is alive; startRelayServer calls this every HEARTBEAT_MS. */
+  beat(now = Date.now()) { this.store.setMeta("heartbeat", String(now)); }
 
-  /** Aggregate stored rows across every host enrolled under one owner fingerprint. */
-  ownerDepth(ownerFp: string): number {
-    const pubs = new Set([...this.enrolments.values()].filter((e) => e.owner_fp === ownerFp).map((e) => e.pubkey));
-    let depth = 0;
-    for (const [pub, q] of this.queues) if (pubs.has(pub)) depth += q.length;
-    return depth;
+  /** Public relay facts for `relay set` pinning and client feature detection (§1). With a caller, also its queue head. */
+  info(caller?: Enrolment) {
+    const q = this.quota;
+    return { v: 2, relay_pubkey: this.key.publicKey, epoch: this.store.epoch(), version: version(),
+      limits: { max_item_bytes: q.maxEnvelopeBytes, max_batch: q.maxBatch, max_pull: q.maxPull, max_pull_bytes: q.maxPullBytes, max_targets: q.maxTargets,
+        retention_days: q.retentionDays, max_queue_items: q.maxQueueDepth, max_queue_bytes: q.maxQueueBytes, max_sender_items: q.maxSenderItems,
+        max_sender_bytes: q.maxSenderBytes, max_owner_items: q.maxOwnerDepth, max_owner_bytes: q.maxOwnerBytes },
+      ...(caller ? { you: { host: caller.host, pubkey: caller.pubkey, head_seq: this.store.lastSeq(caller.pubkey), acked_through: this.store.ackedThrough(caller.pubkey) } } : {}) };
   }
 
-  private checkRate(ownerFp: string): string | null {
-    const now = Date.now(), window = this.pushes.get(ownerFp) ?? [];
-    const recent = window.filter((t) => now - t < 60_000);
-    if (recent.length >= this.quota.pushesPerMinute) return `push rate exceeded for owner (${this.quota.pushesPerMinute}/min)`;
-    recent.push(now);
-    this.pushes.set(ownerFp, recent);
-    return null;
-  }
+  /** Aggregate stored items across every host of one proven account. */
+  accountDepth(account: string): number { return this.store.accountUsage(account).items; }
 
-  /** Enrolment step 1: the relay issues a single-use challenge for a host key. */
+  private window(map: Map<string, number[]>, key: string, limit: number): boolean {
+    const now = Date.now(), recent = (map.get(key) ?? []).filter((t) => now - t < 60_000);
+    if (recent.length >= limit) { map.set(key, recent); return false; }
+    recent.push(now); map.set(key, recent);
+    if (map.size > IP_TABLE_MAX) {
+      for (const [k, v] of map) if (!v.some((t) => now - t < 60_000)) map.delete(k); // forget idle keys
+      for (const k of map.keys()) { if (map.size <= IP_TABLE_MAX) break; map.delete(k); } // hard cap: spoofed keys cannot grow it
+    }
+    return true;
+  }
+  /** Challenge and enrolment calls per client address (HTTP adapter passes it; in-process callers are trusted). */
+  allowEnrolCall(ip: string | undefined): boolean { return ip === undefined || this.window(this.ipCalls, ip, this.quota.enrolPerMinutePerIp); }
+
+  /** Enrolment step 1: the relay issues a single-use challenge for a host key. Bounded and expiring (a public relay). */
   challenge(host: string, pubkey: string): string {
+    if (!HOST_RE.test(host)) throw err("BAD_REQUEST", "bad host name");
+    if (!isPubkey(pubkey)) throw err("BAD_REQUEST", "bad host key");
+    const now = Date.now();
+    for (const [k, v] of this.pending) if (now - v.at > this.quota.challengeTtlMs) this.pending.delete(k);
+    if (!this.pending.has(pubkey) && this.pending.size >= this.quota.maxPendingChallenges) throw err("BUSY", "too many open enrolment challenges; retry later");
     const n = newNonce();
-    this.pending.set(pubkey, n);
+    this.pending.set(pubkey, { n, at: now });
     return n;
   }
 
-  /** Enrolment step 2: the host signs (challenge, its key, its claimed owner); the relay verifies and binds. */
+  /** Enrolment step 2: the host signs (challenge, its key, its claimed owner); the relay verifies and binds. A revoked key
+   *  stays revoked. owner_fp is recorded but proves nothing (§8: accounts come from the JWKS authority). */
   enrol(host: string, pubkey: string, owner_fp: string, sig: string): void {
-    const n = this.pending.get(pubkey);
-    if (!n) throw new Error("no pending enrolment challenge");
-    if (!verifyData(pubkey, canonical({ v: 1, challenge: n, host, pubkey, owner_fp }), sig)) throw new Error("bad enrolment signature");
+    if (!HOST_RE.test(host) || !isPubkey(pubkey) || typeof owner_fp !== "string" || !OWNER_FP_RE.test(owner_fp)) throw err("BAD_REQUEST", "bad enrolment fields");
+    const p = this.pending.get(pubkey);
+    if (!p || Date.now() - p.at > this.quota.challengeTtlMs) throw new Error("no pending enrolment challenge");
+    if (typeof sig !== "string" || !verifyData(pubkey, canonical({ v: 1, challenge: p.n, host, pubkey, owner_fp }), sig)) throw new Error("bad enrolment signature");
     this.pending.delete(pubkey);
-    this.enrolments.set(pubkey, { host, pubkey, owner_fp, at: new Date().toISOString() });
+    this.store.transaction(() => {
+      const known = this.store.getEnrolment(pubkey);
+      if (!known && this.store.liveEnrolmentCount() >= this.quota.maxEnrolments) throw err("FULL", "relay enrolment capacity reached");
+      this.store.putEnrolment({ host, pubkey, owner_fp, at: new Date().toISOString(), authorized_by: "host-key-challenge" });
+    });
+  }
+
+  /** T030 rotation (§2): the old key's signed rotation record moves its name, account and queue to the new key and
+   *  revokes the old key. Both keys signed the record; the old key must be the enrolled one. */
+  rotate(s: SignedRotation): { moved: number } {
+    const oldPub = s?.rec?.old_pub;
+    const old = typeof oldPub === "string" ? this.store.getEnrolment(oldPub) : null;
+    if (!old || old.revoked_at) throw err("NOT_ENROLLED", "the rotated key is not enrolled here");
+    const bad = checkRotation(s, old.pubkey);
+    if (bad) throw err("BAD_ROTATION", bad);
+    if (s.rec.host !== old.host || !isPubkey(s.rec.new_pub)) throw err("BAD_ROTATION", "rotation names another host");
+    const moved = this.store.rebind(old.pubkey, { ...old, pubkey: s.rec.new_pub, at: new Date().toISOString(), authorized_by: old.authorized_by ?? "host-rotation", revoked_at: null });
+    return { moved };
   }
 
   requireEnrolled(pubkey: string): Enrolment {
-    const e = this.enrolments.get(pubkey);
-    if (!e) throw new Error("host is not enrolled");
+    const e = this.store.getEnrolment(pubkey);
+    if (!e || e.revoked_at) throw new Error("host is not enrolled");
     return e;
+  }
+  /** v1 name routing: a name resolves only when exactly one live enrolment carries it, or exactly one inside the
+   *  caller's proven account. Anything else is ambiguous and routes nowhere: an unproven owner claim or a newer squatter
+   *  never wins (v1 senders drop their row on a 200, so a wrong guess would lose mail silently). */
+  resolveName(host: string, viewer?: Enrolment): { enrolment: Enrolment | null; ambiguous: boolean } {
+    const all = this.store.enrolmentsByName(host);
+    if (all.length > this.quota.maxPerName) return { enrolment: null, ambiguous: true }; // crowded counts as ambiguous
+    if (all.length === 1) return { enrolment: all[0]!, ambiguous: false };
+    const mine = viewer?.account ? all.filter((e) => e.account === viewer.account) : [];
+    if (mine.length === 1) return { enrolment: mine[0]!, ambiguous: false };
+    return { enrolment: null, ambiguous: all.length > 1 };
+  }
+  enrolmentByName(host: string, viewer?: Enrolment): Enrolment | null { return this.resolveName(host, viewer).enrolment; }
+
+  /** A target publishes the sender keys it accepts, signed by its host key; a newer list replaces an older one. */
+  publishSenders(target: Enrolment, list: SenderList, sig: string): void {
+    if (list?.v !== 1 || list.type !== "relay-senders" || list.host_pubkey !== target.pubkey || typeof list.iat !== "string" || !Number.isFinite(Date.parse(list.iat))
+      || !Array.isArray(list.senders) || list.senders.length > MAX_SENDERS || !list.senders.every(isPubkey)) throw err("BAD_REQUEST", "bad sender list");
+    if (Date.parse(list.iat) > Date.now() + 5 * 60_000) throw err("BAD_REQUEST", "sender list iat is in the future");
+    if (typeof sig !== "string" || !verifyData(target.pubkey, canonical(list), sig)) throw err("BAD_SIGNATURE", "sender list is not signed by the target");
+    const cur = this.store.senderList(target.pubkey);
+    if (cur && Date.parse(cur.iat) >= Date.parse(list.iat)) throw err("STALE", "a newer sender list is already stored");
+    this.store.transaction(() => this.store.putSenderList(target.pubkey, [...new Set(list.senders)], list.iat, canonical(list), sig));
+  }
+  private senderAllowed(target: Enrolment, sender: string): boolean {
+    const l = this.store.senderList(target.pubkey);
+    return !l || l.senders.includes(sender);
+  }
+  /** Hop authentication: by key when the caller sends x-mbx-key (v2), else by name, letting the signature pick among
+   *  the enrolments that carry the name (v1). */
+  authenticate(headers: IncomingHttpHeaders, method: string, signedPath: string, body: string): Enrolment | null {
+    const ts = headers["x-mbx-ts"] as string | undefined, sig = headers["x-mbx-sig"] as string | undefined;
+    if (!ts || !sig || !Number.isFinite(Number(ts)) || Math.abs(Date.now() - Number(ts)) > 300_000) return null;
+    const payload = canonical({ method, path: signedPath, ts, body: `${method}:${signedPath}:${ts}:${body}` });
+    const key = headers["x-mbx-key"] as string | undefined, name = headers["x-mbx-host"] as string | undefined;
+    const byName = !key && name ? this.store.enrolmentsByName(name) : [];
+    if (byName.length > this.quota.maxPerName) return null; // a crowded name: v1 callers must upgrade to key headers
+    const candidates = key ? [this.store.getEnrolment(key)].filter((e): e is Enrolment => !!e && !e.revoked_at) : byName;
+    return candidates.find((e) => verifyData(e.pubkey, payload, sig)) ?? null;
   }
 
   /** A host publishes its enc key, signed by its host key; any enrolled host can read it (T028 via relay). The signature
    *  is served too: senders check it against the host key they pinned at pairing, never trusting the relay (T032). */
-  private encAds = new Map<string, { host: string; enc_pub: string; sig: string }>();
   publishEncAd(host: string, pubkey: string, encPub: string, sig: string): void {
     const e = this.requireEnrolled(pubkey);
     if (e.host !== host) throw new Error("host mismatch");
     if (!verifyData(pubkey, canonical({ v: 1, host, enc_pub: encPub }), sig)) throw new Error("bad enc-key signature");
-    this.encAds.set(host, { host, enc_pub: encPub, sig });
+    this.store.transaction(() => this.store.putEncAd({ host, host_pubkey: pubkey, enc_pub: encPub, sig, at: new Date().toISOString() }));
   }
-  getEncAd(host: string): { host: string; enc_pub: string; sig: string } | null { return this.encAds.get(host) ?? null; }
+  getEncAd(host: string, viewer?: Enrolment): { host: string; enc_pub: string; sig: string } | null {
+    const e = this.resolveName(host, viewer).enrolment;
+    return e ? this.getEncAdByKey(e.pubkey) : null;
+  }
+  getEncAdByKey(pubkey: string): { host: string; host_pubkey: string; enc_pub: string; sig: string } | null {
+    const ad = this.store.encAd(pubkey);
+    return ad ? { host: ad.host, host_pubkey: ad.host_pubkey, enc_pub: ad.enc_pub, sig: ad.sig } : null;
+  }
 
-  /** Push envelopes addressed to recipient host keys. Opaque storage; bodies must already be sealed. */
+  private expiry(now: number) { return new Date(now + this.quota.retentionDays * 86_400_000).toISOString(); }
+
+  /** Quota check for adding one item to a target: the target's queue, this sender's share of it, and a proven account. */
+  private quotaError(target: Enrolment, sender: string, bytes: number): string | null {
+    const t = this.store.targetUsage(target.pubkey), s = this.store.senderUsage(sender, target.pubkey);
+    if (t.items + 1 > this.quota.maxQueueDepth) return `queue depth exceeded for ${target.host}`;
+    if (t.bytes + bytes > this.quota.maxQueueBytes) return `queue bytes exceeded for ${target.host}`;
+    if (s.items + 1 > this.quota.maxSenderItems || s.bytes + bytes > this.quota.maxSenderBytes) return `sender share exceeded for ${target.host}`;
+    if (target.account) {
+      const a = this.store.accountUsage(target.account);
+      if (a.items + 1 > this.quota.maxOwnerDepth) return `owner queue depth exceeded for ${target.host}`;
+      if (a.bytes + bytes > this.quota.maxOwnerBytes) return `owner queue bytes exceeded for ${target.host}`;
+    }
+    return null;
+  }
+
+  /** v1 push (kept for one release, §11): envelopes routed by recipient host name, id-only dedup (v1 senders re-seal on
+   *  every retry), now atomic per envelope and durable. */
   push(from: { host: string; pubkey: string }, envelopes: Envelope[]): { stored: number; error?: string } {
-    const enrolment = this.requireEnrolled(from.pubkey);
+    const sender = this.requireEnrolled(from.pubkey);
     if (envelopes.length > this.quota.maxBatch) return { stored: 0, error: `batch over limit ${this.quota.maxBatch}` };
-    const rateError = this.checkRate(enrolment.owner_fp);
-    if (rateError) return { stored: 0, error: rateError };
+    if (!this.window(this.pushes, sender.pubkey, this.quota.pushesPerMinute)) return { stored: 0, error: `push rate exceeded (${this.quota.pushesPerMinute}/min)` };
     let stored = 0;
     for (const e of envelopes) {
       if (checkShape(e)) return { stored, error: `bad envelope: ${checkShape(e)}` };
-      if (Buffer.byteLength(JSON.stringify(e)) > this.quota.maxEnvelopeBytes) return { stored, error: "envelope over size limit" };
-      if (this.seen.has(e.id)) { stored++; continue; } // exactly-once: a relay retry confirms durable storage, never duplicates
-      for (const recipient of e.to) {
-        const hostPart = recipient.split("@")[1];
-        const target = [...this.enrolments.values()].find((en) => en.host === hostPart);
+      const wire = Buffer.from(JSON.stringify(e)), bytes = wire.length;
+      if (bytes > this.quota.maxEnvelopeBytes) return { stored, error: "envelope over size limit" };
+      const names = [...new Set(e.to.map((r) => r.split("@")[1]))];
+      const targets: Enrolment[] = [];
+      for (const hostPart of names) {
+        const r = hostPart ? this.resolveName(hostPart, sender) : { enrolment: null, ambiguous: false };
+        if (r.ambiguous) return { stored, error: `recipient host ambiguous: ${hostPart} (several hosts use that name here; upgrade to address hosts by key)` };
+        const target = r.enrolment;
         if (!target) return { stored, error: `recipient host not enrolled: ${hostPart}` };
-        if (this.ownerDepth(target.owner_fp) >= this.quota.maxOwnerDepth) return { stored, error: `owner queue depth exceeded for ${hostPart}` };
-        const q = this.queues.get(target.pubkey) ?? [];
-        if (q.length >= this.quota.maxQueueDepth) return { stored, error: `queue depth exceeded for ${hostPart}` };
-        const seq = (this.cursors.get(target.pubkey) ?? 0) + 1;
-        this.cursors.set(target.pubkey, seq);
-        q.push({ seq, envelope: e, from: from.host, at: new Date().toISOString() });
-        this.queues.set(target.pubkey, q);
+        if (!this.senderAllowed(target, sender.pubkey)) return { stored, error: `sender not accepted by ${hostPart}` };
+        if (!targets.some((t) => t.pubkey === target.pubkey)) targets.push(target);
       }
-      this.seen.add(e.id);
+      // v1 dedup: an envelope id this sender already stored counts as stored for every target (exactly-once storage)
+      if (targets.every((t) => this.store.dedup(from.pubkey, e.id, t.pubkey))) { stored++; continue; }
+      for (const t of targets) { const q = this.quotaError(t, from.pubkey, bytes); if (q) return { stored, error: q }; }
+      const now = Date.now(), at = new Date(now).toISOString();
+      this.store.transaction(() => {
+        for (const t of targets) if (!this.store.dedup(from.pubkey, e.id, t.pubkey))
+          this.store.insertItem({ target_pubkey: t.pubkey, kind: "envelope", item_id: e.id, sender_pubkey: from.pubkey, sender_host: from.host,
+            wire, wire_hash: wireHash(wire), bytes, accepted_at: at, expires_at: this.expiry(now) });
+      });
       stored++;
     }
     return { stored };
   }
 
-  /** Pull everything after a cursor for an enrolled host. */
+  /** v1 pull: envelopes after a cursor, a bounded page; `cursor` is the last allocated seq, or the last seq read when
+   *  the page is full (the client acks it and pulls again). */
   pull(pubkey: string, after = 0): { items: { seq: number; envelope: Envelope; from: string }[]; cursor: number } {
     this.requireEnrolled(pubkey);
-    const q = this.queues.get(pubkey) ?? [];
-    const items = q.filter((r) => r.seq > after).map(({ seq, envelope, from }) => ({ seq, envelope, from }));
-    return { items, cursor: this.cursors.get(pubkey) ?? 0 };
+    const rows = this.store.pull(pubkey, after, this.quota.maxPull + 1), page = rows.slice(0, this.quota.maxPull);
+    const cursor = rows.length > this.quota.maxPull ? page[page.length - 1]!.seq : this.store.lastSeq(pubkey);
+    return { items: page.filter((r) => r.kind === "envelope").map((r) => ({ seq: r.seq, envelope: JSON.parse(r.wire.toString("utf8")) as Envelope, from: r.sender_host })), cursor };
   }
 
-  /** Ack a cursor: the host got everything up to here; the relay drops it. */
+  /** v1 ack: the host got everything up to here; the relay drops it. */
   ack(pubkey: string, cursor: number): void {
     this.requireEnrolled(pubkey);
-    const q = this.queues.get(pubkey) ?? [];
-    this.queues.set(pubkey, q.filter((r) => r.seq > cursor));
+    this.store.ack(pubkey, Math.min(Math.max(0, Math.floor(cursor) || 0), this.store.lastSeq(pubkey)));
   }
 
-  /** Test/ops introspection: how a relay operator sees stored mail — bodies must be sealed. */
-  inspect(pubkey: string): QueueRow[] { return [...(this.queues.get(pubkey) ?? [])]; }
+  /** v2 push (§3): one transaction per item over all its targets; per-target dedup by (sender, item, target) with the
+   *  wire hash deciding duplicate vs conflict; every accepted or duplicate item gets an accept statement signed by the
+   *  relay key. Nothing is answered before it is committed. */
+  pushItems(from: { host: string; pubkey: string }, items: PushItem[]): PushResult[] {
+    const sender = this.requireEnrolled(from.pubkey);
+    if (!Array.isArray(items) || items.length > this.quota.maxBatch) throw err("BAD_BATCH", `batch must be an array of at most ${this.quota.maxBatch}`);
+    const rateOk = this.window(this.pushes, sender.pubkey, this.quota.pushesPerMinute);
+    return items.map((it): PushResult => {
+      const id = typeof it?.item_id === "string" ? it.item_id : "";
+      const reject = (why: string): PushResult => ({ item_id: id, status: `rejected:${why}`, targets: [] });
+      if (!rateOk) return reject("rate");
+      if (!id || id.length > ITEM_ID_MAX) return reject("bad item id");
+      if (it.kind !== "envelope" && it.kind !== "receipt") return reject("bad kind");
+      if (!Array.isArray(it.targets) || !it.targets.length || it.targets.length > this.quota.maxTargets) return reject("bad targets");
+      const prepared: { target: Enrolment; wire: Buffer; wire_hash: string; bytes: number }[] = [];
+      for (const t of it.targets) {
+        const target = typeof t?.host_pubkey === "string" ? this.store.getEnrolment(t.host_pubkey) : null;
+        if (!target || target.revoked_at) return reject("target not enrolled");
+        if (!this.senderAllowed(target, sender.pubkey)) return reject("sender not accepted by target");
+        if (prepared.some((p) => p.target.pubkey === target.pubkey)) return reject("duplicate target"); // the sender merges a host's recipients
+        if (typeof t.wire_b64 !== "string" || !B64_RE.test(t.wire_b64)) return reject("bad wire");
+        const wire = Buffer.from(t.wire_b64, "base64"), bytes = wire.length;
+        if (bytes > this.quota.maxEnvelopeBytes) return reject("item over size limit");
+        const shapeError = this.checkWire(it.kind, id, wire, sender.pubkey);
+        if (shapeError) return reject(shapeError);
+        prepared.push({ target, wire, wire_hash: wireHash(wire), bytes });
+      }
+      const now = Date.now(), at = new Date(now).toISOString();
+      try {
+        const done = this.store.transaction(() => {
+          const out: { host_pubkey: string; seq: number; wire_hash: string; fresh: boolean }[] = [];
+          for (const p of prepared) {
+            const hit = this.store.dedup(from.pubkey, id, p.target.pubkey);
+            if (hit) {
+              if (hit.wire_hash !== p.wire_hash) throw err("CONFLICT", "conflict");
+              out.push({ host_pubkey: p.target.pubkey, seq: hit.seq, wire_hash: hit.wire_hash, fresh: false });
+              continue;
+            }
+            const q = this.quotaError(p.target, from.pubkey, p.bytes);
+            if (q) throw err("QUOTA", `quota:${q}`);
+            const seq = this.store.insertItem({ target_pubkey: p.target.pubkey, kind: it.kind as ItemKind, item_id: id, sender_pubkey: from.pubkey,
+              sender_host: from.host, wire: p.wire, wire_hash: p.wire_hash, bytes: p.bytes, accepted_at: at, expires_at: this.expiry(now) });
+            out.push({ host_pubkey: p.target.pubkey, seq, wire_hash: p.wire_hash, fresh: true });
+          }
+          return out;
+        });
+        const accept: AcceptStatement = { v: 1, type: "relay-accept", relay_pubkey: this.key.publicKey, epoch: this.store.epoch(), sender_pubkey: from.pubkey,
+          item_id: id, targets: done.map(({ host_pubkey, seq, wire_hash }) => ({ host_pubkey, seq, wire_hash })), at };
+        return { item_id: id, status: done.some((d) => d.fresh) ? "accepted" : "duplicate", targets: done.map(({ host_pubkey, seq }) => ({ host_pubkey, seq })),
+          accept, sig: signData(this.key.privateKey, canonical(accept)) };
+      } catch (e) {
+        const code = (e as { code?: string }).code;
+        if (code === "CONFLICT") return reject("conflict");
+        if (code === "QUOTA") return reject((e as Error).message);
+        throw e;
+      }
+    });
+  }
+
+  /** The relay stores opaque items, but never a plaintext body (ADR-035) and never something that is not what it claims:
+   *  envelopes are sealed and carry the item id; receipts are well-formed T218 records signed by the sending host, whose
+   *  item id is receipt:<msg>:<recipient>:<seq>. */
+  private checkWire(kind: string, id: string, wire: Buffer, senderPub: string): string | null {
+    let v: unknown;
+    try { v = JSON.parse(wire.toString("utf8")); } catch { return "bad wire"; }
+    if (kind === "envelope") {
+      const e = v as Envelope;
+      if (checkShape(e)) return `bad envelope: ${checkShape(e)}`;
+      if (e.id !== id) return "item id is not the envelope id";
+      if (!e.enc) return "envelope body is not sealed";
+      return null;
+    }
+    const r = v as { rec?: unknown; sig?: unknown };
+    const rec = ReceiptRecord.safeParse(r?.rec);
+    if (!rec.success || typeof r.sig !== "string") return "bad receipt";
+    if (id !== `receipt:${rec.data.msg}:${rec.data.recipient}:${rec.data.seq}`) return "item id is not the receipt id";
+    if (!verifyData(senderPub, canonical(rec.data), r.sig)) return "receipt is not signed by the sending host";
+    return null;
+  }
+
+  /** v2 pull (§4): items after `after`, at most `limit` and about maxPullBytes (always at least one); `last_seq` is the
+   *  last seq returned, `head_seq` the last seq allocated. A head below the receiver's checkpoint in the same epoch means
+   *  the store went back in time: the receiver treats it like an epoch change (§5). */
+  pullItems(pubkey: string, after = 0, limit = this.quota.maxPull, epoch?: string) {
+    this.requireEnrolled(pubkey);
+    if (epoch !== undefined && epoch !== this.store.epoch()) throw err("EPOCH", "relay epoch changed: pull again from 0");
+    const from = Math.max(0, Math.floor(after) || 0), n = Math.max(1, Math.min(this.quota.maxPull, Math.floor(limit) || this.quota.maxPull));
+    const rows = this.store.pull(pubkey, from, n + 1);
+    const page: StoredItem[] = [];
+    let bytes = 0;
+    for (const r of rows.slice(0, n)) {
+      if (page.length && bytes + r.bytes > this.quota.maxPullBytes) break;
+      page.push(r); bytes += r.bytes;
+    }
+    return { epoch: this.store.epoch(), head_seq: this.store.lastSeq(pubkey),
+      items: page.map((r) => ({ seq: r.seq, kind: r.kind, item_id: r.item_id, sender_pubkey: r.sender_pubkey, wire_b64: r.wire.toString("base64") })),
+      last_seq: page.length ? page[page.length - 1]!.seq : from, more: rows.length > page.length };
+  }
+
+  /** v2 ack (§4): the host processed everything through `through` in this epoch. Never past what was allocated. */
+  ackItems(pubkey: string, epoch: string, through: number): { acked_through: number; deleted: number; head_seq: number } {
+    this.requireEnrolled(pubkey);
+    if (epoch !== this.store.epoch()) throw err("EPOCH", "relay epoch changed: pull again from 0");
+    const t = Math.floor(through);
+    if (!Number.isSafeInteger(t) || t < 0 || t > this.store.lastSeq(pubkey)) throw err("BAD_ACK", "ack beyond the last allocated seq: treat as an epoch change");
+    const deleted = this.store.ack(pubkey, t);
+    return { acked_through: this.store.ackedThrough(pubkey), deleted, head_seq: this.store.lastSeq(pubkey) };
+  }
+
+  /** Test/ops introspection: how a relay operator sees stored mail — bodies must be sealed. Bounded like a pull. */
+  inspect(pubkey: string, limit = 1000): QueueRow[] {
+    return this.store.pull(pubkey, 0, limit).filter((r) => r.kind === "envelope")
+      .map((r) => ({ seq: r.seq, envelope: JSON.parse(r.wire.toString("utf8")) as Envelope, from: r.sender_host, at: r.accepted_at }));
+  }
 }
 
 // ---- HTTP adapter --------------------------------------------------------------------------------
 /** Bodies stop at RELAY_MAX_BODY while streaming (T029): an oversized upload is refused before it is buffered. */
 export const RELAY_MAX_BODY = 8 * 1024 * 1024;
+/** Enrolment calls are tiny; a pubkey or challenge body larger than this is refused before parsing. */
+const ENROL_MAX_BODY = 8192;
 const readBody = (req: import("node:http").IncomingMessage, max = RELAY_MAX_BODY) => new Promise<string | null>((r, rej) => {
   if (Number(req.headers["content-length"]) > max) return r(null);
   let n = 0; const chunks: Buffer[] = [];
@@ -133,52 +424,96 @@ const readBody = (req: import("node:http").IncomingMessage, max = RELAY_MAX_BODY
   req.on("end", () => r(Buffer.concat(chunks).toString("utf8"))); req.on("error", rej);
 });
 
-/** Hop-style auth for enrolled hosts, reusing the same signed-hop shape as host-to-host HTTP. */
-export const relayHop = (host: string, priv: string, method: string, path: string, body: string, now = Date.now()) => ({
-  "x-mbx-host": host, "x-mbx-ts": String(now), "x-mbx-sig": signData(priv, canonical({ method, path, ts: String(now), body: `${method}:${path}:${now}:${body}` })),
+/** Hop-style auth for enrolled hosts, reusing the same signed-hop shape as host-to-host HTTP (the signature covers the
+ *  method, path, timestamp and the full body). For /v2 the signed `path` includes the query string (§3), so a pull
+ *  cursor cannot be altered in transit; v2 callers also send x-mbx-key so the relay finds them by key, not by name. */
+export const relayHop = (host: string, priv: string, method: string, path: string, body: string, now = Date.now(), pubkey?: string) => ({
+  "x-mbx-host": host, ...(pubkey ? { "x-mbx-key": pubkey } : {}), "x-mbx-ts": String(now),
+  "x-mbx-sig": signData(priv, canonical({ method, path, ts: String(now), body: `${method}:${path}:${now}:${body}` })),
 });
 
-export function startRelayServer(core: RelayCore, port = 0, bind = "127.0.0.1"): Promise<Server> {
-  const byHost = new Map([...core.enrolments.values()].map((e) => [e.host, e]));
+export interface RelayServerOptions {
+  /** How to find the client address behind a proxy: "xff" = the rightmost X-Forwarded-For entry (the one the trusted
+   *  proxy appended; earlier entries are client-controlled), "cloudflare" = CF-Connecting-IP. Default: the socket. */
+  trustProxy?: false | "xff" | "cloudflare";
+}
+export function clientAddress(headers: IncomingHttpHeaders, socketAddr: string | undefined, mode: RelayServerOptions["trustProxy"]): string {
+  if (mode === "cloudflare") { const cf = headers["cf-connecting-ip"]; if (typeof cf === "string" && cf.trim()) return cf.trim().slice(0, 64); }
+  if (mode === "xff") { const parts = String(headers["x-forwarded-for"] ?? "").split(",").map((x) => x.trim()).filter(Boolean); if (parts.length) return parts[parts.length - 1]!.slice(0, 64); }
+  return socketAddr ?? "unknown";
+}
+
+export function startRelayServer(core: RelayCore, port = 0, bind = "127.0.0.1", o: RelayServerOptions = {}): Promise<Server> {
   const server = createServer(async (req, res) => {
     const send = (code: number, obj: unknown) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
     try {
       const url = new URL(req.url ?? "/", "http://x");
-      const body = await readBody(req);
+      const enrolCall = req.method === "POST" && (url.pathname === "/v1/relay/challenge" || url.pathname === "/v1/relay/enrol" || url.pathname === "/v2/relay/rotate");
+      const body = await readBody(req, enrolCall ? ENROL_MAX_BODY : RELAY_MAX_BODY);
       if (body === null) { // answer, then discard (never buffer) the rest for up to 2 s so the client reads the 413, not a reset
-        send(413, { error: `request body over ${RELAY_MAX_BODY} bytes` }); req.resume();
+        send(413, { error: "request body too large" }); req.resume();
         return void setTimeout(() => req.complete || req.destroy(), 2_000).unref();
       }
-      if (req.method === "POST" && url.pathname === "/v1/relay/challenge") {
-        const { host, pubkey } = JSON.parse(body) as { host?: string; pubkey?: string };
-        if (!host || !pubkey) return send(400, { error: "host and pubkey required" });
-        return send(200, { challenge: core.challenge(host, pubkey) });
+      const signedPath = url.pathname.startsWith("/v2/") ? url.pathname + url.search : url.pathname;
+      if (req.method === "GET" && url.pathname === "/v2/relay/info") {
+        const caller = req.headers["x-mbx-sig"] ? core.authenticate(req.headers, "GET", signedPath, body) : null;
+        return send(200, core.info(caller ?? undefined));
       }
-      if (req.method === "POST" && url.pathname === "/v1/relay/enrol") {
+      if (enrolCall) {
+        if (!core.allowEnrolCall(clientAddress(req.headers, req.socket.remoteAddress, o.trustProxy))) return send(429, { error: "too many enrolment calls; retry in a minute" });
+        if (url.pathname === "/v2/relay/rotate") { // self-authenticating: both keys signed the record (a rotated host signs hops with its new key)
+          const { rotation } = JSON.parse(body) as { rotation?: SignedRotation };
+          try { return send(200, core.rotate(rotation as SignedRotation)); }
+          catch (e) { const c = (e as { code?: string }).code; return send(c === "NOT_ENROLLED" ? 404 : c === "ROTATION_TARGET" ? 409 : 400, { error: (e as Error).message }); }
+        }
         const j = JSON.parse(body) as { host?: string; pubkey?: string; owner_fp?: string; sig?: string };
+        if (url.pathname === "/v1/relay/challenge") {
+          if (!j.host || !j.pubkey) return send(400, { error: "host and pubkey required" });
+          try { return send(200, { challenge: core.challenge(j.host, j.pubkey) }); }
+          catch (e) { const c = (e as { code?: string }).code; return send(c === "BUSY" ? 503 : 400, { error: (e as Error).message }); }
+        }
         if (!j.host || !j.pubkey || j.owner_fp === undefined || !j.sig) return send(400, { error: "incomplete enrolment" });
-        try { core.enrol(j.host, j.pubkey, j.owner_fp, j.sig); byHost.set(j.host, core.enrolments.get(j.pubkey)!); return send(200, { ok: true }); }
-        catch (e) { return send(401, { error: (e as Error).message }); }
+        try { core.enrol(j.host, j.pubkey, j.owner_fp, j.sig); return send(200, { ok: true }); }
+        catch (e) {
+          const c = (e as { code?: string }).code;
+          return send(c === "REVOKED" ? 403 : c === "NAME_TAKEN" ? 409 : c === "FULL" ? 503 : c === "BAD_REQUEST" ? 400 : 401, { error: (e as Error).message });
+        }
       }
       // below here requires an enrolled, hop-authenticated host
-      const h = req.headers["x-mbx-host"] as string | undefined, ts = req.headers["x-mbx-ts"] as string | undefined, sig = req.headers["x-mbx-sig"] as string | undefined;
-      const enrol = h ? byHost.get(h) : undefined;
-      if (!enrol || !ts || !sig || Math.abs(Date.now() - Number(ts)) > 300_000
-        || !verifyData(enrol.pubkey, canonical({ method: req.method ?? "GET", path: url.pathname, ts, body: `${req.method}:${url.pathname}:${ts}:${body}` }), sig)) return send(401, { error: "bad relay hop" });
+      const enrol = core.authenticate(req.headers, req.method ?? "GET", signedPath, body);
+      if (!enrol) return send(401, { error: "bad relay hop" });
+      const me = { host: enrol.host, pubkey: enrol.pubkey };
       if (req.method === "POST" && url.pathname === "/v1/relay/messages") {
         const { envelopes } = JSON.parse(body) as { envelopes?: unknown[] };
         if (!Array.isArray(envelopes)) return send(400, { error: "bad batch" });
-        const r = core.push({ host: enrol.host, pubkey: enrol.pubkey }, envelopes as Envelope[]);
+        const r = core.push(me, envelopes as Envelope[]);
         return send(r.error && r.stored === 0 ? 413 : 200, r);
       }
-      if (req.method === "GET" && url.pathname === "/v1/relay/messages") {
-        const after = Number(url.searchParams.get("after") ?? 0);
-        return send(200, core.pull(enrol.pubkey, after));
-      }
+      if (req.method === "GET" && url.pathname === "/v1/relay/messages") return send(200, core.pull(enrol.pubkey, Number(url.searchParams.get("after") ?? 0)));
       if (req.method === "POST" && url.pathname === "/v1/relay/ack") {
         const { cursor } = JSON.parse(body) as { cursor?: number };
         core.ack(enrol.pubkey, Number(cursor ?? 0));
         return send(200, { ok: true });
+      }
+      if (req.method === "POST" && url.pathname === "/v2/relay/items") {
+        const { items } = JSON.parse(body) as { items?: PushItem[] };
+        try { return send(200, { results: core.pushItems(me, items as PushItem[]) }); }
+        catch (e) { return send((e as { code?: string }).code === "BAD_BATCH" ? 400 : 500, { error: (e as Error).message }); }
+      }
+      if (req.method === "GET" && url.pathname === "/v2/relay/items") {
+        const epoch = url.searchParams.get("epoch") ?? undefined;
+        try { return send(200, core.pullItems(enrol.pubkey, Number(url.searchParams.get("after") ?? 0), Number(url.searchParams.get("limit") ?? core.quota.maxPull), epoch)); }
+        catch (e) { return send((e as { code?: string }).code === "EPOCH" ? 409 : 400, { error: (e as Error).message, epoch: core.store.epoch() }); }
+      }
+      if (req.method === "POST" && url.pathname === "/v2/relay/ack") {
+        const { epoch, through } = JSON.parse(body) as { epoch?: string; through?: number };
+        try { return send(200, core.ackItems(enrol.pubkey, String(epoch ?? ""), Number(through))); }
+        catch (e) { const c = (e as { code?: string }).code; return send(c === "EPOCH" ? 409 : 400, { error: (e as Error).message, code: c, epoch: core.store.epoch(), head_seq: core.store.lastSeq(enrol.pubkey) }); }
+      }
+      if (req.method === "POST" && url.pathname === "/v2/relay/senders") {
+        const { list, sig } = JSON.parse(body) as { list?: SenderList; sig?: string };
+        try { core.publishSenders(enrol, list as SenderList, String(sig ?? "")); return send(200, { ok: true }); }
+        catch (e) { const c = (e as { code?: string }).code; return send(c === "STALE" ? 409 : c === "BAD_SIGNATURE" ? 401 : 400, { error: (e as Error).message }); }
       }
       if (req.method === "POST" && url.pathname === "/v1/relay/enc-key") {
         const j = JSON.parse(body) as { enc_pub?: string; sig?: string };
@@ -186,14 +521,16 @@ export function startRelayServer(core: RelayCore, port = 0, bind = "127.0.0.1"):
         try { core.publishEncAd(enrol.host, enrol.pubkey, j.enc_pub, j.sig); return send(200, { ok: true }); }
         catch (e) { return send(401, { error: (e as Error).message }); }
       }
-      if (req.method === "GET" && url.pathname === "/v1/relay/enc-key") {
-        const host = url.searchParams.get("host");
-        const ad = host ? core.getEncAd(host) : null;
+      if (req.method === "GET" && (url.pathname === "/v1/relay/enc-key" || url.pathname === "/v2/relay/enc-key")) {
+        const pubkey = url.searchParams.get("pubkey"), host = url.searchParams.get("host");
+        const ad = pubkey ? core.getEncAdByKey(pubkey) : host ? core.getEncAd(host, enrol) : null;
         return ad ? send(200, ad) : send(404, { error: "unknown host" });
       }
       return send(404, { error: "not found" });
     } catch (e) { return send(400, { error: (e as Error).message }); }
   });
   Object.assign(server, { headersTimeout: 10_000, requestTimeout: 30_000, keepAliveTimeout: 5_000 }); // slow clients cannot hold sockets open
+  const beat = setInterval(() => { try { core.beat(); } catch { /* store closed */ } }, HEARTBEAT_MS);
+  beat.unref(); server.on("close", () => clearInterval(beat));
   return new Promise((resolve, reject) => { server.once("error", reject); server.listen(port, bind, () => resolve(server)); });
 }

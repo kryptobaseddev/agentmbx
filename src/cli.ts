@@ -1,15 +1,17 @@
 // mbx command line. Humans, hooks and scripts use this; agents use the MCP tools (mbx mcp).
-import { existsSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { constants as osConstants, homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { execFileSync, spawn } from "node:child_process";
-import { canonical, fingerprint, ulid } from "./crypto.ts";
+import { canonical, fingerprint, generateKeyPair, ulid, type KeyPair } from "./crypto.ts";
 import { buildGrant, CAPS, grantPayload, NAME_RE, type Envelope, type Grant } from "./envelope.ts";
 import { advertise, browse, lanIPv4 } from "./discovery.ts";
 import { announceRotations, flushOutbox, flushReceipts, addrSignature, healPeerAddr, healStuckPeers, notifyUnpair, sendPresence, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.ts";
 import { relayDrainOutbox, relayFor, relayPull } from "./relay-client.ts";
-import { RelayCore, startRelayServer } from "./relay.ts";
+import { relayPushOutbox, relayPushReceipts, relayReceive, relayRoute, relaySettle } from "./relay-v2.ts";
+import { DEFAULT_QUOTA, parseRelayKey, RelayCore, startRelayServer } from "./relay.ts";
+import { SqliteRelayStore } from "./relay-store.ts";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.ts";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.ts";
 import { ancestors, withProcSnapshot } from "./proc.ts";
@@ -208,7 +210,7 @@ async function run(argv: string[]) {
     cursor: { type: "string" }, "max-bytes": { type: "string" }, "scan-limit": { type: "string" }, "project-host": { type: "string" }, topic: { type: "string" },
     compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" },
     backend: { type: "string" }, "no-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
-    project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }, "wait-ms": { type: "string" },
+    project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }, "wait-ms": { type: "string" }, "store-dir": { type: "string" }, "trust-proxy": { type: "boolean" },
     "older-than": { type: "string" }, minutes: { type: "string" }, apply: { type: "boolean" }, days: { type: "string" }, fix: { type: "boolean" } } });
   if (o.help) return console.log(commandHelp(cmd));
   const str = (k: string) => (typeof (o as Record<string, unknown>)[k] === "string" ? (o as Record<string, unknown>)[k] as string : undefined);
@@ -589,11 +591,44 @@ If the codes differ, do not approve: someone is in the middle.`);
         console.log("the daemon reads it on start: agentmbx daemon install, or launchctl kickstart -k gui/$(id -u)/com.agentmbx.daemon");
         return;
       }
-      if (sub !== undefined && sub !== "serve") die("relay [serve [--port N]] | relay set <url> | relay unset");
-      const port = Number(str("port") ?? 7374);
-      const core = new RelayCore();
-      const server = await startRelayServer(core, port, str("bind") ?? "0.0.0.0");
-      console.log(`[agentmbx] untrusted store-and-forward relay listening on :${port} (ADR-035 reference; holds no keys, decides nothing)`);
+      if (sub === "quarantine") { // T166: relay items this host could not accept (kept, never dropped silently)
+        const rows = node.store.db.prepare("SELECT relay, epoch, seq, kind, item_id, reason, at FROM relay_quarantine ORDER BY at DESC LIMIT 200").all() as Record<string, unknown>[];
+        if (o.json) return console.log(JSON.stringify(rows, null, 2));
+        if (!rows.length) return console.log("relay quarantine is empty");
+        for (const r of rows) console.log(`${r.at}  ${r.kind} ${r.item_id}  seq ${r.seq} (${r.relay})  ${r.reason}`);
+        return;
+      }
+      if (sub === "keygen") {
+        const k = generateKeyPair();
+        console.log(`MBX_RELAY_KEY=${k.privateKey}`);
+        console.error(`[agentmbx] relay key fingerprint ${fingerprint(k.publicKey)}: store the value as a secret, record the fingerprint for clients`);
+        return;
+      }
+      const dir = str("store-dir") ?? process.env.MBX_RELAY_DIR ?? join(homedir(), ".local/share/agentmbx-relay");
+      if (sub === "rotate-epoch") {
+        // after any restore not made by agentmbx (volume snapshot, file copy): receivers re-pull from 0 and senders re-push (spec §5)
+        const store = new SqliteRelayStore(join(dir, "relay.db"));
+        try { console.log(`relay epoch ${store.epoch()} -> ${store.rotateEpoch()}`); } finally { store.close(); }
+        return;
+      }
+      if (sub !== undefined && sub !== "serve") die("relay [serve [--port N] [--store-dir DIR] [--trust-proxy]] | relay keygen | relay rotate-epoch [--store-dir DIR] | relay quarantine [--json] | relay set <url> | relay unset");
+      // T165: durable store and a persistent relay key in one directory (a Railway volume in production: MBX_RELAY_DIR=/data)
+      const port = Number(str("port") ?? process.env.PORT ?? 7374);
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      // MBX_RELAY_KEY (a deploy secret: the base64 private key `agentmbx relay keygen` prints) wins over relay.key on the volume
+      const keyPath = join(dir, "relay.key");
+      const envKey = process.env.MBX_RELAY_KEY?.trim();
+      delete process.env.MBX_RELAY_KEY; // read once; never inherited by anything this process starts
+      if (!envKey && !existsSync(keyPath)) writeFileSync(keyPath, JSON.stringify(generateKeyPair()) + "\n", { mode: 0o600 });
+      const relayKey = ((): KeyPair => {
+        try { return parseRelayKey(envKey ?? readFileSync(keyPath, "utf8")); }
+        catch (e) { return die(`relay key ${envKey ? "MBX_RELAY_KEY" : keyPath}: ${(e as Error).message}`); }
+      })();
+      const core = new RelayCore(DEFAULT_QUOTA, { store: new SqliteRelayStore(join(dir, "relay.db")), key: relayKey });
+      const envProxy = process.env.MBX_RELAY_TRUST_PROXY, trustProxy = envProxy === "cloudflare" ? "cloudflare" as const : o["trust-proxy"] === true || envProxy === "xff" || envProxy === "1" ? "xff" as const : false;
+      const server = await startRelayServer(core, port, str("bind") ?? "0.0.0.0", { trustProxy });
+      console.log(`[agentmbx] untrusted store-and-forward relay listening on :${port} (ADR-035; durable store ${join(dir, "relay.db")}, epoch ${core.store.epoch()})`);
+      console.log(`[agentmbx] relay key ${fingerprint(relayKey.publicKey)} (${envKey ? "from MBX_RELAY_KEY" : "keep relay.key with its store"}; record this fingerprint for clients)`);
       return new Promise(() => void server);
     }
     case "daemon": {
@@ -604,9 +639,16 @@ If the codes differ, do not approve: someone is in the middle.`);
         if (busy) return; busy = true;
         try {
           if (node.reloadKeys()) process.stderr.write("[mbx] host keys rotated; using the new keys\n");
-          await announceRotations(node); await flushOutbox(node); await flushReceipts(node); await dispatchWakes(node); await opencodePermissionPass(node, yoloLookup(node), opencodeService);
+          await announceRotations(node);
+          // T166: a v2 relay takes rows the LAN failed twice before the LAN pass (one shared backoff); receive and settle after
           const relay = relayFor(node);
-          if (relay) { await relayDrainOutbox(node, relay); await relayPull(node, relay); }
+          const route = relay ? await relayRoute(node, relay).catch((e) => ({ mode: "skip" as const, why: (e as Error).message })) : null;
+          const v2 = route?.mode === "v2" ? route.session : null;
+          if (v2) { await relayPushOutbox(node, v2); await relayPushReceipts(node, v2); }
+          await flushOutbox(node); await flushReceipts(node); await dispatchWakes(node); await opencodePermissionPass(node, yoloLookup(node), opencodeService);
+          if (v2) await relayReceive(node, v2);
+          else if (relay && route?.mode === "v1") { await relayDrainOutbox(node, relay); await relayPull(node, relay); } // a relay that only speaks v1
+          relaySettle(node); // the sender-side deadline runs whatever the relay's state
         } catch (e) { process.stderr.write(`[mbx] ${(e as Error).message}\n`); } finally { busy = false; }
       };
       await startServer(node, node.config.port, node.config.bind, () => void tick());

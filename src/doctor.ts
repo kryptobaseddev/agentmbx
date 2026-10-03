@@ -1,4 +1,5 @@
 // `agentmbx doctor`: one checklist that says what works, what doesn't, and the one command that fixes it.
+import { rotationLog } from "./key-rotation.ts";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { phantomMailboxes, returnDays } from "./stranded.ts";
 import { join } from "node:path";
@@ -235,9 +236,24 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     for (const p of peers.filter((x) => x.state === "pending")) add("warn", `pairing with ${p.host} pending (code ${p.code})`, `if ${p.host} shows the same code: agentmbx pair approve ${p.host} ${p.code}`);
     const relay = process.env.MBX_RELAY_URL ?? (node.config as { relay?: string }).relay ?? null;
     if (relay) {
-      const enrolled = node.store.get(`relay-enrolled:${relay}`);
+      // G13: the client keys its enrolment by host key (v1) or by host key, relay key and epoch (v2, T166)
+      const db = node.store.db, hostPub = node.key.publicKey;
+      const enrolled = node.store.get(`relay-enrolled:${relay}:${hostPub}`)
+        ?? (db.prepare("SELECT v FROM kv WHERE k LIKE ? LIMIT 1").get(`relay-enrolled-v2:${relay}:${hostPub}:%`) as { v: string } | undefined)?.v;
       add(enrolled ? "ok" : "warn", `relay configured: ${relay}${enrolled ? " (enrolled)" : " (not yet enrolled — the daemon enrols on its next pass)"}`,
         enrolled ? undefined : `check the relay is running: agentmbx relay serve --port …`);
+      const n = (sql: string, ...a: string[]) => Number((db.prepare(sql).get(...a) as { c: number }).c);
+      const changed = db.prepare("SELECT detail FROM audit WHERE event='relay.key_changed' ORDER BY at DESC LIMIT 1").get() as { detail: string } | undefined;
+      if (changed && node.store.get(`relay-key:${relay}`)) add("fail", `relay ${relay} now serves a different key than the one pinned: relay use is stopped (${changed.detail})`, "confirm the relay operator rotated it, then: agentmbx relay set <url> --key <fingerprint>");
+      const waiting = n("SELECT COUNT(*) c FROM relay_sent WHERE relay=? AND state='relay-accepted'", relay);
+      if (waiting) add("info", `${waiting} message(s) accepted by the relay, waiting for the recipient host's delivery receipt`);
+      const unconfirmed = n("SELECT COUNT(*) c FROM relay_sent WHERE relay=? AND state='unconfirmed'", relay);
+      if (unconfirmed) add("warn", `${unconfirmed} relay delivery(ies) never confirmed by the recipient host (their senders were alerted)`);
+      const rotFail = db.prepare("SELECT at, detail FROM audit WHERE event='relay.rotate_failed' ORDER BY at DESC LIMIT 1").get() as { at: string; detail: string } | undefined;
+      const rotDone = Number(node.store.get(`relay-rotations:${relay}`) ?? 0);
+      if (rotFail && rotDone < rotationLog(node.home).records.length) add("warn", `the relay has not taken this host's key rotation yet (last try ${rotFail.at}: ${rotFail.detail})`, "the daemon retries every pass; check the relay is reachable and runs a v2 relay");
+      const quarantined = n("SELECT COUNT(*) c FROM relay_quarantine WHERE relay=?", relay);
+      if (quarantined) add("warn", `${quarantined} relay item(s) this host could not accept are in quarantine`, "agentmbx relay quarantine");
     }
     node.close();
   }

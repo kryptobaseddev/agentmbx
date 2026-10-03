@@ -116,20 +116,19 @@ test("enrolment requires the host-key challenge signature (no anonymous registra
   void verifyData;
 });
 
-test("quotas are per OWNER across their hosts, and push rate is bounded per owner", () => {
-  const core = new RelayCore({ ...DEFAULT_QUOTA, maxQueueDepth: 100, maxOwnerDepth: 2, pushesPerMinute: 100 }), k = hosts();
+test("v1 quotas: a target's queue is bounded, an unproven owner claim is never charged, push rate is per sender key", () => {
+  const core = new RelayCore({ ...DEFAULT_QUOTA, maxQueueDepth: 2, maxOwnerDepth: 1, pushesPerMinute: 100 }), k = hosts();
   enrol(core, "alpha", k.alpha, "owner-1"); enrol(core, "beta", k.beta, "owner-2");
-  enrol(core, "gamma", generateKeyPair(), "owner-2"); // second host under owner-2
+  enrol(core, "gamma", generateKeyPair(), "owner-2"); // second host claiming owner-2: the claim is unproven, so not aggregated
   const mk = (n: number, to = "bob@beta") => {
     const d = buildEnvelope({ from: "alice@alpha", to: [to], subject: "s", body: `m${n}` });
     return signEnvelope(d, "alpha", k.alpha.publicKey, k.alpha.privateKey);
   };
   assert.deepEqual(core.push({ host: "alpha", pubkey: k.alpha.publicKey }, [mk(1), mk(2)]), { stored: 2 });
-  // owner-2 depth is now 2 across beta; a third envelope to a NEW owner-2 host is refused by the owner limit
-  const third = core.push({ host: "alpha", pubkey: k.alpha.publicKey }, [mk(3, "carol@gamma")]);
+  assert.deepEqual(core.push({ host: "alpha", pubkey: k.alpha.publicKey }, [mk(3, "carol@gamma")]), { stored: 1 }, "maxOwnerDepth applies only to proven accounts");
+  const third = core.push({ host: "alpha", pubkey: k.alpha.publicKey }, [mk(4)]);
   assert.equal(third.stored, 0);
-  assert.match(third.error ?? "", /owner queue depth exceeded/);
-  assert.equal(core.ownerDepth("owner-2"), 2);
+  assert.match(third.error ?? "", /queue depth exceeded for beta/);
 
   const rate = new RelayCore({ ...DEFAULT_QUOTA, pushesPerMinute: 2 }), r = hosts();
   enrol(rate, "alpha", r.alpha, "o"); enrol(rate, "beta", r.beta, "o");

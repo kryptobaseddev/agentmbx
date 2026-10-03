@@ -7,6 +7,7 @@ import type { AddressInfo } from "node:net";
 import { MbxNode } from "../src/node.ts";
 import { openBody } from "../src/body-encryption.ts";
 import { RelayCore, startRelayServer } from "../src/relay.ts";
+import type { SqliteRelayStore } from "../src/relay-store.ts";
 import { relayDrainOutbox, relayEnrol, relayFor, relayPull } from "../src/relay-client.ts";
 
 const pair = (a: MbxNode, b: MbxNode, addr: string) => {
@@ -76,7 +77,7 @@ test("relayDrainOutbox refuses to push plaintext when the peer published no enc 
   await relayEnrol(a, relay);
   await relayEnrol(b, relay);
   // strip beta's enc advertisement: without it the relay must not carry bodies
-  (core as unknown as { encAds: Map<string, unknown> }).encAds.delete("beta");
+  (core.store as SqliteRelayStore).db.prepare("DELETE FROM enc_ads WHERE host_name='beta'").run();
   a.send({ from: "alice", to: ["bob@beta"], subject: "x", body: "plaintext must not flow" });
   const drained = await relayDrainOutbox(a, relay);
   assert.deepEqual(drained, { pushed: 0, failed: 1 });
@@ -108,11 +109,14 @@ test("a relay cannot substitute a peer's enc key: a client squatting the peer's 
   pair(a, b, "unused");
   assert.equal(await relayEnrol(a, relay), true);
   assert.equal(await relayEnrol(b, relay), true);
-  assert.equal(await relayEnrol(m, relay), true); // the reference relay lets any key enrol any host name
-  assert.equal(core.getEncAd("beta")?.enc_pub, m.encKey.publicKey, "mallory now advertises its own enc key as beta's");
+  assert.equal(await relayEnrol(m, relay), true, "names are labels: another key may enrol the name beta (several owners have one)");
+  assert.equal(core.getEncAd("beta"), null, "two hosts named beta: a name lookup is ambiguous and answers nothing");
+  // and a relay that lies outright: beta's own enc ad row now carries mallory's key (a compromised store)
+  (core.store as SqliteRelayStore).db.prepare("UPDATE enc_ads SET enc_pub=? WHERE host_pubkey=?").run(m.encKey.publicKey, b.key.publicKey);
+  assert.equal(core.getEncAdByKey(b.key.publicKey)?.enc_pub, m.encKey.publicKey);
   a.send({ from: "alice", to: ["bob@beta"], subject: "x", body: "for beta only" });
   await relayDrainOutbox(a, relay);
-  for (const { envelope: e } of core.inspect(b.key.publicKey)) {
+  for (const pub of [b.key.publicKey, m.key.publicKey]) for (const { envelope: e } of core.inspect(pub)) {
     let opened: string | null = null;
     try { opened = openBody(e.enc!, m.encKey.privateKey, e.id); } catch { /* sealed for someone else */ }
     assert.equal(opened, null, "mail for beta is never sealed to mallory's key");
