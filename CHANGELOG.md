@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **Status surface (T312/T313):** `agentmbx statusline <claude|codex|kimi|opencode|grok>` renders one MBX segment from HUD snapshots the daemon writes every tick — one `cat`, no store access by the adapter; pid snapshots only when the identity resolver proves a single holder, keyed by process birth time; nothing renders when the daemon is down (a `hud/.alive` heartbeat) or the identity is ambiguous. Output format: `mbx <name> [<n>↑ unread] [<n>↺ needs-reply] [owner:<n>] [<n> unsent] [*v<version> update]`. The bundled `skill/scripts/claude-statusline.sh` is now a thin exec of the adapter; it no longer reads the store.
+- **Status surface (T312/T313):** `agentmbx statusline <claude|codex|kimi|opencode|grok>` renders one MBX segment from HUD snapshots the daemon writes every tick — one `cat`, no store access by the adapter; pid snapshots only when the identity resolver proves a single holder, keyed by process birth time; nothing renders when the daemon is down (a `hud/.alive` heartbeat) or the identity is ambiguous. Output format: `mbx <name> [<n>↑ unread] [<n>↺ needs-reply] [owner:<n>] [<n> unsent] [*v<version> update]`. The bundled `skill/scripts/claude-statusline.sh` is now pure sh — sed, date, one cat of the pre-rendered line, no node startup on the render path (a node startup is 150 ms idle and breaks Kimi's 300 ms statusline cap under load); it honors `MBX_HOME`. The pid-file fallback fires only for Claude, the only one-conversation-per-process CLI: a shared-process CLI (Kimi, OpenCode) that names no session id renders nothing, since its pid file cannot know whether an unbound sibling conversation exists.
 
 
 ## 0.5.5 (2026-10-02)

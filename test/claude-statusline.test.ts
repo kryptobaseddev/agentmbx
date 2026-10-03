@@ -14,7 +14,9 @@ test("Claude HUD follows the session identity and excludes another sender's outg
   if (spawnSync("bash", ["--version"]).error) { t.skip("bash unavailable"); return; }
   const home = mkdtempSync(join(tmpdir(), "mbx-hud-")), node = new MbxNode(home, { host: "alpha" });
   t.after(() => { node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
-  node.store.db.prepare("INSERT INTO sessions(agent,cli,session_id,updated_at) VALUES ('renamed','claude','hud-session',?)").run(new Date().toISOString());
+  // every production binder records the provider pid (hooks pass process.ppid, the MCP server env.ppid);
+  // the HUD refuses rows with no pid, so this fixture must carry one
+  node.store.db.prepare("INSERT INTO sessions(agent,cli,session_id,pid,updated_at) VALUES ('renamed','claude','hud-session',?,?)").run(process.pid, new Date().toISOString());
   new IdentityLeases(node.store).claim("renamed", { pid: process.pid, start: inspectLeaseProcess(process.pid).start!, keyFp: "aaaa-bbbb-cccc-dddd", cli: "claude", sessionId: "hud-session" });
   const other = node.send({ from: "other", to: ["renamed"], subject: "incoming", body: "data" }).envelope.id;
   const own = node.send({ from: "renamed", to: ["other"], subject: "outgoing", body: "data" }).envelope.id;

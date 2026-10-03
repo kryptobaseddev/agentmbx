@@ -55,9 +55,9 @@ test("a bound session gets a ${cli}-${sid} snapshot (0600, 0700 dir), identical 
 test("critical: a pid shared by several sessions gets NO pid file — an unknown session id renders nothing", (t) => {
   const h = home(), n = new MbxNode(h, { host: "alpha" });
   t.after(() => { n.close(); rmSync(h, { recursive: true, force: true }); });
-  // two opencode sessions under one pid (the owner's probe): the resolver is ambiguous on the pid
-  n.bindSession({ agent: "one", cli: "opencode", session_id: "oc-1", pid: 4242, session_key: "k1" });
-  n.bindSession({ agent: "other", cli: "opencode", session_id: "oc-2", pid: 4242, session_key: "k2" });
+  // two opencode sessions under one live pid (the owner's probe): the resolver is ambiguous on the pid
+  n.bindSession({ agent: "one", cli: "opencode", session_id: "oc-1", pid: process.pid, session_key: "k1" });
+  n.bindSession({ agent: "other", cli: "opencode", session_id: "oc-2", pid: process.pid, session_key: "k2" });
   claim(n, "one", "oc-1"); claim(n, "other", "oc-2");
   writeHud(n);
   assert.ok(existsSync(hudSessionPath(h, "opencode", "oc-1")), "each session keeps its own namespaced file");
@@ -71,6 +71,44 @@ test("critical: a pid shared by several sessions gets NO pid file — an unknown
   const known = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "statusline", "opencode"],
     { input: JSON.stringify({ session_id: "oc-2" }), encoding: "utf8", env });
   assert.match(known.stdout, /^mbx other/);
+});
+
+test("round 3: a shared-process CLI that names no session id renders nothing (pid fallback is claude-only)", (t) => {
+  const h = home(), n = new MbxNode(h, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(h, { recursive: true, force: true }); });
+  n.bindSession({ agent: "one", cli: "opencode", session_id: "oc-1", pid: process.pid, session_key: "k1" });
+  n.bindSession({ agent: "other", cli: "opencode", session_id: "oc-2", pid: process.pid, session_key: "k2" });
+  claim(n, "other", "oc-2");
+  writeHud(n);
+  const env = { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: h, MBX_NO_DESKTOP: "1" } as Record<string, string>;
+  // stdin names no session id at all: the pid file exists for this pid, but only Claude may read it —
+  // for a shared-process CLI an unbound sibling could exist, and the pid file cannot know.
+  const none = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "statusline", "opencode"],
+    { input: "{}", encoding: "utf8", env });
+  assert.equal(none.stdout, "", "no sid from a shared-process CLI: never the pid fallback");
+  const kimi = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "statusline", "kimi"],
+    { input: "{}", encoding: "utf8", env });
+  assert.equal(kimi.stdout, "", "kimi is also multi-conversation per process: no pid fallback either");
+});
+
+test("round 3: rows a pass proves dead (and rows with no pid) render nothing and prune on the next tick", (t) => {
+  const h = home(), n = new MbxNode(h, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(h, { recursive: true, force: true }); });
+  n.bindSession({ agent: "ghost", cli: "kimi", session_id: "ghost-1", pid: 424242, session_key: "k" });
+  claim(n, "ghost", "ghost-1");
+  n.send({ from: "boss", to: ["ghost"], subject: "hey", body: "b" });
+  writeHud(n); // 424242 does not exist: the pass proves the row dead before any file is written
+  assert.ok(!existsSync(hudSessionPath(h, "kimi", "ghost-1")), "a dead-pid row gets no session file");
+  assert.equal(readdirSync(hudDir(h)).filter(f => f.endsWith(".line")).length, 0, "no line file either");
+  // a row with no pid at all can never be proven live (no production binder omits a pid)
+  n.store.db.prepare("INSERT INTO sessions (agent,cli,session_id,updated_at) VALUES ('legacy','kimi','legacy-1',?)")
+    .run(new Date().toISOString());
+  writeHud(n);
+  assert.ok(!existsSync(hudSessionPath(h, "kimi", "legacy-1")), "a no-pid row never renders");
+  // the binding outlives the process (row lingers until the reaper): a live rebind brings the file back
+  n.bindSession({ agent: "ghost", cli: "kimi", session_id: "ghost-1", pid: process.pid, session_key: "k" });
+  writeHud(n);
+  assert.ok(existsSync(hudSessionPath(h, "kimi", "ghost-1")), "a live row renders again");
 });
 
 test("a real release removes the binding and the snapshot on the next tick; a stale .alive refuses renders", (t) => {
@@ -110,7 +148,29 @@ test("the writer validates ids and isolates bad rows", (t) => {
   assert.ok(!existsSync(outside), "a ../ session id never escapes the hud directory");
 });
 
-test("the adapter renders in budget without opening the store — an empty home gains no files", (t) => {
+test("the bundled Claude adapter renders with node absent from PATH — pure sh, one cat of the line file", (t) => {
+  const h = home(), n = new MbxNode(h, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(h, { recursive: true, force: true }); });
+  n.bindSession({ agent: "drum", cli: "claude", session_id: "claude-1", pid: process.pid, session_key: "k" });
+  claim(n, "drum", "claude-1");
+  n.send({ from: "boss", to: ["drum"], subject: "hey", body: "b", needs_reply: true });
+  writeHud(n);
+  const script = resolve("skill/scripts/claude-statusline.sh");
+  // Round 3: the render budget is enforced as a dependency, not a wall clock — a node startup is
+  // 150 ms idle and 470-630 ms at load 78, which breaks Kimi's 300 ms cap. With node off PATH the
+  // script must still render. /bin:/usr/bin carries sed/date/cat but no node (macOS ships none).
+  const shEnv = { ...process.env, MBX_HOME: h, PATH: "/bin:/usr/bin" } as Record<string, string>;
+  const ok = spawnSync("/bin/sh", [script], { input: JSON.stringify({ session_id: "claude-1" }), encoding: "utf8", env: shEnv });
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.match(ok.stdout, /^mbx drum 1↑ 1↺/);
+  const unbound = spawnSync("/bin/sh", [script], { input: JSON.stringify({ session_id: "nope" }), encoding: "utf8", env: shEnv });
+  assert.equal(unbound.status, 0, unbound.stderr);
+  assert.equal(unbound.stdout, "", "an unbound session renders nothing");
+  const noSid = spawnSync("/bin/sh", [script], { input: "{}", encoding: "utf8", env: shEnv });
+  assert.equal(noSid.stdout, "", "no session id on stdin renders nothing");
+});
+
+test("the CLI adapter resolves exactly without opening the store — an empty home gains no files", (t) => {
   const h = home(), n = new MbxNode(h, { host: "alpha" });
   t.after(() => { n.close(); rmSync(h, { recursive: true, force: true }); });
   n.bindSession({ agent: "drum", cli: "claude", session_id: "claude-1", pid: process.pid, session_key: "k" });
@@ -118,15 +178,11 @@ test("the adapter renders in budget without opening the store — an empty home 
   n.send({ from: "boss", to: ["drum"], subject: "hey", body: "b", needs_reply: true });
   writeHud(n);
   const env = { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: h, MBX_NO_DESKTOP: "1" } as Record<string, string>;
-  const run = (args: string[], stdin: string) => {
-    const t0 = Date.now();
-    const r = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "statusline", ...args], { input: stdin, encoding: "utf8", env });
-    return { ...r, ms: Date.now() - t0 };
-  };
+  const run = (args: string[], stdin: string) =>
+    spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "statusline", ...args], { input: stdin, encoding: "utf8", env });
   const ok = run(["claude"], JSON.stringify({ session_id: "claude-1" }));
   assert.equal(ok.status, 0, ok.stderr);
   assert.match(ok.stdout, /^mbx drum 1↑ 1↺/);
-  assert.ok(ok.ms < 1_500, "one node startup plus a single cat; well under the 300 ms CLI budget once the CLI is native or the shell script cats the line directly");
   // cross-CLI isolation: the kimi adapter cannot read claude's file
   const cross = run(["kimi"], JSON.stringify({ session_id: "claude-1" }));
   assert.equal(cross.stdout, "", "session files are namespaced by CLI");

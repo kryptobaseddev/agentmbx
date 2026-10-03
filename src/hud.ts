@@ -114,13 +114,18 @@ export function writeHud(node: MbxNode, now = Date.now()): void {
   const pidDone = new Set<string>();
   // One ps for every distinct pid, not one per row (review low 4).
   const pids = [...new Set(rows.map((r) => r.pid).filter((p): p is number => !!p))];
-  const starts = new Map<number, string | null>();
+  const evidence = new Map<number, { alive: boolean | null; start: string | null }>();
   try {
-    for (const [pid, ev] of inspectLeaseProcesses(pids)) starts.set(pid, ev.start);
+    for (const [pid, ev] of inspectLeaseProcesses(pids)) evidence.set(pid, ev);
   } catch { /* evidence unavailable: pid files are skipped this pass */ }
   for (const row of rows) {
     try {
       if (!CLI_RE.test(row.cli) || !SID_RE.test(row.session_id)) continue; // writer-side id validation
+      // Review round 3: a row whose pid this pass proves dead (or a row with no pid at all, which can
+      // never be proven live — no production binder omits a pid) renders until the reaper deletes the
+      // binding. Skip it so its stale files prune now. Absent evidence is not proof of death.
+      if (!row.pid) continue;
+      if (evidence.get(row.pid)?.alive === false) continue;
       const resolved = resolveStatusIdentity(node, row.cli, { sessionId: row.session_id, pid: row.pid });
       if (resolved.state !== "bound" || !resolved.name) continue; // never render unbound or ambiguous (review low 9)
       let snapshot = perAgent.get(resolved.name);
@@ -140,7 +145,7 @@ export function writeHud(node: MbxNode, now = Date.now()): void {
         pidDone.add(`${row.cli}:${row.pid}`);
         const byPid = resolveStatusIdentity(node, row.cli, { pid: row.pid });
         if (byPid.state === "bound" && byPid.name && byPid.resolved_by === "pid") {
-          const start = starts.get(row.pid) ?? null;
+          const start = evidence.get(row.pid)?.start ?? null;
           if (start) {
             const pidKey = `pid:${byPid.name}`; // never reuse a session-keyed snapshot's resolved_by
             let pidSnap = perAgent.get(pidKey);

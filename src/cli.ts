@@ -376,12 +376,15 @@ async function run(argv: string[]) {
     // The daemon pre-renders one line per snapshot: the render is a single cat, no JSON parsing.
     // Critical: when the provider DID name a session id, a missing snapshot means this session is
     // unbound (released, or not yet bound in a shared process) — never fall back to the pid file,
-    // which may belong to a sibling session's holder. The pid fallback is only for a provider
-    // process that names no session id at all.
+    // which may belong to a sibling session's holder.
     if (sid) {
       try { process.stdout.write(readFileSync(hudSessionLinePath(home, which, sid), "utf8")); } catch { /* unbound: render nothing */ }
       return;
     }
+    // Round 3: the pid fallback is allowed only for one-conversation-per-process CLIs (Claude).
+    // A shared-process CLI (Kimi, OpenCode) that names no session id renders nothing: its pid file
+    // cannot know whether an unbound sibling conversation exists in that process.
+    if (which !== "claude") return;
     try {
       const out = execFileSync("ps", ["-p", String(process.ppid), "-o", "lstart="], { encoding: "utf8", timeout: 1000, env: { ...process.env, LC_ALL: "C", TZ: "UTC" } }).trim();
       if (out) process.stdout.write(readFileSync(hudPidLinePath(home, which, process.ppid, `ps-utc:${out.replace(/\s+/g, " ")}`), "utf8"));
