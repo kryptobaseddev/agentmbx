@@ -66,6 +66,7 @@ Messages
     Use --cli <provider> --session <id> when multiple sessions share the caller. --as only selects the held name.
     New sends without a lease are marked unverified-sender and grant no delegated authority.
   agentmbx status --cli <provider> --session <id> --json   current session identity and mailbox counts (read-only)
+  agentmbx status --cli <provider> [--session <id>] --json --schema mbx.status/v1   HUD snapshot for harnesses; no lease needed (T311)
   agentmbx statusline <claude|codex|kimi|opencode|grok>   render one MBX segment from the HUD snapshot (T313)
   agentmbx identity list [--project <dir>] [--all] [--json]   identities with role, holder, claimable and unread (read-only)
   agentmbx identity prune [--days 7] [--apply]   retire mailboxes older versions generated that nobody holds (dry run by default)

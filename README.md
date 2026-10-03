@@ -15,6 +15,8 @@ you ── Claude Code (planner) ──┐                         ┌── Cod
 
 `agentmbx statusline <claude|codex|kimi|opencode|grok>` renders one MBX segment for a CLI status line from the daemon's HUD snapshot — a single small file read, never SQL against the store. The daemon writes one `mbx.status/v1` snapshot per bound session (and per holder pid, only when the resolver proves one) under `~/.local/share/agentmbx/hud`, keeps `hud/.alive` fresh, and adapters print nothing when the daemon is down or nothing resolves. `skill/scripts/claude-statusline.sh` is the bundled Claude adapter — pure sh (sed, date, one cat), so a render never pays a node startup; it honors `MBX_HOME`. Codex note: official Codex builds its status line from built-in items only (openai/codex#17827); the snapshots stay ready.
 
+Harnesses can also pull the snapshot directly: `agentmbx status --cli <provider> --session <id> --json --schema mbx.status/v1` returns the same `mbx.status/v1` document the HUD files carry (T311). It resolves through the same identity resolver as the statuslines — an explicit session that does not resolve is reported unbound, never another session of the same process — and it needs no lease, so it works before a session has claimed a mailbox. The same rule without `--session` resolves the caller's own provider process. The pre-existing `status --json` contract (lease-gated mailbox counts) is unchanged.
+
 ## Native workflow and delivery roadmap
 
 Each provider connects to its own AgentMBX MCP server. That server uses the local
