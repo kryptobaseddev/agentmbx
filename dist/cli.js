@@ -13,9 +13,10 @@ import { relayPushOutbox, relayPushReceipts, relayReceive, relayRoute, relaySett
 import { DEFAULT_QUOTA, parseRelayKey, RelayCore, startRelayServer } from "./relay.js";
 import { SqliteRelayStore } from "./relay-store.js";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.js";
-import { HUD_ALIVE_MAX_MS, hudAlivePath, hudDir, hudPidLinePath, hudPidPath, hudSessionLinePath, hudSessionPath, writeHud } from "./hud.js";
+import { HUD_ALIVE_MAX_MS, HUD_SCHEMA, hudAlivePath, hudDir, hudPidLinePath, hudPidPath, hudSessionLinePath, hudSessionPath, hudStatus, writeHud } from "./hud.js";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
 import { ancestors, withProcSnapshot } from "./proc.js";
+import { resolveStatusIdentity } from "./status-identity.js";
 import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.js";
 import { retirePhantoms, returnNeverClaimed } from "./stranded.js";
 import { activeLead, leadSummary, makeLead, makeLeadRevocation, revokeLead, storeLead } from "./project-ledger.js";
@@ -63,6 +64,7 @@ Messages
     Use --cli <provider> --session <id> when multiple sessions share the caller. --as only selects the held name.
     New sends without a lease are marked unverified-sender and grant no delegated authority.
   agentmbx status --cli <provider> --session <id> --json   current session identity and mailbox counts (read-only)
+  agentmbx status --cli <provider> [--session <id>] --json --schema mbx.status/v1   HUD snapshot for harnesses; no lease needed (T311)
   agentmbx statusline <claude|codex|kimi|opencode|grok>   render one MBX segment from the HUD snapshot (T313)
   agentmbx identity list [--project <dir>] [--all] [--json]   identities with role, holder, claimable and unread (read-only)
   agentmbx identity prune [--days 7] [--apply]   retire mailboxes older versions generated that nobody holds (dry run by default)
@@ -235,7 +237,7 @@ async function run(argv) {
     const { values: o, positionals: pos } = parseArgs({ args: rest, allowPositionals: true, strict: cmd !== "hook" && cmd !== "mcp", options: {
             help: { type: "boolean", short: "h" }, force: { type: "boolean" },
             as: { type: "string" }, to: { type: "string" }, subject: { type: "string" }, m: { type: "string", short: "m" },
-            "body-file": { type: "string" }, kind: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" }, "new-mailbox": { type: "boolean" },
+            "body-file": { type: "string" }, kind: { type: "string" }, schema: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" }, "new-mailbox": { type: "boolean" },
             ref: { type: "string", multiple: true }, all: { type: "boolean" }, json: { type: "boolean" }, note: { type: "string" },
             mailbox: { type: "string" }, limit: { type: "string" }, host: { type: "string" }, port: { type: "string" }, cli: { type: "string" }, session: { type: "string" }, caps: { type: "string" },
             ttl: { type: "string" }, bind: { type: "string" }, role: { type: "string" }, description: { type: "string" }, thread: { type: "string" }, from: { type: "string" }, check: { type: "boolean" }, yes: { type: "boolean", short: "y" },
@@ -646,6 +648,18 @@ async function run(argv) {
             return node.agents().forEach((a) => console.log(`${a.name}@${a.host}\t${a.host === node.host ? (live.has(a.name) ? "live" : "offline") : "remote"}\t${a.role ?? ""}\t${a.cli ?? ""}\t${a.last_seen ?? ""}\t${a.description ?? ""}`));
         }
         case "status": {
+            if (o.json && str("schema") === HUD_SCHEMA) {
+                // T311: mbx.status/v1 for harnesses, behind an explicit schema flag so the existing
+                // status --json contract (lease-gated) is unchanged. Identity comes from the T310 resolver
+                // (never a shared directory name), not from a lease: a status read works even before a
+                // session has claimed one. Same rule as the statusline adapters: an explicit --session that
+                // does not resolve is unbound — never the provider pid's holder, which may be a sibling.
+                const sid = str("session") ?? null;
+                const resolved = sid
+                    ? resolveStatusIdentity(node, str("cli") ?? "", { sessionId: sid })
+                    : resolveStatusIdentity(node, str("cli") ?? "", { pid: process.ppid });
+                return console.log(JSON.stringify(hudStatus(node, { agent: resolved.name, state: resolved.state, resolvedBy: resolved.resolved_by ?? "none", candidates: resolved.candidates }), null, 2));
+            }
             const sid = str("session");
             if (sid) {
                 const cli = str("cli") ?? die("status --session requires --cli <provider>");
