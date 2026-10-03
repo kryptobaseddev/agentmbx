@@ -52,6 +52,7 @@ async function world(t: { after: (fn: () => Promise<void>) => void }, names: str
     send: (who: string, to: string[], extra: Record<string, unknown> = {}) => sent(call(who, "mbx_send", { to, subject: "work", body: "data", ...extra })),
     reply: (who: string, id: string, extra: Record<string, unknown> = {}) => sent(call(who, "mbx_reply", { id, body: "answer", ...extra })),
     read: async (who: string, id: string) => (await call(who, "mbx_read", { ids: [id] })).text,
+    thread: async (who: string, id: string) => (await call(who, "mbx_thread", { id })).text,
     whoami: async (who: string) => (await call(who, "mbx_whoami", {})).out.external as Record<string, unknown>,
     /** A stored message as it arrived, without the current sender code (old or malformed envelopes). */
     insert(e: Envelope, to: string) { const s = signEnvelope(e, "alpha", n.key.publicKey, n.key.privateKey); n.store.insertMessage(s, "local", "local", null); n.store.addDelivery(s.id, to); return s; },
@@ -64,7 +65,7 @@ test("a conversation between two agents after an exposure clears at root + 1 h, 
   assert.equal(outside.meta.external_source, "declared", "a sender that marks content external declares it first-hand");
   assert.equal(outside.meta.external_since, outside.ts);
   const root = w.now, clears = iso(root + EXTERNAL_TAINT_MS);
-  assert.match(await w.read("ada", outside.id), new RegExp(`origin: external, declared by the sender at ${esc(outside.ts)} .*your own sends external until ${esc(clears)}`));
+  assert.match(await w.read("ada", outside.id), new RegExp(`origin: external, declared by the sender at ${esc(outside.ts)} .*your own sends are external for an hour after you first read it`));
 
   let m = await w.send("ada", ["bob"]);
   assert.equal(m.e.meta.origin, "external");
@@ -80,7 +81,7 @@ test("a conversation between two agents after an exposure clears at root + 1 h, 
     w.advance(10 * MIN);
     const who = i % 2 ? "bob" : "ada";
     const header = await w.read(who, m.e.id);
-    assert.match(header, new RegExp(`origin: external, inherited: the sender did not declare it, its session read outside content at ${esc(iso(root))} \\(root exposure\\), so the sender's taint clears at ${esc(clears)}; reading it makes your own sends external until ${esc(clears)}, never longer`));
+    assert.match(header, new RegExp(`origin: external, inherited: the sender did not declare it, its session read outside content at ${esc(iso(root))} \\(root exposure\\), so the sender's taint clears at ${esc(clears)}; reading it makes your own sends external until then, never longer`));
     m = await w.reply(who, m.e.id);
     assert.equal(m.e.meta.origin, "external", `exchange ${i} is still inside the hour`);
     assert.equal(m.e.meta.external_since, iso(root), `exchange ${i} keeps the root`);
@@ -103,16 +104,21 @@ test("a conversation between two agents after an exposure clears at root + 1 h, 
   assert.equal((await w.send("bob", ["ada"])).e.meta.origin ?? "agent", "agent");
   assert.deepEqual(await w.whoami("ada"), { tainted: false });
 
-  // External mail from before T344 has no root time: it counts from its send time, not from when it is read.
-  const old = buildEnvelope({ from: "elder@alpha", to: ["ada"], subject: "old relay", body: "data", origin: "external" }, new Date(w.now - 50 * MIN)) as Env;
+  // External mail from before T344 has no root time. It may be declared outside content of any age, so it counts as
+  // first-hand from when it is read: rooting it at its send time would let old outside content escape the taint.
+  const old = buildEnvelope({ from: "elder@alpha", to: ["ada"], subject: "old relay", body: "data", origin: "external" }, new Date(w.now - 2 * 3_600_000)) as Env;
   delete old.meta.external_since; delete old.meta.external_source;
   const legacy = w.insert(old, "ada");
-  assert.match(await w.read("ada", legacy.id), new RegExp(`origin: external, from an older AgentMBX without a root exposure time: counted from its send time ${esc(legacy.ts)}`));
+  const legacyAt = w.now;
+  assert.match(await w.read("ada", legacy.id), /origin: external, from an older AgentMBX without a root exposure time: counted as first-hand outside content/);
   const after = await w.send("ada", ["bob"]);
-  assert.equal(after.e.meta.origin, "external");
-  assert.equal(after.e.meta.external_since, legacy.ts);
+  assert.equal(after.e.meta.origin, "external", "two-hour-old external mail still taints its reader");
+  assert.equal(after.e.meta.external_since, iso(legacyAt));
+  assert.ok(after.warnings.some((x) => x.includes(`you read ${legacy.id} from elder@alpha, external mail from an older AgentMBX`)), JSON.stringify(after.warnings));
+  w.advance(50 * MIN);
+  assert.equal((await w.send("ada", ["bob"])).e.meta.external_since, iso(legacyAt));
   w.advance(10 * MIN);
-  assert.equal((await w.send("ada", ["bob"])).e.meta.origin ?? "agent", "agent", "send time + 1 h has passed");
+  assert.equal((await w.send("ada", ["bob"])).e.meta.origin ?? "agent", "agent", "an hour after the read");
 });
 
 test("fresh outside content still taints; an owner prompt and origin agent never clear it; malformed mail counts as outside (T344, T104)", async (t) => {
@@ -140,10 +146,18 @@ test("fresh outside content still taints; an owner prompt and origin agent never
   assert.equal(declared.e.meta.external_source, "declared");
   assert.ok(declared.warnings.some((x) => x.startsWith("sent with origin external, as you declared")), JSON.stringify(declared.warnings));
 
-  // Re-reading first-hand content is a new exposure: the reader's root moves to the read time.
+  // Viewing the same first-hand message again within the hour (mbx_thread every turn, mbx_read again) keeps its first
+  // read as the root. Answering it is a new exposure at reply time, and so is viewing it after the hour.
   w.advance(20 * MIN);
+  assert.match(await w.thread("ada", outside.id), /origin: external, declared by the sender/);
   await w.read("ada", outside.id);
-  assert.equal((await w.send("ada", ["bob"])).e.meta.external_since, iso(w.now));
+  assert.equal((await w.send("ada", ["bob"])).e.meta.external_since, iso(root), "re-reads within the hour keep the first read as the root");
+  const replyAt = w.now;
+  assert.equal((await w.reply("ada", outside.id)).e.meta.external_since, iso(replyAt), "a reply to declared content roots at reply time");
+  assert.equal((await w.send("ada", ["bob"])).e.meta.external_since, iso(replyAt));
+  w.advance(45 * MIN); // past the first read + 1 h, still inside the reply's hour
+  await w.thread("ada", outside.id);
+  assert.equal((await w.send("ada", ["bob"])).e.meta.external_since, iso(w.now), "after the hour, viewing it again is a new exposure");
 
   // Malformed mail cannot erase unknown provenance: it is first-hand outside content.
   const bad = buildEnvelope({ from: "mallory@alpha", to: ["bob"], subject: "odd", body: "data" });
@@ -175,8 +189,8 @@ test("external_since is validated on every path and interpreted safely (T344)", 
   assert.deepEqual(externalExposure(future, now), { how: "inherited", root: now }, "a future root counts as now, never later");
   const legacy = { ...declared, meta: { ...declared.meta, external_since: undefined, external_source: undefined } };
   assert.equal(checkShape(legacy), null);
-  assert.deepEqual(externalExposure(legacy, now), { how: "legacy", root: now - 10 * MIN }, "no root time: the send time");
-  assert.deepEqual(externalExposure({ ...legacy, ts: iso(now + MIN) }, now), { how: "legacy", root: now });
+  assert.deepEqual(externalExposure(legacy, now), { how: "legacy", root: now }, "no root time: first-hand, from the read, never the send time");
+  assert.deepEqual(externalExposure({ ...legacy, ts: iso(now - 5 * 3_600_000) }, now), { how: "legacy", root: now });
   const noSource = { ...inherited, meta: { ...inherited.meta, external_source: undefined } };
   assert.deepEqual(externalExposure(noSource, now), { how: "declared", root: now }, "an unlabelled root is treated as first-hand");
   assert.equal(externalExposure(buildEnvelope({ from: "a@alpha", to: ["b@beta"], subject: "s", body: "b" }), now), null);

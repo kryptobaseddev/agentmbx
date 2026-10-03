@@ -1002,16 +1002,18 @@ export function externalLine(e, now = Date.now()) {
     const x = externalExposure(e, now);
     if (!x)
         return null;
-    const iso = (t) => new Date(t).toISOString(), active = x.root + EXTERNAL_TAINT_MS > now;
-    const yours = active ? `reading it makes your own sends external until ${iso(x.root + EXTERNAL_TAINT_MS)}, never longer` : "reading it no longer makes your sends external";
+    const iso = (t) => new Date(t).toISOString();
+    // first-hand content: the reader's root is its first read in the last hour, which only the reading session knows
+    const firstHand = "your own sends are external for an hour after you first read it (mbx_whoami shows until when)";
     if (x.how === "malformed")
-        return `origin: treated as external (malformed envelope: unknown provenance counts as outside content): ${yours}`;
+        return `origin: treated as external (malformed envelope: unknown provenance counts as outside content): ${firstHand}`;
     if (x.how === "declared")
-        return `origin: external, declared by the sender at ${iso(Date.parse(e.meta.external_since))} (content from outside: a web page, issue, PR comment or email): ${yours}`;
-    const clears = `${active ? "clears" : "cleared"} at ${iso(x.root + EXTERNAL_TAINT_MS)}`;
+        return `origin: external, declared by the sender at ${iso(Date.parse(e.meta.external_since))} (content from outside: a web page, issue, PR comment or email): ${firstHand}`;
     if (x.how === "legacy")
-        return `origin: external, from an older AgentMBX without a root exposure time: counted from its send time ${iso(x.root)}, so its taint ${clears}; ${yours}`;
-    return `origin: external, inherited: the sender did not declare it, its session read outside content at ${iso(x.root)} (root exposure), so the sender's taint ${clears}; ${yours}`;
+        return `origin: external, from an older AgentMBX without a root exposure time: counted as first-hand outside content; ${firstHand}`;
+    const active = x.root + EXTERNAL_TAINT_MS > now, clears = iso(x.root + EXTERNAL_TAINT_MS);
+    return `origin: external, inherited: the sender did not declare it, its session read outside content at ${iso(x.root)} (root exposure), so the sender's taint ${active
+        ? `clears at ${clears}; reading it makes your own sends external until then, never longer` : `cleared at ${clears}; reading it no longer makes your sends external`}`;
 }
 export function formatMessage(m, policy) {
     const e = JSON.parse(m.envelope);

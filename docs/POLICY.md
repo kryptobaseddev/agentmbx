@@ -83,9 +83,8 @@ External taint (T344). A session that read external content sends everything as 
 - `meta.external_source`: `declared` or `inherited`.
 
 A reader takes the latest root of what it read:
-- **First-hand content** exposes the reader at the moment it reads it. That is a `declared` message, or a malformed envelope, whose provenance is unknown.
-- **Inherited taint** keeps the sender's root, never the read time. Two agents answering each other after either was exposed are therefore both clean one hour after the root exposure, however often they reply.
-- **Older external mail** without `external_since` counts from its send time.
+- **First-hand content** exposes the reader at the moment it reads it. That is a `declared` message, a malformed envelope (provenance unknown), or older external mail without `external_since`. Older mail may be declared content of any age, so its send time is never trusted. Viewing the same message again within the hour keeps the first read as its root: `mbx_read` again, or `mbx_thread` every turn. Each session remembers the first reads of the last hour, up to 1000 messages. Replying to it, or viewing it after the hour, is a new exposure.
+- **Inherited taint** keeps the sender's root, never the read time. Two agents answering each other after either was exposed are therefore both clean one hour after the root exposure, however often they reply. An agent on a version without T344 sends inherited taint with no root, which its readers count from their read, so a conversation with such an agent keeps re-tainting until it upgrades.
 - **Doubtful values fall back to the safe reading.** A root later than the reader's clock counts as the read time. A missing `external_source` counts as `declared`. A malformed `external_since` makes the envelope malformed: a paired host or relay rejects it, and a stored one counts as first-hand.
 
 Agents are told why at each step:

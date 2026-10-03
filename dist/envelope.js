@@ -160,20 +160,21 @@ export function checkShape(x) {
     return null;
 }
 /**
- * The root exposure a reader takes from one message read at `now`. First-hand outside content (declared external by its
- * sender, or a malformed envelope whose provenance is unknown) exposes the reader now. Inherited taint keeps the sender's
- * root exposure, and external mail from before T344 (no `external_since`) counts from its send time, so agents answering
- * each other never extend a taint past root + EXTERNAL_TAINT_MS. A root later than `now` (a skewed clock or a bad sender)
- * counts as `now`: never longer than one first-hand read. A reader keeps the latest root of everything it read.
+ * The root exposure a reader takes from one message read at `now`. First-hand outside content exposes the reader now:
+ * declared external by its sender, a malformed envelope whose provenance is unknown, or external mail from before T344
+ * (no `external_since`), which may be declared content however old it is. Inherited taint keeps the sender's root
+ * exposure, so agents answering each other never extend a taint past root + EXTERNAL_TAINT_MS. A root later than `now`
+ * (a skewed clock or a bad sender) counts as `now`: never longer than one first-hand read. A reader keeps the latest root
+ * of everything it read.
  */
 export function externalExposure(e, now) {
     if (checkShape(e))
         return { how: "malformed", root: now };
-    const { meta: m, ts } = e;
+    const { meta: m } = e;
     if (m.origin !== "external")
         return null;
     if (m.external_since === undefined)
-        return { how: "legacy", root: Math.min(Date.parse(ts), now) };
+        return { how: "legacy", root: now };
     if (m.external_source !== "inherited")
         return { how: "declared", root: now };
     return { how: "inherited", root: Math.min(Date.parse(m.external_since), now) };

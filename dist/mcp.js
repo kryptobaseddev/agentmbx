@@ -276,12 +276,14 @@ export const statusWakeWarning = (e) => e.kind === "status" && (e.needs_reply ||
  *  sender can't see the recipient's level, so it is warned only past collaborate's allowance (T104). */
 export const depthWarning = (e) => (e.meta.hop ?? 0) > LEVEL_MAX_HOP.collaborate
     ? [`relay depth ${e.meta.hop} exceeds ${LEVEL_MAX_HOP.collaborate}: this session has read a long chain from agents other than this message's recipients since your user last typed. A recipient under ask (limit ${MAX_HOP}) or collaborate (limit ${LEVEL_MAX_HOP.collaborate}) will not be woken or act on it (it can still read and answer); autonomous and yolo have no depth limit. Your user's next prompt resets the depth.`] : [];
+/** First-hand external messages a session remembers the first read of (T344); beyond this a re-read counts as new. */
+const FIRST_HAND_MAX = 1000;
 const isoAt = (t) => new Date(t).toISOString();
 /** Which read caused a taint, in words for the sender's warning and mbx_whoami. */
 export const taintCause = (t) => `you read ${t.id} from ${t.from}, ${{
     declared: "which its sender declared external: first-hand outside content, so the root is when you read it",
     inherited: "whose sender inherited the taint from that earlier exposure",
-    legacy: "external mail from an older AgentMBX without a root time, counted from its send time",
+    legacy: "external mail from an older AgentMBX without a root time: counted as first-hand outside content, from when you read it",
     malformed: "a malformed message: unknown provenance counts as first-hand outside content",
 }[t.how]}`;
 /** Tell the sender why its message went out external and when that ends (T344): agents were re-tainting each other silently. */
@@ -710,8 +712,9 @@ export async function runMcp(existing) {
         }
         return state;
     };
-    // relay tracking: a message this session sends after reading one is one hop further, and inherits an external origin
-    const noteRead = (rows) => {
+    // relay tracking: a message this session sends after reading one is one hop further, and inherits an external origin.
+    // `reply`: the session is answering this message (mbx_reply, mbx_send reply_to), which re-exposes it to the content.
+    const noteRead = (rows, { reply = false } = {}) => {
         const state = current(), { agent } = state;
         const now = Date.now();
         if (state.parent)
@@ -719,13 +722,18 @@ export async function runMcp(existing) {
                 if (now - x.at >= 3_600_000)
                     state.parent.hops.delete(k);
             }
+        if (state.parent)
+            for (const [id, at] of state.parent.firstHand) {
+                if (now - at >= EXTERNAL_TAINT_MS)
+                    state.parent.firstHand.delete(id);
+            }
         for (const r of rows) {
             if (r.from_addr === `${agent}@${node.host}`)
                 continue;
             const e = JSON.parse(r.envelope);
             // Retained malformed mail is readable, but cannot erase unknown provenance.
             const m = checkShape(e) ? { hop: MAX_RELAY_DEPTH } : e.meta; // past every level's allowance (T104)
-            state.parent ??= { hops: new Map(), external: null };
+            state.parent ??= { hops: new Map(), external: null, firstHand: new Map() };
             // Each (sender, depth) keeps its own last exposure. Lower-depth mail cannot renew a higher one. The sender is kept so
             // a reply to that same sender doesn't count it (T104): a two-party conversation is not a relay chain.
             const hop = m.hop ?? 0;
@@ -733,6 +741,18 @@ export async function runMcp(existing) {
             // External taint (T344): the latest ROOT exposure of everything read, never the read time of inherited taint, so two
             // agents answering each other can't keep renewing it. First-hand content (declared, or malformed) is exposure now.
             const x = externalExposure(e, now);
+            if (x && x.how !== "inherited") {
+                // Viewing the same first-hand message again within the hour (mbx_thread every turn, mbx_read again) adds no new
+                // outside content: its first read stays the root. A reply to it, or a read after the hour, is a new exposure.
+                const first = state.parent.firstHand.get(r.id);
+                if (first === undefined) {
+                    if (state.parent.firstHand.size >= FIRST_HAND_MAX)
+                        state.parent.firstHand.delete(state.parent.firstHand.keys().next().value); // oldest: a re-read then counts as new, never shorter
+                    state.parent.firstHand.set(r.id, now);
+                }
+                else if (!reply)
+                    x.root = first;
+            }
             if (x && x.root > (state.parent.external?.root ?? -Infinity))
                 state.parent.external = { ...x, from: r.from_addr, id: r.id };
         }
@@ -1149,7 +1169,7 @@ export async function runMcp(existing) {
         let thread;
         if (reply_to) {
             const m = node.read(reply_to, agent);
-            noteRead([m]);
+            noteRead([m], { reply: true });
             thread = m.thread;
             reply_to = m.id;
         }
@@ -1174,7 +1194,7 @@ export async function runMcp(existing) {
     }, ({ id, body, kind, needs_reply, origin }) => {
         const { agent } = current();
         const m = node.read(id, agent);
-        noteRead([m]);
+        noteRead([m], { reply: true });
         const subject = /^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`.slice(0, 200);
         const rel = relay(origin, [m.from_addr]);
         const r = node.send({ from: agent, to: [m.from_addr], subject, body, kind, reply_to: m.id, thread: m.thread, needs_reply, refs: [], ...rel.draft }, session());
