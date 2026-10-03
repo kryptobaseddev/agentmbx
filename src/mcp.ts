@@ -21,13 +21,13 @@ import { reviveMailbox } from "./identity-cleanup.ts";
 import { AUTO_NAME_RE, linkedKey, noteProject, projectKey, projectOf, registeredIdentity, registerIdentity, renameRegistration, ROLE_RE, sessionHint, UNSPECIFIED_ROLE } from "./registry.ts";
 import { applyIdentityTakeover, type IdentityTakeoverApproval } from "./identity-takeover.ts";
 import { listIdentityStatus } from "./identity-status.ts";
-import { consumeIdentityControl, identityControlAliases, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl, type IdentityControlDescriptor } from "./identity-control.ts";
-import { didWarning, formatFor, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
+import { consumeIdentityControl, identityControlAliases, identityControlKey, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl, type IdentityControlDescriptor } from "./identity-control.ts";
+import { alive, didWarning, formatFor, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
 import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy.ts";
 import { assertKnownRecipients, deliveryReceipts, offlineWarnings, receiptLine, recipientReceipts, sentPage } from "./receipts.ts";
 import { forwardMessage, ledgerPage } from "./project-ledger.ts";
 import { skillFiles } from "./setup.ts";
-import { claudeSessionId, procStart, withProcSnapshot } from "./proc.ts";
+import { claudeSessionId, claudeSessionTracker, procStart, withProcSnapshot } from "./proc.ts";
 import { updateAvailable } from "./update.ts";
 import { installKind, version } from "./version.ts";
 import { connectorKey } from "./diagnostics.ts";
@@ -423,6 +423,54 @@ export async function runMcp(existing?: MbxNode) {
     });
     Object.assign(state, result);
   });
+  // Claude replaces the session id of a running process: a resumed start reports a temporary id first (T326), and /clear,
+  // /resume and compaction start new ones. Its own ~/.claude/sessions/<pid>.json names the current id, so this server
+  // follows that file rather than the id it started with. Only this process's own binding moves, and only to that id.
+  const providerSession = env.cli === "claude" && !hosted ? claudeSessionTracker(env.ppid) : () => null;
+  /** Another live process answers for `id`: its session binding, or the control endpoint an unbound session publishes without one. */
+  const heldElsewhere = (id: string, controlKey: string) => {
+    // Liveness, not a cached start time: a reused pid can only make this server keep its current id, never overwrite a
+    // live session's binding.
+    if ((node.store.db.prepare("SELECT pid FROM sessions WHERE cli=? AND session_id=? AND pid IS NOT NULL AND pid<>?")
+      .all(env.cli, id, env.ppid) as { pid: number }[]).some(r => alive(r.pid))) return true;
+    // Two windows resuming one conversation: the other window's unbound endpoint is where an owner claim/takeover of that
+    // session must arrive. An endpoint of this same provider process (a previous server of it) may be replaced.
+    let endpoint: { control_key?: unknown; parent_pid?: unknown } | null = null;
+    try { endpoint = JSON.parse(node.store.get(identityControlKey(env.cli, id)) ?? "null"); } catch { /* malformed: nobody answers there */ }
+    return !!endpoint && endpoint.control_key !== controlKey && Number.isSafeInteger(endpoint.parent_pid)
+      && endpoint.parent_pid !== env.ppid && alive(endpoint.parent_pid as number);
+  };
+  /** Move this server's binding and control endpoint to `id`; nothing on `state` changes until the move commits. */
+  const followSession = (state: State, id: string) => {
+    const previous = state.sessionId, controlKey = fingerprint(state.key.publicKey);
+    const controlAliases = state.controlAliases?.filter(alias => alias !== previous);
+    const moved = prepareState(state, undefined, () => node.store.tx(() => {
+      if (heldElsewhere(id, controlKey)) return false;
+      if (bound(state)) {
+        leases.renew(state.agent, state.leaseToken!);
+        leases.moveSession(state.agent, state.leaseToken!, id);
+        node.bindSession({ agent: state.agent, cli: env.cli, session_id: id, cwd: process.cwd(), pid: env.ppid,
+          session_key: state.key.publicKey, channel: env.channel || env.socket, mcp_pid: process.pid });
+        node.store.db.prepare("DELETE FROM sessions WHERE cli=? AND pid=? AND session_key=? AND session_id<>?").run(env.cli, env.ppid, state.key.publicKey, id);
+        node.keepName(env.cli, id, state.agent);
+      }
+      // The control endpoint published under the old id (an unbound session publishes one too) stops answering for it;
+      // only this server's own endpoint is removed.
+      const old = identityControlKey(env.cli, previous), raw = node.store.get(old);
+      try { if (raw && JSON.parse(raw).control_key === controlKey) node.store.db.prepare("DELETE FROM kv WHERE k=?").run(old); }
+      catch { /* malformed: leave it to the endpoint parser */ }
+      publishControl({ ...state, sessionId: id, controlAliases });
+      return true;
+    }));
+    if (moved) { state.sessionId = env.sessionId = id; state.controlAliases = controlAliases; }
+  };
+  const followProvider = (state: State) => {
+    // A stat of the session file; the process table is read only when the id it names differs from this session's.
+    const id = state === base ? providerSession() : null;
+    if (!id || id === state.sessionId) return;
+    try { withProcSnapshot(() => followSession(state, id)); }
+    catch (e) { process.stderr.write(`[mbx] could not follow the provider session: ${(e as Error).message}\n`); }
+  };
   /** Claim `name` for this session; on failure the session stays unbound and keeps `name` pending. Never another name. */
   const resume = (state: State, name: string, o: { explicit?: boolean; launch?: boolean } = {}): boolean => {
     const before = { agent: state.agent, leaseToken: state.leaseToken };
@@ -650,6 +698,7 @@ export async function runMcp(existing?: MbxNode) {
         });
       }
       const state = contextFor(a[1]);
+      followProvider(state);
       // Identity tools work for an unbound session (they are how it gets one); everything else needs this session's own lease.
       const identityTool = name === "mbx_identity" || name === "mbx_whoami" || name === "mbx_agents";
       if (!identityTool) {
@@ -1174,6 +1223,7 @@ export async function runMcp(existing?: MbxNode) {
     publishConnector();
     for (const state of [base, ...states.values()]) {
       if (state.released) continue;
+      followProvider(state);
       // An unbound session retries its pending identity (or learns it from a later hook); it never takes another name.
       if (!state.leaseToken) { retryResume(state); continue; }
       try { bind(state); } catch (e) {
