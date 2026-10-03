@@ -141,13 +141,15 @@ While any yolo policy is active, it's visible everywhere:
 
 **Owner operations after this:** `owner grant`, `owner send`, `policy set` and `policy revoke` each need one Touch ID tap.
 
-## 7. Accounts and devices (forward-compatible, not built yet)
+## 7. Accounts and devices
 
-- **Principal** = an owner key. Nothing else identifies a human. AgentMBX never stores an email address or a passphrase. A future cloud account links an owner public key to an account, the way a Git host links an SSH key.
+- **Principal** = an owner key. Nothing else identifies a human to a daemon. The daemon and the CLI never store an email address or a passphrase, and never consult an account.
+- **Cloud accounts (optional).** AgentMBX Cloud has accounts (email with a passkey, or GitHub) for login, billing and cloud access only. An account links an owner public key with an owner-signed `account-link` record `{account_id, owner_pub, origin, challenge, iat}`, the way a Git host links an SSH key, and unlinks it with an owner-signed `account-unlink` record. An account, an account or organization role, or a plan never grants an agent anything and is never an input to policy resolution. LAN use needs no account.
+- **Owner authenticators.** The owner key can enroll a passkey as an owner authenticator with a signed `authenticator` record (one owner-key confirmation: Touch ID, or the passphrase on the tty). A console command carrying a valid WebAuthn assertion from an enrolled, unexpired, unrevoked authenticator counts as the owner's signature for that one command, within the daemon's device-confirmation rule. Anything above that rule needs an owner-key confirmation on a device, or, for an owner who chose passkey mode, a passkey step-up with a typed confirmation of the effect. Revocation is an owner-signed `authenticator-revocation` record, distributed like policy revocations.
 - **Devices.** The owner certifies each host key with a signed `device` record: `{host, host_pub, owner_fp, iat}`. A new machine pairs, then the owner approves it once on a machine that holds the owner key, so there's no second owner key. Policies and grants signed on one machine apply to all of the owner's devices.
 - **Members (sharing with a friend).** Another human's owner key is added with a role (`member` or `guest`) by an owner-signed `member` record. Policies can then name `from.principals`. A member's agents are treated like a paired host at the member's role:
   - `guest`: `ask` only;
   - `member`: whatever the owner's policy grants to that principal.
-- **Cloud relay (T007).** It carries the same records. The relay stores and forwards signed envelopes and never holds a private key.
+- **Cloud relay (T007).** It carries the same records. The relay stores and forwards signed envelopes and never holds a private key. It authenticates hosts for transport and quota only and never decides authorization.
 
 The `principals` table ships in v0.3 with a single row (the owner, role `owner`). Policy `from` can already name `principal:<fp>`.
