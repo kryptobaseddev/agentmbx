@@ -481,50 +481,61 @@ export async function runMcp(existing) {
     // /resume and compaction start new ones. Its own ~/.claude/sessions/<pid>.json names the current id, so this server
     // follows that file rather than the id it started with. Only this process's own binding moves, and only to that id.
     const providerSession = env.cli === "claude" && !hosted ? claudeSessionTracker(env.ppid) : () => null;
-    const followSession = (state) => {
-        const id = state === base ? providerSession() : null;
-        if (!id || id === state.sessionId)
-            return;
-        // An id bound by any other process that is alive now is never taken over. Liveness, not a cached start time: a
-        // reused pid can only make this server keep its current id, never overwrite a live session's binding.
+    /** Another live process answers for `id`: its session binding, or the control endpoint an unbound session publishes without one. */
+    const heldElsewhere = (id, controlKey) => {
+        // Liveness, not a cached start time: a reused pid can only make this server keep its current id, never overwrite a
+        // live session's binding.
         if (node.store.db.prepare("SELECT pid FROM sessions WHERE cli=? AND session_id=? AND pid IS NOT NULL AND pid<>?")
             .all(env.cli, id, env.ppid).some(r => alive(r.pid)))
-            return;
-        const previous = state.sessionId;
-        // The control endpoint published under the old id (an unbound session publishes one too) stops answering for it;
-        // only this server's own endpoint is removed.
-        const retireOld = () => {
-            const key = identityControlKey(env.cli, previous), raw = node.store.get(key);
+            return true;
+        // Two windows resuming one conversation: the other window's unbound endpoint is where an owner claim/takeover of that
+        // session must arrive. An endpoint of this same provider process (a previous server of it) may be replaced.
+        let endpoint = null;
+        try {
+            endpoint = JSON.parse(node.store.get(identityControlKey(env.cli, id)) ?? "null");
+        }
+        catch { /* malformed: nobody answers there */ }
+        return !!endpoint && endpoint.control_key !== controlKey && Number.isSafeInteger(endpoint.parent_pid)
+            && endpoint.parent_pid !== env.ppid && alive(endpoint.parent_pid);
+    };
+    /** Move this server's binding and control endpoint to `id`; nothing on `state` changes until the move commits. */
+    const followSession = (state, id) => {
+        const previous = state.sessionId, controlKey = fingerprint(state.key.publicKey);
+        const controlAliases = state.controlAliases?.filter(alias => alias !== previous);
+        const moved = prepareState(state, undefined, () => node.store.tx(() => {
+            if (heldElsewhere(id, controlKey))
+                return false;
+            if (bound(state)) {
+                leases.renew(state.agent, state.leaseToken);
+                leases.moveSession(state.agent, state.leaseToken, id);
+                node.bindSession({ agent: state.agent, cli: env.cli, session_id: id, cwd: process.cwd(), pid: env.ppid,
+                    session_key: state.key.publicKey, channel: env.channel || env.socket, mcp_pid: process.pid });
+                node.store.db.prepare("DELETE FROM sessions WHERE cli=? AND pid=? AND session_key=? AND session_id<>?").run(env.cli, env.ppid, state.key.publicKey, id);
+                node.keepName(env.cli, id, state.agent);
+            }
+            // The control endpoint published under the old id (an unbound session publishes one too) stops answering for it;
+            // only this server's own endpoint is removed.
+            const old = identityControlKey(env.cli, previous), raw = node.store.get(old);
             try {
-                if (raw && JSON.parse(raw).control_key === fingerprint(state.key.publicKey))
-                    node.store.db.prepare("DELETE FROM kv WHERE k=?").run(key);
+                if (raw && JSON.parse(raw).control_key === controlKey)
+                    node.store.db.prepare("DELETE FROM kv WHERE k=?").run(old);
             }
             catch { /* malformed: leave it to the endpoint parser */ }
-            state.controlAliases = state.controlAliases?.filter(alias => alias !== previous);
-        };
-        try {
-            prepareState(state, undefined, () => node.store.tx(() => {
-                if (bound(state)) {
-                    leases.renew(state.agent, state.leaseToken);
-                    leases.moveSession(state.agent, state.leaseToken, id);
-                    node.bindSession({ agent: state.agent, cli: env.cli, session_id: id, cwd: process.cwd(), pid: env.ppid,
-                        session_key: state.key.publicKey, channel: env.channel || env.socket, mcp_pid: process.pid });
-                    node.store.db.prepare("DELETE FROM sessions WHERE cli=? AND pid=? AND session_key=? AND session_id<>?").run(env.cli, env.ppid, state.key.publicKey, id);
-                    node.keepName(env.cli, id, state.agent);
-                }
-                retireOld();
-                state.sessionId = env.sessionId = id;
-                publishControl(state);
-            }));
-        }
-        catch (error) {
-            state.sessionId = env.sessionId = previous;
-            throw error;
+            publishControl({ ...state, sessionId: id, controlAliases });
+            return true;
+        }));
+        if (moved) {
+            state.sessionId = env.sessionId = id;
+            state.controlAliases = controlAliases;
         }
     };
     const followProvider = (state) => {
+        // A stat of the session file; the process table is read only when the id it names differs from this session's.
+        const id = state === base ? providerSession() : null;
+        if (!id || id === state.sessionId)
+            return;
         try {
-            withProcSnapshot(() => followSession(state));
+            withProcSnapshot(() => followSession(state, id));
         }
         catch (e) {
             process.stderr.write(`[mbx] could not follow the provider session: ${e.message}\n`);
