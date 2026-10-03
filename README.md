@@ -13,7 +13,27 @@ you ── Claude Code (planner) ──┐                         ┌── Cod
 
 ## Status line
 
-`agentmbx statusline <claude|codex|kimi|opencode|grok>` renders one MBX segment for a CLI status line from the daemon's HUD snapshot — a single small file read, never SQL against the store. The daemon writes one `mbx.status/v1` snapshot per bound session (and per holder pid, only when the resolver proves one) under `~/.local/share/agentmbx/hud`, keeps `hud/.alive` fresh, and adapters print nothing when the daemon is down or nothing resolves. `skill/scripts/claude-statusline.sh` is the bundled Claude adapter — pure sh (sed, date, one cat), so a render never pays a node startup; it honors `MBX_HOME`. Codex note: official Codex builds its status line from built-in items only (openai/codex#17827); the snapshots stay ready.
+`agentmbx statusline <claude|codex|kimi|opencode|grok|copilot|cursor|gemini>` renders one MBX segment for a CLI status line from the daemon's HUD snapshot — a single small file read, never SQL against the store. The daemon writes one `mbx.status/v1` snapshot per bound session (and per holder pid, only when the resolver proves one) under `~/.local/share/agentmbx/hud`, keeps `hud/.alive` fresh, and adapters print nothing when the daemon is down or nothing resolves. `skill/scripts/claude-statusline.sh` is the bundled Claude adapter — pure sh (sed, date, one cat), so a render never pays a node startup; it honors `MBX_HOME`. Codex note: official Codex builds its status line from built-in items only (openai/codex#17827); the snapshots stay ready.
+
+Wiring, per harness (every adapter reads the session id the CLI pipes on stdin, so a segment always belongs to the conversation that asked). Verified against first-party docs: **Claude Code**, **Kimi Code**. Everything else is community-reported — the shape is Claude-compatible, but confirm against the CLI's own docs before relying on it.
+
+- **Claude Code** (`~/.claude/settings.json`, verified): `"statusLine": { "type": "command", "command": "agentmbx statusline claude" }` — or point `command` at `skill/scripts/claude-statusline.sh` for the pure-sh render. Setup never overwrites an existing status line.
+- **Kimi Code** (`~/.kimi-code/tui.toml`, verified): a custom command's first stdout line replaces footer line 1 (built-in slots stay available via `items`):
+  ```toml
+  [status_line]
+  command = "agentmbx statusline kimi"
+  ```
+- **Grok CLI** (unverified, community-reported): `[ui.status_line] type = "command"` with `command = "agentmbx statusline grok"`.
+- **GitHub Copilot CLI** (unverified, community-reported via copilot-cli#3192 — the same issue documents the `statusLine.command` shape and a quirk where a custom command does not render while `footer.showCustom` is true): `{ "statusLine": { "command": "agentmbx statusline copilot" } }`.
+- **Cursor CLI** (`~/.cursor/cli-config.json`; unverified, community-reported): `{ "statusLine": { "command": "agentmbx statusline cursor" } }`.
+- **Gemini CLI** (unverified, community-reported via the universal cli-status-bar project): `{ "statusLine": { "command": "agentmbx statusline gemini" } }`.
+- **Codex**: no custom command yet (openai/codex#17827) — `agentmbx statusline codex` prints where the snapshots live, ready for forks or a tmux footer row.
+- **OpenCode**: built-in segments only today (anomalyco/opencode#30295).
+- **Hermes**: no footer command hook; its plugin lifecycle hooks receive the session id, so an AgentMBX plugin can surface inbox state instead.
+
+Claude, Codex, OpenCode and Kimi sessions are detected by `agentmbx setup` and `detectHost`. **Copilot, Cursor, Gemini and Grok are not** — nothing binds their sessions yet, so those adapters render nothing out of the box until detection lands (tracked as **T337**). Today they need `MBX_CLI=<cli>` on the MCP server plus hand-wired hooks, the same way any custom CLI integration works.
+
+Copilot, Cursor, Gemini and Grok render by session id only, like every non-Claude adapter: if the CLI names no session id, nothing renders rather than risk a sibling conversation's mail.
 
 Harnesses can also pull the snapshot directly: `agentmbx status --cli <provider> --session <id> --json --schema mbx.status/v1` returns the same `mbx.status/v1` document the HUD files carry (T311). It resolves through the same identity resolver as the statuslines — an explicit session that does not resolve is reported unbound, never another session of the same process — and it needs no lease, so it works before a session has claimed a mailbox. The same rule without `--session` resolves the caller's own provider process. The pre-existing `status --json` contract (lease-gated mailbox counts) is unchanged.
 
