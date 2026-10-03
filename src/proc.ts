@@ -1,6 +1,6 @@
 // Process identity: a PID plus its start time, so a reused PID never inherits a dead session's identity.
 // Linux uses kernel birth ticks and boot identity; other platforms use ps. Tables are cached briefly.
-import { execFileSync } from "node:child_process";
+import { execFileSync, type StdioOptions } from "node:child_process";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +12,13 @@ const snapshots = new AsyncLocalStorage<{ active: boolean; at: number; table: Ma
 
 /** Count of ps spawns for process evidence (T206 measurement); never reset by production code. */
 export const processEvidenceSpawns = { count: 0 };
+
+type PsOptions = { env: NodeJS.ProcessEnv; timeout?: number; stdio?: StdioOptions };
+/** Test seam (T332): the platform branch and the ps runner. Production code never reassigns either. */
+export const procSeams: { platform: NodeJS.Platform; ps: (args: string[], options: PsOptions) => string } = {
+  platform: process.platform,
+  ps: (args, options) => execFileSync("ps", args, { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, ...options }),
+};
 
 /** Synchronous sleep for retry backoff; evidence paths must stay synchronous. */
 export const sleepSync = (ms: number) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
@@ -53,7 +60,7 @@ export function procTable(maxAgeMs = 2_000): Map<number, Proc> {
   if (cache && Date.now() - cache.at < maxAgeMs) return cache.table;
   const table = new Map<number, Proc>();
   try {
-    if (process.platform === "linux") {
+    if (procSeams.platform === "linux") {
       const boot = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
       for (const entry of readdirSync("/proc")) {
         if (!/^\d+$/.test(entry)) continue;
@@ -62,7 +69,7 @@ export function procTable(maxAgeMs = 2_000): Map<number, Proc> {
       }
     } else {
       processEvidenceSpawns.count += 1;
-      const out = execFileSync("ps", ["-A", "-o", "pid=,ppid=,lstart="], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, env: { ...process.env, LC_ALL: "C" } });
+      const out = procSeams.ps(["-A", "-o", "pid=,ppid=,lstart="], { env: { ...process.env, LC_ALL: "C" } });
       for (const line of out.split("\n")) {
         const m = /^\s*(\d+)\s+(\d+)\s+(.+?)\s*$/.exec(line);
         if (m) table.set(Number(m[1]), { ppid: Number(m[2]), start: m[3] });
@@ -94,7 +101,41 @@ export function ancestors(pid = process.pid, max = 16): number[] {
   return out;
 }
 
-export const _resetProcCache = () => { cache = null; };
+/** Lease-format evidence from one full process table: BSD one-second birth resolution, rendered in UTC. */
+export type PsEvidence = { zombie: boolean; start: string };
+const PS_EVIDENCE_TIMEOUT_MS = 1000;
+/** A successful table answers every pid for this long (the T206 evidence cache window); a failed read is never kept. */
+const PS_EVIDENCE_MAX_AGE_MS = 1000;
+let psEvidence: { at: number; table: Map<number, PsEvidence> } | null = null;
+
+/**
+ * Every process's lease evidence from one `ps -A` (T332). On macOS `ps -p <a,b,…>` costs 0.3-0.7 s (it hit the 1 s
+ * timeout under load), while the full table costs about 30 ms; filtering in process keeps one read per pass, never one per
+ * pid. Start strings are byte-identical to the former `ps -p` read: `ps-utc:` plus lstart in UTC with whitespace collapsed.
+ * Returns null when ps fails or times out; that failure is not cached, so the next call reads again.
+ */
+export function psEvidenceTable(maxAgeMs = PS_EVIDENCE_MAX_AGE_MS): { at: number; table: Map<number, PsEvidence> } | null {
+  if (psEvidence && performance.now() - psEvidence.at <= maxAgeMs) return psEvidence;
+  const at = performance.now(); // taken before the spawn: a slow read does not extend its own freshness
+  processEvidenceSpawns.count += 1;
+  let out: string;
+  try {
+    out = procSeams.ps(["-A", "-o", "pid=,stat=,lstart="], {
+      timeout: PS_EVIDENCE_TIMEOUT_MS, stdio: ["ignore", "pipe", "ignore"],
+      env: { ...process.env, TZ: "UTC", LC_ALL: "C", LANG: "C" },
+    });
+  } catch { return null; }
+  const table = new Map<number, PsEvidence>();
+  for (const line of out.split("\n")) {
+    const m = /^\s*(\d+)\s+(\S+)\s+([A-Z][a-z]{2} [A-Z][a-z]{2}\s+\d{1,2} \d{2}:\d{2}:\d{2} \d{4})\s*$/.exec(line);
+    if (m) table.set(Number(m[1]), { zombie: m[2].includes("Z"), start: `ps-utc:${m[3].replace(/\s+/g, " ")}` });
+  }
+  if (!table.size) return null; // a table with no rows (not even ps itself) is not evidence that anything died
+  return psEvidence = { at, table };
+}
+
+export const _resetPsEvidenceCache = () => { psEvidence = null; };
+export const _resetProcCache = () => { cache = null; psEvidence = null; };
 
 /**
  * The session id Claude Code currently records for its process `pid` (~/.claude/sessions/<pid>.json). /clear, /resume

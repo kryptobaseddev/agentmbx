@@ -9,6 +9,11 @@ let cache = null;
 const snapshots = new AsyncLocalStorage();
 /** Count of ps spawns for process evidence (T206 measurement); never reset by production code. */
 export const processEvidenceSpawns = { count: 0 };
+/** Test seam (T332): the platform branch and the ps runner. Production code never reassigns either. */
+export const procSeams = {
+    platform: process.platform,
+    ps: (args, options) => execFileSync("ps", args, { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, ...options }),
+};
 /** Synchronous sleep for retry backoff; evidence paths must stay synchronous. */
 export const sleepSync = (ms) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
 /** Capture process inventory before a database transaction; expired or escaped scopes fail closed. */
@@ -62,7 +67,7 @@ export function procTable(maxAgeMs = 2_000) {
         return cache.table;
     const table = new Map();
     try {
-        if (process.platform === "linux") {
+        if (procSeams.platform === "linux") {
             const boot = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
             for (const entry of readdirSync("/proc")) {
                 if (!/^\d+$/.test(entry))
@@ -74,7 +79,7 @@ export function procTable(maxAgeMs = 2_000) {
         }
         else {
             processEvidenceSpawns.count += 1;
-            const out = execFileSync("ps", ["-A", "-o", "pid=,ppid=,lstart="], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, env: { ...process.env, LC_ALL: "C" } });
+            const out = procSeams.ps(["-A", "-o", "pid=,ppid=,lstart="], { env: { ...process.env, LC_ALL: "C" } });
             for (const line of out.split("\n")) {
                 const m = /^\s*(\d+)\s+(\d+)\s+(.+?)\s*$/.exec(line);
                 if (m)
@@ -115,7 +120,43 @@ export function ancestors(pid = process.pid, max = 16) {
         out.push(p);
     return out;
 }
-export const _resetProcCache = () => { cache = null; };
+const PS_EVIDENCE_TIMEOUT_MS = 1000;
+/** A successful table answers every pid for this long (the T206 evidence cache window); a failed read is never kept. */
+const PS_EVIDENCE_MAX_AGE_MS = 1000;
+let psEvidence = null;
+/**
+ * Every process's lease evidence from one `ps -A` (T332). On macOS `ps -p <a,b,…>` costs 0.3-0.7 s (it hit the 1 s
+ * timeout under load), while the full table costs about 30 ms; filtering in process keeps one read per pass, never one per
+ * pid. Start strings are byte-identical to the former `ps -p` read: `ps-utc:` plus lstart in UTC with whitespace collapsed.
+ * Returns null when ps fails or times out; that failure is not cached, so the next call reads again.
+ */
+export function psEvidenceTable(maxAgeMs = PS_EVIDENCE_MAX_AGE_MS) {
+    if (psEvidence && performance.now() - psEvidence.at <= maxAgeMs)
+        return psEvidence;
+    const at = performance.now(); // taken before the spawn: a slow read does not extend its own freshness
+    processEvidenceSpawns.count += 1;
+    let out;
+    try {
+        out = procSeams.ps(["-A", "-o", "pid=,stat=,lstart="], {
+            timeout: PS_EVIDENCE_TIMEOUT_MS, stdio: ["ignore", "pipe", "ignore"],
+            env: { ...process.env, TZ: "UTC", LC_ALL: "C", LANG: "C" },
+        });
+    }
+    catch {
+        return null;
+    }
+    const table = new Map();
+    for (const line of out.split("\n")) {
+        const m = /^\s*(\d+)\s+(\S+)\s+([A-Z][a-z]{2} [A-Z][a-z]{2}\s+\d{1,2} \d{2}:\d{2}:\d{2} \d{4})\s*$/.exec(line);
+        if (m)
+            table.set(Number(m[1]), { zombie: m[2].includes("Z"), start: `ps-utc:${m[3].replace(/\s+/g, " ")}` });
+    }
+    if (!table.size)
+        return null; // a table with no rows (not even ps itself) is not evidence that anything died
+    return psEvidence = { at, table };
+}
+export const _resetPsEvidenceCache = () => { psEvidence = null; };
+export const _resetProcCache = () => { cache = null; psEvidence = null; };
 /**
  * The session id Claude Code currently records for its process `pid` (~/.claude/sessions/<pid>.json). /clear, /resume
  * and compaction rewrite it while the same process (and its mbx MCP server) lives on, so it is read fresh each time.

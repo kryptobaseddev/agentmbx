@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Process evidence no longer times out on macOS under load (T332):** lease and hook identity checks read process birth times with `ps -p <pid,pid,…>`, which takes 0.3-0.7 s on macOS 27 (a full `ps -A` takes about 30 ms) and hit its 1 s timeout under load. A timed-out read was then cached as "unknown" for a second, so the 250 ms and 500 ms retries saw the same failure and hooks, takeovers and held operations failed intermittently. On macOS and other ps platforms the evidence now comes from one `ps -A` table per pass, filtered in process and shared for one second; Linux still reads /proc. A failed or timed-out read, or any other unknown answer, is never cached, so every retry inspects again; a live process with its birth time, or a pid proven gone, is cached as before. Stored start strings are unchanged (`identity_leases.holder_start` keeps `ps-utc:<lstart in UTC>`, `sessions.pid_start` keeps the local `lstart`), so existing leases and bindings stay valid.
+
 ## 0.5.6 (2026-10-03)
 
 The status surface: every harness can show which mailbox a session holds and what is waiting, from snapshots the daemon writes, without ever showing another session's mail; and a resumed Claude session keeps the mailbox it registers.
