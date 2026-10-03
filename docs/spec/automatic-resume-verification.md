@@ -36,10 +36,10 @@ records what is proven with which evidence, and what remains. It changes no runt
 
 | Provider | Resume path | Proven (evidence) | Missing |
 |---|---|---|---|
-| Claude (dedicated) | New kernel session id on restart → claim with prior anchor; live push via channel/socket (T202) | Clean + crash reconnect tests ("claude: renamed mailbox survives clean/crash reconnect"); MCP disconnect retires its key and rebinds; claim/adopt idempotency; pending-resume test; persona handoff test | Live capture on this host: restart a Claude session in a real folder, confirm channel wake arrives before the next prompt (file as a T220-style proof) |
-| Codex (shared, resumable thread) | Exact-session restart keeps threadId; sessionHint + claim resume identity | Clean + crash reconnect tests; "list and claim agree" idle-conversation takeover; remembered-name pending resume | Live capture: resume a Codex thread, confirm `mbx_whoami` shows the same identity and the missed counter |
+| Claude (dedicated) | New kernel session id on restart → claim with prior anchor; live push via channel/socket (T202). Inside one process the id also changes on `claude --resume`, `/resume`, `/clear` and compaction: the SessionStart hook rebinds the holder to the id named in `~/.claude/sessions/<pid>.json` (T309), and the MCP server follows that file on its next tool call or 60 s heartbeat (T326). After a crash the remembered name `name:claude:<id>` is restored automatically; after a clean exit the SessionEnd release deletes it, so the next session claims the mailbox by name | Clean + crash reconnect tests ("claude: renamed mailbox survives clean/crash reconnect"); claim/adopt idempotency; pending-resume test; persona handoff test; test/hooks.test.ts "Claude /clear with a real session file: the hook rebinds the holder to the new id; a forged id is refused (T309)"; test/status-identity.test.ts (T310); test/resume-binding.test.ts (T326) | Live capture on this host: restart or `/resume` a Claude session in a real folder, confirm the channel wake arrives before the next prompt and that `agentmbx status --cli claude --session <resumed id>` resolves the same mailbox |
+| Codex (shared, resumable thread) | Exact-session restart keeps threadId; sessionHint + claim resume identity | Clean + crash reconnect tests; "MCP disconnect retires its key and reconnects to the hook session" (test/mcp.test.ts, runs as Codex); "list and claim agree" idle-conversation takeover; remembered-name pending resume | Live capture: resume a Codex thread, confirm `mbx_whoami` shows the same identity and the missed counter |
 | OpenCode (shared service) | sessionID resume; same hint + claim machinery | Clean + crash reconnect tests; "an MCP-only opencode binding never wakes a guessed session" (exact session only); explicit OpenCode→Claude handoff test | Live capture, same shape as Codex |
-| Kimi — terminal | Dedicated process, new session id per start; watcher wake (T033) | Clean + crash reconnect tests; live T033 watcher proofs (.cleo/cache/evidence/t033-kimi-terminal-watcher.txt and the 2026-10-01 wake probes) | None blocking |
+| Kimi — terminal | Dedicated process, new session id per start; watcher wake (T033) | Clean + crash reconnect tests; live T033 watcher proofs and the 2026-10-01 wake probes, recorded as CLEO evidence on T033 (local evidence cache, not in git) | None blocking |
 | Kimi — hosted (web/desktop daimon) | Bind-ticket conversation linking (T033); identity + checkpoint per conversation | Fixture: "a desktop conversation links its own mbx server by ticket, registers its own identity, resumes it, and its hooks then work"; wakeKimiDesktop outcome matrix | Live proof of resume after the daimon restarts (checkpoint continues, bind re-links); needs the app running — manual/live item |
 | Hermes | MCP-only wiring exists; Hermes deferred (T189) with explicit fixture/live coverage gaps | Wiring only | Everything resume-specific: no hooks, no wake path, no reconnect test. Record as the accepted deferral; a fixture-level claim test is the only near-term item |
 
@@ -47,13 +47,14 @@ records what is proven with which evidence, and what remains. It changes no runt
 
 - CU-01..CU-10 suite (merged; CI green) for the checkpoint contract.
 - Per-CLI reconnect matrix above (test suite).
-- Two-host T220 proof and the t033 live evidence files under .cleo/cache/evidence/.
+- The two-host live proof (T220, macbook ↔ fedora, 2026-10-02) and the T033 live evidence, both recorded as CLEO task
+  evidence (the evidence cache is local and not in git).
 
 ## Missing-work list
 
 1. Live restart captures: Claude channel wake after a real terminal restart; Codex and OpenCode
    thread/session resumes showing identity + missed counter. Each is a short manual run on this
-   host; file outputs under .cleo/cache/evidence/.
+   host; record the outputs as CLEO evidence on T162.
 2. Hosted-Kimi daimon-restart proof (checkpoint continuity and bind re-link).
 3. Hermes: fixture claim test plus a documented deferral referencing T189.
 
