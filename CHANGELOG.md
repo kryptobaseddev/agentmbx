@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **External taint ends an hour after its root exposure (T344):** after a session read external mail, every message it sent for the next hour went out `origin: "external"`. Each read of external mail restarted that hour, including mail that was external only because its sender had read external mail. Two agents answering each other after either was exposed therefore kept tainting each other indefinitely: under policy the other could only read, never edit. For example, cleo-dev-mac → lead → drum → lead kept drum read-only on the lead's own task assignment. Nobody was told why. Now:
+  - External mail carries the **root exposure** time in two new signed fields: `meta.external_since` (ISO) and `meta.external_source` (`declared` or `inherited`).
+  - A reader keeps the latest root, never its read time. A conversation is clean one hour after the root exposure, however often both sides reply.
+  - First-hand content still taints from the moment it is read: content its sender declared external, and malformed mail. Re-reading it is a new exposure.
+  - External mail from older versions counts from its send time. A root later than the reader's clock counts as the read time.
+  - A malformed value fails the envelope shape check, so paired hosts and relays reject it, and a stored one counts as first-hand.
+  - Agents now see the taint. `mbx_send` and `mbx_reply` warn when a message went out external: the root time, which message and sender caused it, and when it clears. An explicit `origin: "agent"` while tainted is reported as overridden. The `mbx_read` header has an `origin:` line: declared by the sender, or inherited from a root exposure at a given time, and when that clears. `mbx_whoami` shows `external` with `clears_at`.
+  - Unchanged: the read-only downgrade, relay depth (T104), and the rule that an owner prompt never clears external origin.
+
 - **Process evidence no longer times out on macOS under load (T332):** lease and hook identity checks read process birth times with `ps -p <pid,pid,…>`, which takes 0.3-0.7 s on macOS 27 (a full `ps -A` takes about 30 ms) and hit its 1 s timeout under load. A timed-out read was then cached as "unknown" for a second, so the 250 ms and 500 ms retries saw the same failure and hooks, takeovers and held operations failed intermittently. On macOS and other ps platforms the evidence now comes from one `ps -A` table per pass, filtered in process and shared for one second; Linux still reads /proc. A failed or timed-out read, or any other unknown answer, is never cached, so every retry inspects again; a live process with its birth time, or a pid proven gone, is cached as before. Stored start strings are unchanged (`identity_leases.holder_start` keeps `ps-utc:<lstart in UTC>`, `sessions.pid_start` keeps the local `lstart`), so existing leases and bindings stay valid.
 
 ## 0.5.6 (2026-10-03)

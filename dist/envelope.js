@@ -10,6 +10,10 @@ export const MAX_SUBJECT = 200, MAX_RECIPIENTS = 100, MAX_REFS = 100, MAX_FIELD 
 /** A sealed body on the wire: base64 of the MAX_BODY plaintext plus the 16-byte AEAD tag. */
 export const MAX_SEALED_BODY = 4 * Math.ceil((MAX_BODY + 16) / 3);
 export const NAME_RE = /^[a-z0-9][a-z0-9-]{1,39}$/;
+/** How long outside content a session read keeps that session's own sends external, counted from the root exposure (T104, T344). */
+export const EXTERNAL_TAINT_MS = 3_600_000;
+/** Instants as `Date.prototype.toISOString` writes them (years 0000-9999). */
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
 export function parseMeta(body) {
     const uniq = (xs) => [...new Set(xs)];
     const all = (re) => uniq([...body.matchAll(re)].map((m) => m[1]));
@@ -31,7 +35,7 @@ export function buildEnvelope(d, now = new Date()) {
     return {
         v: 3, id, ts: now.toISOString(), from: d.from, to: d.to, thread: d.thread ?? id, reply_to: d.reply_to ?? null,
         kind: d.kind ?? "message", subject: oneLine(d.subject).slice(0, 200), body: d.body, needs_reply: d.needs_reply ?? false,
-        refs: d.refs ?? [], meta: { ...parseMeta(d.body), ...(d.unverifiedSender ? { sender_verification: "unverified" } : {}), ...(d.origin === "external" ? { origin: "external" } : {}), ...(d.hop ? { hop: d.hop } : {}), ...(d.project ? { project: d.project.slice(0, 300) } : {}), ...(d.project_key ? { project_key: d.project_key.slice(0, 300) } : {}) },
+        refs: d.refs ?? [], meta: { ...parseMeta(d.body), ...(d.unverifiedSender ? { sender_verification: "unverified" } : {}), ...(d.origin === "external" ? { origin: "external", external_since: d.external_since ?? now.toISOString(), external_source: d.external_since ? "inherited" : "declared" } : {}), ...(d.hop ? { hop: d.hop } : {}), ...(d.project ? { project: d.project.slice(0, 300) } : {}), ...(d.project_key ? { project_key: d.project_key.slice(0, 300) } : {}) },
         authority: null, enc: null,
     };
 }
@@ -140,6 +144,12 @@ export function checkShape(x) {
         return "bad hop";
     if (m?.origin !== undefined && m.origin !== "agent" && m.origin !== "external")
         return "bad origin";
+    // T344: the root exposure time of external mail. A future value is well-formed here and counts as the reader's now.
+    if (m?.external_since !== undefined && (m.origin !== "external" || typeof m.external_since !== "string" || !ISO_INSTANT.test(m.external_since)
+        || !Number.isFinite(Date.parse(m.external_since))))
+        return "bad external_since";
+    if (m?.external_source !== undefined && (m.external_since === undefined || (m.external_source !== "declared" && m.external_source !== "inherited")))
+        return "bad external_source";
     if (m?.project !== undefined && (typeof m.project !== "string" || m.project.length > 300))
         return "bad project";
     if (m?.project_key !== undefined && (typeof m.project_key !== "string" || m.project_key.length > 300))
@@ -148,6 +158,25 @@ export function checkShape(x) {
     if (m?.local_names !== undefined && (!Array.isArray(m.local_names) || m.local_names.length > 100 || m.local_names.some((n) => typeof n !== "string" || !NAME_RE.test(n))))
         return "bad local names";
     return null;
+}
+/**
+ * The root exposure a reader takes from one message read at `now`. First-hand outside content (declared external by its
+ * sender, or a malformed envelope whose provenance is unknown) exposes the reader now. Inherited taint keeps the sender's
+ * root exposure, and external mail from before T344 (no `external_since`) counts from its send time, so agents answering
+ * each other never extend a taint past root + EXTERNAL_TAINT_MS. A root later than `now` (a skewed clock or a bad sender)
+ * counts as `now`: never longer than one first-hand read. A reader keeps the latest root of everything it read.
+ */
+export function externalExposure(e, now) {
+    if (checkShape(e))
+        return { how: "malformed", root: now };
+    const { meta: m, ts } = e;
+    if (m.origin !== "external")
+        return null;
+    if (m.external_since === undefined)
+        return { how: "legacy", root: Math.min(Date.parse(ts), now) };
+    if (m.external_source !== "inherited")
+        return { how: "declared", root: now };
+    return { how: "inherited", root: Math.min(Date.parse(m.external_since), now) };
 }
 // ---- owner grants ----------------------------------------------------------------------------
 export const CAPS = ["task.assign", "decision", "broadcast", "alert"];
