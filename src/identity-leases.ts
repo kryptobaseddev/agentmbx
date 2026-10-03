@@ -289,6 +289,17 @@ export class IdentityLeases {
       return true;
     });
   }
+  /** The same holder, process and key under the provider's new session id (Claude replaces it within one process, T326). */
+  moveSession(name: string, token: string, sessionId: string): IdentityLease {
+    return this.store.tx(() => {
+      const row = this.row(name);
+      if (!row || row.token !== token || row.released_at !== null) throw error("IDENTITY_LEASE_LOST", `identity ${name} lease is no longer usable; explicitly reclaim it`);
+      if (row.session_id === sessionId) return row;
+      this.store.db.prepare("UPDATE identity_leases SET session_id=? WHERE name=? AND token=? AND released_at IS NULL").run(sessionId, name, token);
+      this.store.audit("identity.session-moved", { name, from: row.session_id, to: sessionId, holder: this.holder(row) });
+      return this.row(name)!;
+    });
+  }
   /** Move ownership atomically with a fresh generation; a failed destination claim restores the source. */
   rename(name: string, token: string, nextName: string): IdentityLease {
     const source = this.observe(name), destination = name === nextName ? source : this.observe(nextName);

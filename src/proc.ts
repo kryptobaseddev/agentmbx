@@ -1,7 +1,7 @@
 // Process identity: a PID plus its start time, so a reused PID never inherits a dead session's identity.
 // Linux uses kernel birth ticks and boot identity; other platforms use ps. Tables are cached briefly.
 import { execFileSync } from "node:child_process";
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -102,7 +102,23 @@ export const _resetProcCache = () => { cache = null; };
  */
 export function claudeSessionId(pid: number): string | null {
   try {
-    const id = JSON.parse(readFileSync(join(homedir(), ".claude/sessions", `${pid}.json`), "utf8"))?.sessionId;
+    const id = JSON.parse(readFileSync(claudeSessionFile(pid), "utf8"))?.sessionId;
     return typeof id === "string" && id.trim() ? id : null;
   } catch { return null; }
+}
+const claudeSessionFile = (pid: number) => join(homedir(), ".claude/sessions", `${pid}.json`);
+
+/**
+ * claudeSessionId for a caller that asks on every tool call and heartbeat (T326): the file is parsed again only when its
+ * inode, size or modification time changed.
+ */
+export function claudeSessionTracker(pid: number): () => string | null {
+  let stamp: string | null = null, id: string | null = null;
+  return () => {
+    let next: string | null = null;
+    try { const s = statSync(claudeSessionFile(pid)); next = `${s.ino}:${s.size}:${s.mtimeMs}`; } catch { /* no file yet */ }
+    if (next === null) { stamp = null; return id = null; }
+    if (next !== stamp) { stamp = next; id = claudeSessionId(pid); }
+    return id;
+  };
 }

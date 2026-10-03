@@ -5,12 +5,32 @@
 # overwrites it. Renders nothing when the daemon heartbeat is stale or the session is unbound.
 set -f
 json=$(cat 2>/dev/null) || exit 0
-# Round 4: the FIRST session_id wins. A left-greedy match lets a nested key override the
-# conversation's own id ({"session_id":"mine","agent":{"session_id":"victim"}} renders victim); a
-# charset-validating match falls through to the nested key when the top-level id is invalid.
-pair=$(printf '%s' "$json" | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n 1)
-[ -n "$pair" ] || exit 0
-sid=$(printf '%s' "$pair" | sed 's/^"session_id"[[:space:]]*:[[:space:]]*"//; s/"$//')
+# Only the TOP-LEVEL "session_id" counts, and only when its value is a string. A small awk scanner
+# tracks strings, escapes and nesting depth, so a nested key never supplies the id, whether it
+# comes before or after the top-level one, and a null, number or object id renders nothing.
+sid=$(printf '%s' "$json" | LC_ALL=C awk '
+BEGIN { RS = "\001" }
+{
+  n = length($0); d = 0; ins = 0; esc = 0; tok = ""; key = ""; expectkey = 0; want = 0
+  for (i = 1; i <= n; i++) {
+    c = substr($0, i, 1)
+    if (ins) {
+      if (esc) { esc = 0; tok = tok c; continue }
+      if (c == "\\") { esc = 1; tok = tok c; continue }
+      if (c != "\"") { tok = tok c; continue }
+      ins = 0
+      if (d == 1 && want) { print tok; exit }
+      if (d == 1 && expectkey) { key = tok; expectkey = 0 }
+      continue
+    }
+    if (want && c != "\"" && c !~ /[ \t\r\n]/) exit
+    if (c == "\"") { ins = 1; tok = ""; continue }
+    if (c == "{" || c == "[") { d++; if (d == 1 && c == "{") expectkey = 1; continue }
+    if (c == "}" || c == "]") { d--; continue }
+    if (d == 1 && c == ",") { expectkey = 1; key = ""; continue }
+    if (d == 1 && c == ":" && key == "session_id") want = 1
+  }
+}')
 case "$sid" in
   *[!A-Za-z0-9_-]*|'') exit 0 ;;
 esac
