@@ -48,10 +48,11 @@ the oldest unacked message id per open thread; (c) retention is 30 days.
 
 ### The saved note (AC1, AC3)
 
-4. The only persisted artifact is a handoff note saved by an explicit act: `mbx_handoff save` (or
-   `save: true`), the session-end hook, or `mbx_identity release`. It is agent-entered text of at
-   most **1000 characters**, plus `task_refs: string[]` (unioned from the open threads' signed
-   `meta.task_refs) and `msg_refs: string[]` (the open threads' ids). No other fields.
+4. The only persisted artifact is a handoff note authored by the agent's explicit act: `mbx_handoff save`
+   or `mbx_identity release {note}`. Session-end hooks never author text — a note exists only when an
+   agent chose to write one. The note is agent-entered text of at most **1000 characters**, plus
+   `task_refs: string[]` and `msg_refs: string[]` that the agent chose and that are validated against
+   the open threads' ids and their signed `meta.task_refs` (not auto-unioned). No other fields.
 5. Writes are replace-only (one current note; no history) under the held write lease. There are no
    ack-batch or per-tool-call writes. Retention is explicit: 30 days, dropped on read with a reason.
    Size bounds: at most 20 task references and 20 message references; excess is dropped
@@ -97,4 +98,4 @@ the note is a pointer, not a log).
 | HC-04 | Task references come from signed `meta.task_refs` only; tool text and skill state status must be re-verified via CLEO. |
 | HC-05 | Release/retire/forward leave the note; rename moves it; expiry drops it after 30 days with an explicit reason. |
 | HC-06 | Corrupted note and injected write failure behave per R10. |
-| HC-07 | Write triggers are explicit save, session-end, and release only; no write on ordinary tool calls or ack batches. |
+| HC-07 | Write triggers are explicit save and `mbx_identity release {note}` only (hooks never author text); no write on ordinary tool calls or ack batches. |
