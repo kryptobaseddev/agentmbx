@@ -86,7 +86,7 @@ test("channel mode: a new request pushes a notifications/claude/channel wake wit
   for (let i = 0; i < 20 && !notes.length; i++) await new Promise((r) => setTimeout(r, 250));
   assert.equal(notes.length, 1);
   const p = notes[0] as { content: string; meta: { count: string } };
-  assert.match(p.content, /1 new message\(s\) for sleeper .*Check them with mbx_inbox/);
+  assert.match(p.content, /1 new message\(s\) for sleeper .*mbx_inbox or mbx_read, reply, ack/);
   assert.doesNotMatch(p.content, /SECRET-BODY-TEXT|claimed/);
   assert.equal(p.meta.count, "1");
   n.close(); await c.close();

@@ -27,7 +27,7 @@ import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy
 import { assertKnownRecipients, deliveryReceipts, offlineWarnings, receiptLine, recipientReceipts, sentPage } from "./receipts.js";
 import { forwardMessage, ledgerPage } from "./project-ledger.js";
 import { skillFiles } from "./setup.js";
-import { procStart, withProcSnapshot } from "./proc.js";
+import { claudeSessionId, procStart, withProcSnapshot } from "./proc.js";
 import { updateAvailable } from "./update.js";
 import { installKind, version } from "./version.js";
 import { connectorKey } from "./diagnostics.js";
@@ -238,14 +238,7 @@ export function detectHost(ppid = process.ppid) {
     // (tests, scripts) inherits the variables but must never push into that unrelated session. Sockets are named <pid>.sock.
     const sock = process.env.CLAUDE_CODE_MESSAGING_SOCKET;
     const socket = cli === "claude" && !channel && !!sock && process.env.MBX_SESSION_SOCKET !== "0" && basename(sock) === `${ppid}.sock`;
-    let sessionId = `mcp-${process.pid}`;
-    const cs = join(homedir(), ".claude/sessions", `${ppid}.json`);
-    if (cli === "claude" && existsSync(cs)) {
-        try {
-            sessionId = JSON.parse(readFileSync(cs, "utf8")).sessionId ?? sessionId;
-        }
-        catch { /* keep default */ }
-    }
+    const sessionId = (cli === "claude" ? claudeSessionId(ppid) : null) ?? `mcp-${process.pid}`;
     return { cli, channel, socket, sessionId, ppid };
 }
 /** Queue a no-body wake hint into this Claude session through its inbox socket (NDJSON: auth line, then a user line). */
@@ -820,7 +813,7 @@ export async function runMcp(existing) {
         if (action !== "claim" && action !== "register" && (name || role || description))
             throw new Error("name, role and description are only valid for claim and register");
         if (action === "list") {
-            const result = listIdentityStatus(node.home, { project: all ? undefined : project, caller: { cli: env.cli, sessionId: state.sessionId } });
+            const result = listIdentityStatus(node.home, { project: all ? undefined : project, caller: { cli: env.cli, sessionId: state.sessionId, pid: process.pid } });
             const out = { ...result, you: bound(state) ? { agent: state.agent, address: `${state.agent}@${node.host}` } : { agent: null, pending: state.pending ?? null, reason: state.lostTo ?? state.pendingReason ?? null },
                 next: bound(state) ? "This session already holds an identity; release it before claiming another."
                     : `Claim one with claimable true ({"action":"claim","name":"<name>"}), or register a new identity ({"action":"register","name":"<project>-<role>","role":"<role>"}).${!all ? " Pass all:true for every identity on this host." : ""}` };
@@ -859,9 +852,13 @@ export async function runMcp(existing) {
             // still be claimed without one, to read their mail.
             if (AUTO_NAME_RE.test(target))
                 throw Object.assign(new Error(`"${target}" looks auto-generated; register a readable name such as <project>-<role>`), { code: "IDENTITY_NAME_UNREADABLE" });
-            if (!role)
+            // A mailbox that already exists here (it had mail, a lease, an agents row or an alias) is resumed by name, keeping
+            // the role it was known by, so the list's "claimable" and the claim agree (T315). A new name still needs a role.
+            if (!role && !(action === "claim" && node.knownLocalName(target)))
                 throw Object.assign(new Error(`${target} is not a registered identity yet: pass role (e.g. lead, reviewer, builder) to ${action} it`), { code: "IDENTITY_ROLE_REQUIRED" });
         }
+        const inheritedRole = !registration && !role && action === "claim" && !AUTO_NAME_RE.test(target)
+            ? node.agents().find((a) => a.name === target && a.host === node.host)?.role || UNSPECIFIED_ROLE : undefined;
         if (state.leaseToken && !state.released) {
             try {
                 return leases.withHeld(state.agent, state.leaseToken, () => {
@@ -883,8 +880,8 @@ export async function runMcp(existing) {
             reviveMailbox(node, target);
             bind(next, true);
             node.keepName(env.cli, next.sessionId, next.agent);
-            if (role || description)
-                registerIdentity(node.store, { name: target, role: role ?? registration?.role ?? UNSPECIFIED_ROLE, description, by: `${env.cli}:${next.sessionId}` });
+            if (role || description || inheritedRole)
+                registerIdentity(node.store, { name: target, role: role ?? registration?.role ?? inheritedRole ?? UNSPECIFIED_ROLE, description, by: `${env.cli}:${next.sessionId}` });
             node.registerAgent(target, { cli: env.cli, ...(role ? { role } : {}), ...(description ? { description } : {}) });
             return handoff(next.agent);
         }));
@@ -950,7 +947,7 @@ export async function runMcp(existing) {
         if (!bound(state)) {
             if (name)
                 return identityOperation({ action: registeredIdentity(node.store, name) || AUTO_NAME_RE.test(name) ? "claim" : "register", name, role, description });
-            const list = listIdentityStatus(node.home, { project, caller: { cli: env.cli, sessionId: state.sessionId } });
+            const list = listIdentityStatus(node.home, { project, caller: { cli: env.cli, sessionId: state.sessionId, pid: process.pid } });
             const out = { agent: null, host: node.host, cli: env.cli, unbound: true, project: project ?? null, pending: state.pending ?? null,
                 reason: state.lostTo ? `claimed by ${state.lostTo}` : state.pendingReason ?? null, next: unboundMessage(state),
                 project_identities: list.identities.map(i => ({ name: i.name, role: i.role, state: i.state, claimable: i.claimable, unread: i.unread, reason: i.reason })),

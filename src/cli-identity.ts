@@ -2,7 +2,7 @@
 import { canonical } from "./crypto.ts";
 import { findIdentityControl, identityControlKey, identityGeneration, inspectIdentityControlCaller, listIdentityControls, type IdentityControlDescriptor } from "./identity-control.ts";
 import { IdentityLeases, inspectLeaseProcess, UNKNOWN_RETRY_DELAYS_MS, type IdentityLease } from "./identity-leases.ts";
-import { sleepSync } from "./proc.ts";
+import { claudeSessionId, sleepSync } from "./proc.ts";
 import { kimiInstances } from "./kimi-web.ts";
 import type { MbxNode } from "./node.ts";
 
@@ -34,8 +34,11 @@ export function withHookIdentity<T>(node: MbxNode, cli: string, session: string 
   if (node.store.get(identityControlKey(cli, session)) !== undefined && !rebindClaude) descriptors = [findIdentityControl(node.store, cli, session)];
   else {
     // Hosted providers must first publish an exact session binding. Never bootstrap by directory.
+    // Claude's /clear, /resume and compaction replace the session id of the same process, whose MCP holder carries the
+    // id it started with: the provider's own session file naming exactly this session is the proof of that rotation.
+    const rotated = cli === "claude" && claudeSessionId(process.ppid) === session;
     if (!allowBootstrap || !["claude", "kimi"].includes(cli) || (cli === "kimi" && kimiInstances().some(instance => instance.pid === process.ppid)) || new Set(all.map(d => d.control_key)).size !== 1
-      || all.some(d => !d.lease_session_id.startsWith("mcp-") || (cli !== "claude" && !d.session_id.startsWith("mcp-"))
+      || all.some(d => (!d.lease_session_id.startsWith("mcp-") && !rotated) || (cli !== "claude" && !d.session_id.startsWith("mcp-"))
         || !matches(d, rowFor(node, d.agent)) || canonical({ ...d, session_id: "" }) !== canonical({ ...all[0], session_id: "" })))
       throw refused("hook session has no exact current MCP binding");
     descriptors = all; bootstrap = true;

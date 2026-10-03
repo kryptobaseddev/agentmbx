@@ -2,6 +2,8 @@
 // Linux uses kernel birth ticks and boot identity; other platforms use ps. Tables are cached briefly.
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 let cache = null;
 const snapshots = new AsyncLocalStorage();
@@ -114,3 +116,16 @@ export function ancestors(pid = process.pid, max = 16) {
     return out;
 }
 export const _resetProcCache = () => { cache = null; };
+/**
+ * The session id Claude Code currently records for its process `pid` (~/.claude/sessions/<pid>.json). /clear, /resume
+ * and compaction rewrite it while the same process (and its mbx MCP server) lives on, so it is read fresh each time.
+ */
+export function claudeSessionId(pid) {
+    try {
+        const id = JSON.parse(readFileSync(join(homedir(), ".claude/sessions", `${pid}.json`), "utf8"))?.sessionId;
+        return typeof id === "string" && id.trim() ? id : null;
+    }
+    catch {
+        return null;
+    }
+}

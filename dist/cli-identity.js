@@ -2,7 +2,7 @@
 import { canonical } from "./crypto.js";
 import { findIdentityControl, identityControlKey, identityGeneration, inspectIdentityControlCaller, listIdentityControls } from "./identity-control.js";
 import { IdentityLeases, inspectLeaseProcess, UNKNOWN_RETRY_DELAYS_MS } from "./identity-leases.js";
-import { sleepSync } from "./proc.js";
+import { claudeSessionId, sleepSync } from "./proc.js";
 import { kimiInstances } from "./kimi-web.js";
 const refused = (message) => Object.assign(new Error(message), { code: "IDENTITY_LEASE_REQUIRED" });
 const rowFor = (node, name) => node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(name);
@@ -31,8 +31,11 @@ export function withHookIdentity(node, cli, session, operation, allowBootstrap =
         descriptors = [findIdentityControl(node.store, cli, session)];
     else {
         // Hosted providers must first publish an exact session binding. Never bootstrap by directory.
+        // Claude's /clear, /resume and compaction replace the session id of the same process, whose MCP holder carries the
+        // id it started with: the provider's own session file naming exactly this session is the proof of that rotation.
+        const rotated = cli === "claude" && claudeSessionId(process.ppid) === session;
         if (!allowBootstrap || !["claude", "kimi"].includes(cli) || (cli === "kimi" && kimiInstances().some(instance => instance.pid === process.ppid)) || new Set(all.map(d => d.control_key)).size !== 1
-            || all.some(d => !d.lease_session_id.startsWith("mcp-") || (cli !== "claude" && !d.session_id.startsWith("mcp-"))
+            || all.some(d => (!d.lease_session_id.startsWith("mcp-") && !rotated) || (cli !== "claude" && !d.session_id.startsWith("mcp-"))
                 || !matches(d, rowFor(node, d.agent)) || canonical({ ...d, session_id: "" }) !== canonical({ ...all[0], session_id: "" })))
             throw refused("hook session has no exact current MCP binding");
         descriptors = all;

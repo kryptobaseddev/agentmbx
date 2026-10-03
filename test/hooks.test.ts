@@ -102,7 +102,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} hooks re
   const { n, call, agent, sid, run, send } = await holder(t, cli);
   const id = send();
   const prompt = run("prompt"); assert.equal(prompt.status, 0, prompt.stderr);
-  assert.match(prompt.stdout, /1 unread mbx message/); assert.doesNotMatch(prompt.stdout, /PRIVATE SUBJECT|SECRET BODY|unrelated/);
+  assert.match(prompt.stdout, /1 unread for .*: mbx_inbox/); assert.doesNotMatch(prompt.stdout, /PRIVATE SUBJECT|SECRET BODY|unrelated/);
   const rows = n.sessionsFor(agent); assert.equal(rows.length, 1); assert.equal(rows[0].session_id, sid); assert.ok(rows[0].session_key);
   assert.equal(n.inbox(agent)[0].state, "delivered");
   const startup = run("session-start"); assert.equal(startup.status, 0, startup.stderr);
@@ -238,4 +238,46 @@ for (const cli of ["claude", "codex", "kimi"]) test(`${cli} Stop honors a direct
   const r = run("stop");
   if (cli === "kimi") { assert.equal(r.status, 2); assert.match(r.stderr, /Before stopping/); }
   else { assert.equal(r.status, 0, r.stderr); assert.equal(JSON.parse(r.stdout).decision, "block"); }
+});
+
+test("Claude /clear with a real session file: the hook rebinds the holder to the new id; a forged id is refused (T309)", async t => {
+  // Claude writes ~/.claude/sessions/<pid>.json before it starts MCP servers, so the holder's lease carries the real id
+  // (not a provisional mcp- id). /clear rewrites that file while the same process and MCP server live on.
+  const home = mkdtempSync(join(tmpdir(), "mbx-clear-")), fakeHome = mkdtempSync(join(tmpdir(), "mbx-clear-home-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  const client = new Client({ name: "clear-test", version: "1" });
+  t.after(async () => { await client.close(); n.close(); for (const d of [home, fakeHome]) rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const sessions = join(fakeHome, ".claude/sessions"); mkdirSync(sessions, { recursive: true });
+  const write = (sid: string) => writeFileSync(join(sessions, `${process.pid}.json`), JSON.stringify({ pid: process.pid, sessionId: sid }));
+  write("real-before-clear");
+  await client.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
+    env: { ...process.env, HOME: fakeHome, MBX_HOME: home, MBX_AGENT: "builder", MBX_CLI: "claude", AGENTMBX_DEV: "1" } as Record<string,string> }));
+  assert.equal(((await client.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent: string }).agent, "builder");
+  assert.equal(n.store.db.prepare("SELECT session_id FROM identity_leases WHERE name='builder'").get()?.session_id, "real-before-clear");
+  sendLeased(n, { from: "sender", to: ["builder"], subject: "s", body: "b", kind: "request" });
+  const run = (event: string, sid: string) => spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", event, "--cli", "claude"],
+    { input: JSON.stringify({ session_id: sid, cwd: process.cwd() }), encoding: "utf8", timeout: 10_000,
+      env: { ...process.env, HOME: fakeHome, MBX_HOME: home, MBX_AGENT: "unrelated", AGENTMBX_DEV: "1" } });
+  assert.match(run("prompt", "real-before-clear").stdout, /1 unread/);
+  write("after-clear");
+  const r = run("session-start", "after-clear"); assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /You are builder@alpha/); assert.match(r.stdout, /1 unread/);
+  assert.deepEqual(n.sessionsFor("builder").map((s) => s.session_id), ["after-clear"]);
+  assert.match(run("prompt", "after-clear").stdout, /1 unread/);
+  // A session id the provider's own file does not name never rebinds the holder.
+  const forged = run("prompt", "someone-else"); assert.equal(forged.status, 0, forged.stderr); assert.doesNotMatch(forged.stdout, /unread/);
+  assert.deepEqual(n.sessionsFor("builder").map((s) => s.session_id), ["after-clear"]);
+  assert.notEqual((await client.callTool({ name: "mbx_inbox", arguments: {} })).isError, true);
+});
+
+test("lean notices: a wake prompt adds no second notice, and the policy recap is sent once per session", async t => {
+  const { n, agent, run, send } = await holder(t, "claude");
+  send();
+  const first = run("prompt", "real-hook-session", "claude", {}, { prompt: "please continue" });
+  assert.match(first.stdout, /1 unread for .*: mbx_inbox\. Policies \(separate grants; each message.s mbx_read header applies\): autonomous/);
+  const second = run("prompt", "real-hook-session", "claude", {}, { prompt: "and now?" });
+  assert.match(second.stdout, /1 unread for .*: mbx_inbox\./); assert.doesNotMatch(second.stdout, /Policies/, "recap only once per session");
+  const wake = run("prompt", "real-hook-session", "claude", {}, { prompt: `[mbx] 1 new message(s) for ${agent} from sender@alpha [local] (ids X). mbx_read, reply, ack.` });
+  assert.doesNotMatch(wake.stdout, /unread for/, "the wake prompt is the notice");
+  void n;
 });

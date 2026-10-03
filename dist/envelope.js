@@ -144,6 +144,9 @@ export function checkShape(x) {
         return "bad project";
     if (m?.project_key !== undefined && (typeof m.project_key !== "string" || m.project_key.length > 300))
         return "bad project key";
+    // bare `to` entries the sending host delivered to its own agents; receivers skip exactly these (S2 follow-up)
+    if (m?.local_names !== undefined && (!Array.isArray(m.local_names) || m.local_names.length > 100 || m.local_names.some((n) => typeof n !== "string" || !NAME_RE.test(n))))
+        return "bad local names";
     return null;
 }
 // ---- owner grants ----------------------------------------------------------------------------

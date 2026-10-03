@@ -376,6 +376,6 @@ export function dueReminders(db: DatabaseSync, withinMs = 48 * H, now = new Date
 export function policyBrief(db: DatabaseSync, agent: string, host: string): string {
   const ps = activePolicies(db, agent, host);
   if (!ps.length) return "";
-  return ` Your owner's signed AgentMBX policies for you (separate grants): ${ps.map(noticeGrant).join("; ")}.`
-    + " Do not combine their classes, scopes or expiries. Read mbx_read before acting; its header applies sender restrictions and message-specific downgrades. CLI permission prompts still require a matching permissions grant.";
+  // Each grant keeps its own scope; the how-to-apply guidance is in the session-start note and every mbx_read header.
+  return ` Policies (separate grants; each message's mbx_read header applies): ${ps.map(noticeGrant).join("; ")}.`;
 }
