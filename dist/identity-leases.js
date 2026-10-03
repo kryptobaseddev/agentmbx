@@ -20,6 +20,19 @@ const EVIDENCE_MAX_AGE_MS = 5000;
 /** Unknown evidence is retried with this backoff before an operation fails (T206). */
 export const UNKNOWN_RETRY_DELAYS_MS = [250, 500, 1_000];
 const error = (code, message) => Object.assign(new Error(message), { code });
+/**
+ * Repeat `attempt` while its answer is unknown, sleeping UNKNOWN_RETRY_DELAYS_MS between attempts (T340). A definite answer,
+ * a proof or a refusal, returns at once, so a legitimate refusal costs no backoff. Never sleeps while `store` holds an open
+ * transaction (an outer write lock): there the first answer stands.
+ */
+export function retryUnknown(store, attempt, unknown) {
+    for (let i = 0;; i++) {
+        const answer = attempt();
+        if (!unknown(answer) || i >= UNKNOWN_RETRY_DELAYS_MS.length || store.db.isTransaction)
+            return answer;
+        sleepSync(UNKNOWN_RETRY_DELAYS_MS[i]);
+    }
+}
 /** A point-in-time assessment, not authority to claim or operate as this holder. */
 export function identityLeaseStatus(row, now, p) {
     if (row.released_at !== null)
@@ -47,7 +60,7 @@ let selfEvidenceCache = null;
 function inspectSelf() {
     if (selfEvidenceCache)
         return selfEvidenceCache;
-    const value = psInspectBatch([process.pid]).get(process.pid) ?? UNKNOWN_PROCESS;
+    const value = psInspectBatch([process.pid]).found.get(process.pid) ?? UNKNOWN_PROCESS;
     // Cache only a complete answer: a ps timeout under load must not pin "unknown" for the life of the process.
     if (value.alive === true && value.start)
         selfEvidenceCache = value;
@@ -56,9 +69,10 @@ function inspectSelf() {
 /**
  * Evidence for every requested pid from one inventory read: /proc on Linux, otherwise one full `ps -A` table filtered here
  * (T332; never `ps -p <list>`, which takes 0.3-0.7 s on macOS). Liveness is probed now; start times come from the table.
+ * `at` is when that inventory was read: a table shared from earlier in the pass is as old as its read, not as this call.
  */
 function psInspectBatch(pids) {
-    const found = new Map();
+    const found = new Map(), requested = performance.now();
     const probe = (pid) => {
         try {
             process.kill(pid, 0);
@@ -78,9 +92,8 @@ function psInspectBatch(pids) {
             const p = readLinuxProcess(pid);
             found.set(pid, p?.dead ? { alive: false, start: null } : { alive, start: p?.start ?? null });
         }
-        return found;
+        return { at: requested, found };
     }
-    const requested = performance.now();
     let read = psEvidenceTable();
     // A table shared from earlier in this pass predates a process that is alive but absent from it: read once more.
     if (read && read.at < requested && pids.some(pid => !read.table.has(pid) && probe(pid) !== false))
@@ -90,7 +103,7 @@ function psInspectBatch(pids) {
         // No table (ps failed or timed out): probed liveness only, start stays unknown.
         found.set(pid, row?.zombie ? { alive: false, start: null } : { alive: probe(pid), start: row?.start ?? null });
     }
-    return found;
+    return { at: read?.at ?? requested, found };
 }
 /** Batched, cached process evidence for other pids: one inventory read per cache-miss set, never one per pid. */
 export function inspectLeaseProcesses(pids) {
@@ -109,10 +122,12 @@ export function inspectLeaseProcesses(pids) {
             missing.push(pid);
     }
     if (missing.length) {
-        const takenAt = performance.now();
-        for (const [pid, value] of psInspectBatch(missing)) {
+        // Stamp answers with the inventory's read time (T340): a table shared for up to a second must not restart the
+        // per-pid cache window, or one read could answer for nearly two seconds.
+        const { at, found } = psInspectBatch(missing);
+        for (const [pid, value] of found) {
             if (settled(value))
-                evidenceCache.set(pid, { value, at: takenAt });
+                evidenceCache.set(pid, { value, at });
             else
                 evidenceCache.delete(pid);
             out.set(pid, value);
