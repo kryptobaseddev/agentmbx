@@ -15,9 +15,21 @@ multi-transport kernel (LAN primary, relay fallback). The relay:
    signatures commit to the ciphertext);
 2. **never holds a private key and never decides authorization** — all authorization decisions stay on
    receiving hosts, which verify owner-signed records (SPEC trust model; council condition 2);
-3. enrols hosts by **owner-key challenge-signature** — no bearer keys, no unauthenticated registration
-   (the SignalDock failure mode, rejected by the salvage audit);
-4. accounts (if any) bind **owner public keys**, never emails or passphrases (POLICY.md §7).
+3. enrols hosts through a pluggable enrolment authority, never by unauthenticated registration (the
+   SignalDock failure mode, rejected by the salvage audit). The hosted relay accepts a short-lived (at most
+   15 minutes), relay-audience access token, issued by the AgentMBX Cloud account service to a per-host
+   cloud key that the host key certified, and verifies it offline against the issuer's JWKS. Every relay
+   hop is still signed by the host key, and the token's host binding must match the hop key. A self-hosted
+   relay uses a host-key challenge-signature. No long-lived bearer secret is stored on a host, and the
+   relay accepts no API key and no account session;
+4. accounts exist only in the optional AgentMBX Cloud: users with an email address and a passkey or GitHub
+   sign-in, used for login, billing and cloud access. An account links owner public keys through
+   owner-signed `account-link` records. An account, an account role, an organization role or a plan is
+   never an input to authorization; authority remains owner-signed records, or console commands asserted
+   by an owner authenticator that the owner key enrolled (POLICY.md §7), verified by the receiving daemon.
+
+*Amended 2026-10-02 by owner decision D7 (accounts) and the accepted cloud ADRs; the earlier text required
+owner-key enrolment at the relay and accounts that never store an email.*
 
 ## Trust boundaries and assets
 
@@ -47,8 +59,9 @@ owner-signed but readable, private keys of any kind.
 - *Relay impersonating a host to another host:* impossible without the host private key; the hop between
   daemon and relay is host-signed exactly like daemon-to-daemon today, and the relay cannot mint a valid
   `X-Mbx-Sig`. *Mitigation: existing hop signatures; relay is pinned per-host like any peer.*
-- *One host impersonating another to the relay:* the relay authenticates hosts by their enrolled owner-key
-  challenge; two hosts cannot share an enrolment. *Mitigation: enrolment record + per-host queues.*
+- *One host impersonating another to the relay:* the relay authenticates each hop by the host key and its
+  enrolment (a host-key challenge on a self-hosted relay, a host-bound account token on the hosted relay);
+  two hosts cannot share an enrolment (THREAT-MODEL F4). *Mitigation: enrolment record + per-host queues.*
 
 **Tampering.**
 - *Relay modifying a stored envelope:* breaks the sender's host signature at receive verification;
@@ -82,7 +95,7 @@ because it happens on the receiver (council condition 2, already tested).
    via id-dedupe; senders keep outbox copies with retry; owner sees undelivered alerts.
 3. *Compromised paired host reading queued mail* → pairwise keys are per-pair; unpairing kills that pair's
    readability going forward (receiver stops accepting; sender stops sealing for that peer).
-4. *Spam through the relay* → enrolment is owner-attested; quotas bound abuse; receiver-side policy still
+4. *Spam through the relay* → enrolment is host-key-bound and, on the hosted relay, account-authorized; quotas bound abuse; receiver-side policy still
    gates authority; unknown/unverified senders get `policy: ask` and no wake authority (shipped behaviour).
 5. *Replay of old envelopes via the relay* → permanent id dedupe on receive; freshness is on the signed
    hop headers (council condition 4).
