@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **A resumed Claude session keeps the mailbox it registers (T326):** a resumed `claude` start gives its MCP servers a temporary session id, then switches `~/.claude/sessions/<pid>.json` to the resumed conversation's id. The mbx server read that file once at start, so a mailbox registered or claimed afterwards was bound under the temporary id. Hooks, wakes, statuslines and `agentmbx status --session <id>` then never found it; the statusline fell back to the folder name and showed another agent's mail. The server now follows the file on every tool call and heartbeat (re-parsing it only when it changes): an unbound session takes the new id before it registers or claims, and a held mailbox moves its lease, session binding and control endpoint to the new id, so /clear, /resume and compaction no longer depend on a hook firing. It never moves to an id that another live process has bound.
+
 ## 0.5.5 (2026-10-02)
 
 The durable relay: a relay restart, crash or restore never loses mail, and a sender always learns when mail could not be confirmed. Self-hosted relays work today; the hosted relay at relay.agentmbx.com follows.
