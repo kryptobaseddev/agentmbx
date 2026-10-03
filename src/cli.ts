@@ -16,6 +16,7 @@ import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.ts";
 import { HUD_ALIVE_MAX_MS, HUD_SCHEMA, hudAlivePath, hudDir, hudPidLinePath, hudPidPath, hudSessionLinePath, hudSessionPath, hudStatus, writeHud, type HudStatus } from "./hud.ts";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.ts";
 import { ancestors, withProcSnapshot } from "./proc.ts";
+import { bumpPostToolMarkersForAgent, readPostToolMarker, writePostToolLast } from "./posttool.ts";
 import { resolveStatusIdentity } from "./status-identity.ts";
 import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.ts";
 import { retirePhantoms, returnNeverClaimed } from "./stranded.ts";
@@ -125,7 +126,7 @@ Agent integration
   agentmbx hook session-start --cli <codex|kimi|claude|opencode>   bind the running session (reads the hook JSON on stdin)
   agentmbx hook session-end --cli claude         release the exact session on terminal exit (keeps /clear and /resume bindings)
   agentmbx hook prompt --cli <…>                adds "N unread mbx messages" to the next turn when there is mail
-  agentmbx hook post-tool --cli claude          surfaces new unread mail between tool calls
+  agentmbx hook post-tool --cli claude          surfaces new unread mail between tool calls (bundled sh fast path: zero node starts in steady state, T342)
   agentmbx hook permission --cli <claude|codex|kimi>   YOLO: approves the prompt only under an active owner policy with the permissions class
   agentmbx import-v2 <MAILBOX/v2 dir>           import this caller's leased mailbox as unsigned 'legacy' messages
 
@@ -1138,6 +1139,7 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
         emit(cli, "SessionStart", lines.join("\n"));
         return;
       }
+      let posttoolDone: (() => void) | null = null;
       if (event === "post-tool") {
         if (cli !== "claude") return;
         // Track IDs, not counts or sender timestamps: replacing one acked message with a new one must notify,
@@ -1147,7 +1149,12 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
         const ids = (node.store.db.prepare("SELECT msg_id FROM deliveries WHERE agent=? AND state <> 'acked'").all(agent) as { msg_id: string }[]).map(r => `${agent}:${r.msg_id}`);
         const snapshot = JSON.stringify(ids);
         if (snapshot !== node.store.get(key)) node.store.set(key, snapshot);
-        if (!ids.some((id) => !previous.has(id))) return;
+        // T342: record the marker value this decision processed so the bundled sh wrapper can skip
+        // the next call without starting node. Only when a marker exists: absent means the wrapper
+        // falls through to this full path anyway.
+        const marker = sid ? readPostToolMarker(node.home, cli, sid) : null;
+        posttoolDone = () => { if (marker !== null && sid) writePostToolLast(node.home, cli, sid, marker); };
+        if (!ids.some((id) => !previous.has(id))) { posttoolDone(); return; }
       }
       if (event === "prompt" && isHumanPrompt(input.prompt)) node.store.set(humanPromptKey(agent), new Date().toISOString());
       if (event === "prompt" || event === "post-tool") {
@@ -1168,6 +1175,7 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
           if (w) lines.push(w);
         }
         if (lines.length) emit(cli, event === "post-tool" ? "PostToolUse" : "UserPromptSubmit", lines.join("\n"));
+        posttoolDone?.();
         return;
       }
       if (event === "stop") {
@@ -1294,6 +1302,7 @@ function importV2(node: MbxNode, dir: string, selection: CliIdentitySelection) {
       if (node.store.db.prepare("SELECT 1 FROM deliveries WHERE msg_id=? AND agent=?").get(e.id, agent)) continue;
       if (!existing) node.store.insertMessage(e, "legacy", "legacy", null);
       node.store.addDelivery(e.id, agent);
+      bumpPostToolMarkersForAgent(node.store.db, node.home, agent);
       if (acked.has(agent)) { node.store.setDelivery(e.id, agent, "read"); node.store.setDelivery(e.id, agent, "acked", "acked in v2"); }
       imported++;
     }

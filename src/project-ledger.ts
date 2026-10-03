@@ -7,6 +7,7 @@ import { canonical, fingerprint, ulid, verifyData } from "./crypto.ts";
 import type { Envelope } from "./envelope.ts";
 import type { MbxNode } from "./node.ts";
 import { ownerKeys } from "./policy.ts";
+import { bumpPostToolMarkersForAgent } from "./posttool.ts";
 import { deliveryReceipts, type DeliveryReceipt } from "./receipts.ts";
 import { projectIdentities, projectKey, registeredIdentity } from "./registry.ts";
 import type { MessageRow } from "./store.ts";
@@ -200,5 +201,6 @@ export function forwardMessage(node: MbxNode, lead: string, project: string | un
     node.store.set(forwardKey(m!.id, target), `${lead}@${node.host}`);
     node.store.audit("message.forwarded", { msg: m!.id, by: `${lead}@${node.host}`, to: `${target}@${node.host}`, project });
   });
+  bumpPostToolMarkersForAgent(node.store.db, node.home, target);
   return { id: m!.id, to: `${target}@${node.host}` };
 }

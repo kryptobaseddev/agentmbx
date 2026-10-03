@@ -9,6 +9,7 @@ import { activePolicies } from "./policy.ts";
 import { registeredIdentity } from "./registry.ts";
 import { resolveStatusIdentity } from "./status-identity.ts";
 import { inspectLeaseProcesses } from "./identity-leases.ts";
+import { sweepPostToolMarkers } from "./posttool.ts";
 import { procStart } from "./proc.ts";
 import { updateAvailable } from "./update.ts";
 import { version } from "./version.ts";
@@ -176,6 +177,8 @@ export function writeHud(node: MbxNode, now = Date.now()): void {
     if (wanted.has(path) || file === ".alive") continue;
     try { unlinkSync(path); } catch { /* gone: fine */ }
   }
+  // T342: post-tool markers outlive released/reaped sessions; delete files whose session is not bound.
+  sweepPostToolMarkers(node.home, new Set(rows.map((r) => `${r.cli}-${r.session_id}`)));
   // Heartbeat: adapters refuse to render from a snapshot older than HUD_ALIVE_MAX_MS.
   const alive = String(now);
   try { if (readFileSync(hudAlivePath(node.home), "utf8") !== alive) writeFileSync(hudAlivePath(node.home), alive, { mode: 0o600 }); } catch { writeFileSync(hudAlivePath(node.home), alive, { mode: 0o600 }); }

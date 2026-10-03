@@ -9,6 +9,7 @@ import { activePolicies } from "./policy.js";
 import { registeredIdentity } from "./registry.js";
 import { resolveStatusIdentity } from "./status-identity.js";
 import { inspectLeaseProcesses } from "./identity-leases.js";
+import { sweepPostToolMarkers } from "./posttool.js";
 import { procStart } from "./proc.js";
 import { updateAvailable } from "./update.js";
 import { version } from "./version.js";
@@ -173,6 +174,8 @@ export function writeHud(node, now = Date.now()) {
         }
         catch { /* gone: fine */ }
     }
+    // T342: post-tool markers outlive released/reaped sessions; delete files whose session is not bound.
+    sweepPostToolMarkers(node.home, new Set(rows.map((r) => `${r.cli}-${r.session_id}`)));
     // Heartbeat: adapters refuse to render from a snapshot older than HUD_ALIVE_MAX_MS.
     const alive = String(now);
     try {
