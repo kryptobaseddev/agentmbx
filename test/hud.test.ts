@@ -239,6 +239,29 @@ test("the CLI adapter resolves exactly without opening the store — an empty ho
   assert.ok(!existsSync(join(empty, "mbx.db")) && !existsSync(join(empty, "config.json")), "no store is created by a render");
 });
 
+test("copilot, cursor and gemini adapters render by session id only (Claude-compatible statusLine shape)", (t) => {
+  const h = home(), n = new MbxNode(h, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(h, { recursive: true, force: true }); });
+  for (const cli of ["copilot", "cursor", "gemini"])
+    n.bindSession({ agent: "drum", cli, session_id: `${cli}-1`, pid: process.pid, session_key: "k" });
+  claim(n, "drum", "copilot-1");
+  n.send({ from: "boss", to: ["drum"], subject: "hey", body: "b", needs_reply: true });
+  writeHud(n);
+  const env = { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: h, MBX_NO_DESKTOP: "1" } as Record<string, string>;
+  const run = (cli: string, stdin: string) =>
+    spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "statusline", cli], { input: stdin, encoding: "utf8", env });
+  for (const cli of ["copilot", "cursor", "gemini"]) {
+    const ok = run(cli, JSON.stringify({ session_id: `${cli}-1` }));
+    assert.equal(ok.status, 0, ok.stderr);
+    assert.match(ok.stdout, /^mbx drum/, `${cli} renders its own session's segment`);
+    if (cli !== "copilot")
+      assert.equal(run(cli, JSON.stringify({ session_id: "copilot-1" })).stdout, "", `${cli} cannot read copilot's file`);
+    assert.equal(run(cli, "{}").stdout, "", `${cli} names no session id: never the pid fallback`);
+  }
+  const unknown = run("vscode", "{}");
+  assert.equal(unknown.status, 2, "an unlisted CLI is a usage error, not a render");
+});
+
 test("hudStatus builds the mbx.status/v1 shape from mailbox state, re-checking owner authority", (t) => {
   const h = home(), n = new MbxNode(h, { host: "alpha" });
   t.after(() => { n.close(); rmSync(h, { recursive: true, force: true }); });
