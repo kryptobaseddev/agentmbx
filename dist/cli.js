@@ -65,7 +65,7 @@ Messages
     New sends without a lease are marked unverified-sender and grant no delegated authority.
   agentmbx status --cli <provider> --session <id> --json   current session identity and mailbox counts (read-only)
   agentmbx status --cli <provider> [--session <id>] --json --schema mbx.status/v1   HUD snapshot for harnesses; no lease needed (T311)
-  agentmbx statusline <claude|codex|kimi|opencode|grok>   render one MBX segment from the HUD snapshot (T313)
+  agentmbx statusline <claude|codex|kimi|opencode|grok|copilot|cursor|gemini>   render one MBX segment from the HUD snapshot (T313)
   agentmbx identity list [--project <dir>] [--all] [--json]   identities with role, holder, claimable and unread (read-only)
   agentmbx identity prune [--days 7] [--apply]   retire mailboxes older versions generated that nobody holds (dry run by default)
   agentmbx identity forward <from> <to>          move a mailbox's unread mail to another, with your owner signature
@@ -137,6 +137,9 @@ catch {
     return "";
 } };
 const EXIT = { USAGE: 2, NOT_FOUND: 3, AMBIGUOUS: 4 };
+// T313: every CLI with a statusline adapter. Session files are namespaced by these names, so a
+// statusline can never read another CLI's snapshot.
+const STATUSLINE_CLIS = ["claude", "codex", "kimi", "opencode", "grok", "copilot", "cursor", "gemini"];
 /** Help lines for one command (`agentmbx <cmd> --help`). */
 function commandHelp(cmd) {
     const lines = [];
@@ -434,9 +437,12 @@ async function run(argv) {
     if (cmd === "statusline") {
         // T313: render from the daemon-written HUD snapshot BEFORE any node exists — no store open, no
         // migration, no key creation on an empty home (review: the 40 ms render budget is one cat).
-        const which = pos[0] ?? die("statusline <claude|codex|kimi|opencode|grok>");
-        if (!["claude", "codex", "kimi", "opencode", "grok"].includes(which))
-            die("statusline <claude|codex|kimi|opencode|grok>");
+        // copilot/cursor/gemini speak Claude's statusLine.command shape (session_id on stdin); like every
+        // non-Claude CLI they are session-id-only — no pid fallback, since a pid file cannot prove their
+        // process model has one conversation.
+        const which = pos[0] ?? die(`statusline <${STATUSLINE_CLIS.join("|")}>`);
+        if (!STATUSLINE_CLIS.includes(which))
+            die(`statusline <${STATUSLINE_CLIS.join("|")}>`);
         let info = {};
         if (!process.stdin.isTTY) {
             try {
