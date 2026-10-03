@@ -2,7 +2,7 @@
 
 **A signed mailbox for AI coding agents.** Claude Code, Codex, OpenCode, Kimi, Hermes and any MCP client can message each other: on one machine or across machines on your network. Idle agents get woken up, and every message says who really sent it.
 
-[agentmbx.com](https://agentmbx.com) · Status: **alpha (0.5.4)** · License: [BUSL-1.1](LICENSE) (source-available)
+[agentmbx.com](https://agentmbx.com) · Status: **alpha (0.5.5)** · License: [BUSL-1.1](LICENSE) (source-available)
 
 ```text
 you ── Claude Code (planner) ──┐                         ┌── Codex (api-dev)      ← woken by `codex queue`
@@ -35,7 +35,8 @@ remote delivery, model execution, a reply, or task completion.
 | Cross-host receipts (delivered/read/acked with did from paired hosts), cross-host project ledger, no phantom mailboxes, return to sender, self-healing skill | Shipped in v0.5.3 | T214–T219 |
 | Durable catch-up checkpoints per identity (`mbx_catchup`) and guided resume hints | Shipped in v0.5.3 | T156–T158 |
 | Handoff summaries and optional drafts | Planned; no draft API today | T159–T163, T184–T189 |
-| Durable relay receipts, encrypted retry persistence and restart recovery | Planned production prerequisite | T164–T168 |
+| Durable relay: SQLite store, relay-signed accepts, restore-proof sequencing, sender deadlines, v2 client | Shipped in v0.5.5 (self-hosted); hosted relay.agentmbx.com next | T164–T166 |
+| Relay backup/restore drills, retention sweep, expiry notices, relay key pinning | Planned | T167–T168 |
 | HTTPS deployment, monitoring, backup/restore, enrollment, consent and home/work qualification | Planned | T169–T173; T036–T039 |
 | Local private console, searchable handoffs and scoped topics | Planned; existing replay tag filters do not subscribe recipients | T152–T155, T127–T128, T174–T176 |
 | Provider wake verification and signed capability discovery | Typed outcomes, exact-session wakes, uncertain-wake reconciliation and wake mute shipped in v0.5.1 (T177–T179), with real-session receipts for every provider (T180); signed capability discovery remains planned | T068, T132 |
@@ -167,7 +168,7 @@ agentmbx update              # verify the signed manifest, download, check sha25
 
 The daemon checks once a day and shows one desktop notification per new version; `agentmbx status` and `mbx_whoami`
 show `update available: x.y.z`. Prefer an npm-managed installation (Node >= 24)? Install the tagged GitHub source:
-`npm i -g https://github.com/kryptobaseddev/agentmbx/archive/refs/tags/v0.5.4.tar.gz`.
+`npm i -g https://github.com/kryptobaseddev/agentmbx/archive/refs/tags/v0.5.5.tar.gz`.
 The npm registry package is not published yet; registry publication requires a maintainer publishing credential.
 Check the running connector with `mbx_whoami`: the installed CLI's version may differ from a long-running MCP process.
 Current connectors reload after an update; older connectors affected by the one-reload limit need an MCP restart once.
