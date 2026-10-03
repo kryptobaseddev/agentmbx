@@ -9,6 +9,7 @@ import { activePolicies } from "./policy.ts";
 import { registeredIdentity } from "./registry.ts";
 import { resolveStatusIdentity } from "./status-identity.ts";
 import { inspectLeaseProcesses } from "./identity-leases.ts";
+import { procStart } from "./proc.ts";
 import { updateAvailable } from "./update.ts";
 import { version } from "./version.ts";
 import type { MbxNode } from "./node.ts";
@@ -107,8 +108,8 @@ export function writeHud(node: MbxNode, now = Date.now()): void {
   const dir = hudDir(node.home);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   chmodSync(dir, 0o700);
-  const rows = node.store.db.prepare(`SELECT agent, cli, session_id, pid, updated_at FROM sessions
-    WHERE session_id NOT LIKE 'mcp-%'`).all() as { agent: string; cli: string; session_id: string; pid: number | null; updated_at: string }[];
+  const rows = node.store.db.prepare(`SELECT agent, cli, session_id, pid, pid_start, updated_at FROM sessions
+    WHERE session_id NOT LIKE 'mcp-%'`).all() as { agent: string; cli: string; session_id: string; pid: number | null; pid_start: string | null; updated_at: string }[];
   const wanted = new Set<string>();
   const perAgent = new Map<string, string>(); // computed once per agent, not per row (review low 8)
   const pidDone = new Set<string>();
@@ -126,6 +127,11 @@ export function writeHud(node: MbxNode, now = Date.now()): void {
       // binding. Skip it so its stale files prune now. Absent evidence is not proof of death.
       if (!row.pid) continue;
       if (evidence.get(row.pid)?.alive === false) continue;
+      // Round 4: a REUSED pid is alive but belongs to a different process. procStart and the row's
+      // recorded pid_start come from the same process table (same string format on every platform), so
+      // a positive mismatch proves reuse. No start evidence (empty table): do not skip.
+      const liveStart = procStart(row.pid);
+      if (row.pid_start && liveStart && liveStart !== row.pid_start) continue;
       const resolved = resolveStatusIdentity(node, row.cli, { sessionId: row.session_id, pid: row.pid });
       if (resolved.state !== "bound" || !resolved.name) continue; // never render unbound or ambiguous (review low 9)
       let snapshot = perAgent.get(resolved.name);

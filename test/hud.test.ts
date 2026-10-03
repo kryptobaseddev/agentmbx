@@ -12,6 +12,7 @@ import { join, resolve } from "node:path";
 import { MbxNode } from "../src/node.ts";
 import { HUD_ALIVE_MAX_MS, HUD_SCHEMA, hudAlivePath, hudDir, hudPidLinePath, hudPidPath, hudSessionLinePath, hudSessionPath, hudStatus, writeHud } from "../src/hud.ts";
 import { IdentityLeases, inspectLeaseProcess } from "../src/identity-leases.ts";
+import { procStart } from "../src/proc.ts";
 
 const home = () => mkdtempSync(join(tmpdir(), "mbx-hud-"));
 const claim = (n: MbxNode, name: string, sid: string) =>
@@ -111,6 +112,25 @@ test("round 3: rows a pass proves dead (and rows with no pid) render nothing and
   assert.ok(existsSync(hudSessionPath(h, "kimi", "ghost-1")), "a live row renders again");
 });
 
+test("round 4: a reused pid (alive but a different process) renders nothing and prunes", (t) => {
+  const h = home(), n = new MbxNode(h, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(h, { recursive: true, force: true }); });
+  n.bindSession({ agent: "ghost", cli: "kimi", session_id: "ghost-1", pid: process.pid, session_key: "k" });
+  claim(n, "ghost", "ghost-1");
+  n.send({ from: "boss", to: ["ghost"], subject: "hey", body: "b" });
+  writeHud(n);
+  assert.ok(existsSync(hudSessionPath(h, "kimi", "ghost-1")), "the row renders while the pid is its own");
+  // the pid gets reused: the row's recorded birth time no longer matches the live process
+  n.store.db.prepare("UPDATE sessions SET pid_start=? WHERE session_id='ghost-1'").run("not-the-live-start");
+  writeHud(n);
+  assert.ok(!existsSync(hudSessionPath(h, "kimi", "ghost-1")), "a reused pid renders nothing");
+  assert.ok(!existsSync(hudSessionLinePath(h, "kimi", "ghost-1")), "its line file prunes too");
+  // restoring the true birth time renders again
+  n.store.db.prepare("UPDATE sessions SET pid_start=? WHERE session_id='ghost-1'").run(procStart(process.pid));
+  writeHud(n);
+  assert.ok(existsSync(hudSessionPath(h, "kimi", "ghost-1")), "the true start renders again");
+});
+
 test("a real release removes the binding and the snapshot on the next tick; a stale .alive refuses renders", (t) => {
   const h = home(), n = new MbxNode(h, { host: "alpha" });
   t.after(() => { n.close(); rmSync(h, { recursive: true, force: true }); });
@@ -168,6 +188,15 @@ test("the bundled Claude adapter renders with node absent from PATH — pure sh,
   assert.equal(unbound.stdout, "", "an unbound session renders nothing");
   const noSid = spawnSync("/bin/sh", [script], { input: "{}", encoding: "utf8", env: shEnv });
   assert.equal(noSid.stdout, "", "no session id on stdin renders nothing");
+  // Round 4: the FIRST session_id wins — a nested key must never override the conversation's own id,
+  // and an invalid top-level id must exit instead of falling through to a later valid one.
+  const nested = spawnSync("/bin/sh", [script],
+    { input: JSON.stringify({ session_id: "claude-1", agent: { session_id: "victim" } }), encoding: "utf8", env: shEnv });
+  assert.equal(nested.status, 0, nested.stderr);
+  assert.match(nested.stdout, /^mbx drum/, "first session_id wins over a nested key");
+  const invalidFirst = spawnSync("/bin/sh", [script],
+    { input: JSON.stringify({ session_id: "bad id!", agent: { session_id: "claude-1" } }), encoding: "utf8", env: shEnv });
+  assert.equal(invalidFirst.stdout, "", "an invalid first id never falls through to a nested valid one");
 });
 
 test("the CLI adapter resolves exactly without opening the store — an empty home gains no files", (t) => {

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { MbxNode } from "../src/node.ts";
@@ -22,12 +22,9 @@ test("Claude HUD follows the session identity and excludes another sender's outg
   const own = node.send({ from: "renamed", to: ["other"], subject: "outgoing", body: "data" }).envelope.id;
   const queue = node.store.db.prepare("INSERT INTO outbox(msg_id,host,next_at,created_at) VALUES (?,?,?,?)"), now = new Date().toISOString();
   queue.run(other, "offline", now, now); // a copy of mail FROM someone else: never this identity's unsent
-  // The bundled script execs `agentmbx` from PATH; point PATH at this checkout so the test exercises
-  // the working tree's adapter rather than a globally installed release.
-  const binDir = mkdtempSync(join(tmpdir(), "mbx-bin-"));
-  t.after(() => rmSync(binDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
-  symlinkSync(resolve("bin/agentmbx.js"), join(binDir, "agentmbx"));
-  const env = { ...process.env, MBX_HOME: home, PATH: `${binDir}:${process.env.PATH}` } as Record<string, string>;
+  // The script is pure sh (sed, date, one cat) and needs nothing on PATH but coreutils; MBX_HOME
+  // points it at this fixture home.
+  const env = { ...process.env, MBX_HOME: home, PATH: "/bin:/usr/bin" } as Record<string, string>;
   const run = (session: string) => {
     writeHud(node); // the daemon keeps these current; the test drives them synchronously
     return spawnSync("bash", [resolve("skill/scripts/claude-statusline.sh")], {

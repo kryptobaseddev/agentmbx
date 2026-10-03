@@ -5,7 +5,12 @@
 # overwrites it. Renders nothing when the daemon heartbeat is stale or the session is unbound.
 set -f
 json=$(cat 2>/dev/null) || exit 0
-sid=$(printf '%s' "$json" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([A-Za-z0-9_-]*\)".*/\1/p' | head -n 1)
+# Round 4: the FIRST session_id wins. A left-greedy match lets a nested key override the
+# conversation's own id ({"session_id":"mine","agent":{"session_id":"victim"}} renders victim); a
+# charset-validating match falls through to the nested key when the top-level id is invalid.
+pair=$(printf '%s' "$json" | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n 1)
+[ -n "$pair" ] || exit 0
+sid=$(printf '%s' "$pair" | sed 's/^"session_id"[[:space:]]*:[[:space:]]*"//; s/"$//')
 case "$sid" in
   *[!A-Za-z0-9_-]*|'') exit 0 ;;
 esac
