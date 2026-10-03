@@ -256,11 +256,8 @@ export async function relayPushReceipts(node, s, now = Date.now()) {
     const r = await call(s, node, "POST", "/v2/relay/items", { items: items.map((i) => ({ kind: "receipt", item_id: i.id, targets: [{ host_pubkey: i.target, wire_b64: i.wire.toString("base64") }] })) });
     const results = Array.isArray(r.json.results) ? r.json.results : [];
     const sent = r.status === 200 ? items.filter((i) => validAccept(s, node, results.find((x) => x?.item_id === i.id), i.id, i.target, sha256hex(i.wire))) : [];
-    if (sent.length) {
-        receiptsSent(node, sent.map((i) => i.seq));
-        for (const i of sent)
-            node.store.db.prepare("DELETE FROM relay_receipt_wire WHERE seq=?").run(i.seq);
-    }
+    if (sent.length)
+        receiptsSent(node, sent.map((i) => i.seq)); // also drops their kept bytes
     return sent.length;
 }
 /**
@@ -291,6 +288,8 @@ function setPosition(node, relay, epoch, through) {
     node.store.db.prepare(`INSERT INTO relay_position (relay,epoch,received_through,updated_at) VALUES (?,?,?,?)
     ON CONFLICT(relay) DO UPDATE SET epoch=excluded.epoch, received_through=excluded.received_through, updated_at=excluded.updated_at`).run(relay, epoch, through, new Date().toISOString());
 }
+/** The host an envelope says it comes from: the host receive() checks the pairing of. */
+const envelopeHost = (e) => typeof e?.from === "string" ? e.from.split("@")[1] ?? "" : "";
 /** Process one relay item. True when it is done (accepted, duplicate or quarantined). */
 function processItem(node, relay, epoch, it) {
     const wire = Buffer.from(it.wire_b64, "base64");
@@ -298,8 +297,8 @@ function processItem(node, relay, epoch, it) {
     try {
         const v = JSON.parse(wire.toString("utf8"));
         if (it.kind === "envelope") {
-            const e = v, host = typeof e?.from === "string" ? e.from.split("@")[1] ?? "" : "";
-            result = node.receive(e, host);
+            const e = v;
+            result = node.receive(e, envelopeHost(e));
         }
         else if (it.kind === "receipt")
             result = acceptReceipt(node, v, null);
@@ -318,13 +317,33 @@ function processItem(node, relay, epoch, it) {
     }
     return result;
 }
-/** Items quarantined only because their sender was not paired yet get another chance once it is. */
+/**
+ * Items quarantined only because their sender was not paired yet get another chance once it is: once the host the
+ * envelope names is paired with the key that pushed it (T333). The sender key being paired is not enough. receive()
+ * checks the envelope's host, so a key paired under another host name (the published allowlist lets it push, but the
+ * envelope names a host we never paired) failed again and was re-quarantined, and audited, on every tick. Now a retried
+ * item either lands or fails for another reason, and is never retried again.
+ */
 function retryUnpairedQuarantine(node, relay) {
-    let n = 0;
-    const rows = node.store.db.prepare("SELECT epoch, seq, kind, item_id, sender_pubkey, wire FROM relay_quarantine WHERE relay=? AND reason='rejected:host not paired' LIMIT 100").all(relay);
+    const keys = node.peers().filter((p) => p.state === "approved").map((p) => p.pubkey);
+    if (!keys.length)
+        return 0;
+    let n = 0, tried = 0;
+    const rows = node.store.db.prepare(`SELECT epoch, seq, kind, item_id, sender_pubkey, wire FROM relay_quarantine WHERE relay=? AND reason='rejected:host not paired'
+    AND sender_pubkey IN (SELECT value FROM json_each(?)) ORDER BY at, seq`).all(relay, JSON.stringify(keys));
     for (const r of rows) {
-        if (!node.peers().some((p) => p.state === "approved" && p.pubkey === r.sender_pubkey))
+        if (tried >= 100)
+            break;
+        let host = "";
+        try {
+            host = envelopeHost(JSON.parse(Buffer.from(r.wire).toString("utf8")));
+        }
+        catch {
             continue;
+        }
+        if (node.approvedPeer(host)?.pubkey !== r.sender_pubkey)
+            continue; // the key receive() verifies the envelope with
+        tried++;
         node.store.db.prepare("DELETE FROM relay_quarantine WHERE relay=? AND epoch=? AND seq=?").run(relay, r.epoch, r.seq);
         const res = processItem(node, relay, r.epoch, { seq: r.seq, kind: r.kind, item_id: r.item_id, sender_pubkey: r.sender_pubkey, wire_b64: Buffer.from(r.wire).toString("base64") });
         if (res === "accepted")

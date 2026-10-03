@@ -85,17 +85,23 @@ export class RelayCore {
   private pushes = new Map<string, number[]>();                   // sender pubkey -> push timestamps (rate window)
   private ipCalls = new Map<string, number[]>();                  // client address -> challenge/enrol timestamps
 
-  constructor(quota: Partial<RelayQuota> = DEFAULT_QUOTA, o: { store?: RelayStore; key?: KeyPair; heartbeatStaleMs?: number; now?: () => number } = {}) {
+  constructor(quota: Partial<RelayQuota> = DEFAULT_QUOTA, o: { store?: RelayStore; key?: KeyPair; heartbeatStaleMs?: number; now?: () => number; log?: (line: string) => void } = {}) {
     this.quota = { ...DEFAULT_QUOTA, ...quota }; this.store = o.store ?? new SqliteRelayStore(); this.key = o.key ?? generateKeyPair();
     const pinned = this.store.meta("relay_pubkey");
     if (pinned && pinned !== this.key.publicKey) throw err("RELAY_KEY", "this relay store belongs to another relay key: keep relay.key with its store");
     if (!pinned) this.store.setMeta("relay_pubkey", this.key.publicKey);
     // A store whose heartbeat is stale may be a restored copy (a volume restore restarts the service): rotate the epoch so
-    // senders re-push and receivers re-pull at once. A long outage rotates too, which dedup makes harmless (spec §5).
-    const now = (o.now ?? Date.now)(), beat = Number(this.store.meta("heartbeat") ?? NaN);
-    if (Number.isFinite(beat) && now - beat > (o.heartbeatStaleMs ?? HEARTBEAT_STALE_MS)) {
-      const from = this.store.epoch(), to = this.store.rotateEpoch();
-      this.store.setMeta("epoch_rotated", JSON.stringify({ from, to, at: new Date(now).toISOString(), reason: "stale heartbeat (restore or long outage)" }));
+    // senders re-push and receivers re-pull at once. A long outage rotates too, which dedup makes harmless (spec §5). So
+    // does a heartbeat from the future: the clock went back, or the store was written under a clock that ran ahead, and
+    // its age proves nothing. The operator gets one line either way (T333).
+    const now = (o.now ?? Date.now)(), beat = Number(this.store.meta("heartbeat") ?? NaN), stale = o.heartbeatStaleMs ?? HEARTBEAT_STALE_MS;
+    if (Number.isFinite(beat) && Math.abs(now - beat) > stale) {
+      const from = this.store.epoch(), to = this.store.rotateEpoch(), ahead = beat > now;
+      const heartbeat = Math.abs(beat) <= 8.64e15 ? new Date(beat).toISOString() : String(beat); // a corrupt value must not stop the relay
+      const cause = ahead ? "clock went back, or store written under a clock that ran ahead" : "restore or long outage";
+      const reason = `${ahead ? "heartbeat ahead of the clock" : "stale heartbeat"} (${cause})`;
+      this.store.setMeta("epoch_rotated", JSON.stringify({ from, to, at: new Date(now).toISOString(), heartbeat, reason }));
+      (o.log ?? ((l: string) => console.error(l)))(`[agentmbx] relay epoch rotated at startup: stored heartbeat ${heartbeat} is ${Math.round(Math.abs(now - beat) / 60_000)} min ${ahead ? "ahead of this clock" : "old"} (${cause}); epoch ${from} -> ${to}: senders re-push, receivers re-pull`);
     }
     this.beat(now);
   }
