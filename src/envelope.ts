@@ -14,8 +14,16 @@ export const MAX_SEALED_BODY = 4 * Math.ceil((MAX_BODY + 16) / 3);
 export const NAME_RE = /^[a-z0-9][a-z0-9-]{1,39}$/;
 
 /** `origin`: where the content came from (external = a web page, issue, PR comment, email relayed by an agent);
- *  `hop`: agent-to-agent relay depth, saturated at MAX_RELAY_DEPTH. Both are signed with the envelope. */
-export interface Meta { mentions: string[]; directives: string[]; tags: string[]; task_refs: string[]; origin?: "agent" | "external"; hop?: number; project?: string; project_key?: string; local_names?: string[]; sender_verification?: "unverified" | "leased" }
+ *  `hop`: agent-to-agent relay depth, saturated at MAX_RELAY_DEPTH. Both are signed with the envelope.
+ *  On external mail (T344), `external_since` is the ROOT exposure time (ISO) and `external_source` says whether the sender
+ *  declared the content external itself ("declared", root = its send time) or only inherited the taint of outside
+ *  content it read earlier ("inherited", root = when that first-hand content was read). */
+export interface Meta { mentions: string[]; directives: string[]; tags: string[]; task_refs: string[]; origin?: "agent" | "external"; hop?: number; project?: string; project_key?: string; local_names?: string[]; sender_verification?: "unverified" | "leased"; external_since?: string; external_source?: "declared" | "inherited" }
+
+/** How long outside content a session read keeps that session's own sends external, counted from the root exposure (T104, T344). */
+export const EXTERNAL_TAINT_MS = 3_600_000;
+/** Instants as `Date.prototype.toISOString` writes them (years 0000-9999). */
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
 
 /** Owner-signed delegation to ONE live session: `sub` is that session's in-memory key, so nothing else on the
  *  host (even a process using the same agent name) can use it. */
@@ -47,6 +55,8 @@ export function parseMeta(body: string): Meta {
 export interface Draft {
   from: string; to: string[]; subject: string; body: string; kind?: Kind; thread?: string;
   reply_to?: string | null; needs_reply?: boolean; refs?: string[]; origin?: "agent" | "external"; hop?: number;
+  /** With origin external: the root exposure this sender inherited (T344). Absent: the sender declares the content external now. */
+  external_since?: string;
   /** the sender's project root (canonical path), so receivers can tell which project a message is about */
   project?: string;
   /** the project's normalized git origin (registry.projectKey), so paired hosts match it to their own folder (T219) */
@@ -62,7 +72,7 @@ export function buildEnvelope(d: Draft, now = new Date()): Envelope {
   return {
     v: 3, id, ts: now.toISOString(), from: d.from, to: d.to, thread: d.thread ?? id, reply_to: d.reply_to ?? null,
     kind: d.kind ?? "message", subject: oneLine(d.subject).slice(0, 200), body: d.body, needs_reply: d.needs_reply ?? false,
-    refs: d.refs ?? [], meta: { ...parseMeta(d.body), ...(d.unverifiedSender ? { sender_verification: "unverified" as const } : {}), ...(d.origin === "external" ? { origin: "external" as const } : {}), ...(d.hop ? { hop: d.hop } : {}), ...(d.project ? { project: d.project.slice(0, 300) } : {}), ...(d.project_key ? { project_key: d.project_key.slice(0, 300) } : {}) },
+    refs: d.refs ?? [], meta: { ...parseMeta(d.body), ...(d.unverifiedSender ? { sender_verification: "unverified" as const } : {}), ...(d.origin === "external" ? { origin: "external" as const, external_since: d.external_since ?? now.toISOString(), external_source: d.external_since ? "inherited" as const : "declared" as const } : {}), ...(d.hop ? { hop: d.hop } : {}), ...(d.project ? { project: d.project.slice(0, 300) } : {}), ...(d.project_key ? { project_key: d.project_key.slice(0, 300) } : {}) },
     authority: null, enc: null,
   };
 }
@@ -144,11 +154,35 @@ export function checkShape(x: unknown): string | null {
   if (m?.sender_verification !== undefined && m.sender_verification !== "unverified" && m.sender_verification !== "leased") return "bad sender verification";
   if (m?.hop !== undefined && !(Number.isInteger(m.hop) && m.hop >= 0 && m.hop <= MAX_RELAY_DEPTH)) return "bad hop";
   if (m?.origin !== undefined && m.origin !== "agent" && m.origin !== "external") return "bad origin";
+  // T344: the root exposure time of external mail. A future value is well-formed here and counts as the reader's now.
+  if (m?.external_since !== undefined && (m.origin !== "external" || typeof m.external_since !== "string" || !ISO_INSTANT.test(m.external_since)
+    || !Number.isFinite(Date.parse(m.external_since)))) return "bad external_since";
+  if (m?.external_source !== undefined && (m.external_since === undefined || (m.external_source !== "declared" && m.external_source !== "inherited"))) return "bad external_source";
   if (m?.project !== undefined && (typeof m.project !== "string" || m.project.length > 300)) return "bad project";
   if (m?.project_key !== undefined && (typeof m.project_key !== "string" || m.project_key.length > 300)) return "bad project key";
   // bare `to` entries the sending host delivered to its own agents; receivers skip exactly these (S2 follow-up)
   if (m?.local_names !== undefined && (!Array.isArray(m.local_names) || m.local_names.length > 100 || m.local_names.some((n: unknown) => typeof n !== "string" || !NAME_RE.test(n)))) return "bad local names";
   return null;
+}
+
+/** What reading one message exposes the reader to (T344): the root exposure time it inherits, or null for agent content. */
+export interface ExternalExposure { how: "declared" | "inherited" | "legacy" | "malformed"; root: number }
+
+/**
+ * The root exposure a reader takes from one message read at `now`. First-hand outside content exposes the reader now:
+ * declared external by its sender, a malformed envelope whose provenance is unknown, or external mail from before T344
+ * (no `external_since`), which may be declared content however old it is. Inherited taint keeps the sender's root
+ * exposure, so agents answering each other never extend a taint past root + EXTERNAL_TAINT_MS. A root later than `now`
+ * (a skewed clock or a bad sender) counts as `now`: never longer than one first-hand read. A reader keeps the latest root
+ * of everything it read.
+ */
+export function externalExposure(e: unknown, now: number): ExternalExposure | null {
+  if (checkShape(e)) return { how: "malformed", root: now };
+  const { meta: m } = e as Envelope;
+  if (m.origin !== "external") return null;
+  if (m.external_since === undefined) return { how: "legacy", root: now };
+  if (m.external_source !== "inherited") return { how: "declared", root: now };
+  return { how: "inherited", root: Math.min(Date.parse(m.external_since), now) };
 }
 
 // ---- owner grants ----------------------------------------------------------------------------

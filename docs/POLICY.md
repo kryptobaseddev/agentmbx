@@ -69,7 +69,7 @@ It is stored with `owner_sig`.
 
 | Condition | Effect |
 |---|---|
-| `meta.origin = "external"`: the sender marked the content as coming from a web page, an issue, a PR comment or an email | only `read` applies, and the header says so |
+| `meta.origin = "external"`: the sender marked the content as coming from a web page, an issue, a PR comment or an email, or its session read such content in the last hour | only `read` applies, and the header says so (declared by the sender, or inherited from a root exposure, and when that clears) |
 | the thread already had 20 requests or tasks acted on under policy, or the message's `meta.hop` is over 6 | `ask`; the owner gets an `alert` |
 | the message body contains text that looks like a `policy:` or `authority:` line | the header warns that the body claims a policy and the claim is ignored |
 | the sender's host was unpaired or its policy revoked | fails closed immediately |
@@ -77,6 +77,20 @@ It is stored with `owner_sig`.
 `meta.origin` and `meta.hop` are signed envelope fields:
 - `mbx_send` gets `origin` (`agent` by default, or `external`).
 - `hop` is the parent's hop + 1 when a session sends while handling a message (the MCP server tracks the last read message).
+
+External taint (T344). A session that read external content sends everything as `origin: "external"` for one hour after its **root exposure**, whatever `origin` it passes (an explicit `agent` is overridden, and said so). The owner typing a prompt resets relay depth, never this. External mail carries two more signed fields:
+- `meta.external_since`: the root exposure time (ISO). For a send the sender marked external itself it is the send time. For a send that is external only because its session read external content earlier, it is the time that first-hand content was read.
+- `meta.external_source`: `declared` or `inherited`.
+
+A reader takes the latest root of what it read:
+- **First-hand content** exposes the reader at the moment it reads it. That is a `declared` message, a malformed envelope (provenance unknown), or older external mail without `external_since`. Older mail may be declared content of any age, so its send time is never trusted. Viewing the same message again within the hour keeps the first read as its root: `mbx_read` again, or `mbx_thread` every turn. Each session remembers the first reads of the last hour, up to 1000 messages. Replying to it, or viewing it after the hour, is a new exposure.
+- **Inherited taint** keeps the sender's root, never the read time. Two agents answering each other after either was exposed are therefore both clean one hour after the root exposure, however often they reply. An agent on a version without T344 sends inherited taint with no root, which its readers count from their read, so a conversation with such an agent keeps re-tainting until it upgrades.
+- **Doubtful values fall back to the safe reading.** A root later than the reader's clock counts as the read time. A missing `external_source` counts as `declared`. A malformed `external_since` makes the envelope malformed: a paired host or relay rejects it, and a stored one counts as first-hand.
+
+Agents are told why at each step:
+- the `mbx_send` and `mbx_reply` results warn when a message went out external: the root time, the message and sender that caused it, and when it clears;
+- the `mbx_read` header has an `origin:` line saying whether the sender declared the content or inherited it from a root exposure, and when that taint clears;
+- `mbx_whoami` shows `external` with the session's taint, its cause and `clears_at`.
 
 ### Distribution and revocation
 
