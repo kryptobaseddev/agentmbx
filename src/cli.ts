@@ -13,6 +13,7 @@ import { relayPushOutbox, relayPushReceipts, relayReceive, relayRoute, relaySett
 import { DEFAULT_QUOTA, parseRelayKey, RelayCore, startRelayServer } from "./relay.ts";
 import { SqliteRelayStore } from "./relay-store.ts";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.ts";
+import { HUD_ALIVE_MAX_MS, hudAlivePath, hudDir, hudPidLinePath, hudPidPath, hudSessionLinePath, hudSessionPath, writeHud, type HudStatus } from "./hud.ts";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.ts";
 import { ancestors, withProcSnapshot } from "./proc.ts";
 import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.ts";
@@ -64,6 +65,7 @@ Messages
     Use --cli <provider> --session <id> when multiple sessions share the caller. --as only selects the held name.
     New sends without a lease are marked unverified-sender and grant no delegated authority.
   agentmbx status --cli <provider> --session <id> --json   current session identity and mailbox counts (read-only)
+  agentmbx statusline <claude|codex|kimi|opencode|grok>   render one MBX segment from the HUD snapshot (T313)
   agentmbx identity list [--project <dir>] [--all] [--json]   identities with role, holder, claimable and unread (read-only)
   agentmbx identity prune [--days 7] [--apply]   retire mailboxes older versions generated that nobody holds (dry run by default)
   agentmbx identity forward <from> <to>          move a mailbox's unread mail to another, with your owner signature
@@ -348,6 +350,46 @@ async function run(argv: string[]) {
     }
     if ((pos[0] === "export" || pos[0] === "import") && pos.length === 2) return identityBackup(pos[0], pos[1], !!o.force);
     die("identity list [--project <dir>] [--all] | prune [--days 7] [--apply] | forward <from> <to> | export <file> | import <file> | claim [name] --cli <provider> --session <id> | release --cli <provider> --session <id> | takeover <name> --force --cli <provider> --session <id> | result <request-id>");
+  }
+  if (cmd === "statusline") {
+    // T313: render from the daemon-written HUD snapshot BEFORE any node exists — no store open, no
+    // migration, no key creation on an empty home (review: the 40 ms render budget is one cat).
+    const which = pos[0] ?? die("statusline <claude|codex|kimi|opencode|grok>");
+    if (!["claude", "codex", "kimi", "opencode", "grok"].includes(which)) die("statusline <claude|codex|kimi|opencode|grok>");
+    let info: Record<string, unknown> = {};
+    if (!process.stdin.isTTY) { try { info = JSON.parse(readStdin() || "{}"); } catch { info = {}; } }
+    const home = defaultHome();
+    if (which === "codex") {
+      // Official Codex builds its status line from built-in item identifiers only; a custom command
+      // hook is still an open request (openai/codex#17827, #20140). The snapshots stay ready for forks.
+      console.log(`mbx: ready at ${hudDir(home)} (official Codex has no custom statusline command yet: openai/codex#17827)`);
+      return;
+    }
+    // Freshness: the daemon touches hud/.alive on every tick; older than ~10 s means the daemon is
+    // down, and a stale snapshot must never render (review high 2).
+    try {
+      const aliveAt = Number(readFileSync(hudAlivePath(home), "utf8"));
+      if (!Number.isFinite(aliveAt) || Date.now() - aliveAt > HUD_ALIVE_MAX_MS) return;
+    } catch { return; }
+    const sid = [info.session_id, info.sessionID, info.sessionId, info.thread_id]
+      .find((v): v is string => typeof v === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v));
+    // The daemon pre-renders one line per snapshot: the render is a single cat, no JSON parsing.
+    // Critical: when the provider DID name a session id, a missing snapshot means this session is
+    // unbound (released, or not yet bound in a shared process) — never fall back to the pid file,
+    // which may belong to a sibling session's holder.
+    if (sid) {
+      try { process.stdout.write(readFileSync(hudSessionLinePath(home, which, sid), "utf8")); } catch { /* unbound: render nothing */ }
+      return;
+    }
+    // Round 3: the pid fallback is allowed only for one-conversation-per-process CLIs (Claude).
+    // A shared-process CLI (Kimi, OpenCode) that names no session id renders nothing: its pid file
+    // cannot know whether an unbound sibling conversation exists in that process.
+    if (which !== "claude") return;
+    try {
+      const out = execFileSync("ps", ["-p", String(process.ppid), "-o", "lstart="], { encoding: "utf8", timeout: 1000, env: { ...process.env, LC_ALL: "C", TZ: "UTC" } }).trim();
+      if (out) process.stdout.write(readFileSync(hudPidLinePath(home, which, process.ppid, `ps-utc:${out.replace(/\s+/g, " ")}`), "utf8"));
+    } catch { /* no pid snapshot: render nothing */ }
+    return;
   }
   const node = new MbxNode();
   // Inside an agent session (a hook-bound or MCP-bound CLI up the process tree) the session's own name is the default,
@@ -637,6 +679,9 @@ If the codes differ, do not approve: someone is in the middle.`);
       let busy = false;
       const tick = async () => {
         if (busy) return; busy = true;
+        // The HUD heartbeat runs first in its own try: a failure in any later step must never
+        // leave hud/.alive stale (statuslines go blank when writeHud is skipped).
+        try { writeHud(node); } catch { /* db busy or hud io: next tick */ }
         try {
           if (node.reloadKeys()) process.stderr.write("[mbx] host keys rotated; using the new keys\n");
           await announceRotations(node);
