@@ -1,10 +1,9 @@
 // Local coordination, not isolation from another process with access to this user's database.
 // Lease tokens fence stale connections; they are never owner grants or permission approvals.
 import { randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { NAME_RE } from "./envelope.ts";
-import { processEvidenceSpawns, readLinuxProcess, sleepSync } from "./proc.ts";
+import { _resetPsEvidenceCache, procSeams, psEvidenceTable, readLinuxProcess, sleepSync } from "./proc.ts";
 import type { Store } from "./store.ts";
 
 // Only a synchronous, open write operation may attest which sender it currently holds.
@@ -49,6 +48,12 @@ export function inspectLeaseProcess(pid: number): ProcessEvidence {
 const EVIDENCE_CACHE_MS = 1_000;
 const EVIDENCE_CACHE_STALE_MS = 10 * EVIDENCE_CACHE_MS;
 const evidenceCache = new Map<number, { value: ProcessEvidence; at: number }>();
+/**
+ * Only an answer can be cached: a live process with its birth time, or a pid proven gone. An unknown answer (ps failed or
+ * timed out, a pid missing from the table while it still answers signals, a process we may not signal) is returned but never
+ * kept, so the 250/500/1000 ms retries inspect again instead of re-reading the failure (T332).
+ */
+const settled = (value: ProcessEvidence) => value.alive === false || (value.alive === true && !!value.start);
 
 let selfEvidenceCache: ProcessEvidence | null = null;
 /** Own pid is alive by definition; its birth time is computed once per process, never per call. */
@@ -60,14 +65,17 @@ function inspectSelf(): ProcessEvidence {
   return value;
 }
 
-/** One ps spawn for every requested pid (BSD one-second birth resolution; coordination fence, not a boundary). */
+/**
+ * Evidence for every requested pid from one inventory read: /proc on Linux, otherwise one full `ps -A` table filtered here
+ * (T332; never `ps -p <list>`, which takes 0.3-0.7 s on macOS). Liveness is probed now; start times come from the table.
+ */
 function psInspectBatch(pids: number[]): Map<number, ProcessEvidence> {
   const found = new Map<number, ProcessEvidence>();
   const probe = (pid: number): boolean | null => {
     try { process.kill(pid, 0); return true; }
     catch (e) { return (e as NodeJS.ErrnoException).code === "ESRCH" ? false : null; }
   };
-  if (process.platform === "linux") {
+  if (procSeams.platform === "linux") {
     for (const pid of pids) {
       const alive = probe(pid);
       if (alive === false) { found.set(pid, { alive: false, start: null }); continue; }
@@ -76,24 +84,19 @@ function psInspectBatch(pids: number[]): Map<number, ProcessEvidence> {
     }
     return found;
   }
-  processEvidenceSpawns.count += 1;
-  try {
-    const out = execFileSync("ps", ["-p", pids.join(","), "-o", "pid=,stat=,lstart="], {
-      encoding: "utf8", timeout: 1000, stdio: ["ignore", "pipe", "ignore"],
-      env: { ...process.env, TZ: "UTC", LC_ALL: "C", LANG: "C" },
-    }).trim();
-    for (const line of out.split("\n")) {
-      const m = /^\s*(\d+)\s+(\S+)\s+([A-Z][a-z]{2} [A-Z][a-z]{2}\s+\d{1,2} \d{2}:\d{2}:\d{2} \d{4})\s*$/.exec(line);
-      if (!m) continue;
-      const pid = Number(m[1]);
-      found.set(pid, m[2].includes("Z") ? { alive: false, start: null } : { alive: probe(pid), start: `ps-utc:${m[3].replace(/\s+/g, " ")}` });
-    }
-  } catch { /* unavailable inventory: probed liveness below, start stays unknown */ }
-  for (const pid of pids) if (!found.has(pid)) found.set(pid, { alive: probe(pid), start: null });
+  const requested = performance.now();
+  let read = psEvidenceTable();
+  // A table shared from earlier in this pass predates a process that is alive but absent from it: read once more.
+  if (read && read.at < requested && pids.some(pid => !read!.table.has(pid) && probe(pid) !== false)) read = psEvidenceTable(0) ?? read;
+  for (const pid of pids) {
+    const row = read?.table.get(pid);
+    // No table (ps failed or timed out): probed liveness only, start stays unknown.
+    found.set(pid, row?.zombie ? { alive: false, start: null } : { alive: probe(pid), start: row?.start ?? null });
+  }
   return found;
 }
 
-/** Batched, cached process evidence for other pids: one spawn per cache miss set, never one per pid. */
+/** Batched, cached process evidence for other pids: one inventory read per cache-miss set, never one per pid. */
 export function inspectLeaseProcesses(pids: number[]): Map<number, ProcessEvidence> {
   const now = performance.now();
   const out = new Map<number, ProcessEvidence>();
@@ -107,7 +110,8 @@ export function inspectLeaseProcesses(pids: number[]): Map<number, ProcessEviden
   if (missing.length) {
     const takenAt = performance.now();
     for (const [pid, value] of psInspectBatch(missing)) {
-      evidenceCache.set(pid, { value, at: takenAt });
+      if (settled(value)) evidenceCache.set(pid, { value, at: takenAt });
+      else evidenceCache.delete(pid);
       out.set(pid, value);
     }
   }
@@ -115,7 +119,7 @@ export function inspectLeaseProcesses(pids: number[]): Map<number, ProcessEviden
   return out;
 }
 
-export const _resetEvidenceCacheForTests = () => { evidenceCache.clear(); selfEvidenceCache = null; };
+export const _resetEvidenceCacheForTests = () => { evidenceCache.clear(); selfEvidenceCache = null; _resetPsEvidenceCache(); };
 
 export class IdentityLeases {
   #prepared = new AsyncLocalStorage<EvidenceScope>();
