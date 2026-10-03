@@ -197,6 +197,17 @@ test("the bundled Claude adapter renders with node absent from PATH — pure sh,
   const invalidFirst = spawnSync("/bin/sh", [script],
     { input: JSON.stringify({ session_id: "bad id!", agent: { session_id: "claude-1" } }), encoding: "utf8", env: shEnv });
   assert.equal(invalidFirst.stdout, "", "an invalid first id never falls through to a nested valid one");
+  // Only the top-level key counts: a nested key placed first never supplies the id, and a non-string
+  // top-level id (null, number, object) renders nothing even when a nested string id is bound.
+  const render = (payload: string) => spawnSync("/bin/sh", [script], { input: payload, encoding: "utf8", env: shEnv });
+  assert.equal(render(JSON.stringify({ session_id: null, agent: { session_id: "claude-1" } })).stdout, "", "a null top-level id never falls through to a nested one");
+  assert.equal(render(JSON.stringify({ agent: { session_id: "claude-1" }, session_id: "nope" })).stdout, "", "a nested key before the top-level one is ignored");
+  assert.match(render(JSON.stringify({ agent: { session_id: "nope" }, session_id: "claude-1" })).stdout, /^mbx drum/, "the top-level id wins when it comes last");
+  assert.equal(render(JSON.stringify({ session_id: 7 })).stdout, "", "a number id renders nothing");
+  assert.equal(render(JSON.stringify({ session_id: { session_id: "claude-1" } })).stdout, "", "an object id renders nothing");
+  assert.equal(render(JSON.stringify({ note: "\"session_id\":\"claude-1\"" })).stdout, "", "a session_id inside a string value is not a key");
+  assert.equal(render(JSON.stringify([{ session_id: "claude-1" }])).stdout, "", "a top-level array has no session id");
+  assert.match(render('{ "model": {"id": "x"},\n  "session_id" :\t"claude-1" }').stdout, /^mbx drum/, "whitespace and newlines around the key are fine");
 });
 
 test("the CLI adapter resolves exactly without opening the store — an empty home gains no files", (t) => {
