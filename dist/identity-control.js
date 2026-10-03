@@ -6,7 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
 import { canonical, sha256 } from "./crypto.js";
 import { NAME_RE } from "./envelope.js";
-import { inspectLeaseProcess, inspectLeaseProcesses, UNKNOWN_PROCESS } from "./identity-leases.js";
+import { inspectLeaseProcess, inspectLeaseProcesses, retryUnknown, UNKNOWN_PROCESS } from "./identity-leases.js";
 import { procTable } from "./proc.js";
 import { identityTakeoverApprovalSchema } from "./identity-takeover.js";
 import { SCHEMA_VERSION } from "./store.js";
@@ -53,6 +53,7 @@ export function removeIdentityControl(store, controlKey) {
     for (const descriptor of identityControlAliases(store, controlKey))
         store.db.prepare("DELETE FROM kv WHERE k=?").run(identityControlKey(descriptor.cli, descriptor.session_id));
 }
+const sameBirth = (p, start) => p.alive === false || (p.start !== null && p.start !== start) ? "invalid" : p.alive === true && p.start === start ? "valid" : "unknown";
 /** All process inspection precedes the operation's transaction. Missing proof never authorizes it. */
 export function inspectIdentityControlCaller(target, requesterPid, requesterStart) {
     const evidence = inspectLeaseProcesses([requesterPid, target.parent_pid, target.mcp_pid]);
@@ -60,7 +61,8 @@ export function inspectIdentityControlCaller(target, requesterPid, requesterStar
     // The ancestry walk must see a requester that may have spawned after any cached process table was
     // taken, so it bypasses the shared short cache; the three-pid evidence above stays batched and cached.
     const freshTable = procTable(0);
-    let current = requesterPid, related = false;
+    // A table without the requester (ps failed, or it predates the requester) cannot answer; one with it can, either way.
+    let current = requesterPid, ancestry = freshTable.has(requesterPid) ? "invalid" : "unknown";
     for (let depth = 0; depth < 64; depth++) {
         const next = freshTable.get(current)?.ppid;
         if (!next || next === current)
@@ -68,24 +70,29 @@ export function inspectIdentityControlCaller(target, requesterPid, requesterStar
         // PID 1 can be the provider in a container. Its recorded birth and liveness
         // must still match; generic shell-discovery helpers deliberately omit it.
         if (next === target.parent_pid) {
-            related = true;
+            ancestry = "valid";
             break;
         }
         current = next;
     }
+    const verdicts = [ancestry, sameBirth(requester, requesterStart), sameBirth(parent, target.parent_start), sameBirth(mcp, target.mcp_start)];
+    const state = verdicts.includes("invalid") ? "invalid" : verdicts.every(v => v === "valid") ? "valid" : "unknown";
     // Freshness is measured from when the evidence was taken, not from when collection began:
     // slow ps spawns under load must not expire proof that is fresh at hand-off.
     const at = performance.now();
-    return { at, valid: related && requester.alive === true && requester.start === requesterStart
-            && parent.alive === true && parent.start === target.parent_start && mcp.alive === true && mcp.start === target.mcp_start };
+    return { at, valid: state === "valid", state };
 }
 export function submitIdentityControl(store, target, action, name, approval) {
     if (action === "release" && name)
         throw fail("release does not accept a target name");
-    const requester = inspectLeaseProcess(process.pid);
-    if (requester.alive !== true || !requester.start)
+    // Unknown evidence is retried on the lease schedule; a definite answer, proof or refusal, stands at once (T340).
+    const { requester, proof } = retryUnknown(store, () => {
+        const requester = inspectLeaseProcess(process.pid);
+        return { requester, proof: requester.alive === true && requester.start ? inspectIdentityControlCaller(target, process.pid, requester.start) : null };
+    }, ({ requester, proof }) => proof ? proof.state === "unknown" : requester.alive !== false);
+    if (!proof || !requester.start)
         throw fail("cannot verify requester process identity");
-    const proof = inspectIdentityControlCaller(target, process.pid, requester.start), now = Date.now();
+    const now = Date.now();
     const request = requestSchema.parse({ v: 1, id: randomUUID(), action, ...(name ? { name } : {}), ...(approval ? { approval } : {}), target,
         requester_pid: process.pid, requester_start: requester.start, created_at: now, expires_at: now + 10_000, status: "pending" });
     return store.tx(() => {
