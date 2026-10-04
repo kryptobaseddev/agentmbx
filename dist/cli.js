@@ -1659,6 +1659,12 @@ async function watch(node, selection) {
                         pinned = { token: row.token, holder_pid: row.holder_pid, holder_start: row.holder_start };
                         lastHeartbeatAt = row.heartbeat_at;
                         heartbeatAdvancedMono = performance.now();
+                        // Review minor 6: a finite positive integer, clamped between the heartbeat interval and
+                        // the lease's idle ttl; anything else takes the default (3 beats).
+                        const raw = Number(process.env.MBX_WATCH_STALE_MS);
+                        staleMs = Number.isFinite(raw) && process.env.MBX_WATCH_STALE_MS !== undefined
+                            ? Math.min(Math.max(Math.trunc(raw), MCP_HEARTBEAT_MS), row.idle_ttl)
+                            : 3 * MCP_HEARTBEAT_MS;
                     }
                     return agent;
                 }); // full resolution + evidence, once
@@ -1672,8 +1678,6 @@ async function watch(node, selection) {
                 pinned = { token: lease.token, holder_pid: lease.holder_pid, holder_start: lease.holder_start };
                 lastHeartbeatAt = lease.heartbeat_at;
                 heartbeatAdvancedMono = performance.now();
-                // Review minor 6: a finite positive integer, clamped between the heartbeat interval and
-                // the lease's idle ttl; anything else takes the default (3 beats).
                 const raw = Number(process.env.MBX_WATCH_STALE_MS);
                 staleMs = Number.isFinite(raw) && process.env.MBX_WATCH_STALE_MS !== undefined
                     ? Math.min(Math.max(Math.trunc(raw), MCP_HEARTBEAT_MS), lease.idle_ttl)
@@ -1690,9 +1694,13 @@ async function watch(node, selection) {
             // rate-limited probes would reset the strike count.
             if (deadUntilMono && performance.now() <= deadUntilMono)
                 throw leaseLost(`the holder process for ${agent} is gone`);
+            if (process.env.MBX_WATCH_DEBUG)
+                process.stderr.write(`[mbx-watch debug] tick staleFor=${Math.round(performance.now() - heartbeatAdvancedMono)}ms window=${staleMs} deadUntil=${deadUntilMono}\n`);
             if (performance.now() - heartbeatAdvancedMono > staleMs && performance.now() - lastProbeMono > staleMs) {
                 probes += 1;
                 const status = identityLeaseStatus(lease, Date.now(), inspectLeaseProcess(lease.holder_pid));
+                if (process.env.MBX_WATCH_DEBUG)
+                    process.stderr.write(`[mbx-watch debug] probe ${status.state}\n`);
                 if (status.state === "live") {
                     deadUntilMono = 0;
                     lastProbeMono = performance.now();

@@ -120,7 +120,7 @@ test("T343: an idle watcher pays zero process evidence; a quiet-but-alive holder
   assert.ok(await until(() => liveWatcher(n, "worker")), "the second watcher registers");
   process.kill(transport.pid!, "SIGSTOP");
   t.after(() => { try { process.kill(transport.pid!, "SIGCONT"); } catch { /* already gone */ } });
-  await new Promise(r => setTimeout(r, 66_000)); // one full staleness window plus the probe, real clock
+  assert.ok(await until(() => /probe live/.test(w2.err()), 75_000), "the probe fired inside the window (polled, not guessed — load-dependent timing)"); // one full staleness window, real clock
   assert.ok(liveWatcher(n, "worker"), "a quiet-but-alive holder does not stop the watcher");
   process.kill(transport.pid!, "SIGCONT");
   w2.child.kill("SIGTERM");
