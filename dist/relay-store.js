@@ -6,6 +6,8 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
+/** The relay log keeps this many receipts. */
+export const OPS_KEEP = 1000;
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS enrolments (
@@ -27,9 +29,10 @@ CREATE INDEX IF NOT EXISTS dedup_age ON dedup(accepted_at);
 CREATE TABLE IF NOT EXISTS seqs (target_pubkey TEXT PRIMARY KEY, next_seq INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS acked (target_pubkey TEXT PRIMARY KEY, acked_through INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sender_lists (target_pubkey TEXT PRIMARY KEY, senders TEXT NOT NULL, iat TEXT NOT NULL, record TEXT NOT NULL, sig TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS ops (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, op TEXT NOT NULL, receipt TEXT NOT NULL);
 `;
 /** 1: T165 draft (wire TEXT, globally unique names). 2: wire BLOB, names unique per account, sender index.
- *  (Sequence numbers have a time floor and sender allowlists are additive: no version change.) */
+ *  (Sequence numbers have a time floor; sender allowlists and the relay log are additive: no version change.) */
 export const SCHEMA_VERSION = 2;
 /** Upgrades from older schema versions, each in its own transaction. */
 const MIGRATIONS = {
@@ -66,6 +69,13 @@ export class SqliteRelayStore {
         this.db.exec(SCHEMA);
         if (!this.meta("epoch"))
             this.setMeta("epoch", randomUUID());
+        // Expiry is enforced from T167 on, for v2 items only. Items queued before (v1 or v2: the store cannot tell) never had
+        // it and keep not having it: their senders may be v1, which can never learn of an expiry. Once, recorded in meta.
+        if (!this.meta("expiry_from"))
+            this.transaction(() => {
+                this.db.prepare("UPDATE items SET expires_at=NULL WHERE kind<>'expired'").run();
+                this.setMeta("expiry_from", new Date().toISOString());
+            });
         this.setMeta("schema_version", String(SCHEMA_VERSION));
     }
     transaction(fn) {
@@ -161,7 +171,7 @@ export class SqliteRelayStore {
       ON CONFLICT(target_pubkey) DO UPDATE SET senders=excluded.senders, iat=excluded.iat, record=excluded.record, sig=excluded.sig`).run(target, JSON.stringify(senders), iat, record, sig);
     }
     dedup(sender, itemId, target) {
-        const r = this.db.prepare("SELECT wire_hash, seq FROM dedup WHERE sender_pubkey=? AND item_id=? AND target_pubkey=?").get(sender, itemId, target);
+        const r = this.db.prepare("SELECT wire_hash, seq, accepted_at FROM dedup WHERE sender_pubkey=? AND item_id=? AND target_pubkey=?").get(sender, itemId, target);
         return r ? { ...r } : null;
     }
     insertItem(i) {
@@ -189,6 +199,25 @@ export class SqliteRelayStore {
         });
     }
     ackedThrough(target) { return this.db.prepare("SELECT acked_through FROM acked WHERE target_pubkey=?").get(target)?.acked_through ?? 0; }
+    expiredItems(at, limit) {
+        return this.db.prepare("SELECT * FROM items WHERE expires_at IS NOT NULL AND expires_at <= ? ORDER BY expires_at, target_pubkey, seq LIMIT ?").all(at, limit)
+            .map((r) => ({ ...r, wire: Buffer.from(r.wire) }));
+    }
+    deleteItem(target, seq) { this.db.prepare("DELETE FROM items WHERE target_pubkey=? AND seq=?").run(target, seq); }
+    pruneDedup(before) {
+        return Number(this.db.prepare(`DELETE FROM dedup WHERE accepted_at < ?
+      AND NOT EXISTS (SELECT 1 FROM items i WHERE i.target_pubkey=dedup.target_pubkey AND i.seq=dedup.seq)`).run(before).changes);
+    }
+    logOp(op, receipt, at = new Date().toISOString()) {
+        this.transaction(() => {
+            this.db.prepare("INSERT INTO ops (at, op, receipt) VALUES (?,?,?)").run(at, op, JSON.stringify(receipt));
+            this.db.prepare("DELETE FROM ops WHERE id <= (SELECT MAX(id) FROM ops) - ?").run(OPS_KEEP);
+        });
+    }
+    ops(limit) {
+        return this.db.prepare("SELECT id, at, op, receipt FROM ops ORDER BY id DESC LIMIT ?").all(limit)
+            .map((r) => ({ id: Number(r.id), at: r.at, op: r.op, receipt: JSON.parse(r.receipt) }));
+    }
     #usage = (sql, ...args) => {
         const r = this.db.prepare(sql).get(...args);
         return { items: Number(r.items), bytes: Number(r.bytes) };

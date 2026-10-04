@@ -12,6 +12,7 @@ import { relayDrainOutbox, relayFor, relayPull } from "./relay-client.js";
 import { relayPushOutbox, relayPushReceipts, relayReceive, relayRoute, relaySettle } from "./relay-v2.js";
 import { DEFAULT_QUOTA, parseRelayKey, RelayCore, startRelayServer } from "./relay.js";
 import { SqliteRelayStore } from "./relay-store.js";
+import { backupStore, readOps, restoredFrom, restoreStore, rotateEpochOp, STORE_DB, waitForLock } from "./relay-ops.js";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.js";
 import { HUD_ALIVE_MAX_MS, HUD_SCHEMA, hudAlivePath, hudDir, hudPidLinePath, hudPidPath, hudSessionLinePath, hudSessionPath, hudStatus, writeHud } from "./hud.js";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
@@ -91,6 +92,9 @@ Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …'
   agentmbx daemon                                   agentmbx daemon install | uninstall   (launchd / systemd user service)
   agentmbx relay [serve [--port N]]                 run an untrusted store-and-forward relay (ADR-035 reference)
   agentmbx relay set <url> | relay unset            point this daemon at a relay (picked up on daemon start)
+  agentmbx relay backup <file> [--store-dir DIR]    online backup of a relay store (safe while it runs); prints a receipt
+  agentmbx relay restore <file> [--store-dir DIR] [--force]   replace a stopped relay's store: new epoch, revocations kept, rollback copy
+  agentmbx relay log [--store-dir DIR] [--json] [--limit N]    the relay's receipts: backups, restores, epoch rotations, sweeps
   agentmbx notify-test [--as <agent>]               send a sample desktop notification the way wake-ups do
   agentmbx identity export <file> [--force]         passphrase-sealed backup (0600) of this host's keys, config and paired peers
   agentmbx identity import <file> [--force]         restore it on a replacement machine; --force backs up an existing identity first
@@ -99,7 +103,7 @@ Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …'
 Retention (default off: nothing is deleted until you set it)
   agentmbx retention [set <days> | off]             the daemon prunes settled mail older than <days> every 6 h
   agentmbx prune [--older-than <days>] [--dry-run]  delete acked, settled mail older than the window, then VACUUM
-                  never touches unacked mail or the outbox; replay reports pruned history as history_pruned
+                  never touches unacked mail or mail still held for delivery (outbox, relay); replay reports pruned history as history_pruned
 
 Owner (each signature needs you: a Touch ID / password prompt on macOS with AgentMBX.app, else the passphrase on a terminal)
   agentmbx owner init [--backend keychain|file]   agentmbx owner show
@@ -231,6 +235,113 @@ async function launchClaude(args) {
     const code = await new Promise((resolve) => child.on("exit", (c, sig) => resolve(c ?? (sig ? 128 + (osConstants.signals[sig] ?? 0) : 1))));
     process.off("SIGINT", ignore);
     process.exitCode = code;
+}
+const RELAY_SERVER_COMMANDS = ["serve", "keygen", "rotate-epoch", "backup", "restore", "log"];
+const RELAY_USAGE = "relay [serve [--port N] [--store-dir DIR] [--trust-proxy]] | relay keygen | relay rotate-epoch [--store-dir DIR] | relay backup <file> [--store-dir DIR] | relay restore <file> [--store-dir DIR] [--force] | relay log [--store-dir DIR] [--json] [--limit N] | relay quarantine [--json] | relay set <url> | relay unset";
+/** How long `relay serve` waits for another process to release the store (a redeploy can overlap the old one briefly). */
+const RELAY_LOCK_WAIT_MS = 60_000;
+/** The relay operator's side of `agentmbx relay`: everything that works on a relay store (T165, T167). */
+async function relayServerCommand(pos, o, str) {
+    const sub = pos[0] ?? "serve";
+    if (sub === "keygen") {
+        const k = generateKeyPair();
+        console.log(`MBX_RELAY_KEY=${k.privateKey}`);
+        console.error(`[agentmbx] relay key fingerprint ${fingerprint(k.publicKey)}: store the value as a secret, record the fingerprint for clients`);
+        return;
+    }
+    const dir = str("store-dir") ?? process.env.MBX_RELAY_DIR ?? join(homedir(), ".local/share/agentmbx-relay");
+    const receipt = (r) => console.log(JSON.stringify(r, null, 2));
+    if (sub === "rotate-epoch") {
+        // after any restore not made by agentmbx (volume snapshot, file copy): receivers re-pull from 0 and senders re-push (spec §5)
+        const r = rotateEpochOp(dir);
+        console.error(`[agentmbx] relay epoch ${r.from} -> ${r.to}`);
+        return receipt(r);
+    }
+    if (sub === "backup") {
+        if (pos.length !== 2)
+            die("relay backup <file> [--store-dir DIR]");
+        const r = await backupStore(dir, pos[1]);
+        console.error(`[agentmbx] backup ${r.file}: ${r.counts.items} queued item(s), ${r.counts.enrolments} enrolment(s), epoch ${r.epoch}, sha256 ${r.sha256}`);
+        return receipt(r);
+    }
+    if (sub === "restore") {
+        if (pos.length !== 2)
+            die("relay restore <file> [--store-dir DIR] [--force]");
+        const r = await restoreStore(dir, pos[1], { force: o.force === true });
+        console.error(`[agentmbx] restored ${r.backup.file} into ${r.store}: epoch ${r.epoch.from} -> ${r.epoch.to}; carried ${r.carried.revocations} revocation(s), ${r.carried.sender_lists} sender list(s)`);
+        if (r.rollback)
+            console.error(`[agentmbx] the replaced store is kept: undo with ${r.rollback}`);
+        return receipt(r);
+    }
+    if (sub === "log") {
+        const limit = Number(str("limit") ?? 50);
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000)
+            die("--limit must be an integer from 1 to 1000");
+        const ops = readOps(dir, limit);
+        if (o.json)
+            return receipt(ops);
+        if (!ops.length)
+            return console.log("the relay log is empty");
+        for (const r of ops) {
+            const x = r.receipt;
+            const what = r.op === "backup" ? `${x.file} sha256 ${String(x.sha256).slice(0, 16)}… epoch ${String(x.epoch)}`
+                : r.op === "restore" ? `${x.backup.file} epoch ${x.epoch.from} -> ${x.epoch.to}${x.rollback ? `; undo: ${String(x.rollback)}` : ""}`
+                    : r.op === "epoch-rotated" ? `epoch ${String(x.from)} -> ${String(x.to)} (${String(x.by ?? "")}${x.reason ? `: ${String(x.reason)}` : ""})`
+                        : r.op === "sweep" ? `expired ${Object.values(x.expired ?? {}).reduce((a, b) => a + b, 0)} item(s), ${x.notices ?? 0} notice(s), ${String(x.dedup_pruned ?? 0)} dedup row(s) pruned`
+                            : JSON.stringify(x);
+            console.log(`${r.at}  ${r.op}  ${what}`);
+        }
+        return;
+    }
+    if (sub !== "serve")
+        return die(RELAY_USAGE);
+    // T165: durable store and a persistent relay key in one directory (a Railway volume in production: MBX_RELAY_DIR=/data)
+    const port = Number(str("port") ?? process.env.PORT ?? 7374);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // T167: one writer per store. Held for the life of this process; the OS releases it if the process dies.
+    const lock = await waitForLock(dir, RELAY_LOCK_WAIT_MS);
+    if (!lock)
+        return die(`another process holds ${join(dir, "relay.lock")} (a relay or a restore on this store): one writer per store`);
+    // MBX_RELAY_KEY (a deploy secret: the base64 private key `agentmbx relay keygen` prints) wins over relay.key on the volume
+    const keyPath = join(dir, "relay.key");
+    const envKey = process.env.MBX_RELAY_KEY?.trim();
+    delete process.env.MBX_RELAY_KEY; // read once; never inherited by anything this process starts
+    if (!envKey && !existsSync(keyPath))
+        writeFileSync(keyPath, JSON.stringify(generateKeyPair()) + "\n", { mode: 0o600 });
+    const relayKey = (() => {
+        try {
+            return parseRelayKey(envKey ?? readFileSync(keyPath, "utf8"));
+        }
+        catch (e) {
+            return die(`relay key ${envKey ? "MBX_RELAY_KEY" : keyPath}: ${e.message}`);
+        }
+    })();
+    // A hosted relay cannot run `relay restore` beside itself: MBX_RELAY_RESTORE_FROM=<backup on the volume> restores it at
+    // start, under the lock. The path is consumed: once restored from, it is never restored again, even if the file there
+    // is replaced later or other restores happened since (unset the variable after the deploy).
+    const restoreFrom = process.env.MBX_RELAY_RESTORE_FROM?.trim();
+    if (restoreFrom) {
+        try {
+            const done = restoredFrom(dir, restoreFrom);
+            if (done)
+                console.error(`[agentmbx] MBX_RELAY_RESTORE_FROM ignored: already restored from ${resolve(restoreFrom)} at ${done}; unset MBX_RELAY_RESTORE_FROM`);
+            else {
+                const r = await restoreStore(dir, restoreFrom, { lock });
+                console.error(`[agentmbx] restored ${r.backup.file} at start: epoch ${r.epoch.from} -> ${r.epoch.to}${r.rollback ? `; replaced store kept at ${r.replaced.rollback}` : ""}; unset MBX_RELAY_RESTORE_FROM`);
+                console.error(`[agentmbx] restore receipt ${JSON.stringify(r)}`);
+            }
+        }
+        catch (e) { // a restore is all or nothing: serve the store as it is rather than stay down
+            console.error(`[agentmbx] MBX_RELAY_RESTORE_FROM=${restoreFrom} was not restored (${e.message}); serving the current store unchanged`);
+        }
+    }
+    const core = new RelayCore(DEFAULT_QUOTA, { store: new SqliteRelayStore(join(dir, STORE_DB)), key: relayKey });
+    const envProxy = process.env.MBX_RELAY_TRUST_PROXY, trustProxy = envProxy === "cloudflare" ? "cloudflare" : o["trust-proxy"] === true || envProxy === "xff" || envProxy === "1" ? "xff" : false;
+    const server = await startRelayServer(core, port, str("bind") ?? "0.0.0.0", { trustProxy });
+    server.on("close", () => lock.release()); // also keeps the lock reachable (never collected) while the server listens
+    console.log(`[agentmbx] untrusted store-and-forward relay listening on :${port} (ADR-035; durable store ${join(dir, STORE_DB)}, epoch ${core.store.epoch()})`);
+    console.log(`[agentmbx] relay key ${fingerprint(relayKey.publicKey)} (${envKey ? "from MBX_RELAY_KEY" : "keep relay.key with its store"}; record this fingerprint for clients)`);
+    return new Promise(() => void server);
 }
 async function run(argv) {
     const [cmd, ...rest] = argv;
@@ -496,6 +607,9 @@ async function run(argv) {
         catch { /* no pid snapshot: render nothing */ }
         return;
     }
+    // A relay box needs no host identity: serving, keys, backups and restores work on the relay store alone.
+    if (cmd === "relay" && (pos[0] === undefined || RELAY_SERVER_COMMANDS.includes(pos[0])))
+        return relayServerCommand(pos, o, str);
     const node = new MbxNode();
     // Inside an agent session (a hook-bound or MCP-bound CLI up the process tree) the session's own name is the default,
     // but a shell sender name alone conveys no lease or mailbox access.
@@ -803,49 +917,7 @@ If the codes differ, do not approve: someone is in the middle.`);
                     console.log(`${r.at}  ${r.kind} ${r.item_id}  seq ${r.seq} (${r.relay})  ${r.reason}`);
                 return;
             }
-            if (sub === "keygen") {
-                const k = generateKeyPair();
-                console.log(`MBX_RELAY_KEY=${k.privateKey}`);
-                console.error(`[agentmbx] relay key fingerprint ${fingerprint(k.publicKey)}: store the value as a secret, record the fingerprint for clients`);
-                return;
-            }
-            const dir = str("store-dir") ?? process.env.MBX_RELAY_DIR ?? join(homedir(), ".local/share/agentmbx-relay");
-            if (sub === "rotate-epoch") {
-                // after any restore not made by agentmbx (volume snapshot, file copy): receivers re-pull from 0 and senders re-push (spec §5)
-                const store = new SqliteRelayStore(join(dir, "relay.db"));
-                try {
-                    console.log(`relay epoch ${store.epoch()} -> ${store.rotateEpoch()}`);
-                }
-                finally {
-                    store.close();
-                }
-                return;
-            }
-            if (sub !== undefined && sub !== "serve")
-                die("relay [serve [--port N] [--store-dir DIR] [--trust-proxy]] | relay keygen | relay rotate-epoch [--store-dir DIR] | relay quarantine [--json] | relay set <url> | relay unset");
-            // T165: durable store and a persistent relay key in one directory (a Railway volume in production: MBX_RELAY_DIR=/data)
-            const port = Number(str("port") ?? process.env.PORT ?? 7374);
-            mkdirSync(dir, { recursive: true, mode: 0o700 });
-            // MBX_RELAY_KEY (a deploy secret: the base64 private key `agentmbx relay keygen` prints) wins over relay.key on the volume
-            const keyPath = join(dir, "relay.key");
-            const envKey = process.env.MBX_RELAY_KEY?.trim();
-            delete process.env.MBX_RELAY_KEY; // read once; never inherited by anything this process starts
-            if (!envKey && !existsSync(keyPath))
-                writeFileSync(keyPath, JSON.stringify(generateKeyPair()) + "\n", { mode: 0o600 });
-            const relayKey = (() => {
-                try {
-                    return parseRelayKey(envKey ?? readFileSync(keyPath, "utf8"));
-                }
-                catch (e) {
-                    return die(`relay key ${envKey ? "MBX_RELAY_KEY" : keyPath}: ${e.message}`);
-                }
-            })();
-            const core = new RelayCore(DEFAULT_QUOTA, { store: new SqliteRelayStore(join(dir, "relay.db")), key: relayKey });
-            const envProxy = process.env.MBX_RELAY_TRUST_PROXY, trustProxy = envProxy === "cloudflare" ? "cloudflare" : o["trust-proxy"] === true || envProxy === "xff" || envProxy === "1" ? "xff" : false;
-            const server = await startRelayServer(core, port, str("bind") ?? "0.0.0.0", { trustProxy });
-            console.log(`[agentmbx] untrusted store-and-forward relay listening on :${port} (ADR-035; durable store ${join(dir, "relay.db")}, epoch ${core.store.epoch()})`);
-            console.log(`[agentmbx] relay key ${fingerprint(relayKey.publicKey)} (${envKey ? "from MBX_RELAY_KEY" : "keep relay.key with its store"}; record this fingerprint for clients)`);
-            return new Promise(() => void server);
+            return die(RELAY_USAGE);
         }
         case "daemon": {
             if (pos[0] === "install")
@@ -989,7 +1061,7 @@ If the codes differ, do not approve: someone is in the middle.`);
             if (o.json)
                 return console.log(JSON.stringify(r, null, 2));
             console.log(`${r.dry_run ? "would prune" : "pruned"} ${r.messages} messages (${r.deliveries} acked deliveries, ${r.replay_positions} replay positions) received before ${r.cutoff}`);
-            console.log(`kept: ${r.kept.unacked} unacked, ${r.kept.outbox} in the outbox, ${r.kept.recent_activity} acked within the window${r.vacuumed ? "; VACUUM done" : ""}`);
+            console.log(`kept: ${r.kept.unacked} unacked, ${r.kept.outbox} still held for delivery (outbox or relay), ${r.kept.recent_activity} acked within the window${r.vacuumed ? "; VACUUM done" : ""}`);
             return;
         }
         case "owner": return owner(node, pos, str, o);

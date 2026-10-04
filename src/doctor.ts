@@ -247,6 +247,12 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
       if (changed && node.store.get(`relay-key:${relay}`)) add("fail", `relay ${relay} now serves a different key than the one pinned: relay use is stopped (${changed.detail})`, "confirm the relay operator rotated it, then: agentmbx relay set <url> --key <fingerprint>");
       const waiting = n("SELECT COUNT(*) c FROM relay_sent WHERE relay=? AND state='relay-accepted'", relay);
       if (waiting) add("info", `${waiting} message(s) accepted by the relay, waiting for the recipient host's delivery receipt`);
+      const repush = n("SELECT COUNT(*) c FROM relay_sent WHERE relay=? AND state='repush'", relay);
+      if (repush) add("info", `${repush} message(s) to push again after a relay restore (kept until the relay accepts them, a delivery receipt or their deadline)`);
+      const expired = n("SELECT COUNT(*) c FROM relay_sent WHERE relay=? AND state='expired'", relay);
+      if (expired) add("warn", `${expired} relay message(s) expired undelivered: the recipient host never collected them (their senders were alerted)`);
+      const rejected = n("SELECT COUNT(*) c FROM relay_sent WHERE relay=? AND state='rejected'", relay);
+      if (rejected) add("warn", `${rejected} message(s) waiting for a re-push after a relay restore were rejected by the recipient host over the LAN (their senders were alerted)`);
       const unconfirmed = n("SELECT COUNT(*) c FROM relay_sent WHERE relay=? AND state='unconfirmed'", relay);
       if (unconfirmed) add("warn", `${unconfirmed} relay delivery(ies) never confirmed by the recipient host (their senders were alerted)`);
       const rotFail = db.prepare("SELECT at, detail FROM audit WHERE event='relay.rotate_failed' ORDER BY at DESC LIMIT 1").get() as { at: string; detail: string } | undefined;
