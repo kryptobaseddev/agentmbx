@@ -37,6 +37,8 @@ export function dueReceipts(node, now = Date.now()) {
     const expired = node.store.db.prepare("DELETE FROM receipt_outbox WHERE at < ?").run(new Date(now - RETRY_HOURS * 3_600_000).toISOString()).changes;
     if (expired)
         node.store.audit("receipt.expired", { count: Number(expired), hours: RETRY_HOURS });
+    // relay bytes of a receipt that is no longer owed (expired here, retired by doctor --fix, or left by 0.5.5/0.5.6) (T333)
+    node.store.db.prepare("DELETE FROM relay_receipt_wire WHERE seq NOT IN (SELECT seq FROM receipt_outbox)").run();
     const due = new Date(now).toISOString(), by = new Map();
     // one batch per host per pass, so a host with a large backlog never starves the others
     for (const { host } of node.store.db.prepare("SELECT DISTINCT host FROM receipt_outbox WHERE next_at <= ?").all(due))
@@ -44,9 +46,13 @@ export function dueReceipts(node, now = Date.now()) {
             .all(host, due, RECEIPT_BATCH));
     return by;
 }
+/** Delivered receipts leave the outbox, with the bytes kept for the relay if they were signed for it (whichever path
+ *  delivered them: LAN or relay, T333). */
 export const receiptsSent = (node, seqs) => {
-    for (const s of seqs)
+    for (const s of seqs) {
         node.store.db.prepare("DELETE FROM receipt_outbox WHERE seq=?").run(s);
+        node.store.db.prepare("DELETE FROM relay_receipt_wire WHERE seq=?").run(s);
+    }
 };
 /** Back off after a failed push; an older peer without the endpoint is retried hourly until its receipts expire. */
 export function receiptsDeferred(node, host, error, now = Date.now(), unsupported = false) {
