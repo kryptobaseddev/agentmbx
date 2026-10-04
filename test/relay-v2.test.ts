@@ -288,3 +288,64 @@ test("an item quarantined because its sender was not paired yet is retried once 
   assert.equal(count(b, "SELECT COUNT(*) c FROM relay_quarantine"), 0);
   void core;
 });
+
+test("a quarantined item whose sender key is paired under another host name is not re-quarantined every tick (T333)", async (t) => {
+  const { a, b, open } = await world(t);
+  const sb = await open(b);
+  b.store.db.prepare("DELETE FROM peers WHERE host='alpha'").run(); // beta forgets alpha
+  a.send({ from: "alice", to: ["bob@beta"], subject: "early", body: "x" }); lanFailedTwice(a);
+  await relayPushOutbox(a, await open(a));
+  await relayReceive(b, sb);
+  const quarantined = () => b.store.db.prepare("SELECT reason, at FROM relay_quarantine").all().map((r) => ({ ...r }));
+  const audits = () => count(b, "SELECT COUNT(*) c FROM audit WHERE event='relay.quarantined'");
+  const before = quarantined();
+  assert.equal(before.length, 1);
+  assert.equal(audits(), 1);
+  // beta pairs alpha's key, but under another name: the key is on beta's published allowlist, the envelope still names
+  // "alpha", which is not paired, so a retry would fail the same way
+  b.addApprovedPeer({ host: "alpha-old", pubkey: a.key.publicKey, owner_pubkey: null, addr: "127.0.0.1:1" }, "fixture");
+  for (let tick = 0; tick < 3; tick++) assert.equal(await relayReceive(b, sb), 0);
+  assert.deepEqual(quarantined(), before, "the same row, untouched: not deleted and re-inserted");
+  assert.equal(audits(), 1, "audited once, not once per tick");
+  // the host the envelope names gets paired with that key: one retry, and it lands
+  b.store.db.prepare("DELETE FROM peers WHERE host='alpha-old'").run();
+  b.addApprovedPeer({ host: "alpha", pubkey: a.key.publicKey, owner_pubkey: null, addr: "127.0.0.1:1" }, "fixture");
+  assert.equal(await relayReceive(b, sb), 1);
+  assert.equal(b.inbox("bob").length, 1);
+  assert.equal(count(b, "SELECT COUNT(*) c FROM relay_quarantine"), 0);
+});
+
+test("a receipt's relay bytes go when the LAN delivers it or it expires, so relay_receipt_wire never orphans (T333)", async (t) => {
+  const { startServer, flushReceipts } = await import("../src/http.ts");
+  const { dueReceipts } = await import("../src/remote-receipts.ts");
+  const lost: typeof fetch = async (input, init) => {
+    if (String(input).includes("/v2/relay/items") && init?.method === "POST" && String(init.body).includes("\"receipt\"")) throw new Error("lost");
+    return fetch(input, init);
+  };
+  const { a, b, open } = await world(t, { f: lost });
+  const id = a.send({ from: "alice", to: ["bob@beta"], subject: "s", body: "b" }).envelope.id; lanFailedTwice(a);
+  await relayPushOutbox(a, await open(a));
+  const sb = await open(b);
+  await relayReceive(b, sb);
+  const wires = () => count(b, "SELECT COUNT(*) c FROM relay_receipt_wire");
+  receiptsLanFailedTwice(b);
+  assert.equal(await relayPushReceipts(b, sb), 0, "the relay push is lost");
+  assert.equal(wires(), 1, "the signed bytes are kept for the relay retry");
+  // the LAN comes back first and delivers the receipt
+  const lan = await startServer(a, 0, "127.0.0.1");
+  t.after(() => new Promise<void>((r) => lan.close(() => r())));
+  b.store.db.prepare("UPDATE peers SET addr=? WHERE host='alpha'").run(`127.0.0.1:${(lan.address() as AddressInfo).port}`);
+  b.store.db.prepare("UPDATE receipt_outbox SET next_at=?").run(new Date(Date.now() - 1000).toISOString());
+  assert.deepEqual(await flushReceipts(b), { sent: 1, deferred: 0 });
+  assert.equal(count(a, "SELECT COUNT(*) c FROM remote_receipts WHERE recipient='bob@beta'"), 1);
+  assert.equal(wires(), 0, "delivered over the LAN: its relay bytes are dropped with it");
+  // the next receipt is signed for the relay, never delivered, and expires
+  b.setDelivery(id, "bob", "read");
+  receiptsLanFailedTwice(b);
+  assert.equal(await relayPushReceipts(b, sb), 0);
+  assert.equal(wires(), 1);
+  b.store.db.prepare("INSERT INTO relay_receipt_wire (seq,item_id,wire,created_at) VALUES (999999,'receipt:left-by-0.5.6',?,?)").run(Buffer.from("{}"), new Date().toISOString());
+  assert.equal(dueReceipts(b, Date.now() + 73 * 3_600_000).size, 0, "expired after 72 h");
+  assert.equal(count(b, "SELECT COUNT(*) c FROM receipt_outbox"), 0);
+  assert.equal(wires(), 0, "expired: its relay bytes go too, and so does a row an older version left behind");
+});

@@ -142,3 +142,17 @@ test("a live pid missing from a shared table reads once more; a pid proven gone 
     assert.equal(ps.evidenceReads(), 2);
   });
 });
+
+test("an answer from a shared table is cached from the table's read time, not from when it was asked (T340)", t => {
+  const a = child(t), b = child(t);
+  const rows: Row[] = [{ pid: process.pid, utc: "Sat Oct  3 08:00:00 2026" }, { pid: a, utc: "Sat Oct  3 08:01:00 2026" }, { pid: b, utc: "Sat Oct  3 08:02:00 2026" }];
+  const ps = fakePs(t, args => args[2] === EVIDENCE ? evidenceOut(rows) : tableOut(rows));
+  inspectLeaseProcesses([a]); // reads the table
+  sleepSync(600);
+  assert.equal(inspectLeaseProcesses([b]).get(b)?.start, "ps-utc:Sat Oct 3 08:02:00 2026", "served from the shared table");
+  assert.equal(ps.evidenceReads(), 1);
+  sleepSync(500);
+  // 1.1 s after the read: stamped with the time it was asked, b's answer would still look 0.5 s old and skip this read.
+  inspectLeaseProcesses([b]);
+  assert.equal(ps.evidenceReads(), 2, "the answer expired with the table it came from");
+});

@@ -402,15 +402,29 @@ test("a future-dated sender list is refused; a stale heartbeat rotates the epoch
   const k = keys(); enrol(core, "beta", k.beta);
   const l: SenderList = { v: 1, type: "relay-senders", host_pubkey: k.beta.publicKey, senders: [], iat: new Date(Date.now() + 3_600_000).toISOString() };
   assert.throws(() => core.publishSenders(core.requireEnrolled(k.beta.publicKey), l, signData(k.beta.privateKey, canonical(l))), /in the future/);
-  const store = seqStore(), key = generateKeyPair();
+  const store = seqStore(), key = generateKeyPair(), lines: string[] = [], log = (l: string) => lines.push(l);
   t.after(() => store.close());
-  const a = new RelayCore(DEFAULT_QUOTA, { store, key, now: () => 1_000_000 });
+  const a = new RelayCore(DEFAULT_QUOTA, { store, key, now: () => 1_000_000, log });
   const epoch = store.epoch();
-  new RelayCore(DEFAULT_QUOTA, { store, key, now: () => 1_000_000 + 60_000 });
+  new RelayCore(DEFAULT_QUOTA, { store, key, now: () => 1_000_000 + 60_000, log });
   assert.equal(store.epoch(), epoch, "a quick restart keeps the epoch");
-  new RelayCore(DEFAULT_QUOTA, { store, key, now: () => 1_000_000 + 60_000 + 11 * 60_000 });
-  assert.notEqual(store.epoch(), epoch, "a stale heartbeat (restore or long outage) rotates it");
+  assert.equal(lines.length, 0, "and says nothing");
+  new RelayCore(DEFAULT_QUOTA, { store, key, now: () => 1_000_000 + 60_000 + 11 * 60_000, log });
+  const stale = store.epoch();
+  assert.notEqual(stale, epoch, "a stale heartbeat (restore or long outage) rotates it");
   assert.match(store.meta("epoch_rotated") ?? "", /stale heartbeat/);
+  // T333: the operator sees it, in one line
+  assert.equal(lines.length, 1);
+  assert.match(lines[0]!, /^\[agentmbx\] relay epoch rotated at startup: stored heartbeat \S+ is 11 min old \(restore or long outage\)/);
+  assert.ok(lines[0]!.includes(`epoch ${epoch} -> ${stale}`), lines[0]);
+  // a heartbeat from the future (the clock went back) proves nothing either: rotate and say so
+  new RelayCore(DEFAULT_QUOTA, { store, key, now: () => 1_000_000 + 60_000 + 11 * 60_000 - 30 * 60_000, log });
+  assert.notEqual(store.epoch(), stale, "a clock ahead of this one rotates it");
+  assert.match(store.meta("epoch_rotated") ?? "", /heartbeat ahead of the clock/);
+  assert.equal(lines.length, 2);
+  assert.match(lines[1]!, /is 30 min ahead of this clock \(clock went back/);
+  new RelayCore(DEFAULT_QUOTA, { store, key, now: () => 1_000_000 + 60_000 + 11 * 60_000 - 30 * 60_000 - 5 * 60_000, log });
+  assert.equal(lines.length, 2, "a small step back (within the stale window) is not a restore");
   void a;
 });
 

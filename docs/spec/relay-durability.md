@@ -183,7 +183,9 @@ The receiving host MUST process items in seq order:
 - **Accepted** or **duplicate** → the item is done.
 - **Rejected** (undecryptable, bad signature, unpaired, malformed) → the item is written to `relay_quarantine(relay,
   epoch, seq, item_id, sender_pubkey, reason, wire, at)` and is then done. It is never dropped silently (G9).
-  `doctor` and `agentmbx relay quarantine` list it.
+  `doctor` and `agentmbx relay quarantine` list it. An envelope quarantined because its host was not paired is
+  processed again once the host it names is paired with the key that pushed it (T333). A sender key that is paired
+  under another host name does not qualify, so such an item is not re-quarantined on every pull.
 - `received_through` advances only over a contiguous run of done items and is persisted in the same transaction as
   the last one.
 
@@ -209,8 +211,10 @@ state retryable: the next pull starts at `received_through`, and the relay simpl
   receivers' checkpoints, and receivers that pull before any push detect the rewind (`head_seq < received_through`,
   §4). The relay also writes a heartbeat to its store every 30 s and, at startup, rotates the epoch itself when the
   stored heartbeat is more than 10 minutes old: a volume restore restarts the service on old data, and so does a long
-  outage (an extra rotation only costs a re-push and a re-pull, which dedup absorbs). On seeing a new epoch, in either
-  a push or a pull response:
+  outage (an extra rotation only costs a re-push and a re-pull, which dedup absorbs). A heartbeat more than 10 minutes
+  ahead of the relay clock rotates it too, since the clock went back or the store was written under another clock. The
+  relay logs one line when it rotates at startup, with the heartbeat, its age and both epochs (T333). On seeing a new
+  epoch, in either a push or a pull response:
   - A sender re-pushes every outbox row in `relay-accepted` state whose delivery receipt hasn't arrived. Dedup
     makes this safe even where the restored store still has the item.
   - A receiver resets its relay position for that relay to 0 and pulls everything. Receiver dedup by message id
@@ -281,6 +285,9 @@ and wire bytes = canonical(`{rec, sig}`). This is the unsigned routing envelope 
 with `to_host` expressed as the target key. The receiver applies it with `acceptReceipt(node, item, null)`. A
 `relay-accepted` envelope row moves to done when its delivery receipt (state `delivered` or later) arrives this way,
 or over the LAN.
+
+The host that owes a receipt signs it for the relay once and keeps those bytes (`relay_receipt_wire`) for every
+retry. The bytes go when the receipt leaves its outbox: delivered over the relay or the LAN, expired, or retired (T333).
 
 ### 10. Transport selection
 

@@ -12,7 +12,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { fingerprint, generateKeyPair } from "./crypto.ts";
-import { checkShape, KINDS, MAX_RELAY_DEPTH, NAME_RE, type Envelope, type Grant } from "./envelope.ts";
+import { checkShape, EXTERNAL_TAINT_MS, externalExposure, KINDS, MAX_RELAY_DEPTH, NAME_RE, type Envelope, type ExternalExposure, type Grant } from "./envelope.ts";
 import { kimiMultiHost } from "./kimi-web.ts";
 import { BIND_TICKET_RE, takeBindTicket } from "./bind-ticket.ts";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
@@ -256,6 +256,27 @@ export const statusWakeWarning = (e: Envelope): string[] => e.kind === "status" 
 export const depthWarning = (e: Envelope): string[] => (e.meta.hop ?? 0) > LEVEL_MAX_HOP.collaborate
   ? [`relay depth ${e.meta.hop} exceeds ${LEVEL_MAX_HOP.collaborate}: this session has read a long chain from agents other than this message's recipients since your user last typed. A recipient under ask (limit ${MAX_HOP}) or collaborate (limit ${LEVEL_MAX_HOP.collaborate}) will not be woken or act on it (it can still read and answer); autonomous and yolo have no depth limit. Your user's next prompt resets the depth.`] : [];
 
+/** First-hand external messages a session remembers the first read of (T344); beyond this a re-read counts as new. */
+const FIRST_HAND_MAX = 1000;
+/** The outside content behind a session's taint (T344): the root exposure and the message that set it. */
+export type Taint = ExternalExposure & { from: string; id: string };
+const isoAt = (t: number) => new Date(t).toISOString();
+/** Which read caused a taint, in words for the sender's warning and mbx_whoami. */
+export const taintCause = (t: Taint): string => `you read ${t.id} from ${t.from}, ${{
+  declared: "which its sender declared external: first-hand outside content, so the root is when you read it",
+  inherited: "whose sender inherited the taint from that earlier exposure",
+  legacy: "external mail from an older AgentMBX without a root time: counted as first-hand outside content, from when you read it",
+  malformed: "a malformed message: unknown provenance counts as first-hand outside content",
+}[t.how]}`;
+/** Tell the sender why its message went out external and when that ends (T344): agents were re-tainting each other silently. */
+export const externalWarning = (origin: "agent" | "external" | undefined, taint: Taint | null): string[] => {
+  const until = taint ? ` This session's sends stay external until ${isoAt(taint.root + EXTERNAL_TAINT_MS)}, an hour after its root exposure at ${isoAt(taint.root)}: ${taintCause(taint)}.`
+    + " Answers from agents who read your mail carry that same root and do not extend it; reading first-hand outside content again does. A prompt from your user does not clear it." : "";
+  if (origin === "external") return [`sent with origin external, as you declared: recipients may only read it under owner policy (no edit or outward), and reading it makes their own sends external for 1 h.${until}`];
+  if (!taint) return [];
+  return [`${origin === "agent" ? "origin \"agent\" overridden: " : ""}sent with origin external because this session read outside content: recipients may only read it under owner policy (no edit or outward).${until}`];
+};
+
 export async function runMcp(existing?: MbxNode) {
   let node: MbxNode;
   if (existing) node = existing;
@@ -282,7 +303,9 @@ export async function runMcp(existing?: MbxNode) {
     lostTo?: string;
     activityAt?: number;
     controlAliases?: string[];
-    parent: { hops: Map<string, { hop: number; from: string; at: number }>; externalAt: number | null } | null };
+    parent: { hops: Map<string, { hop: number; from: string; at: number }>; external: Taint | null;
+      /** First read of each first-hand external message in the last hour: re-reading it keeps that root (T344). */
+      firstHand: Map<string, number> } | null };
   const base: State = { agent: "", sessionId: env.sessionId, key: generateKeyPair(), parent: null };
   if (detached?.base.released) { base.agent = detached.base.agent; base.released = true; base.controlAliases = detached.base.aliases; }
   const states = new Map<string, State>();
@@ -582,36 +605,61 @@ export async function runMcp(existing?: MbxNode) {
     }
     return state;
   };
-  // relay tracking: a message this session sends after reading one is one hop further, and inherits an external origin
-  const noteRead = (rows: { envelope: string; from_addr: string }[]) => {
+  // relay tracking: a message this session sends after reading one is one hop further, and inherits an external origin.
+  // `reply`: the session is answering this message (mbx_reply, mbx_send reply_to), which re-exposes it to the content.
+  const noteRead = (rows: { id: string; envelope: string; from_addr: string }[], { reply = false } = {}) => {
     const state = current(), { agent } = state;
     const now = Date.now();
     if (state.parent) for (const [k, x] of state.parent.hops) {
       if (now - x.at >= 3_600_000) state.parent.hops.delete(k);
     }
+    if (state.parent) for (const [id, at] of state.parent.firstHand) {
+      if (now - at >= EXTERNAL_TAINT_MS) state.parent.firstHand.delete(id);
+    }
     for (const r of rows) {
       if (r.from_addr === `${agent}@${node.host}`) continue;
       const e = JSON.parse(r.envelope) as Envelope;
       // Retained malformed mail is readable, but cannot erase unknown provenance.
-      const m = checkShape(e) ? { hop: MAX_RELAY_DEPTH, origin: "external" } : e.meta; // past every level's allowance (T104)
-      state.parent ??= { hops: new Map(), externalAt: null };
+      const m = checkShape(e) ? { hop: MAX_RELAY_DEPTH } : e.meta; // past every level's allowance (T104)
+      state.parent ??= { hops: new Map(), external: null, firstHand: new Map() };
       // Each (sender, depth) keeps its own last exposure. Lower-depth mail cannot renew a higher one. The sender is kept so
       // a reply to that same sender doesn't count it (T104): a two-party conversation is not a relay chain.
       const hop = m.hop ?? 0;
       state.parent.hops.set(`${r.from_addr}\u0000${hop}`, { hop, from: r.from_addr, at: now });
-      if (m.origin === "external") state.parent.externalAt = now;
+      // External taint (T344): the latest ROOT exposure of everything read, never the read time of inherited taint, so two
+      // agents answering each other can't keep renewing it. First-hand content (declared, or malformed) is exposure now.
+      const x = externalExposure(e, now);
+      if (x && x.how !== "inherited") {
+        // Viewing the same first-hand message again within the hour (mbx_thread every turn, mbx_read again) adds no new
+        // outside content: its first read stays the root. A reply to it, or a read after the hour, is a new exposure.
+        const first = state.parent.firstHand.get(r.id);
+        if (first === undefined) {
+          if (state.parent.firstHand.size >= FIRST_HAND_MAX) state.parent.firstHand.delete(state.parent.firstHand.keys().next().value!); // oldest: a re-read then counts as new, never shorter
+          state.parent.firstHand.set(r.id, now);
+        } else if (!reply) x.root = first;
+      }
+      if (x && x.root > (state.parent.external?.root ?? -Infinity)) state.parent.external = { ...x, from: r.from_addr, id: r.id };
     }
   };
+  /** This session's live external taint, or null once its root exposure is an hour old. */
+  const taintOf = (state: State, now = Date.now()): Taint | null => {
+    const t = state.parent?.external;
+    return t && now - t.root < EXTERNAL_TAINT_MS ? t : null;
+  };
   const relay = (origin?: "agent" | "external", to?: string[]) => {
-    const { parent, agent } = current();
+    const state = current(), { parent, agent } = state;
     const now = Date.now();
     // A prompt the owner typed since an exposure ends that agent-to-agent chain (T104): only depth resets, never external origin.
     const human = Date.parse(node.store.get(humanPromptKey(agent)) ?? "") || 0;
     // Depth counts what this session read from anyone OTHER than the recipients (T104); a broadcast or role send counts all.
     const skip = to ? node.recipientAddrs(to) : null;
     const depths = parent ? [...parent.hops.values()].filter((x) => now - x.at < 3_600_000 && x.at > human && !skip?.has(x.from)).map((x) => x.hop) : [];
-    const external = parent?.externalAt != null && now - parent.externalAt < 3_600_000;
-    return { hop: depths.length ? Math.min(MAX_RELAY_DEPTH, Math.max(...depths) + 1) : 0, origin: origin === "external" || external ? "external" as const : "agent" as const, project, project_key: projectKey(project) };
+    // An explicit origin "agent" cannot clear it, and neither can the owner's prompt (T104); the warning says so (T344).
+    const taint = taintOf(state, now);
+    const draft = { hop: depths.length ? Math.min(MAX_RELAY_DEPTH, Math.max(...depths) + 1) : 0, origin: origin === "external" || taint ? "external" as const : "agent" as const,
+      // inherited taint carries its ROOT exposure; a declared send is first-hand, rooted at its own send time
+      ...(origin !== "external" && taint ? { external_since: isoAt(taint.root) } : {}), project, project_key: projectKey(project) };
+    return { draft, warnings: externalWarning(origin, taint) };
   };
   /** Opening mail marks the reader's own copies read (delivered/notified → read; never past acked), for sender receipts (T207). */
   const markRead = (rows: { id: string }[], agent: string) => { for (const r of rows) node.setDelivery(r.id, agent, "read"); };
@@ -890,6 +938,10 @@ export async function runMcp(existing?: MbxNode) {
       registered: !!reg, project: project ?? null, cli: env.cli, session: fingerprint(key.publicKey),
       owner_grant: s.grant ? { caps: s.grant.caps, expires: s.grant.exp } : null, delivery: node.deliveryMode(agent), unread: node.unreadCount(agent),
       missed: missedCount(node.store, agent).missed,
+      // T344: whether this session's sends go out external, since when (root exposure), why, and when that ends
+      external: ((t) => t ? { tainted: true, root_exposure: isoAt(t.root), clears_at: isoAt(t.root + EXTERNAL_TAINT_MS), cause: taintCause(t),
+        effect: "your mbx_send/mbx_reply go out with origin external (recipients may only read them under policy); origin \"agent\" is overridden and a prompt from your user does not clear it" }
+        : { tainted: false })(taintOf(state)),
       policies: activePolicies(node.store.db, agent, node.host).map((p) => ({ id: p.id, level: p.level, classes: p.classes, from: p.from, projects: p.projects ?? null, expires: p.exp })),
       version: version(), update_available: updateAvailable(node.store),
       ...(!reg || AUTO_NAME_RE.test(agent) ? { next: AUTO_NAME_RE.test(agent)
@@ -952,13 +1004,14 @@ export async function runMcp(existing?: MbxNode) {
       if (prev) return text(`Already sent as ${prev} (same idempotency_key).`, { id: prev, duplicate: true });
     }
     let thread: string | undefined;
-    if (reply_to) { const m = node.read(reply_to, agent); noteRead([m]); thread = m.thread; reply_to = m.id; }
+    if (reply_to) { const m = node.read(reply_to, agent); noteRead([m], { reply: true }); thread = m.thread; reply_to = m.id; }
     assertKnownRecipients(node, to); // T205: never create a mailbox by typo
-    const r = node.send({ from: agent, to, subject, body, kind, reply_to, thread, needs_reply, refs, ...relay(origin, to) }, session());
+    const rel = relay(origin, to);
+    const r = node.send({ from: agent, to, subject, body, kind, reply_to, thread, needs_reply, refs, ...rel.draft }, session());
     if (idempotency_key) node.store.set(`idem:${agent}:${idempotency_key}`, r.envelope.id);
     const recipients = recipientReceipts(node, r.envelope.id, r.targets);
     const out = { id: r.envelope.id, ref: `mbx:${r.envelope.id}@${node.host}`, thread: r.envelope.thread, recipients, delivered_locally: r.local, queued_for_hosts: r.remote,
-      owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...offlineWarnings(recipients), ...statusWakeWarning(r.envelope), ...depthWarning(r.envelope)] };
+      owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...offlineWarnings(recipients), ...statusWakeWarning(r.envelope), ...depthWarning(r.envelope), ...rel.warnings] };
     return text(JSON.stringify(out, null, 2), out);
   });
 
@@ -973,12 +1026,13 @@ export async function runMcp(existing?: MbxNode) {
   }, ({ id, body, kind, needs_reply, origin }) => {
     const { agent } = current();
     const m = node.read(id, agent);
-    noteRead([m]);
+    noteRead([m], { reply: true });
     const subject = /^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`.slice(0, 200);
-    const r = node.send({ from: agent, to: [m.from_addr], subject, body, kind, reply_to: m.id, thread: m.thread, needs_reply, refs: [], ...relay(origin, [m.from_addr]) }, session());
+    const rel = relay(origin, [m.from_addr]);
+    const r = node.send({ from: agent, to: [m.from_addr], subject, body, kind, reply_to: m.id, thread: m.thread, needs_reply, refs: [], ...rel.draft }, session());
     const recipients = recipientReceipts(node, r.envelope.id, r.targets);
     const out = { id: r.envelope.id, to: m.from_addr, thread: r.envelope.thread, reply_to: m.id, recipients, delivered_locally: r.local, queued_for_hosts: r.remote,
-      owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...offlineWarnings(recipients), ...depthWarning(r.envelope)] };
+      owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...offlineWarnings(recipients), ...depthWarning(r.envelope), ...rel.warnings] };
     return text(`${JSON.stringify(out, null, 2)}\nNext: mbx_ack ${m.id} if you are done with it.`, out);
   });
 
