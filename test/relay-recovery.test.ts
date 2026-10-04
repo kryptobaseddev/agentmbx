@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import { tmpdir } from "node:os";
@@ -21,8 +21,8 @@ import { RelayCore, startRelayServer, wireHash, type ExpiryNotice } from "../src
 import { SqliteRelayStore } from "../src/relay-store.ts";
 import { backupStore, lockStore, readOps, restoreStore, sha256File } from "../src/relay-ops.ts";
 import { relayEpochChanged, relayOpen, relayPushOutbox, relayPushReceipts, relayReceive, relaySettle, RELAY_DEADLINE_GRACE_MS, type RelaySession } from "../src/relay-v2.ts";
-import { flushOutbox } from "../src/http.ts";
-import { prune } from "../src/retention.ts";
+import { flushOutbox, startServer } from "../src/http.ts";
+import { prune, PRUNED_ID_KEEP_DAYS } from "../src/retention.ts";
 
 const BIN = join(import.meta.dirname, "../bin/agentmbx.js");
 const DAY = 86_400_000;
@@ -36,6 +36,7 @@ const receiptsDue = (n: MbxNode) => n.store.db.prepare("UPDATE receipt_outbox SE
 const freePort = () => new Promise<number>((resolve) => { const s = createServer(); s.listen(0, "127.0.0.1", () => { const { port } = s.address() as AddressInfo; s.close(() => resolve(port)); }); });
 const closeServer = (s: Server) => new Promise<void>((r) => s.close(() => r()));
 const subjects = (n: MbxNode, agent = "bob") => n.inbox(agent).map((m) => m.subject).sort();
+const mode = (path: string) => statSync(path).mode & 0o777;
 const state = (n: MbxNode, id: string) => (n.store.db.prepare("SELECT state FROM relay_sent WHERE msg_id=?").get(id) as { state: string } | undefined)?.state;
 function enrol(core: RelayCore, host: string, key: KeyPair) {
   const challenge = core.challenge(host, key.publicKey);
@@ -79,7 +80,8 @@ test("restore drill: backup while running, mail accepted after the backup comes 
   const m3 = await w.send("m3"); // queued at the relay when the backup runs, delivered after it
   const backupFile = join(dir, "backups", "relay-1.db");
   const backup = await backupStore(dir, backupFile); // the relay is running and serving
-  assert.equal(backup.sha256, sha256File(backupFile));
+  assert.equal(backup.sha256, await sha256File(backupFile));
+  assert.deepEqual([mode(backupFile), mode(join(dir, "backups"))], [0o600, 0o700], "a backup is owner-only, in an owner-only directory");
   assert.deepEqual([backup.epoch, backup.counts.items, backup.counts.enrolments], [w.core().store.epoch(), 1, 3]);
   assert.match(backup.restore, /^agentmbx relay restore .*relay-1\.db --store-dir /);
   await assert.rejects(backupStore(dir, backupFile), /never overwrites/);
@@ -87,8 +89,11 @@ test("restore drill: backup while running, mail accepted after the backup comes 
   await relayReceive(b, await w.open(b));
   b.store.db.prepare("DELETE FROM receipt_outbox").run();
   const m4 = await w.send("m4"); // accepted after the backup, never pulled: once the relay restores, only alpha has it
-  // after the backup the operator revokes gamma, and beta pairs a new host (its allowlist grows)
+  // after the backup the operator revokes gamma, beta publishes its enc-key ad again, and pairs a new host (its allowlist grows)
   (w.core().store as SqliteRelayStore).revokeEnrolment(gamma.publicKey, new Date().toISOString());
+  await new Promise((r) => setTimeout(r, 5)); // a strictly newer ad
+  w.core().publishEncAd("beta", b.key.publicKey, b.encKey.publicKey, signData(b.key.privateKey, canonical({ v: 1, host: "beta", enc_pub: b.encKey.publicKey })));
+  const adAt = (w.core().store as SqliteRelayStore).db.prepare("SELECT at FROM enc_ads WHERE host_pubkey=?").get(b.key.publicKey) as { at: string };
   const delta = generateKeyPair();
   b.addApprovedPeer({ host: "delta", pubkey: delta.publicKey, owner_pubkey: null, addr: "127.0.0.1:1" }, "fixture");
   await w.open(b);
@@ -103,8 +108,9 @@ test("restore drill: backup while running, mail accepted after the backup comes 
   const r = await restoreStore(dir, backupFile);
   assert.equal(r.epoch.from, backup.epoch, "the backup's epoch");
   assert.notEqual(r.epoch.to, oldEpoch); assert.notEqual(r.epoch.to, r.epoch.from);
-  assert.deepEqual(r.carried, { revocations: 1, sender_lists: 1, enc_ads: 0, seq_floors: 1 });
-  assert.ok(r.replaced && existsSync(r.replaced.rollback) && r.replaced.sha256 === sha256File(r.replaced.rollback), "the replaced store is kept");
+  assert.deepEqual(r.carried, { revocations: 1, sender_lists: 1, enc_ads: 1, seq_floors: 1 });
+  assert.ok(r.replaced && existsSync(r.replaced.rollback) && r.replaced.sha256 === await sha256File(r.replaced.rollback), "the replaced store is kept");
+  assert.deepEqual([mode(r.replaced!.rollback), mode(join(dir, "rollback")), mode(join(dir, "relay.db"))], [0o600, 0o700, 0o600], "rollback copy and restored store are owner-only");
   assert.equal(r.replaced!.epoch, oldEpoch);
   assert.equal(r.rollback, `agentmbx relay restore ${r.replaced!.rollback} --store-dir ${dir}`);
   const core = await w.start();
@@ -112,6 +118,7 @@ test("restore drill: backup while running, mail accepted after the backup comes 
   assert.throws(() => core.requireEnrolled(gamma.publicKey), /not enrolled/, "a key revoked after the backup stays revoked");
   assert.throws(() => enrol(core, "gamma", gamma), /revoked/);
   assert.ok(core.store.senderList(b.key.publicKey)!.senders.includes(delta.publicKey), "the newer signed allowlist is kept");
+  assert.equal((core.store as SqliteRelayStore).db.prepare("SELECT at FROM enc_ads WHERE host_pubkey=?").get(b.key.publicKey)!.at, adAt.at, "the newer signed enc-key ad is kept");
   assert.equal(core.store.targetUsage(b.key.publicKey).items, 1, "quota counts the restored queue only (m3)");
 
   // clients see the new epoch: alpha re-pushes everything beta has not confirmed, beta re-pulls from 0
@@ -184,7 +191,7 @@ test("restore refuses a running relay, another relay's backup, a newer schema an
   rmSync(join(dir, "relay.lock"), { force: true });
   const s = new SqliteRelayStore(join(dir, "relay.db")); s.setMeta("heartbeat", String(Date.now())); s.close();
   await assert.rejects(restoreStore(dir, backup), /heartbeat .* s ago/);
-  assert.equal((await restoreStore(dir, backup, { force: true })).backup.sha256, sha256File(backup));
+  assert.equal((await restoreStore(dir, backup, { force: true })).backup.sha256, await sha256File(backup));
 
   // a current store that cannot be read: its revocations cannot be carried, so only --force restores, keeping its bytes
   writeFileSync(join(dir, "relay.db"), Buffer.alloc(8192, 7));
@@ -361,7 +368,7 @@ test("CLI: backup while serving, restore refused while serving, restore after st
   const b1 = await run(["backup", join(dir, "b1.db")]);
   assert.equal(b1.code, 0, b1.stderr);
   const receipt = JSON.parse(b1.stdout) as { type: string; sha256: string; epoch: string; file: string };
-  assert.deepEqual([receipt.type, receipt.epoch, receipt.sha256], ["relay-backup", first.epoch, sha256File(join(dir, "b1.db"))]);
+  assert.deepEqual([receipt.type, receipt.epoch, receipt.sha256], ["relay-backup", first.epoch, await sha256File(join(dir, "b1.db"))]);
   const refused = await run(["restore", join(dir, "b1.db")]);
   assert.notEqual(refused.code, 0);
   assert.match(refused.stderr, /a relay is running on .* stop it first/);
@@ -384,17 +391,103 @@ test("CLI: backup while serving, restore refused while serving, restore after st
   const third = await info();
   assert.notEqual(third.epoch, after.epoch);
   assert.match(relay.stderr(), /restored .*b2\.db at start: epoch .* unset MBX_RELAY_RESTORE_FROM/);
+  // the variable is consumed by its path: another file at that path, or other restores since, never restore it again
+  assert.equal((await run(["backup", join(dir, "b3.db")])).code, 0);
   await relay.stop();
+  copyFileSync(join(dir, "b3.db"), join(dir, "b2.db"));
   relay = await serve({ MBX_RELAY_RESTORE_FROM: join(dir, "b2.db") });
-  assert.equal((await info()).epoch, third.epoch, "a restart with the variable still set restores nothing");
-  assert.match(relay.stderr(), /already restored into this store: unset it/);
+  assert.equal((await info()).epoch, third.epoch, "a restart with the variable still set restores nothing, though the file changed");
+  assert.match(relay.stderr(), /MBX_RELAY_RESTORE_FROM ignored: already restored from .*b2\.db at .*; unset MBX_RELAY_RESTORE_FROM/);
+  await relay.stop();
+  const again = await run(["restore", join(dir, "b3.db")]); // rewrites meta.restored
+  assert.equal(again.code, 0, again.stderr);
+  const fourth = (JSON.parse(again.stdout) as { epoch: { to: string } }).epoch.to;
+  relay = await serve({ MBX_RELAY_RESTORE_FROM: join(dir, "b2.db") });
+  assert.equal((await info()).epoch, fourth, "still consumed after another restore");
+  assert.match(relay.stderr(), /ignored: already restored from/);
 
   const rot = await run(["rotate-epoch"]); // works while serving: the relay reads its epoch from the store
   assert.equal(rot.code, 0, rot.stderr);
   assert.equal((await info()).epoch, (JSON.parse(rot.stdout) as { to: string }).to);
   const log = await run(["log", "--json"]);
   assert.equal(log.code, 0, log.stderr);
-  assert.deepEqual((JSON.parse(log.stdout) as { op: string }[]).map((o) => o.op), ["epoch-rotated", "restore", "backup", "restore", "backup"]);
+  assert.deepEqual((JSON.parse(log.stdout) as { op: string }[]).map((o) => o.op), ["epoch-rotated", "restore", "backup", "restore", "backup", "restore", "backup"]);
   const text = await run(["log"]);
-  assert.match(text.stdout, /restore .*b2\.db epoch .* -> .*; undo: agentmbx relay restore/);
+  assert.match(text.stdout, /restore .*b3\.db epoch .* -> .*; undo: agentmbx relay restore/);
+});
+
+test("a restore never re-delivers mail the receiver acked and pruned: pruned ids are tombstones", async (t) => {
+  const w = await world(t);
+  const { a, b, dir } = w;
+  const id = await w.send("old work");
+  const file = join(dir, "backups", "before-pull.db");
+  await backupStore(dir, file); // the item is still queued in this backup
+  await relayReceive(b, await w.open(b));
+  b.ack(id, "bob");
+  const pruned = prune(b.store, 1, { now: Date.now() + 3 * DAY });
+  assert.equal(pruned.messages, 1);
+  assert.deepEqual([b.store.hasMessage(id), b.store.wasPruned(id)], [false, true]);
+  await w.stop();
+  await restoreStore(dir, file);
+  await w.start();
+  await relayPushOutbox(a, await w.open(a)); // alpha re-pushes (no receipt reached it)
+  await relayReceive(b, await w.open(b)); // beta re-pulls from 0: the restored queue still holds the item
+  assert.equal(b.store.hasMessage(id), false, "not stored again");
+  assert.deepEqual(b.inbox("bob", { all: true }).map((m) => m.subject), [], "bob is not woken for stale, acked work");
+  assert.equal(w.core().store.targetUsage(b.key.publicKey).items, 0, "taken as a duplicate and acked");
+  // the tombstone outlives anything a relay can hand back (relay retention + dedup grace), then goes
+  prune(b.store, 1, { now: Date.now() + (3 + PRUNED_ID_KEEP_DAYS - 1) * DAY });
+  assert.equal(b.store.wasPruned(id), true);
+  prune(b.store, 1, { now: Date.now() + (3 + PRUNED_ID_KEEP_DAYS + 1) * DAY });
+  assert.equal(b.store.wasPruned(id), false);
+});
+
+test("expiry applies to v2 items only: v1 pushes and items queued before the upgrade never expire", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "mbx-rec-v1-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const key = generateKeyPair(), alpha = generateKeyPair(), beta = generateKeyPair(), enc = generateEncKeyPair();
+  let core = new RelayCore({}, { store: new SqliteRelayStore(join(dir, "relay.db")), key, log: () => {} });
+  enrol(core, "alpha", alpha); enrol(core, "beta", beta);
+  const sealed = () => sealEnvelope(buildEnvelope({ from: "x@alpha", to: ["bob@beta"], subject: "s", body: "b" }), enc.publicKey, "alpha", alpha.publicKey, alpha.privateKey);
+  const v1 = sealed(), v2 = sealed(), legacy = sealed();
+  const pushV2 = (e: ReturnType<typeof sealed>) => core.pushItems({ host: "alpha", pubkey: alpha.publicKey }, [{ kind: "envelope", item_id: e.id, targets: [{ host_pubkey: beta.publicKey, wire_b64: Buffer.from(JSON.stringify(e)).toString("base64") }] }])[0]!;
+  assert.equal(pushV2(legacy).status, "accepted");
+  // a store from before T167: it never enforced expiry, so it cannot tell its v1 items from its v2 items
+  const db = (core.store as SqliteRelayStore).db;
+  db.prepare("DELETE FROM meta WHERE k='expiry_from'").run();
+  core.store.close();
+  core = new RelayCore({}, { store: new SqliteRelayStore(join(dir, "relay.db")), key, log: () => {} });
+  t.after(() => core.store.close());
+  assert.equal(core.push({ host: "alpha", pubkey: alpha.publicKey }, [v1]).stored, 1, "a v1 push after the upgrade");
+  assert.equal(pushV2(v2).status, "accepted");
+  const r = core.sweep(Date.now() + 60 * DAY);
+  assert.deepEqual(r.expired, { envelope: 1, receipt: 0, expired: 0 }, "only the v2 item pushed after the upgrade");
+  assert.deepEqual(core.pullItems(beta.publicKey).items.map((i) => i.item_id).sort(), [v1.id, legacy.id].sort());
+  assert.ok(core.store.meta("expiry_from"), "recorded once: the next open changes nothing");
+});
+
+test("a re-push the LAN rejects ends rejected (doctor shows it); only a LAN delivery settles it", async (t) => {
+  const { doctor } = await import("../src/doctor.ts");
+  const w = await world(t);
+  const { a, b } = w;
+  const lan = await startServer(b, 0, "127.0.0.1");
+  t.after(() => closeServer(lan));
+  a.store.db.prepare("UPDATE peers SET addr=? WHERE host='beta'").run(`127.0.0.1:${(lan.address() as AddressInfo).port}`);
+  const repushed = async (subject: string) => { const id = await w.send(subject); relayEpochChanged(a, w.relay, `epoch-${subject}`, "epoch"); assert.equal(state(a, id), "repush"); return id; };
+  const m1 = await repushed("sealed for the wrong key");
+  a.store.db.prepare("UPDATE peers SET enc_pub=? WHERE host='beta'").run(generateEncKeyPair().publicKey);
+  await flushOutbox(a);
+  assert.deepEqual([state(a, m1), count(a, "SELECT COUNT(*) c FROM outbox WHERE msg_id=?", m1)], ["rejected", 0]);
+  assert.ok(a.inbox("alice").some((m) => m.subject === "Undelivered to beta: sealed for the wrong key"), "the LAN alert");
+  const m2 = await repushed("delivered over the LAN");
+  a.store.db.prepare("UPDATE peers SET enc_pub=? WHERE host='beta'").run(b.encKey.publicKey);
+  await flushOutbox(a);
+  assert.equal(state(a, m2), "settled");
+  assert.ok(subjects(b).includes("delivered over the LAN"));
+  const old = process.env.MBX_RELAY_URL;
+  process.env.MBX_RELAY_URL = w.relay;
+  try {
+    const checks = (await doctor({ home: a.home, cmd: ["agentmbx"], which: () => null, useClis: false } as never, a.home)).map((c) => `${c.level} ${c.label}`);
+    assert.ok(checks.some((l) => /^warn 1 message\(s\) waiting for a re-push after a relay restore were rejected/.test(l)), checks.join("\n"));
+  } finally { if (old === undefined) delete process.env.MBX_RELAY_URL; else process.env.MBX_RELAY_URL = old; }
 });

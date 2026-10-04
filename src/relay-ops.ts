@@ -3,7 +3,7 @@
 // receipts (`agentmbx relay log`). Every operation answers with a receipt an operator can inspect, and a restore keeps
 // the store it replaced as a rollback copy whose restore command is in the receipt.
 import { createHash } from "node:crypto";
-import { closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
+import { chmodSync, closeSync, copyFileSync, createReadStream, existsSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { backup as sqliteBackup, DatabaseSync } from "node:sqlite";
 import { fingerprint } from "./crypto.ts";
@@ -17,7 +17,15 @@ const ALL_PAGES = 2_147_483_647; // one backup step: one consistent snapshot, ev
 
 const coded = (code: string, message: string) => Object.assign(new Error(message), { code });
 const iso = (ms: number) => new Date(ms).toISOString();
-export const sha256File = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex");
+/** SHA-256 of a file, streamed (a store can outgrow what one read may hold). */
+export async function sha256File(path: string): Promise<string> {
+  const h = createHash("sha256");
+  for await (const chunk of createReadStream(path)) h.update(chunk as Buffer);
+  return h.digest("hex");
+}
+/** Backups, rollback copies and the store hold every queued item and the relay's metadata: owner-only, like relay.key. */
+const PRIVATE_FILE = 0o600, PRIVATE_DIR = 0o700;
+const privateDir = (dir: string) => mkdirSync(dir, { recursive: true, mode: PRIVATE_DIR });
 function fsyncPath(path: string) {
   try { const fd = openSync(path, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } } catch { /* not every platform fsyncs a directory */ }
 }
@@ -83,12 +91,13 @@ function sealCopy(path: string): StoreFacts {
 }
 /** An online copy of an open database into `dest` via the SQLite backup API, written beside it and renamed into place. */
 async function onlineCopy(db: DatabaseSync, dest: string): Promise<StoreFacts> {
-  mkdirSync(dirname(dest), { recursive: true });
+  privateDir(dirname(dest));
   const tmp = `${dest}.partial-${process.pid}`;
   removeDb(tmp);
   try {
     await sqliteBackup(db, tmp, { rate: ALL_PAGES });
     const f = sealCopy(tmp);
+    chmodSync(tmp, PRIVATE_FILE); // before it has its final name: never readable by others, not even briefly
     fsyncPath(tmp); renameSync(tmp, dest); fsyncPath(dirname(dest));
     return f;
   } finally { removeDb(tmp); }
@@ -120,7 +129,7 @@ export async function backupStore(dir: string, file: string, o: { now?: () => nu
     db.exec("PRAGMA busy_timeout=5000");
     const f = await onlineCopy(db, dest);
     const at = iso((o.now ?? Date.now)());
-    const receipt: BackupReceipt = { v: 1, type: "relay-backup", at, store: src, file: dest, bytes: statSync(dest).size, sha256: sha256File(dest),
+    const receipt: BackupReceipt = { v: 1, type: "relay-backup", at, store: src, file: dest, bytes: statSync(dest).size, sha256: await sha256File(dest),
       epoch: f.epoch, relay_fingerprint: f.relay_fingerprint, schema_version: f.schema_version, heartbeat: f.heartbeat, counts: f.counts,
       restore: `agentmbx relay restore ${dest} --store-dir ${resolve(dir)}` };
     appendOp(db, "backup", receipt, at);
@@ -133,6 +142,15 @@ interface CurrentAuthority {
   revoked: Record<string, unknown>[]; senderLists: { target_pubkey: string; senders: string; iat: string; record: string; sig: string }[];
   encAds: { host_pubkey: string; host_name: string; enc_pub: string; sig: string; at: string }[]; seqs: { target_pubkey: string; next_seq: number }[];
   ops: { at: string; op: string; receipt: string }[];
+  /** Every path this store was ever restored from (path -> when). */
+  restoredPaths: Record<string, string>;
+}
+/** The paths a store was restored from: `restored_paths`, plus the single `restored` record of the first T167 build. */
+function pathsOf(meta: (k: string) => string | null): Record<string, string> {
+  const out: Record<string, string> = {};
+  try { Object.assign(out, JSON.parse(meta("restored_paths") ?? "{}") as Record<string, string>); } catch { /* unreadable: none */ }
+  try { const r = JSON.parse(meta("restored") ?? "null") as { file?: string; at?: string } | null; if (r?.file && !out[r.file]) out[r.file] = r.at ?? ""; } catch { /* none */ }
+  return out;
 }
 function readAuthority(db: DatabaseSync): CurrentAuthority {
   const all = <T>(sql: string) => db.prepare(sql).all() as T[];
@@ -142,7 +160,8 @@ function readAuthority(db: DatabaseSync): CurrentAuthority {
   return { epoch: meta("epoch"), relay_pubkey: meta("relay_pubkey"),
     revoked: all("SELECT host_pubkey, host_name, owner_fp, account, authorized_by, enrolled_at, revoked_at FROM enrolments WHERE revoked_at IS NOT NULL"),
     senderLists: all("SELECT target_pubkey, senders, iat, record, sig FROM sender_lists"), encAds: all("SELECT host_pubkey, host_name, enc_pub, sig, at FROM enc_ads"),
-    seqs: all<{ target_pubkey: string; next_seq: number }>("SELECT target_pubkey, next_seq FROM seqs").map((r) => ({ target_pubkey: r.target_pubkey, next_seq: Number(r.next_seq) })), ops };
+    seqs: all<{ target_pubkey: string; next_seq: number }>("SELECT target_pubkey, next_seq FROM seqs").map((r) => ({ target_pubkey: r.target_pubkey, next_seq: Number(r.next_seq) })), ops,
+    restoredPaths: pathsOf(meta) };
 }
 
 export interface RestoreReceipt {
@@ -201,7 +220,7 @@ export async function restoreStore(dir: string, file: string, o: RestoreOptions 
     }
     // 2. the backup, copied and checked
     removeDb(tmp);
-    copyFileSync(src, tmp);
+    copyFileSync(src, tmp); chmodSync(tmp, PRIVATE_FILE);
     if (existsSync(`${src}-wal`)) copyFileSync(`${src}-wal`, `${tmp}-wal`); // a raw volume copy: fold its WAL in
     const b = sealCopy(tmp);
     if (!b.epoch || !b.relay_pubkey) throw coded("NOT_A_STORE", `${src} is not a relay store (no epoch or relay key)`);
@@ -219,15 +238,15 @@ export async function restoreStore(dir: string, file: string, o: RestoreOptions 
           if (current.relay_pubkey && current.relay_pubkey !== b.relay_pubkey) otherKey = current.relay_pubkey;
           else {
             const f = await onlineCopy(db, rollback);
-            replaced = { epoch: f.epoch, rollback, sha256: sha256File(rollback), bytes: statSync(rollback).size, readable: true };
+            replaced = { epoch: f.epoch, rollback, sha256: await sha256File(rollback), bytes: statSync(rollback).size, readable: true };
           }
         } finally { db.close(); }
       } catch (e) {
         if (!o.force) throw coded("CURRENT_UNREADABLE", `the current store cannot be read (${(e as Error).message}): its revocations cannot be carried forward. Pass --force to restore without them; the current files are then kept in ${rollbackDir}`);
         current = null;
-        mkdirSync(rollbackDir, { recursive: true, mode: 0o700 });
-        for (const ext of ["", "-wal", "-shm"]) if (existsSync(live + ext)) copyFileSync(live + ext, rollback + ext);
-        replaced = { epoch: null, rollback, sha256: sha256File(rollback), bytes: statSync(rollback).size, readable: false };
+        privateDir(rollbackDir);
+        for (const ext of ["", "-wal", "-shm"]) if (existsSync(live + ext)) { copyFileSync(live + ext, rollback + ext); chmodSync(rollback + ext, PRIVATE_FILE); }
+        replaced = { epoch: null, rollback, sha256: await sha256File(rollback), bytes: statSync(rollback).size, readable: false };
       }
       if (otherKey) throw coded("OTHER_RELAY", `this backup belongs to another relay key (${b.relay_fingerprint}; the store is ${fingerprint(otherKey)}): clients pinned this store's key`);
     }
@@ -274,8 +293,10 @@ export async function restoreStore(dir: string, file: string, o: RestoreOptions 
       });
       const from = store.epoch(), to = store.rotateEpoch();
       store.setMeta("heartbeat", String(now)); // the restore is the event; serve must not rotate again for the backup's age
+      // every path this store lineage was restored from, so MBX_RELAY_RESTORE_FROM never restores one twice
+      store.setMeta("restored_paths", JSON.stringify({ ...pathsOf((k) => store.meta(k)), ...current?.restoredPaths, [src]: at }));
       receipt = { v: 1, type: "relay-restore", at, store: live,
-        backup: { file: src, sha256: sha256File(src), bytes: statSync(src).size, epoch: b.epoch, schema_version: b.schema_version, heartbeat: b.heartbeat },
+        backup: { file: src, sha256: await sha256File(src), bytes: statSync(src).size, epoch: b.epoch, schema_version: b.schema_version, heartbeat: b.heartbeat },
         replaced, epoch: { from, to }, carried, counts: facts(db).counts,
         rollback: replaced ? `agentmbx relay restore ${rollback} --store-dir ${resolve(dir)}${replaced.readable ? "" : " --force"}` : null,
         next: "start the relay: clients see the new epoch, senders re-push every message the relay accepted and the recipient has not confirmed, receivers re-pull from 0, and dedup on both ends absorbs the repeats" };
@@ -283,11 +304,11 @@ export async function restoreStore(dir: string, file: string, o: RestoreOptions 
       store.logOp("restore", receipt as unknown as Record<string, unknown>, at);
     } finally { store.close(); }
     if (existsSync(`${tmp}-wal`) && statSync(`${tmp}-wal`).size > 0) throw coded("WAL", `the restored copy did not close cleanly (${tmp}-wal remains); the live store was not touched`);
-    sealCopy(tmp);
+    sealCopy(tmp); chmodSync(tmp, PRIVATE_FILE);
     // 5. the swap: the old store's WAL must never meet the new file
     for (const ext of ["-wal", "-shm", "-journal"]) {
       if (!existsSync(live + ext)) continue;
-      if (statSync(live + ext).size > 0 && ext === "-wal") { mkdirSync(rollbackDir, { recursive: true }); renameSync(live + ext, `${rollback}${ext}-leftover`); }
+      if (statSync(live + ext).size > 0 && ext === "-wal") { privateDir(rollbackDir); renameSync(live + ext, `${rollback}${ext}-leftover`); }
       else rmSync(live + ext, { force: true });
     }
     fsyncPath(tmp); renameSync(tmp, live); fsyncPath(dir); swapped = true;
@@ -323,11 +344,18 @@ export function readOps(dir: string, limit = 50): OpRecord[] {
   } finally { db.close(); }
 }
 
-/** What MBX_RELAY_RESTORE_FROM already restored into this store (the backup's sha256), so a restart never restores twice. */
-export function restoredSha(dir: string): string | null {
+/**
+ * When this store (or the store it was restored over) was restored from `file`, or null. MBX_RELAY_RESTORE_FROM is
+ * consumed by its path: a path restored once is never restored again, whatever the file there holds now and whatever
+ * restores happened since (the record is carried across restores). Restore another backup from a new path.
+ */
+export function restoredFrom(dir: string, file: string): string | null {
   const path = join(dir, STORE_DB);
   if (!existsSync(path)) return null;
   const db = new DatabaseSync(path);
-  try { return (JSON.parse((db.prepare("SELECT v FROM meta WHERE k='restored'").get() as { v: string } | undefined)?.v ?? "null") as { sha256?: string } | null)?.sha256 ?? null; }
-  catch { return null; } finally { db.close(); }
+  try {
+    const meta = (k: string) => { try { return (db.prepare("SELECT v FROM meta WHERE k=?").get(k) as { v: string } | undefined)?.v ?? null; } catch { return null; } };
+    const paths = pathsOf(meta), key = resolve(file);
+    return key in paths ? paths[key] || "an unknown time" : null;
+  } finally { db.close(); }
 }

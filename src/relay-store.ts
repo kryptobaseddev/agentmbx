@@ -139,6 +139,12 @@ export class SqliteRelayStore implements RelayStore {
     for (let v = stored + 1; stored > 0 && v <= SCHEMA_VERSION; v++) this.transaction(() => { this.db.exec(MIGRATIONS[v] ?? ""); this.setMeta("schema_version", String(v)); });
     this.db.exec(SCHEMA);
     if (!this.meta("epoch")) this.setMeta("epoch", randomUUID());
+    // Expiry is enforced from T167 on, for v2 items only. Items queued before (v1 or v2: the store cannot tell) never had
+    // it and keep not having it: their senders may be v1, which can never learn of an expiry. Once, recorded in meta.
+    if (!this.meta("expiry_from")) this.transaction(() => {
+      this.db.prepare("UPDATE items SET expires_at=NULL WHERE kind<>'expired'").run();
+      this.setMeta("expiry_from", new Date().toISOString());
+    });
     this.setMeta("schema_version", String(SCHEMA_VERSION));
   }
   transaction<T>(fn: () => T): T {

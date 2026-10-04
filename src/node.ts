@@ -684,7 +684,8 @@ export class MbxNode {
       if (opened == null) return "rejected:undecryptable body";
       storedEnv = { ...e, body: opened };
     }
-    if (this.store.hasMessage(e.id)) return "duplicate";
+    // a pruned message is a duplicate too: a relay restore or a late retry must not deliver acked, pruned mail again (T167)
+    if (this.store.hasMessage(e.id) || this.store.wasPruned(e.id)) return "duplicate";
     const auth = storedEnv.authority ? checkAuthority(storedEnv, peer.owner_pubkey, this.revoked()) : null;
     const r = this.route(e.to, true, new Set(e.meta.local_names ?? []));
     const skipped = r.warnings.filter((w) => w.includes("not delivered here"));

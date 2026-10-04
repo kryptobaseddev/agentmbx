@@ -12,7 +12,7 @@ import { relayDrainOutbox, relayFor, relayPull } from "./relay-client.ts";
 import { relayPushOutbox, relayPushReceipts, relayReceive, relayRoute, relaySettle } from "./relay-v2.ts";
 import { DEFAULT_QUOTA, parseRelayKey, RelayCore, startRelayServer } from "./relay.ts";
 import { SqliteRelayStore } from "./relay-store.ts";
-import { backupStore, readOps, restoredSha, restoreStore, rotateEpochOp, sha256File, STORE_DB, waitForLock } from "./relay-ops.ts";
+import { backupStore, readOps, restoredFrom, restoreStore, rotateEpochOp, STORE_DB, waitForLock } from "./relay-ops.ts";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.ts";
 import { HUD_ALIVE_MAX_MS, HUD_SCHEMA, hudAlivePath, hudDir, hudPidLinePath, hudPidPath, hudSessionLinePath, hudSessionPath, hudStatus, writeHud, type HudStatus } from "./hud.ts";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.ts";
@@ -276,11 +276,13 @@ async function relayServerCommand(pos: string[], o: Record<string, unknown>, str
     catch (e) { return die(`relay key ${envKey ? "MBX_RELAY_KEY" : keyPath}: ${(e as Error).message}`); }
   })();
   // A hosted relay cannot run `relay restore` beside itself: MBX_RELAY_RESTORE_FROM=<backup on the volume> restores it at
-  // start, under the lock, once (the backup's sha256 is recorded; unset the variable after the deploy).
+  // start, under the lock. The path is consumed: once restored from, it is never restored again, even if the file there
+  // is replaced later or other restores happened since (unset the variable after the deploy).
   const restoreFrom = process.env.MBX_RELAY_RESTORE_FROM?.trim();
   if (restoreFrom) {
     try {
-      if (restoredSha(dir) === sha256File(restoreFrom)) console.error(`[agentmbx] MBX_RELAY_RESTORE_FROM=${restoreFrom} is already restored into this store: unset it`);
+      const done = restoredFrom(dir, restoreFrom);
+      if (done) console.error(`[agentmbx] MBX_RELAY_RESTORE_FROM ignored: already restored from ${resolve(restoreFrom)} at ${done}; unset MBX_RELAY_RESTORE_FROM`);
       else {
         const r = await restoreStore(dir, restoreFrom, { lock });
         console.error(`[agentmbx] restored ${r.backup.file} at start: epoch ${r.epoch.from} -> ${r.epoch.to}${r.rollback ? `; replaced store kept at ${r.replaced!.rollback}` : ""}; unset MBX_RELAY_RESTORE_FROM`);

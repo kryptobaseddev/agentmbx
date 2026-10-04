@@ -299,6 +299,9 @@ export async function doctor(ctx, mbxHome, opts = {}) {
             const expired = n("SELECT COUNT(*) c FROM relay_sent WHERE relay=? AND state='expired'", relay);
             if (expired)
                 add("warn", `${expired} relay message(s) expired undelivered: the recipient host never collected them (their senders were alerted)`);
+            const rejected = n("SELECT COUNT(*) c FROM relay_sent WHERE relay=? AND state='rejected'", relay);
+            if (rejected)
+                add("warn", `${rejected} message(s) waiting for a re-push after a relay restore were rejected by the recipient host over the LAN (their senders were alerted)`);
             const unconfirmed = n("SELECT COUNT(*) c FROM relay_sent WHERE relay=? AND state='unconfirmed'", relay);
             if (unconfirmed)
                 add("warn", `${unconfirmed} relay delivery(ies) never confirmed by the recipient host (their senders were alerted)`);

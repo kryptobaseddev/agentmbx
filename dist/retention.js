@@ -1,4 +1,8 @@
 export const MAX_RETENTION_DAYS = 36_500;
+/** Pruned message ids are remembered this long (T167): the relay keeps an item 14 days and its dedup row 7 more, and a
+ *  sender re-pushes until its own deadline (14 days + 1), so a restored relay can hand back mail up to 21 days after it
+ *  was accepted. A tombstone younger than this turns that mail into a duplicate instead of a fresh, unacked message. */
+export const PRUNED_ID_KEEP_DAYS = 21;
 export function retentionDays(value) {
     const n = typeof value === "string" && /^\d+$/.test(value) ? Number(value) : value;
     if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 1 || n > MAX_RETENTION_DAYS)
@@ -38,13 +42,17 @@ export function prune(store, days, o = {}) {
     if (o.dryRun)
         return { dry_run: true, ...base, ...store.readTx(count) };
     const r = store.tx(() => {
+        const at = new Date(now).toISOString(), keep = new Date(now - PRUNED_ID_KEEP_DAYS * 86_400_000).toISOString();
+        // tombstones: forget the old ones; adopt mail pruned before pruned_ids existed (its visibility tombstones name it)
+        db.prepare("DELETE FROM pruned_ids WHERE pruned_at < ?").run(keep);
+        db.prepare("INSERT OR IGNORE INTO pruned_ids (id, pruned_at) SELECT message_id, MIN(pruned_at) FROM mailbox_pruned WHERE pruned_at >= ? GROUP BY message_id").run(keep);
         const c = count();
         if (!c.messages)
             return c;
-        const at = new Date(now).toISOString();
         db.exec("CREATE TEMP TABLE IF NOT EXISTS prune_ids (id TEXT PRIMARY KEY); DELETE FROM temp.prune_ids");
         db.prepare(`INSERT INTO prune_ids (id) SELECT m.id FROM messages m WHERE ${ELIGIBLE}`).run(p);
         const ids = "(SELECT id FROM temp.prune_ids)";
+        db.prepare(`INSERT OR REPLACE INTO pruned_ids (id, pruned_at) SELECT id, ? FROM ${ids}`).run(at);
         db.prepare(`INSERT OR IGNORE INTO mailbox_pruned (mailbox,seq,message_id,pruned_at) SELECT mailbox,seq,message_id,? FROM mailbox_visibility WHERE message_id IN ${ids}`).run(at);
         db.exec(`DELETE FROM mailbox_visibility WHERE message_id IN ${ids}; DELETE FROM deliveries WHERE msg_id IN ${ids};
       INSERT INTO messages_fts(messages_fts,rowid,subject,body) SELECT 'delete',rowid,subject,body FROM messages WHERE id IN ${ids};

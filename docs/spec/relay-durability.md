@@ -160,9 +160,9 @@ at most `max_batch` items.
   delivery receipt for that message arrives, or retention expires (§6). This is what makes a relay restore (§5)
   recoverable: the sender still holds the bytes. Through a re-push after an epoch change the row stays in
   `relay_sent` as `repush`, keeping its deadline (T167): the LAN outbox's 72 h give-up never applies to it, since the
-  target may need days to come back and re-enrol. A LAN delivery, a delivery receipt, an expiry notice or the deadline
-  ends it, and local mailbox retention (`agentmbx prune`) never removes a message with a `relay-accepted` or `repush`
-  row.
+  target may need days to come back and re-enrol. A LAN delivery or a delivery receipt settles it; a LAN rejection
+  ends it `rejected` (the sender is alerted, `doctor` shows it); an expiry notice or the deadline ends it too. Local
+  mailbox retention (`agentmbx prune`) never removes a message with a `relay-accepted` or `repush` row.
 - **Own its deadline.** A `relay-accepted` row whose delivery receipt has not arrived by `accepted_at + retention +
   grace` (grace 24 h) is marked unconfirmed and the local sender gets "Undelivered/unconfirmed to <host>", without
   waiting for anything from the relay. The relay's expiry notice (§6) is an early signal, never the only one, because
@@ -228,7 +228,9 @@ state retryable: the next pull starts at `received_through`, and the relay simpl
 
   Post-backup mail is therefore recovered from senders rather than lost. A receiver that gets a relay item it already
   has (a duplicate) queues its delivery receipt for that message again (T167): the sender pushed it again, so it is
-  still waiting, and the receipt the relay accepted after its backup was lost with it.
+  still waiting, and the receipt the relay accepted after its backup was lost with it. A receiver also treats a
+  message its own retention pruned as a duplicate: `agentmbx prune` records each pruned id in `pruned_ids` for 21 days
+  (relay retention plus the dedup grace), so a restored relay never hands back acked, pruned mail as new.
 - **Backup.** `agentmbx relay backup <file>` uses the SQLite online backup API. It is safe while the relay runs.
   `agentmbx relay restore <file>` refuses while the relay runs, writes a new epoch, and records the restore in the
   relay log. Backups contain only ciphertext bodies plus the metadata in the threat model.
@@ -241,8 +243,9 @@ state retryable: the next pull starts at `received_through`, and the relay simpl
   running relay, and a relay cannot start during a restore. For a store without `relay.lock` (a relay older than
   T167), a heartbeat younger than 90 s also refuses a restore unless `--force`.
 - **Backup** (`src/relay-ops.ts` `backupStore`): one backup-API step (one consistent snapshot while the relay writes),
-  written beside the target, switched to a rollback journal (a single self-contained file), integrity-checked, then
-  renamed into place; an existing file is never overwritten. Receipt: `{type:"relay-backup", file, bytes, sha256,
+  written beside the target, switched to a rollback journal (a single self-contained file), integrity-checked, made
+  owner-only (0600, in a directory created 0700; rollback copies and the restored store too), then renamed into place;
+  an existing file is never overwritten. Receipt: `{type:"relay-backup", file, bytes, sha256,
   epoch, relay_fingerprint, schema_version, heartbeat, counts, restore}`, printed and appended to the relay log.
 - **Restore** (`restoreStore`), all or nothing:
   1. The backup is copied (with its `-wal`, if it is a raw volume copy) and checked: integrity, a relay store (epoch
@@ -265,9 +268,11 @@ state retryable: the next pull starts at `received_through`, and the relay simpl
   the exact command that undoes it: restoring the rollback copy, which is itself a restore (a new epoch, clients
   converge again, dedup absorbs the repeats).
 - **Hosted relays** cannot run `relay restore` beside the relay process (the container is the relay).
-  `MBX_RELAY_RESTORE_FROM=<backup on the volume>` makes `relay serve` restore it at start, under its own lock, once:
-  the backup's sha256 is recorded in the store (`meta.restored`) and a restart with the variable still set restores
-  nothing. A failed startup restore is logged and the relay serves the current store unchanged.
+  `MBX_RELAY_RESTORE_FROM=<backup on the volume>` makes `relay serve` restore it at start, under its own lock. The path
+  is consumed: every path a store was restored from is recorded (`meta.restored_paths`, carried across later
+  restores), and a path already there is ignored with one log line ("ignored: already restored from <path> at
+  <time>"), whatever the file there holds now. To restore again, use a new path. A failed startup restore is logged
+  and the relay serves the current store unchanged.
 - **The relay log** (`ops` table, last 1,000; `agentmbx relay log [--json]`) holds every receipt: backups, restores,
   operator and startup epoch rotations (with the stale or future heartbeat that caused them), and each retention sweep
   that changed something. A restore carries the current log into the restored store.
@@ -324,7 +329,11 @@ sends after 72 h ("Undelivered to <host>"). Nothing expires silently (G12). Expi
 notice, because receipts are advisory. The notice is best effort: senders also enforce their own deadline (§3).
 
 As implemented (T167): `relay serve` sweeps at start and every 10 minutes (`RelayCore.sweep`), in bounded batches,
-each one transaction. Only items whose `expires_at` has passed are touched. The notice is the item
+each one transaction. Only items whose `expires_at` has passed are touched. **Expiry applies to v2 items only until
+the v1 endpoints are retired:** a v1 sender deleted its row on the 200 and v1 pulls drop non-envelopes, so it could
+never learn of a notice; v1 pushes therefore get no `expires_at`, and neither do items queued before a store first
+enforced expiry (it cannot tell their protocol; `meta.expiry_from` records when it started). Neither expired before
+T167, so nothing regresses; quotas still bound them. The notice is the item
 `expired:<item_id>:<target_pubkey>` with wire bytes canonical(`{notice, sig}`); a sweep after a restore never queues the
 same notice twice. A notice is not queued when the sender's key is no longer enrolled (revoked or rotated away) or when
 the sender's own queue is at its item or byte cap: quotas hold, and the sender's deadline covers it. Expired items no

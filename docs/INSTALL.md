@@ -88,11 +88,11 @@ sees plaintext bodies — envelopes are sealed for the recipient before they lea
    `agentmbx relay restore <file> --store-dir <dir>`: it rotates the epoch (senders re-push what the recipient has not
    confirmed, receivers re-pull; nothing arrives twice), keeps every revocation and newer signed allowlist the store
    had, keeps the replaced store under `rollback/`, and prints the command that undoes it. A hosted relay restores at
-   start with `MBX_RELAY_RESTORE_FROM=<backup on the volume>` (once; unset it afterwards). `agentmbx relay log` lists
+   start with `MBX_RELAY_RESTORE_FROM=<backup on the volume>` (each path once; unset it afterwards). `agentmbx relay log` lists
    every receipt: backups, restores, epoch rotations and retention sweeps. After restoring the store any way other
    than `agentmbx relay restore` (a volume snapshot, a file copy), run `agentmbx relay rotate-epoch --store-dir <dir>`
-   (a copy older than 10 minutes rotates at start by itself). Queued mail expires after 14 days; its sender gets an
-   "Undelivered to <host>" alert. The runbook is in [relay-durability.md §5.2](spec/relay-durability.md#52-runbook-t167).
+   (a copy older than 10 minutes rotates at start by itself). Mail queued by 0.5.5 and newer daemons expires after 14
+   days and its sender gets an "Undelivered to <host>" alert; mail from older (v1) daemons is kept until collected. The runbook is in [relay-durability.md §5.2](spec/relay-durability.md#52-runbook-t167).
 2. Point each daemon at it: `agentmbx relay set http://<relay-host>:7374`, then restart the daemon
    (`agentmbx daemon install` hosts: `launchctl kickstart -k gui/$(id -u)/com.agentmbx.daemon`).
 3. That's it: mail to unreachable peers flows through the relay and is pulled by the peer; `agentmbx doctor`

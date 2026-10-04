@@ -533,11 +533,12 @@ export async function flushOutbox(node, now = Date.now()) {
     for (const r of due)
         byHost.set(r.host, [...(byHost.get(r.host) ?? []), r]);
     let sent = 0, failed = 0;
-    // A row the relay accepted before a restore is back here for a re-push (state `repush`, T167). The LAN may still
-    // deliver it, which settles it; the relay deadline (relaySettle), not the LAN's 72 h, decides when it is given up.
-    const done = (id, host) => node.store.tx(() => {
+    // A row the relay accepted before a restore is back here for a re-push (state `repush`, T167). A LAN delivery settles
+    // it; a LAN rejection ends it `rejected` (its sender is alerted below, doctor shows it); the relay deadline
+    // (relaySettle), not the LAN's 72 h, decides when it is given up.
+    const done = (id, host, delivered = false) => node.store.tx(() => {
         node.store.db.prepare("DELETE FROM outbox WHERE msg_id=? AND host=?").run(id, host);
-        if (node.store.db.prepare("UPDATE relay_sent SET state='settled', settled_at=? WHERE msg_id=? AND host=? AND state='repush'").run(new Date(now).toISOString(), id, host).changes)
+        if (node.store.db.prepare("UPDATE relay_sent SET state=?, settled_at=? WHERE msg_id=? AND host=? AND state='repush'").run(delivered ? "settled" : "rejected", new Date(now).toISOString(), id, host).changes)
             node.store.db.prepare("DELETE FROM relay_wire WHERE msg_id=? AND host=?").run(id, host);
     });
     const heldByRelay = (id, host) => !!node.store.db.prepare("SELECT 1 FROM relay_sent WHERE msg_id=? AND host=? AND state='repush'").get(id, host);
@@ -564,7 +565,7 @@ export async function flushOutbox(node, now = Date.now()) {
             const { results } = await post(node, peer.addr, "/v2/envelopes", { envelopes });
             for (const r of rows) {
                 const res = results.find((x) => x.id === r.msg_id)?.result ?? "rejected:missing result";
-                done(r.msg_id, host);
+                done(r.msg_id, host, !res.startsWith("rejected"));
                 if (res.startsWith("rejected")) {
                     failed++;
                     alertSender(r, res);

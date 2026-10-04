@@ -293,11 +293,13 @@ export class RelayCore {
       // v1 dedup: an envelope id this sender already stored counts as stored for every target (exactly-once storage)
       if (targets.every((t) => this.store.dedup(from.pubkey, e.id, t.pubkey))) { stored++; continue; }
       for (const t of targets) { const q = this.quotaError(t, from.pubkey, bytes); if (q) return { stored, error: q }; }
-      const now = Date.now(), at = new Date(now).toISOString();
+      const at = new Date().toISOString();
+      // A v1 item never expires (expires_at NULL) while v1 exists: a v1 sender deleted its row on the 200 and v1 pulls drop
+      // non-envelopes, so it could never learn of an expiry notice. v1 had no expiry before T167 either: no regression.
       this.store.transaction(() => {
         for (const t of targets) if (!this.store.dedup(from.pubkey, e.id, t.pubkey))
           this.store.insertItem({ target_pubkey: t.pubkey, kind: "envelope", item_id: e.id, sender_pubkey: from.pubkey, sender_host: from.host,
-            wire, wire_hash: wireHash(wire), bytes, accepted_at: at, expires_at: this.expiry(now) });
+            wire, wire_hash: wireHash(wire), bytes, accepted_at: at, expires_at: null });
       });
       stored++;
     }
@@ -432,7 +434,9 @@ export class RelayCore {
   }
 
   /**
-   * The retention sweep (§6). Items whose `expires_at` has passed are deleted; their dedup row stays as a tombstone until
+   * The retention sweep (§6). Only v2 items expire: v1 pushes, and items queued before this store enforced expiry, carry
+   * no `expires_at` and stay until acked, as before (see SqliteRelayStore `expiry_from`).
+   * Items whose `expires_at` has passed are deleted; their dedup row stays as a tombstone until
    * the dedup horizon, so a late retry is a duplicate, never a re-delivery after expiry. Each expired envelope queues a
    * notice signed by the relay key for its sender, in the same transaction, unless the sender's key is no longer enrolled
    * or its own queue is at its cap (the sender's deadline covers those, §3). Expired receipts and notices go without a
