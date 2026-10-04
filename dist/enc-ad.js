@@ -46,8 +46,9 @@ export function checkEncAd(ad, sig, expect, now = Date.now()) {
     return null;
 }
 /**
- * A paired peer's enc key from a relay's enc-key answer, or why it is refused. Only the signed v2 record counts; a
- * served `enc_pub` beside it must be the same key (a relay that answers two keys is tampering).
+ * A paired peer's enc key from a relay's enc-key answer, or why it is refused. Only the signed v2 record counts. A v1
+ * `enc_pub` served beside a valid record is ignored, never compared: a relay that retired /v1 may still hold an old v1
+ * pair after the peer regenerated its key, and refusing the peer for it would strand its mail.
  */
 export function encFromRelayAnswer(answer, peer, now = Date.now()) {
     const j = answer ?? {};
@@ -59,8 +60,5 @@ export function encFromRelayAnswer(answer, peer, now = Date.now()) {
     const bad = checkEncAd(j.ad, j.ad_sig, { host: peer.host, host_pubkey: peer.pubkey }, now);
     if (bad)
         return { reason: bad };
-    const encPub = j.ad.enc_pub;
-    if (j.enc_pub !== undefined && j.enc_pub !== encPub)
-        return { reason: "tampered: the served key differs from the signed advertisement" };
-    return { enc_pub: encPub, iat: j.ad.iat };
+    return { enc_pub: j.ad.enc_pub, iat: j.ad.iat };
 }

@@ -37,21 +37,26 @@ const PAGES_PER_TICK = 20;
 /** What the last relay pass found, for doctor (T168): the truth about why relay mail moves or waits. */
 export interface RelayState {
   /** `at`: since when (the first pass that found this state). */
-  state: "ok" | "unreachable" | "key-mismatch" | "enrol-failed" | "enc-ad-failed" | "clock-skew"; at: string;
+  state: "ok" | "unreachable" | "key-mismatch" | "enrol-failed" | "enc-ad-failed" | "clock-skew" | "refused-after-enrol"; at: string;
   detail?: string; status?: number; relay_fp?: string; epoch?: string;
-  /** clock-skew: when the daemon tries to enrol again (exponential backoff). */
+  /** clock-skew, refused-after-enrol: when the daemon tries to enrol again (exponential backoff). */
   next_at?: string;
+  /** ok: the relay still serves a v1 pair for another enc key of this host and does not take v1 updates (its fingerprint). */
+  v1_stale?: string | null;
+  /** ok: the relay's /v1 enc-key publish answers this status (retired or failing); v1 is retried at the daily refresh. */
+  v1_down?: number | null;
   /** Expiry of this host's v2 enc-key ad at the relay; null when the relay is too old to store one. */
   enc_ad_exp?: string | null;
 }
 export function relayState(node: MbxNode, relay: string): RelayState | null {
   try { return JSON.parse(node.store.get(`relay-state:${relay}`) ?? "null") as RelayState | null; } catch { return null; }
 }
-/** `at` is when this state began: an unchanged state is not rewritten every tick. */
+/** `at` is when this state began: it is kept while the state stays the same (a retry with a new detail or next_at
+ *  included), and an unchanged record is not rewritten every tick. */
 function setState(node: MbxNode, relay: string, st: Omit<RelayState, "at">) {
-  const { at, ...prev } = relayState(node, relay) ?? {};
-  if (at && JSON.stringify(prev) === JSON.stringify(st)) return;
-  node.store.set(`relay-state:${relay}`, JSON.stringify({ ...st, at: new Date().toISOString() }));
+  const prev = relayState(node, relay);
+  const next = JSON.stringify({ ...st, at: prev?.state === st.state && prev.at ? prev.at : new Date().toISOString() });
+  if (kv(node, `relay-state:${relay}`) !== next) node.store.set(`relay-state:${relay}`, next);
 }
 const delKv = (node: MbxNode, k: string) => node.store.db.prepare("DELETE FROM kv WHERE k=?").run(k);
 
@@ -188,14 +193,14 @@ export async function relayOpen(node: MbxNode, relay: string, f: typeof fetch = 
   const ad = await ensureEncAd(node, s);
   if (!ad.ok) {
     // enrolled a moment ago, then the first signed call is refused: the relay checks hop timestamps (±5 min), so this
-    // host's clock is the likely cause. Back off instead of re-enrolling every tick, and say so.
-    if (enrolled === "enrolled" && ad.status === 401) clockSkew(node, s, ad.date);
+    // host's clock is the likely cause (its Date header tells). Back off instead of re-enrolling every tick, and say so.
+    if (enrolled === "enrolled" && ad.status === 401) refusedAfterEnrol(node, s, ad.date);
     else setState(node, relay, { state: "enc-ad-failed", status: ad.status, detail: ad.detail, relay_fp: fingerprint(info.relay_pubkey), epoch: info.epoch });
     return null;
   }
   delKv(node, `relay-enrol-backoff:${relay}`);
   await publishSenders(node, s);
-  setState(node, relay, { state: "ok", relay_fp: fingerprint(info.relay_pubkey), epoch: info.epoch, enc_ad_exp: ad.exp });
+  setState(node, relay, { state: "ok", relay_fp: fingerprint(info.relay_pubkey), epoch: info.epoch, enc_ad_exp: ad.exp, v1_stale: ad.v1_stale, v1_down: ad.v1_down });
   return s;
 }
 
@@ -203,18 +208,24 @@ export async function relayOpen(node: MbxNode, relay: string, f: typeof fetch = 
 const HOP_WINDOW_MS = 300_000;
 /** Enrolment retries after a likely clock skew: 1 min, doubling, at most 1 h. */
 export const ENROL_BACKOFF_BASE_MS = 60_000, ENROL_BACKOFF_MAX_MS = 3_600_000;
-function clockSkew(node: MbxNode, s: RelaySession, date: string | null | undefined) {
+/**
+ * The first signed call after a fresh enrolment was refused (401). Back off either way. The relay's Date header says
+ * whether this is clock skew: an offset over the hop window (or no usable Date) is reported as clock skew with the fix;
+ * an offset inside it means the clocks agree, so the refusal has another cause and no clock advice is given.
+ */
+function refusedAfterEnrol(node: MbxNode, s: RelaySession, date: string | null | undefined) {
   const k = `relay-enrol-backoff:${s.relay}`, now = Date.now();
   let prev: { n?: number } | null = null;
   try { prev = JSON.parse(kv(node, k) ?? "null"); } catch { /* start over */ }
   const n = (prev?.n ?? 0) + 1, next = new Date(now + Math.min(ENROL_BACKOFF_BASE_MS * 2 ** (n - 1), ENROL_BACKOFF_MAX_MS)).toISOString();
   node.store.set(k, JSON.stringify({ n, next_at: next }));
   const relayNow = date ? Date.parse(date) : NaN, off = Number.isFinite(relayNow) ? now - relayNow : NaN;
-  const detail = Number.isFinite(off) && Math.abs(off) > HOP_WINDOW_MS
-    ? `this host's clock is about ${Math.round(Math.abs(off) / 60_000)} min ${off > 0 ? "ahead of" : "behind"} the relay's (the relay accepts 5)`
-    : "this host's clock is likely more than 5 min off the relay's";
-  if (n === 1) node.store.audit("relay.clock_skew", { relay: s.relay, off_ms: Number.isFinite(off) ? off : null });
-  setState(node, s.relay, { state: "clock-skew", status: 401, detail, next_at: next, relay_fp: fingerprint(s.info.relay_pubkey), epoch: s.info.epoch });
+  const skew = !Number.isFinite(off) || Math.abs(off) > HOP_WINDOW_MS;
+  const detail = !Number.isFinite(off) ? "this host's clock is likely more than 5 min off the relay's"
+    : skew ? `this host's clock is about ${Math.round(Math.abs(off) / 60_000)} min ${off > 0 ? "ahead of" : "behind"} the relay's (the relay accepts 5)`
+    : `refused right after enrolment; clocks agree (${Math.round(Math.abs(off) / 1000)} s apart), so the cause is not this host's clock`;
+  if (n === 1) node.store.audit(skew ? "relay.clock_skew" : "relay.signed_refused", { relay: s.relay, off_ms: Number.isFinite(off) ? off : null });
+  setState(node, s.relay, { state: skew ? "clock-skew" : "refused-after-enrol", status: 401, detail, next_at: next, relay_fp: fingerprint(s.info.relay_pubkey), epoch: s.info.epoch });
 }
 
 /**
@@ -227,6 +238,7 @@ async function ensureEnrolled(node: MbxNode, s: RelaySession): Promise<"confirme
   const flag = `relay-enrolled-v2:${s.relay}:${node.key.publicKey}:${s.info.relay_pubkey}:${s.info.epoch}`;
   if (s.info.you?.pubkey === node.key.publicKey && s.info.you.host === node.host) { // a renamed host re-enrols to carry its name
     if (!kv(node, flag)) node.store.set(flag, new Date().toISOString());
+    delKv(node, `relay-enrol-backoff:${s.relay}`); // a signed answer confirming the enrolment ends any backoff episode
     return "confirmed";
   }
   // a likely clock skew stopped the last attempt: wait out the backoff (a signed answer above ends it at once)
@@ -259,18 +271,24 @@ async function ensureEnrolled(node: MbxNode, s: RelaySession): Promise<"confirme
 /**
  * This host's enc-key ad at the relay (spec §8): a signed, expiring v2 record, plus the v1 pair older senders verify.
  * Republished when the relay's store lacks it or holds another key (a reset, a lost row, a rotation), when this host's
- * keys or the relay epoch change, and once a day. Every result is checked. The v1 pair is best effort once the v2 record
- * is stored: a relay that retired /v1 (404 or 410) is audited once and never stops relay use. Returns the v2 expiry
- * (null: the relay is too old to store v2 ads, so v1 is all it carries and must succeed).
+ * keys or the relay epoch change, and once a day. Every result is checked. Once the v2 record is stored the v1 pair is
+ * best effort: a v1 publish the relay refuses (404/410 retired, or any other status) is remembered, audited only when
+ * its status changes, no longer counts as drift, and is retried at the daily refresh. A v1 pair the relay still serves
+ * for another key is reported (`v1_stale`): upgraded senders ignore it, older ones would seal for it. On a relay too old
+ * for v2 records (404) the v1 pair is all it carries and must succeed. `exp` null: no v2 record.
  */
-async function ensureEncAd(node: MbxNode, s: RelaySession): Promise<{ ok: true; exp: string | null } | { ok: false; status: number; detail: string; date?: string | null }> {
-  const k = `relay-enc-ad:${s.relay}`, retiredK = `relay-enc-v1-retired:${s.relay}`, now = Date.now(), mine = node.encKey.publicKey;
+async function ensureEncAd(node: MbxNode, s: RelaySession): Promise<{ ok: true; exp: string | null; v1_stale: string | null; v1_down: number | null } | { ok: false; status: number; detail: string; date?: string | null }> {
+  const k = `relay-enc-ad:${s.relay}`, downK = `relay-enc-v1-down:${s.relay}`, now = Date.now(), mine = node.encKey.publicKey;
   let cur: { host_pubkey: string; enc_pub: string; iat: string; exp: string | null; epoch: string } | null = null;
   try { cur = JSON.parse(kv(node, k) ?? "null"); } catch { /* republish */ }
-  const served = s.info.you?.enc_ad, v1Retired = !!kv(node, retiredK); // undefined: a relay older than T168 does not say
-  // the v2 record (enc_pub, exp) and, unless the relay retired v1, the v1 pair must name this host's current key
-  const drift = served === null || (served !== undefined && (served.enc_pub !== mine || (!v1Retired && served.v1 !== mine) || !served.exp || Date.parse(served.exp) <= now));
-  if (cur && !drift && cur.host_pubkey === node.key.publicKey && cur.enc_pub === mine && cur.epoch === s.info.epoch && now - Date.parse(cur.iat) < ENC_AD_REFRESH_MS) return { ok: true, exp: cur.exp };
+  let down: { status: number; at: string } | null = null;
+  try { down = JSON.parse(kv(node, downK) ?? "null"); } catch { /* retry v1 */ }
+  const served = s.info.you?.enc_ad; // undefined: a relay older than T168 does not say
+  // the v2 record (enc_pub, exp) and, unless the relay's /v1 is down, the v1 pair must name this host's current key
+  const drift = served === null || (served !== undefined && (served.enc_pub !== mine || (!down && served.v1 !== mine) || !served.exp || Date.parse(served.exp) <= now));
+  const stale = (v1Published: boolean) => !v1Published && served?.v1 && served.v1 !== mine ? fingerprint(served.v1) : null;
+  if (cur && !drift && cur.host_pubkey === node.key.publicKey && cur.enc_pub === mine && cur.epoch === s.info.epoch && now - Date.parse(cur.iat) < ENC_AD_REFRESH_MS)
+    return { ok: true, exp: cur.exp, v1_stale: stale(false), v1_down: down?.status ?? null };
   if (cur && drift) node.store.audit("relay.enc_ad_missing", { relay: s.relay, v2: served?.enc_pub ? fingerprint(served.enc_pub) : null, v1: served?.v1 ? fingerprint(served.v1) : null });
   const { ad, sig } = signEncAd(node.host, node.key, mine, now);
   const v2 = await call(s, node, "POST", "/v2/relay/enc-key", { ad, sig });
@@ -280,14 +298,19 @@ async function ensureEncAd(node: MbxNode, s: RelaySession): Promise<{ ok: true; 
   };
   if (v2.status !== 200 && v2.status !== 404) return refused(v2, "v2"); // 404: a relay older than T168
   const v1 = await call(s, node, "POST", "/v1/relay/enc-key", { enc_pub: mine, sig: signData(node.key.privateKey, canonical({ v: 1, host: node.host, enc_pub: mine })) });
-  if (v1.status === 200) { if (v1Retired) delKv(node, retiredK); }
+  if (v1.status === 200) { if (down) delKv(node, downK); down = null; }
   else if (v2.status !== 200) return refused(v1, "v1"); // an old relay carries only v1
-  else if (v1.status === 404 || v1.status === 410) {
-    if (!v1Retired) { node.store.audit("relay.enc_v1_retired", { relay: s.relay, status: v1.status }); node.store.set(retiredK, new Date(now).toISOString()); }
-  } else node.store.audit("relay.enc_publish_failed", { relay: s.relay, shape: "v1", status: v1.status, error: String(v1.json.error ?? ""), fatal: false });
+  else if (v1.status !== 0) { // 0: unreachable for a moment; the next pass retries
+    if (down?.status !== v1.status) {
+      if (v1.status === 404 || v1.status === 410) node.store.audit("relay.enc_v1_retired", { relay: s.relay, status: v1.status });
+      else node.store.audit("relay.enc_publish_failed", { relay: s.relay, shape: "v1", status: v1.status, error: String(v1.json.error ?? ""), fatal: false });
+    }
+    down = { status: v1.status, at: down?.status === v1.status ? down.at : new Date(now).toISOString() };
+    node.store.set(downK, JSON.stringify(down));
+  }
   const exp = v2.status === 200 ? ad.exp : null;
   node.store.set(k, JSON.stringify({ host_pubkey: node.key.publicKey, enc_pub: mine, iat: ad.iat, exp, epoch: s.info.epoch }));
-  return { ok: true, exp };
+  return { ok: true, exp, v1_stale: stale(v1.status === 200), v1_down: down?.status ?? null };
 }
 
 /** T030 rotations the relay has not seen: the relay moves our name and queue to the new key (spec §2). */

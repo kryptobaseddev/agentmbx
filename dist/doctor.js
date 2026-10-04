@@ -306,6 +306,8 @@ export async function doctor(ctx, mbxHome, opts = {}) {
                 add(st.status === 401 || st.status === 403 ? "fail" : "warn", `relay ${relay} refused this host's enrolment since ${st.at} (${st.detail}): relay mail is paused${held}`, st.status === 403 ? "this host key is revoked or not authorized on that relay: ask its operator (the daemon retries every pass)" : "the daemon re-enrols every pass; check the relay is reachable and runs a current agentmbx");
             else if (st?.state === "clock-skew")
                 add("fail", `relay ${relay} refuses this host's signed requests right after enrolling it (since ${st.at}): ${st.detail}; relay mail is paused${held}`, `set this host's clock right (turn on network time: macOS System Settings > General > Date & Time, Linux timedatectl set-ntp true); the daemon retries enrolment with backoff, next at ${st.next_at}`);
+            else if (st?.state === "refused-after-enrol")
+                add("fail", `relay ${relay} refuses this host's signed requests right after enrolling it (since ${st.at}): ${st.detail}; relay mail is paused${held}`, `check the relay's log and version with its operator; the daemon retries enrolment with backoff, next at ${st.next_at}`);
             else if (st?.state === "enc-ad-failed")
                 add("warn", `relay ${relay} has not taken this host's encryption key ad since ${st.at} (${st.detail}): peers cannot seal relay mail for this host${held}`, "the daemon republishes every pass");
             else if (st?.state === "unreachable")
@@ -314,6 +316,8 @@ export async function doctor(ctx, mbxHome, opts = {}) {
                 add("warn", `relay ${relay} runs an agentmbx too old to store expiring encryption ads: peers on this version cannot seal relay mail for this host unless they learned its key on the LAN`, "upgrade the relay");
             else if (st?.state === "ok" && st.enc_ad_exp)
                 add("info", `this host's encryption key ad at the relay is valid until ${st.enc_ad_exp} (republished daily)`);
+            if (st?.state === "ok" && st.v1_stale)
+                add("warn", `relay ${relay} still serves an old v1 encryption key for this host (${st.v1_stale}) and refuses v1 updates${st.v1_down ? ` (${st.v1_down})` : ""}: senders on 0.5.6 or older would seal relay mail for a key this host no longer holds (upgraded senders use the signed v2 ad)`, "ask the relay operator to drop this host's v1 enc-key ad or accept v1 updates again; upgrade older peers");
             for (const r of db.prepare("SELECT k, v FROM kv WHERE k LIKE 'relay-enc-rejected:%'").all()) {
                 const host = r.k.slice("relay-enc-rejected:".length), waiting = n("SELECT COUNT(*) c FROM outbox WHERE host=?", host);
                 let reason = "";

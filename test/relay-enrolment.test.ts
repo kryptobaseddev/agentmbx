@@ -75,7 +75,8 @@ test("AC1: an enc-key ad counts only when signed by the pinned key, naming that 
   // tampered: another key in the signed record, or an added field
   assert.equal(reason(answer({ ...good.ad, enc_pub: generateEncKeyPair().publicKey }, good.sig)), "bad signature");
   assert.equal(reason(answer({ ...good.ad, note: "x" }, good.sig)), "bad signature");
-  assert.match(reason(answer(good.ad, good.sig, { enc_pub: generateEncKeyPair().publicKey }))!, /^tampered/, "a relay answering two keys");
+  assert.deepEqual(encFromRelayAnswer(answer(good.ad, good.sig, { enc_pub: generateEncKeyPair().publicKey, sig: "c2ln" }), peer, now), { enc_pub: enc, iat: good.ad.iat },
+    "a v1 key served beside a valid record is ignored: only the signed record counts");
   // expired, not yet valid, or valid for too long (all validly signed by the right key)
   const old = signEncAd("beta", beta, enc, now - ENC_AD_TTL_MS - 1000);
   assert.equal(reason(answer(old.ad, old.sig)), "expired");
@@ -191,14 +192,12 @@ test("AC2: a store that lost this host's enrolment or ad in the same epoch is ca
   assert.equal(audits(a, "relay.enrolment_lost").length, 1);
   assert.ok(core.store.getEnrolment(a.key.publicKey), "re-enrolled in the same pass");
   assert.equal(core.getEncAdByKey(a.key.publicKey)?.ad?.enc_pub, a.encKey.publicKey);
-  // beta's v1 pair and v2 record now disagree: alpha refuses both until beta republishes
-  assert.equal((await relayPushOutbox(a, sa!)).accepted, 0);
-  assert.match(JSON.parse(a.store.get("relay-enc-rejected:beta")!).reason, /^tampered/);
+  // beta's stale v1 pair does not matter to alpha: only the signed v2 record counts, and mail moves in the same pass
+  assert.equal((await relayPushOutbox(a, sa!)).accepted, 1, "and mail moves in the same pass");
+  // beta notices its stale v1 pair (older senders still read it) and republishes
   assert.ok(await open(b));
   assert.equal(audits(b, "relay.enc_ad_missing").length, 1, "beta saw its stale ad and republished");
   assert.equal(core.getEncAdByKey(b.key.publicKey)?.enc_pub, b.encKey.publicKey);
-  lanFailedTwice(a);
-  assert.equal((await relayPushOutbox(a, (await open(a))!)).accepted, 1, "mail moves once beta's ad is current again");
 });
 
 test("AC3: this host's key rotation re-enrols the new key, republishes its ad, keeps the queued row and delivers it", async (t) => {
@@ -361,7 +360,7 @@ test("review: a relay that retired /v1 (404 or 410 to the v1 ad) is audited once
   a.send({ from: "alice", to: ["bob@beta"], subject: "s", body: "v2 only" }); lanFailedTwice(a);
   assert.equal((await relayPushOutbox(a, (await open(a))!)).accepted, 1);
   // 404 is the same; another v1 failure is audited but not fatal once the v2 record is stored
-  for (const k of [`relay-enc-ad:${RELAY}`, `relay-enc-v1-retired:${RELAY}`]) b.store.db.prepare("DELETE FROM kv WHERE k=?").run(k);
+  for (const k of [`relay-enc-ad:${RELAY}`, `relay-enc-v1-down:${RELAY}`]) b.store.db.prepare("DELETE FROM kv WHERE k=?").run(k);
   assert.ok(await open(b, answering(f, "POST", "/v1/relay/enc-key", 404)));
   assert.equal(audits(b, "relay.enc_v1_retired").length, 2);
   b.store.db.prepare("DELETE FROM kv WHERE k=?").run(`relay-enc-ad:${RELAY}`);
@@ -397,47 +396,149 @@ test("review: an older ad naming another key (a regenerated enc.key rolled back 
   const lines = await doctorLines(a);
   assert.ok(lines.some((l) => /^warn 1 message\(s\) for beta wait: the relay served an older encryption key ad for it than one already accepted, a possible replay/.test(l)), lines.join("\n"));
   // an older ad naming the current key rolls nothing back (a publisher's clock may step back): accepted
+  const newest = () => JSON.parse(a.store.get(`relay-enc-newest:${b.key.publicKey}`)!) as { iat: string; enc_pub: string };
+  const before = newest();
+  assert.equal(before.enc_pub, b.encKey.publicKey);
   const sameKeyOlder = signEncAd("beta", b.key, b.encKey.publicKey, Date.now() - 3_600_000);
   lanFailedTwice(a);
   assert.equal((await relayPushOutbox(a, (await open(a, lyingEncKey(f, (j) => ({ ...j, ad: sameKeyOlder.ad, ad_sig: sameKeyOlder.sig }))))!)).accepted, 1);
+  assert.deepEqual(newest(), before, "an older same-key ad never lowers the newest accepted iat");
   assert.equal(await relayReceive(b, (await open(b))!), 2, "two and three arrive, sealed for the key beta holds");
   assert.equal(count(b, "SELECT COUNT(*) c FROM relay_quarantine"), 0, "nothing was sealed for the key beta no longer holds");
 });
 
-test("review: a host whose clock is off re-enrols with backoff, not every tick, and doctor says clock skew", async (t) => {
-  const { a, core, f, open } = await world(t);
-  const AHEAD = 10 * 60_000;
-  let challenges = 0;
-  // the relay's view of a host whose clock runs 10 min ahead: unsigned enrolment works, every signed hop is refused
-  const skewed: typeof fetch = async (input, init) => {
+/** The relay's view of a host whose signed hops it refuses (as it does for a clock off by more than 5 min): challenge and
+ *  enrol work, a signed info answer carries no `you`, every other signed call is 401 with a Date `relayOffsetMs` from ours. */
+function refusingSigned(f: typeof fetch, relayOffsetMs: number, seen: { challenges: number }): typeof fetch {
+  return async (input, init) => {
     const path = new URL(String(input)).pathname, h = { ...(init?.headers as Record<string, string> | undefined) };
-    if (path === "/v1/relay/challenge") challenges++;
+    if (path === "/v1/relay/challenge") seen.challenges++;
     if (!h["x-mbx-sig"] || path === "/v1/relay/challenge" || path === "/v1/relay/enrol") return f(input, init);
     if (path === "/v2/relay/info") { delete h["x-mbx-sig"]; return f(input, { ...init, headers: h }); } // answered, but no `you`
-    return new Response(JSON.stringify({ error: "bad relay hop" }), { status: 401, headers: { "content-type": "application/json", date: new Date(Date.now() - AHEAD).toUTCString() } });
+    return new Response(JSON.stringify({ error: "bad relay hop" }), { status: 401, headers: { "content-type": "application/json", date: new Date(Date.now() + relayOffsetMs).toUTCString() } });
   };
+}
+
+test("review: a host whose clock is off re-enrols with backoff, not every tick, and doctor says clock skew", async (t) => {
+  const { a, core, f, open } = await world(t);
+  const seen = { challenges: 0 }, skewed = refusingSigned(f, -10 * 60_000, seen); // this host runs 10 min ahead
   assert.equal(await open(a, skewed), null);
   assert.ok(core.store.getEnrolment(a.key.publicKey), "the unsigned enrolment itself worked");
   let st = relayState(a, RELAY)!;
   assert.equal(st.state, "clock-skew");
   assert.match(st.detail!, /about 10 min ahead of the relay's/);
+  const since = st.at;
   const backoff = () => JSON.parse(a.store.get(`relay-enrol-backoff:${RELAY}`)!) as { n: number; next_at: string };
+  const due = (n?: number) => a.store.set(`relay-enrol-backoff:${RELAY}`, JSON.stringify({ n: n ?? backoff().n, next_at: new Date(Date.now() - 1).toISOString() }));
   assert.equal(backoff().n, 1);
   assert.ok(Date.parse(backoff().next_at) - Date.now() > 50_000);
   for (let i = 0; i < 3; i++) assert.equal(await open(a, skewed), null);
-  assert.equal(challenges, 1, "no re-enrolment while the backoff runs");
-  a.store.set(`relay-enrol-backoff:${RELAY}`, JSON.stringify({ ...backoff(), next_at: new Date(Date.now() - 1).toISOString() }));
+  assert.equal(seen.challenges, 1, "no re-enrolment while the backoff runs");
+  await new Promise((r) => setTimeout(r, 5));
+  due();
   assert.equal(await open(a, skewed), null);
-  assert.equal(challenges, 2);
+  assert.equal(seen.challenges, 2);
   assert.equal(backoff().n, 2);
   assert.ok(Date.parse(backoff().next_at) - Date.now() > 110_000, "the wait doubles");
+  assert.equal(relayState(a, RELAY)!.at, since, "doctor's since stays at the start of the episode");
+  due(12);
+  assert.equal(await open(a, skewed), null);
+  const wait = Date.parse(backoff().next_at) - Date.now();
+  assert.ok(wait <= 3_600_000 && wait > 3_590_000, `capped at 1 h (${wait} ms)`);
   assert.equal(audits(a, "relay.clock_skew").length, 1, "audited once per episode");
   const lines = await doctorLines(a);
-  assert.ok(lines.some((l) => l.startsWith(`fail relay ${RELAY} refuses this host's signed requests right after enrolling it`) && l.includes("about 10 min ahead") && l.includes("network time")), lines.join("\n"));
+  assert.ok(lines.some((l) => l.startsWith(`fail relay ${RELAY} refuses this host's signed requests right after enrolling it (since ${since})`) && l.includes("about 10 min ahead") && l.includes("network time")), lines.join("\n"));
   assert.ok(!lines.some((l) => /encryption key ad since/.test(l)), "not reported as an enc-ad failure");
   // the clock is fixed: the next signed answer ends the backoff at once
   assert.ok(await open(a, f));
   assert.equal(a.store.get(`relay-enrol-backoff:${RELAY}`) ?? null, null);
   st = relayState(a, RELAY)!;
   assert.equal(st.state, "ok");
+});
+
+test("review 2: a 401 right after enrolment while the clocks agree backs off but is not called clock skew", async (t) => {
+  const { a, f, open } = await world(t);
+  const seen = { challenges: 0 };
+  assert.equal(await open(a, refusingSigned(f, 20_000, seen)), null); // 20 s apart: inside the relay's 5 min window
+  const st = relayState(a, RELAY)!;
+  assert.equal(st.state, "refused-after-enrol");
+  assert.match(st.detail!, /refused right after enrolment; clocks agree \((19|20|21) s apart\)/); // Date has 1 s resolution
+  assert.equal((JSON.parse(a.store.get(`relay-enrol-backoff:${RELAY}`)!) as { n: number }).n, 1, "the backoff still applies");
+  assert.equal(audits(a, "relay.clock_skew").length, 0);
+  assert.equal(audits(a, "relay.signed_refused").length, 1);
+  const lines = await doctorLines(a);
+  const line = lines.find((l) => l.startsWith(`fail relay ${RELAY} refuses this host's signed requests right after enrolling it`));
+  assert.ok(line && /clocks agree/.test(line) && !/network time|clock right/.test(line), lines.join("\n"));
+});
+
+test("review 2: an answer confirming the enrolment ends a leftover backoff, so the next skew episode starts at 1 min", async (t) => {
+  const { a, core, f, open } = await world(t);
+  const k = `relay-enrol-backoff:${RELAY}`;
+  assert.ok(await open(a));
+  a.store.set(k, JSON.stringify({ n: 6, next_at: new Date(Date.now() + 3_600_000).toISOString() })); // left from an old episode
+  // the relay confirms the enrolment, then the session fails for another reason: the confirmation alone ends the backoff
+  a.store.db.prepare("DELETE FROM kv WHERE k=?").run(`relay-enc-ad:${RELAY}`);
+  assert.equal(await open(a, answering(f, "POST", "/v2/relay/enc-key", 500)), null);
+  assert.equal(relayState(a, RELAY)?.state, "enc-ad-failed");
+  assert.equal(a.store.get(k) ?? null, null, "confirmed: the counter is gone");
+  // a new episode: the relay lost the enrolment and the clock is off
+  (core.store as SqliteRelayStore).db.prepare("DELETE FROM enrolments WHERE host_pubkey=?").run(a.key.publicKey);
+  assert.equal(await open(a, refusingSigned(f, -10 * 60_000, { challenges: 0 })), null);
+  const bo = JSON.parse(a.store.get(k)!) as { n: number; next_at: string };
+  assert.equal(bo.n, 1);
+  const wait = Date.parse(bo.next_at) - Date.now();
+  assert.ok(wait <= 60_000 && wait > 50_000, `starts at 1 min (${wait} ms)`);
+  assert.equal(audits(a, "relay.clock_skew").length, 1);
+});
+
+test("review 2: a stale v1 key beside the current v2 ad (v1 retired, enc.key regenerated) never strands mail; the publisher's doctor warns", async (t) => {
+  const { a, b, core, f, open } = await world(t);
+  assert.ok(await open(b)); // v1 pair and v2 record for beta's first key
+  const oldEnc = b.encKey.publicKey;
+  const gone = answering(f, "POST", "/v1/relay/enc-key", 410); // the relay retires /v1
+  await new Promise((r) => setTimeout(r, 5));
+  b.encKey = generateEncKeyPair(); // enc.key regenerated under the same host key
+  assert.ok(await open(b, gone));
+  const served = core.getEncAdByKey(b.key.publicKey)!;
+  assert.equal(served.enc_pub, oldEnc, "the relay still serves the old v1 key");
+  assert.equal(served.ad?.enc_pub, b.encKey.publicKey, "beside the new v2 record");
+  a.send({ from: "alice", to: ["bob@beta"], subject: "s", body: "sealed for the new key" }); lanFailedTwice(a);
+  assert.equal((await relayPushOutbox(a, (await open(a))!)).accepted, 1, "the sender takes the signed v2 record and ignores the v1 key");
+  assert.equal(a.store.get("relay-enc-rejected:beta") ?? null, null);
+  assert.equal(await relayReceive(b, (await open(b, gone))!), 1);
+  assert.equal(b.inbox("bob")[0]?.body, "sealed for the new key");
+  // the publisher is told: older senders would still seal for the old key
+  const st = relayState(b, RELAY)!;
+  assert.equal(st.state, "ok");
+  assert.equal(st.v1_stale, fingerprint(oldEnc));
+  const lines = await doctorLines(b);
+  assert.ok(lines.some((l) => l.startsWith(`warn relay ${RELAY} still serves an old v1 encryption key for this host (${fingerprint(oldEnc)}) and refuses v1 updates (410)`)), lines.join("\n"));
+});
+
+test("review 2: a persistent v1 error (403) is audited once, retried only at the daily refresh, and never trips drift", async (t) => {
+  const { b, f, open } = await world(t);
+  const posts = { v1: 0, v2: 0 };
+  const counting = (g: typeof fetch): typeof fetch => (input, init) => {
+    if (init?.method === "POST" && String(input).endsWith("/v1/relay/enc-key")) posts.v1++;
+    if (init?.method === "POST" && String(input).endsWith("/v2/relay/enc-key")) posts.v2++;
+    return g(input, init);
+  };
+  const forbidden = counting(answering(f, "POST", "/v1/relay/enc-key", 403));
+  for (let i = 0; i < 5; i++) assert.ok(await open(b, forbidden), `pass ${i}`);
+  assert.deepEqual(posts, { v1: 1, v2: 1 }, "one publish in five passes");
+  const v1Failures = () => audits(b, "relay.enc_publish_failed").filter((d) => d.includes('"shape":"v1"')).length;
+  assert.equal(v1Failures(), 1, "audited once");
+  assert.equal(audits(b, "relay.enc_ad_missing").length, 0, "the missing v1 pair is not drift");
+  assert.equal(relayState(b, RELAY)?.v1_down, 403);
+  // the daily refresh retries both; the same status is not audited again
+  const aged = () => { const r = JSON.parse(b.store.get(`relay-enc-ad:${RELAY}`)!); b.store.set(`relay-enc-ad:${RELAY}`, JSON.stringify({ ...r, iat: new Date(Date.now() - 25 * 3_600_000).toISOString() })); };
+  aged();
+  assert.ok(await open(b, forbidden));
+  assert.deepEqual(posts, { v1: 2, v2: 2 });
+  assert.equal(v1Failures(), 1);
+  // /v1 works again at the next refresh: the failure is forgotten
+  aged();
+  assert.ok(await open(b, counting(f)));
+  assert.equal(b.store.get(`relay-enc-v1-down:${RELAY}`) ?? null, null);
+  assert.equal(relayState(b, RELAY)?.v1_down, null);
 });
