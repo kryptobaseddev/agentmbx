@@ -1,11 +1,13 @@
 // `agentmbx setup` / `doctor` against a fake HOME whose configs copy the STRUCTURE of real ones (fake values only).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { spawn, spawnSync } from "node:child_process";
 import { doctor, failed } from "../src/doctor.ts";
 import { insertMember, member, parseJsonc, removeMember } from "../src/jsonc.ts";
+import { detectHost } from "../src/mcp.ts";
 import { MbxNode } from "../src/node.ts";
 import { grokSessionId } from "../src/proc.ts";
 import { runSetup, skillDest, statuslineState, type SetupCtx } from "../src/setup.ts";
@@ -479,4 +481,27 @@ test("T337: grok guard rails — quoted keys, byte-exact round-trips, escaping, 
   runSetup(c4, { mode: "install", stamp: "Q5" });
   assert.equal(rd(h4, ".grok/config.toml"), before, "an unparseable file is never written into");
   rmSync(h4, { recursive: true, force: true });
+});
+
+// #98 re-review regression: install then uninstall BOTH grok sections on LF and CRLF files with a
+// user section before them — the bytes must come back identical (never an orphaned \r, never a
+// lost final newline, never a doubled blank line).
+test("T337: install+uninstall of both sections round-trips LF and CRLF files byte-exactly", () => {
+  for (const [name, before] of [
+    ["LF", `[models]\nb = 2\n`],
+    ["LF no trailing newline", `[models]\nb = 2`],
+    ["CRLF", `[models]\r\nb = 2\r\n`],
+    ["CRLF no trailing newline", `[models]\r\nb = 2`],
+  ] as const) {
+    const h = fakeHome(); const c = ctxFor(h);
+    mkdirSync(join(h, ".grok"), { recursive: true });
+    writeFileSync(join(h, ".grok/config.toml"), before);
+    runSetup(c, { mode: "install", stamp: "RT1" });
+    const installed = rd(h, ".grok/config.toml");
+    assert.match(installed, /\[mcp_servers\.mbx\]/, `${name}: mcp section installed`);
+    assert.match(installed, /\[ui\.status_line\]/, `${name}: status line installed`);
+    runSetup(c, { mode: "uninstall", stamp: "RT2" });
+    assert.equal(rd(h, ".grok/config.toml"), before, `${name}: byte-identical after removing both sections`);
+    rmSync(h, { recursive: true, force: true });
+  }
 });

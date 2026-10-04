@@ -171,6 +171,75 @@ export function claudeSessionId(pid) {
     }
 }
 const claudeSessionFile = (pid) => join(homedir(), ".claude/sessions", `${pid}.json`);
+const PS_LSTART_RE = /^[A-Z][a-z]{2} ([A-Z][a-z]{2})\s+(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/;
+const PS_MONTHS = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+/** The process start as epoch ms, comparable with ISO timestamps (T337 review: reject a session row older than its process). */
+export function procStartEpochMs(pid) {
+    const start = procStart(pid);
+    if (!start)
+        return null;
+    if (start.startsWith("linux:")) {
+        const ticks = Number(start.split(":")[2]);
+        try {
+            const btime = Number(/btime (\d+)/.exec(readFileSync("/proc/stat", "utf8"))?.[1]);
+            return Number.isFinite(ticks) && Number.isFinite(btime) ? btime * 1000 + ticks * 10 : null; // USER_HZ is 100
+        }
+        catch {
+            return null;
+        }
+    }
+    const m = PS_LSTART_RE.exec(start.replace(/^ps-utc:/, ""));
+    if (!m)
+        return null;
+    // procTable's lstart is captured in the process's local zone (LC_ALL=C): build the epoch locally.
+    return new Date(Number(m[6]), PS_MONTHS[m[1]], Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5])).getTime();
+}
+const grokSessionsFile = () => process.env.MBX_GROK_SESSIONS_FILE || join(process.env.GROK_HOME || join(homedir(), ".grok"), "active_sessions.json");
+/** The grok CLI tracks live sessions in active_sessions.json: [{session_id, pid, cwd, opened_at}].
+ *  T337: this MCP server is that grok process's child, so a pid match names its session. Review:
+ *  one process can host several sessions (forks, "+ New Agent") — never guess unless exactly one
+ *  row matches; a row older than the process is a reused pid's leftover, never its session. */
+export function grokSessionId(pid) {
+    try {
+        const rows = JSON.parse(readFileSync(grokSessionsFile(), "utf8"));
+        if (!Array.isArray(rows))
+            return null;
+        const matches = rows.filter((r) => !!r && typeof r === "object" && r.pid === pid
+            && typeof r.session_id === "string"
+            && /^[A-Za-z0-9_-]{1,128}$/.test(r.session_id));
+        if (matches.length !== 1)
+            return null;
+        const opened = typeof matches[0].opened_at === "string" ? Date.parse(matches[0].opened_at) : NaN;
+        const startMs = procStartEpochMs(pid);
+        if (Number.isFinite(opened) && startMs !== null && opened < startMs)
+            return null;
+        return matches[0].session_id;
+    }
+    catch {
+        return null;
+    } // malformed or half-written file: no session id
+}
+/** grok switches sessions in-process (/new, /clear, /resume): re-read the registry when it changes (review med 7). */
+export function grokSessionTracker(pid) {
+    let stamp = null, id = null;
+    return () => {
+        let next = null;
+        try {
+            const s = statSync(grokSessionsFile());
+            next = `${s.ino}:${s.size}:${s.mtimeMs}`;
+        }
+        catch { /* no file yet */ }
+        if (next === null) {
+            stamp = null;
+            return id = null;
+        }
+        if (next !== stamp) {
+            stamp = next;
+            id = grokSessionId(pid);
+        }
+        return id;
+    };
+}
 /**
  * claudeSessionId for a caller that asks on every tool call and heartbeat (T326): the file is parsed again only when its
  * inode, size or modification time changed.

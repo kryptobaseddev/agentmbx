@@ -18,7 +18,7 @@ import { fingerprint } from "./crypto.ts";
 import { version } from "./version.ts";
 import { authHelperPath, canPrompt, createKeychainOwner, ownerInfo } from "./owner.ts";
 
-export const CLIS = ["claude", "codex", "opencode", "kimi", "hermes"] as const;
+export const CLIS = ["claude", "codex", "opencode", "kimi", "hermes", "grok"] as const;
 export type CliId = (typeof CLIS)[number];
 export type Action = "added" | "updated" | "removed" | "unchanged" | "skipped" | "manual" | "error";
 
@@ -63,7 +63,8 @@ export const hookCommand = (cmd: string[], event: string, cli: string) => `${shJ
 // status line is left alone and reported (runSetup adds a manual row with the snippet); uninstall
 // removes only what setup wrote. "Ours" is an EXACT match against a command setup itself writes
 // (review blocker: the absolute script-path form or the shJoin(cmd) form — nothing else).
-export const statuslineCommand = (home: string, cli: "claude" | "kimi", cmd: string[]): string => {
+export const statuslineCommand = (home: string, cli: "claude" | "kimi" | "grok", cmd: string[]): string => {
+  if (cli === "grok") return `${shJoin(cmd)} statusline grok`; // no bundled grok adapter: the direct form
   // The bundled pure-sh adapter when the skill ships it (SEA bundles SKILL.md only: the node adapter)
   const script = join(skillDest(home), "scripts", `${cli}-statusline.sh`);
   return existsSync(script) ? `sh ${shJoin([script])}` : `${shJoin(cmd)} statusline ${cli}`;
@@ -79,7 +80,7 @@ const isOurStatusline = (home: string, cli: "claude" | "kimi" | "grok", cmd: str
     || new RegExp(`^(?:agentmbx|\\S+/agentmbx) statusline ${cli}$`).test(command));
 /** "absent" = nothing there, "ours" = an exact setup-written command, "foreign" = anything else.
  *  A malformed file is foreign, never a thrown runSetup (review major 2). */
-export const statuslineState = (home: string, cli: "claude" | "kimi", cmd: string[]): "absent" | "ours" | "foreign" => {
+export const statuslineState = (home: string, cli: "claude" | "kimi" | "grok", cmd: string[]): "absent" | "ours" | "foreign" => {
   try {
     if (cli === "claude") {
       const cur = read(join(home, ".claude/settings.json"));
@@ -123,7 +124,7 @@ const kimiStatus = (cur: string): KimiStatus => {
   const headerAt = start.index + (start[0].startsWith("\n") ? 1 : 0);
   const rest = cur.slice(headerAt);
   const next = /\r?\n[ \t]*\[/.exec(rest);
-  const body = next ? rest.slice(0, next.index + 1) : rest;
+  const body = next ? rest.slice(0, next.index) : rest; // ends with the section's own terminator, never the next separator
   const commandLine = /(?:^|\r?\n)([ \t]*command[ \t]*=[^\n]*\r?\n)/.exec(body)?.[1] ?? null; // capture excludes the leading \n, so a rewrite never eats it
   return { form: "section", body, commandLine };
 };
@@ -195,7 +196,10 @@ function kimiStatusLine(home: string, cmd: string[]) {
         const eolOfFile = (cur ?? "").includes("\r\n") ? "\r\n" : "\n"; // minor: match the file's line ending
         return guarded(cur, (cur ?? "").replace(st.commandLine!, () => `command = ${JSON.stringify(w)}${eolOfFile}`)); // rewrite ONLY our command line — items and other keys stay
       }
-      return guarded(cur, (cur ?? "") + (cur && !cur.endsWith("\n") ? "\n" : "") + "\n" + sectionText(w));
+      // Exactly one line ending between the prior content and our section — uninstall removes
+      // exactly one too, so LF and CRLF files round-trip byte-exactly.
+      const eol = (cur ?? "").includes("\r\n") ? "\r\n" : "\n";
+      return guarded(cur, (cur ?? "") + (cur ? eol : "") + sectionText(w));
     },
     uninstall: (cur: string | null) => {
       if (cur === null) return cur;
@@ -211,11 +215,11 @@ function kimiStatusLine(home: string, cmd: string[]) {
       else {
         // the whole section goes; exactly one separator \n install added before it goes too
         const start = (cur ?? "").indexOf(st.body);
-        const removalStart = start > 0 && (cur ?? "")[start - 1] === "\n" ? start - 1 : start;
+        const removalStart = start > 0 && (cur ?? "")[start - 1] === "\n" ? start - ((cur ?? "")[start - 2] === "\r" ? 2 : 1) : start;
         next = (cur ?? "").slice(0, removalStart) + (cur ?? "").slice(start + st.body.length);
       }
       if (next.trim() === "") next = null; // setup created the file: remove it entirely
-      return next;
+      return guarded(cur, next); // re-review: uninstall is guarded too — never write invalid TOML
     },
   };
 }
@@ -232,7 +236,10 @@ const tomlSectionAt = (cur: string, header: string): string | null => {
   const headerAt = start.index + (start[0].startsWith("\n") || start[0].startsWith("\r") ? start[0].match(/^(\r?\n)/)![1].length : 0);
   const rest = cur.slice(headerAt);
   const next = /\r?\n[ \t]*\[/.exec(rest);
-  return next ? rest.slice(0, next.index + (rest[next.index] === "\r" ? 2 : 1)) : rest;
+  // The body ends with the section's own line terminator, never the separator before the next
+  // header — the separator belongs to whoever appended that section, and uninstall removes
+  // exactly one of those per removed section (re-review regression fix).
+  return next ? rest.slice(0, next.index) : rest;
 };
 
 /** smol-toml parse guard (re-review E): parse before editing — a key in a form we don't recognise
@@ -291,9 +298,10 @@ function grokStatusLine(home: string, cmd: string[]) {
         const eolOfFile = (cur ?? "").includes("\r\n") ? "\r\n" : "\n"; // minor: match the file's line ending
         return guarded(cur, (cur ?? "").replace(st.commandLine!, () => `command = ${JSON.stringify(w)}${eolOfFile}`)); // rewrite ONLY our line — type, refresh_interval, padding stay
       }
-      // Separator encoding: a no-trailing-newline file gets a single \n before our section, a
-      // newline-terminated file gets a blank line — so uninstall can restore both byte-exactly.
-      return guarded(cur, (cur ?? "") + (cur && !cur.endsWith("\n") ? "\n" : "\n\n") + sectionText(w));
+      // Exactly one line ending between the prior content and our section — uninstall removes
+      // exactly one too, so LF and CRLF files round-trip byte-exactly.
+      const eol = (cur ?? "").includes("\r\n") ? "\r\n" : "\n";
+      return guarded(cur, (cur ?? "") + (cur ? eol : "") + sectionText(w));
     },
     uninstall: (cur: string | null) => {
       if (cur === null) return cur;
@@ -309,11 +317,11 @@ function grokStatusLine(home: string, cmd: string[]) {
       else {
         // the whole section goes; exactly one separator \n install added before it goes too
         const start = (cur ?? "").indexOf(st.body);
-        const removalStart = start > 0 && (cur ?? "")[start - 1] === "\n" ? start - 1 : start;
+        const removalStart = start > 0 && (cur ?? "")[start - 1] === "\n" ? start - ((cur ?? "")[start - 2] === "\r" ? 2 : 1) : start;
         next = (cur ?? "").slice(0, removalStart) + (cur ?? "").slice(start + st.body.length);
       }
       if (next.trim() === "") next = null;
-      return next;
+      return guarded(cur, next);
     },
   };
 }
@@ -358,7 +366,8 @@ function grokMcp(cmd: string[]) {
         }
         return cur;
       }
-      return guarded(cur, (cur ?? "") + (cur && !cur.endsWith("\n") ? "\n" : "") + "\n" + sectionText());
+      const eol = (cur ?? "").includes("\r\n") ? "\r\n" : "\n";
+      return guarded(cur, (cur ?? "") + (cur ? eol : "") + sectionText());
     },
     uninstall: (cur: string | null) => {
       if (cur === null) return cur;
@@ -366,10 +375,10 @@ function grokMcp(cmd: string[]) {
       if (st.form !== "section" || !ours(st.body)) return cur;
       // the whole section goes; exactly one separator \n install added before it goes too
       const start = (cur ?? "").indexOf(st.body);
-      const removalStart = start > 0 && (cur ?? "")[start - 1] === "\n" ? start - 1 : start;
+      const removalStart = start > 0 && (cur ?? "")[start - 1] === "\n" ? start - ((cur ?? "")[start - 2] === "\r" ? 2 : 1) : start;
       let next: string | null = (cur ?? "").slice(0, removalStart) + (cur ?? "").slice(start + st.body.length);
       if (next.trim() === "") next = null;
-      return next;
+      return guarded(cur, next);
     },
   };
 }
@@ -677,7 +686,7 @@ export function detect(ctx: SetupCtx): Detected[] {
     return { cli, found: !!onPath || existsSync(join(h, dir)), why: onPath ? `${bin} on PATH` : existsSync(join(h, dir)) ? `~/${dir} exists` : "not found" };
   };
   const hermesCfg = existsSync(join(h, ".hermes/config.yaml"));
-  return [d("claude", "claude", ".claude"), d("codex", "codex", ".codex"), d("opencode", "opencode", ".config/opencode"), d("kimi", "kimi", ".kimi-code"),
+  return [d("claude", "claude", ".claude"), d("codex", "codex", ".codex"), d("opencode", "opencode", ".config/opencode"), d("kimi", "kimi", ".kimi-code"), d("grok", "grok", ".grok"),
     { cli: "hermes", found: hermesCfg, why: hermesCfg ? "~/.hermes/config.yaml exists" : ctx.which("hermes") || existsSync(join(h, ".hermes")) ? "no ~/.hermes/config.yaml yet" : "not found" }];
 }
 
@@ -897,10 +906,12 @@ export function runSetup(ctx: SetupCtx, o: RunOpts): Row[] {
     if (d.cli === "codex" && o.mode === "install" && rows.some((r) => r.cli === "codex" && r.item.startsWith("hooks") && r.action !== "unchanged"))
       rows.push({ cli: "codex", item: "note", path: "-", action: "manual", note: "Codex may ask you to review/trust the new hooks on next start" });
     // T347: a user's own status line is never overwritten — report it and print the snippet instead.
-    if (o.mode === "install" && (d.cli === "claude" || d.cli === "kimi") && statuslineState(ctx.home, d.cli, ctx.cmd) === "foreign")
+    if (o.mode === "install" && (d.cli === "claude" || d.cli === "kimi" || d.cli === "grok") && statuslineState(ctx.home, d.cli, ctx.cmd) === "foreign")
       rows.push({ cli: d.cli, item: "statusLine", path: "-", action: "manual",
         note: `an existing status line was left alone; add the MBX segment yourself: ${d.cli === "claude"
           ? `"statusLine": { "type": "command", "command": ${JSON.stringify(statuslineCommand(ctx.home, "claude", ctx.cmd))} }`
+          : d.cli === "grok"
+          ? `[ui.status_line]\ntype = "command"\ncommand = ${JSON.stringify(statuslineCommand(ctx.home, "grok", ctx.cmd))}`
           : `[status_line]\ncommand = ${JSON.stringify(statuslineCommand(ctx.home, "kimi", ctx.cmd))}` }` });
   }
   if (skillRows) rows.push(...skillRows);
@@ -928,6 +939,7 @@ export const MANUAL_HINTS: Record<CliId, string> = {
   codex: "add [mcp_servers.mbx] command = \"agentmbx\", args = [\"mcp\"] to ~/.codex/config.toml",
   opencode: "add \"mbx\": {\"type\":\"local\",\"command\":[\"agentmbx\",\"mcp\"]} under mcp.servers in ~/.config/opencode/opencode.jsonc",
   kimi: "add {\"mcpServers\":{\"mbx\":{\"command\":\"agentmbx\",\"args\":[\"mcp\"]}}} to ~/.kimi-code/mcp.json",
+  grok: "grok mcp add mbx --scope user -- agentmbx mcp",
   hermes: "add mcp_servers: { mbx: { command: agentmbx, args: [mcp] } } to ~/.hermes/config.yaml",
 };
 
