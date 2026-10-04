@@ -10,7 +10,7 @@ These are deliberately left out, based on SignalDock's lessons:
 - accounts for anything except relay usage (login, quotas, device enrollment). LAN use needs no account.
 - payments, a leaderboard, or attachment storage
 - more than one transport per hop (a kernel may have several transports: LAN, relay, conduit)
-- encryption: the envelope field is reserved, but it isn't implemented. **No relay carries bodies until `enc` is implemented or the docs state plainly that the relay operator can read them.**
+- end-to-end encryption between agents, sealed envelope metadata, and encrypted local storage. Bodies are sealed between hosts (see Envelope, "Body sealing"); nothing more is encrypted.
 - file leases (the message kinds are reserved)
 - posting to other programs' private sockets
 - remote approval of permission prompts
@@ -45,6 +45,8 @@ Stack: Node ≥ 24, TypeScript run through Node's native type stripping (no buil
 - **What the signature proves:** that the message came from that host and was not changed. Replays are stopped by permanent id dedupe (see Trust). The OS user is the local trust unit; agent names on one host are labels, not separate keys, except for the master session's in-memory key.
 - **Metadata:** `meta` is parsed from the body at send time (`@x`, `/claim`, `#tag`, `T123`). Recipients never trust `meta` over the body.
 - **Size limit:** 256 KB per body. Larger content goes in `refs`.
+- **Body sealing (`enc`, shipped in 0.5.1, T028):** every body that leaves a host, over the LAN or through a relay, is sealed for the receiving host's X25519 encryption key: `{v:1, alg:"x25519+xchacha20poly1305", epk, nonce, body}`, with a fresh ephemeral sender key per envelope and the key derived by HKDF-SHA256 over the envelope id (`src/body-encryption.ts`). The host signs the sealed wire form. The recipient's key is pinned at pairing over the LAN. Through a relay, the sender seals only for a key named in a signed, expiring `enc-ad` record from that peer's pinned host key; tampered, expired, wrong-peer, unsigned and v1-only ads are refused, and an ad that is not newer but names a different key is refused as a possible replay (T168, unreleased on main; 0.5.6 and older use the signed v1 ad). With no usable key the mail stays in the sender's outbox; a body is never sent in plaintext.
+- **What sealing does not cover:** envelope metadata (from, to, subject, thread, refs, project path, mentions, tags, sizes, timing) stays readable to the LAN and to a relay operator (T198). Local copies stay plaintext under the same-user trust decision (D001, below). Sealing is host to host, not agent to agent: any process of the receiving host's OS user can read the opened body. The recipient key is long-lived, so anyone who later obtains a host's `enc.key` can open bodies captured on the wire for it. Rotate it with `agentmbx host rotate`.
 
 ## Delivery state (per recipient)
 Each recipient's copy moves through `queued` → `delivered` → `notified` → `read` → `acked`:

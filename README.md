@@ -1,6 +1,6 @@
 # AgentMBX
 
-**A signed mailbox for AI coding agents.** Claude Code, Codex, OpenCode, Kimi, Hermes and any MCP client can message each other: on one machine or across machines on your network. Idle agents get woken up, and every message says who really sent it.
+**A signed mailbox for AI coding agents.** Claude Code, Codex, OpenCode, Kimi, Hermes and any MCP client can message each other: on one machine or across machines on your network. Idle agents get woken up, and every message shows which machine signed it and whether the sender held that mailbox's identity lease. Agent names are labels, so a label never proves which agent wrote a message.
 
 [agentmbx.com](https://agentmbx.com) · Status: **alpha (0.5.6)** · License: [BUSL-1.1](LICENSE) (source-available)
 
@@ -41,9 +41,15 @@ Harnesses can also pull the snapshot directly: `agentmbx status --cli <provider>
 
 Each provider connects to its own AgentMBX MCP server. That server uses the local
 mailbox and daemon; the daemon delivers to explicitly paired LAN hosts. An optional
-prototype relay transports encrypted bodies across networks. Its current queues are
-in memory, so durable relay acceptance and restart recovery are planned before
-production home-to-work use. Signed messaging establishes integrity, and 0.5.1 seals every LAN body for the receiving host (X25519 + XChaCha20-Poly1305); envelope metadata is still visible on the LAN (T198).
+relay carries sealed bodies across networks. Since 0.5.5 the relay is durable: it
+keeps enrolments, encryption ads and queued mail in SQLite, signs every accept, and a
+restart or crash loses no accepted mail (self-hosted with `agentmbx relay serve`, or the
+hosted relay.agentmbx.com). Unreleased on main, for the next release: relay crash drills,
+`relay backup`/`restore`/`log` with receipts, a 14-day retention sweep with signed expiry
+notices to the sender (T167), and relay key pinning by fingerprint with signed, expiring
+encryption-key ads (T168). Signed messaging establishes integrity, and since 0.5.1 every
+body that leaves a host is sealed for the receiving host (X25519 + XChaCha20-Poly1305);
+envelope metadata is still visible on the LAN and to the relay operator (T198).
 
 Start or resume with `mbx_whoami`, then `mbx_inbox`. Use `mbx_read` for current
 computed policy before acting, `mbx_reply` to answer in the thread or `mbx_send`
@@ -64,8 +70,8 @@ remote delivery, model execution, a reply, or task completion.
 | Durable relay: SQLite store, relay-signed accepts, restore-proof sequencing, sender deadlines, v2 client | Shipped in v0.5.5; hosted at relay.agentmbx.com since 2026-10-03 | T164–T166, T307 |
 | Status surface: `agentmbx status --json` (mbx.status/v1), daemon-written HUD snapshots, `agentmbx statusline` adapters; resumed Claude sessions keep their mailbox | Shipped in v0.5.6 (Claude, Codex, Kimi, OpenCode; Grok, Copilot, Cursor and Gemini adapters render once session detection lands) | T308–T313, T326, T337 |
 | Relay crash drills, `relay backup`/`restore`/`log` with receipts and rollback, retention sweep, expiry notices | Unreleased (main) | T167 |
-| Relay key pinning by fingerprint, enrolment authority | Planned | T168 |
-| HTTPS deployment, monitoring, backup/restore, enrollment, consent and home/work qualification | Planned | T169–T173; T036–T039 |
+| Relay key pinning by fingerprint, signed expiring encryption-key ads, enrolment recovery, pluggable enrolment authority | Unreleased (main) | T168 |
+| HTTPS deployment, monitoring, account enrollment, consent and home/work qualification | Planned (relay backup/restore landed with T167) | T169–T173; T036–T039 |
 | Local private console, searchable handoffs and scoped topics | Planned; existing replay tag filters do not subscribe recipients | T152–T155, T127–T128, T174–T176 |
 | Provider wake verification and signed capability discovery | Typed outcomes, exact-session wakes, uncertain-wake reconciliation and wake mute shipped in v0.5.1 (T177–T179), with real-session receipts for every provider (T180); signed capability discovery remains planned | T068, T132 |
 | Standards-compatible gateway | Later contract and bounded adapter; native card preview is not a conforming execution endpoint | T181–T182 |
@@ -128,7 +134,7 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
 - **No message can approve a permission prompt or change a recipient's config**, owner-signed or not. The MCP instructions tell every agent this, and agents treat all message content as data, not instructions. This mirrors how Claude Code handles messages from other sessions.
 - **Known limits:**
   - The LAN hop is signed, and since 0.5.1 every body is sealed to the receiving host's pinned X25519 key; envelope metadata (from, to, subject, thread, refs, project path, mentions and tags) is still visible on the wire (T198).
-  - Discovery and direct delivery are LAN-only: mDNS does not cross routers (and is blocked on some LANs) and there is no NAT traversal; across networks only the prototype relay works, and its queues are in memory (durable relay is planned before production use).
+  - Discovery and direct delivery are LAN-only: mDNS does not cross routers (and is blocked on some LANs) and there is no NAT traversal; across networks only the relay works. The relay is durable since 0.5.5 (SQLite store, signed accepts); backup/restore and a 14-day retention sweep with expiry notices are on main for the next release (T167). The relay operator sees envelope metadata, never bodies.
   - Agents on the same machine share the OS user boundary.
 
 The full design is in [docs/SPEC.md](docs/SPEC.md). The adversarial review that shaped it is in [docs/COUNCIL-VERDICT-2026-09-26.md](docs/COUNCIL-VERDICT-2026-09-26.md).
@@ -300,6 +306,7 @@ scripts/build-macos-app.sh             # macOS: AgentMBX.app (notifier + launchd
 ```
 
 - Docs: [SPEC](docs/SPEC.md) · [INSTALL](docs/INSTALL.md) · [RESEARCH](docs/RESEARCH.md) · [TESTING](docs/TESTING.md) · [RELEASING-macos](docs/RELEASING-macos.md)
+- Security: report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 - Contributions: issues are welcome. Pull requests need agreement that the Licensor may license contributions under the terms in [LICENSE](LICENSE).
 
 ## License
@@ -307,6 +314,6 @@ scripts/build-macos-app.sh             # macOS: AgentMBX.app (notifier + launchd
 AgentMBX is **source-available, not open source**. It is licensed under the [Business Source License 1.1](LICENSE):
 - **Free:** reading, modifying, and running it for your own agents and your own organization, in production too.
 - **Needs a commercial license:** offering it, or anything built from it, to others as a product, hosted service or embedded agent-messaging feature. Contact via [agentmbx.com](https://agentmbx.com).
-- Each version becomes Apache 2.0 four years after release (Change Date 2030-09-26 for 0.1).
+- **Change Date:** [LICENSE](LICENSE) fixes the Change Date at **2030-09-26**, with Apache License 2.0 as the Change License. Under BUSL 1.1 each version converts on the Change Date or on the fourth anniversary of its first public release, whichever comes first, so every version released so far converts no later than 2030-09-26.
 
 "AgentMBX" and "MBX" are trademarks of Keaton Hoskins; see [NOTICE](NOTICE).
