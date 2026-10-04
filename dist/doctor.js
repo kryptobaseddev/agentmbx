@@ -11,7 +11,7 @@ import { kimiDesktop } from "./kimi-desktop.js";
 import { version } from "./version.js";
 import { MbxNode, RETRY_HOURS } from "./node.js";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.js";
-import { detect, edits, skillStatus, wired } from "./setup.js";
+import { detect, edits, skillStatus, statuslineConfiguredCommand, statuslineState, wired } from "./setup.js";
 import { mailboxLiveness } from "./receipts.js";
 import { listIdentityControls } from "./identity-control.js";
 import { pruneCandidates } from "./identity-cleanup.js";
@@ -214,6 +214,23 @@ export async function doctor(ctx, mbxHome, opts = {}) {
             const what = kind === "mcp" ? "MCP server" : "hooks";
             add(ok ? "ok" : "fail", `${d.cli}: ${what} ${ok ? "wired" : "not wired"} (${e.map((x) => x.path.replace(ctx.home, "~")).join(", ")})`, ok ? undefined : `agentmbx setup --only ${d.cli}`);
         }
+        // The status line is optional and never fails doctor (review minor 7): a foreign one is left
+        // alone at info, ours pointing at a deleted script is a warn, and a user who removed the
+        // optional segment hears nothing about it.
+        const sl = es.filter((x) => x.kind === "statusline");
+        if (sl.length && (d.cli === "claude" || d.cli === "kimi")) {
+            const state = statuslineState(ctx.home, d.cli, ctx.cmd);
+            // Re-review item 2: check the CONFIGURED command's script, not the one setup would write —
+            // and parse the quoted path form setup writes, so a home path with a space stays intact.
+            const configured = statuslineConfiguredCommand(ctx.home, d.cli);
+            const scriptPath = configured?.startsWith("sh ") ? firstShellWord(configured.slice(3)) : null;
+            if (state === "ours" && scriptPath && !existsSync(scriptPath))
+                add("warn", `${d.cli}: status line points at a missing script (${scriptPath})`, "agentmbx setup --only skill");
+            else if (state === "ours")
+                add("ok", `${d.cli}: status line wired (${sl[0].path.replace(ctx.home, "~")})`);
+            else if (state === "foreign")
+                add("info", `${d.cli}: a user's status line is left alone (MBX segment not wired)`);
+        }
     }
     if (node) {
         for (const d of detect(ctx).filter((d) => d.found))
@@ -361,4 +378,43 @@ export const failed = (checks) => checks.some((c) => c.level === "fail");
 export function formatChecks(checks) {
     const mark = { ok: "✔", fail: "✗", warn: "!", info: "·" };
     return checks.map((c) => `${mark[c.level]} ${c.label}${c.fix ? `\n    fix: ${c.fix}` : ""}`).join("\n");
+}
+/** The first word of a POSIX shell command line, unquoted: setup writes paths with shJoin (single quotes, `'\\''` for a
+ *  quote); a hand-written command may use double quotes or a bare word. Null when the word is unterminated. */
+export function firstShellWord(line) {
+    let out = "", i = 0;
+    while (i < line.length && line[i] === " ")
+        i++;
+    if (i >= line.length)
+        return null;
+    while (i < line.length && line[i] !== " ") {
+        const c = line[i];
+        if (c === "'") {
+            const end = line.indexOf("'", i + 1);
+            if (end < 0)
+                return null;
+            out += line.slice(i + 1, end);
+            i = end + 1;
+        }
+        else if (c === '"') {
+            let j = i + 1;
+            for (; j < line.length && line[j] !== '"'; j++) {
+                if (line[j] === "\\" && j + 1 < line.length)
+                    j++;
+                out += line[j];
+            }
+            if (j >= line.length)
+                return null;
+            i = j + 1;
+        }
+        else if (c === "\\" && i + 1 < line.length) {
+            out += line[i + 1];
+            i += 2;
+        }
+        else {
+            out += c;
+            i++;
+        }
+    }
+    return out;
 }

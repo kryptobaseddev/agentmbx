@@ -1,7 +1,7 @@
 // `agentmbx setup` / `doctor` against a fake HOME whose configs copy the STRUCTURE of real ones (fake values only).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { doctor, failed } from "../src/doctor.ts";
@@ -86,7 +86,9 @@ test("setup wires every CLI, backs files up, leaves other hook groups alone, and
   assert.equal(s.hooks.UserPromptSubmit[1].hooks[0].command, "/opt/bin/agentmbx hook prompt --cli claude");
   assert.equal(s.hooks.Stop.length, 2); assert.equal(s.hooks.Stop[1].hooks[0].command, "/opt/bin/agentmbx hook stop --cli claude");
   assert.equal(s.hooks.PreToolUse.length, 1);
-  assert.equal(s.hooks.PostToolUse[0].hooks[0].command, "/opt/bin/agentmbx hook post-tool --cli claude");
+  // Review major 5: the skill installs before the edits, so the first run already wires the bundled
+  // sh fast path (the script path, then the resolved command as arguments).
+  assert.match(s.hooks.PostToolUse[0].hooks[0].command, /^sh .*claude-posttool\.sh \/opt\/bin\/agentmbx$/, "PostToolUse is the bundled fast path on the first run");
   assert.equal(s.hooks.SessionEnd[0].hooks[0].command, "/opt/bin/agentmbx hook session-end --cli claude");
 
   // Codex
@@ -118,31 +120,29 @@ test("setup wires every CLI, backs files up, leaves other hook groups alone, and
     readFileSync(join(import.meta.dirname, "../skill/scripts/claude-statusline.sh"), "utf8"));
   for (const d of [".claude/skills/agentmbx", ".codex/skills/agentmbx"]) assert.equal(readlinkSync(join(home, d)), skillDest(home));
 
-  // second run: the only change is upgrading PostToolUse to the bundled sh fast path (the first
-  // run installed the skill after the hooks row ran, so the script appeared in between); no other
-  // file changes, no duplicates, no new backups
+  // Review major 5: the skill installs BEFORE the CLI edits, so the very first run already wires
+  // the bundled sh adapters — no upgrade run needed afterwards.
+  const firstSettings = JSON.parse(rd(home, ".claude/settings.json"));
+  assert.match(firstSettings.hooks.PostToolUse.at(-1).hooks[0].command, /claude-posttool\.sh/, "PostToolUse is the bundled fast path on the first run");
+  assert.match(firstSettings.statusLine.command, /claude-statusline\.sh/, "the statusLine is the bundled pure-sh adapter on the first run");
+
+  // second run: nothing changes, no duplicates, no new backups
   const snapshot = Object.fromEntries(Object.keys(FILES).map((rel) => [rel, rd(home, rel)]));
   const again = runSetup(ctx, { mode: "install", stamp: "T2" });
-  const changed = again.filter((r) => r.action !== "unchanged" && r.action !== "skipped");
-  assert.deepEqual(changed, [{ action: "updated", cli: "claude", item: "hooks SessionStart + SessionEnd + UserPromptSubmit + PostToolUse + PermissionRequest + Stop",
-    path: join(home, ".claude/settings.json"), backup: join(home, ".claude/settings.json.bak-agentmbx-T2") }]);
-  assert.match(JSON.parse(rd(home, ".claude/settings.json")).hooks.PostToolUse.at(-1).hooks[0].command, /claude-posttool\.sh/);
-  // third run: fully clean
-  const third = runSetup(ctx, { mode: "install", stamp: "T3" });
-  assert.deepEqual(third.filter((r) => r.action !== "unchanged" && r.action !== "skipped"), []);
-  for (const rel of Object.keys(FILES)) {
-    if (rel === ".claude/settings.json") continue; // the one file the fast-path upgrade legitimately rewrites
-    assert.equal(rd(home, rel), snapshot[rel], `${rel} unchanged after the upgrade settles`);
-  }
+  assert.deepEqual(again.filter((r) => r.action !== "unchanged" && r.action !== "skipped"), []);
+  for (const rel of Object.keys(FILES)) assert.equal(rd(home, rel), snapshot[rel], `${rel} unchanged on rerun`);
   assert.ok(!readdirSync(join(home, ".codex")).some((f) => f.includes("T2")));
-  assert.ok(!readdirSync(join(home, ".codex")).some((f) => f.includes("T3")));
 });
 
 test("setup updates a stale command path in place instead of adding a duplicate", () => {
   const home = fakeHome();
   runSetup(ctxFor(home, ["/old/agentmbx"]), { mode: "install", stamp: "A" });
   const rows = runSetup(ctxFor(home, ["/new/bin/agentmbx"]), { mode: "install", stamp: "B" });
-  assert.ok(rows.filter((r) => r.cli !== "skill" && r.action !== "manual").every((r) => r.action === "updated"), JSON.stringify(rows));
+  assert.ok(rows.filter((r) => r.cli !== "skill" && r.action !== "manual" && r.action !== "skipped" && r.action !== "unchanged").every((r) => r.action === "updated"), JSON.stringify(rows));
+  // the status lines legitimately stay: the bundled sh adapter's command names the script path,
+  // which does not move with the agentmbx command
+  assert.equal(rows.find((r) => r.item.startsWith("statusLine"))?.action, "unchanged");
+  assert.equal(rows.find((r) => r.item.startsWith("[status_line]"))?.action, "unchanged");
   const s = JSON.parse(rd(home, ".claude/settings.json"));
   assert.equal(s.hooks.SessionStart.length, 2);
   assert.equal(s.hooks.SessionStart[1].hooks[0].command, "/new/bin/agentmbx hook session-start --cli claude");
@@ -219,4 +219,105 @@ test("setup policy default: collaborate (ratified), explicit wins, no terminal +
   assert.equal(setupPolicyLevel({ keychain: true }), "collaborate");
   assert.equal(setupPolicyLevel({ keychain: false }), undefined);
   assert.equal(setupPolicyLevel({ explicit: "ask", keychain: true }), "ask");
+});
+
+// T347 (review round 2): exact-match ours, additive key preservation, robust section detection,
+// byte-exact uninstall, skill-first wiring.
+test("T347: setup wires statuslines, never overwrites a user's, reports the snippet", () => {
+  // Claude: a user's own statusLine is foreign — even one that mentions our script path in another form.
+  for (const foreign of ["my-own-statusline.sh", "bash ~/bin/claude-statusline.sh"]) {
+    const home = fakeHome(); const ctx = ctxFor(home);
+    writeFileSync(join(home, ".claude/settings.json"), JSON.stringify({ hooks: {}, statusLine: { type: "command", command: foreign } }));
+    const rows = runSetup(ctx, { mode: "install", stamp: "S1" });
+    assert.equal(JSON.parse(rd(home, ".claude/settings.json")).statusLine.command, foreign, `a foreign statusLine is never overwritten: ${foreign}`);
+    const manual = rows.find((r) => r.cli === "claude" && r.action === "manual" && r.item === "statusLine");
+    assert.ok(manual, "the foreign status line is reported");
+    assert.match(manual!.note!, /left alone/);
+    assert.match(manual!.note!, /statusline claude|claude-statusline\.sh/, "and the report prints our snippet");
+    runSetup(ctx, { mode: "uninstall", stamp: "S2" });
+    assert.equal(JSON.parse(rd(home, ".claude/settings.json")).statusLine.command, foreign, "uninstall never removes a foreign statusLine");
+    rmSync(home, { recursive: true, force: true });
+  }
+
+  // Claude: keep the user's other keys when normalizing ours (padding survives).
+  const home2 = fakeHome(); const ctx2 = ctxFor(home2);
+  writeFileSync(join(home2, ".claude/settings.json"), JSON.stringify({ hooks: {}, statusLine: { type: "command", command: "/opt/bin/agentmbx statusline claude", padding: 2 } }));
+  runSetup(ctx2, { mode: "install", stamp: "S3" });
+  const kept = JSON.parse(rd(home2, ".claude/settings.json")).statusLine;
+  assert.equal(kept.padding, 2, "the user's padding survives normalization");
+  assert.equal(kept.type, "command");
+  assert.match(kept.command, /claude-statusline\.sh/, "normalized to the bundled adapter (skill-first)");
+  runSetup(ctx2, { mode: "uninstall", stamp: "S4" });
+  assert.equal(JSON.parse(rd(home2, ".claude/settings.json")).statusLine, undefined, "uninstall drops the whole statusLine once our command is out — Claude may reject a command-less one (re-review item 3)");
+
+  // Claude absent: script form on the first run (skill-first), no-op afterwards, uninstall removes it.
+  rmSync(home2, { recursive: true, force: true });
+  const home3 = fakeHome(); const ctx3 = ctxFor(home3);
+  runSetup(ctx3, { mode: "install", stamp: "S5" });
+  assert.match(JSON.parse(rd(home3, ".claude/settings.json")).statusLine.command, /claude-statusline\.sh/);
+  assert.equal(runSetup(ctx3, { mode: "install", stamp: "S6" }).filter((r) => r.cli === "claude" && r.item.startsWith("statusLine") && r.action !== "unchanged").length, 0);
+  runSetup(ctx3, { mode: "uninstall", stamp: "S7" });
+  assert.equal(JSON.parse(rd(home3, ".claude/settings.json")).statusLine, undefined);
+  rmSync(home3, { recursive: true, force: true });
+
+  // Kimi re-review item 1: a user's own [status_line] with items and NO command is foreign —
+  // setup never adds to their section; it reports and prints the snippet.
+  const home4 = fakeHome(); const ctx4 = ctxFor(home4);
+  writeFileSync(join(home4, ".kimi-code/tui.toml"), `theme = "dark"\n\n[status_line]\nitems = ["mode","model"]\n`);
+  const rows4 = runSetup(ctx4, { mode: "install", stamp: "S8" });
+  const untouched = rd(home4, ".kimi-code/tui.toml");
+  assert.equal(untouched, `theme = "dark"\n\n[status_line]\nitems = ["mode","model"]\n`, "their section is never edited");
+  assert.ok(rows4.find((r) => r.cli === "kimi" && r.action === "manual"), "and it is reported");
+  runSetup(ctx4, { mode: "uninstall", stamp: "S9" });
+  assert.equal(rd(home4, ".kimi-code/tui.toml"), untouched, "uninstall leaves it too");
+  rmSync(home4, { recursive: true, force: true });
+
+  // Kimi re-review item 3's sibling: OUR command plus their items — normalization keeps items.
+  const home4b = fakeHome(); const ctx4b = ctxFor(home4b);
+  writeFileSync(join(home4b, ".kimi-code/tui.toml"), `theme = "dark"\n\n[status_line]\ncommand = "agentmbx statusline kimi"\nitems = ["mode","model"]\n`);
+  runSetup(ctx4b, { mode: "install", stamp: "S8b" });
+  const normalized = rd(home4b, ".kimi-code/tui.toml");
+  assert.match(normalized, /items = \["mode","model"\]/, "the user's items stay when our command is normalized");
+  assert.match(normalized, /command = "[^"]*kimi-statusline\.sh"/, "and our command is the bundled adapter");
+  runSetup(ctx4b, { mode: "uninstall", stamp: "S9b" });
+  const removed = rd(home4b, ".kimi-code/tui.toml");
+  assert.match(removed, /items = \["mode","model"\]/, "uninstall removes only our command line — items stay");
+  assert.doesNotMatch(removed, /kimi-statusline\.sh|statusline kimi/);
+  rmSync(home4b, { recursive: true, force: true });
+
+  // Kimi: every non-section status_line form is foreign — never a duplicate table appended.
+  for (const [name, body] of [
+    ["inline table", `theme = "dark"\nstatus_line = { command = "mine.sh" }\n`],
+    ["dotted key", `theme = "dark"\nstatus_line.items = ["mode"]\n`],
+  ]) {
+    const h = fakeHome(); const c = ctxFor(h);
+    writeFileSync(join(h, ".kimi-code/tui.toml"), body);
+    const rows = runSetup(c, { mode: "install", stamp: "SA" });
+    assert.equal(rd(h, ".kimi-code/tui.toml"), body, `${name}: never written`);
+    assert.ok(rows.find((r) => r.cli === "kimi" && r.action === "manual"), `${name}: reported`);
+    rmSync(h, { recursive: true, force: true });
+  }
+
+  // Kimi: CRLF, a trailing comment, and inner spaces are the same section — no duplicate table.
+  const home5 = fakeHome(); const ctx5 = ctxFor(home5);
+  writeFileSync(join(home5, ".kimi-code/tui.toml"), `theme = "dark"\r\n\r\n[ status_line ] # mine\r\ncommand = "my-own.sh"\r\n`);
+  runSetup(ctx5, { mode: "install", stamp: "SB" });
+  assert.equal(rd(home5, ".kimi-code/tui.toml").match(/\[ *status_line *\]/g)!.length, 1, "no duplicate [status_line] table");
+  assert.match(rd(home5, ".kimi-code/tui.toml"), /command = "my-own\.sh"/, "the foreign command is untouched");
+  rmSync(home5, { recursive: true, force: true });
+
+  // Kimi: byte-exact uninstall — a file setup created is deleted; a user's file keeps its bytes.
+  const home6 = fakeHome(); const ctx6 = ctxFor(home6);
+  runSetup(ctx6, { mode: "install", stamp: "SC" });
+  assert.ok(existsSync(join(home6, ".kimi-code/tui.toml")), "setup creates tui.toml");
+  runSetup(ctx6, { mode: "uninstall", stamp: "SD" });
+  assert.ok(!existsSync(join(home6, ".kimi-code/tui.toml")), "uninstall removes a file it created entirely");
+  rmSync(home6, { recursive: true, force: true });
+  const home7 = fakeHome(); const ctx7 = ctxFor(home7);
+  const userToml = `theme = "dark"\n\n\n[editor]\ncommand = "vim"\n`;
+  writeFileSync(join(home7, ".kimi-code/tui.toml"), userToml);
+  runSetup(ctx7, { mode: "install", stamp: "SE" });
+  runSetup(ctx7, { mode: "uninstall", stamp: "SF" });
+  assert.equal(rd(home7, ".kimi-code/tui.toml"), userToml, "byte-exact: the user's file returns to its exact bytes (blank lines and all)");
+  rmSync(home7, { recursive: true, force: true });
 });
