@@ -68,7 +68,7 @@ export function sweepPostToolMarkers(home, bound) {
         return;
     }
     for (const file of files) {
-        const m = /^([a-z0-9][a-z0-9-]{0,39})-([A-Za-z0-9_-]{1,128})\.(marker|last|stdin)$/.exec(file);
+        const m = /^([a-z0-9][a-z0-9-]{0,39})-([A-Za-z0-9_-]{1,128})\.(marker|last|stdin)$/.exec(file); // .stdin: scratch files from the pre-heredoc wrapper (review medium 3); none are written anymore
         if (!m)
             continue;
         if (bound.has(`${m[1]}-${m[2]}`))

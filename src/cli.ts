@@ -1144,16 +1144,16 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
         if (cli !== "claude") return;
         // Track IDs, not counts or sender timestamps: replacing one acked message with a new one must notify,
         // including delayed remote mail. Never fetch or inject message bodies into a tool hook.
+        // T342: read the fast-path marker BEFORE querying the mailbox. A delivery that commits
+        // after this read also bumps the marker after it, so the next call re-checks; reading the
+        // marker late would record as processed a delivery the query never saw (review medium 1).
+        const marker = sid ? readPostToolMarker(node.home, cli, sid) : null;
+        posttoolDone = () => { if (marker !== null && sid) writePostToolLast(node.home, cli, sid, marker); };
         const key = `toolseen:${cli}:${sid ?? process.ppid}:${agent}`;
         const previous = new Set<string>(JSON.parse(node.store.get(key) ?? "[]"));
         const ids = (node.store.db.prepare("SELECT msg_id FROM deliveries WHERE agent=? AND state <> 'acked'").all(agent) as { msg_id: string }[]).map(r => `${agent}:${r.msg_id}`);
         const snapshot = JSON.stringify(ids);
         if (snapshot !== node.store.get(key)) node.store.set(key, snapshot);
-        // T342: record the marker value this decision processed so the bundled sh wrapper can skip
-        // the next call without starting node. Only when a marker exists: absent means the wrapper
-        // falls through to this full path anyway.
-        const marker = sid ? readPostToolMarker(node.home, cli, sid) : null;
-        posttoolDone = () => { if (marker !== null && sid) writePostToolLast(node.home, cli, sid, marker); };
         if (!ids.some((id) => !previous.has(id))) { posttoolDone(); return; }
       }
       if (event === "prompt" && isHumanPrompt(input.prompt)) node.store.set(humanPromptKey(agent), new Date().toISOString());

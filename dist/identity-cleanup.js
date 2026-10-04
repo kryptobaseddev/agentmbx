@@ -7,6 +7,7 @@ import { canonical, fingerprint, verifyData } from "./crypto.js";
 import { NAME_RE } from "./envelope.js";
 import { identityAvailability, activityKey, parseActivity } from "./identity-availability.js";
 import { inspectLeaseProcess } from "./identity-leases.js";
+import { bumpPostToolMarkersForAgent } from "./posttool.js";
 import { AUTO_NAME_RE, registeredIdentity } from "./registry.js";
 export const retiredKey = (name) => `retired:${name}`;
 export const isRetired = (node, name) => node.store.get(retiredKey(name)) !== undefined;
@@ -114,7 +115,7 @@ export function applyForward(node, approval, now = Date.now()) {
         throw new Error("owner forward approval names another host");
     if (payload.issued_at > now || payload.expires_at <= now)
         throw new Error("owner forward approval expired");
-    return node.store.tx(() => {
+    const result = node.store.tx(() => {
         if (node.store.get(`forward-used:${payload.id}`))
             throw new Error("owner forward approval was already used");
         node.store.set(`forward-used:${payload.id}`, String(now));
@@ -127,4 +128,7 @@ export function applyForward(node, approval, now = Date.now()) {
         node.store.audit("identity.forward", { from: payload.from, to: payload.to, moved: pending.length, owner_fp: payload.owner_fp, approval: payload.id });
         return { moved: pending.length };
     });
+    // T342: unread mail moved to payload.to; its claude sessions' hooks must notice (review medium 2).
+    bumpPostToolMarkersForAgent(node.store.db, node.home, payload.to);
+    return result;
 }

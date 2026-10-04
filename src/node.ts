@@ -319,6 +319,9 @@ export class MbxNode {
       this.store.set(`alias:${oldName}`, newName);
       this.store.audit("agent.renamed", { from: oldName, to: newName });
     });
+    // T342: unread mail just moved under the new name; its claude sessions' hooks must notice
+    // (review medium 2). Bumping a name that moved nothing is a wasted full-path run, never wrong.
+    bumpPostToolMarkersForAgent(this.store.db, this.home, newName);
   }
 
   resolveAlias(name: string): string {

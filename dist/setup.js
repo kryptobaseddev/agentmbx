@@ -34,12 +34,13 @@ const isOurHook = (command, event, cli, cmd) => (command.includes(` hook ${event
 /** T342: when the bundled skill ships the post-tool wrapper, PostToolUse runs it (zero node starts
  *  in steady state); otherwise the event keeps the direct `agentmbx hook` command (SEA bundles
  *  SKILL.md only). The wrapper alone decides nothing — it always falls through to the full hook
- *  on any doubt, so hook decisions stay identical. */
-const posttoolFastPath = (home) => (sub) => {
+ *  on any doubt, so hook decisions stay identical. It gets the setup's own resolved command: a
+ *  desktop-started Claude has a minimal PATH (review high — never rely on PATH agentmbx). */
+const posttoolFastPath = (home, cmd) => (sub) => {
     if (sub !== "post-tool")
         return null;
     const script = join(skillDest(home), "scripts", "claude-posttool.sh");
-    return existsSync(script) ? `sh ${shJoin([script])}` : null;
+    return existsSync(script) ? `sh ${shJoin([script])} ${shJoin(cmd)}` : null;
 };
 const read = (p) => existsSync(p) ? readFileSync(p, "utf8") : null;
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
@@ -434,11 +435,17 @@ export function edits(ctx, cli) {
                         }
                     } },
                 { cli, kind: "hooks", item: "hooks SessionStart + SessionEnd + UserPromptSubmit + PostToolUse + PermissionRequest + Stop", path: join(home, ".claude/settings.json"),
-                    ...jsonHooks([...STOP_EVENTS, ["PostToolUse", "post-tool"], ["SessionEnd", "session-end"]], "claude", cmd, posttoolFastPath(home)),
+                    ...jsonHooks([...STOP_EVENTS, ["PostToolUse", "post-tool"], ["SessionEnd", "session-end"]], "claude", cmd, posttoolFastPath(home, cmd)),
                     isWired: (cur) => {
                         try {
                             const hooks = (JSON.parse(cur ?? "null")?.hooks ?? {});
-                            return (hooks.PostToolUse ?? []).some((g) => (g.hooks ?? []).some((h) => (h.command ?? "").includes(" hook post-tool --cli claude")));
+                            const directPostTool = (hooks.PostToolUse ?? []).some((g) => (g.hooks ?? []).some((h) => (h.command ?? "").includes(" hook post-tool --cli claude")));
+                            if (!directPostTool)
+                                return false;
+                            // Review medium 4: an old-style wiring counts only if EVERY event is wired in the
+                            // old style too — a file holding just PostToolUse must not read as fully wired.
+                            const plain = jsonHooks([...STOP_EVENTS, ["PostToolUse", "post-tool"], ["SessionEnd", "session-end"]], "claude", cmd);
+                            return plain.install(cur) === cur;
                         }
                         catch {
                             return false;
