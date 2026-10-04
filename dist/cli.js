@@ -16,7 +16,7 @@ import { backupStore, readOps, restoredFrom, restoreStore, rotateEpochOp, STORE_
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.js";
 import { HUD_ALIVE_MAX_MS, HUD_SCHEMA, hudAlivePath, hudDir, hudPidLinePath, hudPidPath, hudSessionLinePath, hudSessionPath, hudStatus, writeHud } from "./hud.js";
 import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
-import { ancestors, withProcSnapshot } from "./proc.js";
+import { ancestors, processEvidenceSpawns, withProcSnapshot } from "./proc.js";
 import { bumpPostToolMarkersForAgent, readPostToolMarker, writePostToolLast } from "./posttool.js";
 import { resolveStatusIdentity } from "./status-identity.js";
 import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.js";
@@ -1624,45 +1624,72 @@ export const watcherEvidenceRetryable = (e) => e?.code === "IDENTITY_STATUS_UNKN
     || /caller process evidence became stale|process status is unknown/.test(e?.message ?? "");
 async function watch(node, selection) {
     const every = Math.max(200, Number(process.env.MBX_WATCH_INTERVAL_MS) || 2_000);
-    let watching, failures = 0, evidenceRetries = 0;
+    // T343: MCP leases heartbeat every 60 s (mcp.ts). While the holder's heartbeat advances, the
+    // lease row itself is the liveness proof — no process evidence, no ps spawns. Three missed
+    // beats pay ONE evidence probe (the T332 shared ps -A table), never one per poll.
+    const staleMs = Math.max(500, Number(process.env.MBX_WATCH_STALE_MS) || 3 * 60_000);
+    let watching, failures = 0, evidenceRetries = 0, lastProbeAt = 0, deadUntil = 0;
     const clear = () => { if (watching)
         try {
             node.store.db.prepare("DELETE FROM kv WHERE k=?").run(watcherKey(watching));
         }
         catch { /* closing */ } };
-    process.once("SIGTERM", () => { clear(); process.exit(143); });
-    process.once("SIGINT", () => { clear(); process.exit(130); });
+    const debugExit = () => { if (process.env.MBX_WATCH_DEBUG)
+        process.stderr.write(`[mbx-watch debug] evidence spawns: startup ${startupSpawns} total ${processEvidenceSpawns.count}\n`); };
+    let startupSpawns = 0;
+    process.once("SIGTERM", () => { clear(); debugExit(); process.exit(143); });
+    process.once("SIGINT", () => { clear(); debugExit(); process.exit(130); });
     for (;;) {
         let report = null;
         try {
-            report = withCliIdentity(node, selection, agent => {
-                if (watching && watching !== agent)
-                    clear();
-                watching = agent;
-                node.store.set(watcherKey(agent), JSON.stringify({ pid: process.pid, at: Date.now() }));
-                const lines = [];
-                for (const mailbox of [agent, ...node.linkedNames(agent)]) {
-                    if (wakeMutedUntil(node, mailbox))
-                        continue; // muted: the mail stays delivered and unread
-                    const rows = node.store.db.prepare(`SELECT m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state='delivered' ORDER BY m.ts`).all(mailbox);
-                    if (!rows.length)
-                        continue;
-                    const wanted = rows.filter(r => node.wantsWake(mailbox, r) && hasWakeAuthority(node, mailbox, r));
-                    if (wanted.length) {
-                        const reservation = node.reserveWake(mailbox, wanted[0].thread);
-                        if (reservation.brake?.startsWith("batched"))
-                            continue;
-                        const linked = mailbox === agent ? "" : ` This is your linked mailbox: use agentmbx inbox --as ${mailbox} and agentmbx ack --as ${mailbox} <id>.`;
-                        if (!reservation.brake)
-                            lines.push(wakeText(mailbox, wanted) + linked);
-                    }
-                    for (const r of rows)
-                        node.setDelivery(r.id, mailbox, "notified");
-                    if (wanted.length)
-                        node.store.audit("wake.attempt", { agent: mailbox, outcome: "admitted", receipt: "transport", via: "watcher" });
+            if (!watching) {
+                watching = withCliIdentity(node, selection, agent => agent); // full resolution + evidence, once
+                startupSpawns = processEvidenceSpawns.count;
+            }
+            const agent = watching;
+            const lease = node.store.db.prepare("SELECT token,holder_pid,holder_start,heartbeat_at,released_at FROM identity_leases WHERE name=?")
+                .get(agent);
+            if (!lease || lease.released_at !== null)
+                throw Object.assign(new Error("no current identity lease"), { code: "IDENTITY_LEASE_LOST" });
+            // A dead holder keeps counting toward the stop until the next probe window; otherwise the
+            // successful ticks between rate-limited probes would reset the strike count.
+            if (deadUntil && Date.now() < deadUntil)
+                throw Object.assign(new Error(`the holder process for ${agent} is gone`), { code: "IDENTITY_LEASE_LOST" });
+            if (Date.now() - lease.heartbeat_at > staleMs && Date.now() - lastProbeAt > staleMs) {
+                lastProbeAt = Date.now();
+                const ev = inspectLeaseProcess(lease.holder_pid);
+                if (ev.alive === true && ev.start && ev.start === lease.holder_start)
+                    deadUntil = 0; // alive, just quiet
+                else {
+                    deadUntil = lastProbeAt + staleMs;
+                    throw Object.assign(new Error(`the holder process for ${agent} is gone`), { code: "IDENTITY_LEASE_LOST" });
                 }
-                return lines.length ? lines.join("\n") : null;
-            });
+            }
+            else
+                deadUntil = 0;
+            node.store.set(watcherKey(agent), JSON.stringify({ pid: process.pid, at: Date.now() }));
+            const lines = [];
+            for (const mailbox of [agent, ...node.linkedNames(agent)]) {
+                if (wakeMutedUntil(node, mailbox))
+                    continue; // muted: the mail stays delivered and unread
+                const rows = node.store.db.prepare(`SELECT m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state='delivered' ORDER BY m.ts`).all(mailbox);
+                if (!rows.length)
+                    continue;
+                const wanted = rows.filter(r => node.wantsWake(mailbox, r) && hasWakeAuthority(node, mailbox, r));
+                if (wanted.length) {
+                    const reservation = node.reserveWake(mailbox, wanted[0].thread);
+                    if (reservation.brake?.startsWith("batched"))
+                        continue;
+                    const linked = mailbox === agent ? "" : ` This is your linked mailbox: use agentmbx inbox --as ${mailbox} and agentmbx ack --as ${mailbox} <id>.`;
+                    if (!reservation.brake)
+                        lines.push(wakeText(mailbox, wanted) + linked);
+                }
+                for (const r of rows)
+                    node.setDelivery(r.id, mailbox, "notified");
+                if (wanted.length)
+                    node.store.audit("wake.attempt", { agent: mailbox, outcome: "admitted", receipt: "transport", via: "watcher" });
+            }
+            report = lines.length ? lines.join("\n") : null;
             failures = 0;
         }
         catch (e) {
@@ -1677,6 +1704,7 @@ async function watch(node, selection) {
             // the session's lease ended or moved: say so once instead of watching nothing
             if (++failures >= 5) {
                 clear();
+                debugExit();
                 console.log(`[mbx-watch] stopped: ${e.message}`);
                 process.exitCode = 1;
                 return;
