@@ -1632,15 +1632,16 @@ async function watch(node, selection) {
     // The pinned lease identity (review blocker): a takeover or reclaim that swaps token, holder
     // pid or holder start must stop this watcher — by name alone it would keep consuming the new
     // session's wakes. Mono clock (performance.now) so a backward wall step can't hide a crash.
+    // `probes` counts probe calls, not ps spawns (ubuntu CI: Linux reads /proc, never spawns ps).
     let pinned = null;
-    let staleMs = 3 * MCP_HEARTBEAT_MS, heartbeatAdvancedMono = 0, lastHeartbeatAt = 0, lastProbeMono = 0, deadUntilMono = 0;
+    let staleMs = 3 * MCP_HEARTBEAT_MS, heartbeatAdvancedMono = 0, lastHeartbeatAt = 0, lastProbeMono = 0, deadUntilMono = 0, probes = 0;
     const clear = () => { if (watching)
         try {
             node.store.db.prepare("DELETE FROM kv WHERE k=?").run(watcherKey(watching));
         }
         catch { /* closing */ } };
     const debugExit = () => { if (process.env.MBX_WATCH_DEBUG)
-        process.stderr.write(`[mbx-watch debug] evidence spawns: startup ${startupSpawns} total ${processEvidenceSpawns.count}\n`); };
+        process.stderr.write(`[mbx-watch debug] probes ${probes} evidence spawns: startup ${startupSpawns} total ${processEvidenceSpawns.count}\n`); };
     let startupSpawns = 0;
     const leaseLost = (message) => Object.assign(new Error(message), { code: "IDENTITY_LEASE_LOST" });
     process.once("SIGTERM", () => { clear(); debugExit(); process.exit(143); });
@@ -1649,8 +1650,18 @@ async function watch(node, selection) {
         let report = null;
         try {
             if (!watching) {
-                watching = withCliIdentity(node, selection, agent => agent); // full resolution + evidence, once
-                startupSpawns = processEvidenceSpawns.count;
+                watching = withCliIdentity(node, selection, agent => {
+                    startupSpawns = processEvidenceSpawns.count;
+                    // Nit: pin inside the callback — a takeover between resolution and a later read would
+                    // otherwise pin the NEW holder and never notice the move.
+                    const row = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(agent);
+                    if (row && row.released_at === null) {
+                        pinned = { token: row.token, holder_pid: row.holder_pid, holder_start: row.holder_start };
+                        lastHeartbeatAt = row.heartbeat_at;
+                        heartbeatAdvancedMono = performance.now();
+                    }
+                    return agent;
+                }); // full resolution + evidence, once
             }
             const agent = watching;
             const lease = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?")
@@ -1680,14 +1691,16 @@ async function watch(node, selection) {
             if (deadUntilMono && performance.now() <= deadUntilMono)
                 throw leaseLost(`the holder process for ${agent} is gone`);
             if (performance.now() - heartbeatAdvancedMono > staleMs && performance.now() - lastProbeMono > staleMs) {
-                lastProbeMono = performance.now();
+                probes += 1;
                 const status = identityLeaseStatus(lease, Date.now(), inspectLeaseProcess(lease.holder_pid));
-                if (status.state === "live")
-                    deadUntilMono = 0; // alive, just quiet
+                if (status.state === "live") {
+                    deadUntilMono = 0;
+                    lastProbeMono = performance.now();
+                } // alive, just quiet
                 else if (status.state === "unknown")
-                    throw Object.assign(new Error("holder process status is unknown"), { code: "IDENTITY_STATUS_UNKNOWN" });
+                    throw Object.assign(new Error("holder process status is unknown"), { code: "IDENTITY_STATUS_UNKNOWN" }); // nit: lastProbeMono stays — the next tick re-probes early, paced by the retry backoff
                 else { // expired: dead, pid-reused, or idle past the lease ttl (review: idle_ttl expiry restored)
-                    deadUntilMono = lastProbeMono + staleMs;
+                    deadUntilMono = (lastProbeMono = performance.now()) + staleMs;
                     throw leaseLost(status.reason === "idle" ? "the identity lease idled out" : `the holder process for ${agent} is gone`);
                 }
             }

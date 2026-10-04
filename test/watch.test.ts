@@ -90,8 +90,8 @@ const spawnDebug = (env: Record<string, string>, extra: Record<string, string> =
   return { child, out: () => out, err: () => err, exited: new Promise<number | null>(r => child.on("exit", r)) };
 };
 const spawnCounts = (err: string) => {
-  const m = /evidence spawns: startup (\d+) total (\d+)/.exec(err);
-  return m ? { startup: Number(m[1]), total: Number(m[2]) } : null;
+  const m = /probes (\d+) evidence spawns: startup (\d+) total (\d+)/.exec(err);
+  return m ? { probes: Number(m[1]), startup: Number(m[2]), total: Number(m[3]) } : null;
 };
 
 test("T343: an idle watcher pays zero process evidence; a quiet-but-alive holder pays one rate-limited probe", async (t) => {
@@ -109,7 +109,8 @@ test("T343: an idle watcher pays zero process evidence; a quiet-but-alive holder
   w.child.kill("SIGTERM");
   assert.equal(await w.exited, 143);
   const idle = spawnCounts(w.err());
-  assert.ok(idle && idle.total - idle.startup === 0, `zero evidence spawns across ~15 ticks: ${JSON.stringify(idle)}`);
+  assert.ok(idle && idle.total - idle.startup === 0 && idle.probes === 0,
+    `zero evidence work across ~15 ticks on every platform: ${JSON.stringify(idle)}`);
 
   // A holder that stays quiet past the 60 s staleness window while ALIVE: SIGSTOP freezes it (no
   // heartbeats, but kill(pid,0) and its start time still prove life — a dead holder it is not).
@@ -125,8 +126,10 @@ test("T343: an idle watcher pays zero process evidence; a quiet-but-alive holder
   w2.child.kill("SIGTERM");
   assert.equal(await w2.exited, 143);
   const stale = spawnCounts(w2.err());
-  assert.ok(stale && stale.total - stale.startup >= 1, `the quiet holder paid at least one probe: ${JSON.stringify(stale)}`);
-  assert.ok(stale && stale.total - stale.startup <= 3, `probes are rate-limited across the whole quiet stretch: ${JSON.stringify(stale)}`);
+  // Probes are counted at the probe call, not as ps spawns (ubuntu CI: Linux reads /proc and never
+  // spawns ps): at least one probe fired, and the rate limit held on every platform.
+  assert.ok(stale && stale.probes >= 1, `the quiet holder paid at least one probe: ${JSON.stringify(stale)}`);
+  assert.ok(stale && stale.probes <= 3, `probes are rate-limited across the whole quiet stretch: ${JSON.stringify(stale)}`);
 });
 
 test("T343: a dead holder stops the watcher with the probe's reason", async (t) => {
