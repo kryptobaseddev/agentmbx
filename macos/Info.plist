@@ -13,6 +13,6 @@
   <key>CFBundleVersion</key><string>__VERSION__</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
-  <key>NSHumanReadableCopyright</key><string>Copyright © Keaton Hoskins. AgentMBX is licensed under BUSL-1.1.</string>
+  <key>NSHumanReadableCopyright</key><string>Copyright © 2026 CodLuv LLC. AgentMBX is licensed under BUSL-1.1.</string>
 </dict>
 </plist>
