@@ -13,6 +13,7 @@ import { attachAuthority, buildEnvelope, ownerSign, ownerSignRequest, withOwnerS
 import { ownerPublicKey } from "./owner.js";
 import { effectivePolicy, policyLine } from "./policy.js";
 import { procStart, procTable, provenProcess, sameProcess } from "./proc.js";
+import { bumpPostToolMarker, bumpPostToolMarkersForAgent } from "./posttool.js";
 import { privatePath } from "./private-files.js";
 import { backfillRegistry } from "./registry.js";
 import { Store } from "./store.js";
@@ -142,7 +143,7 @@ export class MbxNode {
      */
     bindSession(s) {
         const db = this.store.db, start = procStart(s.pid);
-        return this.store.tx(() => {
+        const bound = this.store.tx(() => {
             // A parent CLI can outlive a crashed MCP child. Retire only keys whose recorded child
             // is positively gone or whose PID now belongs to a different process; unknown stays held.
             const keys = db.prepare("SELECT DISTINCT session_key FROM sessions WHERE cli=? AND pid=? AND session_key IS NOT NULL")
@@ -224,6 +225,11 @@ export class MbxNode {
                 db.prepare("UPDATE deliveries SET state='delivered', note=NULL WHERE agent=? AND state='notified' AND note='desktop'").run(agent);
             return agent;
         });
+        // T342: a claude bind can change the session→agent mapping the post-tool hook resolves, so the
+        // hook's fast path must run the full decision once. After the tx: fs writes never inside it.
+        if (s.cli === "claude" && s.session_id)
+            bumpPostToolMarker(this.home, "claude", s.session_id);
+        return bound;
     }
     /** The agent name the MCP server of this CLI process uses (fresh binding of a live pid), if any. */
     agentFor(cli, pid, o = {}) {
@@ -335,6 +341,9 @@ export class MbxNode {
             this.store.set(`alias:${oldName}`, newName);
             this.store.audit("agent.renamed", { from: oldName, to: newName });
         });
+        // T342: unread mail just moved under the new name; its claude sessions' hooks must notice
+        // (review medium 2). Bumping a name that moved nothing is a wasted full-path run, never wrong.
+        bumpPostToolMarkersForAgent(this.store.db, this.home, newName);
     }
     resolveAlias(name) {
         let n = name;
@@ -745,6 +754,9 @@ export class MbxNode {
                 this.store.db.prepare("INSERT OR IGNORE INTO outbox (msg_id,host,next_at,created_at) VALUES (?,?,?,?)")
                     .run(e.id, h, new Date().toISOString(), new Date().toISOString());
         });
+        // T342: the post-tool hook's fast path must notice this delivery without starting node.
+        for (const a of r.local)
+            bumpPostToolMarkersForAgent(this.store.db, this.home, a);
         if (auth && !auth.ok)
             r.warnings.push(`owner authority not attached: ${auth.reason}`);
         return { envelope: e, local: [...r.local], remote: [...r.remote], warnings: r.warnings, targets: r.targets };
@@ -798,6 +810,10 @@ export class MbxNode {
                 this.store.addDelivery(e.id, a);
             return true;
         });
+        // T342: the post-tool hook's fast path must notice this delivery without starting node.
+        if (stored)
+            for (const a of r.local)
+                bumpPostToolMarkersForAgent(this.store.db, this.home, a);
         this.store.db.prepare("INSERT INTO agents (name,host,last_seen) VALUES (?,?,?) ON CONFLICT(name,host) DO UPDATE SET last_seen=excluded.last_seen")
             .run(e.from.split("@")[0], via, new Date().toISOString());
         return stored ? "accepted" : "duplicate";

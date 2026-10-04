@@ -35,6 +35,10 @@ export interface Edit {
   install: (cur: string | null) => string | null;
   uninstall: (cur: string | null) => string | null;
   viaCli?: (ctx: SetupCtx, mode: "install" | "uninstall", cur: string | null) => boolean; // true = done by the CLI itself
+  /** T342: a wiring state that is functional but not what install() would write right now (the
+   *  pre-fast-path `hook post-tool` command once the skill script exists). Wired, and the next
+   *  setup run upgrades it; doctor should not call it "not wired" in between. */
+  isWired?: (cur: string | null) => boolean;
 }
 
 /** The bundled skill as {relative path: content}: embedded in the single executable (SEA asset), else read from ../skill. */
@@ -54,7 +58,19 @@ const shq = (s: string) => /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, 
 export const shJoin = (argv: string[]) => argv.map(shq).join(" ");
 export const hookCommand = (cmd: string[], event: string, cli: string) => `${shJoin(cmd)} hook ${event} --cli ${cli}`;
 const isOurHook = (command: string, event: string, cli: string, cmd: string[]) =>
-  command.includes(` hook ${event} --cli ${cli}`) && (command.includes("agentmbx") || command.startsWith(shJoin(cmd)));
+  (command.includes(` hook ${event} --cli ${cli}`) && (command.includes("agentmbx") || command.startsWith(shJoin(cmd))))
+  // T342: the bundled sh fast path is ours too, so setup upgrades an old direct command to it (and back)
+  || (event === "post-tool" && cli === "claude" && command.includes("claude-posttool.sh"));
+/** T342: when the bundled skill ships the post-tool wrapper, PostToolUse runs it (zero node starts
+ *  in steady state); otherwise the event keeps the direct `agentmbx hook` command (SEA bundles
+ *  SKILL.md only). The wrapper alone decides nothing — it always falls through to the full hook
+ *  on any doubt, so hook decisions stay identical. It gets the setup's own resolved command: a
+ *  desktop-started Claude has a minimal PATH (review high — never rely on PATH agentmbx). */
+const posttoolFastPath = (home: string, cmd: string[]) => (sub: string): string | null => {
+  if (sub !== "post-tool") return null;
+  const script = join(skillDest(home), "scripts", "claude-posttool.sh");
+  return existsSync(script) ? `sh ${shJoin([script])} ${shJoin(cmd)}` : null;
+};
 const read = (p: string) => existsSync(p) ? readFileSync(p, "utf8") : null;
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
@@ -107,13 +123,15 @@ const STOP_EVENTS: [string, string][] = [...HOOK_EVENTS, ["Stop", "stop"]];
 
 type HookGroup = { matcher?: string; hooks?: { type?: string; command?: string; timeout?: number }[] };
 
-/** Hooks in the Claude/Codex shape: { hooks: { Event: [ { hooks: [ {type, command} ] } ] } }. Appends groups; never edits others. */
-function jsonHooks(events: [string, string][], cli: string, cmd: string[]) {
+/** Hooks in the Claude/Codex shape: { hooks: { Event: [ { hooks: [ {type, command} ] } ] } }. Appends groups; never edits others.
+ *  `commandFor` overrides the command for an event (T342: PostToolUse runs the bundled sh fast
+ *  path when the skill script is installed; absent, the event keeps the direct `agentmbx hook`. */
+function jsonHooks(events: [string, string][], cli: string, cmd: string[], commandFor?: (sub: string) => string | null) {
   const install = (cur: string | null) => {
     const obj = parseObj(cur); let changed = false;
     const hooks = (obj.hooks ??= {}) as Record<string, HookGroup[]>;
     for (const [ev, sub] of events) {
-      const want = hookCommand(cmd, sub, cli);
+      const want = commandFor?.(sub) ?? hookCommand(cmd, sub, cli);
       const groups = (hooks[ev] ??= []);
       const ours = groups.flatMap((g) => (g.hooks ?? []).filter((h) => isOurHook(h.command ?? "", sub, cli, cmd)));
       if (!ours.length) { groups.push({ hooks: [{ type: "command", command: want, timeout: 10 }] }); changed = true; continue; }
@@ -370,7 +388,18 @@ export function edits(ctx: SetupCtx, cli: CliId): Edit[] {
             } catch { return false; }
           } },
         { cli, kind: "hooks", item: "hooks SessionStart + SessionEnd + UserPromptSubmit + PostToolUse + PermissionRequest + Stop", path: join(home, ".claude/settings.json"),
-          ...jsonHooks([...STOP_EVENTS, ["PostToolUse", "post-tool"], ["SessionEnd", "session-end"]], "claude", cmd) },
+          ...jsonHooks([...STOP_EVENTS, ["PostToolUse", "post-tool"], ["SessionEnd", "session-end"]], "claude", cmd, posttoolFastPath(home, cmd)),
+          isWired: (cur) => {
+            try {
+              const hooks = (JSON.parse(cur ?? "null")?.hooks ?? {}) as Record<string, HookGroup[]>;
+              const directPostTool = (hooks.PostToolUse ?? []).some((g) => (g.hooks ?? []).some((h) => (h.command ?? "").includes(" hook post-tool --cli claude")));
+              if (!directPostTool) return false;
+              // Review medium 4: an old-style wiring counts only if EVERY event is wired in the
+              // old style too — a file holding just PostToolUse must not read as fully wired.
+              const plain = jsonHooks([...STOP_EVENTS, ["PostToolUse", "post-tool"], ["SessionEnd", "session-end"]], "claude", cmd);
+              return plain.install(cur) === cur;
+            } catch { return false; }
+          } },
       ];
     }
     case "codex":
@@ -397,7 +426,7 @@ export function edits(ctx: SetupCtx, cli: CliId): Edit[] {
 /** Is this edit already in its installed state? (Used by doctor.) */
 export function wired(e: Edit): boolean {
   const cur = read(e.path);
-  try { return cur !== null && e.install(cur) === cur; } catch { return false; }
+  try { return cur !== null && (e.isWired?.(cur) || e.install(cur) === cur); } catch { return false; }
 }
 
 // ---- skill -----------------------------------------------------------------------------------
