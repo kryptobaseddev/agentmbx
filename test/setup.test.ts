@@ -118,12 +118,24 @@ test("setup wires every CLI, backs files up, leaves other hook groups alone, and
     readFileSync(join(import.meta.dirname, "../skill/scripts/claude-statusline.sh"), "utf8"));
   for (const d of [".claude/skills/agentmbx", ".codex/skills/agentmbx"]) assert.equal(readlinkSync(join(home, d)), skillDest(home));
 
-  // second run: nothing changes, no duplicates, no new backups
+  // second run: the only change is upgrading PostToolUse to the bundled sh fast path (the first
+  // run installed the skill after the hooks row ran, so the script appeared in between); no other
+  // file changes, no duplicates, no new backups
   const snapshot = Object.fromEntries(Object.keys(FILES).map((rel) => [rel, rd(home, rel)]));
   const again = runSetup(ctx, { mode: "install", stamp: "T2" });
-  assert.deepEqual(again.filter((r) => r.action !== "unchanged" && r.action !== "skipped"), []);
-  for (const rel of Object.keys(FILES)) assert.equal(rd(home, rel), snapshot[rel], `${rel} unchanged on rerun`);
+  const changed = again.filter((r) => r.action !== "unchanged" && r.action !== "skipped");
+  assert.deepEqual(changed, [{ action: "updated", cli: "claude", item: "hooks SessionStart + SessionEnd + UserPromptSubmit + PostToolUse + PermissionRequest + Stop",
+    path: join(home, ".claude/settings.json"), backup: join(home, ".claude/settings.json.bak-agentmbx-T2") }]);
+  assert.match(JSON.parse(rd(home, ".claude/settings.json")).hooks.PostToolUse.at(-1).hooks[0].command, /claude-posttool\.sh/);
+  // third run: fully clean
+  const third = runSetup(ctx, { mode: "install", stamp: "T3" });
+  assert.deepEqual(third.filter((r) => r.action !== "unchanged" && r.action !== "skipped"), []);
+  for (const rel of Object.keys(FILES)) {
+    if (rel === ".claude/settings.json") continue; // the one file the fast-path upgrade legitimately rewrites
+    assert.equal(rd(home, rel), snapshot[rel], `${rel} unchanged after the upgrade settles`);
+  }
   assert.ok(!readdirSync(join(home, ".codex")).some((f) => f.includes("T2")));
+  assert.ok(!readdirSync(join(home, ".codex")).some((f) => f.includes("T3")));
 });
 
 test("setup updates a stale command path in place instead of adding a duplicate", () => {

@@ -3,7 +3,9 @@
 // every retry; it leaves the outbox only on a valid accept signed by the pinned relay key, then waits in relay_sent for
 // the target's delivery receipt or the sender-side deadline. The receiving side processes items in seq order, keeps
 // what it cannot accept in quarantine, checkpoints, and only then acks. An epoch change (a restore) or a queue head
-// below the checkpoint makes senders re-push and receivers re-pull; dedup on both ends makes that safe.
+// below the checkpoint makes senders re-push and receivers re-pull; dedup on both ends makes that safe. A row the relay
+// accepted keeps its relay deadline through a re-push (state `repush`), and a relay expiry notice ends it with an alert
+// (T167): accepted mail never leaves this host's books without the sender being told.
 // T168 (spec §1, §8): the relay key is pinned by the owner (`relay set --key`) or on first use, and a changed key stops
 // relay use; enrolment and this host's enc-key ad are reconciled against the relay's own store on every session (a
 // local flag is only a cache), so a reset, restore, lost row or rotation re-enrols with a signed challenge; a peer's
@@ -474,15 +476,17 @@ export async function relayPushReceipts(node: MbxNode, s: RelaySession, now = Da
 /**
  * The relay went back in time (a new epoch, a queue head below our checkpoint, or BAD_ACK): unsettled relay-accepted
  * rows go back to the outbox to be re-pushed (their persisted bytes make them duplicates if the relay still has them),
- * and our receive position restarts at 0 (receive() and acceptReceipt() dedup what we already have).
+ * and our receive position restarts at 0 (receive() and acceptReceipt() dedup what we already have). Each row stays in
+ * relay_sent as `repush` with its relay deadline (T167), so the LAN's 72 h give-up never drops mail the relay accepted
+ * (the target may need days to come back and re-enrol); the deadline, a delivery receipt or an expiry notice ends it.
  */
 export function relayEpochChanged(node: MbxNode, relay: string, epoch: string, why: "epoch" | "rewind") {
   const now = new Date().toISOString();
   node.store.tx(() => {
-    const rows = node.store.db.prepare("SELECT msg_id, host, queued_at FROM relay_sent WHERE relay=? AND state='relay-accepted'").all(relay) as { msg_id: string; host: string; queued_at: string }[];
+    const rows = node.store.db.prepare("SELECT msg_id, host, queued_at FROM relay_sent WHERE relay=? AND state IN ('relay-accepted','repush')").all(relay) as { msg_id: string; host: string; queued_at: string }[];
     for (const r of rows) node.store.db.prepare(`INSERT INTO outbox (msg_id,host,attempts,next_at,last_error,created_at) VALUES (?,?,?,?,?,?)
       ON CONFLICT(msg_id,host) DO NOTHING`).run(r.msg_id, r.host, RELAY_AFTER_ATTEMPTS, now, `relay ${why}: re-push`, r.queued_at);
-    node.store.db.prepare("DELETE FROM relay_sent WHERE relay=? AND state='relay-accepted'").run(relay);
+    node.store.db.prepare("UPDATE relay_sent SET state='repush' WHERE relay=? AND state='relay-accepted'").run(relay);
     node.store.db.prepare(`INSERT INTO relay_position (relay,epoch,received_through,updated_at) VALUES (?,?,0,?)
       ON CONFLICT(relay) DO UPDATE SET epoch=excluded.epoch, received_through=0, updated_at=excluded.updated_at`).run(relay, epoch, now);
     node.store.set(`relay-epoch:${relay}`, epoch);
@@ -503,6 +507,19 @@ function setPosition(node: MbxNode, relay: string, epoch: string, through: numbe
 /** The host an envelope says it comes from: the host receive() checks the pairing of. */
 const envelopeHost = (e: Envelope | null) => typeof e?.from === "string" ? e.from.split("@")[1] ?? "" : "";
 
+/**
+ * A relay duplicate means its sender pushed it again, so it is still waiting for our delivery receipt: after a relay
+ * restore, the receipt the relay accepted after its backup is gone with it (T167). Queue the current state of each local
+ * delivery of that message again (as the deliveries triggers would), unless one is already queued, so the sender settles
+ * instead of alerting at its deadline. A receipt older than the receipt window still expires (receipts are advisory).
+ */
+function resendReceipts(node: MbxNode, msgId: string) {
+  node.store.db.prepare(`INSERT INTO receipt_outbox (msg_id,agent,host,state,note,at,next_at)
+    SELECT d.msg_id, d.agent, substr(m.from_addr, instr(m.from_addr,'@')+1), d.state, d.note, d.updated_at, ?
+    FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.msg_id=? AND m.origin<>'local' AND instr(m.from_addr,'@')>0
+      AND d.state IN ${DELIVERED} AND NOT EXISTS (SELECT 1 FROM receipt_outbox r WHERE r.msg_id=d.msg_id AND r.agent=d.agent)`).run(iso(Date.now()), msgId);
+}
+
 /** Process one relay item. True when it is done (accepted, duplicate or quarantined). */
 function processItem(node: MbxNode, relay: string, epoch: string, it: { seq: number; kind: string; item_id: string; sender_pubkey: string; wire_b64: string }): string {
   const wire = Buffer.from(it.wire_b64, "base64");
@@ -512,8 +529,9 @@ function processItem(node: MbxNode, relay: string, epoch: string, it: { seq: num
     if (it.kind === "envelope") {
       const e = v as Envelope;
       result = node.receive(e, envelopeHost(e));
+      if (result === "duplicate") resendReceipts(node, e.id);
     } else if (it.kind === "receipt") result = acceptReceipt(node, v, null);
-    else if (it.kind === "expired") result = "accepted"; // relay expiry notices (§6) are handled by T167; the deadline covers them meanwhile
+    else if (it.kind === "expired") result = applyExpiryNotice(node, relay, v, it.sender_pubkey);
     else result = "rejected:unknown item kind";
   } catch { result = "rejected:unreadable item"; }
   if (result.startsWith("rejected")) {
@@ -522,6 +540,45 @@ function processItem(node: MbxNode, relay: string, epoch: string, it: { seq: num
     node.store.audit("relay.quarantined", { relay, seq: it.seq, item: String(it.item_id).slice(0, 80), reason: result.slice(0, 200) });
   }
   return result;
+}
+
+const DELIVERED = "('delivered','notified','read','acked')";
+/** The target host already reported this message delivered (a receipt over the LAN or the relay). */
+const confirmed = (node: MbxNode, msg: string, host: string) => !!node.store.db.prepare(`SELECT 1 FROM remote_receipts WHERE msg_id=?
+  AND substr(recipient, instr(recipient,'@')+1)=? AND state IN ${DELIVERED} LIMIT 1`).get(msg, host);
+
+/**
+ * A relay expiry notice (§6, T167): the relay dropped an envelope we pushed because its target never collected it within
+ * retention. Only the pinned relay key's signature counts, and only for the row with that message and that target key
+ * (a row re-sealed for a rotated key is not the one that expired). The row ends `expired` with the alert the LAN outbox
+ * sends after 72 h, and leaves the outbox if a re-push was pending. If the target already confirmed delivery (its pull
+ * raced the sweep), the row settles instead and nobody is alarmed. A row already final makes the notice a duplicate.
+ */
+export function applyExpiryNotice(node: MbxNode, relay: string, v: unknown, from: string, now = Date.now()): string {
+  const pinned = kv(node, `relay-key:${relay}`);
+  const { notice, sig } = (v ?? {}) as { notice?: { v?: unknown; type?: unknown; item_id?: unknown; target_pubkey?: unknown; accepted_at?: unknown; expired_at?: unknown }; sig?: unknown };
+  if (!pinned || from !== pinned || !notice || notice.v !== 1 || notice.type !== "relay-expired" || typeof sig !== "string" || typeof notice.item_id !== "string"
+    || typeof notice.target_pubkey !== "string" || typeof notice.accepted_at !== "string" || typeof notice.expired_at !== "string"
+    || !verifyData(pinned, canonical(notice), sig)) return "rejected:bad expiry notice";
+  const row = node.store.db.prepare(`SELECT s.msg_id, s.host, s.state, m.envelope FROM relay_sent s LEFT JOIN messages m ON m.id=s.msg_id
+    WHERE s.msg_id=? AND s.relay=? AND s.target_pubkey=?`).get(notice.item_id, relay, notice.target_pubkey) as { msg_id: string; host: string; state: string; envelope: string | null } | undefined;
+  if (!row || (row.state !== "relay-accepted" && row.state !== "repush")) return "duplicate"; // settled, expired or unconfirmed already
+  const at = iso(now), days = Math.max(1, Math.round((Date.parse(notice.expired_at) - Date.parse(notice.accepted_at)) / 86_400_000));
+  node.store.tx(() => {
+    node.store.db.prepare("DELETE FROM outbox WHERE msg_id=? AND host=?").run(row.msg_id, row.host); // a pending re-push is moot either way
+    node.store.db.prepare("DELETE FROM relay_wire WHERE msg_id=? AND host=?").run(row.msg_id, row.host);
+    if (confirmed(node, row.msg_id, row.host)) {
+      node.store.db.prepare("UPDATE relay_sent SET state='settled', settled_at=? WHERE msg_id=? AND host=?").run(at, row.msg_id, row.host);
+      return;
+    }
+    node.store.db.prepare("UPDATE relay_sent SET state='expired', settled_at=? WHERE msg_id=? AND host=?").run(at, row.msg_id, row.host);
+    node.store.audit("relay.expired", { relay, msg: row.msg_id, host: row.host, accepted_at: notice.accepted_at, expired_at: notice.expired_at });
+    if (!row.envelope) return;
+    const e = JSON.parse(row.envelope) as Envelope;
+    node.send({ from: "mbx", to: [e.from.split("@")[0]!], kind: "alert", subject: `Undelivered to ${row.host}: ${e.subject}`,
+      body: `Message ${e.id} could not be delivered to host ${row.host}: the relay held it for ${days} day(s) (accepted ${notice.accepted_at}) and ${row.host} never collected it, so the relay expired it at ${notice.expired_at}.` });
+  });
+  return "accepted";
 }
 
 /**
@@ -587,20 +644,27 @@ export async function relayReceive(node: MbxNode, s: RelaySession): Promise<numb
  * target never confirmed by accepted_at + retention + grace alerts its sender, without waiting on the relay (§3).
  */
 export function relaySettle(node: MbxNode, now = Date.now()): { settled: number; unconfirmed: number } {
-  const settled = Number(node.store.db.prepare(`UPDATE relay_sent SET state='settled', settled_at=? WHERE state='relay-accepted' AND EXISTS (
-    SELECT 1 FROM remote_receipts r WHERE r.msg_id=relay_sent.msg_id AND substr(r.recipient, instr(r.recipient,'@')+1)=relay_sent.host
-      AND r.state IN ('delivered','notified','read','acked'))`).run(iso(now)).changes);
+  // a repush row the target confirmed needs no re-push: it leaves the outbox with it
+  const settled = node.store.tx(() => {
+    node.store.db.prepare(`DELETE FROM outbox WHERE (msg_id, host) IN (SELECT msg_id, host FROM relay_sent s WHERE s.state='repush' AND EXISTS (
+      SELECT 1 FROM remote_receipts r WHERE r.msg_id=s.msg_id AND substr(r.recipient, instr(r.recipient,'@')+1)=s.host AND r.state IN ${DELIVERED}))`).run();
+    return Number(node.store.db.prepare(`UPDATE relay_sent SET state='settled', settled_at=? WHERE state IN ('relay-accepted','repush') AND EXISTS (
+      SELECT 1 FROM remote_receipts r WHERE r.msg_id=relay_sent.msg_id AND substr(r.recipient, instr(r.recipient,'@')+1)=relay_sent.host
+        AND r.state IN ${DELIVERED})`).run(iso(now)).changes);
+  });
   if (settled) node.store.db.prepare("DELETE FROM relay_wire WHERE (msg_id, host) IN (SELECT msg_id, host FROM relay_sent WHERE state='settled')").run();
-  const late = node.store.db.prepare(`SELECT s.msg_id, s.host, m.envelope FROM relay_sent s JOIN messages m ON m.id=s.msg_id
-    WHERE s.state='relay-accepted' AND s.deadline_at <= ?`).all(iso(now)) as { msg_id: string; host: string; envelope: string }[];
+  const late = node.store.db.prepare(`SELECT s.msg_id, s.host, m.envelope FROM relay_sent s LEFT JOIN messages m ON m.id=s.msg_id
+    WHERE s.state IN ('relay-accepted','repush') AND s.deadline_at <= ?`).all(iso(now)) as { msg_id: string; host: string; envelope: string | null }[];
   for (const r of late) {
-    const e = JSON.parse(r.envelope) as Envelope;
     const everConfirmed = node.store.db.prepare("SELECT 1 FROM remote_receipts WHERE substr(recipient, instr(recipient,'@')+1)=? LIMIT 1").get(r.host);
     const why = everConfirmed ? "the relay accepted it, but the recipient's host never confirmed delivery"
       : "the relay accepted it, but there is no delivery confirmation (the recipient's host may run AgentMBX older than 0.5.3, which sends none)";
     node.store.tx(() => {
       node.store.db.prepare("UPDATE relay_sent SET state='unconfirmed', settled_at=? WHERE msg_id=? AND host=?").run(iso(now), r.msg_id, r.host);
       node.store.db.prepare("DELETE FROM relay_wire WHERE msg_id=? AND host=?").run(r.msg_id, r.host);
+      node.store.db.prepare("DELETE FROM outbox WHERE msg_id=? AND host=?").run(r.msg_id, r.host); // a re-push still pending ends here too
+      if (!r.envelope) return void node.store.audit("relay.unconfirmed", { msg: r.msg_id, host: r.host, why: "message no longer stored" });
+      const e = JSON.parse(r.envelope) as Envelope;
       node.send({ from: "mbx", to: [e.from.split("@")[0]!], kind: "alert", subject: `Undelivered/unconfirmed to ${r.host}: ${e.subject}`,
         body: `Message ${e.id} to host ${r.host}: ${why}.` });
     });

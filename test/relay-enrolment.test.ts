@@ -542,3 +542,45 @@ test("review 2: a persistent v1 error (403) is audited once, retried only at the
   assert.equal(b.store.get(`relay-enc-v1-down:${RELAY}`) ?? null, null);
   assert.equal(relayState(b, RELAY)?.v1_down, null);
 });
+
+test("with T167: relay restore keeps the newer signed v2 ad, and a host's own guard state never moves with the relay's", async (t) => {
+  const { backupStore, lockStore, restoreStore } = await import("../src/relay-ops.ts");
+  const dir = mkdtempSync(join(tmpdir(), "mbx-t168-restore-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  const key = generateKeyPair(), storeAt = () => new SqliteRelayStore(join(dir, "relay.db"));
+  const w = await world(t, { core: new RelayCore(undefined, { store: storeAt(), key }) });
+  const { a, b } = w;
+  const send = async (subject: string, accepted = 1) => { a.send({ from: "alice", to: ["bob@beta"], subject, body: subject }); lanFailedTwice(a); assert.equal((await relayPushOutbox(a, (await w.open(a))!)).accepted, accepted); };
+  assert.ok(await w.open(b));
+  await send("m1");
+  assert.equal(await relayReceive(b, (await w.open(b))!), 1);
+  const backup = await backupStore(dir, join(dir, "backups", "relay-1.db")); // holds beta's first ad
+  const first = w.core.getEncAdByKey(b.key.publicKey)!.ad!;
+  // after the backup beta regenerates enc.key and republishes; alpha accepts the newer ad
+  await new Promise((r) => setTimeout(r, 5));
+  b.encKey = generateEncKeyPair();
+  assert.ok(await w.open(b));
+  const second = w.core.getEncAdByKey(b.key.publicKey)!.ad!;
+  assert.ok(Date.parse(second.iat) > Date.parse(first.iat));
+  await send("m2");
+  const guard = a.store.get(`relay-enc-newest:${b.key.publicKey}`);
+  assert.equal(JSON.parse(guard!).iat, second.iat);
+  a.store.set(`relay-enrol-backoff:${RELAY}`, JSON.stringify({ n: 3, next_at: new Date(Date.now() - 1).toISOString() })); // a host-side row
+  // the operator restores the backup (the relay stopped)
+  w.core.store.close();
+  const lock = lockStore(dir)!; // what `relay serve` holds; the restore runs under it
+  const r = await restoreStore(dir, backup.file, { lock });
+  lock.release();
+  assert.equal(r.carried.enc_ad_records, 1, "the live store's newer v2 record is carried");
+  const core = await w.reset(new RelayCore(undefined, { store: storeAt(), key }));
+  assert.deepEqual(core.getEncAdByKey(b.key.publicKey)!.ad, second, "the restored relay serves the newer ad, never the backup's older one");
+  assert.equal(a.store.get(`relay-enc-newest:${b.key.publicKey}`), guard, "the sender's guard lives in its own store: untouched by the restore");
+  assert.equal(JSON.parse(a.store.get(`relay-enrol-backoff:${RELAY}`)!).n, 3, "so does the enrolment backoff");
+  // everyone converges on the new epoch: alpha re-pushes the unconfirmed m1 and m2 with m3; beta gets m2 and m3 sealed
+  // for the key it holds, and m1 again as a duplicate
+  assert.ok(await w.open(b));
+  await send("m3", 3);
+  assert.equal(await relayReceive(b, (await w.open(b))!), 2);
+  assert.deepEqual(b.inbox("bob").map((m) => m.subject).sort(), ["m1", "m2", "m3"]);
+  assert.equal(a.store.get(`relay-enrol-backoff:${RELAY}`) ?? null, null, "a confirmed enrolment ended the host's backoff");
+});

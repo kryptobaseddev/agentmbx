@@ -35,6 +35,9 @@ CREATE INDEX IF NOT EXISTS mailbox_visibility_mailbox_seq ON mailbox_visibility(
 -- as an explicit gap. Additive: stores without it simply have nothing pruned (no schema version change).
 CREATE TABLE IF NOT EXISTS mailbox_pruned (
   mailbox TEXT NOT NULL, seq INTEGER NOT NULL, message_id TEXT NOT NULL, pruned_at TEXT NOT NULL, PRIMARY KEY (mailbox, seq)) WITHOUT ROWID;
+-- Ids of pruned messages (T167): receive() treats them as duplicates, so a relay restore or a late LAN retry never
+-- delivers acked, pruned mail again as new. Kept PRUNED_ID_KEEP_DAYS (src/retention.ts). Additive: no version change.
+CREATE TABLE IF NOT EXISTS pruned_ids (id TEXT PRIMARY KEY, pruned_at TEXT NOT NULL) WITHOUT ROWID;
 CREATE TRIGGER IF NOT EXISTS deliveries_visibility AFTER INSERT ON deliveries BEGIN
   INSERT OR IGNORE INTO mailbox_visibility (mailbox,message_id) VALUES (new.agent,new.msg_id); END;
 CREATE TABLE IF NOT EXISTS outbox (       -- envelopes waiting to reach a paired host
@@ -331,6 +334,8 @@ export class Store {
     get(k) { return this.db.prepare("SELECT v FROM kv WHERE k=?").get(k)?.v; }
     set(k, v) { this.db.prepare("INSERT INTO kv (k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").run(k, v); }
     hasMessage(id) { return !!this.db.prepare("SELECT 1 FROM messages WHERE id=?").get(id); }
+    /** This host stored the message once and retention pruned it (a tombstone, src/retention.ts). */
+    wasPruned(id) { return !!this.db.prepare("SELECT 1 FROM pruned_ids WHERE id=?").get(id); }
     /** Insert once (id dedupe). Returns false when the id was already stored. */
     insertMessage(e, origin, trust, authority) {
         return this.tx(() => {

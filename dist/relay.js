@@ -26,6 +26,10 @@ const IP_TABLE_MAX = 50_000;
 export const hostKeyChallengeAuthority = { name: "host-key-challenge", authorize: () => ({ ok: true }) };
 export const HEARTBEAT_MS = 30_000;
 export const HEARTBEAT_STALE_MS = 10 * 60_000;
+/** The retention sweep runs at startup and then this often (§6). */
+export const SWEEP_MS = 10 * 60_000;
+/** Dedup rows outlive their item by this much beyond retention (§7: the dedup horizon is retention + 7 days). */
+export const DEDUP_GRACE_DAYS = 7;
 /** Lowercase hex SHA-256 of the exact wire bytes. */
 export const wireHash = (b) => createHash("sha256").update(b).digest("hex");
 const err = (code, message) => Object.assign(new Error(message), { code });
@@ -96,6 +100,7 @@ export class RelayCore {
             const cause = ahead ? "clock went back, or store written under a clock that ran ahead" : "restore or long outage";
             const reason = `${ahead ? "heartbeat ahead of the clock" : "stale heartbeat"} (${cause})`;
             this.store.setMeta("epoch_rotated", JSON.stringify({ from, to, at: new Date(now).toISOString(), heartbeat, reason }));
+            this.store.logOp("epoch-rotated", { v: 1, type: "relay-epoch-rotated", at: new Date(now).toISOString(), from, to, heartbeat, reason, by: "startup" }, new Date(now).toISOString());
             (o.log ?? ((l) => console.error(l)))(`[agentmbx] relay epoch rotated at startup: stored heartbeat ${heartbeat} is ${Math.round(Math.abs(now - beat) / 60_000)} min ${ahead ? "ahead of this clock" : "old"} (${cause}); epoch ${from} -> ${to}: senders re-push, receivers re-pull`);
         }
         this.beat(now);
@@ -337,12 +342,14 @@ export class RelayCore {
                 if (q)
                     return { stored, error: q };
             }
-            const now = Date.now(), at = new Date(now).toISOString();
+            const at = new Date().toISOString();
+            // A v1 item never expires (expires_at NULL) while v1 exists: a v1 sender deleted its row on the 200 and v1 pulls drop
+            // non-envelopes, so it could never learn of an expiry notice. v1 had no expiry before T167 either: no regression.
             this.store.transaction(() => {
                 for (const t of targets)
                     if (!this.store.dedup(from.pubkey, e.id, t.pubkey))
                         this.store.insertItem({ target_pubkey: t.pubkey, kind: "envelope", item_id: e.id, sender_pubkey: from.pubkey, sender_host: from.host,
-                            wire, wire_hash: wireHash(wire), bytes, accepted_at: at, expires_at: this.expiry(now) });
+                            wire, wire_hash: wireHash(wire), bytes, accepted_at: at, expires_at: null });
             });
             stored++;
         }
@@ -408,7 +415,7 @@ export class RelayCore {
                         if (hit) {
                             if (hit.wire_hash !== p.wire_hash)
                                 throw err("CONFLICT", "conflict");
-                            out.push({ host_pubkey: p.target.pubkey, seq: hit.seq, wire_hash: hit.wire_hash, fresh: false });
+                            out.push({ host_pubkey: p.target.pubkey, seq: hit.seq, wire_hash: hit.wire_hash, fresh: false, accepted_at: hit.accepted_at });
                             continue;
                         }
                         const q = this.quotaError(p.target, from.pubkey, p.bytes);
@@ -416,12 +423,15 @@ export class RelayCore {
                             throw err("QUOTA", `quota:${q}`);
                         const seq = this.store.insertItem({ target_pubkey: p.target.pubkey, kind: it.kind, item_id: id, sender_pubkey: from.pubkey,
                             sender_host: from.host, wire: p.wire, wire_hash: p.wire_hash, bytes: p.bytes, accepted_at: at, expires_at: this.expiry(now) });
-                        out.push({ host_pubkey: p.target.pubkey, seq, wire_hash: p.wire_hash, fresh: true });
+                        out.push({ host_pubkey: p.target.pubkey, seq, wire_hash: p.wire_hash, fresh: true, accepted_at: at });
                     }
                     return out;
                 });
+                // A pure duplicate is the same acceptance as before: it carries the original time, so the sender's deadline (§3)
+                // stays accepted_at + retention + grace however often it retries (also after a restore, or past an expiry).
+                const first = done.some((d) => d.fresh) ? at : done.map((d) => d.accepted_at).sort()[0] ?? at;
                 const accept = { v: 1, type: "relay-accept", relay_pubkey: this.key.publicKey, epoch: this.store.epoch(), sender_pubkey: from.pubkey,
-                    item_id: id, targets: done.map(({ host_pubkey, seq, wire_hash }) => ({ host_pubkey, seq, wire_hash })), at };
+                    item_id: id, targets: done.map(({ host_pubkey, seq, wire_hash }) => ({ host_pubkey, seq, wire_hash })), at: first };
                 return { item_id: id, status: done.some((d) => d.fresh) ? "accepted" : "duplicate", targets: done.map(({ host_pubkey, seq }) => ({ host_pubkey, seq })),
                     accept, sig: signData(this.key.privateKey, canonical(accept)) };
             }
@@ -497,6 +507,57 @@ export class RelayCore {
             throw err("BAD_ACK", "ack beyond the last allocated seq: treat as an epoch change");
         const deleted = this.store.ack(pubkey, t);
         return { acked_through: this.store.ackedThrough(pubkey), deleted, head_seq: this.store.lastSeq(pubkey) };
+    }
+    /**
+     * The retention sweep (§6). Only v2 items expire: v1 pushes, and items queued before this store enforced expiry, carry
+     * no `expires_at` and stay until acked, as before (see SqliteRelayStore `expiry_from`).
+     * Items whose `expires_at` has passed are deleted; their dedup row stays as a tombstone until
+     * the dedup horizon, so a late retry is a duplicate, never a re-delivery after expiry. Each expired envelope queues a
+     * notice signed by the relay key for its sender, in the same transaction, unless the sender's key is no longer enrolled
+     * or its own queue is at its cap (the sender's deadline covers those, §3). Expired receipts and notices go without a
+     * notice. Live items (not yet expired) are never touched. Bounded per call; anything left waits for the next sweep.
+     */
+    sweep(now = Date.now(), o = {}) {
+        const at = new Date(now).toISOString(), batch = o.batch ?? 500, maxBatches = o.maxBatches ?? 20;
+        const r = { v: 1, type: "relay-sweep", at, retention_days: this.quota.retentionDays, expired: { envelope: 0, receipt: 0, expired: 0 }, notices: 0,
+            notices_skipped: { not_enrolled: 0, over_cap: 0 }, dedup_pruned: 0, freed_bytes: 0 };
+        for (let i = 0; i < maxBatches; i++) {
+            const n = this.store.transaction(() => {
+                const rows = this.store.expiredItems(at, batch);
+                for (const it of rows) {
+                    this.store.deleteItem(it.target_pubkey, it.seq);
+                    r.expired[it.kind]++;
+                    r.freed_bytes += it.bytes;
+                    if (it.kind !== "envelope")
+                        continue; // receipts are advisory; a notice about a notice tells nobody anything
+                    const sender = this.store.getEnrolment(it.sender_pubkey);
+                    if (!sender || sender.revoked_at) {
+                        r.notices_skipped.not_enrolled++;
+                        continue;
+                    }
+                    const notice = { v: 1, type: "relay-expired", item_id: it.item_id, target_pubkey: it.target_pubkey, accepted_at: it.accepted_at, expired_at: at };
+                    const noticeId = `expired:${it.item_id}:${it.target_pubkey}`;
+                    if (this.store.dedup(this.key.publicKey, noticeId, sender.pubkey))
+                        continue; // already told (a sweep after a restore)
+                    const wire = Buffer.from(canonical({ notice, sig: signData(this.key.privateKey, canonical(notice)) }));
+                    const u = this.store.targetUsage(sender.pubkey);
+                    if (u.items + 1 > this.quota.maxQueueDepth || u.bytes + wire.length > this.quota.maxQueueBytes) {
+                        r.notices_skipped.over_cap++;
+                        continue;
+                    }
+                    this.store.insertItem({ target_pubkey: sender.pubkey, kind: "expired", item_id: noticeId, sender_pubkey: this.key.publicKey, sender_host: "relay",
+                        wire, wire_hash: wireHash(wire), bytes: wire.length, accepted_at: at, expires_at: this.expiry(now) });
+                    r.notices++;
+                }
+                return rows.length;
+            });
+            if (n < batch)
+                break;
+        }
+        r.dedup_pruned = this.store.transaction(() => this.store.pruneDedup(new Date(now - (this.quota.retentionDays + DEDUP_GRACE_DAYS) * 86_400_000).toISOString()));
+        if (r.expired.envelope + r.expired.receipt + r.expired.expired + r.dedup_pruned)
+            this.store.logOp("sweep", { ...r }, at);
+        return r;
     }
     /** Test/ops introspection: how a relay operator sees stored mail — bodies must be sealed. Bounded like a pull. */
     inspect(pubkey, limit = 1000) {
@@ -692,7 +753,23 @@ export function startRelayServer(core, port = 0, bind = "127.0.0.1", o = {}) {
         core.beat();
     }
     catch { /* store closed */ } }, HEARTBEAT_MS);
+    // The retention sweep (§6): once now, so a store restored from an old copy or a long outage settles at once, then periodically.
+    const log = o.log ?? ((l) => console.error(l));
+    const sweep = () => {
+        try {
+            const r = core.sweep(), gone = r.expired.envelope + r.expired.receipt + r.expired.expired;
+            if (gone || r.dedup_pruned)
+                log(`[agentmbx] relay sweep: ${gone} expired item(s) (${r.expired.envelope} envelope(s), ${r.expired.receipt} receipt(s), ${r.expired.expired} notice(s)), ${r.notices} expiry notice(s) queued for senders${r.notices_skipped.not_enrolled + r.notices_skipped.over_cap ? `, ${r.notices_skipped.not_enrolled + r.notices_skipped.over_cap} sender(s) not told (key gone or queue full; their own deadline alerts them)` : ""}, ${r.dedup_pruned} dedup row(s) past the horizon`);
+        }
+        catch (e) {
+            if (!/not open|closed/i.test(e.message))
+                log(`[agentmbx] relay sweep failed: ${e.message}`);
+        }
+    };
+    sweep();
+    const sweeper = setInterval(sweep, o.sweepMs ?? SWEEP_MS);
     beat.unref();
-    server.on("close", () => clearInterval(beat));
+    sweeper.unref();
+    server.on("close", () => { clearInterval(beat); clearInterval(sweeper); });
     return new Promise((resolve, reject) => { server.once("error", reject); server.listen(port, bind, () => resolve(server)); });
 }
