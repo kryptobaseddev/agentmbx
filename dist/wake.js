@@ -352,6 +352,13 @@ export function liveWatcher(node, agent, now = Date.now()) {
     const w = JSON.parse(node.store.get(watcherKey(agent)) ?? "null");
     if (!w || now - w.at > WATCHER_FRESH_MS)
         return false;
+    // A moved lease invalidates the old watcher (T343 review / T348 finding 3): a watcher started
+    // under a previous token must not keep answering for the session that claimed the name after.
+    if (w.token) {
+        const row = node.store.db.prepare("SELECT token FROM identity_leases WHERE name=?").get(agent);
+        if (!row || row.token !== w.token)
+            return false;
+    }
     try {
         process.kill(w.pid, 0);
         return true;

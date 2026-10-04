@@ -324,8 +324,14 @@ function reconcileWakes(node: MbxNode, now: number) {
 export const watcherKey = (agent: string) => `watcher:${agent}`;
 export const WATCHER_FRESH_MS = 15_000;
 export function liveWatcher(node: MbxNode, agent: string, now = Date.now()): boolean {
-  const w = JSON.parse(node.store.get(watcherKey(agent)) ?? "null") as { pid: number; at: number } | null;
+  const w = JSON.parse(node.store.get(watcherKey(agent)) ?? "null") as { pid: number; at: number; token?: string } | null;
   if (!w || now - w.at > WATCHER_FRESH_MS) return false;
+  // A moved lease invalidates the old watcher (T343 review / T348 finding 3): a watcher started
+  // under a previous token must not keep answering for the session that claimed the name after.
+  if (w.token) {
+    const row = node.store.db.prepare("SELECT token FROM identity_leases WHERE name=?").get(agent) as { token: string } | undefined;
+    if (!row || row.token !== w.token) return false;
+  }
   try { process.kill(w.pid, 0); return true; } catch { return false; }
 }
 

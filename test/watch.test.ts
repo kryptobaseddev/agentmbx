@@ -9,6 +9,7 @@ import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { MbxNode } from "../src/node.ts";
+import { IdentityLeases } from "../src/identity-leases.ts";
 import { dispatchWakes, liveWatcher } from "../src/wake.ts";
 import { selfWatchInstruction, WATCHER_INSTRUCTION } from "../src/mcp.ts";
 import { delegateWake } from "./helpers/wake-lease.ts";
@@ -75,4 +76,96 @@ test("a terminal Kimi prompt carries the watcher instruction until a watcher run
   assert.match(prompt(), /start one now with your shell tool: command "agentmbx watch"/);
   n.store.set("watcher:worker", JSON.stringify({ pid: process.pid, at: Date.now() }));
   assert.doesNotMatch(prompt(), /agentmbx watch/, "no nagging while a watcher is live");
+});
+
+// T343: liveness comes from the lease row's heartbeat, not a ps spawn per poll. While the holder
+// heartbeats, an idle watcher pays zero process evidence after startup; a stale heartbeat pays one
+// probe (alive holder → carry on); a dead holder stops the watcher.
+const spawnDebug = (env: Record<string, string>, extra: Record<string, string> = {}) => {
+  const child = spawn(process.execPath, [resolve("bin/agentmbx.js"), "watch"],
+    { env: { ...env, MBX_AGENT: "", MBX_WATCH_INTERVAL_MS: "200", MBX_WATCH_DEBUG: "1", ...extra } });
+  let out = "", err = "";
+  child.stdout.on("data", d => { out += d; });
+  child.stderr.on("data", d => { err += d; });
+  return { child, out: () => out, err: () => err, exited: new Promise<number | null>(r => child.on("exit", r)) };
+};
+const spawnCounts = (err: string) => {
+  const m = /probes (\d+) evidence spawns: startup (\d+) total (\d+)/.exec(err);
+  return m ? { probes: Number(m[1]), startup: Number(m[2]), total: Number(m[3]) } : null;
+};
+
+test("T343: an idle watcher pays zero process evidence; a quiet-but-alive holder pays one rate-limited probe", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-watch-t343-"));
+  const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "watch-t343", version: "1" });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const env = { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "kimi", MBX_AGENT: "worker", MBX_NO_DESKTOP: "1", MBX_DEBUG: "" } as Record<string, string>;
+  const transport = new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"], env });
+  await c.connect(transport);
+  const w = spawnDebug(env);
+  t.after(() => { w.child.kill(); });
+  assert.ok(await until(() => liveWatcher(n, "worker")), "the watcher registers");
+  n.store.db.prepare("UPDATE identity_leases SET heartbeat_at=? WHERE name='worker'").run(Date.now()); // flake fix: anchor the idle window
+  await new Promise(r => setTimeout(r, 3_000)); // ~15 ticks inside one staleness window: nothing to probe
+  w.child.kill("SIGTERM");
+  assert.equal(await w.exited, 143);
+  const idle = spawnCounts(w.err());
+  assert.ok(idle && idle.total - idle.startup === 0 && idle.probes === 0,
+    `zero evidence work across ~15 ticks on every platform: ${JSON.stringify(idle)}`);
+
+  // A holder that stays quiet past the 60 s staleness window while ALIVE: SIGSTOP freezes it (no
+  // heartbeats, but kill(pid,0) and its start time still prove life — a dead holder it is not).
+  // ONE rate-limited probe proves it alive; the watcher continues. Real-clock wait.
+  assert.ok(transport.pid, "the MCP child has a pid");
+  const w2 = spawnDebug(env, { MBX_WATCH_STALE_MS: "60000" }); // the clamp floor: one 60 s window, not the 180 s default
+  assert.ok(await until(() => liveWatcher(n, "worker")), "the second watcher registers");
+  process.kill(transport.pid!, "SIGSTOP");
+  t.after(() => { try { process.kill(transport.pid!, "SIGCONT"); } catch { /* already gone */ } });
+  assert.ok(await until(() => /probe live/.test(w2.err()), 75_000), "the probe fired inside the window (polled, not guessed — load-dependent timing)"); // one full staleness window, real clock
+  assert.ok(liveWatcher(n, "worker"), "a quiet-but-alive holder does not stop the watcher");
+  process.kill(transport.pid!, "SIGCONT");
+  w2.child.kill("SIGTERM");
+  assert.equal(await w2.exited, 143);
+  const stale = spawnCounts(w2.err());
+  // Probes are counted at the probe call, not as ps spawns (ubuntu CI: Linux reads /proc and never
+  // spawns ps): at least one probe fired, and the rate limit held on every platform.
+  assert.ok(stale && stale.probes >= 1, `the quiet holder paid at least one probe: ${JSON.stringify(stale)}`);
+  assert.ok(stale && stale.probes <= 3, `probes are rate-limited across the whole quiet stretch: ${JSON.stringify(stale)}`);
+});
+
+test("T343: a dead holder stops the watcher with the probe's reason", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-watch-dead-"));
+  const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "watch-t343-dead", version: "1" });
+  t.after(async () => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const env = { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "kimi", MBX_AGENT: "worker", MBX_NO_DESKTOP: "1", MBX_DEBUG: "" } as Record<string, string>;
+  const transport = new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"], env });
+  await c.connect(transport);
+  const w = spawnDebug(env, { MBX_WATCH_STALE_MS: "60000" }); // the clamp floor: the probe fires after one 60 s window, not 180
+  assert.ok(await until(() => liveWatcher(n, "worker")), "the watcher registers");
+  assert.ok(transport.pid, "the MCP child has a pid");
+  process.kill(transport.pid!, "SIGKILL"); // review major 3: a crash, never the graceful release path
+  // real-clock: the probe fires after one staleness window (60 s), then five strikes stop it
+  assert.equal(await w.exited, 1);
+  assert.match(w.out(), /^\[mbx-watch\] stopped: the holder process for worker is gone/, "the probe's own reason, not a release path");
+});
+
+test("T343: a lease that moves to another holder stops the pinned watcher and invalidates liveWatcher", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-watch-takeover-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  t.after(async () => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const envA = { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "kimi", MBX_AGENT: "worker", MBX_NO_DESKTOP: "1", MBX_DEBUG: "" } as Record<string, string>;
+  const cA = new Client({ name: "watch-takeover-a", version: "1" });
+  t.after(async () => { await cA.close().catch(() => {}); });
+  await cA.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"], env: envA }));
+  const w = spawnDebug(envA);
+  assert.ok(await until(() => liveWatcher(n, "worker")), "session A's watcher registers");
+  // A releases; B (a different parent process) claims the same name with a NEW token.
+  const leases = new IdentityLeases(n.store);
+  const row = n.store.db.prepare("SELECT token FROM identity_leases WHERE name='worker'").get() as { token: string };
+  leases.release("worker", row.token);
+  const cB = new Client({ name: "watch-takeover-b", version: "1" });
+  t.after(async () => { await cB.close().catch(() => {}); });
+  await cB.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"], env: envA }));
+  assert.equal(await w.exited, 1, "the pinned watcher stops when the lease moves");
+  assert.match(w.out(), /moved to another holder/, "with the pinning reason");
+  assert.equal(liveWatcher(n, "worker"), false, "a token-mismatched watcher record does not count as live");
 });
