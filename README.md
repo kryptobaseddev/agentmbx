@@ -316,4 +316,4 @@ AgentMBX is **source-available, not open source**. It is licensed under the [Bus
 - **Needs a commercial license:** offering it, or anything built from it, to others as a product, hosted service or embedded agent-messaging feature. Contact via [agentmbx.com](https://agentmbx.com).
 - **Change Date:** [LICENSE](LICENSE) fixes the Change Date at **2030-09-26**, with Apache License 2.0 as the Change License. Under BUSL 1.1 each version converts on the Change Date or on the fourth anniversary of its first public release, whichever comes first, so every version released so far converts no later than 2030-09-26.
 
-"AgentMBX" and "MBX" are trademarks of Keaton Hoskins; see [NOTICE](NOTICE).
+"AgentMBX" and "MBX" are trademarks of CodLuv LLC; see [NOTICE](NOTICE).
