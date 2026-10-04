@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS enrolments (
 CREATE INDEX IF NOT EXISTS enrolments_name ON enrolments(lower(host_name)) WHERE revoked_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS enrolments_account_name ON enrolments(account, host_name) WHERE revoked_at IS NULL AND account IS NOT NULL;
 CREATE TABLE IF NOT EXISTS enc_ads (host_pubkey TEXT PRIMARY KEY, host_name TEXT NOT NULL, enc_pub TEXT NOT NULL, sig TEXT NOT NULL, at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS enc_ad_records (host_pubkey TEXT PRIMARY KEY, record TEXT NOT NULL, sig TEXT NOT NULL, at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS items (
   target_pubkey TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL, item_id TEXT NOT NULL, sender_pubkey TEXT NOT NULL,
   sender_host TEXT NOT NULL, wire BLOB NOT NULL, wire_hash TEXT NOT NULL, bytes INTEGER NOT NULL, accepted_at TEXT NOT NULL,
@@ -32,7 +33,8 @@ CREATE TABLE IF NOT EXISTS sender_lists (target_pubkey TEXT PRIMARY KEY, senders
 CREATE TABLE IF NOT EXISTS ops (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, op TEXT NOT NULL, receipt TEXT NOT NULL);
 `;
 /** 1: T165 draft (wire TEXT, globally unique names). 2: wire BLOB, names unique per account, sender index.
- *  (Sequence numbers have a time floor; sender allowlists and the relay log are additive: no version change.) */
+ *  (Sequence numbers have a time floor; sender allowlists, signed enc-ad records and the relay log are additive: no
+ *  version change.) */
 export const SCHEMA_VERSION = 2;
 /** Upgrades from older schema versions, each in its own transaction. */
 const MIGRATIONS = {
@@ -145,6 +147,7 @@ export class SqliteRelayStore {
             }
             this.db.prepare("DELETE FROM items WHERE target_pubkey=?").run(oldPub);
             this.db.prepare("DELETE FROM enc_ads WHERE host_pubkey=?").run(oldPub);
+            this.db.prepare("DELETE FROM enc_ad_records WHERE host_pubkey=?").run(oldPub);
             this.db.prepare("UPDATE sender_lists SET target_pubkey=? WHERE target_pubkey=?").run(next.pubkey, oldPub);
             for (const l of this.db.prepare("SELECT target_pubkey, senders FROM sender_lists WHERE instr(senders, ?) > 0").all(oldPub)) {
                 const senders = JSON.parse(l.senders).map((k) => k === oldPub ? next.pubkey : k);
@@ -159,6 +162,15 @@ export class SqliteRelayStore {
     }
     encAd(pubkey) {
         const r = this.db.prepare(`SELECT a.host_name host, a.host_pubkey, a.enc_pub, a.sig, a.at FROM enc_ads a JOIN enrolments e ON e.host_pubkey=a.host_pubkey
+      WHERE a.host_pubkey=? AND e.revoked_at IS NULL`).get(pubkey);
+        return r ? { ...r } : null;
+    }
+    putEncAdRecord(r) {
+        this.db.prepare(`INSERT INTO enc_ad_records (host_pubkey,record,sig,at) VALUES (?,?,?,?)
+      ON CONFLICT(host_pubkey) DO UPDATE SET record=excluded.record, sig=excluded.sig, at=excluded.at`).run(r.host_pubkey, r.record, r.sig, r.at);
+    }
+    encAdRecord(pubkey) {
+        const r = this.db.prepare(`SELECT a.host_pubkey, a.record, a.sig, a.at FROM enc_ad_records a JOIN enrolments e ON e.host_pubkey=a.host_pubkey
       WHERE a.host_pubkey=? AND e.revoked_at IS NULL`).get(pubkey);
         return r ? { ...r } : null;
     }

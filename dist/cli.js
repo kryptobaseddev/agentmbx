@@ -9,7 +9,7 @@ import { buildGrant, CAPS, grantPayload, NAME_RE } from "./envelope.js";
 import { advertise, browse, lanIPv4 } from "./discovery.js";
 import { announceRotations, flushOutbox, flushReceipts, addrSignature, healPeerAddr, healStuckPeers, notifyUnpair, sendPresence, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.js";
 import { relayDrainOutbox, relayFor, relayPull } from "./relay-client.js";
-import { relayPushOutbox, relayPushReceipts, relayReceive, relayRoute, relaySettle } from "./relay-v2.js";
+import { parseRelayFingerprint, relayPin, relayPushOutbox, relayPushReceipts, relayReceive, relayRoute, relaySettle } from "./relay-v2.js";
 import { DEFAULT_QUOTA, parseRelayKey, RelayCore, startRelayServer } from "./relay.js";
 import { SqliteRelayStore } from "./relay-store.js";
 import { backupStore, readOps, restoredFrom, restoreStore, rotateEpochOp, STORE_DB, waitForLock } from "./relay-ops.js";
@@ -91,7 +91,8 @@ Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …'
   agentmbx wake mute <agent> [--minutes 60]          pause wake hints and notices for an agent (mail keeps arriving)   agentmbx wake unmute <agent>
   agentmbx daemon                                   agentmbx daemon install | uninstall   (launchd / systemd user service)
   agentmbx relay [serve [--port N]]                 run an untrusted store-and-forward relay (ADR-035 reference)
-  agentmbx relay set <url> | relay unset            point this daemon at a relay (picked up on daemon start)
+  agentmbx relay set <url> [--key <fingerprint>]    point this daemon at a relay and pin its key (--key: only that key, never trust on first use)
+  agentmbx relay unset                              stop using the relay (picked up on daemon start)
   agentmbx relay backup <file> [--store-dir DIR]    online backup of a relay store (safe while it runs); prints a receipt
   agentmbx relay restore <file> [--store-dir DIR] [--force]   replace a stopped relay's store: new epoch, revocations kept, rollback copy
   agentmbx relay log [--store-dir DIR] [--json] [--limit N]    the relay's receipts: backups, restores, epoch rotations, sweeps
@@ -237,7 +238,7 @@ async function launchClaude(args) {
     process.exitCode = code;
 }
 const RELAY_SERVER_COMMANDS = ["serve", "keygen", "rotate-epoch", "backup", "restore", "log"];
-const RELAY_USAGE = "relay [serve [--port N] [--store-dir DIR] [--trust-proxy]] | relay keygen | relay rotate-epoch [--store-dir DIR] | relay backup <file> [--store-dir DIR] | relay restore <file> [--store-dir DIR] [--force] | relay log [--store-dir DIR] [--json] [--limit N] | relay quarantine [--json] | relay set <url> | relay unset";
+const RELAY_USAGE = "relay [serve [--port N] [--store-dir DIR] [--trust-proxy]] | relay keygen | relay rotate-epoch [--store-dir DIR] | relay backup <file> [--store-dir DIR] | relay restore <file> [--store-dir DIR] [--force] | relay log [--store-dir DIR] [--json] [--limit N] | relay quarantine [--json] | relay set <url> [--key <fingerprint>] | relay unset";
 /** How long `relay serve` waits for another process to release the store (a redeploy can overlap the old one briefly). */
 const RELAY_LOCK_WAIT_MS = 60_000;
 /** The relay operator's side of `agentmbx relay`: everything that works on a relay store (T165, T167). */
@@ -360,7 +361,7 @@ async function run(argv) {
             compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" },
             backend: { type: "string" }, "no-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
             project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }, "wait-ms": { type: "string" }, "store-dir": { type: "string" }, "trust-proxy": { type: "boolean" },
-            "older-than": { type: "string" }, minutes: { type: "string" }, apply: { type: "boolean" }, days: { type: "string" }, fix: { type: "boolean" }
+            "older-than": { type: "string" }, minutes: { type: "string" }, apply: { type: "boolean" }, days: { type: "string" }, fix: { type: "boolean" }, key: { type: "string" }
         } });
     if (o.help)
         return console.log(commandHelp(cmd));
@@ -897,7 +898,16 @@ If the codes differ, do not approve: someone is in the middle.`);
             if (sub === "set" || sub === "unset") {
                 const cfg = join(node.home, "config.json");
                 const c = JSON.parse(readFileSync(cfg, "utf8"));
-                const value = sub === "set" ? (pos[1] ?? die("relay set <url>")) : undefined;
+                const value = sub === "set" ? (pos[1] ?? die("relay set <url> [--key <fingerprint>]")) : undefined;
+                if (value !== undefined) { // T168: pin the relay key now, or fail closed before anything changes
+                    const key = str("key");
+                    if (key !== undefined && !parseRelayFingerprint(key))
+                        die(`--key ${key}: not a relay key fingerprint (16 hex digits such as 1a2b-3c4d-5e6f-7a8b, as agentmbx relay serve prints it)`);
+                    const pin = await relayPin(node, value, key);
+                    if (!pin.ok)
+                        throw Object.assign(new Error(pin.message), { code: "RELAY_KEY" }); // exit 1, config unchanged
+                    console.log(pin.message);
+                }
                 if (value !== undefined)
                     c.relay = value;
                 else

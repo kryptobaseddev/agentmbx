@@ -108,7 +108,7 @@ test("restore drill: backup while running, mail accepted after the backup comes 
   const r = await restoreStore(dir, backupFile);
   assert.equal(r.epoch.from, backup.epoch, "the backup's epoch");
   assert.notEqual(r.epoch.to, oldEpoch); assert.notEqual(r.epoch.to, r.epoch.from);
-  assert.deepEqual(r.carried, { revocations: 1, sender_lists: 1, enc_ads: 1, seq_floors: 1 });
+  assert.deepEqual(r.carried, { revocations: 1, sender_lists: 1, enc_ads: 1, enc_ad_records: 0, seq_floors: 1 }); // beta's v2 record did not change after the backup
   assert.ok(r.replaced && existsSync(r.replaced.rollback) && r.replaced.sha256 === await sha256File(r.replaced.rollback), "the replaced store is kept");
   assert.deepEqual([mode(r.replaced!.rollback), mode(join(dir, "rollback")), mode(join(dir, "relay.db"))], [0o600, 0o700, 0o600], "rollback copy and restored store are owner-only");
   assert.equal(r.replaced!.epoch, oldEpoch);
@@ -199,7 +199,7 @@ test("restore refuses a running relay, another relay's backup, a newer schema an
   const forced = await restoreStore(dir, backup, { force: true });
   assert.equal(forced.replaced?.readable, false);
   assert.ok(forced.rollback?.endsWith("--force"));
-  assert.deepEqual(forced.carried, { revocations: 0, sender_lists: 0, enc_ads: 0, seq_floors: 0 });
+  assert.deepEqual(forced.carried, { revocations: 0, sender_lists: 0, enc_ads: 0, enc_ad_records: 0, seq_floors: 0 });
   core = new RelayCore({}, { store: new SqliteRelayStore(join(dir, "relay.db")), key, log: () => {} });
   t.after(() => core.store.close());
   assert.equal(core.store.epoch(), forced.epoch.to);

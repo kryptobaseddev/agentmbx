@@ -12,6 +12,8 @@ import { randomUUID } from "node:crypto";
  *  proved it (JWKS tokens, §8); `owner_fp` is the host's own unproven claim and decides nothing. */
 export interface Enrolment { host: string; pubkey: string; owner_fp: string; at: string; account?: string | null; authorized_by?: string | null; revoked_at?: string | null }
 export interface EncAd { host: string; host_pubkey: string; enc_pub: string; sig: string; at: string }
+/** A signed, expiring v2 advertisement (src/enc-ad.ts, T168): `record` is the canonical JSON the host signed. */
+export interface EncAdRecordRow { host_pubkey: string; record: string; sig: string; at: string }
 export type ItemKind = "envelope" | "receipt" | "expired";
 /** `wire` is the exact bytes the sender submitted; `wire_hash` is lowercase hex SHA-256 of those bytes. */
 export interface StoredItem { target_pubkey: string; seq: number; kind: ItemKind; item_id: string; sender_pubkey: string; sender_host: string; wire: Buffer; wire_hash: string; bytes: number; accepted_at: string; expires_at: string | null }
@@ -47,6 +49,9 @@ export interface RelayStore {
   rebind(oldPub: string, next: Enrolment): number;
   putEncAd(ad: EncAd): void;
   encAd(pubkey: string): EncAd | null;
+  /** The v2 advertisement of a live enrolment (T168); a rotation drops the old key's, like its v1 ad. */
+  putEncAdRecord(r: EncAdRecordRow): void;
+  encAdRecord(pubkey: string): EncAdRecordRow | null;
   dedup(sender_pubkey: string, item_id: string, target_pubkey: string): DedupHit | null;
   /** Allocate the next never-reused seq for the target and store the item and its dedup row. */
   insertItem(i: Omit<StoredItem, "seq">): number;
@@ -79,6 +84,7 @@ CREATE TABLE IF NOT EXISTS enrolments (
 CREATE INDEX IF NOT EXISTS enrolments_name ON enrolments(lower(host_name)) WHERE revoked_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS enrolments_account_name ON enrolments(account, host_name) WHERE revoked_at IS NULL AND account IS NOT NULL;
 CREATE TABLE IF NOT EXISTS enc_ads (host_pubkey TEXT PRIMARY KEY, host_name TEXT NOT NULL, enc_pub TEXT NOT NULL, sig TEXT NOT NULL, at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS enc_ad_records (host_pubkey TEXT PRIMARY KEY, record TEXT NOT NULL, sig TEXT NOT NULL, at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS items (
   target_pubkey TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL, item_id TEXT NOT NULL, sender_pubkey TEXT NOT NULL,
   sender_host TEXT NOT NULL, wire BLOB NOT NULL, wire_hash TEXT NOT NULL, bytes INTEGER NOT NULL, accepted_at TEXT NOT NULL,
@@ -95,7 +101,8 @@ CREATE TABLE IF NOT EXISTS sender_lists (target_pubkey TEXT PRIMARY KEY, senders
 CREATE TABLE IF NOT EXISTS ops (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, op TEXT NOT NULL, receipt TEXT NOT NULL);
 `;
 /** 1: T165 draft (wire TEXT, globally unique names). 2: wire BLOB, names unique per account, sender index.
- *  (Sequence numbers have a time floor; sender allowlists and the relay log are additive: no version change.) */
+ *  (Sequence numbers have a time floor; sender allowlists, signed enc-ad records and the relay log are additive: no
+ *  version change.) */
 export const SCHEMA_VERSION = 2;
 
 /** Upgrades from older schema versions, each in its own transaction. */
@@ -198,6 +205,7 @@ export class SqliteRelayStore implements RelayStore {
       }
       this.db.prepare("DELETE FROM items WHERE target_pubkey=?").run(oldPub);
       this.db.prepare("DELETE FROM enc_ads WHERE host_pubkey=?").run(oldPub);
+      this.db.prepare("DELETE FROM enc_ad_records WHERE host_pubkey=?").run(oldPub);
       this.db.prepare("UPDATE sender_lists SET target_pubkey=? WHERE target_pubkey=?").run(next.pubkey, oldPub);
       for (const l of this.db.prepare("SELECT target_pubkey, senders FROM sender_lists WHERE instr(senders, ?) > 0").all(oldPub) as { target_pubkey: string; senders: string }[]) {
         const senders = (JSON.parse(l.senders) as string[]).map((k) => k === oldPub ? next.pubkey : k);
@@ -213,6 +221,15 @@ export class SqliteRelayStore implements RelayStore {
   encAd(pubkey: string): EncAd | null {
     const r = this.db.prepare(`SELECT a.host_name host, a.host_pubkey, a.enc_pub, a.sig, a.at FROM enc_ads a JOIN enrolments e ON e.host_pubkey=a.host_pubkey
       WHERE a.host_pubkey=? AND e.revoked_at IS NULL`).get(pubkey) as EncAd | undefined;
+    return r ? { ...r } : null;
+  }
+  putEncAdRecord(r: EncAdRecordRow) {
+    this.db.prepare(`INSERT INTO enc_ad_records (host_pubkey,record,sig,at) VALUES (?,?,?,?)
+      ON CONFLICT(host_pubkey) DO UPDATE SET record=excluded.record, sig=excluded.sig, at=excluded.at`).run(r.host_pubkey, r.record, r.sig, r.at);
+  }
+  encAdRecord(pubkey: string): EncAdRecordRow | null {
+    const r = this.db.prepare(`SELECT a.host_pubkey, a.record, a.sig, a.at FROM enc_ad_records a JOIN enrolments e ON e.host_pubkey=a.host_pubkey
+      WHERE a.host_pubkey=? AND e.revoked_at IS NULL`).get(pubkey) as EncAdRecordRow | undefined;
     return r ? { ...r } : null;
   }
   senderList(target: string) {

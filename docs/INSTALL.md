@@ -93,10 +93,15 @@ sees plaintext bodies — envelopes are sealed for the recipient before they lea
    than `agentmbx relay restore` (a volume snapshot, a file copy), run `agentmbx relay rotate-epoch --store-dir <dir>`
    (a copy older than 10 minutes rotates at start by itself). Mail queued by 0.5.5 and newer daemons expires after 14
    days and its sender gets an "Undelivered to <host>" alert; mail from older (v1) daemons is kept until collected. The runbook is in [relay-durability.md §5.2](spec/relay-durability.md#52-runbook-t167).
-2. Point each daemon at it: `agentmbx relay set http://<relay-host>:7374`, then restart the daemon
-   (`agentmbx daemon install` hosts: `launchctl kickstart -k gui/$(id -u)/com.agentmbx.daemon`).
+2. Point each daemon at it and pin the relay key: `agentmbx relay set http://<relay-host>:7374 --key <fingerprint>`
+   (the fingerprint the relay printed at startup), then restart the daemon (`agentmbx daemon install` hosts:
+   `launchctl kickstart -k gui/$(id -u)/com.agentmbx.daemon`). With `--key` the daemon uses the relay only while it
+   serves exactly that key; a mismatch changes nothing and exits 1. Without `--key` the command pins the key the relay
+   serves now and prints its fingerprint for you to compare. If the relay's key later changes, relay use stops and
+   `agentmbx doctor` says so until you confirm the new key with `relay set <url> --key <new fingerprint>`.
 3. That's it: mail to unreachable peers flows through the relay and is pulled by the peer; `agentmbx doctor`
-   reports relay and enrolment status.
+   reports the pinned relay key, enrolment, why relay mail waits (a refused enrolment, a peer without a valid
+   encryption key ad) and how many messages are queued. A relay problem never drops queued mail silently: the sender is alerted.
 
 The relay needs no account and no pairing of its own — hosts enrol with their existing host keys, and quotas
 are per owner. See [SPEC.md](SPEC.md#relay-protocol-untrusted-store-and-forward-adr-035) and the threat model

@@ -5,10 +5,11 @@ import { phantomMailboxes, returnDays } from "./stranded.ts";
 import { join } from "node:path";
 import { fingerprint } from "./crypto.ts";
 import { signHop } from "./http.ts";
+import { relayState, ROLLBACK_REASON } from "./relay-v2.ts";
 import { kimiHostedServer, kimiInstances } from "./kimi-web.ts";
 import { kimiDesktop } from "./kimi-desktop.ts";
 import { version } from "./version.ts";
-import { MbxNode } from "./node.ts";
+import { MbxNode, RETRY_HOURS } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
 import { detect, edits, skillStatus, wired, type SetupCtx } from "./setup.ts";
 import { mailboxLiveness } from "./receipts.ts";
@@ -236,15 +237,43 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     for (const p of peers.filter((x) => x.state === "pending")) add("warn", `pairing with ${p.host} pending (code ${p.code})`, `if ${p.host} shows the same code: agentmbx pair approve ${p.host} ${p.code}`);
     const relay = process.env.MBX_RELAY_URL ?? (node.config as { relay?: string }).relay ?? null;
     if (relay) {
-      // G13: the client keys its enrolment by host key (v1) or by host key, relay key and epoch (v2, T166)
-      const db = node.store.db, hostPub = node.key.publicKey;
-      const enrolled = node.store.get(`relay-enrolled:${relay}:${hostPub}`)
-        ?? (db.prepare("SELECT v FROM kv WHERE k LIKE ? LIMIT 1").get(`relay-enrolled-v2:${relay}:${hostPub}:%`) as { v: string } | undefined)?.v;
-      add(enrolled ? "ok" : "warn", `relay configured: ${relay}${enrolled ? " (enrolled)" : " (not yet enrolled — the daemon enrols on its next pass)"}`,
+      // G13, T168: the client keys its enrolment by host key (v1) or by host key, relay key and epoch (v2). Only the flag
+      // for the pinned relay key and the current epoch counts: one from another key or epoch is stale and proves nothing.
+      const db = node.store.db, hostPub = node.key.publicKey, get = (k: string) => node!.store.get(k);
+      const pinned = get(`relay-key:${relay}`), epoch = get(`relay-epoch:${relay}`), src = get(`relay-key-src:${relay}`), expect = get(`relay-key-expect:${relay}`);
+      const enrolled = get(`relay-enrolled:${relay}:${hostPub}`) ?? (pinned && epoch ? get(`relay-enrolled-v2:${relay}:${hostPub}:${pinned}:${epoch}`) : null);
+      const keyNote = pinned ? `relay key ${fingerprint(pinned)} pinned ${src === "owner" ? "by the owner (relay set --key)" : src === "relay set" ? "at relay set" : "on first use"}`
+        : expect ? `relay key not pinned yet: only ${expect} will be accepted` : "relay key not pinned yet (pinned on first contact)";
+      add(enrolled ? "ok" : "warn", `relay configured: ${relay}${enrolled ? " (enrolled)" : " (not yet enrolled — the daemon enrols on its next pass)"}; ${keyNote}`,
         enrolled ? undefined : `check the relay is running: agentmbx relay serve --port …`);
       const n = (sql: string, ...a: string[]) => Number((db.prepare(sql).get(...a) as { c: number }).c);
-      const changed = db.prepare("SELECT detail FROM audit WHERE event='relay.key_changed' ORDER BY at DESC LIMIT 1").get() as { detail: string } | undefined;
-      if (changed && node.store.get(`relay-key:${relay}`)) add("fail", `relay ${relay} now serves a different key than the one pinned: relay use is stopped (${changed.detail})`, "confirm the relay operator rotated it, then: agentmbx relay set <url> --key <fingerprint>");
+      const mismatch = (() => { try { return JSON.parse(get(`relay-key-mismatch:${relay}`) ?? "null") as { how: string; pinned: string; served: string; at: string } | null; } catch { return null; } })();
+      if (mismatch) add("fail", `relay ${relay} now serves a different key than the one ${mismatch.how === "expected" ? "relay set --key named" : "pinned"}: relay use is stopped (${mismatch.how} ${mismatch.pinned}, served ${mismatch.served}, since ${mismatch.at})`,
+        `confirm with the relay operator that it rotated its key, then: agentmbx relay set ${relay} --key ${mismatch.served}`);
+      // T168: what the daemon's last relay pass found. Every failure keeps mail queued; say so, with the reason.
+      const st = relayState(node, relay), queued = n("SELECT COUNT(*) c FROM outbox");
+      const held = queued ? `; ${queued} message(s) wait in the outbox (the LAN keeps trying; after ${RETRY_HOURS} h undelivered mail alerts its sender)` : "";
+      if (st?.state === "enrol-failed") add(st.status === 401 || st.status === 403 ? "fail" : "warn", `relay ${relay} refused this host's enrolment since ${st.at} (${st.detail}): relay mail is paused${held}`,
+        st.status === 403 ? "this host key is revoked or not authorized on that relay: ask its operator (the daemon retries every pass)" : "the daemon re-enrols every pass; check the relay is reachable and runs a current agentmbx");
+      else if (st?.state === "clock-skew") add("fail", `relay ${relay} refuses this host's signed requests right after enrolling it (since ${st.at}): ${st.detail}; relay mail is paused${held}`,
+        `set this host's clock right (turn on network time: macOS System Settings > General > Date & Time, Linux timedatectl set-ntp true); the daemon retries enrolment with backoff, next at ${st.next_at}`);
+      else if (st?.state === "refused-after-enrol") add("fail", `relay ${relay} refuses this host's signed requests right after enrolling it (since ${st.at}): ${st.detail}; relay mail is paused${held}`,
+        `check the relay's log and version with its operator; the daemon retries enrolment with backoff, next at ${st.next_at}`);
+      else if (st?.state === "enc-ad-failed") add("warn", `relay ${relay} has not taken this host's encryption key ad since ${st.at} (${st.detail}): peers cannot seal relay mail for this host${held}`, "the daemon republishes every pass");
+      else if (st?.state === "unreachable") add("warn", `relay ${relay}: ${st.detail} since ${st.at}${held}`, "the daemon retries every pass");
+      else if (st?.state === "ok" && st.enc_ad_exp === null) add("warn", `relay ${relay} runs an agentmbx too old to store expiring encryption ads: peers on this version cannot seal relay mail for this host unless they learned its key on the LAN`, "upgrade the relay");
+      else if (st?.state === "ok" && st.enc_ad_exp) add("info", `this host's encryption key ad at the relay is valid until ${st.enc_ad_exp} (republished daily)`);
+      if (st?.state === "ok" && st.v1_stale) add("warn", `relay ${relay} still serves an old v1 encryption key for this host (${st.v1_stale}) and refuses v1 updates${st.v1_down ? ` (${st.v1_down})` : ""}: senders on 0.5.6 or older would seal relay mail for a key this host no longer holds (upgraded senders use the signed v2 ad)`,
+        "ask the relay operator to drop this host's v1 enc-key ad or accept v1 updates again; upgrade older peers");
+      for (const r of db.prepare("SELECT k, v FROM kv WHERE k LIKE 'relay-enc-rejected:%'").all() as { k: string; v: string }[]) {
+        const host = r.k.slice("relay-enc-rejected:".length), waiting = n("SELECT COUNT(*) c FROM outbox WHERE host=?", host);
+        let reason = "";
+        try { reason = String((JSON.parse(r.v) as { reason?: string }).reason ?? ""); } catch { /* shown without a reason */ }
+        if (waiting && reason.startsWith(ROLLBACK_REASON)) add("warn", `${waiting} message(s) for ${host} wait: the relay served an older encryption key ad for it than one already accepted, a possible replay of a retired key (${reason}); nothing is sealed for the older key`,
+          `it clears when the relay serves ${host}'s current ad (republished daily) or ${host} is reachable on the LAN; if it persists, the relay is replaying old ads`);
+        else if (waiting) add("warn", `${waiting} message(s) for ${host} wait: the relay offers no valid encryption key ad for it (${reason}), and nothing is sealed for an unverified key`,
+          `${host} must run a current agentmbx with this relay configured, or reach this host on the LAN once (its key is then pinned)`);
+      }
       const waiting = n("SELECT COUNT(*) c FROM relay_sent WHERE relay=? AND state='relay-accepted'", relay);
       if (waiting) add("info", `${waiting} message(s) accepted by the relay, waiting for the recipient host's delivery receipt`);
       const repush = n("SELECT COUNT(*) c FROM relay_sent WHERE relay=? AND state='repush'", relay);

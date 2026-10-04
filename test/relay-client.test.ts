@@ -76,8 +76,9 @@ test("relayDrainOutbox refuses to push plaintext when the peer published no enc 
   pair(a, b, "unused");
   await relayEnrol(a, relay);
   await relayEnrol(b, relay);
-  // strip beta's enc advertisement: without it the relay must not carry bodies
+  // strip beta's enc advertisements (the v1 pair and the signed v2 record): without one the relay must not carry bodies
   (core.store as SqliteRelayStore).db.prepare("DELETE FROM enc_ads WHERE host_name='beta'").run();
+  (core.store as SqliteRelayStore).db.prepare("DELETE FROM enc_ad_records WHERE host_pubkey=?").run(b.key.publicKey);
   a.send({ from: "alice", to: ["bob@beta"], subject: "x", body: "plaintext must not flow" });
   const drained = await relayDrainOutbox(a, relay);
   assert.deepEqual(drained, { pushed: 0, failed: 1 });

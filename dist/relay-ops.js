@@ -190,10 +190,15 @@ function readAuthority(db) {
         ops = all("SELECT at, op, receipt FROM ops ORDER BY id");
     }
     catch { /* a store older than the relay log */ }
+    let encAdRecords = [];
+    try {
+        encAdRecords = all("SELECT host_pubkey, record, sig, at FROM enc_ad_records");
+    }
+    catch { /* a store older than T168 */ }
     return { epoch: meta("epoch"), relay_pubkey: meta("relay_pubkey"),
         revoked: all("SELECT host_pubkey, host_name, owner_fp, account, authorized_by, enrolled_at, revoked_at FROM enrolments WHERE revoked_at IS NOT NULL"),
         senderLists: all("SELECT target_pubkey, senders, iat, record, sig FROM sender_lists"), encAds: all("SELECT host_pubkey, host_name, enc_pub, sig, at FROM enc_ads"),
-        seqs: all("SELECT target_pubkey, next_seq FROM seqs").map((r) => ({ target_pubkey: r.target_pubkey, next_seq: Number(r.next_seq) })), ops,
+        seqs: all("SELECT target_pubkey, next_seq FROM seqs").map((r) => ({ target_pubkey: r.target_pubkey, next_seq: Number(r.next_seq) })), ops, encAdRecords,
         restoredPaths: pathsOf(meta) };
 }
 /**
@@ -204,7 +209,8 @@ function readAuthority(db) {
  *    can open, and the same relay key as the store it replaces.
  * 3. Copies the current store into rollback/ with the online backup API and reads the authority it holds.
  * 4. On the copy: keeps every revocation (a key revoked or rotated away after the backup stays revoked), the newer
- *    signed sender allowlists and enc-key ads, each target's sequence floor, and the relay log; rotates the epoch;
+ *    signed sender allowlists and enc-key ads (v1 by receipt time, v2 records by signed iat, T168), each target's
+ *    sequence floor, and the relay log; rotates the epoch;
  *    writes a fresh heartbeat; logs the receipt.
  * 5. Renames the copy over relay.db: the old store or the new one, never a mix. A failure before that leaves the live
  *    store untouched.
@@ -295,7 +301,7 @@ export async function restoreStore(dir, file, o = {}) {
         try {
             const db = store.db;
             const carried = store.transaction(() => {
-                const c = { revocations: 0, sender_lists: 0, enc_ads: 0, seq_floors: 0 };
+                const c = { revocations: 0, sender_lists: 0, enc_ads: 0, enc_ad_records: 0, seq_floors: 0 };
                 if (!current)
                     return c;
                 for (const r of current.revoked) {
@@ -320,6 +326,21 @@ export async function restoreStore(dir, file, o = {}) {
                         continue;
                     store.putEncAd({ host: a.host_name, host_pubkey: a.host_pubkey, enc_pub: a.enc_pub, sig: a.sig, at: a.at });
                     c.enc_ads++;
+                }
+                // T168: the signed v2 ad with the newer signed iat wins, so a restore never serves an older ad than the live store
+                // held (senders also refuse an older ad naming another key; that guard lives in each sender's own store)
+                const iatOf = (record) => { try {
+                    return Date.parse(JSON.parse(record ?? "null")?.iat ?? "");
+                }
+                catch {
+                    return NaN;
+                } };
+                for (const a of current.encAdRecords) {
+                    const theirs = iatOf(a.record), mine = iatOf(db.prepare("SELECT record FROM enc_ad_records WHERE host_pubkey=?").get(a.host_pubkey)?.record);
+                    if (!Number.isFinite(theirs) || (Number.isFinite(mine) && mine >= theirs))
+                        continue;
+                    store.putEncAdRecord({ host_pubkey: a.host_pubkey, record: a.record, sig: a.sig, at: a.at });
+                    c.enc_ad_records++;
                 }
                 for (const q of current.seqs) {
                     const mine = Number(db.prepare("SELECT next_seq FROM seqs WHERE target_pubkey=?").get(q.target_pubkey)?.next_seq ?? 0);
