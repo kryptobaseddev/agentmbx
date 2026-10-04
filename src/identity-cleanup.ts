@@ -7,6 +7,7 @@ import { canonical, fingerprint, verifyData } from "./crypto.ts";
 import { NAME_RE } from "./envelope.ts";
 import { identityAvailability, activityKey, parseActivity } from "./identity-availability.ts";
 import { inspectLeaseProcess, type IdentityLease, type ProcessEvidence } from "./identity-leases.ts";
+import { bumpPostToolMarkersForAgent } from "./posttool.ts";
 import { AUTO_NAME_RE, registeredIdentity } from "./registry.ts";
 import type { MbxNode } from "./node.ts";
 
@@ -101,7 +102,7 @@ export function applyForward(node: MbxNode, approval: { payload: ForwardPayload;
   if (!owner || fingerprint(owner) !== payload.owner_fp || !verifyData(owner, canonical(payload), approval.sig)) throw new Error("invalid owner forward signature");
   if (payload.host !== node.host || payload.host_fp !== fingerprint(node.key.publicKey)) throw new Error("owner forward approval names another host");
   if (payload.issued_at > now || payload.expires_at <= now) throw new Error("owner forward approval expired");
-  return node.store.tx(() => {
+  const result = node.store.tx(() => {
     if (node.store.get(`forward-used:${payload.id}`)) throw new Error("owner forward approval was already used");
     node.store.set(`forward-used:${payload.id}`, String(now));
     const pending = node.store.db.prepare("SELECT msg_id,state,updated_at,note FROM deliveries WHERE agent=? AND state<>'acked'").all(payload.from) as { msg_id: string; state: string; updated_at: string; note: string | null }[];
@@ -113,4 +114,7 @@ export function applyForward(node: MbxNode, approval: { payload: ForwardPayload;
     node.store.audit("identity.forward", { from: payload.from, to: payload.to, moved: pending.length, owner_fp: payload.owner_fp, approval: payload.id });
     return { moved: pending.length };
   });
+  // T342: unread mail moved to payload.to; its claude sessions' hooks must notice (review medium 2).
+  bumpPostToolMarkersForAgent(node.store.db, node.home, payload.to);
+  return result;
 }

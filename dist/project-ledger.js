@@ -5,6 +5,7 @@
 import { z } from "zod";
 import { canonical, fingerprint, ulid, verifyData } from "./crypto.js";
 import { ownerKeys } from "./policy.js";
+import { bumpPostToolMarkersForAgent } from "./posttool.js";
 import { deliveryReceipts } from "./receipts.js";
 import { projectIdentities, projectKey, registeredIdentity } from "./registry.js";
 export const LEAD_DEFAULT_TTL_MS = 30 * 86_400_000;
@@ -197,5 +198,6 @@ export function forwardMessage(node, lead, project, id, to) {
         node.store.set(forwardKey(m.id, target), `${lead}@${node.host}`);
         node.store.audit("message.forwarded", { msg: m.id, by: `${lead}@${node.host}`, to: `${target}@${node.host}`, project });
     });
+    bumpPostToolMarkersForAgent(node.store.db, node.home, target);
     return { id: m.id, to: `${target}@${node.host}` };
 }

@@ -2,9 +2,11 @@ import { sendLeased } from "./helpers/leased-send.ts";
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { writeHud } from "../src/hud.ts";
+import { posttoolFileCount } from "../src/posttool.ts";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { canonical, signData } from "../src/crypto.ts";
@@ -12,6 +14,7 @@ import { createOwnerKey, unlockOwnerKey } from "../src/owner.ts";
 import { acceptSigned, makePolicy } from "../src/policy.ts";
 import { MbxNode } from "../src/node.ts";
 import { IdentityLeases } from "../src/identity-leases.ts";
+import { applyForward, buildForward } from "../src/identity-cleanup.ts";
 
 for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} startup offers recovery choices without claiming historical mail`, t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-startup-choice-")), node = new MbxNode(home, { host: "alpha" });
@@ -154,6 +157,91 @@ test("Claude post-tool deduplicates exact leased mailbox arrivals and ignores re
   n.store.set("ident:shell", agent); send("shell");
   assert.equal(run("post-tool").stdout, "");
   assert.equal(run("post-tool", "different-session").stdout, "");
+});
+
+// T342: the bundled sh wrapper must decide "nothing changed" without starting node — two small
+// file reads — and every doubt must fall through to the full hook, whose decisions are unchanged.
+test("T342: the post-tool wrapper skips steady state without node; markers bump on bind and delivery; the sweep prunes", async t => {
+  const { n, agent, sid, run, send } = await holder(t, "claude");
+  const script = resolve("skill/scripts/claude-posttool.sh");
+  const dir = join(n.home, "posttool");
+  const markerFile = join(dir, `claude-${sid}.marker`), lastFile = join(dir, `claude-${sid}.last`);
+  // The wrapper takes the hook's resolved command as arguments (review high — never PATH agentmbx).
+  // For the full-path run we hand it THIS checkout; for the node-absent steady run a sentinel that
+  // proves any exec.
+  const sentinelDir = mkdtempSync(join(tmpdir(), "mbx-t342-sentinel-"));
+  t.after(() => rmSync(sentinelDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  const sentinel = join(sentinelDir, "spawned");
+  const sentinelScript = join(sentinelDir, "runme");
+  writeFileSync(sentinelScript, `#!/bin/sh\ntouch "${sentinel}"\nexit 0\n`, { mode: 0o700 });
+  const wrap = (argv: string[], path: string, session: unknown = sid) => spawnSync("/bin/sh", [script, ...argv], {
+    input: JSON.stringify({ session_id: session, cwd: process.cwd() }), encoding: "utf8",
+    env: { ...process.env, MBX_HOME: n.home, AGENTMBX_DEV: "1", PATH: path } });
+
+  // The prompt hook binds the session; the bind bumps the fast-path marker into existence.
+  assert.equal(run("prompt").status, 0);
+  assert.ok(existsSync(markerFile), "a claude bind writes the marker");
+
+  // New mail bumps the marker (delivery = the unacked-id set grew, so the hook decision may change).
+  const before = readFileSync(markerFile, "utf8");
+  send();
+  const after = readFileSync(markerFile, "utf8");
+  assert.notEqual(after, before, "a local delivery bumps the marker");
+
+  // The wrapper falls through to the full hook (this checkout's), which notifies and records .last.
+  const notice = wrap([process.execPath, resolve("bin/agentmbx.js")], process.env.PATH!);
+  assert.equal(notice.status, 0, notice.stderr); assert.match(notice.stdout, /1 unread/);
+  assert.equal(readFileSync(lastFile, "utf8"), after, "the full path records the marker it processed");
+
+  // Steady state: marker == last. With node absent from PATH the wrapper must skip silently and
+  // never exec the hook command at all (the sentinel stays untouched).
+  const steady = wrap([sentinelScript], "/bin:/usr/bin");
+  assert.equal(steady.status, 0, steady.stderr);
+  assert.equal(steady.stdout, "");
+  assert.ok(!existsSync(sentinel), "steady state execs nothing");
+  assert.equal(run("post-tool").stdout, "", "full path still silent in steady state");
+
+  // An invalid session id falls through (it cannot key a marker).
+  const badSid = wrap([sentinelScript], "/bin:/usr/bin", "bad id!");
+  assert.equal(badSid.stdout, "", "no session id, no marker: silent without node is fine (Claude re-runs nothing)");
+
+  // The daemon-tick sweep prunes markers whose binding vanished.
+  n.store.db.prepare("DELETE FROM sessions WHERE cli='claude' AND session_id=?").run(sid);
+  writeHud(n);
+  assert.ok(!existsSync(markerFile) && !existsSync(lastFile), "an unbound session's marker and last are swept");
+  assert.equal(posttoolFileCount(n.home), 0);
+});
+
+// Review medium 2: every other way a mailbox gains unread mail must also bump the marker.
+test("T342: rename and owner forward bump the fast-path markers", t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-t342-m2-"));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  const n = new MbxNode(home, { host: "alpha" });
+  t.after(() => n.close());
+  n.bindSession({ agent: "renamer", cli: "claude", session_id: "rn-1", pid: process.pid });
+  const markerFile = join(n.home, "posttool/claude-rn-1.marker");
+  const first = readFileSync(markerFile, "utf8");
+  sendLeased(n, { from: "boss", to: ["renamer"], subject: "hi", body: "b" });
+  const afterSend = readFileSync(markerFile, "utf8");
+  assert.notEqual(afterSend, first);
+  n.addAlias("renamer", "renamed", process.pid);
+  assert.notEqual(readFileSync(markerFile, "utf8"), afterSend, "a rename bumps the marker under the new name");
+
+  // owner forward: unread mail moving to a mailbox whose claude session is bound bumps its marker
+  const home2 = mkdtempSync(join(tmpdir(), "mbx-t342-fwd-"));
+  t.after(() => rmSync(home2, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  createOwnerKey(home2, "test-only-passphrase");
+  const n2 = new MbxNode(home2, { host: "alpha" });
+  t.after(() => n2.close());
+  const owner2 = unlockOwnerKey(home2, "test-only-passphrase");
+  n2.registerAgent("orbit-lead"); n2.registerAgent("orbit-mcp-0123456789abcdef");
+  n2.bindSession({ agent: "orbit-lead", cli: "claude", session_id: "fwd-1", pid: process.pid });
+  const fwdMarker = join(home2, "posttool/claude-fwd-1.marker");
+  const fwdBefore = readFileSync(fwdMarker, "utf8");
+  sendLeased(n2, { from: "boss", to: ["orbit-mcp-0123456789abcdef"], subject: "one", body: "1" });
+  const payload = buildForward(n2, "orbit-mcp-0123456789abcdef", "orbit-lead");
+  applyForward(n2, { payload, sig: signData(owner2.privateKey, canonical(payload)) });
+  assert.notEqual(readFileSync(fwdMarker, "utf8"), fwdBefore, "an owner forward bumps the target's marker");
 });
 
 test("unleased hooks neither rebind legacy sessions nor reveal mailbox counts", t => {
