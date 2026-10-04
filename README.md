@@ -63,7 +63,8 @@ remote delivery, model execution, a reply, or task completion.
 | Handoff summaries and optional drafts | Spec merged (docs/spec/handoff-context.md); implementation planned; no draft API today | T159–T163, T184–T189 |
 | Durable relay: SQLite store, relay-signed accepts, restore-proof sequencing, sender deadlines, v2 client | Shipped in v0.5.5; hosted at relay.agentmbx.com since 2026-10-03 | T164–T166, T307 |
 | Status surface: `agentmbx status --json` (mbx.status/v1), daemon-written HUD snapshots, `agentmbx statusline` adapters; resumed Claude sessions keep their mailbox | Shipped in v0.5.6 (Claude, Codex, Kimi, OpenCode; Grok, Copilot, Cursor and Gemini adapters render once session detection lands) | T308–T313, T326, T337 |
-| Relay backup/restore drills, retention sweep, expiry notices, relay key pinning | Planned | T167–T168 |
+| Relay crash drills, `relay backup`/`restore`/`log` with receipts and rollback, retention sweep, expiry notices | Unreleased (main) | T167 |
+| Relay key pinning by fingerprint, enrolment authority | Planned | T168 |
 | HTTPS deployment, monitoring, backup/restore, enrollment, consent and home/work qualification | Planned | T169–T173; T036–T039 |
 | Local private console, searchable handoffs and scoped topics | Planned; existing replay tag filters do not subscribe recipients | T152–T155, T127–T128, T174–T176 |
 | Provider wake verification and signed capability discovery | Typed outcomes, exact-session wakes, uncertain-wake reconciliation and wake mute shipped in v0.5.1 (T177–T179), with real-session receipts for every provider (T180); signed capability discovery remains planned | T068, T132 |

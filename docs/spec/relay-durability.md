@@ -140,7 +140,9 @@ at most `max_batch` items.
   receipt:<msg>:<recipient>:<seq>`; envelopes MUST be sealed and carry `item_id` as their id.
 - **Dedup.** For each target, `(sender_pubkey, item_id, target_pubkey)`:
   - absent → insert the item and the dedup row, and allocate a seq;
-  - present with the same `wire_hash` → `duplicate`, returning the original seq;
+  - present with the same `wire_hash` → `duplicate`, returning the original seq. Its accept statement carries the
+    original acceptance time as `at` (T167), so a retry, a re-push after a restore, or a retry after expiry never
+    moves the sender's deadline;
   - present with a different `wire_hash` → `rejected:conflict`, and nothing changes.
 - **Response.** `{results:[{item_id, status: "accepted"|"duplicate"|"rejected:<code>", targets:[{host_pubkey, seq}],
   accept: {v:1, type:"relay-accept", relay_pubkey, epoch, sender_pubkey, item_id, targets:[{host_pubkey, seq,
@@ -156,7 +158,11 @@ at most `max_batch` items.
   missing result, or a lost response leaves the row pending.
 - Keep the accepted row in state `relay-accepted` (with seq, epoch and the receipt) until the target's T218
   delivery receipt for that message arrives, or retention expires (§6). This is what makes a relay restore (§5)
-  recoverable: the sender still holds the bytes.
+  recoverable: the sender still holds the bytes. Through a re-push after an epoch change the row stays in
+  `relay_sent` as `repush`, keeping its deadline (T167): the LAN outbox's 72 h give-up never applies to it, since the
+  target may need days to come back and re-enrol. A LAN delivery, a delivery receipt, an expiry notice or the deadline
+  ends it, and local mailbox retention (`agentmbx prune`) never removes a message with a `relay-accepted` or `repush`
+  row.
 - **Own its deadline.** A `relay-accepted` row whose delivery receipt has not arrived by `accepted_at + retention +
   grace` (grace 24 h) is marked unconfirmed and the local sender gets "Undelivered/unconfirmed to <host>", without
   waiting for anything from the relay. The relay's expiry notice (§6) is an early signal, never the only one, because
@@ -220,10 +226,90 @@ state retryable: the next pull starts at `received_through`, and the relay simpl
   - A receiver resets its relay position for that relay to 0 and pulls everything. Receiver dedup by message id
     (`node.receive` → `duplicate`) and `acceptReceipt` (state rank, then seq) make repeats harmless.
 
-  Post-backup mail is therefore recovered from senders rather than lost.
+  Post-backup mail is therefore recovered from senders rather than lost. A receiver that gets a relay item it already
+  has (a duplicate) queues its delivery receipt for that message again (T167): the sender pushed it again, so it is
+  still waiting, and the receipt the relay accepted after its backup was lost with it.
 - **Backup.** `agentmbx relay backup <file>` uses the SQLite online backup API. It is safe while the relay runs.
   `agentmbx relay restore <file>` refuses while the relay runs, writes a new epoch, and records the restore in the
   relay log. Backups contain only ciphertext bodies plus the metadata in the threat model.
+
+#### 5.1 As implemented (T167)
+
+- **One writer per store.** `relay serve` holds an exclusive SQLite lock on `relay.lock` in the store directory for
+  its whole life (it waits up to 60 s for it at start, for an overlapping redeploy). The operating system releases it
+  when the process dies, even by SIGKILL. `relay restore` takes the same lock, so it can never replace a store under a
+  running relay, and a relay cannot start during a restore. For a store without `relay.lock` (a relay older than
+  T167), a heartbeat younger than 90 s also refuses a restore unless `--force`.
+- **Backup** (`src/relay-ops.ts` `backupStore`): one backup-API step (one consistent snapshot while the relay writes),
+  written beside the target, switched to a rollback journal (a single self-contained file), integrity-checked, then
+  renamed into place; an existing file is never overwritten. Receipt: `{type:"relay-backup", file, bytes, sha256,
+  epoch, relay_fingerprint, schema_version, heartbeat, counts, restore}`, printed and appended to the relay log.
+- **Restore** (`restoreStore`), all or nothing:
+  1. The backup is copied (with its `-wal`, if it is a raw volume copy) and checked: integrity, a relay store (epoch
+     and relay key), a schema this binary can open, and the **same relay key** as the store it replaces (clients
+     pinned it, §1). The file given is never modified.
+  2. The current store is copied to `rollback/relay-<time>.db` with the backup API, and the authority it holds is read.
+     If it cannot be read, the restore stops unless `--force` (its raw files are then kept in `rollback/`).
+  3. **A restore never recreates authority.** The copy keeps every revocation of the current store (a key revoked or
+     rotated away after the backup stays revoked, and cannot re-enrol), the newer signed sender allowlist of each
+     target and the newer signed enc-key ads (by `iat` / `at`), each target's sequence floor, and the relay log.
+     Only what restricts, or what its owner signed, is carried; enrolments made after the backup are not (those hosts
+     get `401` and re-enrol, §8).
+  4. The epoch rotates, the heartbeat is set to now (so `serve` does not rotate again for the backup's age), and the
+     receipt is logged in the copy.
+  5. The copy is renamed over `relay.db`; the old store's WAL never meets the new file. A failure before the rename
+     leaves the live store untouched.
+
+  Receipt: `{type:"relay-restore", backup:{file, sha256, epoch, …}, replaced:{epoch, rollback, sha256, readable},
+  epoch:{from, to}, carried:{revocations, sender_lists, enc_ads, seq_floors}, counts, rollback, next}`. `rollback` is
+  the exact command that undoes it: restoring the rollback copy, which is itself a restore (a new epoch, clients
+  converge again, dedup absorbs the repeats).
+- **Hosted relays** cannot run `relay restore` beside the relay process (the container is the relay).
+  `MBX_RELAY_RESTORE_FROM=<backup on the volume>` makes `relay serve` restore it at start, under its own lock, once:
+  the backup's sha256 is recorded in the store (`meta.restored`) and a restart with the variable still set restores
+  nothing. A failed startup restore is logged and the relay serves the current store unchanged.
+- **The relay log** (`ops` table, last 1,000; `agentmbx relay log [--json]`) holds every receipt: backups, restores,
+  operator and startup epoch rotations (with the stale or future heartbeat that caused them), and each retention sweep
+  that changed something. A restore carries the current log into the restored store.
+- **Crash drills** (`test/relay-crash-drills.test.ts`) kill real child processes with SIGKILL: the relay before and
+  after the accept commit, before a pull answer, and before and after the ack commit; the sending host after
+  persisting its bytes and after the relay answered; the receiving host after delivery before its checkpoint, after its
+  checkpoint before the ack, and after the ack before recording it; and the real `agentmbx relay serve` mid-push and
+  mid-pull. Each restart loses nothing, delivers nothing twice, keeps sequences increasing and keeps the epoch.
+
+#### 5.2 Runbook (T167)
+
+Self-hosted relay (`--store-dir DIR`, default `~/.local/share/agentmbx-relay`):
+
+1. **Back up** (any time, relay running): `agentmbx relay backup /backups/relay-$(date +%F).db --store-dir DIR`. Keep
+   the printed receipt (sha256). Keep `relay.key` (or the `MBX_RELAY_KEY` secret) separately: a backup holds no key.
+2. **Restore**: stop the relay, then `agentmbx relay restore <backup> --store-dir DIR`. Keep the receipt; it names the
+   rollback copy and the command that undoes the restore. Start the relay. Check `agentmbx relay log` and that
+   `GET /v2/relay/info` shows the receipt's `epoch.to`.
+3. **Roll back** a restore: stop the relay, run the receipt's `rollback` command, start the relay.
+4. **Any other restore** (a volume snapshot, a file copy): run `agentmbx relay rotate-epoch --store-dir DIR` before or
+   right after the relay starts (it is safe while it runs). A copy older than 10 minutes rotates at start by itself.
+
+Hosted relay (Railway, `relay.agentmbx.com` and `relay-staging.agentmbx.com`; daily volume backups, 7 kept). These
+steps need the live service and the owner, so they are a procedure, not a test; rehearse on staging first:
+
+1. Before: `node scripts/relay-restore-check.mjs https://relay-staging.agentmbx.com > before.json` (read-only: the key
+   fingerprint, epoch and version the relay serves).
+2. **Volume restore**: restore the volume from a Railway backup. The service restarts on the old data; its heartbeat is
+   hours old, so it rotates the epoch at start and logs one line with the heartbeat, its age and both epochs.
+   **File restore**: the backup must be on the volume (for example one made over `railway ssh` with
+   `agentmbx relay backup /data/backups/<file> --store-dir /data`). Set `MBX_RELAY_RESTORE_FROM=/data/backups/<file>`,
+   redeploy, keep the receipt from the deploy log, then unset the variable.
+3. After: `node scripts/relay-restore-check.mjs https://relay-staging.agentmbx.com --before before.json`. Exit 0 means
+   a new epoch under the same relay key. A changed key means the wrong store or key secret: clients refuse the relay
+   (§1), so restore the right one. An unchanged epoch means run `agentmbx relay rotate-epoch --store-dir /data` (via
+   `railway ssh`).
+4. Roll back a volume restore by restoring the newer volume backup, or a file restore with
+   `MBX_RELAY_RESTORE_FROM=/data/rollback/relay-<time>.db` (the receipt in the deploy log names it).
+
+Known limit: a message acked by its target before the backup whose delivery receipt the relay accepted after the
+backup is not re-delivered (the restored store remembers it), so that receipt is not sent again; its sender alerts
+"unconfirmed" at its deadline although the mail was delivered. Nothing is lost silently.
 
 ### 6. Retention and expiry (T167)
 
@@ -237,6 +323,18 @@ sender's daemon marks its `relay-accepted` row expired and sends the local sende
 sends after 72 h ("Undelivered to <host>"). Nothing expires silently (G12). Expired receipt items are dropped without
 notice, because receipts are advisory. The notice is best effort: senders also enforce their own deadline (§3).
 
+As implemented (T167): `relay serve` sweeps at start and every 10 minutes (`RelayCore.sweep`), in bounded batches,
+each one transaction. Only items whose `expires_at` has passed are touched. The notice is the item
+`expired:<item_id>:<target_pubkey>` with wire bytes canonical(`{notice, sig}`); a sweep after a restore never queues the
+same notice twice. A notice is not queued when the sender's key is no longer enrolled (revoked or rotated away) or when
+the sender's own queue is at its item or byte cap: quotas hold, and the sender's deadline covers it. Expired items no
+longer count against any quota. The sender applies a notice only if the pinned relay key signed it and it names the
+row with that message **and that target key** (a row re-sealed for a rotated key is a different one); the row ends
+`expired`, leaves the outbox if a re-push was pending, and the sender gets "Undelivered to <host>". If the target
+already confirmed delivery (its pull raced the sweep), the row settles instead and nobody is alerted. A forged notice is
+quarantined. Each sweep that changed something writes a receipt to the relay log (`relay-sweep`: expired by kind,
+notices, notices skipped and why, dedup rows pruned, bytes freed).
+
 ### 7. Quotas and bounds
 
 Quotas charge what the relay can prove. Per target host key: `max_queue_items` and `max_queue_bytes` (10,000 and
@@ -247,7 +345,8 @@ anyone could claim another owner's fingerprint and exhaust that owner's quota. P
 sender key.
 Per request: `max_batch` and the body cap (`RELAY_MAX_BODY`), checked while streaming. Per pull: `max_pull` and
 `max_pull_bytes`. v1 pulls are bounded the same way. The
-dedup horizon is retention + 7 days. A quota failure rejects the whole item (§3) with `rejected:quota:<which>`, and
+dedup horizon is retention + 7 days: the sweep deletes dedup rows accepted before it whose item is gone (acked or
+expired); a row whose item is still queued is never pruned (T167). A quota failure rejects the whole item (§3) with `rejected:quota:<which>`, and
 the sender keeps its row and retries with backoff.
 
 ### 8. Enrolment and enc-key advertisement recovery (T168)
@@ -333,6 +432,11 @@ v1 otherwise. Mixed hosts work because items are opaque to the relay, and receiv
   - Tests: real child-process crashes at every commit, response and checkpoint boundary; backup while running; a
     restore that rotates the epoch, re-pushes from senders and lets receivers re-pull without duplicates; the expiry
     sweep and the expiry notice to the sender.
+  - Done: `test/relay-crash-drills.test.ts` (relay, sender and receiver SIGKILLed at each boundary, and the real
+    `relay serve` mid-push and mid-pull), `test/relay-recovery.test.ts` (backup while serving; restore with authority
+    carried forward and rollback; refusals; the sweep, notices, tombstones and quota; no local expiry rule dropping
+    accepted mail; the CLI and `MBX_RELAY_RESTORE_FROM`). The hosted restore drill is the runbook in §5.2, with
+    `scripts/relay-restore-check.mjs`; it runs with the owner as part of T147.
 - **T168: enrolment and enc-ad recovery.** §1, §8 (`EnrolmentAuthority` with the host-key implementation), the G13
   doctor fix.
   - Tests: re-enrolment after a restart and after a restore; a name squatter never receives a host's mail (key routing); a relay key change stops

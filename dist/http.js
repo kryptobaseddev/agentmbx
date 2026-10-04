@@ -533,7 +533,14 @@ export async function flushOutbox(node, now = Date.now()) {
     for (const r of due)
         byHost.set(r.host, [...(byHost.get(r.host) ?? []), r]);
     let sent = 0, failed = 0;
-    const done = (id, host) => node.store.db.prepare("DELETE FROM outbox WHERE msg_id=? AND host=?").run(id, host);
+    // A row the relay accepted before a restore is back here for a re-push (state `repush`, T167). The LAN may still
+    // deliver it, which settles it; the relay deadline (relaySettle), not the LAN's 72 h, decides when it is given up.
+    const done = (id, host) => node.store.tx(() => {
+        node.store.db.prepare("DELETE FROM outbox WHERE msg_id=? AND host=?").run(id, host);
+        if (node.store.db.prepare("UPDATE relay_sent SET state='settled', settled_at=? WHERE msg_id=? AND host=? AND state='repush'").run(new Date(now).toISOString(), id, host).changes)
+            node.store.db.prepare("DELETE FROM relay_wire WHERE msg_id=? AND host=?").run(id, host);
+    });
+    const heldByRelay = (id, host) => !!node.store.db.prepare("SELECT 1 FROM relay_sent WHERE msg_id=? AND host=? AND state='repush'").get(id, host);
     const alertSender = (r, why) => {
         const e = JSON.parse(r.envelope);
         node.send({ from: "mbx", to: [e.from.split("@")[0]], kind: "alert", subject: `Undelivered to ${r.host}: ${e.subject}`, body: `Message ${e.id} could not be delivered to host ${r.host}: ${why}` });
@@ -568,7 +575,7 @@ export async function flushOutbox(node, now = Date.now()) {
         }
         catch (err) {
             for (const r of rows) {
-                if (now - Date.parse(r.created_at) > RETRY_HOURS * 3_600_000) {
+                if (now - Date.parse(r.created_at) > RETRY_HOURS * 3_600_000 && !heldByRelay(r.msg_id, host)) {
                     done(r.msg_id, host);
                     failed++;
                     alertSender(r, `gave up after ${RETRY_HOURS} h (${err.message})`);

@@ -475,7 +475,14 @@ export async function flushOutbox(node: MbxNode, now = Date.now()): Promise<{ se
   const byHost = new Map<string, typeof due>();
   for (const r of due) byHost.set(r.host, [...(byHost.get(r.host) ?? []), r]);
   let sent = 0, failed = 0;
-  const done = (id: string, host: string) => node.store.db.prepare("DELETE FROM outbox WHERE msg_id=? AND host=?").run(id, host);
+  // A row the relay accepted before a restore is back here for a re-push (state `repush`, T167). The LAN may still
+  // deliver it, which settles it; the relay deadline (relaySettle), not the LAN's 72 h, decides when it is given up.
+  const done = (id: string, host: string) => node.store.tx(() => {
+    node.store.db.prepare("DELETE FROM outbox WHERE msg_id=? AND host=?").run(id, host);
+    if (node.store.db.prepare("UPDATE relay_sent SET state='settled', settled_at=? WHERE msg_id=? AND host=? AND state='repush'").run(new Date(now).toISOString(), id, host).changes)
+      node.store.db.prepare("DELETE FROM relay_wire WHERE msg_id=? AND host=?").run(id, host);
+  });
+  const heldByRelay = (id: string, host: string) => !!node.store.db.prepare("SELECT 1 FROM relay_sent WHERE msg_id=? AND host=? AND state='repush'").get(id, host);
   const alertSender = (r: (typeof due)[number], why: string) => {
     const e = JSON.parse(r.envelope) as Envelope;
     node.send({ from: "mbx", to: [e.from.split("@")[0]], kind: "alert", subject: `Undelivered to ${r.host}: ${e.subject}`, body: `Message ${e.id} could not be delivered to host ${r.host}: ${why}` });
@@ -499,7 +506,7 @@ export async function flushOutbox(node: MbxNode, now = Date.now()): Promise<{ se
       }
     } catch (err) {
       for (const r of rows) {
-        if (now - Date.parse(r.created_at) > RETRY_HOURS * 3_600_000) { done(r.msg_id, host); failed++; alertSender(r, `gave up after ${RETRY_HOURS} h (${(err as Error).message})`); continue; }
+        if (now - Date.parse(r.created_at) > RETRY_HOURS * 3_600_000 && !heldByRelay(r.msg_id, host)) { done(r.msg_id, host); failed++; alertSender(r, `gave up after ${RETRY_HOURS} h (${(err as Error).message})`); continue; }
         const wait = Math.min(5_000 * 2 ** r.attempts, 3_600_000);
         node.store.db.prepare("UPDATE outbox SET attempts=attempts+1, next_at=?, last_error=? WHERE msg_id=? AND host=?")
           .run(new Date(now + wait).toISOString(), (err as Error).message.slice(0, 300), r.msg_id, host);

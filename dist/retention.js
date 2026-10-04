@@ -11,9 +11,13 @@ export const configuredRetention = (config) => {
     return v === undefined || v === null ? null : retentionDays(v);
 };
 const OLD = "m.received_at < :cutoff";
+/** Still held for delivery: an outbox row, or a relay row that is not final (accepted, or waiting for a re-push after a
+ *  relay restore, T167). The relay keeps such mail for its own retention (14 days by default), longer than a short local
+ *  window, and the sender's deadline and expiry alerts need the message: pruning it would lose that mail silently. */
+const HELD = `(EXISTS (SELECT 1 FROM outbox o WHERE o.msg_id=m.id) OR EXISTS (SELECT 1 FROM relay_sent s WHERE s.msg_id=m.id AND s.state IN ('relay-accepted','repush')))`;
 const ELIGIBLE = `${OLD}
   AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.msg_id=m.id AND (d.state<>'acked' OR d.updated_at >= :cutoff))
-  AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.msg_id=m.id)`;
+  AND NOT ${HELD}`;
 /** Count (dry run) or delete prunable mail in one write transaction; VACUUM afterwards when asked and anything went. */
 export function prune(store, days, o = {}) {
     const older_than_days = retentionDays(days), now = o.now ?? Date.now();
@@ -25,9 +29,9 @@ export function prune(store, days, o = {}) {
         replay_positions: n(`SELECT count(*) n FROM mailbox_visibility WHERE message_id IN (SELECT m.id FROM messages m WHERE ${ELIGIBLE})`),
         kept: {
             unacked: n(`SELECT count(*) n FROM messages m WHERE ${OLD} AND EXISTS (SELECT 1 FROM deliveries d WHERE d.msg_id=m.id AND d.state<>'acked')`),
-            outbox: n(`SELECT count(*) n FROM messages m WHERE ${OLD} AND EXISTS (SELECT 1 FROM outbox o WHERE o.msg_id=m.id)`),
+            outbox: n(`SELECT count(*) n FROM messages m WHERE ${OLD} AND ${HELD}`),
             recent_activity: n(`SELECT count(*) n FROM messages m WHERE ${OLD} AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.msg_id=m.id AND d.state<>'acked')
-        AND EXISTS (SELECT 1 FROM deliveries d WHERE d.msg_id=m.id AND d.updated_at >= :cutoff) AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.msg_id=m.id)`),
+        AND EXISTS (SELECT 1 FROM deliveries d WHERE d.msg_id=m.id AND d.updated_at >= :cutoff) AND NOT ${HELD}`),
         },
     });
     const base = { older_than_days, cutoff, vacuumed: false };

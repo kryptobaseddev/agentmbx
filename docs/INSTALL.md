@@ -82,8 +82,17 @@ sees plaintext bodies — envelopes are sealed for the recipient before they lea
    `agentmbx relay keygen` prints `MBX_RELAY_KEY=<base64 private key>` (store it as a secret) and the fingerprint;
    when `MBX_RELAY_KEY` is set it wins over `relay.key`. Behind a proxy add `--trust-proxy` (Railway: the rightmost
    X-Forwarded-For hop) or `MBX_RELAY_TRUST_PROXY=cloudflare` (behind Cloudflare: CF-Connecting-IP) so enrolment rate
-   limits see client addresses. After restoring the store any way other than `agentmbx relay restore`
-   (a volume snapshot, a file copy), run `agentmbx relay rotate-epoch --store-dir <dir>` before serving again.
+   limits see client addresses. One relay process per store: `relay serve` holds `relay.lock` while it runs.
+   **Backups:** `agentmbx relay backup <file> --store-dir <dir>` takes a consistent online copy while the relay runs
+   and prints a receipt (sha256, epoch, counts). To restore, stop the relay and run
+   `agentmbx relay restore <file> --store-dir <dir>`: it rotates the epoch (senders re-push what the recipient has not
+   confirmed, receivers re-pull; nothing arrives twice), keeps every revocation and newer signed allowlist the store
+   had, keeps the replaced store under `rollback/`, and prints the command that undoes it. A hosted relay restores at
+   start with `MBX_RELAY_RESTORE_FROM=<backup on the volume>` (once; unset it afterwards). `agentmbx relay log` lists
+   every receipt: backups, restores, epoch rotations and retention sweeps. After restoring the store any way other
+   than `agentmbx relay restore` (a volume snapshot, a file copy), run `agentmbx relay rotate-epoch --store-dir <dir>`
+   (a copy older than 10 minutes rotates at start by itself). Queued mail expires after 14 days; its sender gets an
+   "Undelivered to <host>" alert. The runbook is in [relay-durability.md §5.2](spec/relay-durability.md#52-runbook-t167).
 2. Point each daemon at it: `agentmbx relay set http://<relay-host>:7374`, then restart the daemon
    (`agentmbx daemon install` hosts: `launchctl kickstart -k gui/$(id -u)/com.agentmbx.daemon`).
 3. That's it: mail to unreachable peers flows through the relay and is pulled by the peer; `agentmbx doctor`
