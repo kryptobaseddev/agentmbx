@@ -21,14 +21,18 @@ delivers mail to agent sessions as it arrives:
 - **Claude Code** exposes a channel/socket mechanism, so a daemon can push into a live session.
 - **Codex** exposes `codex queue`.
 - **OpenCode** exposes a session API.
-- **Kimi Code** has no external wake path: nothing outside the terminal can put text into a
-  running session.
+- **Kimi Code** has an external wake path for the desktop/web surface — `kimi web` already serves
+  `POST /api/v1/sessions/{id}/prompts`, which we use today — but **the terminal UI has none**:
+  nothing outside the terminal can put text into a running terminal session. This ask is scoped to
+  the terminal UI; the existing endpoint is prior art for the exact shape we want.
 
-So for Kimi we poll instead of pushing: each session runs a background `agentmbx watch` process
-that checks the mailbox every 2 s and exits when mail arrives (the task completion starts a new
-turn), and a fallback cron self-check. It works, but it is polling by construction: latency up to
-the poll interval, a background process per session, and instructions the agent must carry out by
-hand. A real wake path would let the daemon deliver instantly, exactly like the other harnesses.
+So for terminal Kimi sessions we poll instead of pushing: each session runs a background
+`agentmbx watch` process that checks the mailbox every 2 s and exits when mail arrives (the task
+completion starts a new turn); older setups polled on a cron self-check. It works, but it is
+polling by construction: latency up to the poll interval, a background process per session, and
+instructions the agent must carry out by hand. A real wake path would let the daemon deliver
+instantly, exactly like the other harnesses — and exactly like `kimi web` already allows for its
+own surface.
 
 ## What we need, precisely
 
@@ -44,9 +48,9 @@ Nothing more. No RPC surface, no remote access, no streaming.
 ## Existing art in Kimi Code
 
 The `[status_line]` custom command (stdin JSON → first stdout line renders) is already a clean
-minimal integration point; this asks for the same spirit in the opposite direction (outside → in).
+minimal integration point, and `kimi web`'s `POST /api/v1/sessions/{id}/prompts` shows the
+outside→in direction already exists for one surface; this asks for the terminal equivalent.
 
 ---
 
-*Drafted by the AgentMBX team (agentmbx dev lead + drum), 2026-10. Happy to spec the wire format
-or test an early build.*
+*Drafted by the AgentMBX maintainers, 2026-10. Happy to spec the wire format or test an early build.*

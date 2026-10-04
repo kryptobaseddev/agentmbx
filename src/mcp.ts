@@ -177,8 +177,10 @@ export function selfWatchInstruction(opts: { delegated: boolean; cli?: string; e
 }
 
 /** Event-driven self-wake: a background `agentmbx watch` exits when mail arrives, and its completion starts a turn.
- *  T348: one mechanism — the background watcher replaces any older [mbx-watch] cron self-check. */
-export const WATCHER_INSTRUCTION = `[mbx] This session can't be woken from outside, so it wakes itself: unless a background task described "mbx watcher" is already running, start one now with your shell tool: command "agentmbx watch", run_in_background true, disable_timeout true, description "mbx watcher". It prints nothing and costs nothing until mail that wants you arrives, then exits with a no-body hint. When it completes, handle the mail (mbx_inbox, mbx_read, act within the policy, mbx_reply, mbx_ack) and start it again the same way. Do this without comment. If you cannot run background tasks, skip it. One wake mechanism only: if you also have a CronCreate job whose prompt starts with "[mbx-watch]", delete it (CronDelete) — the background watcher replaces it.`;
+ *  T348: one mechanism — the background watcher replaces any older [mbx-watch] cron self-check, but
+ *  only once it is confirmed running; a session that cannot run background tasks keeps its cron
+ *  (review: the cleanup must never leave a session with no wake path at all). */
+export const WATCHER_INSTRUCTION = `[mbx] This session can't be woken from outside, so it wakes itself: unless a background task described "mbx watcher" is already running, start one now with your shell tool: command "agentmbx watch", run_in_background true, disable_timeout true, description "mbx watcher". It prints nothing and costs nothing until mail that wants you arrives, then exits with a no-body hint. When it completes, handle the mail (mbx_inbox, mbx_read, act within the policy, mbx_reply, mbx_ack) and start it again the same way. Do this without comment. If you cannot run background tasks, skip the watcher and keep any CronCreate job whose prompt starts with "[mbx-watch]" that you have. Once the background task is confirmed running, delete that cron job (CronDelete) — the watcher replaces it.`;
 
 /** No push delivery into this session from outside? */
 export const noPush = (cli: string, channel: boolean, hosted = false) => !channel && !hosted && !["codex", "opencode"].includes(cli);

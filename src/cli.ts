@@ -1251,6 +1251,10 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
           const w = selfWatchInstruction({ delegated: !!delegationNote(node.store.db, agent, node.host), cli });
           if (w) lines.push(w);
         }
+        // T348 review medium 2: the owner-visible case is a LIVE watcher plus a legacy [mbx-watch]
+        // cron prompt arriving — Kimi drops SessionStart, so the cleanup reaches it only here.
+        if (event === "prompt" && cli === "kimi" && liveWatcher(node, agent) && typeof input.prompt === "string" && input.prompt.startsWith("[mbx-watch]"))
+          lines.push(`[mbx] One wake mechanism only: your "mbx watcher" background task is alive — delete this cron job (CronDelete) so the watcher is the only wake path.`);
         if (lines.length) emit(cli, event === "post-tool" ? "PostToolUse" : "UserPromptSubmit", lines.join("\n"));
         posttoolDone?.();
         return;
