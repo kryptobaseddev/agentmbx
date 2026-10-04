@@ -67,12 +67,15 @@ export const statuslineCommand = (home: string, cli: "claude" | "kimi", cmd: str
   const script = join(skillDest(home), "scripts", `${cli}-statusline.sh`);
   return existsSync(script) ? `sh ${shJoin([script])}` : `${shJoin(cmd)} statusline ${cli}`;
 };
-const statuslineForms = (home: string, cli: "claude" | "kimi", cmd: string[]): Set<string> => new Set([
+const statuslineForms = (home: string, cli: "claude" | "kimi" | "grok", cmd: string[]): Set<string> => new Set([
   `sh ${shJoin([join(skillDest(home), "scripts", `${cli}-statusline.sh`)])}`,
   `${shJoin(cmd)} statusline ${cli}`,
 ]);
-const isOurStatusline = (home: string, cli: "claude" | "kimi", cmd: string[], command: string | undefined): boolean =>
-  !!command && statuslineForms(home, cli, cmd).has(command);
+const isOurStatusline = (home: string, cli: "claude" | "kimi" | "grok", cmd: string[], command: string | undefined): boolean =>
+  !!command && (statuslineForms(home, cli, cmd).has(command)
+    // Re-review minor: also recognise the exact forms older setups wrote — the bare command and any
+    // absolute agentmbx path — so those get upgraded and uninstalled rather than left as "foreign".
+    || new RegExp(`^(?:agentmbx|\\S+/agentmbx) statusline ${cli}$`).test(command));
 /** "absent" = nothing there, "ours" = an exact setup-written command, "foreign" = anything else.
  *  A malformed file is foreign, never a thrown runSetup (review major 2). */
 export const statuslineState = (home: string, cli: "claude" | "kimi", cmd: string[]): "absent" | "ours" | "foreign" => {
@@ -107,10 +110,21 @@ const kimiStatus = (cur: string): KimiStatus => {
   const rest = cur.slice(headerAt);
   const next = /\r?\n[ \t]*\[/.exec(rest);
   const body = next ? rest.slice(0, next.index + 1) : rest;
-  const commandLine = /(?:^|\r?\n)[ \t]*command[ \t]*=[^\n]*\r?\n/.exec(body)?.[0] ?? null;
+  const commandLine = /(?:^|\r?\n)([ \t]*command[ \t]*=[^\n]*\r?\n)/.exec(body)?.[1] ?? null; // capture excludes the leading \n, so a rewrite never eats it
   return { form: "section", body, commandLine };
 };
 const kimiCommandValue = (body: string): string | null => /(?:^|\r?\n)[ \t]*command[ \t]*=[ \t]*"([^"]*)"/.exec(body)?.[1] ?? null;
+
+/** The status line command actually configured for a CLI right now (re-review item 2: doctor
+ *  checks the configured command, never the one setup would write). */
+export const statuslineConfiguredCommand = (home: string, cli: "claude" | "kimi"): string | null => {
+  try {
+    if (cli === "claude") return (parseObj(read(join(home, ".claude/settings.json"))).statusLine as { command?: string } | undefined)?.command ?? null;
+    const dir = (home === homedir() && process.env.KIMI_CODE_HOME) || join(home, ".kimi-code");
+    const cur = read(join(dir, "tui.toml"));
+    return cur === null ? null : kimiCommandValue(cur);
+  } catch { return null; }
+};
 
 function claudeStatusLine(home: string, cmd: string[]) {
   const want = () => statuslineCommand(home, "claude", cmd);
@@ -128,12 +142,9 @@ function claudeStatusLine(home: string, cmd: string[]) {
       const obj = parseObj(cur);
       const existing = obj.statusLine as Record<string, unknown> | undefined;
       if (!isOurStatusline(home, "claude", cmd, existing?.command as string | undefined)) return cur;
-      // remove only what setup wrote (type + command); the user's other keys stay
-      if (existing && Object.keys(existing).length > 2) {
-        const rest = { ...existing } as Record<string, unknown>;
-        delete rest.type; delete rest.command;
-        obj.statusLine = rest;
-      } else delete obj.statusLine;
+      // Re-review item 3: with our command removed, only non-command keys can remain — and a
+      // statusLine without a command may be rejected by Claude. Remove the whole object.
+      delete obj.statusLine;
       return jsonOut(obj, cur);
     },
   };
@@ -150,11 +161,13 @@ function kimiStatusLine(home: string, cmd: string[]) {
       const w = want();
       if (st.form === "section") {
         const command = kimiCommandValue(st.body);
-        if (command !== null && !isOurStatusline(home, "kimi", cmd, command)) return cur; // a foreign command line: leave everything
+        // Re-review major 1: a user's own section with items and NO command is foreign — adding our
+        // command to THEIR section is their call, not setup's (manual row prints the snippet).
+        if (command === null) return cur;
+        if (!isOurStatusline(home, "kimi", cmd, command)) return cur; // a foreign command line: leave everything
         if (command === w) return cur;
-        if (st.commandLine) return (cur ?? "").replace(st.commandLine, () => commandLineText(w)); // rewrite ONLY our command line — items and other keys stay
-        const eol = st.body.indexOf("\n"); // no command line yet: insert ours right after the header
-        return (cur ?? "").replace(st.body, () => st.body.slice(0, eol + 1) + commandLineText(w) + st.body.slice(eol + 1));
+        const eolOfFile = (cur ?? "").includes("\r\n") ? "\r\n" : "\n"; // minor: match the file's line ending
+        return (cur ?? "").replace(st.commandLine!, () => `command = ${JSON.stringify(w)}${eolOfFile}`); // rewrite ONLY our command line — items and other keys stay
       }
       return (cur ?? "") + (cur && !cur.endsWith("\n") ? "\n" : "") + "\n" + sectionText(w);
     },
@@ -695,8 +708,8 @@ export function runSetup(ctx: SetupCtx, o: RunOpts): Row[] {
     if (o.mode === "install" && (d.cli === "claude" || d.cli === "kimi") && statuslineState(ctx.home, d.cli, ctx.cmd) === "foreign")
       rows.push({ cli: d.cli, item: "statusLine", path: "-", action: "manual",
         note: `an existing status line was left alone; add the MBX segment yourself: ${d.cli === "claude"
-          ? `"statusLine": { "type": "command", "command": "${statuslineCommand(ctx.home, "claude", ctx.cmd)}" }`
-          : `[status_line]\ncommand = "${statuslineCommand(ctx.home, "kimi", ctx.cmd)}"` }` });
+          ? `"statusLine": { "type": "command", "command": ${JSON.stringify(statuslineCommand(ctx.home, "claude", ctx.cmd))} }`
+          : `[status_line]\ncommand = ${JSON.stringify(statuslineCommand(ctx.home, "kimi", ctx.cmd))}` }` });
   }
   if (skillRows) rows.push(...skillRows);
   // A running OpenCode service only reads its config at start.

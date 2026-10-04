@@ -248,7 +248,7 @@ test("T347: setup wires statuslines, never overwrites a user's, reports the snip
   assert.equal(kept.type, "command");
   assert.match(kept.command, /claude-statusline\.sh/, "normalized to the bundled adapter (skill-first)");
   runSetup(ctx2, { mode: "uninstall", stamp: "S4" });
-  assert.deepEqual(JSON.parse(rd(home2, ".claude/settings.json")).statusLine, { padding: 2 }, "uninstall removes only type+command, keeps the user's keys");
+  assert.equal(JSON.parse(rd(home2, ".claude/settings.json")).statusLine, undefined, "uninstall drops the whole statusLine once our command is out — Claude may reject a command-less one (re-review item 3)");
 
   // Claude absent: script form on the first run (skill-first), no-op afterwards, uninstall removes it.
   rmSync(home2, { recursive: true, force: true });
@@ -260,18 +260,30 @@ test("T347: setup wires statuslines, never overwrites a user's, reports the snip
   assert.equal(JSON.parse(rd(home3, ".claude/settings.json")).statusLine, undefined);
   rmSync(home3, { recursive: true, force: true });
 
-  // Kimi: a [status_line] with items gets our command ADDED — items stay (additive, owner rule).
+  // Kimi re-review item 1: a user's own [status_line] with items and NO command is foreign —
+  // setup never adds to their section; it reports and prints the snippet.
   const home4 = fakeHome(); const ctx4 = ctxFor(home4);
   writeFileSync(join(home4, ".kimi-code/tui.toml"), `theme = "dark"\n\n[status_line]\nitems = ["mode","model"]\n`);
-  runSetup(ctx4, { mode: "install", stamp: "S8" });
-  const added = rd(home4, ".kimi-code/tui.toml");
-  assert.match(added, /items = \["mode","model"\]/, "the user's items stay");
-  assert.match(added, /command = "[^"]*kimi-statusline\.sh"/, "our command (the bundled sh adapter) is added to the same section");
+  const rows4 = runSetup(ctx4, { mode: "install", stamp: "S8" });
+  const untouched = rd(home4, ".kimi-code/tui.toml");
+  assert.equal(untouched, `theme = "dark"\n\n[status_line]\nitems = ["mode","model"]\n`, "their section is never edited");
+  assert.ok(rows4.find((r) => r.cli === "kimi" && r.action === "manual"), "and it is reported");
   runSetup(ctx4, { mode: "uninstall", stamp: "S9" });
-  const removed = rd(home4, ".kimi-code/tui.toml");
+  assert.equal(rd(home4, ".kimi-code/tui.toml"), untouched, "uninstall leaves it too");
+  rmSync(home4, { recursive: true, force: true });
+
+  // Kimi re-review item 3's sibling: OUR command plus their items — normalization keeps items.
+  const home4b = fakeHome(); const ctx4b = ctxFor(home4b);
+  writeFileSync(join(home4b, ".kimi-code/tui.toml"), `theme = "dark"\n\n[status_line]\ncommand = "agentmbx statusline kimi"\nitems = ["mode","model"]\n`);
+  runSetup(ctx4b, { mode: "install", stamp: "S8b" });
+  const normalized = rd(home4b, ".kimi-code/tui.toml");
+  assert.match(normalized, /items = \["mode","model"\]/, "the user's items stay when our command is normalized");
+  assert.match(normalized, /command = "[^"]*kimi-statusline\.sh"/, "and our command is the bundled adapter");
+  runSetup(ctx4b, { mode: "uninstall", stamp: "S9b" });
+  const removed = rd(home4b, ".kimi-code/tui.toml");
   assert.match(removed, /items = \["mode","model"\]/, "uninstall removes only our command line — items stay");
   assert.doesNotMatch(removed, /kimi-statusline\.sh|statusline kimi/);
-  rmSync(home4, { recursive: true, force: true });
+  rmSync(home4b, { recursive: true, force: true });
 
   // Kimi: every non-section status_line form is foreign — never a duplicate table appended.
   for (const [name, body] of [

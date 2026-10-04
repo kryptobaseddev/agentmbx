@@ -10,7 +10,7 @@ import { kimiDesktop } from "./kimi-desktop.ts";
 import { version } from "./version.ts";
 import { MbxNode } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
-import { detect, edits, skillStatus, statuslineCommand, statuslineState, wired, type SetupCtx } from "./setup.ts";
+import { detect, edits, skillStatus, statuslineConfiguredCommand, statuslineState, wired, type SetupCtx } from "./setup.ts";
 import { mailboxLiveness } from "./receipts.ts";
 import { listIdentityControls } from "./identity-control.ts";
 import { pruneCandidates } from "./identity-cleanup.ts";
@@ -184,8 +184,10 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     const sl = es.filter((x) => x.kind === "statusline");
     if (sl.length && (d.cli === "claude" || d.cli === "kimi")) {
       const state = statuslineState(ctx.home, d.cli, ctx.cmd);
-      const script = statuslineCommand(ctx.home, d.cli, ctx.cmd);
-      const scriptPath = script.startsWith("sh ") ? script.slice(3).split(" ")[0] : null;
+      // Re-review item 2: check the CONFIGURED command's script, not the one setup would write —
+      // and parse the quoted path form setup writes, so a home path with a space stays intact.
+      const configured = statuslineConfiguredCommand(ctx.home, d.cli);
+      const scriptPath = configured?.startsWith("sh ") ? (/^sh "([^"]+)"/.exec(configured)?.[1] ?? /^sh (\S+)/.exec(configured)?.[1] ?? null) : null;
       if (state === "ours" && scriptPath && !existsSync(scriptPath)) add("warn", `${d.cli}: status line points at a missing script (${scriptPath})`, "agentmbx setup --only skill");
       else if (state === "ours") add("ok", `${d.cli}: status line wired (${sl[0].path.replace(ctx.home, "~")})`);
       else if (state === "foreign") add("info", `${d.cli}: a user's status line is left alone (MBX segment not wired)`);
