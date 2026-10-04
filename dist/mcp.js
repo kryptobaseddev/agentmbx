@@ -27,7 +27,7 @@ import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy
 import { assertKnownRecipients, deliveryReceipts, offlineWarnings, receiptLine, recipientReceipts, sentPage } from "./receipts.js";
 import { forwardMessage, ledgerPage } from "./project-ledger.js";
 import { skillFiles } from "./setup.js";
-import { claudeSessionId, claudeSessionTracker, procStart, withProcSnapshot } from "./proc.js";
+import { claudeSessionId, claudeSessionTracker, grokSessionId, grokSessionTracker, procStart, withProcSnapshot } from "./proc.js";
 import { updateAvailable } from "./update.js";
 import { installKind, version } from "./version.js";
 import { connectorKey } from "./diagnostics.js";
@@ -230,8 +230,12 @@ export function detectHost(ppid = process.ppid) {
     }
     const args = sh("/bin/ps", ["-o", "args=", "-p", String(ppid)]);
     const comm = basename(sh("/bin/ps", ["-o", "comm=", "-p", String(ppid)]) || args.split(" ")[0] || "");
-    const cli = process.env.MBX_CLI || (/claude/i.test(comm) || /claude/.test(args) ? "claude" : /codex/i.test(args) ? "codex"
-        : /opencode/i.test(args) ? "opencode" : /kimi/i.test(args) ? "kimi" : /hermes/i.test(args) ? "hermes" : "unknown");
+    const cli = process.env.MBX_CLI || (/claude/i.test(comm) || /claude/.test(args) ? "claude"
+        // T337 review: ^grok$ on the binary name, right after Claude's check — before any args rule,
+        // because `grok "fix the claude hook"` and `--cwd …/kimi-tools` would otherwise misclassify;
+        // and ngrok is not grok.
+        : /^grok$/i.test(comm) ? "grok"
+            : /codex/i.test(args) ? "codex" : /opencode/i.test(args) ? "opencode" : /kimi/i.test(args) ? "kimi" : /hermes/i.test(args) ? "hermes" : "unknown");
     if (cli !== "unknown" && !process.env.MBX_CLI)
         process.env.MBX_CLI = cli; // re-exec children inherit a stable classification
     const channel = process.env.MBX_CHANNEL === "1" || (cli === "claude" && hasMbxChannel(args));
@@ -241,7 +245,7 @@ export function detectHost(ppid = process.ppid) {
     // (tests, scripts) inherits the variables but must never push into that unrelated session. Sockets are named <pid>.sock.
     const sock = process.env.CLAUDE_CODE_MESSAGING_SOCKET;
     const socket = cli === "claude" && !channel && !!sock && process.env.MBX_SESSION_SOCKET !== "0" && basename(sock) === `${ppid}.sock`;
-    const sessionId = (cli === "claude" ? claudeSessionId(ppid) : null) ?? `mcp-${process.pid}`;
+    const sessionId = (cli === "claude" ? claudeSessionId(ppid) : cli === "grok" ? grokSessionId(ppid) : null) ?? `mcp-${process.pid}`;
     return { cli, channel, socket, sessionId, ppid };
 }
 /** Queue a no-body wake hint into this Claude session through its inbox socket (NDJSON: auth line, then a user line). */
@@ -503,7 +507,8 @@ export async function runMcp(existing) {
     // Claude replaces the session id of a running process: a resumed start reports a temporary id first (T326), and /clear,
     // /resume and compaction start new ones. Its own ~/.claude/sessions/<pid>.json names the current id, so this server
     // follows that file rather than the id it started with. Only this process's own binding moves, and only to that id.
-    const providerSession = env.cli === "claude" && !hosted ? claudeSessionTracker(env.ppid) : () => null;
+    const providerSession = env.cli === "claude" && !hosted ? claudeSessionTracker(env.ppid)
+        : env.cli === "grok" && !hosted ? grokSessionTracker(env.ppid) : () => null; // T337: grok also switches sessions in-process (review med 7)
     /** Another live process answers for `id`: its session binding, or the control endpoint an unbound session publishes without one. */
     const heldElsewhere = (id, controlKey) => {
         // Liveness, not a cached start time: a reused pid can only make this server keep its current id, never overwrite a

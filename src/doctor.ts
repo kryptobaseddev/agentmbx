@@ -183,7 +183,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     // alone at info, ours pointing at a deleted script is a warn, and a user who removed the
     // optional segment hears nothing about it.
     const sl = es.filter((x) => x.kind === "statusline");
-    if (sl.length && (d.cli === "claude" || d.cli === "kimi")) {
+    if (sl.length && (d.cli === "claude" || d.cli === "kimi" || d.cli === "grok")) {
       const state = statuslineState(ctx.home, d.cli, ctx.cmd);
       // Re-review item 2: check the CONFIGURED command's script, not the one setup would write —
       // and parse the quoted path form setup writes, so a home path with a space stays intact.

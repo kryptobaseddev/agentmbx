@@ -1,13 +1,16 @@
 // `agentmbx setup` / `doctor` against a fake HOME whose configs copy the STRUCTURE of real ones (fake values only).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { spawn, spawnSync } from "node:child_process";
 import { doctor, failed } from "../src/doctor.ts";
 import { insertMember, member, parseJsonc, removeMember } from "../src/jsonc.ts";
+import { detectHost } from "../src/mcp.ts";
 import { MbxNode } from "../src/node.ts";
-import { runSetup, skillDest, type SetupCtx } from "../src/setup.ts";
+import { grokSessionId } from "../src/proc.ts";
+import { runSetup, skillDest, statuslineState, type SetupCtx } from "../src/setup.ts";
 
 const ORCA = "if [ -f \"$HOME/.orca/agent-hooks/hook.sh\" ]; then /bin/sh \"$HOME/.orca/agent-hooks/hook.sh\"; fi";
 const orcaGroups = (events: string[]) => Object.fromEntries(events.map((e) => [e, [{ hooks: [{ type: "command", command: ORCA, timeout: 10 }] }]]));
@@ -320,4 +323,185 @@ test("T347: setup wires statuslines, never overwrites a user's, reports the snip
   runSetup(ctx7, { mode: "uninstall", stamp: "SF" });
   assert.equal(rd(home7, ".kimi-code/tui.toml"), userToml, "byte-exact: the user's file returns to its exact bytes (blank lines and all)");
   rmSync(home7, { recursive: true, force: true });
+});
+
+// T337 (review round 2): grok is a first-class CLI — unique-pid session lookup with a staleness
+// check, robust section detection, exact-match ours, keep-user-keys edits, scoped viaCli, and
+// byte-exact uninstall.
+test("T337: grok session detection, MCP and statusline wiring, never overwrites", () => {
+  // grokSessionId: exactly one matching row, not older than the process — anything else is null.
+  const sessions = mkdtempSync(join(tmpdir(), "mbx-grok-sess-"));
+  const sessFile = join(sessions, "active_sessions.json");
+  const prev = process.env.MBX_GROK_SESSIONS_FILE;
+  process.env.MBX_GROK_SESSIONS_FILE = sessFile;
+  const fresh = new Date(Date.now() + 60_000).toISOString(); // comfortably after this process started
+  const stale = "2000-01-01T00:00:00.000Z";
+  try {
+    writeFileSync(sessFile, JSON.stringify([{ session_id: "sid-1", pid: process.pid, cwd: "/work", opened_at: fresh }]));
+    assert.equal(grokSessionId(process.pid), "sid-1", "one fresh row resolves");
+    assert.equal(grokSessionId(999999), null, "no pid match, no session id");
+    writeFileSync(sessFile, JSON.stringify([
+      { session_id: "sid-a", pid: process.pid, cwd: "/a", opened_at: fresh },
+      { session_id: "sid-b", pid: process.pid, cwd: "/b", opened_at: fresh },
+    ]));
+    assert.equal(grokSessionId(process.pid), null, "one process hosting two sessions: never guess (review high 1)");
+    writeFileSync(sessFile, JSON.stringify([{ session_id: "sid-old", pid: process.pid, cwd: "/w", opened_at: stale }]));
+    assert.equal(grokSessionId(process.pid), null, "a row older than the process is a reused pid's leftover");
+    writeFileSync(sessFile, "not json at all");
+    assert.equal(grokSessionId(process.pid), null, "a malformed registry is no session id");
+    writeFileSync(sessFile, `[{"session_id": "sid-h`);
+    assert.equal(grokSessionId(process.pid), null, "a half-written registry is no session id");
+  } finally { if (prev === undefined) delete process.env.MBX_GROK_SESSIONS_FILE; else process.env.MBX_GROK_SESSIONS_FILE = prev; }
+
+  // setup: MCP server section (grok's exact schema, verified against `grok mcp add`) + [ui.status_line]
+  const home = fakeHome(); const ctx = ctxFor(home);
+  mkdirSync(join(home, ".grok"), { recursive: true });
+  const rows = runSetup(ctx, { mode: "install", stamp: "G1" });
+  const cfg = rd(home, ".grok/config.toml");
+  assert.match(cfg, /\[mcp_servers\.mbx\]\ncommand = "\/opt\/bin\/agentmbx"\nargs = \["mcp"\]\nenabled = true/, "grok's own MCP schema");
+  assert.match(cfg, /\[ui\.status_line\]\ntype = "command"\ncommand = "\/opt\/bin\/agentmbx statusline grok"/, "the status line section");
+  assert.ok(rows.some((r) => r.cli === "grok" && r.action === "added"));
+  assert.equal(runSetup(ctx, { mode: "install", stamp: "G2" }).filter((r) => r.cli === "grok" && r.action !== "unchanged" && r.action !== "skipped").length, 0, "idempotent");
+  runSetup(ctx, { mode: "uninstall", stamp: "G3" });
+  assert.ok(!existsSync(join(home, ".grok/config.toml")), "byte-exact: a setup-created config.toml is deleted (review low 9)");
+  rmSync(home, { recursive: true, force: true });
+
+  // CRLF + a trailing comment parse as the same section — no duplicate table (review high 2)
+  const home2 = fakeHome(); const ctx2 = ctxFor(home2);
+  mkdirSync(join(home2, ".grok"), { recursive: true });
+  writeFileSync(join(home2, ".grok/config.toml"), `[ui]\r\nmax_thoughts_width = 120\r\n\r\n[ui.status_line] # mine\r\ntype = "command"\r\ncommand = "my-own.sh"\r\n`);
+  runSetup(ctx2, { mode: "install", stamp: "G4" });
+  assert.equal(rd(home2, ".grok/config.toml").match(/\[ *ui\.status_line *\]/g)!.length, 1, "no duplicate [ui.status_line] table");
+  assert.match(rd(home2, ".grok/config.toml"), /command = "my-own\.sh"/, "the foreign command is untouched");
+  rmSync(home2, { recursive: true, force: true });
+
+  // a status_line key in another form is foreign — never appended (review high 2)
+  for (const body of [`[ui]\nstatus_line = { command = "mine.sh" }\n`, `ui.status_line.type = "command"\n`]) {
+    const h = fakeHome(); const c = ctxFor(h);
+    mkdirSync(join(h, ".grok"), { recursive: true });
+    writeFileSync(join(h, ".grok/config.toml"), body);
+    const rows2 = runSetup(c, { mode: "install", stamp: "G5" });
+    const out = rd(h, ".grok/config.toml");
+    assert.match(out, /\[mcp_servers\.mbx\]/, "an unrelated MCP edit still lands");
+    assert.doesNotMatch(out, /\[ui\.status_line\]|statusline grok/, "but a non-section status_line key never gets a status line appended (review high 2)");
+    assert.ok(rows2.find((r) => r.cli === "grok" && r.action === "manual"), "and it is reported");
+    rmSync(h, { recursive: true, force: true });
+  }
+
+  // exact-match ours: a composed command and an old-path direct command are foreign (review med 5)
+  const home3 = fakeHome(); const ctx3 = ctxFor(home3);
+  mkdirSync(join(home3, ".grok"), { recursive: true });
+  writeFileSync(join(home3, ".grok/config.toml"), `[ui.status_line]\ntype = "command"\ncommand = "~/my-line.sh; /old/agentmbx statusline grok"\n`);
+  runSetup(ctx3, { mode: "install", stamp: "G6" });
+  assert.match(rd(home3, ".grok/config.toml"), /~\/my-line\.sh; \/old\/agentmbx statusline grok/, "a composed command is foreign, never overwritten");
+  rmSync(home3, { recursive: true, force: true });
+
+  // keep the user's other keys in our sections (review med 6)
+  const home4 = fakeHome(); const ctx4 = ctxFor(home4);
+  mkdirSync(join(home4, ".grok"), { recursive: true });
+  writeFileSync(join(home4, ".grok/config.toml"), `[mcp_servers.mbx]\ncommand = "/old/agentmbx"\nargs = ["mcp"]\nenabled = true\nrefresh_interval = 30\n`);
+  runSetup(ctx4, { mode: "install", stamp: "G7" });
+  const kept = rd(home4, ".grok/config.toml");
+  assert.match(kept, /command = "\/opt\/bin\/agentmbx"/, "our path is normalized");
+  assert.match(kept, /refresh_interval = 30/, "the user's refresh_interval stays");
+  rmSync(home4, { recursive: true, force: true });
+
+  // a foreign [mcp_servers.mbx] (someone else's mbx) is never overwritten
+  const home5 = fakeHome(); const ctx5 = ctxFor(home5);
+  mkdirSync(join(home5, ".grok"), { recursive: true });
+  writeFileSync(join(home5, ".grok/config.toml"), `[mcp_servers.mbx]\ncommand = "/usr/bin/other-mbx"\nargs = ["serve"]\nenabled = true\n`);
+  runSetup(ctx5, { mode: "install", stamp: "G8" });
+  assert.match(rd(home5, ".grok/config.toml"), /"\/usr\/bin\/other-mbx"/, "another mbx server someone else manages is never overwritten");
+  rmSync(home5, { recursive: true, force: true });
+  rmSync(sessions, { recursive: true, force: true });
+});
+
+test("T337: detectHost classifies grok on the binary name only — never ngrok, never grok's args", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "mbx-grok-shim-"));
+  symlinkSync("/bin/sleep", join(dir, "grok"));
+  symlinkSync("/bin/sleep", join(dir, "ngrok"));
+  const classify = (bin: string): Promise<string> => new Promise((resolve, reject) => {
+    delete process.env.MBX_CLI; // detectHost sticks its first classification into the env for re-exec children
+    const child = spawn(join(dir, bin), ["60"]);
+    child.on("spawn", () => {
+      try { resolve(detectHost(child.pid!).cli); }
+      catch (e) { reject(e); }
+      finally { child.kill(); }
+    });
+    child.on("error", reject);
+  });
+  try {
+    assert.equal(await classify("grok"), "grok", "a grok binary is grok");
+    assert.notEqual(await classify("ngrok"), "grok", "ngrok is not grok (review med 4)");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// T337 re-review: quoted keys are foreign, no-trailing-newline round-trips byte-exactly, quoted
+// paths stay ours, and the smol-toml guard refuses unverifiable writes.
+test("T337: grok guard rails — quoted keys, byte-exact round-trips, escaping, parse guard", () => {
+  // quoted key parts are the same section or foreign, never a duplicate table (re-review D)
+  for (const body of [
+    `[ui."status_line"]\ntype = "command"\ncommand = "mine.sh"\n`,
+    `[ui]\n"status_line".type = "command"\n`,
+    `ui = { status_line = { type = "command", command = "mine.sh" } }\n`,
+  ]) {
+    const h = fakeHome(); const c = ctxFor(h);
+    mkdirSync(join(h, ".grok"), { recursive: true });
+    writeFileSync(join(h, ".grok/config.toml"), body);
+    const rows = runSetup(c, { mode: "install", stamp: "Q1" });
+    const out = rd(h, ".grok/config.toml");
+    assert.doesNotMatch(out, /statusline grok/, `no status line appended: ${JSON.stringify(body.slice(0, 30))}`);
+    assert.ok(rows.find((r) => r.cli === "grok" && r.action === "manual"), "and it is reported");
+    rmSync(h, { recursive: true, force: true });
+  }
+
+  // a no-trailing-newline file round-trips byte-exactly (re-review D)
+  const h2 = fakeHome(); const c2 = ctxFor(h2);
+  mkdirSync(join(h2, ".grok"), { recursive: true });
+  writeFileSync(join(h2, ".grok/config.toml"), `[ui]\nmax_thoughts_width = 120`);
+  runSetup(c2, { mode: "install", stamp: "Q2" });
+  runSetup(c2, { mode: "uninstall", stamp: "Q3" });
+  assert.equal(rd(h2, ".grok/config.toml"), `[ui]\nmax_thoughts_width = 120`, "no trailing newline gained");
+  rmSync(h2, { recursive: true, force: true });
+
+  // a command path containing a quote round-trips as ours (re-review D: JSON.stringify + unescape)
+  const h3 = fakeHome();
+  const c3 = ctxFor(h3, [`/opt/weird"bin/agentmbx`]);
+  mkdirSync(join(h3, ".grok"), { recursive: true });
+  runSetup(c3, { mode: "install", stamp: "Q4" });
+  assert.match(rd(h3, ".grok/config.toml"), /\[ui\.status_line\]/, "the section is written even with a quote in the path");
+  assert.equal(statuslineState(h3, "grok", c3.cmd), "ours", "and it round-trips as ours, not foreign");
+  rmSync(h3, { recursive: true, force: true });
+
+  // the smol-toml guard: invalid TOML is never written into (re-review E)
+  const h4 = fakeHome(); const c4 = ctxFor(h4);
+  mkdirSync(join(h4, ".grok"), { recursive: true });
+  writeFileSync(join(h4, ".grok/config.toml"), `this is not [valid toml`);
+  const before = rd(h4, ".grok/config.toml");
+  runSetup(c4, { mode: "install", stamp: "Q5" });
+  assert.equal(rd(h4, ".grok/config.toml"), before, "an unparseable file is never written into");
+  rmSync(h4, { recursive: true, force: true });
+});
+
+// #98 re-review regression: install then uninstall BOTH grok sections on LF and CRLF files with a
+// user section before them — the bytes must come back identical (never an orphaned \r, never a
+// lost final newline, never a doubled blank line).
+test("T337: install+uninstall of both sections round-trips LF and CRLF files byte-exactly", () => {
+  for (const [name, before] of [
+    ["LF", `[models]\nb = 2\n`],
+    ["LF no trailing newline", `[models]\nb = 2`],
+    ["CRLF", `[models]\r\nb = 2\r\n`],
+    ["CRLF no trailing newline", `[models]\r\nb = 2`],
+  ] as const) {
+    const h = fakeHome(); const c = ctxFor(h);
+    mkdirSync(join(h, ".grok"), { recursive: true });
+    writeFileSync(join(h, ".grok/config.toml"), before);
+    runSetup(c, { mode: "install", stamp: "RT1" });
+    const installed = rd(h, ".grok/config.toml");
+    assert.match(installed, /\[mcp_servers\.mbx\]/, `${name}: mcp section installed`);
+    assert.match(installed, /\[ui\.status_line\]/, `${name}: status line installed`);
+    runSetup(c, { mode: "uninstall", stamp: "RT2" });
+    assert.equal(rd(h, ".grok/config.toml"), before, `${name}: byte-identical after removing both sections`);
+    rmSync(h, { recursive: true, force: true });
+  }
 });
