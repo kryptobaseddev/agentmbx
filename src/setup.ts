@@ -13,6 +13,7 @@ import { homedir, hostname } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { insertMember, member, parseJsonc, removeMember, replaceValue, valueOf, type JNode } from "./jsonc.ts";
+import { parse as parseToml } from "smol-toml";
 import { fingerprint } from "./crypto.ts";
 import { version } from "./version.ts";
 import { authHelperPath, canPrompt, createKeychainOwner, ownerInfo } from "./owner.ts";
@@ -86,6 +87,14 @@ export const statuslineState = (home: string, cli: "claude" | "kimi", cmd: strin
       const command = (parseObj(cur).statusLine as { command?: string } | undefined)?.command;
       return command === undefined ? "absent" : isOurStatusline(home, cli, cmd, command) ? "ours" : "foreign";
     }
+    if (cli === "grok") {
+      const dir = (home === homedir() && process.env.GROK_HOME) || join(home, ".grok"); // re-review: honor GROK_HOME
+      const cur = read(join(dir, "config.toml"));
+      if (cur === null) return "absent";
+      const st = grokStatus(cur);
+      if (st.form !== "section") return st.form;
+      return isOurStatusline(home, cli, cmd, grokCommandValue(st.body) ?? undefined) ? "ours" : "foreign";
+    }
     const dir = (home === homedir() && process.env.KIMI_CODE_HOME) || join(home, ".kimi-code"); // review: honor KIMI_CODE_HOME
     const cur = read(join(dir, "tui.toml"));
     if (cur === null) return "absent";
@@ -102,6 +111,11 @@ export const statuslineState = (home: string, cli: "claude" | "kimi", cmd: strin
  *  table (review major 3). */
 type KimiStatus = { form: "absent" } | { form: "foreign" } | { form: "section"; body: string; commandLine: string | null };
 const kimiStatus = (cur: string): KimiStatus => {
+  // Parse guard (review E, applied to the Kimi edits too): invalid TOML, or a status_line key in
+  // ANY non-section form (quoted key, inline table), is never edited.
+  const parsed = tryParseToml(cur);
+  if (parsed === null) return { form: "foreign" };
+  if (tomlKeyExists(parsed, ["status_line"]) && !/(^|\r?\n)[ \t]*\[[ \t]*status_line[ \t]*\]/.test(cur)) return { form: "foreign" };
   // A top-level status_line key in non-section form: `status_line = {…}` or `status_line.items = …`
   if (/^[ \t]*status_line[ \t]*[=.]/m.test(cur)) return { form: "foreign" };
   const start = /(^|\n)[ \t]*\[[ \t]*status_line[ \t]*\][ \t]*(?:#[^\n]*)?\r?\n/.exec(cur);
@@ -113,13 +127,25 @@ const kimiStatus = (cur: string): KimiStatus => {
   const commandLine = /(?:^|\r?\n)([ \t]*command[ \t]*=[^\n]*\r?\n)/.exec(body)?.[1] ?? null; // capture excludes the leading \n, so a rewrite never eats it
   return { form: "section", body, commandLine };
 };
-const kimiCommandValue = (body: string): string | null => /(?:^|\r?\n)[ \t]*command[ \t]*=[ \t]*"([^"]*)"/.exec(body)?.[1] ?? null;
+/** A TOML basic-string value for `command = "…"`, unescaped (re-review: a path containing `"` must
+ *  round-trip as ours, not read as foreign). */
+const tomlStringValue = (body: string, key: string): string | null => {
+  const m = new RegExp(`(?:^|\\r?\\n)[ \\t]*${key}[ \\t]*=[ \\t]*"((?:[^"\\\\]|\\\\.)*)"`).exec(body);
+  if (!m) return null;
+  try { return JSON.parse(`"${m[1]}"`) as string; } catch { return null; }
+};
+const kimiCommandValue = (body: string): string | null => tomlStringValue(body, "command");
 
 /** The status line command actually configured for a CLI right now (re-review item 2: doctor
  *  checks the configured command, never the one setup would write). */
-export const statuslineConfiguredCommand = (home: string, cli: "claude" | "kimi"): string | null => {
+export const statuslineConfiguredCommand = (home: string, cli: "claude" | "kimi" | "grok"): string | null => {
   try {
     if (cli === "claude") return (parseObj(read(join(home, ".claude/settings.json"))).statusLine as { command?: string } | undefined)?.command ?? null;
+    if (cli === "grok") {
+      const dir = (home === homedir() && process.env.GROK_HOME) || join(home, ".grok");
+      const cur = read(join(dir, "config.toml"));
+      return cur === null ? null : grokCommandValue(cur);
+    }
     const dir = (home === homedir() && process.env.KIMI_CODE_HOME) || join(home, ".kimi-code");
     const cur = read(join(dir, "tui.toml"));
     return cur === null ? null : kimiCommandValue(cur);
@@ -167,9 +193,9 @@ function kimiStatusLine(home: string, cmd: string[]) {
         if (!isOurStatusline(home, "kimi", cmd, command)) return cur; // a foreign command line: leave everything
         if (command === w) return cur;
         const eolOfFile = (cur ?? "").includes("\r\n") ? "\r\n" : "\n"; // minor: match the file's line ending
-        return (cur ?? "").replace(st.commandLine!, () => `command = ${JSON.stringify(w)}${eolOfFile}`); // rewrite ONLY our command line — items and other keys stay
+        return guarded(cur, (cur ?? "").replace(st.commandLine!, () => `command = ${JSON.stringify(w)}${eolOfFile}`)); // rewrite ONLY our command line — items and other keys stay
       }
-      return (cur ?? "") + (cur && !cur.endsWith("\n") ? "\n" : "") + "\n" + sectionText(w);
+      return guarded(cur, (cur ?? "") + (cur && !cur.endsWith("\n") ? "\n" : "") + "\n" + sectionText(w));
     },
     uninstall: (cur: string | null) => {
       if (cur === null) return cur;
@@ -183,17 +209,171 @@ function kimiStatusLine(home: string, cmd: string[]) {
       let next: string | null;
       if (meaningful.length) next = (cur ?? "").replace(st.body, () => lines.join("\n"));
       else {
-        // the whole section goes; the blank line install added before it goes too (exact insert bytes)
+        // the whole section goes; exactly one separator \n install added before it goes too
         const start = (cur ?? "").indexOf(st.body);
-        const prefix = start > 0 ? (cur ?? "").slice(0, start) : "";
-        next = (cur ?? "").replace(st.body, () => "");
-        if (prefix.endsWith("\n\n")) next = next.replace(/\n\n$/, "\n");
+        const removalStart = start > 0 && (cur ?? "")[start - 1] === "\n" ? start - 1 : start;
+        next = (cur ?? "").slice(0, removalStart) + (cur ?? "").slice(start + st.body.length);
       }
       if (next.trim() === "") next = null; // setup created the file: remove it entirely
       return next;
     },
   };
 }
+// T337: grok is a first-class CLI — its config.toml sections are found with the same robust rules
+// as Kimi's (CRLF, trailing comments, inner spacing), "ours" is an exact match, edits keep the
+// user's other keys, and uninstall removes exactly the inserted bytes (review items 2, 5, 6, 9, 10).
+
+/** A TOML section (header plus body lines) up to the next section header at line start — tolerant
+ *  of CRLF, a trailing comment, inner spacing, and quoted key parts (re-review: `[ui."status_line"]`). */
+const tomlSectionAt = (cur: string, header: string): string | null => {
+  const pattern = header.split(".").map((p) => `"?${p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"?`).join("[ \\t]*\\.[ \\t]*");
+  const start = new RegExp(`(^|\\r?\\n)[ \\t]*\\[[ \\t]*${pattern}[ \\t]*\\][ \\t]*(?:#[^\\n]*)?\\r?\\n`).exec(cur);
+  if (!start) return null;
+  const headerAt = start.index + (start[0].startsWith("\n") || start[0].startsWith("\r") ? start[0].match(/^(\r?\n)/)![1].length : 0);
+  const rest = cur.slice(headerAt);
+  const next = /\r?\n[ \t]*\[/.exec(rest);
+  return next ? rest.slice(0, next.index + (rest[next.index] === "\r" ? 2 : 1)) : rest;
+};
+
+/** smol-toml parse guard (re-review E): parse before editing — a key in a form we don't recognise
+ *  stays manual — and never write invalid TOML back. Text edits stay, so comments survive. */
+const tryParseToml = (cur: string): Record<string, unknown> | null => {
+  try { return parseToml(cur) as Record<string, unknown>; } catch { return null; }
+};
+const tomlKeyExists = (obj: Record<string, unknown> | null, path: string[]): boolean => {
+  let cur: unknown = obj;
+  for (const key of path) {
+    if (!cur || typeof cur !== "object" || !(key in (cur as Record<string, unknown>))) return false;
+    cur = (cur as Record<string, unknown>)[key];
+  }
+  return true;
+};
+/** Refuse to write invalid TOML: the edit result must parse, or the file stays untouched. */
+const guarded = (cur: string | null, next: string | null): string | null =>
+  next !== cur && next !== null && tryParseToml(next) === null ? cur : next;
+
+/** Where grok's config.toml carries [ui.status_line], and in what form. A `ui.status_line` dotted
+ *  key, or a `status_line` key embedded in the `[ui]` section, is a form setup cannot edit —
+ *  foreign, never appended (review high 2). */
+type GrokStatus = { form: "absent" } | { form: "foreign" } | { form: "section"; body: string; commandLine: string | null };
+const grokStatus = (cur: string): GrokStatus => {
+  // Parse guard (review E): invalid TOML, or a status_line key in ANY form, is never edited.
+  const parsed = tryParseToml(cur);
+  if (parsed === null) return { form: "foreign" }; // invalid TOML: never write into it
+  if (tomlKeyExists(parsed, ["status_line"])) return { form: "foreign" }; // a root status_line key
+  if (tomlKeyExists(parsed, ["ui", "status_line"]) && !tomlSectionAt(cur, "ui.status_line")) return { form: "foreign" }; // a form we can't edit (quoted, inline)
+  if (/^[ \t]*ui\.status_line[ \t]*[=.]/m.test(cur)) return { form: "foreign" }; // dotted key
+  const ui = tomlSectionAt(cur, "ui");
+  if (ui && /^[ \t]*status_line[ \t]*[=.]/m.test(ui)) return { form: "foreign" }; // embedded in [ui]
+  const body = tomlSectionAt(cur, "ui.status_line");
+  if (body === null) return { form: "absent" };
+  const commandLine = /(?:^|\r?\n)[ \t]*command[ \t]*=[^\n]*\r?\n/.exec(body)?.[0] ?? null;
+  return { form: "section", body, commandLine };
+};
+const grokCommandValue = (body: string): string | null => tomlStringValue(body, "command");
+const grokStatusCommand = (cmd: string[]) => `${shJoin(cmd)} statusline grok`;
+
+function grokStatusLine(home: string, cmd: string[]) {
+  const want = () => grokStatusCommand(cmd);
+  const lineText = (key: string, w: string) => `${key} = ${JSON.stringify(w)}\n`; // valid TOML basic string (review: escaping)
+  const sectionText = (w: string) => `[ui.status_line]\n${lineText("type", "command")}${lineText("command", w)}`;
+  return {
+    install: (cur: string | null) => {
+      const st = cur === null ? { form: "absent" as const } : grokStatus(cur);
+      if (st.form === "foreign") return cur; // reported, never overwritten — and never a duplicate table
+      const w = want();
+      if (st.form === "section") {
+        const command = grokCommandValue(st.body);
+        // Re-review medium B: a user section without exactly our command is foreign — a
+        // `[ui.status_line] type = "builtin"` or no command at all is never edited, only reported.
+        if (command === null || !isOurStatusline(home, "grok", cmd, command)) return cur;
+        if (command === w && /(?:^|\r?\n)[ \t]*type[ \t]*=[ \t]*"command"/.test(st.body)) return cur;
+        const eolOfFile = (cur ?? "").includes("\r\n") ? "\r\n" : "\n"; // minor: match the file's line ending
+        return guarded(cur, (cur ?? "").replace(st.commandLine!, () => `command = ${JSON.stringify(w)}${eolOfFile}`)); // rewrite ONLY our line — type, refresh_interval, padding stay
+      }
+      // Separator encoding: a no-trailing-newline file gets a single \n before our section, a
+      // newline-terminated file gets a blank line — so uninstall can restore both byte-exactly.
+      return guarded(cur, (cur ?? "") + (cur && !cur.endsWith("\n") ? "\n" : "\n\n") + sectionText(w));
+    },
+    uninstall: (cur: string | null) => {
+      if (cur === null) return cur;
+      const st = grokStatus(cur);
+      if (st.form !== "section") return cur;
+      const command = grokCommandValue(st.body);
+      if (command === null || !isOurStatusline(home, "grok", cmd, command)) return cur; // foreign: never touched
+      // remove ONLY our command line, byte-exact (review low 9)
+      const lines = st.body.split("\n").filter((l) => !/^[ \t]*command[ \t]*=/.test(l));
+      const meaningful = lines.filter((l) => l.trim() !== "" && !/^[ \t]*\[/.test(l) && !/^[ \t]*type[ \t]*=/.test(l));
+      let next: string | null;
+      if (meaningful.length) next = (cur ?? "").replace(st.body, () => lines.join("\n"));
+      else {
+        // the whole section goes; exactly one separator \n install added before it goes too
+        const start = (cur ?? "").indexOf(st.body);
+        const removalStart = start > 0 && (cur ?? "")[start - 1] === "\n" ? start - 1 : start;
+        next = (cur ?? "").slice(0, removalStart) + (cur ?? "").slice(start + st.body.length);
+      }
+      if (next.trim() === "") next = null;
+      return next;
+    },
+  };
+}
+
+/** The [mcp_servers.mbx] section — grok's own schema (verified byte-for-byte against `grok mcp add`
+ *  in an isolated GROK_HOME, review test 12). "Ours" is an exact command+args match (review med 5);
+ *  the user's other keys in the section stay (review med 6). */
+type GrokMcpState = { form: "absent" } | { form: "foreign" } | { form: "section"; body: string };
+const grokMcpState = (cur: string): GrokMcpState => {
+  // Parse guard (review E): invalid TOML, or an mbx key in ANY form we don't recognise, is never edited.
+  const parsed = tryParseToml(cur);
+  if (parsed === null) return { form: "foreign" };
+  if (tomlKeyExists(parsed, ["mcp_servers", "mbx"]) && !tomlSectionAt(cur, "mcp_servers.mbx")) return { form: "foreign" };
+  if (/^[ \t]*mcp_servers\.mbx[ \t]*[=.]/m.test(cur)) return { form: "foreign" }; // dotted key
+  const parent = tomlSectionAt(cur, "mcp_servers");
+  if (parent && /^[ \t]*mbx[ \t]*[=.]/m.test(parent)) return { form: "foreign" }; // embedded in [mcp_servers]
+  const body = tomlSectionAt(cur, "mcp_servers.mbx");
+  if (body === null) return { form: "absent" };
+  return { form: "section", body };
+};
+
+function grokMcp(cmd: string[]) {
+  const lineText = (key: string, w: string) => `${key} = ${JSON.stringify(w)}\n`;
+  const argsText = `[${[...cmd.slice(1), "mcp"].map((a) => JSON.stringify(a)).join(", ")}]`;
+  const wantCommand = cmd[0], wantArgs = argsText;
+  const sectionText = () => `[mcp_servers.mbx]\n${lineText("command", wantCommand)}args = ${argsText}\nenabled = true\n`;
+  const ours = (body: string) => grokCommandValue(body) === wantCommand && body.includes(`args = ${wantArgs}`); // exact match (review med 5)
+  return {
+    install: (cur: string | null) => {
+      const st = cur === null ? { form: "absent" as const } : grokMcpState(cur);
+      if (st.form === "foreign") return cur;
+      if (st.form === "section") {
+        if (!ours(st.body)) {
+          const command = grokCommandValue(st.body);
+          // normalize only a stale path of the SAME binary (…/agentmbx); anything else is another
+          // tool's mbx — never overwritten (review med 5: agentmbx-fork is not ours)
+          if (command !== null && !/(^|\/)agentmbx$/.test(command)) return cur;
+          // rewrite ONLY our command/args lines — the user's other keys in the section stay
+          return guarded(cur, (cur ?? "").replace(st.body, () => st.body
+            .replace(/(^|\r?\n)[ \t]*command[ \t]*=[^\n]*(\r?\n)/, (_, p1, p2) => `${p1}command = ${JSON.stringify(wantCommand)}${p2}`)
+            .replace(/(^|\r?\n)[ \t]*args[ \t]*=[^\n]*(\r?\n)/, (_, p1, p2) => `${p1}args = ${wantArgs}${p2}`)));
+        }
+        return cur;
+      }
+      return guarded(cur, (cur ?? "") + (cur && !cur.endsWith("\n") ? "\n" : "") + "\n" + sectionText());
+    },
+    uninstall: (cur: string | null) => {
+      if (cur === null) return cur;
+      const st = grokMcpState(cur);
+      if (st.form !== "section" || !ours(st.body)) return cur;
+      // the whole section goes; exactly one separator \n install added before it goes too
+      const start = (cur ?? "").indexOf(st.body);
+      const removalStart = start > 0 && (cur ?? "")[start - 1] === "\n" ? start - 1 : start;
+      let next: string | null = (cur ?? "").slice(0, removalStart) + (cur ?? "").slice(start + st.body.length);
+      if (next.trim() === "") next = null;
+      return next;
+    },
+  };
+}
+
 const isOurHook = (command: string, event: string, cli: string, cmd: string[]) =>
   (command.includes(` hook ${event} --cli ${cli}`) && (command.includes("agentmbx") || command.startsWith(shJoin(cmd))))
   // T342: the bundled sh fast path is ours too, so setup upgrades an old direct command to it (and back)
@@ -560,6 +740,18 @@ export function edits(ctx: SetupCtx, cli: CliId): Edit[] {
         { cli, kind: "mcp", item: "mcpServers.mbx", path: join(kimi, "mcp.json"), ...srv },
         { cli, kind: "hooks", item: "[[hooks]] SessionStart + UserPromptSubmit + PermissionRequest + Stop", path: join(kimi, "config.toml"), ...kimiHooks(cmd) },
         { cli, kind: "statusline", item: "[status_line] (MBX segment)", path: join(kimi, "tui.toml"), ...kimiStatusLine(home, cmd) },
+      ];
+    }
+    case "grok": {
+      // T337: setup edits grok's config.toml with the verified text edit ALWAYS (re-review high A:
+      // `grok mcp add/remove` rewrites the whole file and drops the user's comments, env and
+      // startup_timeout_sec — the CLI's own writer is not byte-preserving). GROK_HOME is honored.
+      const dir = (home === homedir() && process.env.GROK_HOME) || join(home, ".grok");
+      const config = join(dir, "config.toml");
+      return [
+        { cli, kind: "mcp", item: "[mcp_servers.mbx] (user scope)", path: config, ...grokMcp(cmd) },
+        { cli, kind: "statusline", item: "[ui.status_line] (MBX segment)", path: config, ...grokStatusLine(home, cmd),
+          isWired: (cur) => { try { const st = grokStatus(cur ?? ""); return st.form === "section" && isOurStatusline(home, "grok", cmd, grokCommandValue(st.body) ?? undefined); } catch { return false; } } },
       ];
     }
     case "hermes":
