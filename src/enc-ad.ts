@@ -3,6 +3,9 @@
 // itself: signed by the host key the sender pinned at pairing, naming that key and host, inside its validity window.
 // A v1 advertisement ({v:1, host, enc_pub}) carries no expiry, so a relay could replay an old one forever; senders on
 // this version refuse it from a relay (the LAN exchange is unchanged). Publishers still send v1 for older senders.
+// Inside the validity window a relay could still replay an older ad of the same host key naming a retired enc key (an
+// enc.key regenerated under the same host key): senders remember the newest ad they accepted per host key and refuse an
+// older one that names another key (src/relay-v2.ts relayEncVerdict).
 import { canonical, signData, verifyData, type KeyPair } from "./crypto.ts";
 
 export interface EncAdRecord { v: 2; type: "enc-ad"; host: string; host_pubkey: string; enc_pub: string; iat: string; exp: string }
@@ -44,7 +47,7 @@ export function checkEncAd(ad: unknown, sig: unknown, expect: { host?: string; h
  * A paired peer's enc key from a relay's enc-key answer, or why it is refused. Only the signed v2 record counts; a
  * served `enc_pub` beside it must be the same key (a relay that answers two keys is tampering).
  */
-export function encFromRelayAnswer(answer: Record<string, unknown> | null | undefined, peer: { host: string; pubkey: string }, now = Date.now()): { enc_pub: string } | { reason: string } {
+export function encFromRelayAnswer(answer: Record<string, unknown> | null | undefined, peer: { host: string; pubkey: string }, now = Date.now()): { enc_pub: string; iat: string } | { reason: string } {
   const j = answer ?? {};
   if (j.ad === undefined) {
     return typeof j.enc_pub === "string" && typeof j.sig === "string"
@@ -55,5 +58,5 @@ export function encFromRelayAnswer(answer: Record<string, unknown> | null | unde
   if (bad) return { reason: bad };
   const encPub = (j.ad as EncAdRecord).enc_pub;
   if (j.enc_pub !== undefined && j.enc_pub !== encPub) return { reason: "tampered: the served key differs from the signed advertisement" };
-  return { enc_pub: encPub };
+  return { enc_pub: encPub, iat: (j.ad as EncAdRecord).iat };
 }

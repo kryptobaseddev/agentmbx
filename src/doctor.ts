@@ -5,7 +5,7 @@ import { phantomMailboxes, returnDays } from "./stranded.ts";
 import { join } from "node:path";
 import { fingerprint } from "./crypto.ts";
 import { signHop } from "./http.ts";
-import { relayState } from "./relay-v2.ts";
+import { relayState, ROLLBACK_REASON } from "./relay-v2.ts";
 import { kimiHostedServer, kimiInstances } from "./kimi-web.ts";
 import { kimiDesktop } from "./kimi-desktop.ts";
 import { version } from "./version.ts";
@@ -255,6 +255,8 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
       const held = queued ? `; ${queued} message(s) wait in the outbox (the LAN keeps trying; after ${RETRY_HOURS} h undelivered mail alerts its sender)` : "";
       if (st?.state === "enrol-failed") add(st.status === 401 || st.status === 403 ? "fail" : "warn", `relay ${relay} refused this host's enrolment since ${st.at} (${st.detail}): relay mail is paused${held}`,
         st.status === 403 ? "this host key is revoked or not authorized on that relay: ask its operator (the daemon retries every pass)" : "the daemon re-enrols every pass; check the relay is reachable and runs a current agentmbx");
+      else if (st?.state === "clock-skew") add("fail", `relay ${relay} refuses this host's signed requests right after enrolling it (since ${st.at}): ${st.detail}; relay mail is paused${held}`,
+        `set this host's clock right (turn on network time: macOS System Settings > General > Date & Time, Linux timedatectl set-ntp true); the daemon retries enrolment with backoff, next at ${st.next_at}`);
       else if (st?.state === "enc-ad-failed") add("warn", `relay ${relay} has not taken this host's encryption key ad since ${st.at} (${st.detail}): peers cannot seal relay mail for this host${held}`, "the daemon republishes every pass");
       else if (st?.state === "unreachable") add("warn", `relay ${relay}: ${st.detail} since ${st.at}${held}`, "the daemon retries every pass");
       else if (st?.state === "ok" && st.enc_ad_exp === null) add("warn", `relay ${relay} runs an agentmbx too old to store expiring encryption ads: peers on this version cannot seal relay mail for this host unless they learned its key on the LAN`, "upgrade the relay");
@@ -263,7 +265,9 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
         const host = r.k.slice("relay-enc-rejected:".length), waiting = n("SELECT COUNT(*) c FROM outbox WHERE host=?", host);
         let reason = "";
         try { reason = String((JSON.parse(r.v) as { reason?: string }).reason ?? ""); } catch { /* shown without a reason */ }
-        if (waiting) add("warn", `${waiting} message(s) for ${host} wait: the relay offers no valid encryption key ad for it (${reason}), and nothing is sealed for an unverified key`,
+        if (waiting && reason.startsWith(ROLLBACK_REASON)) add("warn", `${waiting} message(s) for ${host} wait: the relay served an older encryption key ad for it than one already accepted, a possible replay of a retired key (${reason}); nothing is sealed for the older key`,
+          `it clears when the relay serves ${host}'s current ad (republished daily) or ${host} is reachable on the LAN; if it persists, the relay is replaying old ads`);
+        else if (waiting) add("warn", `${waiting} message(s) for ${host} wait: the relay offers no valid encryption key ad for it (${reason}), and nothing is sealed for an unverified key`,
           `${host} must run a current agentmbx with this relay configured, or reach this host on the LAN once (its key is then pinned)`);
       }
       const waiting = n("SELECT COUNT(*) c FROM relay_sent WHERE relay=? AND state='relay-accepted'", relay);

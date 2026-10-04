@@ -297,6 +297,28 @@ the sender keeps its row and retries with backoff.
   pinned on first exchange. Peers on 0.5.6 or older publish only v1, so relay mail reaches them only once their key
   is pinned. A relay older than T168 answers 404 to the v2 publish. The host then keeps the v1 ad, and `doctor` warns
   that the relay is too old to carry expiring ads.
+- **Rollback guard.** Inside the validity window a relay can replay any ad it once held. If `enc.key` is regenerated
+  under the same host key, an older ad names a key nobody holds. A sender therefore keeps the newest ad it accepted
+  for each peer host key (`relay-enc-newest:<host key>`). It refuses an ad whose `iat` is not newer than that one but
+  that names a different key, with the reason `rolled back: …`, which `doctor` reports separately as a possible
+  replay. An older ad naming the same key changes nothing and is accepted, so a publisher's clock stepping back does
+  no harm.
+- **The v1 pair is best effort.** Once the v2 record is stored, a v1 publish answered 404 or 410 (a relay that
+  retired `/v1`) is audited once (`relay.enc_v1_retired`). The v1 pair then no longer counts as drift, and any other
+  v1 error is audited without failing the session. On a relay too old for v2 records, the v1 pair is all it carries,
+  so a v1 failure stops the session.
+- **Clock skew.** The relay refuses a hop timestamp more than 5 minutes from its clock. Enrolment itself is unsigned,
+  so a host with a skewed clock enrols and is then refused on every signed call. A 401 on the first signed call after
+  a fresh enrolment is treated as clock skew. It sets state `clock-skew` (with the offset measured from the relay's
+  `Date` header), audits `relay.clock_skew` once per episode, and starts enrolment retries at 1 minute, doubling to
+  1 hour. A signed answer that confirms the enrolment ends the backoff at once. `doctor` fails it with the offset and
+  how to fix the clock.
+- **Rollout.**
+  - Upgrade relay.agentmbx.com before the hosts: until then it serves only v1 ads, and upgraded senders refuse them.
+  - Meanwhile, upgraded senders cannot reach peers on 0.5.6 or older, or peers behind an old relay, unless the
+    peer's key was pinned over the LAN. That mail stays queued, and `doctor` names the peer and the reason.
+  - Senders on 0.5.6 are unaffected, because upgraded hosts keep publishing the v1 pair.
+  - There is no compatibility shim: accepting v1 ads from a relay would reopen the replay hole this closes.
 - **Truthful recovery state (T168).** Each relay pass records its outcome per relay. It is `ok` (with the ad's
   expiry), `unreachable`, `key-mismatch`, `enrol-failed` (with the relay's status and reason) or `enc-ad-failed`,
   stamped with when that state began. `doctor` reports it with the number of queued messages. Key rotation,
@@ -401,6 +423,9 @@ v1 otherwise. Mixed hosts work because items are opaque to the relay, and receiv
     - a revoked key keeps mail queued, never falls back to v1, and `doctor` fails it truthfully;
     - a stub authority grants with an account, or denies, and a throwing authority fails closed;
     - `relay set --key` handles a match, a mismatch, a changed relay key, owner confirmation, an unreachable relay
-      and the CLI exit codes.
+      and the CLI exit codes;
+    - review round 1: a retired `/v1` (404, 410) is audited once and never fatal, while it stays fatal on a relay
+      too old for v2; a replayed older ad naming a regenerated key is refused, with its own `doctor` line; a skewed
+      clock backs off instead of re-enrolling every tick, and `doctor` reports it as clock skew.
 - **T147 (with the owner):** deploy per decisions 1–5 (Railway, `relay.agentmbx.com`) and run the home-to-work proof. Mail both ways with each host
   on a different network, the relay restarted mid-flight, and one restore drill.

@@ -3,6 +3,9 @@
 // itself: signed by the host key the sender pinned at pairing, naming that key and host, inside its validity window.
 // A v1 advertisement ({v:1, host, enc_pub}) carries no expiry, so a relay could replay an old one forever; senders on
 // this version refuse it from a relay (the LAN exchange is unchanged). Publishers still send v1 for older senders.
+// Inside the validity window a relay could still replay an older ad of the same host key naming a retired enc key (an
+// enc.key regenerated under the same host key): senders remember the newest ad they accepted per host key and refuse an
+// older one that names another key (src/relay-v2.ts relayEncVerdict).
 import { canonical, signData, verifyData } from "./crypto.js";
 /** How long a published advertisement is valid, and the longest validity anyone accepts. */
 export const ENC_AD_TTL_MS = 30 * 86_400_000;
@@ -59,5 +62,5 @@ export function encFromRelayAnswer(answer, peer, now = Date.now()) {
     const encPub = j.ad.enc_pub;
     if (j.enc_pub !== undefined && j.enc_pub !== encPub)
         return { reason: "tampered: the served key differs from the signed advertisement" };
-    return { enc_pub: encPub };
+    return { enc_pub: encPub, iat: j.ad.iat };
 }

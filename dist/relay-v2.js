@@ -53,7 +53,7 @@ async function call(s, node, method, pathAndQuery, obj) {
         return { status: 0, json: { error: "relay unreachable" } };
     if (res.status === 401)
         node.store.db.prepare("DELETE FROM kv WHERE k LIKE ?").run(`relay-enrolled-v2:${s.relay}:%`); // re-enrol next pass (G6)
-    return { status: res.status, json: await res.json().catch(() => ({})) };
+    return { status: res.status, json: await res.json().catch(() => ({})), date: res.headers.get("date") };
 }
 /** GET /v2/relay/info: the info, or the HTTP status that came instead (0 = unreachable). Signed when a node is given,
  *  so the answer says whether the relay's store knows this host (`you`). */
@@ -181,14 +181,44 @@ export async function relayOpen(node, relay, f = fetch, given) {
             node.store.set(`relay-epoch:${relay}`, info.epoch);
     }
     await announceRotationsToRelay(node, s);
-    if (!await ensureEnrolled(node, s))
+    const enrolled = await ensureEnrolled(node, s);
+    if (!enrolled)
         return null;
-    const adExp = await ensureEncAd(node, s);
-    if (adExp === false)
+    const ad = await ensureEncAd(node, s);
+    if (!ad.ok) {
+        // enrolled a moment ago, then the first signed call is refused: the relay checks hop timestamps (±5 min), so this
+        // host's clock is the likely cause. Back off instead of re-enrolling every tick, and say so.
+        if (enrolled === "enrolled" && ad.status === 401)
+            clockSkew(node, s, ad.date);
+        else
+            setState(node, relay, { state: "enc-ad-failed", status: ad.status, detail: ad.detail, relay_fp: fingerprint(info.relay_pubkey), epoch: info.epoch });
         return null;
+    }
+    delKv(node, `relay-enrol-backoff:${relay}`);
     await publishSenders(node, s);
-    setState(node, relay, { state: "ok", relay_fp: fingerprint(info.relay_pubkey), epoch: info.epoch, enc_ad_exp: adExp });
+    setState(node, relay, { state: "ok", relay_fp: fingerprint(info.relay_pubkey), epoch: info.epoch, enc_ad_exp: ad.exp });
     return s;
+}
+/** The relay rejects a hop whose timestamp is more than 5 minutes from its clock. */
+const HOP_WINDOW_MS = 300_000;
+/** Enrolment retries after a likely clock skew: 1 min, doubling, at most 1 h. */
+export const ENROL_BACKOFF_BASE_MS = 60_000, ENROL_BACKOFF_MAX_MS = 3_600_000;
+function clockSkew(node, s, date) {
+    const k = `relay-enrol-backoff:${s.relay}`, now = Date.now();
+    let prev = null;
+    try {
+        prev = JSON.parse(kv(node, k) ?? "null");
+    }
+    catch { /* start over */ }
+    const n = (prev?.n ?? 0) + 1, next = new Date(now + Math.min(ENROL_BACKOFF_BASE_MS * 2 ** (n - 1), ENROL_BACKOFF_MAX_MS)).toISOString();
+    node.store.set(k, JSON.stringify({ n, next_at: next }));
+    const relayNow = date ? Date.parse(date) : NaN, off = Number.isFinite(relayNow) ? now - relayNow : NaN;
+    const detail = Number.isFinite(off) && Math.abs(off) > HOP_WINDOW_MS
+        ? `this host's clock is about ${Math.round(Math.abs(off) / 60_000)} min ${off > 0 ? "ahead of" : "behind"} the relay's (the relay accepts 5)`
+        : "this host's clock is likely more than 5 min off the relay's";
+    if (n === 1)
+        node.store.audit("relay.clock_skew", { relay: s.relay, off_ms: Number.isFinite(off) ? off : null });
+    setState(node, s.relay, { state: "clock-skew", status: 401, detail, next_at: next, relay_fp: fingerprint(s.info.relay_pubkey), epoch: s.info.epoch });
 }
 /**
  * Enrolment is what the relay's store says, not what a local flag remembers (spec §8, G6): the signed info answer carries
@@ -201,8 +231,15 @@ async function ensureEnrolled(node, s) {
     if (s.info.you?.pubkey === node.key.publicKey && s.info.you.host === node.host) { // a renamed host re-enrols to carry its name
         if (!kv(node, flag))
             node.store.set(flag, new Date().toISOString());
-        return true;
+        return "confirmed";
     }
+    // a likely clock skew stopped the last attempt: wait out the backoff (a signed answer above ends it at once)
+    try {
+        const bo = JSON.parse(kv(node, `relay-enrol-backoff:${s.relay}`) ?? "null");
+        if (bo?.next_at && Date.parse(bo.next_at) > Date.now())
+            return false;
+    }
+    catch { /* malformed: try now */ }
     if (kv(node, flag))
         node.store.audit("relay.enrolment_lost", { relay: s.relay, epoch: s.info.epoch });
     node.store.db.prepare("DELETE FROM kv WHERE k LIKE ?").run(`relay-enrolled-v2:${s.relay}:%`);
@@ -226,40 +263,55 @@ async function ensureEnrolled(node, s) {
     delKv(node, `relay-enc-ad:${s.relay}`);
     delKv(node, `relay-senders:${s.relay}`);
     node.store.audit("relay.enrolled", { relay: s.relay, epoch: s.info.epoch, relay_key: fingerprint(s.info.relay_pubkey) });
-    return true;
+    return "enrolled";
 }
 /**
  * This host's enc-key ad at the relay (spec §8): a signed, expiring v2 record, plus the v1 pair older senders verify.
  * Republished when the relay's store lacks it or holds another key (a reset, a lost row, a rotation), when this host's
- * keys or the relay epoch change, and once a day. Every result is checked. Returns the v2 expiry (null: the relay is too
- * old to store v2 ads), or false when the relay refused it.
+ * keys or the relay epoch change, and once a day. Every result is checked. The v1 pair is best effort once the v2 record
+ * is stored: a relay that retired /v1 (404 or 410) is audited once and never stops relay use. Returns the v2 expiry
+ * (null: the relay is too old to store v2 ads, so v1 is all it carries and must succeed).
  */
 async function ensureEncAd(node, s) {
-    const k = `relay-enc-ad:${s.relay}`, now = Date.now(), mine = node.encKey.publicKey;
+    const k = `relay-enc-ad:${s.relay}`, retiredK = `relay-enc-v1-retired:${s.relay}`, now = Date.now(), mine = node.encKey.publicKey;
     let cur = null;
     try {
         cur = JSON.parse(kv(node, k) ?? "null");
     }
     catch { /* republish */ }
-    const served = s.info.you?.enc_ad; // undefined: a relay older than T168 does not say
-    // the v2 record (enc_pub, exp) and the v1 pair (v1) must both name this host's current key and the record be unexpired
-    const drift = served === null || (served !== undefined && (served.enc_pub !== mine || served.v1 !== mine || !served.exp || Date.parse(served.exp) <= now));
+    const served = s.info.you?.enc_ad, v1Retired = !!kv(node, retiredK); // undefined: a relay older than T168 does not say
+    // the v2 record (enc_pub, exp) and, unless the relay retired v1, the v1 pair must name this host's current key
+    const drift = served === null || (served !== undefined && (served.enc_pub !== mine || (!v1Retired && served.v1 !== mine) || !served.exp || Date.parse(served.exp) <= now));
     if (cur && !drift && cur.host_pubkey === node.key.publicKey && cur.enc_pub === mine && cur.epoch === s.info.epoch && now - Date.parse(cur.iat) < ENC_AD_REFRESH_MS)
-        return cur.exp;
+        return { ok: true, exp: cur.exp };
     if (cur && drift)
         node.store.audit("relay.enc_ad_missing", { relay: s.relay, v2: served?.enc_pub ? fingerprint(served.enc_pub) : null, v1: served?.v1 ? fingerprint(served.v1) : null });
     const { ad, sig } = signEncAd(node.host, node.key, mine, now);
     const v2 = await call(s, node, "POST", "/v2/relay/enc-key", { ad, sig });
+    const refused = (r, shape) => {
+        node.store.audit("relay.enc_publish_failed", { relay: s.relay, shape, status: r.status, error: String(r.json.error ?? "") });
+        return { ok: false, status: r.status, detail: `${r.status}: ${String(r.json.error ?? "refused")}`.slice(0, 300), date: r.date };
+    };
+    if (v2.status !== 200 && v2.status !== 404)
+        return refused(v2, "v2"); // 404: a relay older than T168
     const v1 = await call(s, node, "POST", "/v1/relay/enc-key", { enc_pub: mine, sig: signData(node.key.privateKey, canonical({ v: 1, host: node.host, enc_pub: mine })) });
-    const bad = v2.status !== 200 && v2.status !== 404 ? v2 : v1.status !== 200 ? v1 : null; // 404: a relay older than T168
-    if (bad) {
-        node.store.audit("relay.enc_publish_failed", { relay: s.relay, status: bad.status, error: String(bad.json.error ?? "") });
-        setState(node, s.relay, { state: "enc-ad-failed", status: bad.status, detail: `${bad.status}: ${String(bad.json.error ?? "refused")}`.slice(0, 300), relay_fp: fingerprint(s.info.relay_pubkey), epoch: s.info.epoch });
-        return false;
+    if (v1.status === 200) {
+        if (v1Retired)
+            delKv(node, retiredK);
     }
+    else if (v2.status !== 200)
+        return refused(v1, "v1"); // an old relay carries only v1
+    else if (v1.status === 404 || v1.status === 410) {
+        if (!v1Retired) {
+            node.store.audit("relay.enc_v1_retired", { relay: s.relay, status: v1.status });
+            node.store.set(retiredK, new Date(now).toISOString());
+        }
+    }
+    else
+        node.store.audit("relay.enc_publish_failed", { relay: s.relay, shape: "v1", status: v1.status, error: String(v1.json.error ?? ""), fatal: false });
     const exp = v2.status === 200 ? ad.exp : null;
     node.store.set(k, JSON.stringify({ host_pubkey: node.key.publicKey, enc_pub: mine, iat: ad.iat, exp, epoch: s.info.epoch }));
-    return exp;
+    return { ok: true, exp };
 }
 /** T030 rotations the relay has not seen: the relay moves our name and queue to the new key (spec §2). */
 async function announceRotationsToRelay(node, s) {
@@ -296,13 +348,30 @@ async function publishSenders(node, s) {
     else
         node.store.audit("relay.senders_failed", { relay: s.relay, status: r.status, error: String(r.json.error ?? "") });
 }
+/** The reason prefix doctor reports as a replayed (rolled-back) enc-key ad. */
+export const ROLLBACK_REASON = "rolled back";
 /**
  * The verdict on a relay's enc-key answer for a peer: its key, or null with the reason recorded for doctor
  * (`relay-enc-rejected:<host>`, cleared once a valid ad arrives or the key is pinned) and an audit when a served ad was
- * refused.
+ * refused. Rollback guard: the newest accepted ad per peer host key is remembered (`relay-enc-newest:<host key>`), and an
+ * ad that is not newer yet names another enc key is refused. The relay may replay any unexpired ad, so without this an
+ * enc.key regenerated under the same host key could be rolled back to one nobody holds. An older ad naming the same
+ * key changes nothing and is accepted (a publisher's clock may step back).
  */
-export function relayEncVerdict(node, host, status, got) {
-    const k = `relay-enc-rejected:${host}`;
+export function relayEncVerdict(node, peer, status, got) {
+    const k = `relay-enc-rejected:${peer.host}`;
+    if ("enc_pub" in got && got.iat) {
+        const nk = `relay-enc-newest:${peer.pubkey}`;
+        let newest = null;
+        try {
+            newest = JSON.parse(kv(node, nk) ?? "null");
+        }
+        catch { /* none */ }
+        if (newest && got.enc_pub !== newest.enc_pub && Date.parse(got.iat) <= Date.parse(newest.iat))
+            got = { reason: `${ROLLBACK_REASON}: the relay served an ad from ${got.iat} naming key ${fingerprint(got.enc_pub)}, not newer than the ad from ${newest.iat} naming ${fingerprint(newest.enc_pub)} already accepted` };
+        else if (!newest || Date.parse(got.iat) > Date.parse(newest.iat))
+            node.store.set(nk, JSON.stringify({ iat: got.iat, enc_pub: got.enc_pub }));
+    }
     if ("enc_pub" in got) {
         if (kv(node, k))
             delKv(node, k);
@@ -316,7 +385,7 @@ export function relayEncVerdict(node, host, status, got) {
     }
     catch { /* replaced below */ }
     if (status === 200 && prev?.reason !== got.reason)
-        node.store.audit("enc_key.rejected", { host, via: "relay", reason: got.reason });
+        node.store.audit("enc_key.rejected", { host: peer.host, via: "relay", reason: got.reason });
     node.store.set(k, JSON.stringify({ reason: got.reason, at: new Date().toISOString() }));
     return null;
 }
@@ -327,11 +396,11 @@ async function peerEnc(node, s, host) {
     if (!p)
         return null;
     if (p.enc_pub)
-        return relayEncVerdict(node, host, 200, { enc_pub: p.enc_pub }); // pinned (LAN or rotation): no relay ad needed
+        return relayEncVerdict(node, p, 200, { enc_pub: p.enc_pub }); // pinned (LAN or rotation): no relay ad needed
     const r = await call(s, node, "GET", `/v2/relay/enc-key?pubkey=${encodeURIComponent(p.pubkey)}`);
     const got = r.status === 200 ? encFromRelayAnswer(r.json, { host, pubkey: p.pubkey })
         : { reason: r.status === 404 ? "the relay holds no advertisement for this peer" : `the relay answered ${r.status}` };
-    return relayEncVerdict(node, host, r.status, got);
+    return relayEncVerdict(node, p, r.status, got);
 }
 /** An accept is ours only if the pinned relay key signed it, for this item, this target and exactly these bytes. */
 function validAccept(s, node, r, itemId, target, wireHash) {

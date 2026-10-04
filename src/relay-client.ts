@@ -65,11 +65,11 @@ export async function relayPublishEnc(node: MbxNode, relay: string, f: typeof fe
 export async function relayPeerEnc(node: MbxNode, relay: string, peerHost: string, f: typeof fetch = fetch): Promise<string | null> {
   const p = node.approvedPeer(peerHost);
   if (!p) return null;
-  if (p.enc_pub) return relayEncVerdict(node, peerHost, 200, { enc_pub: p.enc_pub }); // pinned: no relay ad needed
+  if (p.enc_pub) return relayEncVerdict(node, p, 200, { enc_pub: p.enc_pub }); // pinned: no relay ad needed
   const r = await call(node, "GET", url(relay, `/v1/relay/enc-key?host=${encodeURIComponent(peerHost)}`), undefined, f);
   const got = r.status === 200 ? encFromRelayAnswer(r.json, { host: peerHost, pubkey: p.pubkey })
     : { reason: r.status === 404 ? "the relay holds no advertisement for this peer" : `the relay answered ${r.status}` };
-  return relayEncVerdict(node, peerHost, r.status, got);
+  return relayEncVerdict(node, p, r.status, got);
 }
 
 /** Seal an outbox envelope for a peer and push it to the relay; the local outbox row is dropped on success. */
