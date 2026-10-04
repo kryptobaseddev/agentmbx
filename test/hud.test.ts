@@ -239,6 +239,29 @@ test("the CLI adapter resolves exactly without opening the store — an empty ho
   assert.ok(!existsSync(join(empty, "mbx.db")) && !existsSync(join(empty, "config.json")), "no store is created by a render");
 });
 
+// T347 review major 5: the bundled pure-sh Kimi adapter mirrors the Claude one — and when it has
+// nothing to render it EXITS NONZERO so Kimi shows its built-in footer instead of a blank one
+// (additive by contract, owner 2026-10-04).
+test("the bundled Kimi adapter renders with node absent from PATH — and fails over to the built-in layout when empty", (t) => {
+  const h = home(), n = new MbxNode(h, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(h, { recursive: true, force: true }); });
+  n.bindSession({ agent: "drum", cli: "kimi", session_id: "kimi-1", pid: process.pid, session_key: "k" });
+  claim(n, "drum", "kimi-1");
+  n.send({ from: "boss", to: ["drum"], subject: "hey", body: "b", needs_reply: true });
+  writeHud(n);
+  const script = resolve("skill/scripts/kimi-statusline.sh");
+  const shEnv = { ...process.env, MBX_HOME: h, PATH: "/bin:/usr/bin" } as Record<string, string>;
+  const ok = spawnSync("/bin/sh", [script], { input: JSON.stringify({ session_id: "kimi-1" }), encoding: "utf8", env: shEnv });
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.match(ok.stdout, /^mbx drum 1↑ 1↺/);
+  const unbound = spawnSync("/bin/sh", [script], { input: JSON.stringify({ session_id: "nope" }), encoding: "utf8", env: shEnv });
+  assert.notEqual(unbound.status, 0, "an unbound session fails over to Kimi's built-in layout");
+  assert.equal(unbound.stdout, "");
+  const noSid = spawnSync("/bin/sh", [script], { input: "{}", encoding: "utf8", env: shEnv });
+  assert.notEqual(noSid.status, 0, "no session id also fails over");
+  assert.equal(noSid.stdout, "");
+});
+
 test("copilot, cursor and gemini adapters render by session id only (Claude-compatible statusLine shape)", (t) => {
   const h = home(), n = new MbxNode(h, { host: "alpha" });
   t.after(() => { n.close(); rmSync(h, { recursive: true, force: true }); });

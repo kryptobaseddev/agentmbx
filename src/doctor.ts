@@ -10,7 +10,7 @@ import { kimiDesktop } from "./kimi-desktop.ts";
 import { version } from "./version.ts";
 import { MbxNode } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
-import { detect, edits, skillStatus, wired, type SetupCtx } from "./setup.ts";
+import { detect, edits, skillStatus, statuslineCommand, statuslineState, wired, type SetupCtx } from "./setup.ts";
 import { mailboxLiveness } from "./receipts.ts";
 import { listIdentityControls } from "./identity-control.ts";
 import { pruneCandidates } from "./identity-cleanup.ts";
@@ -177,6 +177,18 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
       const ok = e.every(wired);
       const what = kind === "mcp" ? "MCP server" : "hooks";
       add(ok ? "ok" : "fail", `${d.cli}: ${what} ${ok ? "wired" : "not wired"} (${e.map((x) => x.path.replace(ctx.home, "~")).join(", ")})`, ok ? undefined : `agentmbx setup --only ${d.cli}`);
+    }
+    // The status line is optional and never fails doctor (review minor 7): a foreign one is left
+    // alone at info, ours pointing at a deleted script is a warn, and a user who removed the
+    // optional segment hears nothing about it.
+    const sl = es.filter((x) => x.kind === "statusline");
+    if (sl.length && (d.cli === "claude" || d.cli === "kimi")) {
+      const state = statuslineState(ctx.home, d.cli, ctx.cmd);
+      const script = statuslineCommand(ctx.home, d.cli, ctx.cmd);
+      const scriptPath = script.startsWith("sh ") ? script.slice(3).split(" ")[0] : null;
+      if (state === "ours" && scriptPath && !existsSync(scriptPath)) add("warn", `${d.cli}: status line points at a missing script (${scriptPath})`, "agentmbx setup --only skill");
+      else if (state === "ours") add("ok", `${d.cli}: status line wired (${sl[0].path.replace(ctx.home, "~")})`);
+      else if (state === "foreign") add("info", `${d.cli}: a user's status line is left alone (MBX segment not wired)`);
     }
   }
 

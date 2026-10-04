@@ -30,86 +30,140 @@ export const shJoin = (argv) => argv.map(shq).join(" ");
 export const hookCommand = (cmd, event, cli) => `${shJoin(cmd)} hook ${event} --cli ${cli}`;
 // T347: setup wires one status line per CLI — never overwrites a user's existing one. A foreign
 // status line is left alone and reported (runSetup adds a manual row with the snippet); uninstall
-// removes only what setup wrote.
+// removes only what setup wrote. "Ours" is an EXACT match against a command setup itself writes
+// (review blocker: the absolute script-path form or the shJoin(cmd) form — nothing else).
 export const statuslineCommand = (home, cli, cmd) => {
-    if (cli === "kimi")
-        return `${shJoin(cmd)} statusline kimi`;
-    // Claude renders periodically: the bundled pure-sh adapter when the skill ships it (SEA: the node adapter)
-    const script = join(skillDest(home), "scripts", "claude-statusline.sh");
-    return existsSync(script) ? `sh ${shJoin([script])}` : `${shJoin(cmd)} statusline claude`;
+    // The bundled pure-sh adapter when the skill ships it (SEA bundles SKILL.md only: the node adapter)
+    const script = join(skillDest(home), "scripts", `${cli}-statusline.sh`);
+    return existsSync(script) ? `sh ${shJoin([script])}` : `${shJoin(cmd)} statusline ${cli}`;
 };
-const isOurStatusline = (command, cli) => !!command && (command.includes(`statusline ${cli}`) && command.includes("agentmbx") || (cli === "claude" && command.includes("claude-statusline.sh")));
-/** "absent" = nothing there, "ours" = we wrote it, "foreign" = a user's own status line. */
-export const statuslineState = (home, cli) => {
-    if (cli === "claude") {
-        const cur = read(join(home, ".claude/settings.json"));
+const statuslineForms = (home, cli, cmd) => new Set([
+    `sh ${shJoin([join(skillDest(home), "scripts", `${cli}-statusline.sh`)])}`,
+    `${shJoin(cmd)} statusline ${cli}`,
+]);
+const isOurStatusline = (home, cli, cmd, command) => !!command && statuslineForms(home, cli, cmd).has(command);
+/** "absent" = nothing there, "ours" = an exact setup-written command, "foreign" = anything else.
+ *  A malformed file is foreign, never a thrown runSetup (review major 2). */
+export const statuslineState = (home, cli, cmd) => {
+    try {
+        if (cli === "claude") {
+            const cur = read(join(home, ".claude/settings.json"));
+            if (cur === null)
+                return "absent";
+            const command = parseObj(cur).statusLine?.command;
+            return command === undefined ? "absent" : isOurStatusline(home, cli, cmd, command) ? "ours" : "foreign";
+        }
+        const dir = (home === homedir() && process.env.KIMI_CODE_HOME) || join(home, ".kimi-code"); // review: honor KIMI_CODE_HOME
+        const cur = read(join(dir, "tui.toml"));
         if (cur === null)
             return "absent";
-        const command = parseObj(cur).statusLine?.command;
-        return command === undefined ? "absent" : isOurStatusline(command, cli) ? "ours" : "foreign";
+        const st = kimiStatus(cur);
+        if (st.form !== "section")
+            return st.form;
+        const command = kimiCommandValue(st.body);
+        return command !== null && isOurStatusline(home, cli, cmd, command) ? "ours" : "foreign";
     }
-    const cur = read(join(home, ".kimi-code/tui.toml"));
-    const section = cur === null ? null : kimiStatusSection(cur);
-    return section === null ? "absent" : section.ours ? "ours" : "foreign";
+    catch {
+        return "foreign";
+    }
 };
-/** The uncommented [status_line] section of a tui.toml, if any — header plus body lines up to the
- *  next section header at line start (array brackets inside values never end a section). */
-const kimiStatusSection = (cur) => {
-    const start = /(^|\n)[ \t]*\[status_line\][ \t]*\n/.exec(cur);
+const kimiStatus = (cur) => {
+    // A top-level status_line key in non-section form: `status_line = {…}` or `status_line.items = …`
+    if (/^[ \t]*status_line[ \t]*[=.]/m.test(cur))
+        return { form: "foreign" };
+    const start = /(^|\n)[ \t]*\[[ \t]*status_line[ \t]*\][ \t]*(?:#[^\n]*)?\r?\n/.exec(cur);
     if (!start)
-        return null;
+        return { form: "absent" };
     const headerAt = start.index + (start[0].startsWith("\n") ? 1 : 0);
     const rest = cur.slice(headerAt);
-    const next = /\n[ \t]*\[/.exec(rest);
+    const next = /\r?\n[ \t]*\[/.exec(rest);
     const body = next ? rest.slice(0, next.index + 1) : rest;
-    const command = /(?:^|\n)[ \t]*command[ \t]*=[ \t]*"([^"]*)"/.exec(body)?.[1];
-    return { ours: !!command && command.includes("statusline kimi") && command.includes("agentmbx"), body };
+    const commandLine = /(?:^|\r?\n)[ \t]*command[ \t]*=[^\n]*\r?\n/.exec(body)?.[0] ?? null;
+    return { form: "section", body, commandLine };
 };
+const kimiCommandValue = (body) => /(?:^|\r?\n)[ \t]*command[ \t]*=[ \t]*"([^"]*)"/.exec(body)?.[1] ?? null;
 function claudeStatusLine(home, cmd) {
     const want = () => statuslineCommand(home, "claude", cmd);
     return {
         install: (cur) => {
             const obj = parseObj(cur);
             const existing = obj.statusLine;
-            if (existing && !isOurStatusline(existing.command, "claude"))
-                return cur; // foreign: reported by runSetup, never overwritten
-            if (existing?.type === "command" && existing?.command === want())
+            if (existing && !isOurStatusline(home, "claude", cmd, existing.command))
+                return cur; // foreign: reported, never overwritten
+            if (existing?.type === "command" && existing.command === want())
                 return cur;
-            obj.statusLine = { type: "command", command: want() };
+            obj.statusLine = { ...existing, type: "command", command: want() }; // keep the user's other keys (padding etc.)
             return jsonOut(obj, cur);
         },
         uninstall: (cur) => {
             if (cur === null)
                 return cur;
             const obj = parseObj(cur);
-            if (!isOurStatusline(obj.statusLine?.command, "claude"))
+            const existing = obj.statusLine;
+            if (!isOurStatusline(home, "claude", cmd, existing?.command))
                 return cur;
-            delete obj.statusLine;
+            // remove only what setup wrote (type + command); the user's other keys stay
+            if (existing && Object.keys(existing).length > 2) {
+                const rest = { ...existing };
+                delete rest.type;
+                delete rest.command;
+                obj.statusLine = rest;
+            }
+            else
+                delete obj.statusLine;
             return jsonOut(obj, cur);
         },
     };
 }
 function kimiStatusLine(home, cmd) {
     const want = () => statuslineCommand(home, "kimi", cmd);
-    const sectionText = () => `[status_line]\ncommand = "${want()}"\n`;
+    const commandLineText = (w) => `command = ${JSON.stringify(w)}\n`; // JSON.stringify: a valid TOML basic string (review: escaping)
+    const sectionText = (w) => `[status_line]\n${commandLineText(w)}`;
     return {
         install: (cur) => {
-            const section = cur === null ? null : kimiStatusSection(cur);
-            if (section && !section.ours)
-                return cur; // foreign: reported, never overwritten
-            if (section && new RegExp(`command[ \t]*=[ \t]*"${want().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`).test(section.body))
-                return cur;
-            if (section)
-                return (cur ?? "").replace(section.body, sectionText());
-            return (cur ?? "") + (cur && !cur.endsWith("\n") ? "\n" : "") + "\n" + sectionText();
+            const st = cur === null ? { form: "absent" } : kimiStatus(cur);
+            if (st.form === "foreign")
+                return cur; // reported by runSetup, never overwritten — and never appended (no duplicate table)
+            const w = want();
+            if (st.form === "section") {
+                const command = kimiCommandValue(st.body);
+                if (command !== null && !isOurStatusline(home, "kimi", cmd, command))
+                    return cur; // a foreign command line: leave everything
+                if (command === w)
+                    return cur;
+                if (st.commandLine)
+                    return (cur ?? "").replace(st.commandLine, () => commandLineText(w)); // rewrite ONLY our command line — items and other keys stay
+                const eol = st.body.indexOf("\n"); // no command line yet: insert ours right after the header
+                return (cur ?? "").replace(st.body, () => st.body.slice(0, eol + 1) + commandLineText(w) + st.body.slice(eol + 1));
+            }
+            return (cur ?? "") + (cur && !cur.endsWith("\n") ? "\n" : "") + "\n" + sectionText(w);
         },
         uninstall: (cur) => {
             if (cur === null)
                 return cur;
-            const section = kimiStatusSection(cur);
-            if (!section?.ours)
+            const st = kimiStatus(cur);
+            if (st.form !== "section")
                 return cur;
-            return cur.replace(section.body, "").replace(/\n{3,}/g, "\n\n");
+            const command = kimiCommandValue(st.body);
+            if (command === null || !isOurStatusline(home, "kimi", cmd, command))
+                return cur; // foreign: never touched
+            // remove ONLY our command line, byte-exact — no whitespace collapsing anywhere else (review minor 6)
+            const lines = st.body.split("\n").filter((l) => !/^[ \t]*command[ \t]*=/.test(l));
+            const meaningful = lines.filter((l) => l.trim() !== "" && !/^[ \t]*\[/.test(l));
+            let next;
+            if (meaningful.length)
+                next = (cur ?? "").replace(st.body, () => lines.join("\n"));
+            else {
+                // the whole section goes; the blank line install added before it goes too (exact insert bytes)
+                const start = (cur ?? "").indexOf(st.body);
+                const prefix = start > 0 ? (cur ?? "").slice(0, start) : "";
+                next = (cur ?? "").replace(st.body, () => "");
+                if (prefix.endsWith("\n\n"))
+                    next = next.replace(/\n\n$/, "\n");
+            }
+            if (next.trim() === "")
+                next = null; // setup created the file: remove it entirely
+            return next;
         },
     };
 }
@@ -536,12 +590,12 @@ export function edits(ctx, cli) {
                             return false;
                         }
                     } },
-                { cli, kind: "hooks", item: "statusLine (MBX segment)", path: join(home, ".claude/settings.json"), ...claudeStatusLine(home, cmd),
+                { cli, kind: "statusline", item: "statusLine (MBX segment)", path: join(home, ".claude/settings.json"), ...claudeStatusLine(home, cmd),
                     isWired: (cur) => {
-                        // Both render commands are ours and functional (script form when the skill ships it,
-                        // direct form otherwise); install() normalizes to the script form on the next run.
+                        // Either exact render command is ours and functional (script form when the skill ships
+                        // it, direct form otherwise); install() normalizes to the script form on the next run.
                         try {
-                            return isOurStatusline(JSON.parse(cur ?? "null")?.statusLine?.command, "claude");
+                            return isOurStatusline(home, "claude", cmd, JSON.parse(cur ?? "null")?.statusLine?.command);
                         }
                         catch {
                             return false;
@@ -563,7 +617,7 @@ export function edits(ctx, cli) {
             return [
                 { cli, kind: "mcp", item: "mcpServers.mbx", path: join(kimi, "mcp.json"), ...srv },
                 { cli, kind: "hooks", item: "[[hooks]] SessionStart + UserPromptSubmit + PermissionRequest + Stop", path: join(kimi, "config.toml"), ...kimiHooks(cmd) },
-                { cli, kind: "hooks", item: "[status_line] (MBX segment)", path: join(kimi, "tui.toml"), ...kimiStatusLine(home, cmd) },
+                { cli, kind: "statusline", item: "[status_line] (MBX segment)", path: join(kimi, "tui.toml"), ...kimiStatusLine(home, cmd) },
             ];
         }
         case "hermes":
@@ -720,6 +774,10 @@ export const timestamp = (d = new Date()) => d.toISOString().replace(/[-:]/g, ""
 export function runSetup(ctx, o) {
     const rows = [];
     const stamp = o.stamp ?? timestamp();
+    // Review major 5: the skill ships the statusline/post-tool adapters the CLI edits reference —
+    // install it FIRST so a single `agentmbx setup` reaches the final wiring state (no second run
+    // to upgrade a node-adapter command to the bundled sh adapter).
+    const skillRows = o.only && !o.only.includes("skill") ? null : skill(ctx, o.mode, !!o.dryRun);
     for (const d of detect(ctx)) {
         if (o.only && !o.only.includes(d.cli))
             continue;
@@ -764,14 +822,14 @@ export function runSetup(ctx, o) {
         if (d.cli === "codex" && o.mode === "install" && rows.some((r) => r.cli === "codex" && r.item.startsWith("hooks") && r.action !== "unchanged"))
             rows.push({ cli: "codex", item: "note", path: "-", action: "manual", note: "Codex may ask you to review/trust the new hooks on next start" });
         // T347: a user's own status line is never overwritten — report it and print the snippet instead.
-        if (o.mode === "install" && (d.cli === "claude" || d.cli === "kimi") && statuslineState(ctx.home, d.cli) === "foreign")
+        if (o.mode === "install" && (d.cli === "claude" || d.cli === "kimi") && statuslineState(ctx.home, d.cli, ctx.cmd) === "foreign")
             rows.push({ cli: d.cli, item: "statusLine", path: "-", action: "manual",
                 note: `an existing status line was left alone; add the MBX segment yourself: ${d.cli === "claude"
                     ? `"statusLine": { "type": "command", "command": "${statuslineCommand(ctx.home, "claude", ctx.cmd)}" }`
                     : `[status_line]\ncommand = "${statuslineCommand(ctx.home, "kimi", ctx.cmd)}"`}` });
     }
-    if (!o.only || o.only.includes("skill"))
-        rows.push(...skill(ctx, o.mode, !!o.dryRun));
+    if (skillRows)
+        rows.push(...skillRows);
     // A running OpenCode service only reads its config at start.
     const oc = rows.find((r) => r.cli === "opencode" && (r.action === "added" || r.action === "updated" || r.action === "removed"));
     if (oc && !o.dryRun && ctx.useClis && ctx.which("opencode")) {

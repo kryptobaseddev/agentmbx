@@ -10,7 +10,7 @@ import { kimiDesktop } from "./kimi-desktop.js";
 import { version } from "./version.js";
 import { MbxNode } from "./node.js";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.js";
-import { detect, edits, skillStatus, wired } from "./setup.js";
+import { detect, edits, skillStatus, statuslineCommand, statuslineState, wired } from "./setup.js";
 import { mailboxLiveness } from "./receipts.js";
 import { listIdentityControls } from "./identity-control.js";
 import { pruneCandidates } from "./identity-cleanup.js";
@@ -212,6 +212,21 @@ export async function doctor(ctx, mbxHome, opts = {}) {
             const ok = e.every(wired);
             const what = kind === "mcp" ? "MCP server" : "hooks";
             add(ok ? "ok" : "fail", `${d.cli}: ${what} ${ok ? "wired" : "not wired"} (${e.map((x) => x.path.replace(ctx.home, "~")).join(", ")})`, ok ? undefined : `agentmbx setup --only ${d.cli}`);
+        }
+        // The status line is optional and never fails doctor (review minor 7): a foreign one is left
+        // alone at info, ours pointing at a deleted script is a warn, and a user who removed the
+        // optional segment hears nothing about it.
+        const sl = es.filter((x) => x.kind === "statusline");
+        if (sl.length && (d.cli === "claude" || d.cli === "kimi")) {
+            const state = statuslineState(ctx.home, d.cli, ctx.cmd);
+            const script = statuslineCommand(ctx.home, d.cli, ctx.cmd);
+            const scriptPath = script.startsWith("sh ") ? script.slice(3).split(" ")[0] : null;
+            if (state === "ours" && scriptPath && !existsSync(scriptPath))
+                add("warn", `${d.cli}: status line points at a missing script (${scriptPath})`, "agentmbx setup --only skill");
+            else if (state === "ours")
+                add("ok", `${d.cli}: status line wired (${sl[0].path.replace(ctx.home, "~")})`);
+            else if (state === "foreign")
+                add("info", `${d.cli}: a user's status line is left alone (MBX segment not wired)`);
         }
     }
     if (node) {
