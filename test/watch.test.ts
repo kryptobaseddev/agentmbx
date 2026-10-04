@@ -59,6 +59,7 @@ test("agentmbx watch outside any session lease stops with a reason", async (t) =
 test("Kimi sessions get the event-driven watcher instruction; other no-push CLIs keep the cron self-check", () => {
   assert.equal(selfWatchInstruction({ delegated: false, cli: "kimi", env: {} }), WATCHER_INSTRUCTION);
   assert.match(WATCHER_INSTRUCTION, /"agentmbx watch", run_in_background true, disable_timeout true/);
+  assert.match(WATCHER_INSTRUCTION, /delete it \(CronDelete\).*background watcher replaces it/s, "T348: one mechanism — legacy cron jobs are cleaned up");
   assert.match(selfWatchInstruction({ delegated: true, cli: "kimi", env: { MBX_SELF_WATCH: "15" } })!, /cron/);
   assert.match(selfWatchInstruction({ delegated: true, cli: "kimi", env: { MBX_SELF_WATCH: "off" } })!, /mbx watcher/);
   assert.equal(selfWatchInstruction({ delegated: false, cli: "hermes", env: {} }), null);

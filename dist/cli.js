@@ -1507,11 +1507,11 @@ async function hook(node, event, cli) {
                 const note = delegationNote(node.store.db, agent, node.host);
                 if (note)
                     lines.push(note);
-                if (watch) {
+                if (watch && !liveWatcher(node, agent)) {
                     const w = selfWatchInstruction({ delegated: !!note, cli });
                     if (w)
                         lines.push(w);
-                }
+                } // T348: no wake instruction while one is alive
                 emit(cli, "SessionStart", lines.join("\n"));
                 return;
             }
