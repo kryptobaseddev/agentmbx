@@ -7,6 +7,7 @@
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { canonical, generateKeyPair, keyPairFromPrivate, signData, verifyData, nonce as newNonce } from "./crypto.js";
+import { checkEncAd } from "./enc-ad.js";
 import { checkShape } from "./envelope.js";
 import { checkRotation } from "./key-rotation.js";
 import { ReceiptRecord } from "./remote-receipts.js";
@@ -21,6 +22,8 @@ export const DEFAULT_QUOTA = {
 };
 export const MAX_SENDERS = 1024;
 const IP_TABLE_MAX = 50_000;
+/** The self-hosted default: any host that answers the challenge with its key may enrol; key and sender quotas bound it. */
+export const hostKeyChallengeAuthority = { name: "host-key-challenge", authorize: () => ({ ok: true }) };
 export const HEARTBEAT_MS = 30_000;
 export const HEARTBEAT_STALE_MS = 10 * 60_000;
 /** Lowercase hex SHA-256 of the exact wire bytes. */
@@ -68,6 +71,7 @@ export class RelayCore {
     store;
     quota;
     key;
+    authority;
     pending = new Map(); // host pubkey -> enrolment challenge (bounded, expiring)
     pushes = new Map(); // sender pubkey -> push timestamps (rate window)
     ipCalls = new Map(); // client address -> challenge/enrol timestamps
@@ -75,6 +79,7 @@ export class RelayCore {
         this.quota = { ...DEFAULT_QUOTA, ...quota };
         this.store = o.store ?? new SqliteRelayStore();
         this.key = o.key ?? generateKeyPair();
+        this.authority = o.authority ?? hostKeyChallengeAuthority;
         const pinned = this.store.meta("relay_pubkey");
         if (pinned && pinned !== this.key.publicKey)
             throw err("RELAY_KEY", "this relay store belongs to another relay key: keep relay.key with its store");
@@ -97,14 +102,17 @@ export class RelayCore {
     }
     /** The running relay records that it is alive; startRelayServer calls this every HEARTBEAT_MS. */
     beat(now = Date.now()) { this.store.setMeta("heartbeat", String(now)); }
-    /** Public relay facts for `relay set` pinning and client feature detection (§1). With a caller, also its queue head. */
+    /** Public relay facts for `relay set` pinning and client feature detection (§1). With a caller, also its queue head
+     *  and the enc-key ad stored for it (T168), so a host reconciles its enrolment and ad against this store, not a flag. */
     info(caller) {
         const q = this.quota;
+        const ad = caller ? this.getEncAdByKey(caller.pubkey) : null;
         return { v: 2, relay_pubkey: this.key.publicKey, epoch: this.store.epoch(), version: version(),
             limits: { max_item_bytes: q.maxEnvelopeBytes, max_batch: q.maxBatch, max_pull: q.maxPull, max_pull_bytes: q.maxPullBytes, max_targets: q.maxTargets,
                 retention_days: q.retentionDays, max_queue_items: q.maxQueueDepth, max_queue_bytes: q.maxQueueBytes, max_sender_items: q.maxSenderItems,
                 max_sender_bytes: q.maxSenderBytes, max_owner_items: q.maxOwnerDepth, max_owner_bytes: q.maxOwnerBytes },
-            ...(caller ? { you: { host: caller.host, pubkey: caller.pubkey, head_seq: this.store.lastSeq(caller.pubkey), acked_through: this.store.ackedThrough(caller.pubkey) } } : {}) };
+            ...(caller ? { you: { host: caller.host, pubkey: caller.pubkey, head_seq: this.store.lastSeq(caller.pubkey), acked_through: this.store.ackedThrough(caller.pubkey),
+                    enc_ad: ad ? { enc_pub: ad.ad?.enc_pub ?? null, exp: ad.ad?.exp ?? null, v1: ad.sig !== undefined ? ad.enc_pub : null } : null } } : {}) };
     }
     /** Aggregate stored items across every host of one proven account. */
     accountDepth(account) { return this.store.accountUsage(account).items; }
@@ -146,9 +154,10 @@ export class RelayCore {
         this.pending.set(pubkey, { n, at: now });
         return n;
     }
-    /** Enrolment step 2: the host signs (challenge, its key, its claimed owner); the relay verifies and binds. A revoked key
-     *  stays revoked. owner_fp is recorded but proves nothing (§8: accounts come from the JWKS authority). */
-    enrol(host, pubkey, owner_fp, sig) {
+    /** Enrolment step 2: the host signs (challenge, its key, its claimed owner); the relay verifies, asks its
+     *  EnrolmentAuthority (§8), and binds with the account the authority proved. A revoked key stays revoked. owner_fp is
+     *  recorded but proves nothing. A denial stores nothing and answers DENIED (403). */
+    enrol(host, pubkey, owner_fp, sig, proof) {
         if (!HOST_RE.test(host) || !isPubkey(pubkey) || typeof owner_fp !== "string" || !OWNER_FP_RE.test(owner_fp))
             throw err("BAD_REQUEST", "bad enrolment fields");
         const p = this.pending.get(pubkey);
@@ -157,11 +166,20 @@ export class RelayCore {
         if (typeof sig !== "string" || !verifyData(pubkey, canonical({ v: 1, challenge: p.n, host, pubkey, owner_fp }), sig))
             throw new Error("bad enrolment signature");
         this.pending.delete(pubkey);
+        let d;
+        try {
+            d = this.authority.authorize({ host_name: host, host_pubkey: pubkey, owner_fp, proof });
+        }
+        catch {
+            d = { ok: false, reason: "the enrolment authority is unavailable" };
+        }
+        if (!d?.ok)
+            throw err("DENIED", `enrolment not authorized${d?.reason ? `: ${String(d.reason).slice(0, 200)}` : ""}`);
         this.store.transaction(() => {
             const known = this.store.getEnrolment(pubkey);
             if (!known && this.store.liveEnrolmentCount() >= this.quota.maxEnrolments)
                 throw err("FULL", "relay enrolment capacity reached");
-            this.store.putEnrolment({ host, pubkey, owner_fp, at: new Date().toISOString(), authorized_by: "host-key-challenge" });
+            this.store.putEnrolment({ host, pubkey, owner_fp, at: new Date().toISOString(), account: d.account ?? null, authorized_by: this.authority.name });
         });
     }
     /** T030 rotation (§2): the old key's signed rotation record moves its name, account and queue to the new key and
@@ -242,13 +260,24 @@ export class RelayCore {
             throw new Error("bad enc-key signature");
         this.store.transaction(() => this.store.putEncAd({ host, host_pubkey: pubkey, enc_pub: encPub, sig, at: new Date().toISOString() }));
     }
+    /** T168: the signed, expiring v2 ad (src/enc-ad.ts). Refused unless it is the caller's own, current and validly signed. */
+    publishEncAdRecord(caller, ad, sig) {
+        const bad = checkEncAd(ad, sig, { host: caller.host, host_pubkey: caller.pubkey });
+        if (bad)
+            throw err("BAD_AD", `enc-key ad refused: ${bad}`);
+        this.store.transaction(() => this.store.putEncAdRecord({ host_pubkey: caller.pubkey, record: canonical(ad), sig, at: new Date().toISOString() }));
+    }
     getEncAd(host, viewer) {
         const e = this.resolveName(host, viewer).enrolment;
         return e ? this.getEncAdByKey(e.pubkey) : null;
     }
+    /** Both shapes a host published: v1 (`enc_pub`, `sig`) for older senders, and the v2 record (`ad`, `ad_sig`). */
     getEncAdByKey(pubkey) {
-        const ad = this.store.encAd(pubkey);
-        return ad ? { host: ad.host, host_pubkey: ad.host_pubkey, enc_pub: ad.enc_pub, sig: ad.sig } : null;
+        const v1 = this.store.encAd(pubkey), rec = this.store.encAdRecord(pubkey);
+        const ad = rec ? JSON.parse(rec.record) : null;
+        if (!v1 && !ad)
+            return null;
+        return { host: v1?.host ?? ad.host, host_pubkey: pubkey, enc_pub: v1?.enc_pub ?? ad.enc_pub, ...(v1 ? { sig: v1.sig } : {}), ...(ad ? { ad, ad_sig: rec.sig } : {}) };
     }
     expiry(now) { return new Date(now + this.quota.retentionDays * 86_400_000).toISOString(); }
     /** Quota check for adding one item to a target: the target's queue, this sender's share of it, and a proven account. */
@@ -559,12 +588,12 @@ export function startRelayServer(core, port = 0, bind = "127.0.0.1", o = {}) {
                 if (!j.host || !j.pubkey || j.owner_fp === undefined || !j.sig)
                     return send(400, { error: "incomplete enrolment" });
                 try {
-                    core.enrol(j.host, j.pubkey, j.owner_fp, j.sig);
+                    core.enrol(j.host, j.pubkey, j.owner_fp, j.sig, j.proof);
                     return send(200, { ok: true });
                 }
                 catch (e) {
                     const c = e.code;
-                    return send(c === "REVOKED" ? 403 : c === "NAME_TAKEN" ? 409 : c === "FULL" ? 503 : c === "BAD_REQUEST" ? 400 : 401, { error: e.message });
+                    return send(c === "REVOKED" || c === "DENIED" ? 403 : c === "NAME_TAKEN" ? 409 : c === "FULL" ? 503 : c === "BAD_REQUEST" ? 400 : 401, { error: e.message, ...(c ? { code: c } : {}) });
                 }
             }
             // below here requires an enrolled, hop-authenticated host
@@ -635,6 +664,16 @@ export function startRelayServer(core, port = 0, bind = "127.0.0.1", o = {}) {
                 }
                 catch (e) {
                     return send(401, { error: e.message });
+                }
+            }
+            if (req.method === "POST" && url.pathname === "/v2/relay/enc-key") {
+                const j = JSON.parse(body);
+                try {
+                    core.publishEncAdRecord(enrol, j.ad, String(j.sig ?? ""));
+                    return send(200, { ok: true });
+                }
+                catch (e) {
+                    return send(400, { error: e.message });
                 }
             }
             if (req.method === "GET" && (url.pathname === "/v1/relay/enc-key" || url.pathname === "/v2/relay/enc-key")) {

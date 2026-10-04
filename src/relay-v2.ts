@@ -4,7 +4,13 @@
 // the target's delivery receipt or the sender-side deadline. The receiving side processes items in seq order, keeps
 // what it cannot accept in quarantine, checkpoints, and only then acks. An epoch change (a restore) or a queue head
 // below the checkpoint makes senders re-push and receivers re-pull; dedup on both ends makes that safe.
+// T168 (spec §1, §8): the relay key is pinned by the owner (`relay set --key`) or on first use, and a changed key stops
+// relay use; enrolment and this host's enc-key ad are reconciled against the relay's own store on every session (a
+// local flag is only a cache), so a reset, restore, lost row or rotation re-enrols with a signed challenge; a peer's
+// enc key comes only from a signed, current advertisement naming that peer's pinned key; every failure leaves mail
+// queued and records what happened for doctor.
 import { canonical, fingerprint, signData, verifyData } from "./crypto.ts";
+import { encFromRelayAnswer, ENC_AD_REFRESH_MS, signEncAd } from "./enc-ad.ts";
 import { sealEnvelope, type Envelope } from "./envelope.ts";
 import { rotationLog } from "./key-rotation.ts";
 import type { MbxNode } from "./node.ts";
@@ -14,6 +20,9 @@ import { createHash } from "node:crypto";
 export interface RelayInfo {
   v: number; relay_pubkey: string; epoch: string;
   limits: { max_batch: number; max_pull: number; retention_days: number; max_item_bytes: number };
+  /** Present only for a signed request from a host the relay's store has enrolled: what that store holds for it. A relay
+   *  older than T168 omits `enc_ad`. */
+  you?: { host: string; pubkey: string; enc_ad?: { enc_pub: string | null; exp: string | null; v1: string | null } | null };
 }
 interface AcceptStatement { v: 1; type: "relay-accept"; relay_pubkey: string; epoch: string; sender_pubkey: string; item_id: string; targets: { host_pubkey: string; seq: number; wire_hash: string }[]; at: string }
 interface PushResult { item_id: string; status: string; accept?: AcceptStatement; sig?: string }
@@ -24,6 +33,25 @@ export const RELAY_AFTER_ATTEMPTS = 2;
 /** Sender-side grace after the relay's retention before an unconfirmed relay delivery is reported (spec §3). */
 export const RELAY_DEADLINE_GRACE_MS = 24 * 3_600_000;
 const PAGES_PER_TICK = 20;
+
+/** What the last relay pass found, for doctor (T168): the truth about why relay mail moves or waits. */
+export interface RelayState {
+  /** `at`: since when (the first pass that found this state). */
+  state: "ok" | "unreachable" | "key-mismatch" | "enrol-failed" | "enc-ad-failed"; at: string;
+  detail?: string; status?: number; relay_fp?: string; epoch?: string;
+  /** Expiry of this host's v2 enc-key ad at the relay; null when the relay is too old to store one. */
+  enc_ad_exp?: string | null;
+}
+export function relayState(node: MbxNode, relay: string): RelayState | null {
+  try { return JSON.parse(node.store.get(`relay-state:${relay}`) ?? "null") as RelayState | null; } catch { return null; }
+}
+/** `at` is when this state began: an unchanged state is not rewritten every tick. */
+function setState(node: MbxNode, relay: string, st: Omit<RelayState, "at">) {
+  const { at, ...prev } = relayState(node, relay) ?? {};
+  if (at && JSON.stringify(prev) === JSON.stringify(st)) return;
+  node.store.set(`relay-state:${relay}`, JSON.stringify({ ...st, at: new Date().toISOString() }));
+}
+const delKv = (node: MbxNode, k: string) => node.store.db.prepare("DELETE FROM kv WHERE k=?").run(k);
 
 const base = (relay: string) => relay.replace(/\/$/, "");
 const sha256hex = (b: Buffer) => createHash("sha256").update(b).digest("hex");
@@ -44,9 +72,11 @@ async function call(s: RelaySession, node: MbxNode, method: string, pathAndQuery
   return { status: res.status, json: await res.json().catch(() => ({})) as Record<string, unknown> };
 }
 
-/** GET /v2/relay/info: the info, or the HTTP status that came instead (0 = unreachable). */
-async function fetchInfo(relay: string, f: typeof fetch): Promise<{ info: RelayInfo | null; status: number }> {
-  const res = await f(`${base(relay)}/v2/relay/info`, { signal: AbortSignal.timeout(10_000) }).catch(() => null);
+/** GET /v2/relay/info: the info, or the HTTP status that came instead (0 = unreachable). Signed when a node is given,
+ *  so the answer says whether the relay's store knows this host (`you`). */
+async function fetchInfo(relay: string, f: typeof fetch, node?: MbxNode): Promise<{ info: RelayInfo | null; status: number }> {
+  const path = "/v2/relay/info";
+  const res = await f(`${base(relay)}${path}`, { ...(node ? { headers: hop(node, "GET", path, "") } : {}), signal: AbortSignal.timeout(10_000) }).catch(() => null);
   if (!res) return { info: null, status: 0 };
   if (res.status !== 200) return { info: null, status: res.status };
   const j = await res.json().catch(() => null) as RelayInfo | null;
@@ -60,26 +90,90 @@ export async function relayInfo(relay: string, f: typeof fetch = fetch): Promise
  * or an error would lose mail silently. Anything else that is not a usable v2 session skips the relay for this tick.
  */
 export async function relayRoute(node: MbxNode, relay: string, f: typeof fetch = fetch): Promise<{ mode: "v2"; session: RelaySession } | { mode: "v1" } | { mode: "skip"; why: string }> {
-  const { info, status } = await fetchInfo(relay, f);
-  if (!info) return status === 404 && !kv(node, `relay-key:${relay}`) ? { mode: "v1" } : { mode: "skip", why: status ? `relay info answered ${status}` : "relay unreachable" };
+  const { info, status } = await fetchInfo(relay, f, node);
+  if (!info) {
+    if (status === 404 && !kv(node, `relay-key:${relay}`)) return { mode: "v1" };
+    const why = status ? `relay info answered ${status}` : "relay unreachable";
+    setState(node, relay, { state: "unreachable", detail: why, status });
+    return { mode: "skip", why };
+  }
   const session = await relayOpen(node, relay, f, info).catch(() => null);
   return session ? { mode: "v2", session } : { mode: "skip", why: "relay session could not open (see doctor)" };
 }
 
+/** `relay set --key` accepts a fingerprint as `agentmbx relay serve` prints it (any case, with or without dashes) or the
+ *  full base64 relay public key. Null when it is neither. */
+export function parseRelayFingerprint(s: string): string | null {
+  const t = s.trim();
+  if (t.length === 44 && /^[A-Za-z0-9+/]{43}=$/.test(t) && Buffer.from(t, "base64").length === 32) return fingerprint(t);
+  const hex = t.toLowerCase().replace(/[-:\s]/g, "");
+  return /^[0-9a-f]{16}$/.test(hex) ? hex.match(/.{4}/g)!.join("-") : null;
+}
+
+/** The pinned relay key decides (spec §1): pinned → it must match; none pinned but `relay set --key` named one → pin
+ *  only that; neither → pin on first use. A mismatch stops relay use until the owner confirms (relay set --key). */
+function checkRelayKey(node: MbxNode, relay: string, served: string): boolean {
+  const pinned = kv(node, `relay-key:${relay}`), expect = kv(node, `relay-key-expect:${relay}`), mk = `relay-key-mismatch:${relay}`;
+  const want = pinned ? fingerprint(pinned) : expect;
+  if (want && (pinned ? pinned !== served : expect !== fingerprint(served))) {
+    const how = pinned ? "pinned" : "expected", got = fingerprint(served);
+    const prev = kv(node, mk);
+    if (!prev || (JSON.parse(prev) as { served?: string }).served !== got) node.store.audit("relay.key_changed", { relay, [how]: want, served: got });
+    node.store.set(mk, JSON.stringify({ how, pinned: want, served: got, at: new Date().toISOString() }));
+    setState(node, relay, { state: "key-mismatch", detail: `${how} ${want}, served ${got}`, relay_fp: got });
+    return false; // never trust accepts from another key; the owner confirms the new key (agentmbx relay set --key)
+  }
+  if (!pinned) {
+    node.store.set(`relay-key:${relay}`, served);
+    node.store.set(`relay-key-src:${relay}`, expect ? "owner" : "first use");
+    if (expect) delKv(node, `relay-key-expect:${relay}`);
+  }
+  if (kv(node, mk)) delKv(node, mk);
+  return true;
+}
+
 /**
- * Open a v2 session for this tick: pin the relay key (trust on first use until `relay set --key`, T168; a changed key
- * stops relay use), notice an epoch change, make sure this host is enrolled with its enc key published, and hand the
- * relay any key rotation it has not seen. Null: use v1 (or nothing) this tick.
+ * `agentmbx relay set <url> [--key <fingerprint>]` (spec §1). With --key, the relay must serve exactly that key or
+ * nothing is pinned (fail closed); an unreachable relay records the expectation, and the daemon then pins only that key.
+ * Without --key the served key is pinned now and shown, so the owner can compare it; a key that differs from the one
+ * already pinned is refused until the owner confirms it with --key.
+ */
+export async function relayPin(node: MbxNode, relay: string, key?: string, f: typeof fetch = fetch): Promise<{ ok: boolean; message: string }> {
+  const want = key === undefined ? null : parseRelayFingerprint(key);
+  if (key !== undefined && !want) return { ok: false, message: `--key ${key}: not a relay key fingerprint (16 hex digits such as 1a2b-3c4d-5e6f-7a8b, as agentmbx relay serve and relay keygen print it)` };
+  const pinned = kv(node, `relay-key:${relay}`);
+  const { info, status } = await fetchInfo(relay, f);
+  if (!info) {
+    const why = status ? `answered ${status} to /v2/relay/info` : "is unreachable";
+    if (!want) return { ok: true, message: `relay ${relay} ${why} right now: the daemon pins its key on first contact (trust on first use). To pin it without that: agentmbx relay set ${relay} --key <fingerprint>` };
+    if (pinned && fingerprint(pinned) === want) return { ok: true, message: `relay ${relay} ${why} right now; its pinned key ${want} already matches --key` };
+    if (pinned) { delKv(node, `relay-key:${relay}`); node.store.audit("relay.key_confirmed", { relay, from: fingerprint(pinned), to: want, pending: true }); }
+    node.store.set(`relay-key-expect:${relay}`, want);
+    delKv(node, `relay-key-mismatch:${relay}`);
+    return { ok: true, message: `relay ${relay} ${why} right now: the daemon will use it only when it serves key ${want}` };
+  }
+  const served = fingerprint(info.relay_pubkey);
+  if (want && want !== served) return { ok: false, message: `relay ${relay} serves key ${served}, not ${want}: nothing was pinned and the relay is not used. Compare the fingerprint with the one its operator published (agentmbx relay serve prints it)` };
+  if (!want && pinned && pinned !== info.relay_pubkey) return { ok: false, message: `relay ${relay} now serves key ${served}, not the pinned ${fingerprint(pinned)}: relay use stays stopped. If its operator rotated the relay key, confirm it: agentmbx relay set ${relay} --key ${served}` };
+  if (pinned && pinned !== info.relay_pubkey) node.store.audit("relay.key_confirmed", { relay, from: fingerprint(pinned), to: served });
+  const already = pinned === info.relay_pubkey;
+  node.store.set(`relay-key:${relay}`, info.relay_pubkey);
+  if (want || !already) node.store.set(`relay-key-src:${relay}`, want ? "owner" : "relay set");
+  delKv(node, `relay-key-expect:${relay}`); delKv(node, `relay-key-mismatch:${relay}`);
+  return { ok: true, message: want ? `relay key ${served} pinned (confirmed with --key)` : already ? `relay key ${served} (already pinned)`
+    : `relay key ${served} pinned: compare it with the fingerprint the relay operator published, or pin it explicitly with --key ${served}` };
+}
+
+/**
+ * Open a v2 session for this tick: check the relay key against the pin (T168: `relay set --key`, else first use; a
+ * changed key stops relay use), notice an epoch change, hand the relay any key rotation it has not seen, make sure the
+ * relay's store has this host enrolled and its current enc-key ad, and publish the senders it accepts. Null: nothing
+ * goes over the relay this tick, and relayState says why.
  */
 export async function relayOpen(node: MbxNode, relay: string, f: typeof fetch = fetch, given?: RelayInfo): Promise<RelaySession | null> {
-  const info = given ?? await relayInfo(relay, f);
+  const info = given ?? (await fetchInfo(relay, f, node)).info;
   if (!info) return null;
-  const pinned = kv(node, `relay-key:${relay}`);
-  if (!pinned) node.store.set(`relay-key:${relay}`, info.relay_pubkey);
-  else if (pinned !== info.relay_pubkey) {
-    node.store.audit("relay.key_changed", { relay, pinned: fingerprint(pinned), served: fingerprint(info.relay_pubkey) });
-    return null; // never trust accepts from another key; the owner confirms the new key (agentmbx relay set --key, T168)
-  }
+  if (!checkRelayKey(node, relay, info.relay_pubkey)) return null;
   const s: RelaySession = { relay, info, f };
   const known = kv(node, `relay-epoch:${relay}`);
   if (known !== info.epoch) {
@@ -88,25 +182,74 @@ export async function relayOpen(node: MbxNode, relay: string, f: typeof fetch = 
   }
   await announceRotationsToRelay(node, s);
   if (!await ensureEnrolled(node, s)) return null;
+  const adExp = await ensureEncAd(node, s);
+  if (adExp === false) return null;
   await publishSenders(node, s);
+  setState(node, relay, { state: "ok", relay_fp: fingerprint(info.relay_pubkey), epoch: info.epoch, enc_ad_exp: adExp });
   return s;
 }
 
+/**
+ * Enrolment is what the relay's store says, not what a local flag remembers (spec §8, G6): the signed info answer carries
+ * `you` only when the store has this key enrolled. Without it (a reset or restored store, a lost row, a rotation the relay
+ * has not bound, a revocation) the host runs the signed challenge again; a refusal leaves every queued row where it is.
+ * The kv flag, keyed by (relay, host key, relay key, epoch), only records the last confirmed enrolment.
+ */
 async function ensureEnrolled(node: MbxNode, s: RelaySession): Promise<boolean> {
   const flag = `relay-enrolled-v2:${s.relay}:${node.key.publicKey}:${s.info.relay_pubkey}:${s.info.epoch}`;
-  if (kv(node, flag)) return true;
+  if (s.info.you?.pubkey === node.key.publicKey && s.info.you.host === node.host) { // a renamed host re-enrols to carry its name
+    if (!kv(node, flag)) node.store.set(flag, new Date().toISOString());
+    return true;
+  }
+  if (kv(node, flag)) node.store.audit("relay.enrolment_lost", { relay: s.relay, epoch: s.info.epoch });
+  node.store.db.prepare("DELETE FROM kv WHERE k LIKE ?").run(`relay-enrolled-v2:${s.relay}:%`);
+  const failed = (status: number, error: unknown) => {
+    const detail = `${status ? `${status}: ` : ""}${String(error ?? "") || (status ? "refused" : "relay unreachable")}`.slice(0, 300);
+    node.store.audit("relay.enrol_failed", { relay: s.relay, status, error: String(error ?? "") });
+    setState(node, s.relay, { state: "enrol-failed", status, detail, relay_fp: fingerprint(s.info.relay_pubkey), epoch: s.info.epoch });
+    return false;
+  };
   const ownerFp = (node.store.db.prepare("SELECT fp FROM principals WHERE role='owner' AND via='local' LIMIT 1").get() as { fp?: string } | undefined)?.fp ?? "";
   const chal = await call(s, node, "POST", "/v1/relay/challenge", { host: node.host, pubkey: node.key.publicKey });
   const challenge = chal.json.challenge;
-  if (typeof challenge !== "string") { node.store.audit("relay.enrol_failed", { relay: s.relay, status: chal.status, error: String(chal.json.error ?? "") }); return false; }
+  if (typeof challenge !== "string") return failed(chal.status, chal.json.error);
   const sig = signData(node.key.privateKey, canonical({ v: 1, challenge, host: node.host, pubkey: node.key.publicKey, owner_fp: ownerFp }));
   const r = await call(s, node, "POST", "/v1/relay/enrol", { host: node.host, pubkey: node.key.publicKey, owner_fp: ownerFp, sig });
-  if (r.status !== 200) { node.store.audit("relay.enrol_failed", { relay: s.relay, status: r.status, error: String(r.json.error ?? "") }); return false; }
-  const enc_pub = node.encKey.publicKey;
-  const ad = await call(s, node, "POST", "/v1/relay/enc-key", { enc_pub, sig: signData(node.key.privateKey, canonical({ v: 1, host: node.host, enc_pub })) });
-  if (ad.status !== 200) { node.store.audit("relay.enc_publish_failed", { relay: s.relay, status: ad.status }); return false; }
+  if (r.status !== 200) return failed(r.status, r.json.error);
   node.store.set(flag, new Date().toISOString());
+  // a store that just (re-)enrolled us holds nothing else of ours: republish the enc-key ad and the sender list to it
+  delKv(node, `relay-enc-ad:${s.relay}`); delKv(node, `relay-senders:${s.relay}`);
+  node.store.audit("relay.enrolled", { relay: s.relay, epoch: s.info.epoch, relay_key: fingerprint(s.info.relay_pubkey) });
   return true;
+}
+
+/**
+ * This host's enc-key ad at the relay (spec §8): a signed, expiring v2 record, plus the v1 pair older senders verify.
+ * Republished when the relay's store lacks it or holds another key (a reset, a lost row, a rotation), when this host's
+ * keys or the relay epoch change, and once a day. Every result is checked. Returns the v2 expiry (null: the relay is too
+ * old to store v2 ads), or false when the relay refused it.
+ */
+async function ensureEncAd(node: MbxNode, s: RelaySession): Promise<string | null | false> {
+  const k = `relay-enc-ad:${s.relay}`, now = Date.now(), mine = node.encKey.publicKey;
+  let cur: { host_pubkey: string; enc_pub: string; iat: string; exp: string | null; epoch: string } | null = null;
+  try { cur = JSON.parse(kv(node, k) ?? "null"); } catch { /* republish */ }
+  const served = s.info.you?.enc_ad; // undefined: a relay older than T168 does not say
+  // the v2 record (enc_pub, exp) and the v1 pair (v1) must both name this host's current key and the record be unexpired
+  const drift = served === null || (served !== undefined && (served.enc_pub !== mine || served.v1 !== mine || !served.exp || Date.parse(served.exp) <= now));
+  if (cur && !drift && cur.host_pubkey === node.key.publicKey && cur.enc_pub === mine && cur.epoch === s.info.epoch && now - Date.parse(cur.iat) < ENC_AD_REFRESH_MS) return cur.exp;
+  if (cur && drift) node.store.audit("relay.enc_ad_missing", { relay: s.relay, v2: served?.enc_pub ? fingerprint(served.enc_pub) : null, v1: served?.v1 ? fingerprint(served.v1) : null });
+  const { ad, sig } = signEncAd(node.host, node.key, mine, now);
+  const v2 = await call(s, node, "POST", "/v2/relay/enc-key", { ad, sig });
+  const v1 = await call(s, node, "POST", "/v1/relay/enc-key", { enc_pub: mine, sig: signData(node.key.privateKey, canonical({ v: 1, host: node.host, enc_pub: mine })) });
+  const bad = v2.status !== 200 && v2.status !== 404 ? v2 : v1.status !== 200 ? v1 : null; // 404: a relay older than T168
+  if (bad) {
+    node.store.audit("relay.enc_publish_failed", { relay: s.relay, status: bad.status, error: String(bad.json.error ?? "") });
+    setState(node, s.relay, { state: "enc-ad-failed", status: bad.status, detail: `${bad.status}: ${String(bad.json.error ?? "refused")}`.slice(0, 300), relay_fp: fingerprint(s.info.relay_pubkey), epoch: s.info.epoch });
+    return false;
+  }
+  const exp = v2.status === 200 ? ad.exp : null;
+  node.store.set(k, JSON.stringify({ host_pubkey: node.key.publicKey, enc_pub: mine, iat: ad.iat, exp, epoch: s.info.epoch }));
+  return exp;
 }
 
 /** T030 rotations the relay has not seen: the relay moves our name and queue to the new key (spec §2). */
@@ -138,17 +281,32 @@ async function publishSenders(node: MbxNode, s: RelaySession) {
   else node.store.audit("relay.senders_failed", { relay: s.relay, status: r.status, error: String(r.json.error ?? "") });
 }
 
-/** A peer's enc key: the pinned one, else the relay's copy only if the peer's pinned host key signed it (T032). */
+/**
+ * The verdict on a relay's enc-key answer for a peer: its key, or null with the reason recorded for doctor
+ * (`relay-enc-rejected:<host>`, cleared once a valid ad arrives or the key is pinned) and an audit when a served ad was
+ * refused.
+ */
+export function relayEncVerdict(node: MbxNode, host: string, status: number, got: { enc_pub: string } | { reason: string }): string | null {
+  const k = `relay-enc-rejected:${host}`;
+  if ("enc_pub" in got) { if (kv(node, k)) delKv(node, k); return got.enc_pub; }
+  if (status === 0) return null; // unreachable: nothing was learned
+  let prev: { reason?: string } | null = null;
+  try { prev = JSON.parse(kv(node, k) ?? "null"); } catch { /* replaced below */ }
+  if (status === 200 && prev?.reason !== got.reason) node.store.audit("enc_key.rejected", { host, via: "relay", reason: got.reason });
+  node.store.set(k, JSON.stringify({ reason: got.reason, at: new Date().toISOString() }));
+  return null;
+}
+
+/** A peer's enc key: the pinned one, else the relay's copy only as a signed, current v2 ad by the peer's pinned host key
+ *  naming that key and host (T032, T168). Tampered, expired, wrong-peer, unsigned and unexpiring v1 ads are refused. */
 async function peerEnc(node: MbxNode, s: RelaySession, host: string): Promise<string | null> {
   const p = node.approvedPeer(host);
   if (!p) return null;
-  if (p.enc_pub) return p.enc_pub;
+  if (p.enc_pub) return relayEncVerdict(node, host, 200, { enc_pub: p.enc_pub }); // pinned (LAN or rotation): no relay ad needed
   const r = await call(s, node, "GET", `/v2/relay/enc-key?pubkey=${encodeURIComponent(p.pubkey)}`);
-  const { enc_pub, sig } = r.json;
-  if (r.status !== 200 || typeof enc_pub !== "string" || typeof sig !== "string") return null;
-  if (verifyData(p.pubkey, canonical({ v: 1, host, enc_pub }), sig)) return enc_pub;
-  node.store.audit("enc_key.rejected", { host, via: "relay", reason: "signature does not verify against the pinned host key" });
-  return null;
+  const got = r.status === 200 ? encFromRelayAnswer(r.json, { host, pubkey: p.pubkey })
+    : { reason: r.status === 404 ? "the relay holds no advertisement for this peer" : `the relay answered ${r.status}` };
+  return relayEncVerdict(node, host, r.status, got);
 }
 
 /** An accept is ours only if the pinned relay key signed it, for this item, this target and exactly these bytes. */

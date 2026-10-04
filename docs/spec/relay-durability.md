@@ -65,6 +65,19 @@ not its own, and errors MUST NOT echo key material. A host pins the relay key wh
 fingerprint and MUST accept an optional `--key <fingerprint>` to pin it without trust on first use. A later change of
 `relay_pubkey` MUST stop relay use and be reported by `doctor` until the owner confirms the new key.
 
+As implemented (T168): `--key` takes the fingerprint `relay serve` and `relay keygen` print (any case, dashes
+optional) or the full public key. The pin is per relay URL (`relay-key:<url>`, with its source: owner, `relay set`,
+or first use).
+
+- **With `--key`:** a relay serving another key pins nothing, leaves `config.json` unchanged and exits 1. An
+  unreachable relay records the expected fingerprint, and the daemon then pins only that key.
+- **Without `--key`:** the served key is pinned at once and its fingerprint printed for the owner to compare. A key
+  that differs from the pinned one is refused; only `--key <new fingerprint>` replaces a pin (audited
+  `relay.key_confirmed`).
+- **The daemon:** it pins on first contact only when nothing is pinned or expected. On any mismatch it stops using
+  the relay (no v2 session, never v1) and records the mismatch. `doctor` shows the pinned fingerprint and its source,
+  and fails a mismatch with the exact `relay set … --key …` fix.
+
 ### 2. Server store (T165)
 
 The relay core MUST talk to its state only through a `RelayStore` interface: enrolments, enc-key ads, item insert
@@ -101,7 +114,8 @@ writer process). Every successful response MUST be sent only after its transacti
   arrives. Until then a republished allowlist names the old key and the peer's relay pushes are refused; the rows wait
   (backoff, deadline), nothing is lost, and the LAN record or a relay-carried rotation notice (later, same item
   mechanism) resolves it.
-- `enc_ads(host_pubkey PK, enc_pub, sig, at)`. Only signed advertisements are stored, as today.
+- `enc_ads(host_pubkey PK, enc_pub, sig, at)`. Only signed advertisements are stored, as today. T168 adds
+  `enc_ad_records(host_pubkey PK, record, sig, at)` for the signed, expiring v2 record (§8); both go with a rotation.
 - `items(target_pubkey, seq, kind, item_id, sender_pubkey, wire BLOB, wire_hash, bytes, accepted_at, expires_at,
   PRIMARY KEY(target_pubkey, seq))`. `wire` is the exact bytes received; `wire_hash` is lowercase hex SHA-256 of those
   bytes (never of a decoded or re-encoded string).
@@ -257,9 +271,47 @@ the sender keeps its row and retries with backoff.
   enrol and enc-key publish. The kv enrolled flag becomes a cache keyed by `(relay, relay_pubkey, epoch,
   host_pubkey)`, never a permanent short-circuit (G6). The `doctor` key mismatch is fixed with it (G13).
 - The client MUST republish its enc-key ad after its own key rotation (T030), and MUST check the result.
+- **Reconciliation against the relay's store (T168).** Each session opens with a signed `GET /v2/relay/info`. The
+  answer carries `you` only when the relay's store has this host key enrolled. `you.enc_ad` is `{enc_pub, exp, v1}`:
+  the v2 record's key and expiry, and the v1 pair's key. Without `you`, or with `you.host` naming another host, the
+  host runs the signed challenge again in the same pass. That covers a reset or restored store, a lost row, a rotation
+  the relay has not bound, and a rename; a remembered flag never overrides it, and a flag for this epoch whose
+  enrolment is gone is audited `relay.enrolment_lost`. A (re-)enrolment republishes the enc-key ad and the sender
+  list to that store. The ad is also republished when `you.enc_ad` is missing, names another key in either shape, or
+  has expired (audited `relay.enc_ad_missing`), when this host's keys or the relay epoch change, and once a day.
+  Nothing falls back to v1 or to plaintext: until enrolment and the ad succeed there is no session, and queued rows
+  stay in the outbox.
+- **Signed, expiring enc-key advertisements (T168).** The v1 ad `{v:1, host, enc_pub}` has no expiry, so a relay
+  could replay an old one forever. A host therefore also publishes `POST /v2/relay/enc-key {ad, sig}`, where `ad` is
+  `{v:2, type:"enc-ad", host, host_pubkey, enc_pub, iat, exp}` (`exp = iat + 30 days`) and `sig` is the host key
+  over `canonical(ad)` (`src/enc-ad.ts`). The relay stores it only for the calling enrolment, validly signed and
+  current. `GET …/enc-key` serves `ad` and `ad_sig` beside the v1 `enc_pub` and `sig`. A sender takes a key from the
+  relay only when all of these hold; otherwise it records why (`enc_key.rejected`, and per host for `doctor`) and
+  keeps the mail queued:
+  - the v2 record verifies against the peer's **pinned** host key, as received (an added or changed field breaks it);
+  - the record names that key and that host, so another peer's valid ad is refused as `wrong peer`;
+  - `iat` is not more than 5 minutes ahead, `exp` has not passed, and `exp - iat` is at most 90 days;
+  - a served `enc_pub` beside the record is the same key (a relay answering two keys is tampering).
+
+  A v1-only answer is refused as unexpiring. A peer whose ad is refused stays reachable over the LAN, where its key is
+  pinned on first exchange. Peers on 0.5.6 or older publish only v1, so relay mail reaches them only once their key
+  is pinned. A relay older than T168 answers 404 to the v2 publish. The host then keeps the v1 ad, and `doctor` warns
+  that the relay is too old to carry expiring ads.
+- **Truthful recovery state (T168).** Each relay pass records its outcome per relay. It is `ok` (with the ad's
+  expiry), `unreachable`, `key-mismatch`, `enrol-failed` (with the relay's status and reason) or `enc-ad-failed`,
+  stamped with when that state began. `doctor` reports it with the number of queued messages. Key rotation,
+  revocation, a denied or failed enrolment and a refused ad never drop or alter queued mail: rows wait in the outbox
+  under their backoff and the 72-hour LAN rule. A refused enrolment (401/403) is a `doctor` failure, not a warning.
 - **Enrolment authority is pluggable.** `enrol` asks an `EnrolmentAuthority` whether a host key may enrol:
   `authorize({host_name, host_pubkey, owner_fp, proof}) → {ok, account?, org?, reason?}`. The answer is stored with
-  the enrolment (`account`, `authorized_by`); quotas and name uniqueness then use the account.
+  the enrolment (`account`, `authorized_by`); quotas and name uniqueness then use the account. As implemented (T168,
+  `src/relay.ts`):
+  - the interface and the default `host-key-challenge` authority, chosen with `new RelayCore(quota, {authority})`;
+  - `authorize` is synchronous, since an account authority verifies tokens offline against cached JWKS keys;
+  - it is asked only after the challenge signature verifies, and `proof` comes from the enrol body;
+  - a denial or a throw stores nothing and answers 403 with code `DENIED`;
+  - `authorized_by` records the authority's `name`;
+  - `org` is not stored yet. The account-token authority itself is T304.
 - **Owner decision (2026-10-02, PLAN D7/D9 and §4.5):**
   - **Hosted relay (relay.agentmbx.com): account tokens.** A host enrols with a short-lived access token issued by
     accounts.agentmbx.com after `agentmbx login`, requested for the relay with an RFC 8707 resource indicator. The
@@ -338,5 +390,17 @@ v1 otherwise. Mixed hosts work because items are opaque to the relay, and receiv
   - Tests: re-enrolment after a restart and after a restore; a name squatter never receives a host's mail (key routing); a relay key change stops
     use; enc-ad republish after rotation; a stub authority denying or granting by account recorded on the
     enrolment.
+  - Shipped tests (`test/relay-enrolment.test.ts`):
+    - tampered, expired, not-yet-valid, over-long, wrong-peer, renamed, unsigned, malformed, v1-only and
+      two-key ads are refused, by the sender and by the relay;
+    - a lying relay never gets mail sealed; the mail stays queued and `doctor` names the reason;
+    - a relay reset re-enrols both hosts by signed challenge and re-pushes sealed mail exactly once;
+    - a store that lost an enrolment or holds a stale ad in the same epoch is re-enrolled or republished in the
+      same pass;
+    - a rotation re-enrols the new key, republishes the ad and delivers the queued row;
+    - a revoked key keeps mail queued, never falls back to v1, and `doctor` fails it truthfully;
+    - a stub authority grants with an account, or denies, and a throwing authority fails closed;
+    - `relay set --key` handles a match, a mismatch, a changed relay key, owner confirmation, an unreachable relay
+      and the CLI exit codes.
 - **T147 (with the owner):** deploy per decisions 1–5 (Railway, `relay.agentmbx.com`) and run the home-to-work proof. Mail both ways with each host
   on a different network, the relay restarted mid-flight, and one restore drill.

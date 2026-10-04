@@ -1,9 +1,11 @@
 // Daemon-side relay transport (T007): enrol this host with a relay, publish our enc key so peers can
 // seal for us, push undeliverable outbox envelopes to the relay (sealed — the relay never sees bodies),
 // and poll for incoming relay mail through the normal node.receive path (signature-verified, decrypted).
-import { canonical, signData, verifyData } from "./crypto.ts";
+import { canonical, signData } from "./crypto.ts";
+import { encFromRelayAnswer, signEncAd } from "./enc-ad.ts";
 import { sealEnvelope, type Envelope } from "./envelope.ts";
 import type { MbxNode } from "./node.ts";
+import { relayEncVerdict } from "./relay-v2.ts";
 
 export interface RelayRef { url: string }
 /** Where the daemon learns the relay address: MBX_RELAY_URL wins, then config.json's relay field. */
@@ -20,6 +22,8 @@ const call = async (node: MbxNode, method: string, path: string, obj: unknown, f
   const body = obj === undefined ? "" : JSON.stringify(obj);
   const res = await f(path, { method, headers: hop(node, method, path, body), body: body || undefined, signal: AbortSignal.timeout(10_000) }).catch(() => null);
   if (!res) return { status: 0, json: { error: "relay unreachable" } };
+  // the relay no longer knows this key (a restart of a v1 relay loses everything): the enrolled flag is only a cache (G6)
+  if (res.status === 401) node.store.db.prepare("DELETE FROM kv WHERE k LIKE ?").run(`relay-enrolled:%:${node.key.publicKey}`);
   return { status: res.status, json: await res.json().catch(() => ({})) as Record<string, unknown> };
 };
 const url = (relay: string, path: string) => `${relay.replace(/\/$/, "")}${path}`;
@@ -45,25 +49,27 @@ export async function relayEnrol(node: MbxNode, relay: string, f: typeof fetch =
 }
 const fingerprintOf = (node: MbxNode): string => node.store.db.prepare("SELECT fp FROM principals WHERE role='owner' AND via='local' LIMIT 1").get()?.fp as string ?? "";
 
+/** Our enc key for senders: the v1 pair older senders verify, and the signed, expiring v2 ad (T168) current senders
+ *  require (a relay older than 0.5.5 answers 404 to it). */
 export async function relayPublishEnc(node: MbxNode, relay: string, f: typeof fetch = fetch): Promise<void> {
   const enc_pub = node.encKey.publicKey;
+  await call(node, "POST", url(relay, "/v2/relay/enc-key"), signEncAd(node.host, node.key, enc_pub), f);
   const sig = signData(node.key.privateKey, canonical({ v: 1, host: node.host, enc_pub }));
   await call(node, "POST", url(relay, "/v1/relay/enc-key"), { enc_pub, sig }, f);
 }
 
-/** A paired peer's enc key: the pinned one, else the relay's copy only if the peer's PINNED host key signed it (the LAN
- *  enc-key exchange may be unreachable for exactly the peers we relay). The relay is untrusted: it, or anyone enrolling
- *  the peer's host name there, could otherwise hand out its own key and read the sealed bodies (T032). */
+/** A paired peer's enc key: the pinned one, else the relay's copy only as a signed, current v2 ad by the peer's PINNED
+ *  host key naming that key and host (the LAN enc-key exchange may be unreachable for exactly the peers we relay). The
+ *  relay is untrusted: it, or anyone enrolling the peer's host name there, could otherwise hand out its own key, or
+ *  replay an old one, and read the sealed bodies (T032, T168). */
 export async function relayPeerEnc(node: MbxNode, relay: string, peerHost: string, f: typeof fetch = fetch): Promise<string | null> {
   const p = node.approvedPeer(peerHost);
   if (!p) return null;
-  if (p.enc_pub) return p.enc_pub;
+  if (p.enc_pub) return relayEncVerdict(node, peerHost, 200, { enc_pub: p.enc_pub }); // pinned: no relay ad needed
   const r = await call(node, "GET", url(relay, `/v1/relay/enc-key?host=${encodeURIComponent(peerHost)}`), undefined, f);
-  const { enc_pub, sig } = r.json;
-  if (r.status !== 200 || typeof enc_pub !== "string" || typeof sig !== "string") return null;
-  if (verifyData(p.pubkey, canonical({ v: 1, host: peerHost, enc_pub }), sig)) return enc_pub;
-  node.store.audit("enc_key.rejected", { host: peerHost, via: "relay", reason: "signature does not verify against the pinned host key" });
-  return null;
+  const got = r.status === 200 ? encFromRelayAnswer(r.json, { host: peerHost, pubkey: p.pubkey })
+    : { reason: r.status === 404 ? "the relay holds no advertisement for this peer" : `the relay answered ${r.status}` };
+  return relayEncVerdict(node, peerHost, r.status, got);
 }
 
 /** Seal an outbox envelope for a peer and push it to the relay; the local outbox row is dropped on success. */
