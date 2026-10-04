@@ -15,7 +15,7 @@ import { SqliteRelayStore } from "./relay-store.js";
 import { backupStore, readOps, restoredFrom, restoreStore, rotateEpochOp, STORE_DB, waitForLock } from "./relay-ops.js";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.js";
 import { HUD_ALIVE_MAX_MS, HUD_SCHEMA, hudAlivePath, hudDir, hudPidLinePath, hudPidPath, hudSessionLinePath, hudSessionPath, hudStatus, writeHud } from "./hud.js";
-import { detectHost, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
+import { detectHost, MCP_HEARTBEAT_MS, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
 import { ancestors, processEvidenceSpawns, withProcSnapshot } from "./proc.js";
 import { bumpPostToolMarkersForAgent, readPostToolMarker, writePostToolLast } from "./posttool.js";
 import { resolveStatusIdentity } from "./status-identity.js";
@@ -33,7 +33,7 @@ import { dispatchWakes, hasWakeAuthority, humanPromptKey, inboxCommand, isHumanP
 import { kimiMultiHost } from "./kimi-web.js";
 import { bindInstruction, issueBindTicket } from "./bind-ticket.js";
 import { activityKey } from "./identity-availability.js";
-import { inspectLeaseProcess } from "./identity-leases.js";
+import { identityLeaseStatus, inspectLeaseProcess } from "./identity-leases.js";
 import { AUTO_NAME_RE, linkedKey, projectOf, recordSessionHint, registeredIdentity } from "./registry.js";
 import { applyForward, buildForward, pruneCandidates, retireMailbox } from "./identity-cleanup.js";
 import { installDesktopPlugin, kimiDesktop, kimiDesktopDir, removeDesktopPlugin, writeDesktopPlugin } from "./kimi-desktop.js";
@@ -1624,11 +1624,16 @@ export const watcherEvidenceRetryable = (e) => e?.code === "IDENTITY_STATUS_UNKN
     || /caller process evidence became stale|process status is unknown/.test(e?.message ?? "");
 async function watch(node, selection) {
     const every = Math.max(200, Number(process.env.MBX_WATCH_INTERVAL_MS) || 2_000);
-    // T343: MCP leases heartbeat every 60 s (mcp.ts). While the holder's heartbeat advances, the
-    // lease row itself is the liveness proof — no process evidence, no ps spawns. Three missed
-    // beats pay ONE evidence probe (the T332 shared ps -A table), never one per poll.
-    const staleMs = Math.max(500, Number(process.env.MBX_WATCH_STALE_MS) || 3 * 60_000);
-    let watching, failures = 0, evidenceRetries = 0, lastProbeAt = 0, deadUntil = 0;
+    // T343: MCP leases heartbeat every MCP_HEARTBEAT_MS (mcp.ts). While the holder's heartbeat
+    // advances, the lease row itself is the liveness proof — no process evidence, no ps spawns. A
+    // stale heartbeat pays ONE rate-limited probe, classified by identityLeaseStatus: live carries
+    // on, unknown is retryable (T206/T340: unknown is never a stop), expired stops with the reason.
+    let watching, failures = 0, evidenceRetries = 0;
+    // The pinned lease identity (review blocker): a takeover or reclaim that swaps token, holder
+    // pid or holder start must stop this watcher — by name alone it would keep consuming the new
+    // session's wakes. Mono clock (performance.now) so a backward wall step can't hide a crash.
+    let pinned = null;
+    let staleMs = 3 * MCP_HEARTBEAT_MS, heartbeatAdvancedMono = 0, lastHeartbeatAt = 0, lastProbeMono = 0, deadUntilMono = 0;
     const clear = () => { if (watching)
         try {
             node.store.db.prepare("DELETE FROM kv WHERE k=?").run(watcherKey(watching));
@@ -1637,6 +1642,7 @@ async function watch(node, selection) {
     const debugExit = () => { if (process.env.MBX_WATCH_DEBUG)
         process.stderr.write(`[mbx-watch debug] evidence spawns: startup ${startupSpawns} total ${processEvidenceSpawns.count}\n`); };
     let startupSpawns = 0;
+    const leaseLost = (message) => Object.assign(new Error(message), { code: "IDENTITY_LEASE_LOST" });
     process.once("SIGTERM", () => { clear(); debugExit(); process.exit(143); });
     process.once("SIGINT", () => { clear(); debugExit(); process.exit(130); });
     for (;;) {
@@ -1647,27 +1653,47 @@ async function watch(node, selection) {
                 startupSpawns = processEvidenceSpawns.count;
             }
             const agent = watching;
-            const lease = node.store.db.prepare("SELECT token,holder_pid,holder_start,heartbeat_at,released_at FROM identity_leases WHERE name=?")
+            const lease = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?")
                 .get(agent);
             if (!lease || lease.released_at !== null)
-                throw Object.assign(new Error("no current identity lease"), { code: "IDENTITY_LEASE_LOST" });
-            // A dead holder keeps counting toward the stop until the next probe window; otherwise the
-            // successful ticks between rate-limited probes would reset the strike count.
-            if (deadUntil && Date.now() < deadUntil)
-                throw Object.assign(new Error(`the holder process for ${agent} is gone`), { code: "IDENTITY_LEASE_LOST" });
-            if (Date.now() - lease.heartbeat_at > staleMs && Date.now() - lastProbeAt > staleMs) {
-                lastProbeAt = Date.now();
-                const ev = inspectLeaseProcess(lease.holder_pid);
-                if (ev.alive === true && ev.start && ev.start === lease.holder_start)
-                    deadUntil = 0; // alive, just quiet
-                else {
-                    deadUntil = lastProbeAt + staleMs;
-                    throw Object.assign(new Error(`the holder process for ${agent} is gone`), { code: "IDENTITY_LEASE_LOST" });
+                throw leaseLost("no current identity lease");
+            if (!pinned) {
+                pinned = { token: lease.token, holder_pid: lease.holder_pid, holder_start: lease.holder_start };
+                lastHeartbeatAt = lease.heartbeat_at;
+                heartbeatAdvancedMono = performance.now();
+                // Review minor 6: a finite positive integer, clamped between the heartbeat interval and
+                // the lease's idle ttl; anything else takes the default (3 beats).
+                const raw = Number(process.env.MBX_WATCH_STALE_MS);
+                staleMs = Number.isFinite(raw) && process.env.MBX_WATCH_STALE_MS !== undefined
+                    ? Math.min(Math.max(Math.trunc(raw), MCP_HEARTBEAT_MS), lease.idle_ttl)
+                    : 3 * MCP_HEARTBEAT_MS;
+            }
+            if (lease.token !== pinned.token || lease.holder_pid !== pinned.holder_pid || lease.holder_start !== pinned.holder_start)
+                throw leaseLost("the lease this watcher was started for moved to another holder");
+            if (lease.heartbeat_at !== lastHeartbeatAt) {
+                lastHeartbeatAt = lease.heartbeat_at;
+                heartbeatAdvancedMono = performance.now();
+            }
+            // A dead holder keeps counting toward the stop until the next probe window (review: <= so
+            // the boundary tick is a strike, not a silent pass); otherwise successful ticks between
+            // rate-limited probes would reset the strike count.
+            if (deadUntilMono && performance.now() <= deadUntilMono)
+                throw leaseLost(`the holder process for ${agent} is gone`);
+            if (performance.now() - heartbeatAdvancedMono > staleMs && performance.now() - lastProbeMono > staleMs) {
+                lastProbeMono = performance.now();
+                const status = identityLeaseStatus(lease, Date.now(), inspectLeaseProcess(lease.holder_pid));
+                if (status.state === "live")
+                    deadUntilMono = 0; // alive, just quiet
+                else if (status.state === "unknown")
+                    throw Object.assign(new Error("holder process status is unknown"), { code: "IDENTITY_STATUS_UNKNOWN" });
+                else { // expired: dead, pid-reused, or idle past the lease ttl (review: idle_ttl expiry restored)
+                    deadUntilMono = lastProbeMono + staleMs;
+                    throw leaseLost(status.reason === "idle" ? "the identity lease idled out" : `the holder process for ${agent} is gone`);
                 }
             }
             else
-                deadUntil = 0;
-            node.store.set(watcherKey(agent), JSON.stringify({ pid: process.pid, at: Date.now() }));
+                deadUntilMono = 0;
+            node.store.set(watcherKey(agent), JSON.stringify({ pid: process.pid, at: Date.now(), token: pinned.token })); // #97: liveWatcher checks the token
             const lines = [];
             for (const mailbox of [agent, ...node.linkedNames(agent)]) {
                 if (wakeMutedUntil(node, mailbox))

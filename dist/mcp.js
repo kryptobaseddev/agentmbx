@@ -1490,5 +1490,7 @@ export async function runMcp(existing) {
                 process.stderr.write(`[mbx] heartbeat for ${state.agent} failed: ${e.message}\n`);
             }
         }
-    }, 60_000).unref());
+    }, MCP_HEARTBEAT_MS).unref());
 }
+/** The MCP lease heartbeat cadence (T343 review nit: one constant shared by mcp.ts and cli.ts's watcher). */
+export const MCP_HEARTBEAT_MS = 60_000;
