@@ -1,7 +1,7 @@
 // `agentmbx setup` / `doctor` against a fake HOME whose configs copy the STRUCTURE of real ones (fake values only).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { doctor, failed } from "../src/doctor.ts";
@@ -118,15 +118,20 @@ test("setup wires every CLI, backs files up, leaves other hook groups alone, and
     readFileSync(join(import.meta.dirname, "../skill/scripts/claude-statusline.sh"), "utf8"));
   for (const d of [".claude/skills/agentmbx", ".codex/skills/agentmbx"]) assert.equal(readlinkSync(join(home, d)), skillDest(home));
 
-  // second run: the only change is upgrading PostToolUse to the bundled sh fast path (the first
-  // run installed the skill after the hooks row ran, so the script appeared in between); no other
-  // file changes, no duplicates, no new backups
+  // second run: the only changes are upgrading PostToolUse to the bundled sh fast path and the
+  // statusLine command to the bundled sh adapter (the first run installed the skill after the
+  // hook rows ran, so the scripts appeared in between); no other file changes, no new backups
   const snapshot = Object.fromEntries(Object.keys(FILES).map((rel) => [rel, rd(home, rel)]));
   const again = runSetup(ctx, { mode: "install", stamp: "T2" });
   const changed = again.filter((r) => r.action !== "unchanged" && r.action !== "skipped");
-  assert.deepEqual(changed, [{ action: "updated", cli: "claude", item: "hooks SessionStart + SessionEnd + UserPromptSubmit + PostToolUse + PermissionRequest + Stop",
-    path: join(home, ".claude/settings.json"), backup: join(home, ".claude/settings.json.bak-agentmbx-T2") }]);
-  assert.match(JSON.parse(rd(home, ".claude/settings.json")).hooks.PostToolUse.at(-1).hooks[0].command, /claude-posttool\.sh/);
+  assert.deepEqual(changed.map(({ action, cli, item, path }) => ({ action, cli, item, path })), [
+    { action: "updated", cli: "claude", item: "hooks SessionStart + SessionEnd + UserPromptSubmit + PostToolUse + PermissionRequest + Stop", path: join(home, ".claude/settings.json") },
+    { action: "updated", cli: "claude", item: "statusLine (MBX segment)", path: join(home, ".claude/settings.json") },
+  ]);
+  assert.ok(changed.every((r) => r.backup === join(home, ".claude/settings.json.bak-agentmbx-T2")), "one shared backup for the two same-file updates");
+  const upgraded = JSON.parse(rd(home, ".claude/settings.json"));
+  assert.match(upgraded.hooks.PostToolUse.at(-1).hooks[0].command, /claude-posttool\.sh/);
+  assert.match(upgraded.statusLine.command, /claude-statusline\.sh/, "the statusLine upgrades to the bundled pure-sh adapter");
   // third run: fully clean
   const third = runSetup(ctx, { mode: "install", stamp: "T3" });
   assert.deepEqual(third.filter((r) => r.action !== "unchanged" && r.action !== "skipped"), []);
@@ -220,3 +225,52 @@ test("setup policy default: collaborate (ratified), explicit wins, no terminal +
   assert.equal(setupPolicyLevel({ keychain: false }), undefined);
   assert.equal(setupPolicyLevel({ explicit: "ask", keychain: true }), "ask");
 });
+
+// T347: setup wires one status line per CLI, never overwrites a user's own, and uninstall removes
+// only what setup wrote.
+test("T347: setup wires statuslines, never overwrites a user's, reports the snippet", () => {
+  // Claude: a user's own statusLine is left alone and reported with the snippet.
+  const home = fakeHome(); const ctx = ctxFor(home);
+  const mine = `"statusLine": { "type": "command", "command": "my-own-statusline.sh" }`;
+  writeFileSync(join(home, ".claude/settings.json"), `{ "hooks": {}, ${mine.slice(0) ? '"statusLine": { "type": "command", "command": "my-own-statusline.sh" }' : ""} }`);
+  const rows = runSetup(ctx, { mode: "install", stamp: "S1" });
+  assert.equal(JSON.parse(rd(home, ".claude/settings.json")).statusLine.command, "my-own-statusline.sh", "a foreign statusLine is never overwritten");
+  const manual = rows.find((r) => r.cli === "claude" && r.action === "manual" && r.item === "statusLine");
+  assert.ok(manual, "the foreign status line is reported");
+  assert.match(manual!.note!, /left alone/);
+  assert.match(manual!.note!, /statusline claude|claude-statusline\.sh/, "and the report prints our snippet");
+  runSetup(ctx, { mode: "uninstall", stamp: "S2" });
+  assert.equal(JSON.parse(rd(home, ".claude/settings.json")).statusLine.command, "my-own-statusline.sh", "uninstall never removes a foreign statusLine");
+
+  // Claude: absent gets ours (with type: "command"), a second run is a no-op, uninstall removes it.
+  rmSync(home, { recursive: true, force: true });
+  const home2 = fakeHome(); const ctx2 = ctxFor(home2);
+  runSetup(ctx2, { mode: "install", stamp: "S3" });
+  const wired = JSON.parse(rd(home2, ".claude/settings.json")).statusLine;
+  assert.equal(wired.type, "command");
+  assert.match(wired.command, /statusline claude/, "our adapter is wired on the first run (the bundled sh adapter once the skill script exists — covered by the idempotency test)");
+  const again = runSetup(ctx2, { mode: "install", stamp: "S4" });
+  assert.equal(JSON.parse(rd(home2, ".claude/settings.json")).statusLine.command.startsWith("sh "), true, "the second run upgrades to the bundled sh adapter once the skill script exists");
+  const third = runSetup(ctx2, { mode: "install", stamp: "S4b" });
+  assert.equal(third.filter((r) => r.cli === "claude" && r.item.startsWith("statusLine") && r.action !== "unchanged").length, 0, "and from then on runs are no-ops");
+  runSetup(ctx2, { mode: "uninstall", stamp: "S5" });
+  assert.equal(JSON.parse(rd(home2, ".claude/settings.json")).statusLine, undefined, "uninstall removes ours");
+
+  // Kimi: a user's [status_line] (built-in items form) is left alone and reported; absent gets ours.
+  rmSync(home2, { recursive: true, force: true });
+  const home3 = fakeHome(); const ctx3 = ctxFor(home3);
+  writeFileSync(join(home3, ".kimi-code/tui.toml"), `theme = "dark"\n\n[status_line]\nitems = ["mode","model"]\n`);
+  const rows3 = runSetup(ctx3, { mode: "install", stamp: "S6" });
+  assert.match(rd(home3, ".kimi-code/tui.toml"), /items = \["mode","model"\]/, "a foreign [status_line] is never overwritten");
+  assert.doesNotMatch(rd(home3, ".kimi-code/tui.toml"), /statusline kimi/, "and ours is not added next to it");
+  assert.ok(rows3.find((r) => r.cli === "kimi" && r.action === "manual"), "the foreign section is reported");
+  rmSync(home3, { recursive: true, force: true });
+  const home4 = fakeHome(); const ctx4 = ctxFor(home4);
+  runSetup(ctx4, { mode: "install", stamp: "S7" });
+  assert.match(rd(home4, ".kimi-code/tui.toml"), /\[status_line\]\ncommand = "\/opt\/bin\/agentmbx statusline kimi"/, "absent gets ours");
+  runSetup(ctx4, { mode: "uninstall", stamp: "S8" });
+  assert.ok(!kimiSectionPresent(rd(home4, ".kimi-code/tui.toml")), "uninstall removes our section");
+  for (const h of [home, home2, home3, home4]) rmSync(h, { recursive: true, force: true });
+});
+
+const kimiSectionPresent = (cur: string) => /(^|\n)[ \t]*\[status_line\]/.test(cur);

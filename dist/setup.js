@@ -28,6 +28,91 @@ const __filename_or_url = () => (typeof __filename !== "undefined" ? __filename 
 const shq = (s) => /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
 export const shJoin = (argv) => argv.map(shq).join(" ");
 export const hookCommand = (cmd, event, cli) => `${shJoin(cmd)} hook ${event} --cli ${cli}`;
+// T347: setup wires one status line per CLI — never overwrites a user's existing one. A foreign
+// status line is left alone and reported (runSetup adds a manual row with the snippet); uninstall
+// removes only what setup wrote.
+export const statuslineCommand = (home, cli, cmd) => {
+    if (cli === "kimi")
+        return `${shJoin(cmd)} statusline kimi`;
+    // Claude renders periodically: the bundled pure-sh adapter when the skill ships it (SEA: the node adapter)
+    const script = join(skillDest(home), "scripts", "claude-statusline.sh");
+    return existsSync(script) ? `sh ${shJoin([script])}` : `${shJoin(cmd)} statusline claude`;
+};
+const isOurStatusline = (command, cli) => !!command && (command.includes(`statusline ${cli}`) && command.includes("agentmbx") || (cli === "claude" && command.includes("claude-statusline.sh")));
+/** "absent" = nothing there, "ours" = we wrote it, "foreign" = a user's own status line. */
+export const statuslineState = (home, cli) => {
+    if (cli === "claude") {
+        const cur = read(join(home, ".claude/settings.json"));
+        if (cur === null)
+            return "absent";
+        const command = parseObj(cur).statusLine?.command;
+        return command === undefined ? "absent" : isOurStatusline(command, cli) ? "ours" : "foreign";
+    }
+    const cur = read(join(home, ".kimi-code/tui.toml"));
+    const section = cur === null ? null : kimiStatusSection(cur);
+    return section === null ? "absent" : section.ours ? "ours" : "foreign";
+};
+/** The uncommented [status_line] section of a tui.toml, if any — header plus body lines up to the
+ *  next section header at line start (array brackets inside values never end a section). */
+const kimiStatusSection = (cur) => {
+    const start = /(^|\n)[ \t]*\[status_line\][ \t]*\n/.exec(cur);
+    if (!start)
+        return null;
+    const headerAt = start.index + (start[0].startsWith("\n") ? 1 : 0);
+    const rest = cur.slice(headerAt);
+    const next = /\n[ \t]*\[/.exec(rest);
+    const body = next ? rest.slice(0, next.index + 1) : rest;
+    const command = /(?:^|\n)[ \t]*command[ \t]*=[ \t]*"([^"]*)"/.exec(body)?.[1];
+    return { ours: !!command && command.includes("statusline kimi") && command.includes("agentmbx"), body };
+};
+function claudeStatusLine(home, cmd) {
+    const want = () => statuslineCommand(home, "claude", cmd);
+    return {
+        install: (cur) => {
+            const obj = parseObj(cur);
+            const existing = obj.statusLine;
+            if (existing && !isOurStatusline(existing.command, "claude"))
+                return cur; // foreign: reported by runSetup, never overwritten
+            if (existing?.type === "command" && existing?.command === want())
+                return cur;
+            obj.statusLine = { type: "command", command: want() };
+            return jsonOut(obj, cur);
+        },
+        uninstall: (cur) => {
+            if (cur === null)
+                return cur;
+            const obj = parseObj(cur);
+            if (!isOurStatusline(obj.statusLine?.command, "claude"))
+                return cur;
+            delete obj.statusLine;
+            return jsonOut(obj, cur);
+        },
+    };
+}
+function kimiStatusLine(home, cmd) {
+    const want = () => statuslineCommand(home, "kimi", cmd);
+    const sectionText = () => `[status_line]\ncommand = "${want()}"\n`;
+    return {
+        install: (cur) => {
+            const section = cur === null ? null : kimiStatusSection(cur);
+            if (section && !section.ours)
+                return cur; // foreign: reported, never overwritten
+            if (section && new RegExp(`command[ \t]*=[ \t]*"${want().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`).test(section.body))
+                return cur;
+            if (section)
+                return (cur ?? "").replace(section.body, sectionText());
+            return (cur ?? "") + (cur && !cur.endsWith("\n") ? "\n" : "") + "\n" + sectionText();
+        },
+        uninstall: (cur) => {
+            if (cur === null)
+                return cur;
+            const section = kimiStatusSection(cur);
+            if (!section?.ours)
+                return cur;
+            return cur.replace(section.body, "").replace(/\n{3,}/g, "\n\n");
+        },
+    };
+}
 const isOurHook = (command, event, cli, cmd) => (command.includes(` hook ${event} --cli ${cli}`) && (command.includes("agentmbx") || command.startsWith(shJoin(cmd))))
     // T342: the bundled sh fast path is ours too, so setup upgrades an old direct command to it (and back)
     || (event === "post-tool" && cli === "claude" && command.includes("claude-posttool.sh"));
@@ -451,6 +536,17 @@ export function edits(ctx, cli) {
                             return false;
                         }
                     } },
+                { cli, kind: "hooks", item: "statusLine (MBX segment)", path: join(home, ".claude/settings.json"), ...claudeStatusLine(home, cmd),
+                    isWired: (cur) => {
+                        // Both render commands are ours and functional (script form when the skill ships it,
+                        // direct form otherwise); install() normalizes to the script form on the next run.
+                        try {
+                            return isOurStatusline(JSON.parse(cur ?? "null")?.statusLine?.command, "claude");
+                        }
+                        catch {
+                            return false;
+                        }
+                    } },
             ];
         }
         case "codex":
@@ -467,6 +563,7 @@ export function edits(ctx, cli) {
             return [
                 { cli, kind: "mcp", item: "mcpServers.mbx", path: join(kimi, "mcp.json"), ...srv },
                 { cli, kind: "hooks", item: "[[hooks]] SessionStart + UserPromptSubmit + PermissionRequest + Stop", path: join(kimi, "config.toml"), ...kimiHooks(cmd) },
+                { cli, kind: "hooks", item: "[status_line] (MBX segment)", path: join(kimi, "tui.toml"), ...kimiStatusLine(home, cmd) },
             ];
         }
         case "hermes":
@@ -666,6 +763,12 @@ export function runSetup(ctx, o) {
         }
         if (d.cli === "codex" && o.mode === "install" && rows.some((r) => r.cli === "codex" && r.item.startsWith("hooks") && r.action !== "unchanged"))
             rows.push({ cli: "codex", item: "note", path: "-", action: "manual", note: "Codex may ask you to review/trust the new hooks on next start" });
+        // T347: a user's own status line is never overwritten — report it and print the snippet instead.
+        if (o.mode === "install" && (d.cli === "claude" || d.cli === "kimi") && statuslineState(ctx.home, d.cli) === "foreign")
+            rows.push({ cli: d.cli, item: "statusLine", path: "-", action: "manual",
+                note: `an existing status line was left alone; add the MBX segment yourself: ${d.cli === "claude"
+                    ? `"statusLine": { "type": "command", "command": "${statuslineCommand(ctx.home, "claude", ctx.cmd)}" }`
+                    : `[status_line]\ncommand = "${statuslineCommand(ctx.home, "kimi", ctx.cmd)}"`}` });
     }
     if (!o.only || o.only.includes("skill"))
         rows.push(...skill(ctx, o.mode, !!o.dryRun));
