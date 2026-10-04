@@ -59,6 +59,8 @@ test("agentmbx watch outside any session lease stops with a reason", async (t) =
 test("Kimi sessions get the event-driven watcher instruction; other no-push CLIs keep the cron self-check", () => {
   assert.equal(selfWatchInstruction({ delegated: false, cli: "kimi", env: {} }), WATCHER_INSTRUCTION);
   assert.match(WATCHER_INSTRUCTION, /"agentmbx watch", run_in_background true, disable_timeout true/);
+  assert.match(WATCHER_INSTRUCTION, /confirmed running, delete that cron job \(CronDelete\).*watcher replaces it/s, "T348: legacy crons go only once the watcher is confirmed running");
+  assert.match(WATCHER_INSTRUCTION, /cannot run background tasks, skip the watcher and keep/, "T348 review: a session without background tasks keeps its cron");
   assert.match(selfWatchInstruction({ delegated: true, cli: "kimi", env: { MBX_SELF_WATCH: "15" } })!, /cron/);
   assert.match(selfWatchInstruction({ delegated: true, cli: "kimi", env: { MBX_SELF_WATCH: "off" } })!, /mbx watcher/);
   assert.equal(selfWatchInstruction({ delegated: false, cli: "hermes", env: {} }), null);
@@ -168,4 +170,32 @@ test("T343: a lease that moves to another holder stops the pinned watcher and in
   assert.equal(await w.exited, 1, "the pinned watcher stops when the lease moves");
   assert.match(w.out(), /moved to another holder/, "with the pinning reason");
   assert.equal(liveWatcher(n, "worker"), false, "a token-mismatched watcher record does not count as live");
+});
+
+// T348 review mediums 1-2 + the session-start gate: the CronDelete cleanup is conditional, and it
+// reaches a live-watcher + legacy-cron session through the prompt hook (Kimi drops SessionStart).
+test("a live watcher plus a legacy [mbx-watch] cron prompt gets the one-line cleanup; the session-start instruction is gated", async (t) => {
+  const { spawnSync } = await import("node:child_process");
+  const home = mkdtempSync(join(tmpdir(), "mbx-watch-cleanup-"));
+  const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "watch-cleanup", version: "1" });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const env = { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "kimi", MBX_AGENT: "worker", MBX_NO_DESKTOP: "1", MBX_DEBUG: "" } as Record<string, string>;
+  await c.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"], env }));
+  const hook = (event: string, prompt?: string) => spawnSync(process.execPath, ["bin/agentmbx.js", "hook", event, "--cli", "kimi"],
+    { input: JSON.stringify({ session_id: "kimi-cleanup-1", cwd: process.cwd(), ...(prompt !== undefined ? { prompt } : {}) }), encoding: "utf8", env }).stdout;
+
+  // no watcher yet: a [mbx-watch] prompt gets no cleanup line (the watcher isn't confirmed running)
+  assert.doesNotMatch(hook("prompt", "[mbx-watch] Periodic self-check"), /delete this cron job/);
+
+  // a live watcher (token-pinned record, as the real watcher writes it)
+  const token = (n.store.db.prepare("SELECT token FROM identity_leases WHERE name='worker'").get() as { token: string }).token;
+  n.store.set("watcher:worker", JSON.stringify({ pid: process.pid, at: Date.now(), token }));
+  const cleanup = hook("prompt", "[mbx-watch] Periodic self-check for worker@alpha: call mbx_inbox.");
+  assert.match(cleanup, /One wake mechanism only.*delete this cron job \(CronDelete\)/s, "the owner-visible case: live watcher + legacy cron prompt");
+
+  // the session-start instruction is gated on no live watcher
+  assert.doesNotMatch(hook("session-start"), /agentmbx watch|CronCreate/, "no wake instruction while a watcher is alive");
+  // a moved lease invalidates the record (shared #94 fix): the cleanup stops and the instruction returns
+  n.store.db.prepare("UPDATE identity_leases SET token='other-token' WHERE name='worker'").run();
+  assert.doesNotMatch(hook("prompt", "[mbx-watch] Periodic self-check"), /delete this cron job/, "a token-mismatched record is not a live watcher");
 });
