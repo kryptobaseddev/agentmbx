@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.7 (2026-10-04)
+
+Grok becomes a first-class CLI, setup wires each CLI's status line without overwriting the user's, Kimi has one wake mechanism, and the relay gains key pinning, signed expiring encryption ads, crash drills, backup/restore and retention. **Upgrade the relay first** (T168 rollout below): upgraded senders refuse the v1 encryption ads that relays on 0.5.6 or older serve.
+
 - Licensing: the Licensor and trademark owner is now CodLuv LLC; licence terms are unchanged.
 - **Relay key pinning, verified encryption ads and enrolment recovery (T168):**
   - **`agentmbx relay set <url> --key <fingerprint>`** pins the relay key the operator published. A relay serving another key pins nothing, leaves the config unchanged and exits 1. An unreachable relay records the fingerprint, and the daemon later pins only that key. Without `--key` the command pins the served key at once and prints its fingerprint to compare. A changed relay key stops relay use until the owner confirms it with `--key`. `doctor` shows the pinned fingerprint and its source, and fails a mismatch with the exact command to run.

@@ -65,6 +65,9 @@
 # EXPLICIT DENY — safety net that overrides allow rules above
 # =============================================================================
 
+# agentmbx: RCASD lifecycle stubs are auto-generated empty templates; not tracked (owner, 2026-10-04, T372)
+rcasd/
+
 # SQLite databases — NEVER track (data loss root cause, ADR-013)
 *.db
 *.db-shm
