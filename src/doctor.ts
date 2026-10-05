@@ -11,7 +11,7 @@ import { kimiDesktop } from "./kimi-desktop.ts";
 import { version } from "./version.ts";
 import { MbxNode, RETRY_HOURS } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
-import { detect, edits, skillDest, skillStatus, statuslineConfiguredCommand, statuslineForms, statuslineState, wired, type SetupCtx } from "./setup.ts";
+import { detect, edits, grokMcpConfiguredCommand, skillDest, skillStatus, statuslineConfiguredCommand, statuslineForms, statuslineState, wired, type SetupCtx } from "./setup.ts";
 import { mailboxLiveness } from "./receipts.ts";
 import { listIdentityControls } from "./identity-control.ts";
 import { pruneCandidates } from "./identity-cleanup.ts";
@@ -219,6 +219,13 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     // The status line is optional and never fails doctor (review minor 7). T368: the checks are
     // static and per-CLI — ours must be a CURRENT form, foreign must be truly foreign.
     for (const c of statuslineChecks(ctx, d.cli)) out.push(c);
+    // T384: a command string that matches what setup would write is still "wired". Flag the path
+    // itself when that file is gone, including a stale …/agentmbx that install would rewrite.
+    if (d.cli === "grok") {
+      const command = grokMcpConfiguredCommand(ctx.home);
+      if (command && command.includes("/") && !existsSync(command))
+        add("fail", `grok: MCP command path does not exist (${command})`, "agentmbx setup --only grok");
+    }
   }
 
   if (node) {

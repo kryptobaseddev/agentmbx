@@ -393,6 +393,116 @@ function grokMcp(cmd: string[]) {
   };
 }
 
+/** The command configured in `[mcp_servers.mbx]`, not the one setup would write. A missing file,
+ *  a non-section form, or invalid TOML has no command to check. */
+export function grokMcpConfiguredCommand(home: string): string | null {
+  try {
+    const dir = (home === homedir() && process.env.GROK_HOME) || join(home, ".grok");
+    const cur = read(join(dir, "config.toml"));
+    if (cur === null) return null;
+    const st = grokMcpState(cur);
+    return st.form === "section" ? grokCommandValue(st.body) : null;
+  } catch { return null; }
+}
+
+/** Grok events whose stdout the harness actually delivers (PostToolUse) or still runs
+ *  (SessionStart, UserPromptSubmit). Stop and PermissionRequest stay out: wake is T385. */
+const GROK_HOOK_EVENTS = [["SessionStart", "session-start"], ["UserPromptSubmit", "prompt"], ["PostToolUse", "post-tool"]] as const;
+const grokHookSub = (event: string) => GROK_HOOK_EVENTS.find((e) => e[0] === event)?.[1] ?? null;
+
+/** Ours is exactly `…/agentmbx hook <sub> --cli grok` (bare or quoted path). A composed command
+ *  is someone else's hook and is left alone. */
+function isOurGrokHookCommand(command: string, sub: string): boolean {
+  const tail = ` hook ${sub} --cli grok`;
+  if (!command.endsWith(tail)) return false;
+  let bin = command.slice(0, -tail.length);
+  if (bin.startsWith("'") && bin.endsWith("'")) bin = bin.slice(1, -1).replace(/'\\''/g, "'");
+  else if (/\s/.test(bin)) return false;
+  return /(^|\/)agentmbx$/.test(bin);
+}
+
+function inlineHookCommand(body: string): string | null {
+  const m = /command[ \t]*=[ \t]*"((?:[^"\\]|\\.)*)"/.exec(body);
+  if (!m) return null;
+  try { return JSON.parse(`"${m[1]}"`) as string; } catch { return null; }
+}
+
+/** One `[[hooks.<Event>]]` table, including the newline that ends its last line. Contiguous
+ *  tables meet exactly (end === next start), so a block uninstall removes only the bytes it added. */
+function grokHookSpans(cur: string): { start: number; end: number; event: string; command: string | null }[] {
+  const re = /[ \t]*\[\[[ \t]*hooks[ \t]*\.[ \t]*([A-Za-z]+)[ \t]*\]\][ \t]*(?:#[^\r\n]*)?\r?\n/g;
+  const spans: { start: number; end: number; event: string; command: string | null }[] = [];
+  for (const m of cur.matchAll(re)) {
+    const start = m.index ?? 0;
+    const after = start + m[0].length;
+    const next = /\r?\n[ \t]*\[/.exec(cur.slice(after));
+    const end = next ? after + next.index + (/^\r?\n/.exec(next[0])?.[0].length ?? 1) : cur.length;
+    spans.push({ start, end, event: m[1], command: inlineHookCommand(cur.slice(start, end)) });
+  }
+  return spans;
+}
+
+/** `[hooks]` / `[hooks.Name]` is one table. `[[hooks.Name]]` is an array of tables. smol-toml
+ *  accepts both in one document; Grok's config must not. A file that already uses the table form
+ *  is left untouched. */
+function grokPlainHooksTable(cur: string): boolean {
+  return /^[ \t]*\[hooks(?:\.[A-Za-z0-9_-]+)?\][ \t]*(?:#[^\r\n]*)?\r?$/m.test(cur);
+}
+
+function grokHooks(cmd: string[]) {
+  const tableText = (event: string, command: string) =>
+    `[[hooks.${event}]]\nhooks = [{ type = "command", command = ${JSON.stringify(command)}, timeout = 10 }]\n`;
+  const oursIn = (cur: string, event: string, sub: string) => grokHookSpans(cur)
+    .filter((s) => s.event === event && s.command !== null && isOurGrokHookCommand(s.command, sub));
+  return {
+    install: (cur: string | null) => {
+      if (cur !== null && (tryParseToml(cur) === null || grokPlainHooksTable(cur))) return cur;
+      let next = cur ?? "";
+      const missing: string[] = [];
+      for (const [event, sub] of GROK_HOOK_EVENTS) {
+        const want = hookCommand(cmd, sub, "grok");
+        const ours = oursIn(next, event, sub);
+        if (!ours.length) { missing.push(tableText(event, want)); continue; }
+        if (ours[0].command !== want) {
+          const body = next.slice(ours[0].start, ours[0].end)
+            .replace(/(command[ \t]*=[ \t]*)"(?:[^"\\]|\\.)*"/, `$1${JSON.stringify(want)}`);
+          next = next.slice(0, ours[0].start) + body + next.slice(ours[0].end);
+        }
+        const extra = oursIn(next, event, sub).slice(1);
+        for (const s of extra.reverse()) next = next.slice(0, s.start) + next.slice(s.end);
+      }
+      if (missing.length) {
+        const block = missing.join("");
+        next = next === "" ? block : next + (next.includes("\r\n") ? "\r\n" : "\n") + block;
+      }
+      return guarded(cur, next === "" ? null : next);
+    },
+    uninstall: (cur: string | null) => {
+      if (cur === null || tryParseToml(cur) === null) return cur;
+      const spans = grokHookSpans(cur).filter((s) => {
+        const sub = grokHookSub(s.event);
+        return !!sub && s.command !== null && isOurGrokHookCommand(s.command, sub);
+      });
+      if (!spans.length) return cur;
+      const groups: { start: number; end: number }[] = [];
+      for (const s of spans) {
+        const g = groups.at(-1);
+        if (g && g.end === s.start) g.end = s.end;
+        else groups.push({ start: s.start, end: s.end });
+      }
+      let next = cur;
+      for (const g of groups.reverse()) {
+        // One separator newline per group — the same byte install added before an appended block.
+        let start = g.start;
+        if (start > 0 && next[start - 1] === "\n") start -= next[start - 2] === "\r" ? 2 : 1;
+        next = next.slice(0, start) + next.slice(g.end);
+      }
+      if (next.trim() === "") next = "";
+      return guarded(cur, next === "" ? null : next);
+    },
+  };
+}
+
 const isOurHook = (command: string, event: string, cli: string, cmd: string[]) =>
   (command.includes(` hook ${event} --cli ${cli}`) && (command.includes("agentmbx") || command.startsWith(shJoin(cmd))))
   // T342: the bundled sh fast path is ours too, so setup upgrades an old direct command to it (and back)
@@ -771,6 +881,8 @@ export function edits(ctx: SetupCtx, cli: CliId): Edit[] {
         { cli, kind: "mcp", item: "[mcp_servers.mbx] (user scope)", path: config, ...grokMcp(cmd) },
         { cli, kind: "statusline", item: "[ui.status_line] (MBX segment)", path: config, ...grokStatusLine(home, cmd),
           isWired: (cur) => { try { const st = grokStatus(cur ?? ""); return st.form === "section" && isOurStatusline(home, "grok", cmd, grokCommandValue(st.body) ?? undefined); } catch { return false; } } },
+        // T384: same file, same parse-guard and byte-exact uninstall as the MCP and status line edits.
+        { cli, kind: "hooks", item: "hooks SessionStart + UserPromptSubmit + PostToolUse", path: config, ...grokHooks(cmd) },
       ];
     }
     case "hermes":

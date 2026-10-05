@@ -1522,6 +1522,14 @@ async function hook(node, event, cli) {
             }
             let posttoolDone = null;
             if (event === "post-tool") {
+                // T384: Grok delivers PostToolUse and drops SessionStart stdout. The hint has to be stored
+                // under the cli the MCP server resolves (grok), on the event Grok actually runs.
+                if (cli === "grok" && sid) {
+                    try {
+                        recordSessionHint(node.store, cli, process.ppid, inspectLeaseProcess(process.ppid).start, sid);
+                    }
+                    catch { /* advisory */ }
+                }
                 if (cli !== "claude")
                     return;
                 // Track IDs, not counts or sender timestamps: replacing one acked message with a new one must notify,
@@ -1602,7 +1610,11 @@ async function hook(node, event, cli) {
         // Missing ownership is a quiet hook result, not a provider failure or an invitation to recreate a binding.
         if (entered)
             throw error;
-        if (!sid || (event !== "session-start" && event !== "prompt"))
+        // T384: an unbound grok session learns how to register on PostToolUse, the event whose
+        // additionalContext Grok delivers. SessionStart and prompt already record a hint; Grok drops
+        // their stdout. Stop stays off this path (T385).
+        const grokUnboundPost = cli === "grok" && event === "post-tool";
+        if (!sid || (event !== "session-start" && event !== "prompt" && !grokUnboundPost))
             return;
         const multi = cli === "kimi" && kimiMultiHost(process.ppid);
         // A conversation in a multi-conversation Kimi host can't be matched to its mbx server from here: hand it a bind
@@ -1628,6 +1640,8 @@ async function hook(node, event, cli) {
             node.store.set(guided, new Date().toISOString());
             emit(cli, "SessionStart", link ? `${unbound}\n${link}` : unbound);
         }
+        else if (grokUnboundPost)
+            emit(cli, "PostToolUse", link ? `${unbound}\n${link}` : unbound);
         else if (link || first) {
             node.store.set(guided, new Date().toISOString());
             emit(cli, "UserPromptSubmit", first ? (link ? `${unbound}\n${link}` : unbound) : link);
