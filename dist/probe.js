@@ -34,9 +34,8 @@ export function planProbe(identities, sender) {
  *  with the project filter and caller scope), sends as kind=request with needs_reply, and
  *  observations read straight from the audit/deliveries/messages tables. Each send runs inside
  *  the sender's withHeld lease fence — the same fence `agentmbx send` uses — so the envelope is
- *  marked sender_verification "leased" and the probe measures the real wake-authority path.
- *  (A sender with no live lease, e.g. engine-level tests, sends unverified, exactly like the
- *  CLI's documented unverified-sender path.) */
+ *  marked sender_verification "leased" and the probe measures the real wake-authority path; a
+ *  sender whose lease is gone when a send lands throws and the target reports a send failure. */
 export function storeProbeIO(node, o) {
     const db = node.store.db;
     return {
@@ -47,9 +46,12 @@ export function storeProbeIO(node, o) {
             const draft = { from: o.sender, to: [target], subject: probeSubject(new Date(at)), body: probeBody(),
                 kind: "request", needs_reply: true, ...(o.project ? { project: o.project } : {}) };
             const row = db.prepare("SELECT token FROM identity_leases WHERE name=? AND released_at IS NULL").get(o.sender);
-            // The token is re-read and re-verified per send: a lease that moves mid-probe throws here
-            // and the target is reported as a send failure, never a silent downgrade.
-            const r = row ? new IdentityLeases(node.store).withHeld(o.sender, row.token, () => node.send(draft)) : node.send(draft);
+            // No unfenced fallback: a sender without a live lease (released between planning and
+            // sending, or never held) throws and the target reports a send failure — the token is
+            // re-read per send so a lease that moves mid-probe lands in the same place.
+            if (!row)
+                throw new Error(`sender ${o.sender} no longer holds its lease`);
+            const r = new IdentityLeases(node.store).withHeld(o.sender, row.token, () => node.send(draft));
             return { id: r.envelope.id, thread: r.envelope.thread, at };
         },
         observe: (target, sent) => {

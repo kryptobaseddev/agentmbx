@@ -173,14 +173,15 @@ test("storeProbeIO against a real store: admitted wake + read + reply + ack pass
   const n = new MbxNode(home, { host: "alpha" });
   t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   bindWakeLease(n, { agent: "worker", cli: "kimi", session_id: "term-1", pid: process.pid });
+  bindWakeLease(n, { agent: "probe-runner", cli: "claude", session_id: "runner-1", pid: process.pid });
 
-  const base = storeProbeIO(n, { sender: "owner" });
+  const base = storeProbeIO(n, { sender: "probe-runner" });
   let probe: SentProbe = { id: "", thread: "", at: 0 };
   const io: ProbeIO = { ...base, send: (name) => { probe = base.send(name); return probe; } };
   let clock = Date.now();
   let step = 0;
   const report = await runProbe(io, {
-    sender: "owner", deadlineMs: 60_000, now: () => clock, pollMs: 1_000,
+    sender: "probe-runner", deadlineMs: 60_000, now: () => clock, pollMs: 1_000,
     sleep: async () => {
       clock += 1_000;
       step += 1;
@@ -189,7 +190,7 @@ test("storeProbeIO against a real store: admitted wake + read + reply + ack pass
       } else if (step === 2) {
         // one autonomous wake turn: read, reply in the thread, then ack
         n.setDelivery(probe.id, "worker", "read");
-        n.send({ from: "worker", to: ["owner"], subject: `Re: ${PROBE_SUBJECT_PREFIX} autonomy probe`, body: `${PROBE_REPLY_MARKER} [mbx] 1 new message(s) for worker`, thread: probe.thread, reply_to: probe.id });
+        n.send({ from: "worker", to: ["probe-runner"], subject: `Re: ${PROBE_SUBJECT_PREFIX} autonomy probe`, body: `${PROBE_REPLY_MARKER} [mbx] 1 new message(s) for worker`, thread: probe.thread, reply_to: probe.id });
         n.ack(probe.id, "worker");
       }
     },
@@ -211,20 +212,21 @@ test("storeProbeIO: an in-turn answer (reply, no wake row) passes by default and
     const home = mkdtempSync(join(tmpdir(), "mbx-probe-inturn-"));
     const n = new MbxNode(home, { host: "alpha" });
     bindWakeLease(n, { agent: "worker", cli: "kimi", session_id: "term-1", pid: process.pid });
-    const base = storeProbeIO(n, { sender: "owner" });
+    bindWakeLease(n, { agent: "probe-runner", cli: "claude", session_id: "runner-1", pid: process.pid });
+    const base = storeProbeIO(n, { sender: "probe-runner" });
     let probe: SentProbe = { id: "", thread: "", at: 0 };
     const io: ProbeIO = { ...base, send: (name) => { probe = base.send(name); return probe; } };
     return { n, home, io, probe: () => probe };
   };
   const drive = (n: MbxNode, probe: SentProbe) => {
-    n.send({ from: "worker", to: ["owner"], subject: `Re: ${PROBE_SUBJECT_PREFIX} x`, body: `${PROBE_REPLY_MARKER} (no wake line) — saw the mail mid-turn`, thread: probe.thread, reply_to: probe.id });
+    n.send({ from: "worker", to: ["probe-runner"], subject: `Re: ${PROBE_SUBJECT_PREFIX} x`, body: `${PROBE_REPLY_MARKER} (no wake line) — saw the mail mid-turn`, thread: probe.thread, reply_to: probe.id });
   };
 
   const defaultWorld = world();
   t.after(() => { defaultWorld.n.close(); rmSync(defaultWorld.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   let clock = Date.now();
   let step = 0;
-  const passed = await runProbe(defaultWorld.io, { sender: "owner", deadlineMs: 10_000, now: () => clock, pollMs: 1_000,
+  const passed = await runProbe(defaultWorld.io, { sender: "probe-runner", deadlineMs: 10_000, now: () => clock, pollMs: 1_000,
     sleep: async () => { clock += 1_000; step += 1; if (step === 1) drive(defaultWorld.n, defaultWorld.probe()); } });
   const passTarget = passed.targets.find((x) => x.name === "worker")!;
   assert.equal(passed.ok, true, JSON.stringify(passed.targets));
@@ -236,7 +238,7 @@ test("storeProbeIO: an in-turn answer (reply, no wake row) passes by default and
   t.after(() => { strictWorld.n.close(); rmSync(strictWorld.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   clock = Date.now();
   step = 0;
-  const failed = await runProbe(strictWorld.io, { sender: "owner", deadlineMs: 10_000, requireIdleWake: true, now: () => clock, pollMs: 1_000,
+  const failed = await runProbe(strictWorld.io, { sender: "probe-runner", deadlineMs: 10_000, requireIdleWake: true, now: () => clock, pollMs: 1_000,
     sleep: async () => { clock += 1_000; step += 1; if (step === 1) drive(strictWorld.n, strictWorld.probe()); } });
   const failTarget = failed.targets.find((x) => x.name === "worker")!;
   assert.equal(failed.ok, false);
@@ -250,14 +252,15 @@ test("storeProbeIO: admitted wake without a reply is a no-reply failure", async 
   const n = new MbxNode(home, { host: "alpha" });
   t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   bindWakeLease(n, { agent: "worker", cli: "kimi", session_id: "term-1", pid: process.pid });
+  bindWakeLease(n, { agent: "probe-runner", cli: "claude", session_id: "runner-1", pid: process.pid });
 
-  const base = storeProbeIO(n, { sender: "owner" });
+  const base = storeProbeIO(n, { sender: "probe-runner" });
   let probe: SentProbe = { id: "", thread: "", at: 0 };
   const io: ProbeIO = { ...base, send: (name) => { probe = base.send(name); return probe; } };
   let clock = Date.now();
   let step = 0;
   const report = await runProbe(io, {
-    sender: "owner", deadlineMs: 10_000, now: () => clock, pollMs: 1_000,
+    sender: "probe-runner", deadlineMs: 10_000, now: () => clock, pollMs: 1_000,
     sleep: async () => {
       clock += 1_000;
       step += 1;
@@ -282,6 +285,18 @@ test("storeProbeIO fences each send inside the sender's held lease (sender_verif
   const sent = io.send("worker");
   const envelope = JSON.parse((n.store.db.prepare("SELECT envelope FROM messages WHERE id=?").get(sent.id) as { envelope: string }).envelope) as { meta: { sender_verification?: string } };
   assert.equal(envelope.meta.sender_verification, "leased", "the probe send carries the lease fence, not a raw node.send");
+});
+
+test("storeProbeIO refuses to send when the sender's lease is gone after planning; nothing is stored", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-probe-released-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const { release } = bindWakeLease(n, { agent: "runner", cli: "claude", session_id: "r1", pid: process.pid });
+  release(); // the lease is gone between sender resolution and the send
+  const io = storeProbeIO(n, { sender: "runner" });
+  assert.throws(() => io.send("worker"), /sender runner no longer holds its lease/);
+  const count = (n.store.db.prepare("SELECT COUNT(*) c FROM messages").get() as { c: number }).c;
+  assert.equal(count, 0, "no unfenced message may be stored");
 });
 
 // ---- the CLI dispatch ---------------------------------------------------------------------------------
