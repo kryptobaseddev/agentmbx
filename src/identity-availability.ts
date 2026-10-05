@@ -26,6 +26,12 @@ export interface Availability {
   reason: string;
   /** How a claim takes a still-held lease: from an idle shared-process conversation, or from an older process of the same session. */
   takeover?: "idle-conversation" | "same-session";
+  /**
+   * T439: the live holder is this same provider session's MCP server under the caller's own provider process, so the caller
+   * is a sibling MCP client of that session (OpenCode code mode, a transient Codex connection). It co-uses the holder's
+   * lease: it acts as the identity under the holder's lease token without taking, renewing or releasing it.
+   */
+  coUse?: true;
 }
 
 const minutes = (ms: number) => `${Math.max(1, Math.round(ms / 60_000))} min`;
@@ -55,13 +61,15 @@ export function identityAvailability(o: { lease?: IdentityLease; evidence: Proce
   if (o.caller && lease.cli === o.caller.cli && lease.session_id === o.caller.sessionId && !o.caller.sessionId.startsWith("mcp-")) {
     // T383: a provider may start a second, short-lived MCP server for a session whose own server is still live and serving
     // (Codex did). Only a holder under a different (restarted) provider process is "older"; a live holder under the caller's
-    // own provider keeps the lease and the newcomer waits until it ends. Unknown parentage never evicts a live holder.
+    // own provider keeps the lease. T439: that second server co-uses it (acts as the identity under the holder's lease, never
+    // taking, renewing or releasing it). Unknown parentage never evicts a live holder and never co-uses it.
     const { providerPid, holderProviderPid: holderProvider } = o.caller;
     if (providerPid !== undefined && holderProvider != null && holderProvider !== providerPid)
       return { claimable: true, state: "live", reason: `held by an older process of this same ${lease.cli} session`, takeover: "same-session" };
-    return { claimable: false, state: "live", reason: providerPid !== undefined && holderProvider === providerPid
-      ? `held by the live MCP server of this same ${lease.cli} session (pid ${lease.holder_pid}, same provider process); it resumes here once that server ends`
-      : `held by a live process of this same ${lease.cli} session (pid ${lease.holder_pid}) whose provider process could not be verified; retry shortly` };
+    if (providerPid !== undefined && holderProvider === providerPid)
+      return { claimable: false, state: "live", coUse: true, reason: `held by the live MCP server of this same ${lease.cli} session (pid ${lease.holder_pid}, same provider process); `
+        + "a sibling server of this session co-uses it: it acts as that identity under the holder's lease, without taking or releasing it" };
+    return { claimable: false, state: "live", reason: `held by a live process of this same ${lease.cli} session (pid ${lease.holder_pid}) whose provider process could not be verified; retry shortly` };
   }
   const quiet = o.activity ? o.now - o.activity.at : null;
   if (o.activity?.shared && quiet !== null && quiet >= SHARED_IDLE_MS)

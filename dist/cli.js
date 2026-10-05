@@ -1788,6 +1788,27 @@ async function hook(node, event, cli) {
  */
 export const watcherEvidenceRetryable = (e) => e?.code === "IDENTITY_STATUS_UNKNOWN"
     || /caller process evidence became stale|process status is unknown/.test(e?.message ?? "");
+/** The conversation that will see this watcher's exit, or null when only an `mcp-*` lease matches.
+ *  Current row: the newest live non-provisional session whose pid is this process or an ancestor.
+ *  `--session` must name that row. With no `--session`, exactly one such row is required. */
+function watcherObservingSession(node, agent, selection) {
+    const chain = new Set([process.pid, ...ancestors()]);
+    const live = node.sessionsFor(agent).filter((r) => {
+        const pid = r.pid;
+        return !!pid && !r.session_id.startsWith("mcp-") && chain.has(pid) && node.sameSession(pid, r)
+            && (!selection.cli || r.cli === selection.cli);
+    });
+    const current = live[0]; // sessionsFor is updated_at DESC
+    if (!current)
+        return null;
+    if (selection.session) {
+        if (selection.session !== current.session_id)
+            return null;
+    }
+    else if (live.length !== 1)
+        return null;
+    return { session: current.session_id, pid: process.pid };
+}
 async function watch(node, selection) {
     const every = Math.max(200, Number(process.env.MBX_WATCH_INTERVAL_MS) || 2_000);
     // T343: MCP leases heartbeat every MCP_HEARTBEAT_MS (mcp.ts). While the holder's heartbeat
@@ -1902,8 +1923,16 @@ async function watch(node, selection) {
                     if (r.delivery_note === "desktop")
                         node.store.db.prepare("UPDATE deliveries SET note=NULL, updated_at=? WHERE msg_id=? AND agent=? AND state='notified' AND note='desktop'").run(new Date().toISOString(), r.id, mailbox);
                 }
-                if (wanted.length)
-                    node.store.audit("wake.attempt", { agent: mailbox, outcome: "admitted", receipt: "transport", via: "watcher" });
+                if (wanted.length) {
+                    // Admitted only for the conversation that can observe this exit. A matching mcp-* lease
+                    // token still lets the process run; it does not make the printed hint an idle wake.
+                    const observed = watcherObservingSession(node, agent, selection);
+                    const session = observed?.session ?? (selection.session && !selection.session.startsWith("mcp-") ? selection.session : undefined);
+                    node.store.audit("wake.attempt", {
+                        agent: mailbox, outcome: observed ? "admitted" : "not_submitted", receipt: observed ? "transport" : "none",
+                        via: "watcher", pid: process.pid, ...(session ? { session } : {}),
+                    });
+                }
             }
             report = lines.length ? lines.join("\n") : null;
             failures = 0;
