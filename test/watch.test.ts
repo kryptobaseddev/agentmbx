@@ -46,6 +46,67 @@ test("agentmbx watch skips status mail, exits with a no-body hint for a request,
   assert.ok(n.store.db.prepare("SELECT 1 FROM audit WHERE event='wake.attempt' AND detail LIKE '%watcher%'").get());
 });
 
+test("T435: agentmbx watch exits for unread desktop-notified mail and ignores read mail", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-watch-desktop-"));
+  const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "watch-desktop", version: "1" });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const env = { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "kimi", MBX_AGENT: "worker", MBX_NO_DESKTOP: "1", MBX_DEBUG: "" } as Record<string, string>;
+  await c.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"], env }));
+  delegateWake(n, "worker");
+
+  const wanted = sendLeased(n, { from: "boss", to: ["worker"], subject: "please review", body: "secret body", kind: "request" }).envelope;
+  const read = sendLeased(n, { from: "boss", to: ["worker"], subject: "old", body: "old secret", kind: "request" }).envelope;
+  const status = sendLeased(n, { from: "boss", to: ["worker"], subject: "fyi", body: "status body", kind: "status" }).envelope;
+  const mark = n.store.db.prepare("UPDATE deliveries SET state=?, note=? WHERE msg_id=? AND agent='worker'");
+  mark.run("notified", "desktop", wanted.id);
+  mark.run("read", null, read.id);
+  mark.run("notified", "desktop", status.id);
+
+  const child = spawn(process.execPath, [resolve("bin/agentmbx.js"), "watch"], { env: { ...env, MBX_AGENT: "", MBX_WATCH_INTERVAL_MS: "200" } });
+  let out = ""; child.stdout.on("data", d => { out += d; });
+  const exited = new Promise<number | null>(r => child.on("exit", r));
+  t.after(() => { child.kill(); });
+  assert.equal(await exited, 0);
+  assert.match(out, /^\[mbx\] 1 new message\(s\) for worker/);
+  assert.ok(out.includes(wanted.id) && !out.includes("secret body") && !out.includes(read.id) && !out.includes(status.id));
+  const notes = n.store.db.prepare("SELECT msg_id, state, note FROM deliveries WHERE agent='worker'").all() as { msg_id: string; state: string; note: string | null }[];
+  const row = (id: string) => notes.find((x) => x.msg_id === id);
+  assert.equal(row(wanted.id)?.state, "notified");
+  assert.equal(row(wanted.id)?.note, null, "reporting clears the desktop note");
+  assert.equal(row(status.id)?.note, null, "a non-wanted desktop row is cleared without an exit");
+  assert.equal(row(read.id)?.state, "read");
+
+  const again = spawn(process.execPath, [resolve("bin/agentmbx.js"), "watch"], { env: { ...env, MBX_AGENT: "", MBX_WATCH_INTERVAL_MS: "200" } });
+  t.after(() => { again.kill(); });
+  await new Promise(r => setTimeout(r, 500));
+  assert.equal(again.exitCode, null, "re-arming before the mail is read does not exit again");
+  again.kill();
+});
+
+test("T435: a terminal Kimi stop nags to re-arm until a watcher is live", async (t) => {
+  const { spawnSync } = await import("node:child_process");
+  const home = mkdtempSync(join(tmpdir(), "mbx-watch-kimi-stop-"));
+  const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "watch-kimi-stop", version: "1" });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const env = { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "kimi", MBX_AGENT: "worker", MBX_NO_DESKTOP: "1", MBX_DEBUG: "" } as Record<string, string>;
+  await c.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"], env }));
+  const prompt = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", "prompt", "--cli", "kimi"],
+    { input: JSON.stringify({ session_id: "kimi-term-1", cwd: process.cwd(), prompt: "hi" }), encoding: "utf8", env });
+  assert.equal(prompt.status, 0, prompt.stderr);
+  const stop = () => spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", "stop", "--cli", "kimi"],
+    { input: JSON.stringify({ session_id: "kimi-term-1", cwd: process.cwd() }), encoding: "utf8", env });
+  const down = stop();
+  assert.equal(down.status, 2, down.stderr);
+  assert.match(down.stderr, /agentmbx watch/);
+  assert.equal(down.stdout, "");
+  const token = (n.store.db.prepare("SELECT token FROM identity_leases WHERE name='worker'").get() as { token: string }).token;
+  n.store.set("watcher:worker", JSON.stringify({ pid: process.pid, at: Date.now(), token }));
+  const live = stop();
+  assert.equal(live.status, 0, live.stderr);
+  assert.equal(live.stderr, "");
+  assert.equal(live.stdout, "");
+});
+
 test("agentmbx watch outside any session lease stops with a reason", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-watch-none-"));
   new MbxNode(home, { host: "alpha" }).close();
