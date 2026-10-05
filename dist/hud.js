@@ -22,10 +22,6 @@ export const hudSessionPath = (home, cli, sessionId) => join(hudDir(home), `${cl
 export const hudPidPath = (home, cli, pid, start) => join(hudDir(home), `${cli}-pid-${pid}-${start.replaceAll(/[^0-9A-Za-z_-]/g, "")}.json`);
 export const hudSessionLinePath = (home, cli, sessionId) => join(hudDir(home), `${cli}-${sessionId}.line`);
 export const hudPidLinePath = (home, cli, pid, start) => join(hudDir(home), `${cli}-pid-${pid}-${start.replaceAll(/[^0-9A-Za-z_-]/g, "")}.line`);
-/** T366: one fixed-path line per CLI for alert-only adapters. Kimi's `[status_line].command`
- *  replaces the footer and its adapter parses no stdin, so its render path cannot name a session
- *  file — the daemon aggregates one `kimi.line` per tick instead. */
-export const hudCliLinePath = (home, cli) => join(hudDir(home), `${cli}.line`);
 export const hudAlivePath = (home) => join(hudDir(home), ".alive");
 const CLI_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const SID_RE = /^[A-Za-z0-9_-]{1,128}$/;
@@ -110,7 +106,6 @@ export function writeHud(node, now = Date.now()) {
     const wanted = new Set();
     const perAgent = new Map(); // computed once per agent, not per row (review low 8)
     const pidDone = new Set();
-    let kimiAlert = ""; // T366: first bound kimi identity with something to show wins footer line 1
     // One ps for every distinct pid, not one per row (review low 4).
     const pids = [...new Set(rows.map((r) => r.pid).filter((p) => !!p))];
     const evidence = new Map();
@@ -147,8 +142,6 @@ export function writeHud(node, now = Date.now()) {
             wanted.add(hudSessionPath(node.home, row.cli, row.session_id));
             writeIfChanged(hudSessionPath(node.home, row.cli, row.session_id), snapshot);
             const line = cliLine(row.cli, JSON.parse(snapshot));
-            if (row.cli === "kimi" && !kimiAlert && line)
-                kimiAlert = line;
             wanted.add(hudSessionLinePath(node.home, row.cli, row.session_id));
             writeSeg(hudSessionLinePath(node.home, row.cli, row.session_id), line);
             // Critical fix: a pid file is written per (cli, pid) only when a pid-ONLY resolution proves a
@@ -178,12 +171,6 @@ export function writeHud(node, now = Date.now()) {
         }
         catch { /* one bad row never aborts the pass */ }
     }
-    // T366: kimi's bundled adapter is one `cat` of a fixed path (no stdin parsing), so the daemon
-    // aggregates one alert line per tick — EMPTY when no bound kimi identity has anything to show,
-    // never stale content. Written even with no kimi rows, so the adapter's cat always finds a file
-    // that reflects the current daemon state.
-    wanted.add(hudCliLinePath(node.home, "kimi"));
-    writeSeg(hudCliLinePath(node.home, "kimi"), kimiAlert);
     // Files whose binding vanished go on the next tick — not after a grace period (review high 2).
     for (const file of readdirSync(dir)) {
         const path = join(dir, file);
