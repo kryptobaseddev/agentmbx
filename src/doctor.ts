@@ -11,7 +11,7 @@ import { kimiDesktop } from "./kimi-desktop.ts";
 import { version } from "./version.ts";
 import { MbxNode, RETRY_HOURS } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
-import { detect, edits, skillStatus, statuslineConfiguredCommand, statuslineState, wired, type SetupCtx } from "./setup.ts";
+import { detect, edits, skillDest, skillStatus, statuslineConfiguredCommand, statuslineForms, statuslineState, wired, type SetupCtx } from "./setup.ts";
 import { mailboxLiveness } from "./receipts.ts";
 import { listIdentityControls } from "./identity-control.ts";
 import { pruneCandidates } from "./identity-cleanup.ts";
@@ -154,6 +154,43 @@ export function pruneSummary(node: MbxNode): Check {
     : { level: "info", label: "no generated mailboxes eligible for prune" };
 }
 
+/** T368: static verification of one CLI's status line integration. Optional and never fails doctor.
+ *  "ours" must be a CURRENT form — an older recognized form is a warn with the upgrade fix, as is
+ *  ours pointing at a deleted bundled script. "foreign" is info, unless the foreign command embeds
+ *  the agentmbx render command (wrapped, re-quoted, extra flags): that is a partial AgentMBX write,
+ *  not a user's own line. Claude composes, so its wired command must be the composing adapter; kimi
+ *  and grok are replace-only — `command` replaces the footer and never renders alongside the user's
+ *  other keys. opencode has no custom status line feature at all (built-in segments only), so the
+ *  honest result is an explicit skip note, not a check against an invented config path. */
+export function statuslineChecks(ctx: SetupCtx, cli: string): Check[] {
+  if (cli === "opencode")
+    return [{ level: "info", label: "opencode: no custom status line feature (built-in segments only: anomalyco/opencode#30295); nothing to verify" }];
+  if (cli !== "claude" && cli !== "kimi" && cli !== "grok") return [];
+  const out: Check[] = [];
+  const where = edits(ctx, cli).find((e) => e.kind === "statusline")?.path.replace(ctx.home, "~") ?? "-";
+  const fix = `agentmbx setup --only ${cli}`;
+  const state = statuslineState(ctx.home, cli, ctx.cmd);
+  // Re-review item 2: check the CONFIGURED command, never the one setup would write — and parse
+  // the quoted path form setup writes, so a home path with a space stays intact.
+  const configured = statuslineConfiguredCommand(ctx.home, cli);
+  const scriptPath = configured?.startsWith("sh ") ? firstShellWord(configured.slice(3)) : null;
+  if (state === "ours") {
+    if (scriptPath && !existsSync(scriptPath))
+      out.push({ level: "warn", label: `${cli}: status line points at a missing script (${scriptPath})`, fix: "agentmbx setup --only skill" });
+    else if (configured !== null && !statuslineForms(ctx.home, cli, ctx.cmd).has(configured))
+      out.push({ level: "warn", label: `${cli}: status line uses an older AgentMBX form (${configured})`, fix });
+    else out.push({ level: "ok", label: `${cli}: status line wired (${where})${cli === "claude"
+      ? "; the command composes with Claude's built-in items" : " — the command replaces the footer; other keys do not render"}` });
+  } else if (state === "foreign") {
+    const embedded = !!configured && ((configured.includes("agentmbx") && configured.includes("statusline"))
+      || configured.includes(join(skillDest(ctx.home), "scripts")));
+    if (embedded) out.push({ level: "warn", label: `${cli}: status line is foreign but embeds the agentmbx render command (${configured}) — a partial AgentMBX write, not a user's own`,
+      fix: `remove the agentmbx reference by hand, then: ${fix}` });
+    else out.push({ level: "info", label: `${cli}: a user's status line is left alone (MBX segment not wired)` });
+  }
+  return out;
+}
+
 export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeoutMs?: number } = {}): Promise<Check[]> {
   const out: Check[] = [];
   const add = (level: Level, label: string, fix?: string) => out.push({ level, label, fix });
@@ -179,20 +216,9 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
       const what = kind === "mcp" ? "MCP server" : "hooks";
       add(ok ? "ok" : "fail", `${d.cli}: ${what} ${ok ? "wired" : "not wired"} (${e.map((x) => x.path.replace(ctx.home, "~")).join(", ")})`, ok ? undefined : `agentmbx setup --only ${d.cli}`);
     }
-    // The status line is optional and never fails doctor (review minor 7): a foreign one is left
-    // alone at info, ours pointing at a deleted script is a warn, and a user who removed the
-    // optional segment hears nothing about it.
-    const sl = es.filter((x) => x.kind === "statusline");
-    if (sl.length && (d.cli === "claude" || d.cli === "kimi" || d.cli === "grok")) {
-      const state = statuslineState(ctx.home, d.cli, ctx.cmd);
-      // Re-review item 2: check the CONFIGURED command's script, not the one setup would write —
-      // and parse the quoted path form setup writes, so a home path with a space stays intact.
-      const configured = statuslineConfiguredCommand(ctx.home, d.cli);
-      const scriptPath = configured?.startsWith("sh ") ? firstShellWord(configured.slice(3)) : null;
-      if (state === "ours" && scriptPath && !existsSync(scriptPath)) add("warn", `${d.cli}: status line points at a missing script (${scriptPath})`, "agentmbx setup --only skill");
-      else if (state === "ours") add("ok", `${d.cli}: status line wired (${sl[0].path.replace(ctx.home, "~")})`);
-      else if (state === "foreign") add("info", `${d.cli}: a user's status line is left alone (MBX segment not wired)`);
-    }
+    // The status line is optional and never fails doctor (review minor 7). T368: the checks are
+    // static and per-CLI — ours must be a CURRENT form, foreign must be truly foreign.
+    for (const c of statuslineChecks(ctx, d.cli)) out.push(c);
   }
 
   if (node) {

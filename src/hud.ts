@@ -43,6 +43,10 @@ export const hudSessionLinePath = (home: string, cli: string, sessionId: string)
   join(hudDir(home), `${cli}-${sessionId}.line`);
 export const hudPidLinePath = (home: string, cli: string, pid: number, start: string): string =>
   join(hudDir(home), `${cli}-pid-${pid}-${start.replaceAll(/[^0-9A-Za-z_-]/g, "")}.line`);
+/** T366: one fixed-path line per CLI for alert-only adapters. Kimi's `[status_line].command`
+ *  replaces the footer and its adapter parses no stdin, so its render path cannot name a session
+ *  file — the daemon aggregates one `kimi.line` per tick instead. */
+export const hudCliLinePath = (home: string, cli: string): string => join(hudDir(home), `${cli}.line`);
 export const hudAlivePath = (home: string): string => join(hudDir(home), ".alive");
 
 const CLI_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
@@ -92,6 +96,14 @@ export function hudLine(snap: HudStatus): string {
   return `mbx ${seg.join(" ")}`;
 }
 
+// T366: Kimi's `[status_line].command` REPLACES the built-in footer (the T347 premise that `items`
+// and `command` compose was wrong), so every kimi-rendered line is alert-only: with nothing to show
+// (unread == 0) the line is EMPTY and Kimi renders its own footer items untouched; with unread mail
+// the alert takes footer line 1. Every other CLI's command composes with its built-in items and its
+// line is unchanged. Unbound/ambiguous rows never reach this — the writer skips them before render.
+const cliLine = (cli: string, snap: HudStatus): string => cli === "kimi" && !snap.unread ? "" : hudLine(snap);
+const writeSeg = (path: string, seg: string): void => writeIfChanged(path, seg ? `${seg}\n` : "");
+
 const writeIfChanged = (path: string, content: string): void => {
   try { if (readFileSync(path, "utf8") === content) return; } catch { /* absent: write */ }
   const tmp = `${path}.tmp-${process.pid}`;
@@ -114,6 +126,7 @@ export function writeHud(node: MbxNode, now = Date.now()): void {
   const wanted = new Set<string>();
   const perAgent = new Map<string, string>(); // computed once per agent, not per row (review low 8)
   const pidDone = new Set<string>();
+  let kimiAlert = ""; // T366: first bound kimi identity with something to show wins footer line 1
   // One ps for every distinct pid, not one per row (review low 4).
   const pids = [...new Set(rows.map((r) => r.pid).filter((p): p is number => !!p))];
   const evidence = new Map<number, { alive: boolean | null; start: string | null }>();
@@ -142,9 +155,10 @@ export function writeHud(node: MbxNode, now = Date.now()): void {
       }
       wanted.add(hudSessionPath(node.home, row.cli, row.session_id));
       writeIfChanged(hudSessionPath(node.home, row.cli, row.session_id), snapshot);
-      const line = hudLine(JSON.parse(snapshot));
+      const line = cliLine(row.cli, JSON.parse(snapshot));
+      if (row.cli === "kimi" && !kimiAlert && line) kimiAlert = line;
       wanted.add(hudSessionLinePath(node.home, row.cli, row.session_id));
-      writeIfChanged(hudSessionLinePath(node.home, row.cli, row.session_id), line + "\n");
+      writeSeg(hudSessionLinePath(node.home, row.cli, row.session_id), line);
       // Critical fix: a pid file is written per (cli, pid) only when a pid-ONLY resolution proves a
       // single holder — keyed by the pid's birth time so a reused pid can never inherit another
       // agent's mail, and never written while the pid is ambiguous (the owner's probe).
@@ -165,12 +179,18 @@ export function writeHud(node: MbxNode, now = Date.now()): void {
             writeIfChanged(p, pidSnap);
             const pl = hudPidLinePath(node.home, row.cli, row.pid, start);
             wanted.add(pl);
-            writeIfChanged(pl, hudLine(JSON.parse(pidSnap)) + "\n");
+            writeSeg(pl, cliLine(row.cli, JSON.parse(pidSnap)));
           }
         }
       }
     } catch { /* one bad row never aborts the pass */ }
   }
+  // T366: kimi's bundled adapter is one `cat` of a fixed path (no stdin parsing), so the daemon
+  // aggregates one alert line per tick — EMPTY when no bound kimi identity has anything to show,
+  // never stale content. Written even with no kimi rows, so the adapter's cat always finds a file
+  // that reflects the current daemon state.
+  wanted.add(hudCliLinePath(node.home, "kimi"));
+  writeSeg(hudCliLinePath(node.home, "kimi"), kimiAlert);
   // Files whose binding vanished go on the next tick — not after a grace period (review high 2).
   for (const file of readdirSync(dir)) {
     const path = join(dir, file);
