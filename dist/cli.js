@@ -19,6 +19,7 @@ import { detectHost, MCP_HEARTBEAT_MS, noPush, runMcp, selfWatchInstruction } fr
 import { ancestors, processEvidenceSpawns, withProcSnapshot } from "./proc.js";
 import { bumpPostToolMarkersForAgent, readPostToolMarker, writePostToolLast } from "./posttool.js";
 import { resolveStatusIdentity } from "./status-identity.js";
+import { runStatuslineSuggest } from "./statusline-suggest.js";
 import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.js";
 import { retirePhantoms, returnNeverClaimed } from "./stranded.js";
 import { activeLead, leadSummary, makeLead, makeLeadRevocation, revokeLead, storeLead } from "./project-ledger.js";
@@ -548,6 +549,10 @@ async function run(argv) {
         die("identity list [--project <dir>] [--all] | prune [--days 7] [--apply] | forward <from> <to> | export <file> | import <file> | claim [name] --cli <provider> --session <id> | release --cli <provider> --session <id> | takeover <name> --force --cli <provider> --session <id> | result <request-id>");
     }
     if (cmd === "statusline") {
+        // T369: `statusline suggest` — a dry-run placement proposal (JSON + human text) for the MBX
+        // segment; --apply writes only where setup's own status line edit can (never a user's own).
+        if (pos[0] === "suggest")
+            return runStatuslineSuggest({ cliFlag: str("cli"), session: str("session"), apply: !!o.apply, json: !!o.json, positionals: pos.slice(1) });
         // T313: render from the daemon-written HUD snapshot BEFORE any node exists — no store open, no
         // migration, no key creation on an empty home (review: the 40 ms render budget is one cat).
         // copilot/cursor/gemini speak Claude's statusLine.command shape (session_id on stdin); like every
