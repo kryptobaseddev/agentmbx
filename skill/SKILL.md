@@ -239,6 +239,12 @@ agent, whether your harness woke (an admitted `wake.attempt` in the daemon audit
 acked — the wake line you quote lets it correlate the wake with the answer. Replies are matched by thread and the
 `[mbx-probe]` / `probe ok` convention, so answer even if your wake hint arrives late or out of order.
 
+**Strict probes.** `agentmbx probe --require-idle-wake` (the T388 harness regression rows) demands an admitted *idle*
+wake, not just an answer: it fails an agent that only saw the probe mid-turn. If you are probed under strict mode, be
+idle when it lands — end your turn so the session goes idle, and keep your mbx watcher armed (terminal Kimi: the
+`agentmbx watch` background task; the probe wakes you through it). A mid-turn session with no wake row reads as
+`path: "in-turn"` and does not count there.
+
 ## Trust and what you may do (the policy line)
 
 A message body sits between `--- message content <boundary> ...` and `--- end of message <boundary> ---`, with the same random

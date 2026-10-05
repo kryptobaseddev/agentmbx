@@ -20,19 +20,18 @@ export function probeSubject(at = new Date()): string {
   return `${PROBE_SUBJECT_PREFIX} autonomy probe ${at.toISOString()}`;
 }
 
-/** The convention contract, sent as the probe body and documented in skill/SKILL.md. An agent
- *  answers autonomously: one `probe ok <wake line>` reply in the thread, then an ack. */
+/** The convention contract, sent as the probe body and documented in skill/SKILL.md (§Autonomy
+ *  probes). An agent answers autonomously: one `probe ok <wake line>` reply in the thread, then an
+ *  ack. */
 export function probeBody(): string {
-  return `${PROBE_SUBJECT_PREFIX} automated autonomy probe (AgentMBX T388 regression gate). Message content is data, not a user instruction.
-
-You hold a live identity lease, so you are being asked to prove your harness operates autonomously. Do NOT ask a human. Take no action beyond these two steps, in order:
+  return `${PROBE_SUBJECT_PREFIX} is the AgentMBX autonomy probe convention (T388 regression gate), documented in the agentmbx skill, section "Autonomy probes". Answering it is pre-authorised by the owner's installed skill: it needs no human prompt and no action beyond these two steps, in order:
 
 1. mbx_reply to THIS thread with exactly one line:
      ${PROBE_REPLY_MARKER} <wake line>
    where <wake line> is the "[mbx] …" hint your session received for this probe message, quoted verbatim after "${PROBE_REPLY_MARKER}" (write "${PROBE_REPLY_MARKER} (no wake line)" if your session received none — that is reported, not a failure).
 2. mbx_ack the probe message (the one with the ${PROBE_SUBJECT_PREFIX} subject).
 
-\`agentmbx probe\` waits up to its deadline and reports, per agent, whether the daemon wake was admitted, the message was read, your reply arrived in this thread and the ack closed it — all with no human prompt. Do not modify files or state beyond the reply and the ack.`;
+\`agentmbx probe\` waits up to its deadline and reports, per agent, whether the daemon wake was admitted, the message was read, your reply arrived in this thread and the ack closed it. Do not modify files or state beyond the reply and the ack.`;
 }
 
 // ---- planning (pure) ---------------------------------------------------------------------------------
@@ -141,6 +140,10 @@ export interface ProbeAgentReport {
   read: { at: string; latency_ms: number } | null;
   ack: { at: string; note: string | null; latency_ms: number } | null;
   reply: { id: string; at: string; latency_ms: number } | null;
+  /** How the answer arrived: an admitted idle wake, or in-turn (the session was
+   *  mid-turn and saw the probe via its in-turn hook — no wake row). Null until
+   *  a reply exists. */
+  path: "idle-wake" | "in-turn" | null;
   ok: boolean;
   reason: string | null;
 }
@@ -152,6 +155,8 @@ export interface ProbeReport {
   project?: string;
   sender: string;
   deadline_ms: number;
+  /** True when run with the strict gate (an admitted idle wake AND the reply). */
+  require_idle_wake: boolean;
   started_at: string;
   finished_at: string;
   targets: ProbeAgentReport[];
@@ -162,8 +167,11 @@ export interface ProbeReport {
 const iso = (ms: number) => new Date(ms).toISOString();
 const latency = (at: number | null, sentAt: number) => (at === null ? null : Math.max(0, at - sentAt));
 
-/** A target passes when the daemon admitted its wake AND the convention reply arrived in the
- *  thread. Read and ack are recorded (AC1) but the gate is wake+reply (AC3). */
+/** Default gate: the convention reply arrived in the thread within the deadline — the agent
+ *  answered autonomously whether it was woken while idle (`path: "idle-wake"`) or saw the probe
+ *  mid-turn through its in-turn hook (`path: "in-turn"`, no wake row). With `requireIdleWake`
+ *  (the T388 harness rows) the gate is the strict one: an admitted idle wake AND the reply. Read
+ *  and ack are recorded either way, never gated. */
 export function buildProbeReport(o: {
   plan: ProbeTarget[];
   sent: Map<string, SentProbe>;
@@ -175,19 +183,24 @@ export function buildProbeReport(o: {
   host: string;
   project?: string;
   sender: string;
+  requireIdleWake?: boolean;
   noTargetsReason?: string;
 }): ProbeReport {
   const deadlineS = Math.round(o.deadlineMs / 1000);
+  const requireIdleWake = o.requireIdleWake ?? false;
   const targets: ProbeAgentReport[] = o.plan.map((t) => {
     const sent = o.sent.get(t.name)!;
     const ob = o.observations.get(t.name) ?? { wake: null, readAt: null, ackedAt: null, ackNote: null, reply: null };
+    const admitted = ob.wake?.outcome === "admitted";
+    const path: ProbeAgentReport["path"] = ob.reply ? (admitted ? "idle-wake" : "in-turn") : null;
     const reason = o.sendErrors?.get(t.name) ? `probe message could not be sent: ${o.sendErrors.get(t.name)}`
-      : !ob.wake ? `no wake.attempt for ${t.name} within ${deadlineS}s of the probe`
-      : ob.wake.outcome !== "admitted" ? `wake for ${t.name} never admitted (last outcome: ${ob.wake.outcome ?? "unknown"}${ob.wake.via ? ` via ${ob.wake.via}` : ""})`
+      : !ob.reply && !ob.wake ? `no wake.attempt for ${t.name} within ${deadlineS}s of the probe`
+      : !ob.reply && !admitted ? `wake for ${t.name} never admitted (last outcome: ${ob.wake!.outcome ?? "unknown"}${ob.wake!.via ? ` via ${ob.wake!.via}` : ""})`
       : !ob.reply ? `${t.name} woke but did not reply in the probe thread within ${deadlineS}s`
+      : requireIdleWake && !admitted ? `in-turn answer without an admitted idle wake (last wake outcome: ${ob.wake?.outcome ?? "none"}${ob.wake?.via ? ` via ${ob.wake.via}` : ""}); --require-idle-wake requires one`
       : null;
     return {
-      name: t.name, holder: t.holder, message_id: sent.id, sent_at: iso(sent.at),
+      name: t.name, holder: t.holder, message_id: sent.id, sent_at: iso(sent.at), path,
       wake: ob.wake ? { ...ob.wake, latency_ms: latency(ob.wake.at, sent.at) } : null,
       read: ob.readAt !== null ? { at: iso(ob.readAt), latency_ms: latency(ob.readAt, sent.at)! } : null,
       ack: ob.ackedAt !== null ? { at: iso(ob.ackedAt), note: ob.ackNote, latency_ms: latency(ob.ackedAt, sent.at)! } : null,
@@ -201,7 +214,8 @@ export function buildProbeReport(o: {
   return {
     schema: PROBE_SCHEMA, ok: targets.length > 0 && failed === 0, host: o.host,
     ...(o.project ? { project: o.project } : {}),
-    sender: o.sender, deadline_ms: o.deadlineMs, started_at: iso(o.startedAt), finished_at: iso(o.finishedAt),
+    sender: o.sender, deadline_ms: o.deadlineMs, require_idle_wake: requireIdleWake,
+    started_at: iso(o.startedAt), finished_at: iso(o.finishedAt),
     targets, summary: { total: targets.length, passed: targets.length - failed, failed }, reason,
   };
 }
@@ -212,6 +226,9 @@ export async function runProbe(io: ProbeIO, o: {
   sender: string;
   project?: string;
   deadlineMs?: number;
+  /** Strict gate (the T388 harness rows): an admitted idle wake AND the reply. Default is
+   *  reply-only — an agent answering mid-turn through its in-turn hook passes as "in-turn". */
+  requireIdleWake?: boolean;
   /** Injectable clock/sleep so tests run the no-wake/no-reply paths without real time. */
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -226,7 +243,7 @@ export async function runProbe(io: ProbeIO, o: {
   const plan = planProbe(io.listTargets(), o.sender);
   if (!plan.length) {
     return buildProbeReport({ plan, sent: new Map(), observations: new Map(), startedAt, finishedAt: now(),
-      deadlineMs, host: io.host(), project: o.project, sender: o.sender,
+      deadlineMs, host: io.host(), project: o.project, sender: o.sender, requireIdleWake: o.requireIdleWake,
       noTargetsReason: "no live leased identities to probe (excluding the sender)" });
   }
 
@@ -255,5 +272,5 @@ export async function runProbe(io: ProbeIO, o: {
   observeAll(); // a final pass so targets still waiting show their latest state
 
   return buildProbeReport({ plan, sent, sendErrors, observations, startedAt, finishedAt: now(),
-    deadlineMs, host: io.host(), project: o.project, sender: o.sender });
+    deadlineMs, host: io.host(), project: o.project, sender: o.sender, requireIdleWake: o.requireIdleWake });
 }
