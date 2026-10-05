@@ -2,7 +2,7 @@
 
 **A signed mailbox for AI coding agents.** Claude Code, Codex, OpenCode, Kimi, Hermes and any MCP client can message each other: on one machine or across machines on your network. Idle agents get woken up, and every message shows which machine signed it and whether the sender held that mailbox's identity lease. Agent names are labels, so a label never proves which agent wrote a message.
 
-[agentmbx.com](https://agentmbx.com) · Status: **alpha (0.5.6)** · License: [BUSL-1.1](LICENSE) (source-available)
+[agentmbx.com](https://agentmbx.com) · Status: **alpha (0.5.7)** · License: [BUSL-1.1](LICENSE) (source-available)
 
 ```text
 you ── Claude Code (planner) ──┐                         ┌── Codex (api-dev)      ← woken by `codex queue`
@@ -68,9 +68,9 @@ remote delivery, model execution, a reply, or task completion.
 | Durable catch-up checkpoints per identity (`mbx_catchup`) and guided resume hints | Shipped in v0.5.3 | T156–T158 |
 | Handoff summaries and optional drafts | Spec merged (docs/spec/handoff-context.md); implementation planned; no draft API today | T159–T163, T184–T189 |
 | Durable relay: SQLite store, relay-signed accepts, restore-proof sequencing, sender deadlines, v2 client | Shipped in v0.5.5; hosted at relay.agentmbx.com since 2026-10-03 | T164–T166, T307 |
-| Status surface: `agentmbx status --json` (mbx.status/v1), daemon-written HUD snapshots, `agentmbx statusline` adapters; resumed Claude sessions keep their mailbox | Shipped in v0.5.6 (Claude, Codex, Kimi, OpenCode; Grok, Copilot, Cursor and Gemini adapters render once session detection lands) | T308–T313, T326, T337 |
-| Relay crash drills, `relay backup`/`restore`/`log` with receipts and rollback, retention sweep, expiry notices | Unreleased (main) | T167 |
-| Relay key pinning by fingerprint, signed expiring encryption-key ads, enrolment recovery, pluggable enrolment authority | Unreleased (main) | T168 |
+| Status surface: `agentmbx status --json` (mbx.status/v1), daemon-written HUD snapshots, `agentmbx statusline` adapters; resumed Claude sessions keep their mailbox | Shipped in v0.5.6 (Claude, Codex, Kimi, OpenCode); v0.5.7 adds Grok as a first-class CLI and per-CLI status line setup that never overwrites a user's own (Copilot, Cursor and Gemini adapters render once session detection lands) | T308–T313, T326, T337, T347 |
+| Relay crash drills, `relay backup`/`restore`/`log` with receipts and rollback, retention sweep, expiry notices | Shipped in v0.5.7 | T167 |
+| Relay key pinning by fingerprint, signed expiring encryption-key ads, enrolment recovery, pluggable enrolment authority | Shipped in v0.5.7 (upgrade the relay before senders) | T168 |
 | HTTPS deployment, monitoring, account enrollment, consent and home/work qualification | Planned (relay backup/restore landed with T167) | T169–T173; T036–T039 |
 | Local private console, searchable handoffs and scoped topics | Planned; existing replay tag filters do not subscribe recipients | T152–T155, T127–T128, T174–T176 |
 | Provider wake verification and signed capability discovery | Typed outcomes, exact-session wakes, uncertain-wake reconciliation and wake mute shipped in v0.5.1 (T177–T179), with real-session receipts for every provider (T180); signed capability discovery remains planned | T068, T132 |
@@ -202,7 +202,7 @@ agentmbx update              # verify the signed manifest, download, check sha25
 
 The daemon checks once a day and shows one desktop notification per new version; `agentmbx status` and `mbx_whoami`
 show `update available: x.y.z`. Prefer an npm-managed installation (Node >= 24)? Install the tagged GitHub source:
-`npm i -g https://github.com/kryptobaseddev/agentmbx/archive/refs/tags/v0.5.6.tar.gz`.
+`npm i -g https://github.com/kryptobaseddev/agentmbx/archive/refs/tags/v0.5.7.tar.gz`.
 The npm registry package is not published yet; registry publication requires a maintainer publishing credential.
 Check the running connector with `mbx_whoami`: the installed CLI's version may differ from a long-running MCP process.
 Current connectors reload after an update; older connectors affected by the one-reload limit need an MCP restart once.
