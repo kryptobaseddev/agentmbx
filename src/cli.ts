@@ -45,6 +45,7 @@ import { configuredRetention, prune, retentionDays } from "./retention.ts";
 import { exportIdentity, identityInitialized, importIdentity } from "./identity-backup.ts";
 import { listIdentityStatus } from "./identity-status.ts";
 import { withCliIdentity, withHookIdentity, type CliIdentitySelection } from "./cli-identity.ts";
+import { runProbe, storeProbeIO } from "./probe.ts";
 import { buildIdentityTakeover, type IdentityTakeoverApproval } from "./identity-takeover.ts";
 import { publishIdentityControl, findIdentityControl, identityControlReceipt, resolveIdentityControlReceipt, submitIdentityControl, type IdentityControlReceipt } from "./identity-control.ts";
 
@@ -71,6 +72,7 @@ Messages
   agentmbx status --cli <provider> --session <id> --json   current session identity and mailbox counts (read-only)
   agentmbx status --cli <provider> [--session <id>] --json --schema mbx.status/v1   HUD snapshot for harnesses; no lease needed (T311)
   agentmbx statusline <claude|codex|kimi|opencode|grok|copilot|cursor|gemini>   render one MBX segment from the HUD snapshot (T313)
+  agentmbx probe [--project <dir>] [--deadline 120s] [--require-idle-wake] [--json]   autonomy probe: every live leased identity must answer the [mbx-probe] request with no human prompt (T388 gate; T392)
   agentmbx identity list [--project <dir>] [--all] [--json]   identities with role, holder, claimable and unread (read-only)
   agentmbx identity prune [--days 7] [--apply]   retire mailboxes older versions generated that nobody holds (dry run by default)
   agentmbx identity forward <from> <to>          move a mailbox's unread mail to another, with your owner signature
@@ -319,7 +321,8 @@ async function run(argv: string[]) {
     compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" },
     backend: { type: "string" }, "no-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
     project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }, "wait-ms": { type: "string" }, "store-dir": { type: "string" }, "trust-proxy": { type: "boolean" },
-    "older-than": { type: "string" }, minutes: { type: "string" }, apply: { type: "boolean" }, days: { type: "string" }, fix: { type: "boolean" }, key: { type: "string" } } });
+    "older-than": { type: "string" }, minutes: { type: "string" }, apply: { type: "boolean" }, days: { type: "string" }, fix: { type: "boolean" }, key: { type: "string" },
+    deadline: { type: "string" }, "require-idle-wake": { type: "boolean" } } });
   if (o.help) return console.log(commandHelp(cmd));
   const str = (k: string) => (typeof (o as Record<string, unknown>)[k] === "string" ? (o as Record<string, unknown>)[k] as string : undefined);
 
@@ -514,6 +517,44 @@ async function run(argv: string[]) {
     if (!explicit) return caller?.agent ?? die("--as <agent> is required (or run this from inside an agent session with mbx set up)");
     return explicit;
   };
+
+  if (cmd === "probe") {
+    // T392: the T388 cross-harness autonomy gate. One [mbx-probe] request per live leased identity
+    // in the project, wait up to the deadline, report wake/read/reply/ack per agent. Default gate
+    // is the convention reply (idle-wake or in-turn path); --require-idle-wake is the strict gate
+    // the harness rows use. Exit is non-zero when any target fails, with the reason.
+    if (pos.length) die("probe accepts options, not positional arguments");
+    const dirs = Array.isArray(o.project) ? (o.project as string[]) : [];
+    if (dirs.length > 1) die("probe requires exactly one --project");
+    const raw = str("deadline") ?? "120s";
+    const seconds = /^(\d+)s?$/.exec(raw)?.[1];
+    if (seconds === undefined) die(`probe --deadline: ${JSON.stringify(raw)} is not a duration like 120s`);
+    const deadlineMs = Number(seconds) * 1000;
+    const caller = node.callerAgent(ancestors());
+    const sender = str("as") ?? process.env.MBX_AGENT ?? caller?.agent ?? "owner";
+    const dir = str("project") ?? dirs[0]; // --project is a multiple option
+    const project = dir ? (projectOf(resolve(dir)) ?? die(`${dir} is the home folder or /, not a project`)) : undefined;
+    try {
+      const report = await runProbe(storeProbeIO(node, { project, sender }),
+        { sender, project, deadlineMs, requireIdleWake: !!o["require-idle-wake"] });
+      if (o.json) console.log(JSON.stringify(report, null, 2));
+      else {
+        console.log(`probe: ${report.summary.passed}/${report.summary.total} passed (sender ${report.sender}@${node.host}, deadline ${Math.round(report.deadline_ms / 1000)}s${report.require_idle_wake ? ", strict idle-wake" : ""})`);
+        for (const t of report.targets) {
+          const parts = [
+            t.wake ? `wake ${t.wake.outcome ?? "unknown"}${t.wake.via ? ` via ${t.wake.via}` : ""} ${t.wake.latency_ms ?? "?"}ms` : "no wake row",
+            t.read ? `read ${t.read.latency_ms}ms` : "unread",
+            t.reply ? `reply ${t.reply.latency_ms}ms` : "no reply",
+            t.ack ? `ack ${t.ack.latency_ms}ms` : "unacked",
+          ];
+          console.log(`${t.ok ? "✔" : "✖"} ${t.name} (${t.path ?? "no answer"}) — ${parts.join(" · ")}${t.reason ? `\n    ${t.reason}` : ""}`);
+        }
+        if (!report.targets.length && report.reason) console.log(report.reason);
+      }
+      process.exitCode = report.ok ? 0 : 1;
+    } finally { node.close(); }
+    return;
+  }
 
   if (cmd === "replay") {
     if (pos.length) die("replay accepts options, not positional arguments");
