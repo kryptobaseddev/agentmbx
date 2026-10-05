@@ -53,7 +53,9 @@ export function wakeText(agent: string, msgs: MessageRow[]): string {
   const ids = msgs.slice(0, 5).map((m) => m.id).join(", ") + (msgs.length > 5 ? `, +${msgs.length - 5} more` : "");
   // One line (owner, 2026-10-02): the trust rules live in the MCP instructions, the session-start note and every
   // mbx_read header; repeating them in each wake only spent context. Content is never in a wake, only ids.
-  return `[mbx] ${msgs.length} new message(s) for ${agent} from ${senders} (ids ${ids}).${owner} mbx_inbox or mbx_read, reply, ack. Already handled: no action needed.`;
+  // T442: the stale-hint note is conditional. An unconditional "Already handled: no action needed" was obeyed
+  // literally and made agents skip unread mail.
+  return `[mbx] ${msgs.length} new message(s) for ${agent} from ${senders} (ids ${ids}).${owner} mbx_inbox or mbx_read, reply, ack. If you already handled these ids, no action is needed.`;
 }
 
 export const which = (bin: string) => { try { return execFileSync("/usr/bin/which", [bin], { encoding: "utf8" }).trim() || null; } catch { return null; } };
