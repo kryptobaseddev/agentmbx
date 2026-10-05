@@ -15,11 +15,14 @@ import { listIdentityControls } from "../src/identity-control.ts";
 const fixture = (t: { after: (fn: () => void | Promise<void>) => void }) => {
   const root = mkdtempSync(join(tmpdir(), "mbx-rollback-")), install = join(root, "install"), home = join(root, "mail");
   mkdirSync(install);
-  for (const path of ["bin", "dist", "package.json"]) cpSync(resolve(path), join(install, path), { recursive: true });
+  // The failure-injection seam is gated behind AGENTMBX_DEV=1, under which the launcher loads ../src/cli.ts —
+  // so the fixture ships src/ as well and the build-change trigger appends to src/cli.ts (codeEntry resolves
+  // ./cli.ts next to the running module).
+  for (const path of ["bin", "dist", "src", "package.json"]) cpSync(resolve(path), join(install, path), { recursive: true });
   symlinkSync(resolve("node_modules"), join(install, "node_modules"), "dir");
   const node = new MbxNode(home, { host: "alpha" });
   t.after(async () => { node.close(); rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
-  return { install, home, node };
+  return { install, home, node, entry: join(install, "src/cli.ts") };
 };
 
 const start = async (t: { after: (fn: () => void | Promise<void>) => void }, install: string, home: string, failMode: string) => {
@@ -27,18 +30,22 @@ const start = async (t: { after: (fn: () => void | Promise<void>) => void }, ins
   t.after(async () => { await client.close().catch(() => {}); });
   const env: NodeJS.ProcessEnv = { ...process.env, MBX_HOME: home, MBX_AGENT: "rollback-reader", MBX_CLI: "claude", MBX_NO_DESKTOP: "1", MBX_TEST_SPAWN_FAIL: failMode };
   for (const key of ["AGENTMBX_DEV", "MBX_MCP_REEXEC", "MBX_MCP_REEXEC_BUILD", "MBX_MCP_DETACHED", "MBX_MCP_PROVIDER_PID"]) delete env[key];
-  await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(install, "bin/agentmbx.js"), "mcp"], env: env as Record<string, string> }));
-  return client;
+  env.AGENTMBX_DEV = "1"; // the failure-injection seam is gated behind the dev flag, as in `npm test`
+  const transport = new StdioClientTransport({ command: process.execPath, args: [join(install, "bin/agentmbx.js"), "mcp"], env: env as Record<string, string>, stderr: "pipe" });
+  await client.connect(transport);
+  const stderrLines: string[] = [];
+  (transport as unknown as { stderr: { on: (ev: string, cb: (d: unknown) => void) => void } }).stderr.on("data", d => stderrLines.push(String(d)));
+  return { client, stderrLines };
 };
 
 const whoami = (client: Client) => client.callTool({ name: "mbx_whoami", arguments: {} });
 
 for (const failMode of ["error", "throw"]) test(`handover spawn failure (${failMode}) keeps the server fully serving`, async t => {
-  const { install, home, node } = fixture(t);
-  const client = await start(t, install, home, failMode);
+  const { install, home, node, entry } = fixture(t);
+  const { client } = await start(t, install, home, failMode);
   const name = `rollback-${failMode}`;
   assert.notEqual((await client.callTool({ name: "mbx_whoami", arguments: { name, role: "builder" } })).isError, true);
-  appendFileSync(join(install, "dist/cli.js"), "\n// deployed build\n");
+  appendFileSync(entry, "\n// deployed build\n");
   const trigger = await whoami(client);
   assert.notEqual(trigger.isError, true, "the triggering call still finishes on the old build");
   // The replacement never started: the parent must still serve, hold its lease and its control endpoint.
@@ -52,11 +59,11 @@ for (const failMode of ["error", "throw"]) test(`handover spawn failure (${failM
 });
 
 test("a child that exits right after spawning mirrors its exit (clean exit, not a half-retired server)", async t => {
-  const { install, home, node } = fixture(t);
-  const client = await start(t, install, home, "exit7");
+  const { install, home, node, entry } = fixture(t);
+  const { client } = await start(t, install, home, "exit7");
   const name = "rollback-exit";
   assert.notEqual((await client.callTool({ name: "mbx_whoami", arguments: { name, role: "builder" } })).isError, true);
-  appendFileSync(join(install, "dist/cli.js"), "\n// deployed build\n");
+  appendFileSync(entry, "\n// deployed build\n");
   assert.notEqual((await whoami(client)).isError, true, "the triggering call still finishes on the old build");
   const deadline = Date.now() + 10_000;
   let closed = false;
@@ -70,4 +77,21 @@ test("a child that exits right after spawning mirrors its exit (clean exit, not 
   const lease = node.store.db.prepare("SELECT released_at FROM identity_leases WHERE name=?").get(name)!;
   assert.notEqual(lease.released_at, null, "retire ran before the mirrored exit (leases released)");
   assert.ok(!listIdentityControls(node.store).some(d => d.agent === name), "retire removed the identity control endpoint");
+});
+
+test("an async spawn error resets the pending handover: a later build change retries it", async t => {
+  const { install, home, entry } = fixture(t);
+  const { client, stderrLines } = await start(t, install, home, "error");
+  assert.notEqual((await client.callTool({ name: "mbx_whoami", arguments: { name: "rollback-retry", role: "builder" } })).isError, true);
+  const announcements = () => stderrLines.filter(l => l.includes("was updated on disk")).length;
+  appendFileSync(entry, "\n// deployed build 1\n");
+  assert.notEqual((await whoami(client)).isError, true);
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline && announcements() < 1) await new Promise(r => setTimeout(r, 25));
+  assert.equal(announcements(), 1, "the first build change triggers the handover");
+  appendFileSync(entry, "\n// deployed build 2\n");
+  assert.notEqual((await whoami(client)).isError, true, "the server still serves after the failed handover");
+  const retryDeadline = Date.now() + 5_000;
+  while (Date.now() < retryDeadline && announcements() < 2) await new Promise(r => setTimeout(r, 25));
+  assert.equal(announcements(), 2, "the async spawn failure reset handedOver, so the next build change retries the handover");
 });

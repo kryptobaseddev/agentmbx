@@ -111,9 +111,10 @@ const REEXEC_PARENT_AGENT = "MBX_MCP_PARENT_AGENT";
  * T441: nothing is torn down until the replacement has provably started. `retired` (when given) runs only on
  * the child's "spawn" event, so a spawn failure leaves this process fully serving on the loaded build — never
  * half-retired with its leases, timers and control endpoints gone. A child that dies after spawning mirrors
- * its exit, which the proxy reports. Returns false when the handover aborted before the child spawned.
+ * its exit, which the proxy reports. Returns false when the handover aborted before the child spawned;
+ * `onAbort` also runs for an ASYNC pre-spawn child error, so callers can reset any pending handover state.
  */
-function handOverToFreshProcess(pauseStdin, parentAgent, providerPid, detached, retired) {
+function handOverToFreshProcess(pauseStdin, parentAgent, providerPid, detached, retired, onAbort) {
     let child;
     try {
         child = handoverSpawn(parentAgent, providerPid, detached);
@@ -140,6 +141,7 @@ function handOverToFreshProcess(pauseStdin, parentAgent, providerPid, detached, 
                     process.stdin.resume();
                 }
                 catch { /* already closed */ }
+            onAbort?.();
             return;
         }
         process.stderr.write(`[mbx] the replacement exited before serving; this session is shutting down: ${err.message}\n`);
@@ -157,11 +159,12 @@ function handOverToFreshProcess(pauseStdin, parentAgent, providerPid, detached, 
     return true;
 }
 /**
- * The spawn behind a handover. `MBX_TEST_SPAWN_FAIL` (error | throw | exit7) fakes the child process so tests
- * can exercise every handover failure mode without a real install; production always spawns for real.
+ * The spawn behind a handover. Under AGENTMBX_DEV=1 (only ever set by `npm test`), `MBX_TEST_SPAWN_FAIL`
+ * (error | throw | exit7) fakes the child process so tests can exercise every handover failure mode without a
+ * real install; any other environment always spawns for real.
  */
 function handoverSpawn(parentAgent, providerPid, detached) {
-    const mode = process.env.MBX_TEST_SPAWN_FAIL;
+    const mode = process.env.AGENTMBX_DEV ? process.env.MBX_TEST_SPAWN_FAIL : undefined;
     if (!mode)
         return spawn(process.execPath, process.argv.slice(1), { stdio: "inherit", env: reexecEnv(parentAgent, providerPid, detached) });
     if (mode === "throw")
@@ -992,15 +995,18 @@ export async function runMcp(existing) {
                         catch { /* already closed */ }
                         return;
                     }
-                    // T441: retire only once the replacement has provably spawned; a spawn failure returns false and
-                    // this server keeps serving with its leases, timers and control endpoints intact.
-                    if (!handOverToFreshProcess(true, bound(base) ? base.agent : undefined, env.ppid, detached, retire)) {
+                    // T441: retire only once the replacement has provably spawned; a spawn failure returns false (sync)
+                    // or fires onAbort (async pre-spawn child error) — either way this server keeps serving with its
+                    // leases, timers and control endpoints intact, and a later build change retries the handover.
+                    const abortHandover = () => {
                         handedOver = false;
                         try {
                             process.stdin.resume();
                         }
                         catch { /* already closed */ }
-                    }
+                    };
+                    if (!handOverToFreshProcess(true, bound(base) ? base.agent : undefined, env.ppid, detached, retire, abortHandover))
+                        abortHandover();
                 });
             }
             const state = contextFor(a[1]);

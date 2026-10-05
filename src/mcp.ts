@@ -115,9 +115,10 @@ const REEXEC_PARENT_AGENT = "MBX_MCP_PARENT_AGENT";
  * T441: nothing is torn down until the replacement has provably started. `retired` (when given) runs only on
  * the child's "spawn" event, so a spawn failure leaves this process fully serving on the loaded build — never
  * half-retired with its leases, timers and control endpoints gone. A child that dies after spawning mirrors
- * its exit, which the proxy reports. Returns false when the handover aborted before the child spawned.
+ * its exit, which the proxy reports. Returns false when the handover aborted before the child spawned;
+ * `onAbort` also runs for an ASYNC pre-spawn child error, so callers can reset any pending handover state.
  */
-function handOverToFreshProcess(pauseStdin: boolean, parentAgent?: string, providerPid?: number, detached?: DetachedReload, retired?: () => void): boolean {
+function handOverToFreshProcess(pauseStdin: boolean, parentAgent?: string, providerPid?: number, detached?: DetachedReload, retired?: () => void, onAbort?: () => void): boolean {
   let child: ReturnType<typeof spawn>;
   try {
     child = handoverSpawn(parentAgent, providerPid, detached);
@@ -138,6 +139,7 @@ function handOverToFreshProcess(pauseStdin: boolean, parentAgent?: string, provi
     if (!spawned) {
       process.stderr.write(`[mbx] build handover failed before the replacement started; this session keeps running on the loaded build: ${err.message}\n`);
       if (pauseStdin) try { process.stdin.resume(); } catch { /* already closed */ }
+      onAbort?.();
       return;
     }
     process.stderr.write(`[mbx] the replacement exited before serving; this session is shutting down: ${err.message}\n`);
@@ -149,11 +151,12 @@ function handOverToFreshProcess(pauseStdin: boolean, parentAgent?: string, provi
 }
 
 /**
- * The spawn behind a handover. `MBX_TEST_SPAWN_FAIL` (error | throw | exit7) fakes the child process so tests
- * can exercise every handover failure mode without a real install; production always spawns for real.
+ * The spawn behind a handover. Under AGENTMBX_DEV=1 (only ever set by `npm test`), `MBX_TEST_SPAWN_FAIL`
+ * (error | throw | exit7) fakes the child process so tests can exercise every handover failure mode without a
+ * real install; any other environment always spawns for real.
  */
 function handoverSpawn(parentAgent: string | undefined, providerPid: number | undefined, detached: DetachedReload | undefined): ReturnType<typeof spawn> {
-  const mode = process.env.MBX_TEST_SPAWN_FAIL;
+  const mode = process.env.AGENTMBX_DEV ? process.env.MBX_TEST_SPAWN_FAIL : undefined;
   if (!mode) return spawn(process.execPath, process.argv.slice(1), { stdio: "inherit", env: reexecEnv(parentAgent, providerPid, detached) });
   if (mode === "throw") throw new Error("injected synchronous spawn failure");
   const fake = new EventEmitter() as unknown as ReturnType<typeof spawn>;
@@ -858,12 +861,14 @@ export async function runMcp(existing?: MbxNode) {
             try { process.stdin.resume(); } catch { /* already closed */ }
             return;
           }
-          // T441: retire only once the replacement has provably spawned; a spawn failure returns false and
-          // this server keeps serving with its leases, timers and control endpoints intact.
-          if (!handOverToFreshProcess(true, bound(base) ? base.agent : undefined, env.ppid, detached, retire)) {
+          // T441: retire only once the replacement has provably spawned; a spawn failure returns false (sync)
+          // or fires onAbort (async pre-spawn child error) — either way this server keeps serving with its
+          // leases, timers and control endpoints intact, and a later build change retries the handover.
+          const abortHandover = () => {
             handedOver = false;
             try { process.stdin.resume(); } catch { /* already closed */ }
-          }
+          };
+          if (!handOverToFreshProcess(true, bound(base) ? base.agent : undefined, env.ppid, detached, retire, abortHandover)) abortHandover();
         });
       }
       const state = contextFor(a[1]);
