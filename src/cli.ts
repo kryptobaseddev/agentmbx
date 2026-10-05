@@ -530,8 +530,20 @@ async function run(argv: string[]) {
     const seconds = /^(\d+)s?$/.exec(raw)?.[1];
     if (seconds === undefined) die(`probe --deadline: ${JSON.stringify(raw)} is not a duration like 120s`);
     const deadlineMs = Number(seconds) * 1000;
-    const caller = node.callerAgent(ancestors());
-    const sender = str("as") ?? process.env.MBX_AGENT ?? caller?.agent ?? "owner";
+    // T392 review: the probe sends as the CALLING SESSION'S HELD IDENTITY — the same lease
+    // fence `agentmbx send` uses (withCliIdentity). Never owner, never unverified: owner
+    // authority would make wake authority look valid when it is not, defeating the gate.
+    const sender = (() => {
+      try {
+        let resolved = "";
+        withCliIdentity(node, { as: str("as") ?? (process.env.MBX_AGENT || undefined), cli: str("cli"), session: str("session") }, (name) => { resolved = name; });
+        return resolved;
+      } catch (error) {
+        const code = (error as { code?: string }).code;
+        if (typeof code !== "string" || !code.startsWith("IDENTITY_")) throw error;
+        return die("probe sends as your session's held identity, and none belongs to this caller: claim one inside your agent session (mbx_identity claim), or pass --as <name> this session holds");
+      }
+    })();
     const dir = str("project") ?? dirs[0]; // --project is a multiple option
     const project = dir ? (projectOf(resolve(dir)) ?? die(`${dir} is the home folder or /, not a project`)) : undefined;
     try {

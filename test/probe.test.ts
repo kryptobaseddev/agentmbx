@@ -2,9 +2,10 @@
 // waiting loop takes the clock and sleep, so pass/no-wake/no-reply all run without real time.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { MbxNode } from "../src/node.ts";
 import type { IdentityStatus } from "../src/identity-status.ts";
 import {
@@ -270,4 +271,75 @@ test("storeProbeIO: admitted wake without a reply is a no-reply failure", async 
   assert.equal(report.ok, false);
   assert.match(target.reason!, /woke but did not reply/);
   assert.equal(target.wake!.outcome, "admitted");
+});
+
+// ---- the CLI dispatch ---------------------------------------------------------------------------------
+
+/** The spawn env: no MBX_AGENT (an explicit identity is a test choice), throwaway home. */
+const cliEnv = (home: string) => {
+  const env = { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_NO_DESKTOP: "1" } as Record<string, string>;
+  delete env.MBX_AGENT;
+  return env;
+};
+const probeCli = (home: string, ...args: string[]) =>
+  spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "probe", ...args], { encoding: "utf8", env: cliEnv(home) });
+
+test("CLI: usage errors exit 2 with the hint", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-probe-cli-usage-"));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  new MbxNode(home, { host: "alpha" }).close();
+  for (const [args, hint] of [
+    [["extra"], /options, not positional arguments .*probe --help/s],
+    [["--deadline", "soon"], /not a duration like 120s/],
+  ] as const) {
+    const r = probeCli(home, ...args);
+    assert.equal(r.status, 2, `${args}: ${r.stderr}`);
+    assert.match(r.stderr, hint);
+  }
+});
+
+test("CLI: a caller without a held identity is refused (exit 2) and nothing is sent", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-probe-cli-refused-"));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  const n = new MbxNode(home, { host: "alpha" });
+  n.send({ from: "boss", to: ["worker"], subject: "seed", body: "b" }); // a known world, no lease for the caller
+  n.close();
+  const r = probeCli(home, "--deadline", "2s");
+  assert.equal(r.status, 2, r.stderr);
+  assert.match(r.stderr, /probe sends as your session's held identity/);
+  const check = new MbxNode(home, { host: "alpha" });
+  t.after(() => check.close());
+  const count = (check.store.db.prepare("SELECT COUNT(*) c FROM messages").get() as { c: number }).c;
+  assert.equal(count, 1, "the refused probe sent nothing");
+});
+
+test("CLI: --as a name this session does not hold is refused (exit 2)", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-probe-cli-as-"));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  const n = new MbxNode(home, { host: "alpha" });
+  bindWakeLease(n, { agent: "probe-runner", cli: "claude", session_id: "s1", pid: process.pid });
+  n.close();
+  const r = probeCli(home, "--as", "someone-else", "--deadline", "2s");
+  assert.equal(r.status, 2, r.stderr);
+  assert.match(r.stderr, /held identity/);
+});
+
+test("CLI: --json prints the report shape; the sender is excluded from its own targets", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-probe-cli-json-"));
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  const n = new MbxNode(home, { host: "alpha" });
+  // the descriptor names this test process as the provider parent, so the spawned probe
+  // (its child) resolves the held identity through the same ancestry proof `agentmbx send` uses
+  bindWakeLease(n, { agent: "probe-runner", cli: "claude", session_id: "s1", pid: process.pid });
+  n.close();
+  const r = probeCli(home, "--json", "--deadline", "2s");
+  assert.equal(r.status, 1, r.stderr);
+  const report = JSON.parse(r.stdout);
+  assert.equal(report.schema, "mbx.probe/v1");
+  assert.equal(report.ok, false);
+  assert.equal(report.require_idle_wake, false);
+  assert.equal(report.sender, "probe-runner");
+  assert.deepEqual(report.targets, []);
+  assert.deepEqual(report.summary, { total: 0, passed: 0, failed: 0 });
+  assert.match(report.reason, /no live leased identities to probe/);
 });
