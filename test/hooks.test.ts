@@ -120,27 +120,32 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} hooks re
     assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before);
   }
   const stopped = run("stop");
-  if (cli === "kimi") { assert.equal(stopped.status, 2); assert.match(stopped.stderr, /Before stopping/); }
+  if (cli === "kimi") {
+    assert.equal(stopped.status, 2);
+    assert.match(stopped.stderr, /Before stopping/);
+    assert.match(stopped.stderr, /agentmbx watch/, "the first fresh-mail continuation may carry the one watcher nag");
+  }
   else if (cli !== "opencode") { assert.equal(stopped.status, 0); assert.equal(JSON.parse(stopped.stdout).decision, "block"); }
   else assert.equal(stopped.stdout, "");
   const repeat = run("stop");
   assert.equal(repeat.stdout, "", "the same mail does not block twice");
-  // T435: a terminal kimi with no live watcher still continues once, to re-arm. That is the
-  // watcher instruction, not the mail that was already surfaced.
-  if (cli === "kimi") { assert.equal(repeat.status, 2); assert.match(repeat.stderr, /agentmbx watch/); assert.doesNotMatch(repeat.stderr, /Before stopping/); }
+  assert.equal(repeat.status, 0, repeat.stderr);
+  // T435: the watcher nag rode the mail continuation and is now inside its 10 minute bound.
+  if (cli === "kimi") assert.equal(repeat.stderr, "");
   n.ack(id, agent);
   n.send({ from: "claimed", to: [agent], subject: "unverified", body: "not delegated", kind: "request", unverifiedSender: true });
   const unverified = run("stop");
   assert.equal(unverified.stdout, "");
-  if (cli === "kimi") {
-    assert.equal(unverified.status, 2, unverified.stderr);
-    assert.match(unverified.stderr, /agentmbx watch/);
-    assert.doesNotMatch(unverified.stderr, /unverified|not delegated/, "unverified mail does not continue the turn");
-  } else assert.equal(unverified.status, 0, unverified.stderr);
+  assert.equal(unverified.status, 0, unverified.stderr);
+  if (cli === "kimi") assert.doesNotMatch(unverified.stderr, /unverified|not delegated|agentmbx watch/, "unverified mail does not continue the turn");
   // autonomous has no relay depth limit (T104): even depth-1000 mail keeps the turn going like any delegated request
   const deep = sendLeased(n, { from: "sender", to: [agent], subject: "deep chain", body: "delegated", kind: "request", hop: 1000 }).envelope.id;
   const deepStop = run("stop");
-  if (cli === "kimi") assert.equal(deepStop.status, 2);
+  if (cli === "kimi") {
+    assert.equal(deepStop.status, 2);
+    assert.match(deepStop.stderr, /Before stopping/);
+    assert.doesNotMatch(deepStop.stderr, /agentmbx watch/, "a later mail continuation does not append another nag");
+  }
   else if (cli !== "opencode") assert.equal(JSON.parse(deepStop.stdout).decision, "block");
   else assert.equal(deepStop.stdout, "");
   n.ack(deep, agent);

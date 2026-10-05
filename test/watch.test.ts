@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { MbxNode } from "../src/node.ts";
+import { MbxNode, WAKE_LIMITS } from "../src/node.ts";
 import { IdentityLeases } from "../src/identity-leases.ts";
 import { dispatchWakes, liveWatcher } from "../src/wake.ts";
 import { selfWatchInstruction, WATCHER_INSTRUCTION } from "../src/mcp.ts";
@@ -83,7 +83,7 @@ test("T435: agentmbx watch exits for unread desktop-notified mail and ignores re
   again.kill();
 });
 
-test("T435: a terminal Kimi stop nags to re-arm until a watcher is live", async (t) => {
+test("T435: three Kimi Stops with the watcher down produce exactly one exit 2", async (t) => {
   const { spawnSync } = await import("node:child_process");
   const home = mkdtempSync(join(tmpdir(), "mbx-watch-kimi-stop-"));
   const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "watch-kimi-stop", version: "1" });
@@ -93,18 +93,52 @@ test("T435: a terminal Kimi stop nags to re-arm until a watcher is live", async 
   const prompt = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", "prompt", "--cli", "kimi"],
     { input: JSON.stringify({ session_id: "kimi-term-1", cwd: process.cwd(), prompt: "hi" }), encoding: "utf8", env });
   assert.equal(prompt.status, 0, prompt.stderr);
-  const stop = () => spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", "stop", "--cli", "kimi"],
-    { input: JSON.stringify({ session_id: "kimi-term-1", cwd: process.cwd() }), encoding: "utf8", env });
-  const down = stop();
-  assert.equal(down.status, 2, down.stderr);
-  assert.match(down.stderr, /agentmbx watch/);
-  assert.equal(down.stdout, "");
+  const stop = (extra: Record<string, unknown> = {}) => spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", "stop", "--cli", "kimi"],
+    { input: JSON.stringify({ session_id: "kimi-term-1", cwd: process.cwd(), ...extra }), encoding: "utf8", env });
+  const nagKey = "stopnag:kimi:kimi-term-1";
+  for (const field of ["stopHookActive", "stop_hook_active"] as const) {
+    const continued = stop({ [field]: true });
+    assert.equal(continued.status, 0, continued.stderr);
+    assert.equal(continued.stderr, "");
+    assert.equal(n.store.get(nagKey) ?? null, null, `${field} does not consume the nag`);
+  }
+  const stops = [stop(), stop(), stop()];
+  assert.equal(stops.filter((s) => s.status === 2).length, 1, stops.map((s) => s.status).join(","));
+  assert.equal(stops[0].status, 2, stops[0].stderr);
+  assert.match(stops[0].stderr, /agentmbx watch/);
+  assert.equal(stops[0].stdout, "");
+  assert.equal(stops[1].status, 0, stops[1].stderr);
+  assert.equal(stops[1].stderr, "");
+  assert.equal(stops[2].status, 0, stops[2].stderr);
+  n.store.set(nagKey, new Date(Date.now() - 11 * 60_000).toISOString());
+  const again = stop();
+  assert.equal(again.status, 2, again.stderr);
+  assert.match(again.stderr, /agentmbx watch/);
   const token = (n.store.db.prepare("SELECT token FROM identity_leases WHERE name='worker'").get() as { token: string }).token;
   n.store.set("watcher:worker", JSON.stringify({ pid: process.pid, at: Date.now(), token }));
   const live = stop();
   assert.equal(live.status, 0, live.stderr);
   assert.equal(live.stderr, "");
   assert.equal(live.stdout, "");
+});
+
+test("T435: a Kimi Stop nag stays inside the daily continue cap", async (t) => {
+  const { spawnSync } = await import("node:child_process");
+  const home = mkdtempSync(join(tmpdir(), "mbx-watch-kimi-cap-"));
+  const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "watch-kimi-cap", version: "1" });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const env = { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "kimi", MBX_AGENT: "worker", MBX_NO_DESKTOP: "1", MBX_DEBUG: "" } as Record<string, string>;
+  await c.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"], env }));
+  const prompt = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", "prompt", "--cli", "kimi"],
+    { input: JSON.stringify({ session_id: "kimi-term-1", cwd: process.cwd(), prompt: "hi" }), encoding: "utf8", env });
+  assert.equal(prompt.status, 0, prompt.stderr);
+  const insert = n.store.db.prepare("INSERT INTO wakes (agent,thread,at) VALUES (?,?,?)");
+  for (let i = 0; i < WAKE_LIMITS.perAgentDay; i++) insert.run("worker", null, new Date().toISOString());
+  const capped = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", "stop", "--cli", "kimi"],
+    { input: JSON.stringify({ session_id: "kimi-term-1", cwd: process.cwd() }), encoding: "utf8", env });
+  assert.equal(capped.status, 0, capped.stderr);
+  assert.equal(capped.stderr, "");
+  assert.equal(n.store.get("stopnag:kimi:kimi-term-1") ?? null, null, "a refused nag does not start the 10 minute window");
 });
 
 test("agentmbx watch outside any session lease stops with a reason", async (t) => {
