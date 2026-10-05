@@ -1,3 +1,4 @@
+import { IdentityLeases } from "./identity-leases.js";
 import { listIdentityStatus } from "./identity-status.js";
 export const PROBE_SUBJECT_PREFIX = "[mbx-probe]";
 /** The exact reply marker the convention asks for; replies are matched on this or the prefix. */
@@ -31,7 +32,11 @@ export function planProbe(identities, sender) {
 }
 /** The real store-backed IO: targets via identity-status (the established read-only enumeration,
  *  with the project filter and caller scope), sends as kind=request with needs_reply, and
- *  observations read straight from the audit/deliveries/messages tables. */
+ *  observations read straight from the audit/deliveries/messages tables. Each send runs inside
+ *  the sender's withHeld lease fence — the same fence `agentmbx send` uses — so the envelope is
+ *  marked sender_verification "leased" and the probe measures the real wake-authority path.
+ *  (A sender with no live lease, e.g. engine-level tests, sends unverified, exactly like the
+ *  CLI's documented unverified-sender path.) */
 export function storeProbeIO(node, o) {
     const db = node.store.db;
     return {
@@ -39,8 +44,12 @@ export function storeProbeIO(node, o) {
         listTargets: () => listIdentityStatus(node.home, { project: o.project, ...(o.caller ? { caller: o.caller } : {}) }).identities,
         send: (target) => {
             const at = Date.now();
-            const r = node.send({ from: o.sender, to: [target], subject: probeSubject(new Date(at)), body: probeBody(),
-                kind: "request", needs_reply: true, ...(o.project ? { project: o.project } : {}) });
+            const draft = { from: o.sender, to: [target], subject: probeSubject(new Date(at)), body: probeBody(),
+                kind: "request", needs_reply: true, ...(o.project ? { project: o.project } : {}) };
+            const row = db.prepare("SELECT token FROM identity_leases WHERE name=? AND released_at IS NULL").get(o.sender);
+            // The token is re-read and re-verified per send: a lease that moves mid-probe throws here
+            // and the target is reported as a send failure, never a silent downgrade.
+            const r = row ? new IdentityLeases(node.store).withHeld(o.sender, row.token, () => node.send(draft)) : node.send(draft);
             return { id: r.envelope.id, thread: r.envelope.thread, at };
         },
         observe: (target, sent) => {

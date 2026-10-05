@@ -273,6 +273,17 @@ test("storeProbeIO: admitted wake without a reply is a no-reply failure", async 
   assert.equal(target.wake!.outcome, "admitted");
 });
 
+test("storeProbeIO fences each send inside the sender's held lease (sender_verification leased)", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-probe-fence-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  bindWakeLease(n, { agent: "runner", cli: "claude", session_id: "r1", pid: process.pid });
+  const io = storeProbeIO(n, { sender: "runner" });
+  const sent = io.send("worker");
+  const envelope = JSON.parse((n.store.db.prepare("SELECT envelope FROM messages WHERE id=?").get(sent.id) as { envelope: string }).envelope) as { meta: { sender_verification?: string } };
+  assert.equal(envelope.meta.sender_verification, "leased", "the probe send carries the lease fence, not a raw node.send");
+});
+
 // ---- the CLI dispatch ---------------------------------------------------------------------------------
 
 /** The spawn env: no MBX_AGENT (an explicit identity is a test choice), throwaway home. */

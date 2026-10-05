@@ -7,6 +7,7 @@
 // pass) are pure; all store I/O sits behind the ProbeIO interface; the waiting loop takes the
 // clock and the sleep function, so the no-wake/no-reply paths test without real time.
 import type { MbxNode } from "./node.ts";
+import { IdentityLeases } from "./identity-leases.ts";
 import { listIdentityStatus, type IdentityStatus } from "./identity-status.ts";
 
 export const PROBE_SUBJECT_PREFIX = "[mbx-probe]" as const;
@@ -74,7 +75,11 @@ export interface ProbeIO {
 
 /** The real store-backed IO: targets via identity-status (the established read-only enumeration,
  *  with the project filter and caller scope), sends as kind=request with needs_reply, and
- *  observations read straight from the audit/deliveries/messages tables. */
+ *  observations read straight from the audit/deliveries/messages tables. Each send runs inside
+ *  the sender's withHeld lease fence — the same fence `agentmbx send` uses — so the envelope is
+ *  marked sender_verification "leased" and the probe measures the real wake-authority path.
+ *  (A sender with no live lease, e.g. engine-level tests, sends unverified, exactly like the
+ *  CLI's documented unverified-sender path.) */
 export function storeProbeIO(node: MbxNode, o: { project?: string; sender: string;
   caller?: { cli: string; sessionId: string; pid?: number } }): ProbeIO {
   const db = node.store.db;
@@ -83,8 +88,12 @@ export function storeProbeIO(node: MbxNode, o: { project?: string; sender: strin
     listTargets: () => listIdentityStatus(node.home, { project: o.project, ...(o.caller ? { caller: o.caller } : {}) }).identities,
     send: (target) => {
       const at = Date.now();
-      const r = node.send({ from: o.sender, to: [target], subject: probeSubject(new Date(at)), body: probeBody(),
-        kind: "request", needs_reply: true, ...(o.project ? { project: o.project } : {}) });
+      const draft = { from: o.sender, to: [target], subject: probeSubject(new Date(at)), body: probeBody(),
+        kind: "request" as const, needs_reply: true, ...(o.project ? { project: o.project } : {}) };
+      const row = db.prepare("SELECT token FROM identity_leases WHERE name=? AND released_at IS NULL").get(o.sender) as { token: string } | undefined;
+      // The token is re-read and re-verified per send: a lease that moves mid-probe throws here
+      // and the target is reported as a send failure, never a silent downgrade.
+      const r = row ? new IdentityLeases(node.store).withHeld(o.sender, row.token, () => node.send(draft)) : node.send(draft);
       return { id: r.envelope.id, thread: r.envelope.thread, at };
     },
     observe: (target, sent) => {
