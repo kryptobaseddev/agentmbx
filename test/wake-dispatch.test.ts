@@ -11,6 +11,38 @@ import type { AddressInfo } from "node:net";
 import { bindWakeLease, delegateWake } from "./helpers/wake-lease.ts";
 import { MbxNode } from "../src/node.ts";
 import { dispatchWakes, wakeOpencode } from "../src/wake.ts";
+import { findIdentityControl, publishIdentityControl } from "../src/identity-control.ts";
+import { captureWakeIdentity } from "../src/wake-identity.ts";
+import { recipientReceipts, receiptLine, sentPage } from "../src/receipts.ts";
+
+for (const defect of ["generation", "parent"] as const) test(`T376: rejected control ${defect} never promises a native wake`, async t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-receipt-fence-")), n = new MbxNode(home, { host: "alpha" });
+  const log = join(home, "calls"), bin = join(home, "codex");
+  writeFileSync(bin, '#!/bin/sh\nprintf called >> "$MBX_TEST_WAKE_LOG"\n', { mode: 0o700 });
+  const old = { MBX_CODEX_BIN: process.env.MBX_CODEX_BIN, MBX_TEST_WAKE_LOG: process.env.MBX_TEST_WAKE_LOG, MBX_NO_DESKTOP: process.env.MBX_NO_DESKTOP };
+  Object.assign(process.env, { MBX_CODEX_BIN: bin, MBX_TEST_WAKE_LOG: log, MBX_NO_DESKTOP: "1" });
+  t.after(() => { for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  bindWakeLease(n, { agent: "worker", cli: "codex", session_id: "valid", pid: process.pid });
+  const original = findIdentityControl(n.store, "codex", "valid");
+  const first = sendLeased(n, { from: "sender", to: ["worker"], subject: "valid", body: "private", kind: "request" });
+  assert.ok(captureWakeIdentity(n, n.sessionsFor("worker")[0]));
+  assert.equal(recipientReceipts(n, first.envelope.id, first.targets)[0].state, "live-wake");
+  n.ack(first.envelope.id, "worker");
+  publishIdentityControl(n.store, { ...original, ...(defect === "generation" ? { generation: "0".repeat(64) } : { parent_pid: process.ppid }) });
+  const sent = sendLeased(n, { from: "sender", to: ["worker"], subject: "retained", body: "private", kind: "request" });
+  assert.equal(captureWakeIdentity(n, n.sessionsFor("worker")[0]), null);
+  const receipt = recipientReceipts(n, sent.envelope.id, sent.targets)[0];
+  assert.equal(receipt.state, "live-next-prompt");
+  assert.match(receipt.detail, /lease or session binding could not be verified/);
+  await dispatchWakes(n);
+  assert.equal(existsSync(log), false);
+  const delivered = sentPage(n, "sender").messages.find(m => m.id === sent.envelope.id)!.recipients[0];
+  assert.equal(delivered.state, "notified");
+  assert.equal(delivered.note, "desktop");
+  assert.match(receiptLine(delivered), /owner desktop notice only/);
+  assert.equal(n.unreadCount("worker"), 1);
+});
 
 for (const invalid of ["dead-pid", "reused-pid", "missing-birth", "expired", "no-pid", "provisional", "stale-channel", "live-channel"])
   test(`wake dispatch validates ${invalid} targets`, async (t) => {

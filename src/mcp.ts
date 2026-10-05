@@ -726,6 +726,10 @@ export async function runMcp(existing?: MbxNode) {
       tools: [...tools].sort(), cli: env.cli, at: new Date().toISOString() })); } catch { /* best effort: diagnostics then reports no observation */ }
   };
   const register = server.registerTool.bind(server) as (...a: unknown[]) => unknown;
+  // Send receipts inspect recipient process/lease evidence after the sender's write lock is released.
+  // Keep message storage/idempotency fenced; this callback only formats the committed result.
+  const receiptResult = Symbol("receiptResult");
+  const afterLease = (finish: () => ReturnType<typeof text>) => Object.assign(text(""), { [receiptResult]: finish });
   (server as { registerTool: unknown }).registerTool = (name: string, config: unknown, cb: (...a: unknown[]) => unknown) => {
     tools.push(name);
     if (cb.constructor.name === "AsyncFunction") throw new Error(`MCP handler ${name} must be synchronous to preserve its lease fence`);
@@ -780,7 +784,10 @@ export async function runMcp(existing?: MbxNode) {
           ? leases.withHeldRead(state.agent, state.leaseToken!, () => cb(...a))
           : leases.withHeld(state.agent, state.leaseToken!, () => cb(...a)));
         const target = (a[0] as { name?: string } | undefined)?.name;
-        return withProcSnapshot(() => name === "mbx_whoami" ? prepareState(state, target, invoke) : invoke());
+        const result = withProcSnapshot(() => name === "mbx_whoami" ? prepareState(state, target, invoke) : invoke());
+        if (result && typeof result === "object" && receiptResult in result)
+          return withProcSnapshot((result as ReturnType<typeof afterLease>)[receiptResult]);
+        return result;
       } catch (e) { Object.assign(state, before); throw e; }
     });
   };
@@ -996,7 +1003,7 @@ export async function runMcp(existing?: MbxNode) {
 
   server.registerTool("mbx_send", {
     title: "Send an mbx message",
-    description: "Start a new conversation with other agents (to answer a message, use mbx_reply instead). `to` accepts agent names (vida-dev), agent@host (vida-dev@fedora), role:<role>, * (everyone), or owner; find names with mbx_agents. Kind decides waking: request/task/decision/alert wake an idle recipient; message/reply wake only with needs_reply=true or an @mention; status NEVER wakes (it waits for the recipient's next prompt). Use kind=request/task with needs_reply=true when you need an answer. A successful send is acceptance, not recipient delivery, reply or task completion; queued transport retry is not a draft API. Avoid manually resending an uncertain send. The result's recipients[] says per recipient: live-wake (woken now), live-next-prompt (seen on its next prompt), offline (no live session; it waits), forwarded (renamed mailbox) or remote (queued for a paired host). A name that never existed on this host is refused with suggestions. Next: check mbx_inbox for answers.",
+    description: "Start a new conversation with other agents (to answer a message, use mbx_reply instead). `to` accepts agent names (vida-dev), agent@host (vida-dev@fedora), role:<role>, * (everyone), or owner; find names with mbx_agents. Kind decides waking: request/task/decision/alert wake an idle recipient; message/reply wake only with needs_reply=true or an @mention; status NEVER wakes (it waits for the recipient's next prompt). Use kind=request/task with needs_reply=true when you need an answer. A successful send is acceptance, not recipient delivery, reply or task completion; queued transport retry is not a draft API. Avoid manually resending an uncertain send. The result's recipients[] says per recipient: live-wake (eligible for wake; dispatcher admission pending), live-next-prompt (seen on its next prompt), offline (no live session; it waits), forwarded (renamed mailbox) or remote (queued for a paired host). A name that never existed on this host is refused with suggestions. Next: check mbx_inbox for answers.",
     inputSchema: {
       to: z.array(z.string().min(1)).min(1).max(20), subject: z.string().min(1).max(200), body: z.string().max(256 * 1024),
       kind: z.enum(KINDS).default("message").describe("request/task/decision/alert wake the recipient; message/reply wake only with needs_reply or an @mention; status never wakes"),
@@ -1017,10 +1024,12 @@ export async function runMcp(existing?: MbxNode) {
     const rel = relay(origin, to);
     const r = node.send({ from: agent, to, subject, body, kind, reply_to, thread, needs_reply, refs, ...rel.draft }, session());
     if (idempotency_key) node.store.set(`idem:${agent}:${idempotency_key}`, r.envelope.id);
-    const recipients = recipientReceipts(node, r.envelope.id, r.targets);
-    const out = { id: r.envelope.id, ref: `mbx:${r.envelope.id}@${node.host}`, thread: r.envelope.thread, recipients, delivered_locally: r.local, queued_for_hosts: r.remote,
-      owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...offlineWarnings(recipients), ...statusWakeWarning(r.envelope), ...depthWarning(r.envelope), ...rel.warnings] };
-    return text(JSON.stringify(out, null, 2), out);
+    return afterLease(() => {
+      const recipients = recipientReceipts(node, r.envelope.id, r.targets);
+      const out = { id: r.envelope.id, ref: `mbx:${r.envelope.id}@${node.host}`, thread: r.envelope.thread, recipients, delivered_locally: r.local, queued_for_hosts: r.remote,
+        owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...offlineWarnings(recipients), ...statusWakeWarning(r.envelope), ...depthWarning(r.envelope), ...rel.warnings] };
+      return text(JSON.stringify(out, null, 2), out);
+    });
   });
 
   server.registerTool("mbx_reply", {
@@ -1038,10 +1047,12 @@ export async function runMcp(existing?: MbxNode) {
     const subject = /^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`.slice(0, 200);
     const rel = relay(origin, [m.from_addr]);
     const r = node.send({ from: agent, to: [m.from_addr], subject, body, kind, reply_to: m.id, thread: m.thread, needs_reply, refs: [], ...rel.draft }, session());
-    const recipients = recipientReceipts(node, r.envelope.id, r.targets);
-    const out = { id: r.envelope.id, to: m.from_addr, thread: r.envelope.thread, reply_to: m.id, recipients, delivered_locally: r.local, queued_for_hosts: r.remote,
-      owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...offlineWarnings(recipients), ...depthWarning(r.envelope), ...rel.warnings] };
-    return text(`${JSON.stringify(out, null, 2)}\nNext: mbx_ack ${m.id} if you are done with it.`, out);
+    return afterLease(() => {
+      const recipients = recipientReceipts(node, r.envelope.id, r.targets);
+      const out = { id: r.envelope.id, to: m.from_addr, thread: r.envelope.thread, reply_to: m.id, recipients, delivered_locally: r.local, queued_for_hosts: r.remote,
+        owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...offlineWarnings(recipients), ...depthWarning(r.envelope), ...rel.warnings] };
+      return text(`${JSON.stringify(out, null, 2)}\nNext: mbx_ack ${m.id} if you are done with it.`, out);
+    });
   });
 
   server.registerTool("mbx_inbox", {

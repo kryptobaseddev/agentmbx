@@ -10,6 +10,9 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { generateKeyPair } from "../src/crypto.ts";
 import { MbxNode } from "../src/node.ts";
 import { sentPage } from "../src/receipts.ts";
+import { bindWakeLease } from "./helpers/wake-lease.ts";
+import { findIdentityControl, publishIdentityControl } from "../src/identity-control.ts";
+import { dispatchWakes } from "../src/wake.ts";
 
 type Receipt = { address: string; state: string; did: string | null; note: string | null; liveness: string; outbox?: { attempts: number } };
 type Page = { messages: { id: string; subject: string; recipients: Receipt[] }[]; next_cursor: string; has_more: boolean };
@@ -32,6 +35,28 @@ async function world(t: { after: (fn: () => Promise<void>) => void }) {
   };
   return { n, session };
 }
+
+test("T376: mbx_sent reports desktop fallback after a rejected Codex binding", async t => {
+  const { n, session } = await world(t);
+  bindWakeLease(n, { agent: "worker", cli: "codex", session_id: "exact-thread", pid: process.pid });
+  const descriptor = findIdentityControl(n.store, "codex", "exact-thread");
+  publishIdentityControl(n.store, { ...descriptor, generation: "0".repeat(64) });
+  const old = process.env.MBX_NO_DESKTOP;
+  process.env.MBX_NO_DESKTOP = "1";
+  t.after(() => { if (old === undefined) delete process.env.MBX_NO_DESKTOP; else process.env.MBX_NO_DESKTOP = old; });
+  const boss = await session("boss");
+  const sent = (await boss("mbx_send", { to: ["worker"], subject: "wake", body: "private", kind: "request" })).structuredContent as unknown as
+    { id: string; recipients: { state: string; detail: string }[] };
+  assert.equal(sent.recipients[0].state, "live-next-prompt");
+  assert.match(sent.recipients[0].detail, /lease or session binding could not be verified/);
+  await dispatchWakes(n);
+  const result = await boss("mbx_sent");
+  const receipt = (result.structuredContent as unknown as Page).messages.find(m => m.id === sent.id)!.recipients[0];
+  assert.equal(receipt.state, "notified");
+  assert.equal(receipt.note, "desktop");
+  assert.match(result.content[0].text, /owner desktop notice only/);
+  assert.doesNotMatch(result.content[0].text, /woken now/);
+});
 
 test("the sender sees delivered → acked with the recipient's did and liveness, and the thread shows it too", async (t) => {
   const { session } = await world(t);
