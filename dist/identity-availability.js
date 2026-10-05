@@ -20,6 +20,19 @@ export function parseActivity(raw) {
     }
 }
 const minutes = (ms) => `${Math.max(1, Math.round(ms / 60_000))} min`;
+/**
+ * The provider process a lease holder serves under: its parent, or `callerProvider` when that process is anywhere in the
+ * holder's ancestry (a reloaded server is the child of the server it replaced). Null when the holder is not in `table`.
+ */
+export function holderProviderPid(table, holderPid, callerProvider) {
+    const parent = table.get(holderPid)?.ppid;
+    if (!parent)
+        return null;
+    for (let p = parent, n = 0; p && p > 1 && n < 16; p = table.get(p)?.ppid, n++)
+        if (p === callerProvider)
+            return p;
+    return parent;
+}
 export function identityAvailability(o) {
     if (o.conflict)
         return { claimable: false, state: "conflict", reason: "historical ownership requires explicit owner recovery" };
@@ -32,8 +45,17 @@ export function identityAvailability(o) {
     const holder = `${lease.cli} session ${lease.session_id}`;
     if (status.state === "unknown")
         return { claimable: false, state: "unknown", reason: `held by ${holder}, whose process could not be verified right now; retry shortly` };
-    if (o.caller && lease.cli === o.caller.cli && lease.session_id === o.caller.sessionId && !o.caller.sessionId.startsWith("mcp-"))
-        return { claimable: true, state: "live", reason: `held by an older process of this same ${lease.cli} session`, takeover: "same-session" };
+    if (o.caller && lease.cli === o.caller.cli && lease.session_id === o.caller.sessionId && !o.caller.sessionId.startsWith("mcp-")) {
+        // T383: a provider may start a second, short-lived MCP server for a session whose own server is still live and serving
+        // (Codex did). Only a holder under a different (restarted) provider process is "older"; a live holder under the caller's
+        // own provider keeps the lease and the newcomer waits until it ends. Unknown parentage never evicts a live holder.
+        const { providerPid, holderProviderPid: holderProvider } = o.caller;
+        if (providerPid !== undefined && holderProvider != null && holderProvider !== providerPid)
+            return { claimable: true, state: "live", reason: `held by an older process of this same ${lease.cli} session`, takeover: "same-session" };
+        return { claimable: false, state: "live", reason: providerPid !== undefined && holderProvider === providerPid
+                ? `held by the live MCP server of this same ${lease.cli} session (pid ${lease.holder_pid}, same provider process); it resumes here once that server ends`
+                : `held by a live process of this same ${lease.cli} session (pid ${lease.holder_pid}) whose provider process could not be verified; retry shortly` };
+    }
     const quiet = o.activity ? o.now - o.activity.at : null;
     if (o.activity?.shared && quiet !== null && quiet >= SHARED_IDLE_MS)
         return { claimable: true, state: "idle", reason: `held by ${holder} in a shared ${lease.cli} process with no mbx activity for ${minutes(quiet)} (that conversation has probably ended)`, takeover: "idle-conversation" };
