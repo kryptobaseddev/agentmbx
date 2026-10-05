@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { kimiHostedServer, type KimiServer } from "./kimi-web.ts";
 import { desktopRpc, kimiDesktop, RpcError, type KimiDesktop } from "./kimi-desktop.ts";
-import { MbxNode, trustLabel } from "./node.ts";
+import { GROK_NO_PUSH, MbxNode, trustLabel } from "./node.ts";
 import { captureWakeIdentity } from "./wake-identity.ts";
 import { policyBrief } from "./policy.ts";
 import { ulid } from "./crypto.ts";
@@ -59,6 +59,14 @@ export function wakeText(agent: string, msgs: MessageRow[]): string {
 export const which = (bin: string) => { try { return execFileSync("/usr/bin/which", [bin], { encoding: "utf8" }).trim() || null; } catch { return null; } };
 const CODEX = () => process.env.MBX_CODEX_BIN || which("codex") || join(homedir(), ".local/bin/codex");
 const OPENCODE = () => process.env.MBX_OPENCODE_BIN || which("opencode") || join(homedir(), ".opencode/bin/opencode");
+
+/** Grok's interactive session cannot be handed a prompt from outside. Nothing is spawned or written.
+ *  `unsupported` holds: retrying cannot grow a path the CLI does not have. */
+export async function wakeGrok(_sessionId: string, _text: string, o: { recheck?: () => boolean } = {}): Promise<WakeResult> {
+  const via = "grok none";
+  if (o.recheck && !o.recheck()) return outcome(via, { kind: "not_submitted", reason: "fenced" }, "wake authority changed");
+  return outcome(via, { kind: "not_submitted", reason: "unsupported", detail: GROK_NO_PUSH }, GROK_NO_PUSH);
+}
 
 export async function wakeCodex(threadId: string, text: string, o: { recheck?: () => boolean } = {}): Promise<WakeResult> {
   const via = "codex queue";
@@ -400,9 +408,11 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
       if (s.cli === "codex") result = await wakeCodex(s.session_id, text, { recheck });
       else if (s.cli === "opencode") result = await wakeOpencode(s.session_id, text, { recheck });
       else if (s.cli === "kimi") result = kimiDesktop(s.pid) ? await wakeKimiDesktop(s, text, { recheck }) : await wakeKimi(s, text, { recheck });
+      else if (s.cli === "grok") result = await wakeGrok(s.session_id, text, { recheck });
       else continue;
       attempts++;
       node.store.audit("wake.attempt", { agent, attempt: marker.attemptId, session: `${s.cli}:${s.session_id}`, outcome: result.outcome?.kind ?? null,
+        ...(result.outcome && "reason" in result.outcome ? { reason: result.outcome.reason } : {}),
         ...(result.outcome?.kind === "admitted" ? { receipt: result.outcome.receipt.strength, native: result.outcome.receipt.nativeId } : {}) });
       const o = result.outcome, kind = o?.kind;
       if (o?.kind === "not_submitted" && o.reason === "fenced") { fenced = true; break; }
