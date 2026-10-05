@@ -97,9 +97,25 @@ test("reboot: 20 sessions of one folder start at once; remembered ones resume th
   }
   // The idle sessions start first, as in the incident, then everyone else in the same instant.
   const clients = await Promise.all(Array.from({ length: 20 }, (_, i) => connect(`sess-${(i + 5) % 20}`)));
-  const names = await Promise.all(clients.map(async c => json(await c.callTool({ name: "mbx_whoami", arguments: {} })).agent));
+  const whoami = async (c: Client) => (json(await c.callTool({ name: "mbx_whoami", arguments: {} })) as { agent: string | null }).agent;
+  // T434: on a loaded machine the first claim can refuse once on incomplete process evidence
+  // (IDENTITY_LEASE_CONFIG, "claim needs a valid identity…" — the server's own birth time starved
+  // by 40 concurrent boots). The session keeps the name pending and resumes on a later call
+  // (retryResume runs on every identity tool call), so poll the remembered sessions until each
+  // converges instead of single-shot whoami. The assertions stay exactly as strict.
+  const deadline = Date.now() + 60_000;
+  for (let i = 0; i < 5; i++) {
+    const c = clients[(i + 15) % 20]; // clients[k] is sess-((k + 5) % 20)
+    let agent: string | null = null;
+    while (Date.now() < deadline) {
+      agent = await whoami(c);
+      if (agent) break;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    assert.equal(agent, `orbit-agent-${i}`, `sess-${i} resumed its own identity`);
+  }
+  const names = await Promise.all(clients.map(whoami));
   const bySession = new Map(clients.map((_, i) => [`sess-${(i + 5) % 20}`, names[i]]));
-  for (let i = 0; i < 5; i++) assert.equal(bySession.get(`sess-${i}`), `orbit-agent-${i}`, `sess-${i} resumed its own identity`);
   for (let i = 5; i < 20; i++) assert.equal(bySession.get(`sess-${i}`), null, `sess-${i} stayed unbound`);
   const held = node.store.db.prepare("SELECT name FROM identity_leases WHERE released_at IS NULL ORDER BY name").all().map(r => r.name);
   assert.deepEqual(held, [0, 1, 2, 3, 4].map(i => `orbit-agent-${i}`), "no other identity exists");
