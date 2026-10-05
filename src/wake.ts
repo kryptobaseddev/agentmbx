@@ -413,7 +413,8 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
       attempts++;
       node.store.audit("wake.attempt", { agent, attempt: marker.attemptId, session: `${s.cli}:${s.session_id}`, outcome: result.outcome?.kind ?? null,
         ...(result.outcome && "reason" in result.outcome ? { reason: result.outcome.reason } : {}),
-        ...(result.outcome?.kind === "admitted" ? { receipt: result.outcome.receipt.strength, native: result.outcome.receipt.nativeId } : {}) });
+        ...(result.outcome?.kind === "admitted" ? { receipt: result.outcome.receipt.strength, native: result.outcome.receipt.nativeId,
+          ...(result.outcome.receipt.nativeStatus ? { nativeStatus: result.outcome.receipt.nativeStatus } : {}) } : {}) });
       const o = result.outcome, kind = o?.kind;
       if (o?.kind === "not_submitted" && o.reason === "fenced") { fenced = true; break; }
       if (kind !== "not_submitted") submitted = guard;

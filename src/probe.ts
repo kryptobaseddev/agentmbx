@@ -57,7 +57,11 @@ export function planProbe(identities: readonly IdentityStatus[], sender: string)
 // ---- store I/O behind an interface -------------------------------------------------------------------
 
 export interface SentProbe { id: string; thread: string; at: number }
-export interface WakeObservation { outcome: string | null; via: string | null; receipt: string | null; at: number | null }
+export interface WakeObservation {
+  outcome: string | null; via: string | null; receipt: string | null;
+  /** Conversation session that can observe a watcher exit. Absent on dispatcher rows. */
+  session: string | null; at: number | null;
+}
 export interface TargetObservation {
   wake: WakeObservation | null;
   readAt: number | null;
@@ -104,10 +108,11 @@ export function storeProbeIO(node: MbxNode, o: { project?: string; sender: strin
       // watchers and channels log everything on the attempt row itself.
       let wake: WakeObservation | null = null;
       for (const row of db.prepare("SELECT at, detail FROM audit WHERE event='wake.attempt' AND at>=? ORDER BY at ASC").all(since) as { at: string; detail: string }[]) {
-        let d: { agent?: string; outcome?: string | null; via?: string | null; receipt?: string | null };
+        let d: { agent?: string; outcome?: string | null; via?: string | null; receipt?: string | null; session?: string | null };
         try { d = JSON.parse(row.detail); } catch { continue; }
         if (d.agent !== target) continue;
-        wake = { outcome: d.outcome ?? null, via: d.via ?? null, receipt: d.receipt ?? null, at: Date.parse(row.at) };
+        wake = { outcome: d.outcome ?? null, via: d.via ?? null, receipt: d.receipt ?? null,
+          session: typeof d.session === "string" && d.session ? d.session : null, at: Date.parse(row.at) };
       }
       if (wake && !wake.via) {
         for (const row of db.prepare("SELECT at, detail FROM audit WHERE event='wake' AND at>=? ORDER BY at ASC").all(since) as { at: string; detail: string }[]) {
@@ -177,11 +182,21 @@ export interface ProbeReport {
 const iso = (ms: number) => new Date(ms).toISOString();
 const latency = (at: number | null, sentAt: number) => (at === null ? null : Math.max(0, at - sentAt));
 
+/** A `via: watcher` admit counts as an idle wake only when the attempt names the conversation
+ *  session that can observe the exit. Printing the hint is not that observation. An `mcp-*`
+ *  lease token is not a conversation session. Other admitted vias are unchanged. */
+export function watcherObservesExit(wake: WakeObservation | null): boolean {
+  if (wake?.outcome !== "admitted") return false;
+  if (wake.via !== "watcher") return true;
+  return !!wake.session && !wake.session.startsWith("mcp-");
+}
+
 /** Default gate: the convention reply arrived in the thread within the deadline — the agent
  *  answered autonomously whether it was woken while idle (`path: "idle-wake"`) or saw the probe
  *  mid-turn through its in-turn hook (`path: "in-turn"`, no wake row). With `requireIdleWake`
- *  (the T388 harness rows) the gate is the strict one: an admitted idle wake AND the reply. Read
- *  and ack are recorded either way, never gated. */
+ *  (the T388 harness rows) the gate is the strict one: an admitted idle wake AND the reply.
+ *  A watcher row without its observing session is not that idle wake. Read and ack are recorded
+ *  either way, never gated. */
 export function buildProbeReport(o: {
   plan: ProbeTarget[];
   sent: Map<string, SentProbe>;
@@ -202,12 +217,13 @@ export function buildProbeReport(o: {
     const sent = o.sent.get(t.name)!;
     const ob = o.observations.get(t.name) ?? { wake: null, readAt: null, ackedAt: null, ackNote: null, reply: null };
     const admitted = ob.wake?.outcome === "admitted";
-    const path: ProbeAgentReport["path"] = ob.reply ? (admitted ? "idle-wake" : "in-turn") : null;
+    const idleWake = watcherObservesExit(ob.wake);
+    const path: ProbeAgentReport["path"] = ob.reply ? (idleWake ? "idle-wake" : "in-turn") : null;
     const reason = o.sendErrors?.get(t.name) ? `probe message could not be sent: ${o.sendErrors.get(t.name)}`
       : !ob.reply && !ob.wake ? `no wake.attempt for ${t.name} within ${deadlineS}s of the probe`
       : !ob.reply && !admitted ? `wake for ${t.name} never admitted (last outcome: ${ob.wake!.outcome ?? "unknown"}${ob.wake!.via ? ` via ${ob.wake!.via}` : ""})`
       : !ob.reply ? `${t.name} woke but did not reply in the probe thread within ${deadlineS}s`
-      : requireIdleWake && !admitted ? `in-turn answer without an admitted idle wake (last wake outcome: ${ob.wake?.outcome ?? "none"}${ob.wake?.via ? ` via ${ob.wake.via}` : ""}); --require-idle-wake requires one`
+      : requireIdleWake && !idleWake ? `in-turn answer without an admitted idle wake (last wake outcome: ${ob.wake?.outcome ?? "none"}${ob.wake?.via ? ` via ${ob.wake.via}` : ""}); --require-idle-wake requires one`
       : null;
     return {
       name: t.name, holder: t.holder, message_id: sent.id, sent_at: iso(sent.at), path,
