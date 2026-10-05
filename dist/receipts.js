@@ -89,9 +89,12 @@ export function recipientReceipts(node, msgId, targets, now = Date.now()) {
             // watcher at turn end by design (T348), so the dispatcher admits the wake moments later.
             // Only a verified binding may read as live-wake (T376's guard above); with no watcher
             // evidence at all, "no push path" stays the answer.
-            const rearming = !watcher && verified.length > 0
-                && (node.store.get(watcherKey(name)) != null
-                    || (!mode.startsWith("push") && verified.every((s) => s.cli === "kimi")));
+            // T435: a lapsed Grok session is not on this set. Its receipt stays live-next-prompt and the
+            // detail is GROK_NO_PUSH (which names the watch remedy). A stale key still re-arms every
+            // other verified cli, including Claude, and a terminal kimi session with no key still re-arms.
+            const terminalKimi = !mode.startsWith("push") && verified.every((s) => s.cli === "kimi");
+            const rearming = !watcher && verified.length > 0 && !verified.some((s) => s.cli === "grok")
+                && (node.store.get(watcherKey(name)) != null || terminalKimi);
             const why = !m ? "message not found" : !node.wantsWake(name, m) ? "this kind does not wake (status, or no needs_reply/mention)"
                 : !watcher && sessions.length && !verified.length ? "the current lease or session binding could not be verified"
                     : !mode.startsWith("push") && !rearming ? (mode === GROK_NO_PUSH ? GROK_NO_PUSH : "the session has no push path")

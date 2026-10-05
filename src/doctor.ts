@@ -13,6 +13,7 @@ import { GROK_NO_PUSH, MbxNode, RETRY_HOURS } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
 import { detect, edits, grokMcpConfiguredCommand, skillDest, skillStatus, statuslineConfiguredCommand, statuslineForms, statuslineState, wired, type SetupCtx } from "./setup.ts";
 import { mailboxLiveness } from "./receipts.ts";
+import { liveWatcher } from "./wake.ts";
 import { listIdentityControls } from "./identity-control.ts";
 import { pruneCandidates } from "./identity-cleanup.ts";
 import type { IdentityLease } from "./identity-leases.ts";
@@ -224,6 +225,15 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     if (d.cli === "grok") {
       // T385: this is a fact about the harness, not a broken install. Setup cannot add a push path.
       add("info", `grok: ${GROK_NO_PUSH}`);
+      // T435: stay inside this block. OpenCode (T391) adds its own doctor function and must not
+      // collide with a new top-level grok check. A warn does not fail doctor.
+      if (node) {
+        const held = node.store.db.prepare(
+          "SELECT agent, session_id FROM sessions WHERE cli='grok' AND session_id NOT LIKE 'mcp-%'"
+        ).all() as { agent: string; session_id: string }[];
+        for (const s of held) if (!liveWatcher(node, s.agent))
+          add("warn", `grok: ${s.agent} has no live mbx watcher`, `agentmbx watch --cli grok --session ${s.session_id}`);
+      }
       const command = grokMcpConfiguredCommand(ctx.home);
       if (command && command.includes("/") && !existsSync(command))
         add("fail", `grok: MCP command path does not exist (${command})`, "agentmbx setup --only grok");
