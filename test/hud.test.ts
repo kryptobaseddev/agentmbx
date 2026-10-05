@@ -6,7 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { MbxNode } from "../src/node.ts";
@@ -15,8 +15,8 @@ import { IdentityLeases, inspectLeaseProcess } from "../src/identity-leases.ts";
 import { procStart } from "../src/proc.ts";
 
 const home = () => mkdtempSync(join(tmpdir(), "mbx-hud-"));
-const claim = (n: MbxNode, name: string, sid: string) =>
-  new IdentityLeases(n.store).claim(name, { pid: process.pid, start: inspectLeaseProcess(process.pid).start!, keyFp: "aaaa-bbbb-cccc-dddd", cli: "kimi", sessionId: sid });
+const claim = (n: MbxNode, name: string, sid: string, cli = "kimi") =>
+  new IdentityLeases(n.store).claim(name, { pid: process.pid, start: inspectLeaseProcess(process.pid).start!, keyFp: "aaaa-bbbb-cccc-dddd", cli, sessionId: sid });
 
 test("a bound session gets a ${cli}-${sid} snapshot (0600, 0700 dir), identical content for the pid+start file", (t) => {
   const h = home(), n = new MbxNode(h, { host: "alpha" });
@@ -239,10 +239,12 @@ test("the CLI adapter resolves exactly without opening the store — an empty ho
   assert.ok(!existsSync(join(empty, "mbx.db")) && !existsSync(join(empty, "config.json")), "no store is created by a render");
 });
 
-// T347 review major 5: the bundled pure-sh Kimi adapter mirrors the Claude one — and when it has
-// nothing to render it EXITS NONZERO so Kimi shows its built-in footer instead of a blank one
-// (additive by contract, owner 2026-10-04).
-test("the bundled Kimi adapter renders with node absent from PATH — and fails over to the built-in layout when empty", (t) => {
+// T366: Kimi's `[status_line].command` REPLACES the footer, so the bundled adapter is alert-only:
+// one `cat` of the daemon-written PER-SESSION line, selected by the top-level session_id Kimi
+// pipes on stdin. Every "nothing to show" path — no/invalid session id, missing or stale
+// heartbeat, missing line file, zero unread (the daemon writes an EMPTY per-session line then) —
+// prints NOTHING and exits 0, so Kimi renders its built-in footer items untouched.
+test("T366: the bundled Kimi adapter renders its own session's alert — every empty path exits 0", (t) => {
   const h = home(), n = new MbxNode(h, { host: "alpha" });
   t.after(() => { n.close(); rmSync(h, { recursive: true, force: true }); });
   n.bindSession({ agent: "drum", cli: "kimi", session_id: "kimi-1", pid: process.pid, session_key: "k" });
@@ -250,16 +252,105 @@ test("the bundled Kimi adapter renders with node absent from PATH — and fails 
   n.send({ from: "boss", to: ["drum"], subject: "hey", body: "b", needs_reply: true });
   writeHud(n);
   const script = resolve("skill/scripts/kimi-statusline.sh");
+  // The render budget is enforced as a dependency, not a wall clock — a node startup is 150 ms
+  // idle and 470-630 ms at load 78, which breaks Kimi's 300 ms cap. With node off PATH the script
+  // must still render. /bin:/usr/bin carries awk/date/cat but no node (macOS ships none).
   const shEnv = { ...process.env, MBX_HOME: h, PATH: "/bin:/usr/bin" } as Record<string, string>;
-  const ok = spawnSync("/bin/sh", [script], { input: JSON.stringify({ session_id: "kimi-1" }), encoding: "utf8", env: shEnv });
+  const render = (input: string, env = shEnv) => spawnSync("/bin/sh", [script], { input, encoding: "utf8", env });
+  // bound with unread: the alert takes footer line 1
+  const ok = render(JSON.stringify({ session_id: "kimi-1" }));
   assert.equal(ok.status, 0, ok.stderr);
   assert.match(ok.stdout, /^mbx drum 1↑ 1↺/);
-  const unbound = spawnSync("/bin/sh", [script], { input: JSON.stringify({ session_id: "nope" }), encoding: "utf8", env: shEnv });
-  assert.notEqual(unbound.status, 0, "an unbound session fails over to Kimi's built-in layout");
-  assert.equal(unbound.stdout, "");
-  const noSid = spawnSync("/bin/sh", [script], { input: "{}", encoding: "utf8", env: shEnv });
-  assert.notEqual(noSid.status, 0, "no session id also fails over");
-  assert.equal(noSid.stdout, "");
+  // garbage, missing, or invalid session ids: nothing renders, still exit 0
+  for (const bad of ["not even json", "{}", JSON.stringify({ session_id: "bad id!" }), JSON.stringify({ session_id: 7 })]) {
+    const out = render(bad);
+    assert.equal(out.status, 0, out.stderr);
+    assert.equal(out.stdout, "", `nothing renders for stdin ${bad}`);
+  }
+  // bound with zero unread: the daemon wrote an EMPTY per-session line — empty output, stock footer
+  n.ack(n.inbox("drum")[0].id, "drum");
+  writeHud(n);
+  const quiet = render(JSON.stringify({ session_id: "kimi-1" }));
+  assert.equal(quiet.status, 0, quiet.stderr);
+  assert.equal(quiet.stdout, "", "zero unread renders nothing — the stock footer stays");
+  // unbound (the binding is gone, its line file pruned): empty output, never error text
+  n.store.db.prepare("DELETE FROM sessions WHERE session_id='kimi-1'").run();
+  writeHud(n);
+  const unbound = render(JSON.stringify({ session_id: "kimi-1" }));
+  assert.equal(unbound.status, 0, unbound.stderr);
+  assert.equal(unbound.stdout, "", "an unbound session renders nothing");
+  // a home the daemon never touched: no heartbeat, no line files — still empty, still exit 0
+  const dead = home();
+  t.after(() => rmSync(dead, { recursive: true, force: true }));
+  const down = render(JSON.stringify({ session_id: "kimi-1" }), { ...shEnv, MBX_HOME: dead });
+  assert.equal(down.status, 0, down.stderr);
+  assert.equal(down.stdout, "", "no daemon at all: nothing renders, nothing errors");
+  // heartbeat older than ~10 s refuses the render even when a line file exists — never a stale alert
+  const staleHome = home();
+  t.after(() => rmSync(staleHome, { recursive: true, force: true }));
+  mkdirSync(join(staleHome, "hud"), { recursive: true });
+  writeFileSync(join(staleHome, "hud", ".alive"), String(Date.now() - 60_000));
+  writeFileSync(join(staleHome, "hud", "kimi-x.line"), "mbx drum 3↑\n");
+  const stale = render(JSON.stringify({ session_id: "x" }), { ...shEnv, MBX_HOME: staleHome });
+  assert.equal(stale.status, 0, stale.stderr);
+  assert.equal(stale.stdout, "", "a stale heartbeat refuses the render");
+});
+
+// T308 AC2 / T366 review blocker: with two bound Kimi sessions, each footer shows only ITS OWN
+// identity — the adapter resolves the session id on stdin and cats that session's line, never a
+// shared aggregate; and a session with zero unread renders empty even while the other has mail.
+test("T366: two bound Kimi sessions each render only their own line — no cross-identity leak", (t) => {
+  const h = home(), n = new MbxNode(h, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(h, { recursive: true, force: true }); });
+  n.bindSession({ agent: "drum", cli: "kimi", session_id: "kimi-a", pid: process.pid, session_key: "k1" });
+  claim(n, "drum", "kimi-a");
+  n.bindSession({ agent: "seg", cli: "kimi", session_id: "kimi-b", pid: process.pid, session_key: "k2" });
+  claim(n, "seg", "kimi-b");
+  n.send({ from: "boss", to: ["drum"], subject: "one", body: "b" });
+  n.send({ from: "boss", to: ["drum"], subject: "two", body: "b" });
+  n.send({ from: "boss", to: ["seg"], subject: "hey", body: "b" });
+  writeHud(n);
+  const script = resolve("skill/scripts/kimi-statusline.sh");
+  const shEnv = { ...process.env, MBX_HOME: h, PATH: "/bin:/usr/bin" } as Record<string, string>;
+  const render = (sid: string) =>
+    spawnSync("/bin/sh", [script], { input: JSON.stringify({ session_id: sid }), encoding: "utf8", env: shEnv });
+  const a = render("kimi-a");
+  assert.equal(a.status, 0, a.stderr);
+  assert.match(a.stdout, /^mbx drum 2↑/, "session A shows only its own identity's two messages");
+  assert.doesNotMatch(a.stdout, /seg/, "session A never shows the other identity");
+  const b = render("kimi-b");
+  assert.equal(b.status, 0, b.stderr);
+  assert.match(b.stdout, /^mbx seg 1↑/, "session B shows only its own identity's one message");
+  assert.doesNotMatch(b.stdout, /drum/, "session B never shows the other identity");
+  // A's mail is handled: A renders empty (its own zero unread) while B still shows its own alert
+  for (const m of n.inbox("drum")) n.ack(m.id, "drum");
+  writeHud(n);
+  assert.equal(render("kimi-a").stdout, "", "zero unread renders empty even while the other session has mail");
+  assert.match(render("kimi-b").stdout, /^mbx seg 1↑/);
+});
+
+// T366 daemon side: kimi's PER-SESSION line renders are alert-only — EMPTY at zero unread (so the
+// CLI's command, which replaces the footer, prints nothing and the built-in items render), the
+// alert at unread > 0, clearing the moment the mail is handled — while every other CLI's line is
+// unchanged. Per-session, never a shared file: one session must never see another identity's line.
+test("T366: kimi's per-session line is alert-only — empty at zero unread, alert on mail, claude unchanged", (t) => {
+  const h = home(), n = new MbxNode(h, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(h, { recursive: true, force: true }); });
+  n.bindSession({ agent: "drum", cli: "kimi", session_id: "kimi-1", pid: process.pid, session_key: "k" });
+  claim(n, "drum", "kimi-1");
+  n.bindSession({ agent: "seg", cli: "claude", session_id: "claude-1", pid: process.pid, session_key: "k" });
+  claim(n, "seg", "claude-1");
+  writeHud(n);
+  assert.equal(readFileSync(hudSessionLinePath(h, "kimi", "kimi-1"), "utf8"), "", "kimi's line is empty at zero unread");
+  assert.equal(readFileSync(hudSessionLinePath(h, "claude", "claude-1"), "utf8"), "mbx seg\n", "claude's line composes as before");
+  // unread mail: the alert takes footer line 1
+  n.send({ from: "boss", to: ["drum"], subject: "hey", body: "b", needs_reply: true });
+  writeHud(n);
+  assert.equal(readFileSync(hudSessionLinePath(h, "kimi", "kimi-1"), "utf8"), "mbx drum 1↑ 1↺\n");
+  // and it clears the moment the mail is handled
+  n.ack(n.inbox("drum")[0].id, "drum");
+  writeHud(n);
+  assert.equal(readFileSync(hudSessionLinePath(h, "kimi", "kimi-1"), "utf8"), "");
 });
 
 test("copilot, cursor and gemini adapters render by session id only (Claude-compatible statusLine shape)", (t) => {

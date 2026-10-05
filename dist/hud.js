@@ -74,6 +74,13 @@ export function hudLine(snap) {
         seg.push(`*v${snap.update_available}`);
     return `mbx ${seg.join(" ")}`;
 }
+// T366: Kimi's `[status_line].command` REPLACES the built-in footer (the T347 premise that `items`
+// and `command` compose was wrong), so every kimi-rendered line is alert-only: with nothing to show
+// (unread == 0) the line is EMPTY and Kimi renders its own footer items untouched; with unread mail
+// the alert takes footer line 1. Every other CLI's command composes with its built-in items and its
+// line is unchanged. Unbound/ambiguous rows never reach this — the writer skips them before render.
+const cliLine = (cli, snap) => cli === "kimi" && !snap.unread ? "" : hudLine(snap);
+const writeSeg = (path, seg) => writeIfChanged(path, seg ? `${seg}\n` : "");
 const writeIfChanged = (path, content) => {
     try {
         if (readFileSync(path, "utf8") === content)
@@ -134,9 +141,9 @@ export function writeHud(node, now = Date.now()) {
             }
             wanted.add(hudSessionPath(node.home, row.cli, row.session_id));
             writeIfChanged(hudSessionPath(node.home, row.cli, row.session_id), snapshot);
-            const line = hudLine(JSON.parse(snapshot));
+            const line = cliLine(row.cli, JSON.parse(snapshot));
             wanted.add(hudSessionLinePath(node.home, row.cli, row.session_id));
-            writeIfChanged(hudSessionLinePath(node.home, row.cli, row.session_id), line + "\n");
+            writeSeg(hudSessionLinePath(node.home, row.cli, row.session_id), line);
             // Critical fix: a pid file is written per (cli, pid) only when a pid-ONLY resolution proves a
             // single holder — keyed by the pid's birth time so a reused pid can never inherit another
             // agent's mail, and never written while the pid is ambiguous (the owner's probe).
@@ -157,7 +164,7 @@ export function writeHud(node, now = Date.now()) {
                         writeIfChanged(p, pidSnap);
                         const pl = hudPidLinePath(node.home, row.cli, row.pid, start);
                         wanted.add(pl);
-                        writeIfChanged(pl, hudLine(JSON.parse(pidSnap)) + "\n");
+                        writeSeg(pl, cliLine(row.cli, JSON.parse(pidSnap)));
                     }
                 }
             }

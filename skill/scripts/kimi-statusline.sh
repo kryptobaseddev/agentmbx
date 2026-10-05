@@ -1,12 +1,15 @@
 #!/bin/sh
-# MBX segment for Kimi Code's [status_line] command (T313/T347). Pure sh: awk, date and one cat —
-# no node startup on the render path (Kimi's cap is 300 ms, throttled to once per second; the node
-# adapter measured 0.21–0.34 s, i.e. one node start per second per session — review major 5).
-# Reads the daemon-written HUD snapshot. Additive by contract (owner 2026-10-04): when there is
-# no segment to render (unbound, daemon down, stale heartbeat) it EXITS NONZERO so Kimi falls back
-# to its built-in layout instead of showing a blank footer — our line is never a substitute for it.
+# MBX alert segment for Kimi Code's [status_line] command (T313/T366). Pure sh: awk, date and one
+# cat — no node startup on the render path (Kimi's cap is 300 ms, throttled to once per second; the
+# node adapter measured 0.21–0.34 s, i.e. one node start per second per session — review major 5).
+# Kimi's custom command REPLACES the footer — the built-in items render only when the command
+# prints nothing — so this adapter is alert-only: it cats the daemon-written PER-SESSION line for
+# the session whose id Kimi pipes on stdin, and every "nothing to show" path (no/invalid session
+# id, missing or stale heartbeat, missing line file, zero unread — the daemon writes an EMPTY
+# per-session line then) prints NOTHING and exits 0, so Kimi renders its built-in footer items.
+# A session never sees another session's line: the render is one cat of its own kimi-<sid>.line.
 set -f
-json=$(cat 2>/dev/null) || exit 1
+json=$(cat 2>/dev/null) || exit 0
 # Only the TOP-LEVEL "session_id" counts, and only when its value is a string (same scanner as the
 # statusline adapter: a nested key never selects another session's snapshot).
 sid=$(printf '%s' "$json" | LC_ALL=C awk '
@@ -33,13 +36,13 @@ BEGIN { RS = "\001" }
   }
 }')
 case "$sid" in
-  *[!A-Za-z0-9_-]*|'') exit 1 ;;
+  *[!A-Za-z0-9_-]*|'') exit 0 ;;
 esac
 hud="${MBX_HOME:-$HOME/.local/share/agentmbx}/hud"
-alive=$(cat "$hud/.alive" 2>/dev/null) || exit 1
+alive=$(cat "$hud/.alive" 2>/dev/null) || exit 0
 case "$alive" in
-  *[!0-9]*|'') exit 1 ;;
+  *[!0-9]*|'') exit 0 ;;
 esac
 now=$(( $(date +%s) * 1000 )) # seconds is macOS-portable; the 10 s staleness budget absorbs the rounding
-[ $(( now - alive )) -le 10000 ] || exit 1
-cat "$hud/kimi-$sid.line" 2>/dev/null || exit 1
+[ $(( now - alive )) -le 10000 ] || exit 0 # a future-dated alive (clock skew) is negative: passes
+cat "$hud/kimi-$sid.line" 2>/dev/null || exit 0 # unbound / pruned: nothing to show, not an error

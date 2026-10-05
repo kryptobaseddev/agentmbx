@@ -69,7 +69,9 @@ export const statuslineCommand = (home: string, cli: "claude" | "kimi" | "grok",
   const script = join(skillDest(home), "scripts", `${cli}-statusline.sh`);
   return existsSync(script) ? `sh ${shJoin([script])}` : `${shJoin(cmd)} statusline ${cli}`;
 };
-const statuslineForms = (home: string, cli: "claude" | "kimi" | "grok", cmd: string[]): Set<string> => new Set([
+/** The command forms a CURRENT setup writes and recognizes as up to date (T368: doctor warns on
+ *  an older recognized form — isOurStatusline also matches those so they upgrade, never read foreign). */
+export const statuslineForms = (home: string, cli: "claude" | "kimi" | "grok", cmd: string[]): Set<string> => new Set([
   `sh ${shJoin([join(skillDest(home), "scripts", `${cli}-statusline.sh`)])}`,
   `${shJoin(cmd)} statusline ${cli}`,
 ]);
@@ -138,18 +140,24 @@ const tomlStringValue = (body: string, key: string): string | null => {
 const kimiCommandValue = (body: string): string | null => tomlStringValue(body, "command");
 
 /** The status line command actually configured for a CLI right now (re-review item 2: doctor
- *  checks the configured command, never the one setup would write). */
+ *  checks the configured command, never the one setup would write). Read from the status line
+ *  SECTION: grok's config.toml also holds [mcp_servers.mbx] with its own `command = `, and a whole-
+ *  file scan would return that one; a status_line key in a non-section form has no command here. */
 export const statuslineConfiguredCommand = (home: string, cli: "claude" | "kimi" | "grok"): string | null => {
   try {
     if (cli === "claude") return (parseObj(read(join(home, ".claude/settings.json"))).statusLine as { command?: string } | undefined)?.command ?? null;
     if (cli === "grok") {
       const dir = (home === homedir() && process.env.GROK_HOME) || join(home, ".grok");
       const cur = read(join(dir, "config.toml"));
-      return cur === null ? null : grokCommandValue(cur);
+      if (cur === null) return null;
+      const st = grokStatus(cur);
+      return st.form === "section" ? grokCommandValue(st.body) : null;
     }
     const dir = (home === homedir() && process.env.KIMI_CODE_HOME) || join(home, ".kimi-code");
     const cur = read(join(dir, "tui.toml"));
-    return cur === null ? null : kimiCommandValue(cur);
+    if (cur === null) return null;
+    const st = kimiStatus(cur);
+    return st.form === "section" ? kimiCommandValue(st.body) : null;
   } catch { return null; }
 };
 
@@ -194,7 +202,9 @@ function kimiStatusLine(home: string, cmd: string[]) {
         if (!isOurStatusline(home, "kimi", cmd, command)) return cur; // a foreign command line: leave everything
         if (command === w) return cur;
         const eolOfFile = (cur ?? "").includes("\r\n") ? "\r\n" : "\n"; // minor: match the file's line ending
-        return guarded(cur, (cur ?? "").replace(st.commandLine!, () => `command = ${JSON.stringify(w)}${eolOfFile}`)); // rewrite ONLY our command line — items and other keys stay
+        // T366: rewrite ONLY our command line. Their other keys stay in the FILE, but Kimi renders
+        // only the command — [status_line].command replaces the footer, items never compose with it.
+        return guarded(cur, (cur ?? "").replace(st.commandLine!, () => `command = ${JSON.stringify(w)}${eolOfFile}`));
       }
       // Exactly one line ending between the prior content and our section — uninstall removes
       // exactly one too, so LF and CRLF files round-trip byte-exactly.
