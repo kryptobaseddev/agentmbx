@@ -52,14 +52,17 @@ test("a second live connection of the same session and provider never takes the 
   const mail = node.send({ from: "sender", to: ["same-reader"], subject: "pending", body: "kept" }).envelope.id;
 
   const transient = await connect();
-  const second = who(await call(transient, "mbx_whoami"));
-  assert.deepEqual([second.agent, second.pending], [null, "same-reader"], "the newcomer stays unbound with the name pending");
-  assert.match(String(second.reason), /live MCP server of this same codex session/);
-  assert.equal((await call(transient, "mbx_read", { ids: [mail] })).isError, true, "the newcomer cannot read the held mailbox");
+  // T439: the newcomer co-uses the live server's lease (test/same-session-sibling.test.ts) instead of taking it.
+  const second = who(await call(transient, "mbx_whoami")) as ReturnType<typeof who> & { co_use?: string };
+  assert.equal(second.agent, "same-reader", "the newcomer co-uses the session's identity");
+  assert.match(String(second.co_use), /co-using this session's identity/);
+  assert.deepEqual(lease("same-reader"), held, "co-use takes nothing");
   const listed = JSON.parse(((await call(transient, "mbx_identity", { action: "list" })).content as { text: string }[])[0].text) as
-    { identities: { name: string; claimable: boolean }[] };
-  assert.equal(listed.identities.find(i => i.name === "same-reader")?.claimable, false, "identity list agrees with the claim");
-  assert.equal((await call(transient, "mbx_identity", { action: "claim", name: "same-reader" })).isError, true, "an explicit claim is refused too");
+    { identities: { name: string; claimable: boolean; reason: string }[] };
+  const entry = listed.identities.find(i => i.name === "same-reader");
+  assert.equal(entry?.claimable, false, "identity list agrees with the claim: not claimable");
+  assert.match(String(entry?.reason), /live MCP server of this same codex session.*co-uses it/);
+  assert.notEqual((await call(transient, "mbx_identity", { action: "claim", name: "same-reader" })).isError, true, "an explicit claim co-uses too");
   assert.deepEqual(lease("same-reader"), held);
   assert.equal(node.store.db.prepare("SELECT 1 FROM audit WHERE event='identity.takeover'").get(), undefined);
 
@@ -71,15 +74,18 @@ test("a second live connection of the same session and provider never takes the 
   assert.equal(who(first).agent, "same-reader");
   assert.notEqual((await call(original, "mbx_read", { ids: [mail] })).isError, true, "the original server keeps serving");
 
-  // The pending newcomer resumes once the live holder really ends.
+  // A co-using newcomer takes the identity over with its own lease once the live holder really ends.
   const later = await connect();
-  assert.equal(who(await call(later, "mbx_whoami")).agent, null);
+  assert.equal(who(await call(later, "mbx_whoami")).agent, "same-reader");
+  assert.deepEqual(lease("same-reader"), held);
   await original.close();
   const deadline = Date.now() + 10_000;
-  while (who(await call(later, "mbx_whoami")).agent !== "same-reader") {
+  while (lease("same-reader").token === held.token || lease("same-reader").released_at !== null) {
     assert.ok(Date.now() < deadline, "the newcomer did not resume after the holder ended");
+    await call(later, "mbx_whoami");
     await new Promise(r => setTimeout(r, 50));
   }
+  assert.notEqual(lease("same-reader").holder_pid, held.holder_pid);
   assert.notEqual((await call(later, "mbx_read", { ids: [mail] })).isError, true);
 });
 

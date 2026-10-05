@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **A sibling MCP server of a live session co-uses its identity (T439):** 0.5.10 (T383) left a second MCP server of the same provider session pending while the session's own server was live, so OpenCode's code-mode `execute` tool and Codex's transient same-thread connection could not use mbx at all. A server of the same CLI and session whose live holder runs under the same provider process now co-uses that identity: `mbx_whoami`, `mbx_inbox`, `mbx_read`, `mbx_reply`, `mbx_send` and `mbx_ack` act as it under the holder's lease token (sends stay `leased`-verified), without taking, renewing, moving, renaming or releasing the lease, and without pushing wakes or publishing a session binding. Each call re-checks the holder's lease: once it is released or replaced, the sibling's next call fails closed and the name goes back to pending. Its own session key carries no owner grant, so its sends never carry owner authority. `mbx_whoami` and `mbx_identity list` say `co_use`; `mbx_identity release` on a sibling only stops co-using. A dead holder or a restarted provider is still taken over as before; an unknown provider parentage neither evicts nor co-uses.
+
 ## 0.5.10 (2026-10-05)
 
 A second short-lived MCP server for the same session can no longer evict the live one, and the build handover no longer crashes an unbound connector (the Codex and OpenCode "Transport closed" failures); `agentmbx probe` checks that every live agent wakes and answers with no human prompt; Grok continues a turn that is ending when mail arrives.
