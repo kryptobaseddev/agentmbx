@@ -7,6 +7,7 @@ import { fingerprint } from "./crypto.ts";
 import { signHop } from "./http.ts";
 import { relayState, ROLLBACK_REASON } from "./relay-v2.ts";
 import { kimiHostedServer, kimiInstances } from "./kimi-web.ts";
+import { opencodeService } from "./wake.ts";
 import { kimiDesktop } from "./kimi-desktop.ts";
 import { version } from "./version.ts";
 import { GROK_NO_PUSH, MbxNode, RETRY_HOURS } from "./node.ts";
@@ -163,6 +164,21 @@ export function pruneSummary(node: MbxNode): Check {
  *  and grok are replace-only — `command` replaces the footer and never renders alongside the user's
  *  other keys. opencode has no custom status line feature at all (built-in segments only), so the
  *  honest result is an explicit skip note, not a check against an invented config path. */
+/** T391: the OpenCode service is the wake path for every opencode mailbox — when one is bound,
+ *  doctor proves the service answers and says how to start it when it does not. A warn never
+ *  fails doctor (the T435 rule for separate per-CLI functions). Unbound hosts stay silent. */
+export async function opencodeServiceCheck(node: MbxNode, service: () => Promise<{ url: string; auth: string } | null> = opencodeService): Promise<Check | null> {
+  const bound = node.store.db.prepare("SELECT agent FROM sessions WHERE cli='opencode' AND session_id NOT LIKE 'mcp-%'").all() as { agent: string }[];
+  if (!bound.length) return null;
+  const svc = await service().catch(() => null);
+  if (svc) return { level: "ok", label: `opencode: service reachable (${svc.url}) — wake path for ${bound.length} bound mailbox(es)` };
+  return {
+    level: "warn",
+    label: "opencode: service not reachable, so bound OpenCode mailboxes cannot be woken",
+    fix: "run any opencode command (or `opencode service start`) so the service API comes up; config: ~/.config/opencode/service.json",
+  };
+}
+
 export function statuslineChecks(ctx: SetupCtx, cli: string): Check[] {
   if (cli === "opencode")
     return [{ level: "info", label: "opencode: no custom status line feature (built-in segments only: anomalyco/opencode#30295); nothing to verify" }];
@@ -220,6 +236,9 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     // The status line is optional and never fails doctor (review minor 7). T368: the checks are
     // static and per-CLI — ours must be a CURRENT form, foreign must be truly foreign.
     for (const c of statuslineChecks(ctx, d.cli)) out.push(c);
+    // T391: the opencode service check is its own function (never a new top-level grok/opencode
+    // collision — see the T435 note above) and runs only when an opencode mailbox is bound.
+    if (d.cli === "opencode" && node) { const c = await opencodeServiceCheck(node); if (c) out.push(c); }
     // T384: a command string that matches what setup would write is still "wired". Flag the path
     // itself when that file is gone, including a stale …/agentmbx that install would rewrite.
     if (d.cli === "grok") {

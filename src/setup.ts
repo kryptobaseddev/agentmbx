@@ -712,6 +712,75 @@ function kimiHooks(cmd: string[]) {
   };
 }
 
+// ---- OpenCode hooks plugin (T391) -------------------------------------------------------------
+// OpenCode has no settings-file hooks: its first-party mechanism is a plugin module that the TUI
+// auto-loads from ~/.config/opencode/plugins/. The plugin below translates OpenCode events onto the
+// same `agentmbx hook <event> --cli opencode` contract every other CLI uses:
+//   session.created -> session-start (bind + inbox note)   tool.execute.after -> post-tool
+//   session.idle    -> stop (Stop continuation)
+// Ours-detection is a first-line marker; a file without it is foreign and is never touched (T347
+// bar: byte-exact install, byte-exact uninstall, local edits reported instead of overwritten).
+
+export const opencodePluginPath = (home: string) => join(home, ".config/opencode/plugins/agentmbx.ts");
+const OPENCODE_PLUGIN_MARKER = "// agentmbx-plugin v1 (T391) — managed by `agentmbx setup --only opencode`";
+
+/** True when the file's first line starts with our marker: ours-current or ours-stale, never a user's edit. */
+const isOpencodePluginOurs = (cur: string | null) => cur !== null && cur.split("\n", 1)[0].trim().startsWith(OPENCODE_PLUGIN_MARKER);
+
+/** The exact plugin source setup writes. `bin` is the absolute agentmbx argv joined for the shell. */
+export function opencodePluginSource(cmd: string[], ver: string): string {
+  const bin = JSON.stringify(shJoin(cmd));
+  return `${OPENCODE_PLUGIN_MARKER} (agentmbx ${ver})
+// Local edits make this file foreign: setup stops managing it and doctor reports it.
+// Uninstall with: agentmbx setup --uninstall --only opencode
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+type Shell = (parts: TemplateStringsArray, ...args: string[]) => { quiet(): Promise<unknown> };
+
+/** One hook call: the JSON payload goes in via a temp-file redirect; a failure never breaks the session. */
+const call = async ($: Shell, bin: string, event: string, payload: Record<string, unknown>): Promise<void> => {
+  let dir: string | null = null;
+  try {
+    dir = mkdtempSync(join(tmpdir(), "agentmbx-hook-"));
+    const f = join(dir, "payload.json");
+    writeFileSync(f, JSON.stringify(payload));
+    await \`\${bin} hook \${event} --cli opencode < \${f}\`.quiet() as unknown as Promise<unknown>;
+  } catch { /* hook failures must never surface in the host TUI */ }
+  finally { if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } } }
+};
+
+export const AgentMBXHooks = async ({ $, directory }: { $: Shell; directory?: string }) => {
+  const run = (event: string, payload: Record<string, unknown>) => call($, ${bin}, event, { cwd: directory, ...payload });
+  return {
+    event: async ({ event }: { event?: { type?: string; properties?: Record<string, unknown> } }) => {
+      const p = event?.properties ?? {};
+      const info = (p.info ?? p.session) as { id?: unknown; directory?: unknown } | undefined;
+      const sid = typeof info?.id === "string" ? info.id : typeof p.sessionID === "string" ? p.sessionID : undefined;
+      if (!sid) return;
+      if (event?.type === "session.created") return run("session-start", { session_id: sid, cwd: typeof info?.directory === "string" ? info.directory : directory });
+      if (event?.type === "session.idle") return run("stop", { session_id: sid });
+    },
+    "tool.execute.after": async (input: { sessionID?: unknown; session_id?: unknown }) => {
+      const sid = typeof input?.sessionID === "string" ? input.sessionID : typeof input?.session_id === "string" ? input.session_id : undefined;
+      if (sid) return run("post-tool", { session_id: sid });
+    },
+  };
+};
+`;
+}
+
+/** The OpenCode hooks edit: one whole file we own. Foreign content is left alone and reported. */
+export function opencodeHooks(cmd: string[], ver: string) {
+  const content = opencodePluginSource(cmd, ver);
+  return {
+    install: (cur: string | null) => (cur === null || isOpencodePluginOurs(cur)) && cur !== content ? content : cur,
+    uninstall: (cur: string | null) => (cur === null || isOpencodePluginOurs(cur)) ? null : cur,
+    isWired: (cur: string | null) => cur === content,
+  };
+}
+
 // ---- OpenCode (JSONC) ------------------------------------------------------------------------
 function opencodeServer(cmd: string[]) {
   const desired = { type: "local", command: [...cmd, "mcp"] };
@@ -861,7 +930,13 @@ export function edits(ctx: SetupCtx, cli: CliId): Edit[] {
           ...jsonHooks(STOP_EVENTS, "codex", cmd) },
       ];
     case "opencode":
-      return [{ cli, kind: "mcp", item: "mcp.servers.mbx", path: opencodeConfig(home), ...opencodeServer(cmd) }];
+      // T391: OpenCode has no settings-file hooks — the first-party mechanism is the plugin module
+      // auto-loaded from ~/.config/opencode/plugins/, translating OpenCode events onto the shared
+      // `agentmbx hook ... --cli opencode` contract (session-start / post-tool / stop continuation).
+      return [
+        { cli, kind: "mcp", item: "mcp.servers.mbx", path: opencodeConfig(home), ...opencodeServer(cmd) },
+        { cli, kind: "hooks", item: "plugin session.created + tool.execute.after + session.idle", path: opencodePluginPath(home), ...opencodeHooks(cmd, version()) },
+      ];
     case "kimi": {
       const kimi = (home === homedir() && process.env.KIMI_CODE_HOME) || join(home, ".kimi-code");
       const srv = jsonServer("mcpServers", { command: cmd[0], args: mcpArgs }, (e) => e.command === cmd[0] && same(e.args ?? [], mcpArgs), true);
