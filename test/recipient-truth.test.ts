@@ -11,6 +11,7 @@ import { generateKeyPair } from "../src/crypto.ts";
 import { MbxNode } from "../src/node.ts";
 import { assertKnownRecipients, suggestNames } from "../src/receipts.ts";
 import { delegateWake } from "./helpers/wake-lease.ts";
+import { inspectLeaseProcess } from "../src/identity-leases.ts";
 
 type Receipt = { to: string; address: string; state: string; detail: string };
 type SendOut = { id: string; recipients: Receipt[]; warnings: string[] };
@@ -33,14 +34,14 @@ async function world(t: { after: (fn: () => Promise<void>) => void }) {
 const out = (r: unknown) => (r as { structuredContent: unknown }).structuredContent as SendOut;
 const byAddr = (o: SendOut, a: string) => o.recipients.find((r) => r.address === a)!;
 
-test("live recipients: woken now for a request, next prompt for a status", async (t) => {
+test("live recipients: eligible for wake for a request, next prompt for a status", async (t) => {
   const { n, session } = await world(t);
   await session("worker", { MBX_CHANNEL: "1" }); // a push path
   delegateWake(n, "worker");
   const boss = await session("boss");
   const req = out(await boss("mbx_send", { to: ["worker"], subject: "s", body: "b", kind: "request", needs_reply: true }));
   assert.equal(byAddr(req, "worker@alpha").state, "live-wake");
-  assert.match(byAddr(req, "worker@alpha").detail, /held by claude session .*woken now/);
+  assert.match(byAddr(req, "worker@alpha").detail, /held by claude session .*eligible for wake .*dispatcher admission pending/);
   assert.deepEqual(req.warnings.filter((w) => /offline/.test(w)), []);
   const st = out(await boss("mbx_send", { to: ["worker"], subject: "s", body: "b", kind: "status" }));
   assert.equal(byAddr(st, "worker@alpha").state, "live-next-prompt");
@@ -123,7 +124,7 @@ test("a crashed or silent holder reads offline at send time, and a quiet shared 
   const lease = (name: string, pid: number, heartbeatAgo: number, cli = "claude") => {
     n.registerAgent(name);
     n.store.db.prepare(`INSERT INTO identity_leases (name,token,holder_pid,holder_start,key_fp,cli,session_id,claimed_at,heartbeat_at,idle_ttl,released_at,release_reason)
-      VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL)`).run(name, `tok-${name}`, pid, "ps-utc:Thu Jan 1 00:00:00 2026", "0000-0000-0000-0000", cli, `sess-${name}`, Date.now(), Date.now() - heartbeatAgo, 1_800_000);
+      VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL)`).run(name, `tok-${name}`, pid, inspectLeaseProcess(pid).start ?? "gone", "0000-0000-0000-0000", cli, `sess-${name}`, Date.now(), Date.now() - heartbeatAgo, 1_800_000);
   };
   lease("crashed", 2 ** 22 + 4242, 10_000);            // its process is gone, the lease was never released
   lease("silent", process.pid, 5 * 60_000);             // alive pid, but no heartbeat for 5 minutes

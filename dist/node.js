@@ -391,8 +391,8 @@ export class MbxNode {
         return out;
     }
     /** How mail reaches this agent when its session is idle. */
-    deliveryMode(agent) {
-        const ss = this.sessionsFor(agent).filter((x) => x.pid && this.sameSession(x.pid, x));
+    deliveryMode(agent, sessions = this.sessionsFor(agent)) {
+        const ss = sessions.filter((x) => x.pid && this.sameSession(x.pid, x));
         if (ss.some((x) => x.channel))
             return "push (Claude channel or session socket)";
         const w = ss.find((x) => sessionWakeable(x));

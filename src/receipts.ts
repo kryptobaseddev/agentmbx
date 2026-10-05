@@ -1,11 +1,12 @@
 // Send-time recipient truth (T205): who a message actually reached, decided when it is sent, so a sender never mistakes
 // "stored in a mailbox" for "an agent will see it". Liveness comes from the identity lease and its existing process
-// evidence only; this module adds no process inspection of its own.
+// evidence. Native push eligibility uses the dispatcher's exact lease/binding guard.
 import { IdentityLeases, identityLeaseStatus, type IdentityLease } from "./identity-leases.ts";
 import type { Envelope } from "./envelope.ts";
 import type { MbxNode, RouteTarget } from "./node.ts";
 import type { MessageRow } from "./store.ts";
-import { hasWakeAuthority } from "./wake.ts";
+import { hasWakeAuthority, liveWatcher } from "./wake.ts";
+import { captureWakeIdentity } from "./wake-identity.ts";
 import { procTable } from "./proc.ts";
 import { activityKey, parseActivity, SHARED_IDLE_MS } from "./identity-availability.ts";
 import { remoteReceipts } from "./remote-receipts.ts";
@@ -34,6 +35,9 @@ export function mailboxLiveness(node: MbxNode, name: string, now = Date.now()): 
     else if (now - row.heartbeat_at >= STALE_HEARTBEAT_MS) { state = "expired"; reason = `no heartbeat for ${Math.round((now - row.heartbeat_at) / 60_000)} min`; }
     // Its pid is running and it renewed within three minutes: as live as an advisory receipt can tell.
     else if (table.has(row.holder_pid)) state = "live";
+  }
+  if ((state === "live" || state === "unknown") && now - row.heartbeat_at >= STALE_HEARTBEAT_MS) {
+    state = "expired"; reason = `no heartbeat for ${Math.round((now - row.heartbeat_at) / 60_000)} min`;
   }
   const holder = `${row.cli} session ${row.session_id.slice(0, 12)}`;
   if (state === "live" || state === "unknown") {
@@ -65,11 +69,16 @@ export function recipientReceipts(node: MbxNode, msgId: string, targets: RouteTa
     let state: RecipientState, detail: string;
     if (!live.live) { state = "offline"; detail = live.detail; }
     else {
-      const mode = node.deliveryMode(name);
+      const sessions = node.sessionsFor(name);
+      const verified = sessions.filter(s => captureWakeIdentity(node, s));
+      const mode = node.deliveryMode(name, verified);
+      const watcher = liveWatcher(node, name, now);
       const why = !m ? "message not found" : !node.wantsWake(name, m) ? "this kind does not wake (status, or no needs_reply/mention)"
-        : !mode.startsWith("push") ? "the session has no push path" : !hasWakeAuthority(node, name, m) ? "no owner policy lets this sender wake it" : null;
+        : !watcher && sessions.length && !verified.length ? "the current lease or session binding could not be verified"
+        : !mode.startsWith("push") || (mode.includes("mbx watcher") && !watcher) ? "the session has no push path"
+        : !hasWakeAuthority(node, name, m) ? "no owner policy lets this sender wake it" : null;
       state = why ? "live-next-prompt" : "live-wake";
-      detail = why ? `${live.detail}; seen on its next prompt: ${why}` : `${live.detail}; woken now (${mode})`;
+      detail = why ? `${live.detail}; seen on its next prompt: ${why}` : `${live.detail}; eligible for wake (${mode}); dispatcher admission pending`;
     }
     if (t.renamed_from) { detail = `${t.renamed_from} was renamed to ${name}; ${state}: ${detail}`; state = "forwarded"; }
     out.push({ to: t.to, address, state, detail });
