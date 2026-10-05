@@ -12,7 +12,12 @@ for (const cli of ["codex", "opencode"]) test(`${cli} a newer process of the sam
   const home = mkdtempSync(join(tmpdir(), "mbx-resume-conflict-")), node = new MbxNode(home, { host: "alpha" });
   const previous = new Client({ name: "previous", version: "test" }), replacement = new Client({ name: "replacement", version: "test" });
   t.after(async () => { await previous.close(); await replacement.close(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
-  const transport = () => new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
+  // The newer process runs under a restarted provider (a stand-in parent process): a second server under the SAME live
+  // provider never takes over (T383, test/same-session-takeover.test.ts).
+  const provider = join(home, "provider.mjs");
+  writeFileSync(provider, "import { spawn } from 'node:child_process'; const c = spawn(process.execPath, process.argv.slice(2), { stdio: 'inherit' }); c.on('exit', code => process.exit(code ?? 1)); process.on('SIGTERM', () => c.kill('SIGTERM'));");
+  let restarted = false;
+  const transport = () => new StdioClientTransport({ command: process.execPath, args: [...(restarted ? [provider] : []), join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "resume-default", MBX_CLI: cli, AGENTMBX_DEV: "1", MBX_NO_DESKTOP: "1" } as Record<string, string> });
   const key = cli === "codex" ? "threadId" : "sessionID", otherId = cli === "codex" ? "99999999-9999-4999-8999-999999999999" : "ses_otherconversation";
   const meta: Record<string, string> = { [key]: cli === "codex" ? "11111111-1111-4111-8111-111111111111" : "ses_resumeconflict" };
@@ -22,6 +27,7 @@ for (const cli of ["codex", "opencode"]) test(`${cli} a newer process of the sam
   assert.notEqual((await call(previous, "mbx_whoami", { name: "circle", role: "reviewer" })).isError, true);
   const holder = node.store.db.prepare("SELECT token,holder_pid FROM identity_leases WHERE name='circle'").get()!;
   const mail = node.send({ from: "sender", to: ["circle"], subject: "pending", body: "preserved" }).envelope.id;
+  restarted = true;
   await replacement.connect(transport());
   // Another conversation that (wrongly) remembers the same identity stays unbound and pending: the live holder keeps it.
   node.keepName(cli, otherId, "circle");

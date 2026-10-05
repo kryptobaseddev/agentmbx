@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Same-session takeover no longer evicts a live server; handover survives a lost lease (T383):** a second MCP connection a provider opens for a session whose own server is still live under the same provider process now stays unbound with the name pending (and resumes once that server ends) instead of taking the lease and releasing it on exit; a takeover still happens when the holder is dead or the provider restarted. An in-place build handover from a server whose base state holds no identity no longer crashes it ("Transport closed"), and the MCP instructions point agents to the `[mbx-probe]` reply convention.
 - **Grok has no idle push; Stop continues a turn that is ending (T385):** Grok's interactive session has no first-party way to accept a prompt from outside. There is no `grok queue` command, `~/.grok/leader.sock` is not a prompt socket, and `grok -p --resume` starts another process. `wakeGrok` submits nothing and reports `not_submitted` / `unsupported` with that reason. A send receipt for a live Grok session with no watcher says the same sentence, and `agentmbx doctor` records it as info. `agentmbx setup` now also installs a Grok `Stop` hook. On a genuine `end_turn` it prints `{"decision":"block","reason":"..."}`, which Grok feeds back as another round of the same turn. A session-end Stop does not block. Idle mail still waits for the next prompt, a desktop notice, or `agentmbx watch`.
 
 ## 0.5.9 (2026-10-05)

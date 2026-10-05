@@ -3,7 +3,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { inspectLeaseProcess, type IdentityLease, type ProcessEvidence } from "./identity-leases.ts";
-import { activityKey, identityAvailability, parseActivity, type LeaseActivity } from "./identity-availability.ts";
+import { activityKey, holderProviderPid, identityAvailability, parseActivity, type LeaseActivity } from "./identity-availability.ts";
+import { procTable } from "./proc.ts";
 import { SCHEMA_VERSION } from "./store.ts";
 
 export interface IdentityStatus {
@@ -26,7 +27,8 @@ export interface IdentityStatus {
 }
 
 export function listIdentityStatus(home: string, options: { now?: number; inspect?: (pid: number) => ProcessEvidence;
-  project?: string; caller?: { cli: string; sessionId: string; pid?: number }; includeRetired?: boolean } = {}) {
+  project?: string; caller?: { cli: string; sessionId: string; pid?: number; providerPid?: number }; includeRetired?: boolean;
+  processTable?: () => Map<number, { ppid: number }> } = {}) {
   const path = join(home, "mbx.db"), now = options.now ?? Date.now();
   if (!Number.isSafeInteger(now) || now < 0 || now > 8.64e15) throw new Error("invalid identity observation time");
   if (!existsSync(path)) throw Object.assign(new Error("mailbox is not initialized; run agentmbx setup"), { code: "NOT_FOUND" });
@@ -79,6 +81,10 @@ export function listIdentityStatus(home: string, options: { now?: number; inspec
   // Process discovery happens after releasing the read transaction. Listing is advisory;
   // a claim must recheck the current generation under its own write lock.
   const inspect = options.inspect ?? inspectLeaseProcess;
+  // The provider process a same-session holder serves under (T383), read only for a lease of the caller's own session.
+  const sameSessionProvider = (lease: IdentityLease, caller: { cli: string; sessionId: string; providerPid?: number }) =>
+    lease.cli === caller.cli && lease.session_id === caller.sessionId
+      ? { holderProviderPid: holderProviderPid((options.processTable ?? procTable)(), lease.holder_pid, caller.providerPid) } : {};
   for (const lease of leases) {
     const item = row(lease.name); activity(item, lease.heartbeat_at); activity(item, lease.released_at);
     let evidence: ProcessEvidence = { alive: null, start: null };
@@ -92,7 +98,8 @@ export function listIdentityStatus(home: string, options: { now?: number; inspec
     const own = options.caller?.pid !== undefined && lease.released_at === null && lease.holder_pid === options.caller.pid
       && lease.cli === options.caller.cli && lease.session_id === options.caller.sessionId && evidence.alive !== false;
     const a = own ? { state: "live" as const, claimable: false, reason: "held by this session" }
-      : identityAvailability({ lease, evidence, activity: activityByName.get(lease.name) ?? null, conflict: conflicts.has(lease.name), now, caller: options.caller });
+      : identityAvailability({ lease, evidence, activity: activityByName.get(lease.name) ?? null, conflict: conflicts.has(lease.name), now,
+        caller: options.caller && { ...options.caller, ...sameSessionProvider(lease, options.caller) } });
     item.state = a.state === "live" ? (a.claimable ? "idle" : "held") : a.state === "idle" ? "idle" : a.state === "unknown" ? "unknown" : a.state === "conflict" ? "conflict" : "available";
     item.claimable = a.claimable;
     item.reason = a.reason;

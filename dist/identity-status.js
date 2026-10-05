@@ -3,7 +3,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { inspectLeaseProcess } from "./identity-leases.js";
-import { activityKey, identityAvailability, parseActivity } from "./identity-availability.js";
+import { activityKey, holderProviderPid, identityAvailability, parseActivity } from "./identity-availability.js";
+import { procTable } from "./proc.js";
 import { SCHEMA_VERSION } from "./store.js";
 export function listIdentityStatus(home, options = {}) {
     const path = join(home, "mbx.db"), now = options.now ?? Date.now();
@@ -94,6 +95,9 @@ export function listIdentityStatus(home, options = {}) {
     // Process discovery happens after releasing the read transaction. Listing is advisory;
     // a claim must recheck the current generation under its own write lock.
     const inspect = options.inspect ?? inspectLeaseProcess;
+    // The provider process a same-session holder serves under (T383), read only for a lease of the caller's own session.
+    const sameSessionProvider = (lease, caller) => lease.cli === caller.cli && lease.session_id === caller.sessionId
+        ? { holderProviderPid: holderProviderPid((options.processTable ?? procTable)(), lease.holder_pid, caller.providerPid) } : {};
     for (const lease of leases) {
         const item = row(lease.name);
         activity(item, lease.heartbeat_at);
@@ -112,7 +116,8 @@ export function listIdentityStatus(home, options = {}) {
         const own = options.caller?.pid !== undefined && lease.released_at === null && lease.holder_pid === options.caller.pid
             && lease.cli === options.caller.cli && lease.session_id === options.caller.sessionId && evidence.alive !== false;
         const a = own ? { state: "live", claimable: false, reason: "held by this session" }
-            : identityAvailability({ lease, evidence, activity: activityByName.get(lease.name) ?? null, conflict: conflicts.has(lease.name), now, caller: options.caller });
+            : identityAvailability({ lease, evidence, activity: activityByName.get(lease.name) ?? null, conflict: conflicts.has(lease.name), now,
+                caller: options.caller && { ...options.caller, ...sameSessionProvider(lease, options.caller) } });
         item.state = a.state === "live" ? (a.claimable ? "idle" : "held") : a.state === "idle" ? "idle" : a.state === "unknown" ? "unknown" : a.state === "conflict" ? "conflict" : "available";
         item.claimable = a.claimable;
         item.reason = a.reason;
