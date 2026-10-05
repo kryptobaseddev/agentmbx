@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Status line placement proposals (T369):** `agentmbx statusline suggest [--cli claude|kimi|grok] [--json] [--apply]` is an LLM-assisted placement mode: it reads the CLI's current status line config (reusing T368's classification) and emits a proposal as human text plus a structured `mbx.statusline-suggest/v1` document the in-session agent can reason over — no network LLM call from agentmbx. Read-only by default (AC1: nothing is written without `--apply`). A user's own status line is never overwritten (T347): the proposal for that state is a wrapper script with exact manual steps — for Claude it appends the MBX segment to the original command's output (additive composition); for Kimi/Grok, whose `command` replaces the footer, the wrapper shows the per-session alert only when the calling session has mail and the original command's output otherwise — never an items+command coexistence claim. `--apply` writes only where setup's own verified text edit can (missing wiring, or upgrading an older recognized form), after a `.bak-agentmbx-<stamp>` backup, and prints the exact before/after and the undo command (`mv <backup> <config>`), which round-trips byte-exact. The proposal states which identity the calling session resolves as, and the rendered segment resolves the calling session's own binding only (T308 AC2).
+
 ## 0.5.8 (2026-10-05)
 
 Kimi's status line becomes alert-only and strictly per-session, `doctor` verifies every CLI's status line wiring, and send receipts stop promising a wake the dispatcher may refuse.
