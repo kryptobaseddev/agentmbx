@@ -47,6 +47,13 @@ export const LIVE_AGENT_MS = 24 * 3_600_000;
 export const SHELL_AGENT_MS = 2 * 3_600_000;
 export const alive = (pid: number | null | undefined) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; } };
 const WAKEABLE = new Set(["codex", "opencode"]);
+/** Idle Grok has no first-party inject (T385). `grok --help` has no queue command. `~/.grok/leader.sock`
+ *  is the leader for config and MCP watches, not a prompt socket (user-guide 26-config-reference.md).
+ *  `grok -p --resume` starts another process (user-guide 14-headless-mode.md). ACP `session/prompt`
+ *  talks to `grok agent`, a different server (user-guide 15-agent-mode.md). A Stop hook can continue
+ *  a turn that is ending (user-guide 10-hooks.md, Stop Decision Control) and cannot open a new one. */
+export const GROK_NO_PUSH =
+  "the session has no push path: Grok has no idle-session inject (no queue command, no TUI prompt socket; grok -p --resume starts another process). A Stop hook continues only a turn that is ending";
 /** Adapter boundary (T067): node core never imports kimi-web; the adapter registers the real check in wake-check. */
 const sessionWakeable = (x: { cli: string; session_id: string; pid?: number | null; channel?: number | boolean }): boolean =>
   !!x.channel || ((WAKEABLE.has(x.cli) || (x.cli === "kimi" && kimiHostedCheck(x.pid))) && !x.session_id.startsWith("mcp-"));
@@ -372,6 +379,7 @@ export class MbxNode {
     if (w) return w.cli === "codex" ? "push (codex queue)" : w.cli === "kimi" ? "push (kimi web or desktop app)" : "push (opencode service)";
     const watcher = JSON.parse(this.store.get(`watcher:${agent}`) ?? "null") as { pid: number; at: number } | null; // agentmbx watch (T033)
     if (watcher && Date.now() - watcher.at < 15_000) try { process.kill(watcher.pid, 0); return "push (mbx watcher: its exit starts your next turn)"; } catch { /* gone */ }
+    if (ss.length > 0 && ss.every((x) => x.cli === "grok")) return GROK_NO_PUSH;
     return "no push: new mail shows on your user's next prompt, or when your mbx watcher or [mbx-watch] self-check runs";
   }
 

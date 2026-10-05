@@ -1271,7 +1271,10 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
       if (event === "stop") {
         // Keep going instead of going idle when mail that wants this agent arrived during the turn, but only when the
         // owner has delegated work or signed the request, only for mail newer than what was already surfaced, within the wake caps.
-        if (!["claude", "codex", "kimi"].includes(cli)) return;
+        // T385: Grok continues the same turn on {"decision":"block","reason"} (user-guide 10-hooks.md,
+        // Stop Decision Control). A session-end Stop, reason other than end_turn, has no turn left to continue.
+        if (!["claude", "codex", "kimi", "grok"].includes(cli)) return;
+        if (cli === "grok" && typeof input.reason === "string" && input.reason !== "end_turn") return;
         const mark = `stopseen:${cli}:${sid ?? process.ppid}`, seen = node.store.get(mark) ?? new Date(Date.now() - 10 * 60_000).toISOString();
         const fresh = node.inbox(agent, { limit: 50 })
           .filter(m => m.received_at > seen && m.from_addr !== `${agent}@${node.host}` && node.wantsWake(agent, m) && hasWakeAuthority(node, agent, m));

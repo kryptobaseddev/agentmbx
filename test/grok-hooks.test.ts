@@ -17,7 +17,7 @@ import { registerIdentity, sessionHint, sessionHintKey } from "../src/registry.t
 import { runSetup, type SetupCtx } from "../src/setup.ts";
 
 const CMD = ["/opt/bin/agentmbx"];
-const EVENTS = [["SessionStart", "session-start"], ["UserPromptSubmit", "prompt"], ["PostToolUse", "post-tool"]] as const;
+const EVENTS = [["SessionStart", "session-start"], ["UserPromptSubmit", "prompt"], ["PostToolUse", "post-tool"], ["Stop", "stop"]] as const;
 
 function homeWithGrok(): string {
   const home = mkdtempSync(join(tmpdir(), "mbx-grok-hooks-"));
@@ -52,7 +52,7 @@ test("T384 AC1: setup installs grok hooks and uninstalls them byte-exactly", () 
     for (const [event, sub] of EVENTS) {
       assert.deepEqual(commands(text, event), [`/opt/bin/agentmbx hook ${sub} --cli grok`]);
     }
-    assert.doesNotMatch(text, /hook stop --cli grok|PermissionRequest/);
+    assert.doesNotMatch(text, /PermissionRequest/);
     assert.equal(install(home).filter((r) => r.cli === "grok" && r.action !== "unchanged" && r.action !== "skipped").length, 0, "second install is a no-op");
     assert.equal(rd(home), text);
     uninstall(home);
