@@ -20,13 +20,16 @@ export const SUGGEST_CLIS = ["claude", "kimi", "grok"];
 const CONFIG_PATH = (ctx, cli) => edits(ctx, cli).find((e) => e.kind === "statusline").path;
 const WRAPPER_PATH = (home, cli) => join(home, ".config/agentmbx/statusline", `${cli}-statusline-wrapper.sh`);
 const shSingleQuote = (s) => `'${s.replace(/'/g, `'\\''`)}'`;
-/** The wrapper proposal for a user's own status line command. Claude (additive): the original
- *  command's first output line is preserved and the MBX segment appended. kimi/grok (replace-only):
- *  the MBX alert takes footer line 1 when the calling session has mail; otherwise the original
- *  command's output renders — the user's footer is preserved except when there is mail. The mbx
- *  half replays stdin (the CLI's status JSON) so the segment resolves the CALLING session only. */
-export function wrapperScript(cli, userCommand, cmd) {
-    const mbx = `${shJoin(cmd)} statusline ${cli}`;
+/** The wrapper proposal for a user's own status line command. `renderCommand` must be the render
+ *  command setup installs right now (`statuslineCommand`) — the bundled pure-sh script form when
+ *  the skill ships it — so a foreign-line wrapper keeps the one-`cat` render budget (T366)
+ *  instead of a node cold start on every footer refresh. Claude (additive): the original command's
+ *  first output line is preserved and the MBX segment appended. kimi/grok (replace-only): the MBX
+ *  alert takes footer line 1 when the calling session has mail; otherwise the original command's
+ *  output renders — the user's footer is preserved except when there is mail. The mbx half
+ *  replays stdin (the CLI's status JSON) so the segment resolves the CALLING session only. */
+export function wrapperScript(cli, userCommand, renderCommand) {
+    const mbx = renderCommand;
     const user = shSingleQuote(userCommand);
     if (cli === "claude") {
         return `#!/bin/sh
@@ -124,7 +127,7 @@ export function statuslineSuggest(o) {
     // suggest's --apply: the proposal IS the manual path, exactly like setup's manual rows.
     const wrapperPath = WRAPPER_PATH(ctx.home, cli);
     const wrapperCommand = `sh ${shJoin([wrapperPath])}`;
-    const wrapper = { path: wrapperPath, content: wrapperScript(cli, configured, ctx.cmd) };
+    const wrapper = { path: wrapperPath, content: wrapperScript(cli, configured, renderCommand) };
     const replaceNote = contract === "replace-only"
         ? `${cli === "kimi" ? "Kimi" : "Grok"} renders ONLY the command's output — your command is WRAPPED, not accompanied: while this session has unread mail the footer shows the MBX alert; when nothing waits, your command's output renders as it does today. Never "items plus command" — those do not render together.`
         : "Claude renders its built-in items plus the command's output — your command's first output line is preserved and the MBX segment is appended to it (true composition).";

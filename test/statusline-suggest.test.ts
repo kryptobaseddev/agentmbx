@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { MbxNode } from "../src/node.ts";
 import { IdentityLeases, inspectLeaseProcess } from "../src/identity-leases.ts";
 import { applyStatuslineProposal, runStatuslineSuggest, statuslineSuggest, type SuggestCli } from "../src/statusline-suggest.ts";
-import { runSetup, type SetupCtx } from "../src/setup.ts";
+import { runSetup, skillDest, type SetupCtx } from "../src/setup.ts";
 
 const home = () => mkdtempSync(join(tmpdir(), "mbx-suggest-"));
 const ctxFor = (h: string, cmd = ["/opt/bin/agentmbx"]): SetupCtx => ({ home: h, cmd, which: () => null, useClis: false });
@@ -64,12 +64,20 @@ test("contracts: claude proposes true composition; kimi/grok propose wrapping, n
   const h2 = home();
   t.after(() => rmSync(h2, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   put(h2, "kimi");
+  // the bundled kimi adapter is installed (as setup installs it): the wrapper must render through
+  // it — one cat, no node cold start per footer refresh (review round 1)
+  mkdirSync(join(skillDest(h2), "scripts"), { recursive: true });
+  writeFileSync(join(skillDest(h2), "scripts", "kimi-statusline.sh"), "#!/bin/sh\n");
   const k = statuslineSuggest({ ctx: ctxFor(h2), cli: "kimi" });
   assert.equal(k.contract, "replace-only");
   assert.match(k.replaceNote!, /WRAPPED, not accompanied/);
   assert.match(k.replaceNote!, /never/i);
   assert.doesNotMatch(JSON.stringify(k), /items stay|items and command coexist|compose/i, "kimi never claims items+command coexist");
   assert.ok(k.wrapper!.content.indexOf("mbx=") < k.wrapper!.content.indexOf("sh -c"), "the mbx alert comes first");
+  assert.match(k.wrapper!.content, /mbx=\$\(printf '%s\\n' "\$json" \| sh \S*kimi-statusline\.sh\)/,
+    "the wrapper invokes the bundled pure-sh render (statuslineCommand), not the node direct form");
+  assert.doesNotMatch(k.wrapper!.content, /mbx=\$\(printf '%s\\n' "\$json" \| \/\S* statusline kimi\)/,
+    "no node cold start on the render path");
   assert.match(k.wrapper!.content, /if \[ -n "\$mbx" \]; then\n  printf '%s\\n' "\$mbx"\n  exit 0\nfi/);
   // grok: same replace-only shape, its own config + render command
   const h3 = home();
