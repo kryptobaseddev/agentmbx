@@ -158,6 +158,9 @@ const codeEntry = () => {
  * "transfer" releases our base's claim so the real session takes over; "adopt" reuses a racing same-session
  * state's claim. Anything in another process (or another session in this one) stays a genuine conflict.
  */
+/** What a sibling MCP server of a live provider session is told about the identity it co-uses (T439). */
+export const CO_USE_NOTE = "co-using this session's identity: the live MCP server of this same provider session holds its lease; this server acts as that identity "
+    + "under the holder's lease without taking, renewing or releasing it, and stops when that server releases it";
 export const leaseCollisionAction = (e, prior, o) => {
     if (e?.code !== "IDENTITY_IN_USE" || !prior || prior.released_at !== null)
         return null;
@@ -451,7 +454,9 @@ export async function runMcp(existing) {
             return;
         state.activityAt = now;
         try {
-            node.store.set(activityKey(state.agent), JSON.stringify({ at: now, shared: sharedState(state) }));
+            // A co-using sibling is activity of the holder's conversation; it keeps the holder's shared/dedicated marking (T439).
+            const shared = state.coUse ? parseActivity(node.store.get(activityKey(state.agent)))?.shared ?? sharedState(state) : sharedState(state);
+            node.store.set(activityKey(state.agent), JSON.stringify({ at: now, shared }));
         }
         catch { /* advisory */ }
     };
@@ -487,11 +492,22 @@ export async function runMcp(existing) {
                 node.store.audit("identity.takeover", { name: agent, kind: a.takeover, previous: { cli: prior.cli, session: prior.session_id, pid: prior.holder_pid }, by: { cli: env.cli, session: state.sessionId } });
                 return finish(leases.claim(agent, evidence).token);
             }
+            // T439: a sibling of the live holder's own provider session. Thrown (not returned) so the enclosing bind transaction
+            // rolls back: a co-user writes no session binding, control endpoint or lease change of its own.
+            if (a.coUse)
+                throw Object.assign(new Error(`identity ${agent} is co-used: ${a.reason}`), { code: "IDENTITY_CO_USE", coUse: { agent, token: prior.token } });
             throw Object.assign(new Error(`identity ${agent} is not available: ${a.reason}. The finishing holder must call mbx_identity release before ending; `
                 + "then claim this name. Closing a hosted conversation may leave its shared MCP process running. If the holder cannot release, the owner can use agentmbx identity takeover."), { code: "IDENTITY_IN_USE" });
         }
     };
-    const bind = (state, explicit = false) => prepareState(state, undefined, () => {
+    /** Act as `agent` under the lease the live MCP server of this same provider session holds (T439). */
+    const coUseError = (error) => error.code === "IDENTITY_CO_USE"
+        ? error.coUse : null;
+    const adoptCoUse = (state, co) => {
+        Object.assign(state, { agent: co.agent, leaseToken: co.token, coUse: true, released: false, pending: undefined, pendingReason: undefined, lostTo: undefined });
+        touch(state, true);
+    };
+    const bind = (state, explicit = false) => state.coUse ? undefined : prepareState(state, undefined, () => {
         const result = node.store.tx(() => {
             if (state.leaseToken)
                 leases.renew(state.agent, state.leaseToken);
@@ -540,7 +556,7 @@ export async function runMcp(existing) {
         const moved = prepareState(state, undefined, () => node.store.tx(() => {
             if (heldElsewhere(id, controlKey))
                 return false;
-            if (bound(state)) {
+            if (bound(state) && !state.coUse) { // a co-user never moves the holder's lease or binding (T439)
                 leases.renew(state.agent, state.leaseToken);
                 leases.moveSession(state.agent, state.leaseToken, id);
                 node.bindSession({ agent: state.agent, cli: env.cli, session_id: id, cwd: process.cwd(), pid: env.ppid,
@@ -566,7 +582,8 @@ export async function runMcp(existing) {
     };
     const followProvider = (state) => {
         // A stat of the session file; the process table is read only when the id it names differs from this session's.
-        const id = state === base ? providerSession() : null;
+        // A co-user publishes no binding or control endpoint of its own: the holder follows the session (T439).
+        const id = state === base && !state.coUse ? providerSession() : null;
         if (!id || id === state.sessionId)
             return;
         try {
@@ -578,9 +595,10 @@ export async function runMcp(existing) {
     };
     /** Claim `name` for this session; on failure the session stays unbound and keeps `name` pending. Never another name. */
     const resume = (state, name, o = {}) => {
-        const before = { agent: state.agent, leaseToken: state.leaseToken };
+        const before = { agent: state.agent, leaseToken: state.leaseToken, coUse: state.coUse };
         state.agent = name;
         state.leaseToken = undefined;
+        state.coUse = undefined;
         try {
             bind(state, !!o.explicit);
             if (o.launch && !registeredIdentity(node.store, name))
@@ -593,7 +611,12 @@ export async function runMcp(existing) {
             return true;
         }
         catch (error) {
-            Object.assign(state, before.leaseToken ? before : { agent: "", leaseToken: undefined });
+            const co = coUseError(error);
+            if (co) {
+                adoptCoUse(state, co);
+                return true;
+            }
+            Object.assign(state, before.leaseToken ? before : { agent: "", leaseToken: undefined, coUse: undefined });
             if (o.explicit)
                 throw error;
             const code = error.code;
@@ -655,6 +678,13 @@ export async function runMcp(existing) {
             return;
         }
         const name = state.agent;
+        if (state.coUse) {
+            // T439: the session's live server released, lost or handed off the lease this sibling co-used. Fail closed: this call
+            // does not act as the identity. The name stays pending and is re-evaluated (co-use, claim or wait) on the next call.
+            Object.assign(state, { agent: "", leaseToken: undefined, coUse: undefined, pending: name,
+                pendingReason: `the live MCP server of this ${env.cli} session no longer holds the lease this server co-used` });
+            return;
+        }
         if (row && row.token !== state.leaseToken && (row.released_at === null || row.release_reason === "released")) {
             // A release by another process of this same session (it took the lease over, then ended) is not an owner release (T383).
             state.leaseToken = undefined;
@@ -915,10 +945,15 @@ export async function runMcp(existing) {
                 if (!bound(state))
                     return { ...text(unboundMessage(state)), isError: true };
             }
-            else if (!bound(state))
-                withProcSnapshot(() => retryResume(state));
+            else {
+                // A co-using sibling re-checks the holder's lease on identity tools too: it never shows an identity it no longer co-uses.
+                if (state.coUse)
+                    withProcSnapshot(() => ensureLease(state));
+                if (!bound(state))
+                    withProcSnapshot(() => retryResume(state));
+            }
             const before = { agent: state.agent, leaseToken: state.leaseToken, released: state.released, parent: state.parent, sessionId: state.sessionId,
-                pending: state.pending, pendingReason: state.pendingReason, lostTo: state.lostTo };
+                pending: state.pending, pendingReason: state.pendingReason, lostTo: state.lostTo, coUse: state.coUse };
             try {
                 // Recovery controls must remain callable after lease loss. Each mutation below performs
                 // its own generation check; ordinary tools still require the current holder's lease.
@@ -967,10 +1002,18 @@ export async function runMcp(existing) {
             throw new Error("name, role and description are only valid for claim and register");
         if (action === "list") {
             const result = listIdentityStatus(node.home, { project: all ? undefined : project, caller: { cli: env.cli, sessionId: state.sessionId, pid: process.pid, providerPid: env.ppid } });
-            const out = { ...result, you: bound(state) ? { agent: state.agent, address: `${state.agent}@${node.host}` } : { agent: null, pending: state.pending ?? null, reason: state.lostTo ?? state.pendingReason ?? null },
+            const out = { ...result, you: bound(state) ? { agent: state.agent, address: `${state.agent}@${node.host}`, ...(state.coUse ? { co_use: CO_USE_NOTE } : {}) }
+                    : { agent: null, pending: state.pending ?? null, reason: state.lostTo ?? state.pendingReason ?? null },
                 next: bound(state) ? "This session already holds an identity; release it before claiming another."
                     : `Claim one with claimable true ({"action":"claim","name":"<name>"}), or register a new identity ({"action":"register","name":"<project>-<role>","role":"<role>"}).${!all ? " Pass all:true for every identity on this host." : ""}` };
             return text(JSON.stringify(out, null, 2), out);
+        }
+        if (action === "release" && state.coUse) {
+            // T439: a co-using sibling only stops acting as the identity. The lease, the session's remembered name and its
+            // binding belong to the session's live server and are left untouched.
+            const agent = state.agent;
+            Object.assign(state, { leaseToken: undefined, coUse: undefined, released: true, parent: null, pending: undefined, pendingReason: undefined, lostTo: undefined });
+            return text(`This server stopped co-using ${agent}; the live MCP server of this session still holds it. Mail is preserved.`, { agent, released: false, detached: true, co_use: true });
         }
         if (action === "release") {
             const released = node.store.tx(() => {
@@ -1028,16 +1071,28 @@ export async function runMcp(existing) {
                     throw error;
             }
         }
-        const next = { ...state, agent: target, leaseToken: undefined, released: false, pending: undefined, pendingReason: undefined, lostTo: undefined, parent: null };
-        const result = prepareState(next, target, () => node.store.tx(() => {
-            reviveMailbox(node, target);
-            bind(next, true);
-            node.keepName(env.cli, next.sessionId, next.agent);
-            if (role || description || inheritedRole)
-                registerIdentity(node.store, { name: target, role: role ?? registration?.role ?? inheritedRole ?? UNSPECIFIED_ROLE, description, by: `${env.cli}:${next.sessionId}` });
-            node.registerAgent(target, { cli: env.cli, ...(role ? { role } : {}), ...(description ? { description } : {}) });
-            return handoff(next.agent);
-        }));
+        const next = { ...state, agent: target, leaseToken: undefined, coUse: undefined, released: false, pending: undefined, pendingReason: undefined, lostTo: undefined, parent: null };
+        let result;
+        try {
+            result = prepareState(next, target, () => node.store.tx(() => {
+                reviveMailbox(node, target);
+                bind(next, true);
+                node.keepName(env.cli, next.sessionId, next.agent);
+                if (role || description || inheritedRole)
+                    registerIdentity(node.store, { name: target, role: role ?? registration?.role ?? inheritedRole ?? UNSPECIFIED_ROLE, description, by: `${env.cli}:${next.sessionId}` });
+                node.registerAgent(target, { cli: env.cli, ...(role ? { role } : {}), ...(description ? { description } : {}) });
+                return handoff(next.agent);
+            }));
+        }
+        catch (error) {
+            // T439: the session's own live server holds it; this sibling co-uses it (the claim transaction wrote nothing).
+            const co = coUseError(error);
+            if (!co)
+                throw error;
+            adoptCoUse(state, co);
+            const out = { ...leases.withHeldRead(co.agent, co.token, () => handoff(co.agent)), co_use: CO_USE_NOTE };
+            return text(JSON.stringify(out, null, 2), out);
+        }
         Object.assign(state, next);
         touch(state, true);
         return text(JSON.stringify(result, null, 2), result);
@@ -1069,7 +1124,7 @@ export async function runMcp(existing) {
         catch { /* the folder may be gone; the binding still records it */ }
         project = projectOf(t.cwd);
         node.store.set(linkedKey(env.cli, t.session_id), JSON.stringify({ at: new Date().toISOString(), mcp_pid: process.pid }));
-        if (bound(base)) {
+        if (bound(base) && !base.coUse) {
             prepareState(base, undefined, () => node.store.tx(() => {
                 leases.renew(base.agent, base.leaseToken);
                 node.bindSession({ agent: base.agent, cli: env.cli, session_id: t.session_id, cwd: t.cwd, pid: env.ppid, session_key: base.key.publicKey, channel: false, mcp_pid: process.pid });
@@ -1077,7 +1132,7 @@ export async function runMcp(existing) {
                 publishControl(base);
             }));
         }
-        else {
+        else if (!base.coUse) {
             base.sessionId = t.session_id;
             const remembered = node.store.get(`name:${env.cli}:${t.session_id}`);
             if (remembered)
@@ -1110,6 +1165,9 @@ export async function runMcp(existing) {
         let { agent } = state;
         const { key } = state;
         const rename = (to) => {
+            // A rename mints a new lease generation, which would fence out the live server whose lease this one co-uses (T439).
+            if (state.coUse)
+                throw Object.assign(new Error(`this server co-uses ${agent} (held by the live MCP server of this session); rename it from that server`), { code: "IDENTITY_CO_USE" });
             const taken = registeredIdentity(node.store, to);
             if (taken)
                 throw Object.assign(new Error(`${to} is a registered identity (role ${taken.role}); to take it over, release yours and claim it with mbx_identity`), { code: "NAME_IN_USE" });
@@ -1139,7 +1197,7 @@ export async function runMcp(existing) {
         const me = node.agents().find((a) => a.name === agent && a.host === node.host);
         const reg = registeredIdentity(node.store, agent);
         const out = { agent, host: node.host, address: `${agent}@${node.host}`, role: reg?.role ?? me?.role ?? null, description: reg?.description ?? me?.description ?? null,
-            registered: !!reg, project: project ?? null, cli: env.cli, session: fingerprint(key.publicKey),
+            registered: !!reg, project: project ?? null, cli: env.cli, session: fingerprint(key.publicKey), ...(state.coUse ? { co_use: CO_USE_NOTE } : {}),
             owner_grant: s.grant ? { caps: s.grant.caps, expires: s.grant.exp } : null, delivery: node.deliveryMode(agent), unread: node.unreadCount(agent),
             missed: missedCount(node.store, agent).missed,
             // T344: whether this session's sends go out external, since when (root exposure), why, and when that ends
@@ -1394,9 +1452,9 @@ export async function runMcp(existing) {
         process.off("exit", retire);
         try {
             node.store.tx(() => {
-                for (const { key, agent, leaseToken } of [base, ...states.values()]) {
-                    if (leaseToken)
-                        leases.release(agent, leaseToken);
+                for (const { key, agent, leaseToken, coUse } of [base, ...states.values()]) {
+                    if (leaseToken && !coUse)
+                        leases.release(agent, leaseToken); // a co-user never releases the holder's lease (T439)
                     removeIdentityControl(node.store, fingerprint(key.publicKey));
                     node.store.db.prepare("DELETE FROM kv WHERE k=?").run(`mcp-process:${key.publicKey}`);
                     // Key-scoped cleanup cannot erase a newer connection that replaced this binding.
@@ -1436,7 +1494,7 @@ export async function runMcp(existing) {
             for (const state of [base, ...states.values()])
                 for (const request of pendingIdentityControls(node.store, fingerprint(state.key.publicKey))) {
                     // Explicit optional fields restore undefined values added by a failed operation.
-                    const before = { agent: state.agent, leaseToken: state.leaseToken, released: state.released, parent: state.parent, sessionId: state.sessionId };
+                    const before = { agent: state.agent, leaseToken: state.leaseToken, released: state.released, parent: state.parent, sessionId: state.sessionId, coUse: state.coUse };
                     try {
                         const proof = inspectIdentityControlCaller(request.target, request.requester_pid, request.requester_start);
                         prepareState(state, request.name, () => {
@@ -1461,8 +1519,8 @@ export async function runMcp(existing) {
     if (env.channel || env.socket) {
         timers.push(setInterval(async () => {
             try {
-                if (!bound(base))
-                    return;
+                if (!bound(base) || base.coUse)
+                    return; // the holder pushes its own session's wakes (T439)
                 const agent = base.agent;
                 leases.withHeld(agent, base.leaseToken, () => undefined);
                 for (const mailbox of [agent, ...node.linkedNames(agent)]) {
@@ -1519,6 +1577,8 @@ export async function runMcp(existing) {
                 retryResume(state);
                 continue;
             }
+            if (state.coUse)
+                continue; // T439: the holder heartbeats its own lease; each co-used call re-checks it (ensureLease)
             try {
                 bind(state);
             }
