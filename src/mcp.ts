@@ -14,6 +14,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { fingerprint, generateKeyPair } from "./crypto.ts";
 import { checkShape, EXTERNAL_TAINT_MS, externalExposure, KINDS, MAX_RELAY_DEPTH, NAME_RE, type Envelope, type ExternalExposure, type Grant } from "./envelope.ts";
+import { readSessionTaint, taintKey, writeSessionTaint } from "./session-taint.ts";
 import { kimiMultiHost } from "./kimi-web.ts";
 import { BIND_TICKET_RE, takeBindTicket } from "./bind-ticket.ts";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
@@ -515,9 +516,38 @@ export async function runMcp(existing?: MbxNode) {
   /** Act as `agent` under the lease the live MCP server of this same provider session holds (T439). */
   const coUseError = (error: unknown) => (error as { code?: string; coUse?: { agent: string; token: string } }).code === "IDENTITY_CO_USE"
     ? (error as { coUse: { agent: string; token: string } }).coUse : null;
+  /** This session's live external taint, or null once its root exposure is an hour old. */
+  const taintOf = (state: State, now = Date.now()): Taint | null => {
+    const t = state.parent?.external;
+    return t && now - t.root < EXTERNAL_TAINT_MS ? t : null;
+  };
+  // T345/T346: the CLI send path reads this same cli+session key. Release does not delete it.
+  // A co-using sibling shares it because it is the same provider session, not a second record.
+  const persistSessionTaint = (state: State, now: number) => {
+    let key: string;
+    try { key = taintKey(env.cli, state.sessionId); } catch { return; }
+    const taint = taintOf(state, now);
+    if (!taint) {
+      node.store.db.prepare("DELETE FROM kv WHERE k=?").run(key);
+      return;
+    }
+    writeSessionTaint(node.store, {
+      v: 1, cli: env.cli, session_id: state.sessionId, root: taint.root, from: taint.from, id: taint.id, how: taint.how,
+      relay_depth: [...(state.parent?.hops.values() ?? [])],
+    }, now);
+  };
+  const restoreSessionTaint = (state: State, now = Date.now()) => {
+    const record = readSessionTaint(node.store, env.cli, state.sessionId, now);
+    if (!record) return;
+    const hops = new Map<string, { hop: number; from: string; at: number }>();
+    for (const hop of record.relay_depth) hops.set(`${hop.from}\u0000${hop.hop}`, hop);
+    // firstHand stays in memory: a re-read after release can count as a new exposure, and the stored root does not move.
+    state.parent = { hops, external: { how: record.how, root: record.root, from: record.from, id: record.id }, firstHand: state.parent?.firstHand ?? new Map() };
+  };
   const adoptCoUse = (state: State, co: { agent: string; token: string }) => {
     Object.assign(state, { agent: co.agent, leaseToken: co.token, coUse: true, released: false, pending: undefined, pendingReason: undefined, lostTo: undefined });
     touch(state, true);
+    restoreSessionTaint(state);
   };
   const bind = (state: State, explicit = false) => state.coUse ? undefined : prepareState(state, undefined, () => {
     const result = node.store.tx(() => {
@@ -596,6 +626,7 @@ export async function runMcp(existing?: MbxNode) {
         registerIdentity(node.store, { name, role: process.env.MBX_ROLE || UNSPECIFIED_ROLE, description: process.env.MBX_DESCRIPTION, by: `${env.cli}:launch` });
       state.released = false; state.pending = undefined; state.pendingReason = undefined; state.lostTo = undefined;
       touch(state, true);
+      restoreSessionTaint(state);
       return true;
     } catch (error) {
       const co = coUseError(error);
@@ -692,6 +723,7 @@ export async function runMcp(existing?: MbxNode) {
       if (priorRelease) {
         state = { agent: priorRelease.agent, sessionId: sid, key: generateKeyPair(), parent: null, released: true };
         prepareState(state, undefined, () => publishControl(state!));
+        restoreSessionTaint(state);
         states.set(sid, state);
         return state;
       }
@@ -743,11 +775,7 @@ export async function runMcp(existing?: MbxNode) {
       }
       if (x && x.root > (state.parent.external?.root ?? -Infinity)) state.parent.external = { ...x, from: r.from_addr, id: r.id };
     }
-  };
-  /** This session's live external taint, or null once its root exposure is an hour old. */
-  const taintOf = (state: State, now = Date.now()): Taint | null => {
-    const t = state.parent?.external;
-    return t && now - t.root < EXTERNAL_TAINT_MS ? t : null;
+    persistSessionTaint(state, now);
   };
   const relay = (origin?: "agent" | "external", to?: string[]) => {
     const state = current(), { parent, agent } = state;
@@ -940,6 +968,7 @@ export async function runMcp(existing?: MbxNode) {
       // binding belong to the session's live server and are left untouched.
       const agent = state.agent;
       Object.assign(state, { leaseToken: undefined, coUse: undefined, released: true, parent: null, pending: undefined, pendingReason: undefined, lostTo: undefined });
+      restoreSessionTaint(state);
       return text(`This server stopped co-using ${agent}; the live MCP server of this session still holds it. Mail is preserved.`, { agent, released: false, detached: true, co_use: true });
     }
     if (action === "release") {
@@ -954,6 +983,7 @@ export async function runMcp(existing?: MbxNode) {
         return released;
       });
       state.leaseToken = undefined; state.released = true; state.parent = null; state.pending = undefined; state.pendingReason = undefined; state.lostTo = undefined;
+      restoreSessionTaint(state);
       return text("Identity detached. Mail is preserved; explicitly claim an identity to resume mailbox tools.", { agent: state.agent || null, released, detached: true });
     }
     const target = name ?? state.pending ?? (state.agent || undefined);
@@ -1002,6 +1032,7 @@ export async function runMcp(existing?: MbxNode) {
       return text(JSON.stringify(out, null, 2), out);
     }
     Object.assign(state, next);
+    restoreSessionTaint(state);
     touch(state, true);
     return text(JSON.stringify(result, null, 2), result);
   };

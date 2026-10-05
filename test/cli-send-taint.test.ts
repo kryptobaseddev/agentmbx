@@ -1,5 +1,5 @@
-// CLI send reads the conversation taint record (T345). The MCP server does not write it yet;
-// these tests seed taint:<cli>:<session_id> the way noteRead will after #120 merges.
+// CLI send reads the conversation taint record (T345). These tests seed the key directly.
+// MCP noteRead writes the same key; release and claim restore it (T346, external-taint.test.ts).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";

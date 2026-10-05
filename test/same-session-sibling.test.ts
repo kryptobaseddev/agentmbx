@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { MbxNode } from "../src/node.ts";
+import { readSessionTaint } from "../src/session-taint.ts";
 import { identityAvailability } from "../src/identity-availability.ts";
 import type { IdentityLease, ProcessEvidence } from "../src/identity-leases.ts";
 
@@ -138,6 +139,35 @@ test("a sibling stops acting as the identity once the holder's lease is released
   const other = await connect();
   const stranger = await other.callTool({ name: "mbx_whoami", arguments: {}, _meta: { sessionID: "ses_unrelatedsession" } }, undefined, { timeout: 10_000 });
   assert.equal(json(stranger).agent, null);
+});
+
+test("a co-using sibling sends with the holder's conversation taint (T346)", async (t) => {
+  const { node, call, pair } = fixture(t, "opencode");
+  const { holder, sibling } = await pair("sib-taint");
+  node.registerAgent("peer", { role: "peer" });
+  const outside = node.send({ from: "scout", to: ["sib-taint"], subject: "page", body: "copied from a web page", origin: "external" }).envelope;
+  assert.notEqual((await call(holder, "mbx_read", { ids: [outside.id] })).isError, true, "holder reads the outside mail");
+  const stored = readSessionTaint(node.store, "opencode", SESSIONS.opencode.sessionID);
+  assert.ok(stored, "the holder persisted taint:<cli>:<session_id>");
+  assert.equal(stored.id, outside.id);
+  assert.equal(stored.from, "scout@alpha");
+  assert.ok(stored.relay_depth.some((h) => h.from === "scout@alpha" && h.hop === 0));
+
+  const who = await call(sibling, "mbx_whoami");
+  assert.equal(json(who).agent, "sib-taint");
+  const ext = (who.structuredContent as { external?: { tainted?: boolean; root_exposure?: string } } | undefined)?.external;
+  assert.equal(ext?.tainted, true, "the sibling restored the shared conversation key");
+  assert.equal(ext?.root_exposure, new Date(stored.root).toISOString());
+
+  const send = await call(sibling, "mbx_send", { to: ["peer"], subject: "onward", body: "still outside" });
+  assert.notEqual(send.isError, true, textOf(send));
+  const id = (send.structuredContent as { id?: string } | undefined)?.id;
+  assert.equal(typeof id, "string");
+  const envelope = JSON.parse(node.message(id!)!.envelope) as { meta: { origin?: string; external_source?: string; external_since?: string; hop?: number } };
+  assert.equal(envelope.meta.origin, "external");
+  assert.equal(envelope.meta.external_source, "inherited");
+  assert.equal(envelope.meta.external_since, new Date(stored.root).toISOString());
+  assert.equal(envelope.meta.hop, 1, "the sibling kept the holder's hop history");
 });
 
 test("co-use requires the same session and the holder's own provider process", () => {

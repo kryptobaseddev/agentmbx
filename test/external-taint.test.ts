@@ -5,6 +5,7 @@
 // each say why and until when.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { buildEnvelope, checkShape, EXTERNAL_TAINT_MS, externalExposure, signEnvelope, type Envelope } from "../src/envelope.ts";
 import { externalLine, MbxNode } from "../src/node.ts";
+import { readSessionTaint } from "../src/session-taint.ts";
 import { humanPromptKey } from "../src/wake.ts";
 
 const MIN = 60_000;
@@ -46,7 +48,7 @@ async function world(t: { after: (fn: () => Promise<void>) => void }, names: str
     return { e: env(out.id as string), warnings: (out.warnings ?? []) as string[] };
   };
   return {
-    n, call, env,
+    n, call, env, home,
     get now() { return now; },
     advance(ms: number) { now += ms; writeFileSync(clock, String(now)); },
     send: (who: string, to: string[], extra: Record<string, unknown> = {}) => sent(call(who, "mbx_send", { to, subject: "work", body: "data", ...extra })),
@@ -230,4 +232,44 @@ test("paired hosts carry external_since signed and reject a malformed one (T344,
   const bad = buildEnvelope({ from: "sender@alpha", to: ["worker@beta"], subject: "relay", body: "data", origin: "external" });
   assert.equal(b.receive(sign({ ...bad, meta: { ...bad.meta, external_since: "soon" } }), "alpha"), "rejected:bad external_since");
   assert.equal(b.receive(sign({ ...bad, meta: { ...bad.meta, external_source: "forwarded" } } as unknown as Envelope), "alpha"), "rejected:bad external_source");
+});
+
+test("release and claim keep the external taint, its root and its hop history (T346)", async (t) => {
+  const w = await world(t, ["ada", "bob"]);
+  const outside = w.n.send({ from: "scout", to: ["ada"], subject: "issue text", body: "copied from a web page", origin: "external" }).envelope as Env;
+  const root = w.now;
+  await w.read("ada", outside.id);
+  const row = w.n.store.db.prepare("SELECT session_id FROM sessions WHERE agent=?").get("ada") as { session_id: string } | undefined;
+  assert.ok(row, "the reader session is bound");
+  const stored = readSessionTaint(w.n.store, "claude", row.session_id, w.now);
+  assert.equal(stored?.root, root);
+  assert.equal(stored?.id, outside.id);
+  assert.equal(stored?.from, "scout@alpha");
+  assert.ok(stored?.relay_depth.some((h) => h.from === "scout@alpha" && h.hop === 0), "the read's hop is in the record");
+
+  await w.call("ada", "mbx_identity", { action: "release" });
+  assert.equal(readSessionTaint(w.n.store, "claude", row.session_id, w.now)?.root, root, "release does not delete the record");
+
+  await w.call("ada", "mbx_identity", { action: "claim", name: "ada" });
+  const sent = await w.send("ada", ["bob"]);
+  assert.equal(sent.e.meta.origin, "external");
+  assert.equal(sent.e.meta.external_source, "inherited");
+  assert.equal(sent.e.meta.external_since, iso(root), "claim restored the original root, not the claim time");
+  assert.equal(sent.e.meta.hop, 1, "restored hop history still counts the read");
+
+  const cli = spawnSync(process.execPath, [join(import.meta.dirname, "../bin/agentmbx.js"),
+    "send", "--cli", "claude", "--session", row.session_id, "--as", "ada", "--to", "bob", "--subject", "from cli", "-m", "body", "--json"], {
+    encoding: "utf8", timeout: 20_000,
+    env: { ...process.env, MBX_HOME: w.home, AGENTMBX_DEV: "1", MBX_NO_DESKTOP: "1" },
+  });
+  assert.equal(cli.status, 0, cli.stderr);
+  const cliEnv = JSON.parse(w.n.message(JSON.parse(cli.stdout).id)!.envelope) as Env;
+  assert.equal(cliEnv.meta.origin, "external");
+  assert.equal(cliEnv.meta.external_source, "inherited");
+  assert.equal(cliEnv.meta.external_since, iso(root), "the CLI reads the same key the MCP server wrote");
+
+  w.advance(EXTERNAL_TAINT_MS);
+  const cleared = await w.send("ada", ["bob"]);
+  assert.equal(cleared.e.meta.origin ?? "agent", "agent", "an hour after the original root the conversation is clean");
+  assert.equal(cleared.e.meta.external_since, undefined);
 });
