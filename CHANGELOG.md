@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Autonomy probe (T392):** new `src/probe.ts` exports `runProbe()` — the T388 cross-harness autonomy regression gate. It sends a `kind=request`, `needs_reply` `[mbx-probe]` message to every live leased identity in the project (identity-status's held/idle enumeration, sender excluded), waits up to a deadline (default 120s), and reports per agent: the `wake.attempt` outcome/via/receipt from the daemon audit (with the dispatcher's sibling `wake` event for the transport), read and ack receipts with latencies, and the convention reply matched tolerantly by thread plus the `[mbx-probe]`/`probe ok` marker. A target passes when its wake was admitted AND it replied in the thread; the report is non-zero with a per-agent reason on no-wake or no-reply (send failures included), and an empty project fails with `no live leased identities to probe`. Planning and reporting are pure, store I/O sits behind the `ProbeIO` interface, and the waiting loop takes the clock and sleep so the failure paths test without real time. The answering-agent convention (one `probe ok <wake line>` reply in the thread, then ack, no human prompt) is documented in `skill/SKILL.md`. The `agentmbx probe` CLI dispatch is intentionally deferred: `src/cli.ts` is owned by T385 and lands as a one-commit follow-up after it merges (as does the matching one-line addition to the MCP `INSTRUCTIONS` in `src/mcp.ts`, owned by T383).
+
 ## 0.5.9 (2026-10-05)
 
 Grok sessions get their own hooks and the register prompt, `agentmbx statusline suggest` proposes where the MBX segment goes, and send receipts stop calling a re-arming Kimi watcher dead.

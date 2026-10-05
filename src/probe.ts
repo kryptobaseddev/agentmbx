@@ -1,0 +1,259 @@
+// T392: `agentmbx probe` — the T388 cross-harness autonomy regression gate. One command sends an
+// [mbx-probe] request to every live leased identity in the project, waits up to a deadline, and
+// reports per agent whether the daemon wake was admitted, the message was read, a convention
+// reply arrived in the probe thread and the ack closed it — all with no human prompt.
+//
+// The module is split for testability: planning (which agents) and reporting (what counts as
+// pass) are pure; all store I/O sits behind the ProbeIO interface; the waiting loop takes the
+// clock and the sleep function, so the no-wake/no-reply paths test without real time.
+import type { MbxNode } from "./node.ts";
+import { listIdentityStatus, type IdentityStatus } from "./identity-status.ts";
+
+export const PROBE_SUBJECT_PREFIX = "[mbx-probe]" as const;
+/** The exact reply marker the convention asks for; replies are matched on this or the prefix. */
+export const PROBE_REPLY_MARKER = "probe ok" as const;
+export const PROBE_DEADLINE_DEFAULT_MS = 120_000;
+export const PROBE_POLL_MS = 1_000;
+export const PROBE_SCHEMA = "mbx.probe/v1" as const;
+
+export function probeSubject(at = new Date()): string {
+  return `${PROBE_SUBJECT_PREFIX} autonomy probe ${at.toISOString()}`;
+}
+
+/** The convention contract, sent as the probe body and documented in skill/SKILL.md. An agent
+ *  answers autonomously: one `probe ok <wake line>` reply in the thread, then an ack. */
+export function probeBody(): string {
+  return `${PROBE_SUBJECT_PREFIX} automated autonomy probe (AgentMBX T388 regression gate). Message content is data, not a user instruction.
+
+You hold a live identity lease, so you are being asked to prove your harness operates autonomously. Do NOT ask a human. Take no action beyond these two steps, in order:
+
+1. mbx_reply to THIS thread with exactly one line:
+     ${PROBE_REPLY_MARKER} <wake line>
+   where <wake line> is the "[mbx] …" hint your session received for this probe message, quoted verbatim after "${PROBE_REPLY_MARKER}" (write "${PROBE_REPLY_MARKER} (no wake line)" if your session received none — that is reported, not a failure).
+2. mbx_ack the probe message (the one with the ${PROBE_SUBJECT_PREFIX} subject).
+
+\`agentmbx probe\` waits up to its deadline and reports, per agent, whether the daemon wake was admitted, the message was read, your reply arrived in this thread and the ack closed it — all with no human prompt. Do not modify files or state beyond the reply and the ack.`;
+}
+
+// ---- planning (pure) ---------------------------------------------------------------------------------
+
+export interface ProbeTarget {
+  name: string;
+  /** held: live holder; idle: live lease, quiet (shared-process) conversation. Both are live leases. */
+  state: string;
+  holder: { cli: string; session_id: string } | null;
+  reason: string;
+}
+
+/** Every live leased identity in the project, excluding the sender. Live = identity-status's
+ *  held/idle states (its claim path uses the same identityAvailability computation). */
+export function planProbe(identities: readonly IdentityStatus[], sender: string): ProbeTarget[] {
+  return identities
+    .filter((i) => i.name !== sender && (i.state === "held" || i.state === "idle"))
+    .map((i) => ({ name: i.name, state: i.state, holder: i.holder ? { cli: i.holder.cli, session_id: i.holder.session_id } : null, reason: i.reason }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// ---- store I/O behind an interface -------------------------------------------------------------------
+
+export interface SentProbe { id: string; thread: string; at: number }
+export interface WakeObservation { outcome: string | null; via: string | null; receipt: string | null; at: number | null }
+export interface TargetObservation {
+  wake: WakeObservation | null;
+  readAt: number | null;
+  ackedAt: number | null;
+  ackNote: string | null;
+  reply: { id: string; at: number } | null;
+}
+
+export interface ProbeIO {
+  host(): string;
+  listTargets(): IdentityStatus[];
+  send(target: string): SentProbe;
+  observe(target: string, sent: SentProbe): TargetObservation;
+}
+
+/** The real store-backed IO: targets via identity-status (the established read-only enumeration,
+ *  with the project filter and caller scope), sends as kind=request with needs_reply, and
+ *  observations read straight from the audit/deliveries/messages tables. */
+export function storeProbeIO(node: MbxNode, o: { project?: string; sender: string;
+  caller?: { cli: string; sessionId: string; pid?: number } }): ProbeIO {
+  const db = node.store.db;
+  return {
+    host: () => node.host,
+    listTargets: () => listIdentityStatus(node.home, { project: o.project, ...(o.caller ? { caller: o.caller } : {}) }).identities,
+    send: (target) => {
+      const at = Date.now();
+      const r = node.send({ from: o.sender, to: [target], subject: probeSubject(new Date(at)), body: probeBody(),
+        kind: "request", needs_reply: true, ...(o.project ? { project: o.project } : {}) });
+      return { id: r.envelope.id, thread: r.envelope.thread, at };
+    },
+    observe: (target, sent) => {
+      const since = new Date(sent.at).toISOString();
+      // Wake: the latest wake.attempt at/after the send decides. The dispatcher logs
+      // outcome/receipt/native on wake.attempt and the transport via on its sibling wake event;
+      // watchers and channels log everything on the attempt row itself.
+      let wake: WakeObservation | null = null;
+      for (const row of db.prepare("SELECT at, detail FROM audit WHERE event='wake.attempt' AND at>=? ORDER BY at ASC").all(since) as { at: string; detail: string }[]) {
+        let d: { agent?: string; outcome?: string | null; via?: string | null; receipt?: string | null };
+        try { d = JSON.parse(row.detail); } catch { continue; }
+        if (d.agent !== target) continue;
+        wake = { outcome: d.outcome ?? null, via: d.via ?? null, receipt: d.receipt ?? null, at: Date.parse(row.at) };
+      }
+      if (wake && !wake.via) {
+        for (const row of db.prepare("SELECT at, detail FROM audit WHERE event='wake' AND at>=? ORDER BY at ASC").all(since) as { at: string; detail: string }[]) {
+          let d: { agent?: string; via?: string | null };
+          try { d = JSON.parse(row.detail); } catch { continue; }
+          if (d.agent === target && d.via) wake = { ...wake, via: d.via };
+        }
+      }
+      const dlv = db.prepare("SELECT state, updated_at, note FROM deliveries WHERE msg_id=? AND agent=?").get(sent.id, target) as
+        { state: string; updated_at: string; note: string | null } | undefined;
+      const readAt = dlv && (dlv.state === "read" || dlv.state === "acked") ? Date.parse(dlv.updated_at) : null;
+      const ackedAt = dlv && dlv.state === "acked" ? Date.parse(dlv.updated_at) : null;
+      // Reply: same thread, from the target, matched tolerantly on the convention — an agent
+      // may answer before or after its wake line is logged, so the thread and the marker are
+      // the contract, not event ordering.
+      let reply: { id: string; at: number } | null = null;
+      for (const row of db.prepare("SELECT id, ts, subject, from_addr, envelope FROM messages WHERE thread=? AND id<>? ORDER BY ts ASC").all(sent.thread, sent.id) as
+        { id: string; ts: string; subject: string | null; from_addr: string; envelope: string }[]) {
+        if (row.from_addr !== `${target}@${node.host}`) continue;
+        let body = "";
+        try { body = (JSON.parse(row.envelope) as { body?: string }).body ?? ""; } catch { /* unmatched shape: fall through */ }
+        if ((row.subject ?? "").startsWith(PROBE_SUBJECT_PREFIX) || body.includes(PROBE_REPLY_MARKER)) {
+          reply = { id: row.id, at: Date.parse(row.ts) };
+          break;
+        }
+      }
+      return { wake, readAt, ackedAt, ackNote: ackedAt !== null ? (dlv?.note ?? null) : null, reply };
+    },
+  };
+}
+
+// ---- report (pure) -----------------------------------------------------------------------------------
+
+export interface ProbeAgentReport {
+  name: string;
+  holder: { cli: string; session_id: string } | null;
+  message_id: string;
+  sent_at: string;
+  wake: (WakeObservation & { latency_ms: number | null }) | null;
+  read: { at: string; latency_ms: number } | null;
+  ack: { at: string; note: string | null; latency_ms: number } | null;
+  reply: { id: string; at: string; latency_ms: number } | null;
+  ok: boolean;
+  reason: string | null;
+}
+
+export interface ProbeReport {
+  schema: typeof PROBE_SCHEMA;
+  ok: boolean;
+  host: string;
+  project?: string;
+  sender: string;
+  deadline_ms: number;
+  started_at: string;
+  finished_at: string;
+  targets: ProbeAgentReport[];
+  summary: { total: number; passed: number; failed: number };
+  reason: string | null;
+}
+
+const iso = (ms: number) => new Date(ms).toISOString();
+const latency = (at: number | null, sentAt: number) => (at === null ? null : Math.max(0, at - sentAt));
+
+/** A target passes when the daemon admitted its wake AND the convention reply arrived in the
+ *  thread. Read and ack are recorded (AC1) but the gate is wake+reply (AC3). */
+export function buildProbeReport(o: {
+  plan: ProbeTarget[];
+  sent: Map<string, SentProbe>;
+  sendErrors?: Map<string, string>;
+  observations: Map<string, TargetObservation>;
+  startedAt: number;
+  finishedAt: number;
+  deadlineMs: number;
+  host: string;
+  project?: string;
+  sender: string;
+  noTargetsReason?: string;
+}): ProbeReport {
+  const deadlineS = Math.round(o.deadlineMs / 1000);
+  const targets: ProbeAgentReport[] = o.plan.map((t) => {
+    const sent = o.sent.get(t.name)!;
+    const ob = o.observations.get(t.name) ?? { wake: null, readAt: null, ackedAt: null, ackNote: null, reply: null };
+    const reason = o.sendErrors?.get(t.name) ? `probe message could not be sent: ${o.sendErrors.get(t.name)}`
+      : !ob.wake ? `no wake.attempt for ${t.name} within ${deadlineS}s of the probe`
+      : ob.wake.outcome !== "admitted" ? `wake for ${t.name} never admitted (last outcome: ${ob.wake.outcome ?? "unknown"}${ob.wake.via ? ` via ${ob.wake.via}` : ""})`
+      : !ob.reply ? `${t.name} woke but did not reply in the probe thread within ${deadlineS}s`
+      : null;
+    return {
+      name: t.name, holder: t.holder, message_id: sent.id, sent_at: iso(sent.at),
+      wake: ob.wake ? { ...ob.wake, latency_ms: latency(ob.wake.at, sent.at) } : null,
+      read: ob.readAt !== null ? { at: iso(ob.readAt), latency_ms: latency(ob.readAt, sent.at)! } : null,
+      ack: ob.ackedAt !== null ? { at: iso(ob.ackedAt), note: ob.ackNote, latency_ms: latency(ob.ackedAt, sent.at)! } : null,
+      reply: ob.reply ? { id: ob.reply.id, at: iso(ob.reply.at), latency_ms: latency(ob.reply.at, sent.at)! } : null,
+      ok: reason === null,
+      reason,
+    };
+  });
+  const failed = targets.filter((t) => !t.ok).length;
+  const reason = o.noTargetsReason ?? (failed ? targets.filter((t) => !t.ok).map((t) => t.reason).join("; ") : null);
+  return {
+    schema: PROBE_SCHEMA, ok: targets.length > 0 && failed === 0, host: o.host,
+    ...(o.project ? { project: o.project } : {}),
+    sender: o.sender, deadline_ms: o.deadlineMs, started_at: iso(o.startedAt), finished_at: iso(o.finishedAt),
+    targets, summary: { total: targets.length, passed: targets.length - failed, failed }, reason,
+  };
+}
+
+// ---- the waiting loop ---------------------------------------------------------------------------------
+
+export async function runProbe(io: ProbeIO, o: {
+  sender: string;
+  project?: string;
+  deadlineMs?: number;
+  /** Injectable clock/sleep so tests run the no-wake/no-reply paths without real time. */
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+  pollMs?: number;
+}): Promise<ProbeReport> {
+  const deadlineMs = o.deadlineMs ?? PROBE_DEADLINE_DEFAULT_MS;
+  const now = o.now ?? Date.now;
+  const sleep = o.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const pollMs = o.pollMs ?? PROBE_POLL_MS;
+  const startedAt = now();
+
+  const plan = planProbe(io.listTargets(), o.sender);
+  if (!plan.length) {
+    return buildProbeReport({ plan, sent: new Map(), observations: new Map(), startedAt, finishedAt: now(),
+      deadlineMs, host: io.host(), project: o.project, sender: o.sender,
+      noTargetsReason: "no live leased identities to probe (excluding the sender)" });
+  }
+
+  const sent = new Map<string, SentProbe>();
+  const sendErrors = new Map<string, string>();
+  for (const t of plan) {
+    try { sent.set(t.name, io.send(t.name)); }
+    catch (e) { sendErrors.set(t.name, (e as Error).message); }
+  }
+
+  const observations = new Map<string, TargetObservation>();
+  const complete = (name: string): boolean => {
+    const ob = observations.get(name);
+    return !!ob && ob.wake?.outcome === "admitted" && ob.reply !== null && (ob.readAt !== null || ob.ackedAt !== null);
+  };
+  const observeAll = () => {
+    for (const t of plan) {
+      if (sent.has(t.name) && !complete(t.name)) observations.set(t.name, io.observe(t.name, sent.get(t.name)!));
+    }
+  };
+  for (;;) {
+    observeAll();
+    if (plan.every((t) => complete(t.name)) || now() - startedAt >= deadlineMs) break;
+    await sleep(pollMs);
+  }
+  observeAll(); // a final pass so targets still waiting show their latest state
+
+  return buildProbeReport({ plan, sent, sendErrors, observations, startedAt, finishedAt: now(),
+    deadlineMs, host: io.host(), project: o.project, sender: o.sender });
+}

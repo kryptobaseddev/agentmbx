@@ -1,0 +1,222 @@
+// T392: the autonomy probe. Planning and reporting are pure; store I/O sits behind ProbeIO; the
+// waiting loop takes the clock and sleep, so pass/no-wake/no-reply all run without real time.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { MbxNode } from "../src/node.ts";
+import type { IdentityStatus } from "../src/identity-status.ts";
+import {
+  PROBE_REPLY_MARKER, PROBE_SUBJECT_PREFIX, buildProbeReport, planProbe, probeBody, probeSubject, runProbe,
+  storeProbeIO, type ProbeIO, type SentProbe, type TargetObservation,
+} from "../src/probe.ts";
+import { bindWakeLease } from "./helpers/wake-lease.ts";
+
+const identity = (name: string, state: IdentityStatus["state"], holder: IdentityStatus["holder"] = null): IdentityStatus =>
+  ({ name, state, claimable: false, reason: `${state} fixture`, role: null, description: null, registered: true,
+    projects: [], unread: 0, messages: 0, last_activity: null, holder });
+
+test("planProbe addresses every live leased identity and excludes the sender", () => {
+  const plan = planProbe([
+    identity("idle-agent", "idle", { cli: "kimi", session_id: "s1", pid: 1 }),
+    identity("held-agent", "held", { cli: "claude", session_id: "s2", pid: 2 }),
+    identity("sender", "held", { cli: "kimi", session_id: "me", pid: 3 }),
+    identity("available", "available"),
+    identity("unknown", "unknown"),
+    identity("conflict", "conflict"),
+    identity("legacy", "legacy"),
+  ], "sender");
+  assert.deepEqual(plan.map((t) => [t.name, t.state]), [["held-agent", "held"], ["idle-agent", "idle"]]);
+  assert.deepEqual(plan[0].holder, { cli: "claude", session_id: "s2" });
+});
+
+test("the convention contract: subject prefix and the probe ok body", () => {
+  assert.ok(probeSubject(new Date("2026-10-05T12:00:00Z")).startsWith(`${PROBE_SUBJECT_PREFIX} autonomy probe 2026-10-05T12:00:00.000Z`));
+  const body = probeBody();
+  for (const required of [PROBE_SUBJECT_PREFIX, PROBE_REPLY_MARKER, "mbx_reply", "mbx_ack", "wake line", "Do NOT ask a human"])
+    assert.ok(body.includes(required), `probe body mentions ${required}`);
+});
+
+const OBS = (over: Partial<TargetObservation> = {}): TargetObservation =>
+  ({ wake: null, readAt: null, ackedAt: null, ackNote: null, reply: null, ...over });
+
+test("buildProbeReport: pass needs an admitted wake and a reply; reasons name the failure", () => {
+  const plan = planProbe([identity("worker", "held", { cli: "kimi", session_id: "s", pid: 1 })], "owner");
+  const sent = new Map([["worker", { id: "m1", thread: "t1", at: 1_000 }]]);
+  const base = { plan, sent, startedAt: 1_000, finishedAt: 61_000, deadlineMs: 60_000, host: "alpha", sender: "owner" };
+  const admitted = { outcome: "admitted", via: "watcher", receipt: "transport", at: 1_500 };
+
+  const pass = buildProbeReport({ ...base, observations: new Map([["worker", OBS({ wake: admitted, readAt: 2_000, ackedAt: 3_000, ackNote: "done", reply: { id: "r1", at: 4_000 } })]]) });
+  assert.equal(pass.ok, true);
+  const t = pass.targets[0];
+  assert.equal(t.wake!.latency_ms, 500);
+  assert.equal(t.read!.latency_ms, 1_000);
+  assert.equal(t.ack!.note, "done");
+  assert.equal(t.reply!.latency_ms, 3_000);
+  assert.equal(t.reason, null);
+  assert.deepEqual(pass.summary, { total: 1, passed: 1, failed: 0 });
+
+  const noWake = buildProbeReport({ ...base, observations: new Map([["worker", OBS()]]) });
+  assert.equal(noWake.ok, false);
+  assert.match(noWake.targets[0].reason!, /no wake\.attempt for worker within 60s/);
+  const notAdmitted = buildProbeReport({ ...base, observations: new Map([["worker", OBS({ wake: { outcome: "not_submitted", via: "kimi web", receipt: null, at: 2_000 }, reply: { id: "r", at: 3_000 } })]]) });
+  assert.match(notAdmitted.targets[0].reason!, /never admitted \(last outcome: not_submitted via kimi web\)/);
+  const noReply = buildProbeReport({ ...base, observations: new Map([["worker", OBS({ wake: admitted, readAt: 2_000 })]]) });
+  assert.match(noReply.targets[0].reason!, /worker woke but did not reply/);
+  const sendError = buildProbeReport({ ...base, sendErrors: new Map([["worker", "mailbox is closed"]]), observations: new Map([["worker", OBS()]]) });
+  assert.match(sendError.targets[0].reason!, /could not be sent: mailbox is closed/);
+});
+
+/** A scripted fake IO: observations per target by poll round, counting polls and sleeps. */
+function fakeIO(targets: IdentityStatus[], script: Record<string, TargetObservation[]>): ProbeIO & { polls: Map<string, number>; sends: string[] } {
+  const polls = new Map<string, number>();
+  const sends: string[] = [];
+  return {
+    polls, sends,
+    host: () => "alpha",
+    listTargets: () => targets,
+    send: (name) => { sends.push(name); return { id: `msg-${name}`, thread: `thread-${name}`, at: 0 }; },
+    observe: (name) => {
+      const round = polls.get(name) ?? 0;
+      polls.set(name, round + 1);
+      return script[name]?.[Math.min(round, script[name]!.length - 1)] ?? OBS();
+    },
+  };
+}
+
+const noSleep = () => Promise.resolve();
+
+test("runProbe passes when every target wakes, reads and replies, and stops polling early", async () => {
+  const done = OBS({ wake: { outcome: "admitted", via: "watcher", receipt: "transport", at: 100 },
+    readAt: 200, ackedAt: 300, reply: { id: "r1", at: 400 } });
+  const io = fakeIO([identity("a", "held", { cli: "kimi", session_id: "s", pid: 1 }), identity("b", "held", { cli: "claude", session_id: "s", pid: 1 })],
+    { a: [OBS(), done], b: [done] });
+  let clock = 0;
+  const report = await runProbe(io, { sender: "owner", deadlineMs: 60_000, now: () => clock, sleep: async () => { clock += 1_000; }, pollMs: 1_000 });
+  assert.equal(report.ok, true);
+  assert.deepEqual(io.sends.sort(), ["a", "b"]);
+  assert.equal(io.polls.get("b"), 1, "b completed on the first poll: no further polls for it after the loop breaks");
+  assert.equal(io.polls.get("a"), 2);
+  assert.equal(report.reason, null);
+});
+
+test("runProbe: no-wake and no-reply fail with reasons, waiting out the deadline", async () => {
+  const noWakeIO = fakeIO([identity("ghost", "held", { cli: "kimi", session_id: "s", pid: 1 })], { ghost: [OBS({ reply: { id: "r", at: 100 } })] });
+  let clock = 0;
+  let sleeps = 0;
+  const noWake = await runProbe(noWakeIO, { sender: "owner", deadlineMs: 5_000, now: () => clock,
+    sleep: async () => { sleeps += 1; clock += 1_000; }, pollMs: 1_000 });
+  assert.equal(noWake.ok, false);
+  assert.match(noWake.reason!, /no wake\.attempt for ghost/);
+  assert.equal(sleeps, 5, "the loop slept until the deadline (5 x 1s polls)");
+
+  const noReplyIO = fakeIO([identity("quiet", "held", { cli: "kimi", session_id: "s", pid: 1 })],
+    { quiet: [OBS({ wake: { outcome: "admitted", via: "watcher", receipt: "transport", at: 100 }, readAt: 200 })] });
+  clock = 0;
+  const noReply = await runProbe(noReplyIO, { sender: "owner", deadlineMs: 3_000, now: () => clock, sleep: async () => { clock += 1_000; }, pollMs: 1_000 });
+  assert.equal(noReply.ok, false);
+  assert.match(noReply.reason!, /quiet woke but did not reply/);
+});
+
+test("runProbe with no live targets fails with a clear reason and sends nothing", async () => {
+  const io = fakeIO([identity("sender", "held", { cli: "kimi", session_id: "me", pid: 1 }), identity("free", "available")], {});
+  const report = await runProbe(io, { sender: "sender", deadlineMs: 1_000, now: () => 0, sleep: noSleep });
+  assert.equal(report.ok, false);
+  assert.match(report.reason!, /no live leased identities to probe/);
+  assert.deepEqual(io.sends, []);
+});
+
+// ---- the real store-backed IO -----------------------------------------------------------------------
+
+test("storeProbeIO against a real store: admitted wake + read + reply + ack passes with latencies", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-probe-pass-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  bindWakeLease(n, { agent: "worker", cli: "kimi", session_id: "term-1", pid: process.pid });
+
+  const base = storeProbeIO(n, { sender: "owner" });
+  let probe: SentProbe = { id: "", thread: "", at: 0 };
+  const io: ProbeIO = { ...base, send: (name) => { probe = base.send(name); return probe; } };
+  let clock = Date.now();
+  let step = 0;
+  const report = await runProbe(io, {
+    sender: "owner", deadlineMs: 60_000, now: () => clock, pollMs: 1_000,
+    sleep: async () => {
+      clock += 1_000;
+      step += 1;
+      if (step === 1) {
+        n.store.audit("wake.attempt", { agent: "worker", outcome: "admitted", receipt: "transport", via: "watcher" });
+      } else if (step === 2) {
+        // one autonomous wake turn: read, reply in the thread, then ack
+        n.setDelivery(probe.id, "worker", "read");
+        n.send({ from: "worker", to: ["owner"], subject: `Re: ${PROBE_SUBJECT_PREFIX} autonomy probe`, body: `${PROBE_REPLY_MARKER} [mbx] 1 new message(s) for worker`, thread: probe.thread, reply_to: probe.id });
+        n.ack(probe.id, "worker");
+      }
+    },
+  });
+  const target = report.targets.find((x) => x.name === "worker")!;
+  assert.equal(report.ok, true, JSON.stringify(report.targets));
+  assert.equal(target.message_id, probe.id);
+  assert.equal(target.wake!.outcome, "admitted");
+  assert.equal(target.wake!.via, "watcher");
+  assert.equal(target.read!.latency_ms! >= 0, true);
+  assert.match(target.reply!.id, /^[0-9A-Z]/);
+  assert.equal(target.ack !== null, true);
+});
+
+test("storeProbeIO: a reply without an admitted wake is a no-wake failure", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-probe-nowake-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  bindWakeLease(n, { agent: "worker", cli: "kimi", session_id: "term-1", pid: process.pid });
+
+  const base = storeProbeIO(n, { sender: "owner" });
+  let probe: SentProbe = { id: "", thread: "", at: 0 };
+  const io: ProbeIO = { ...base, send: (name) => { probe = base.send(name); return probe; } };
+  let clock = Date.now();
+  let step = 0;
+  const report = await runProbe(io, {
+    sender: "owner", deadlineMs: 10_000, now: () => clock, pollMs: 1_000,
+    sleep: async () => {
+      clock += 1_000;
+      step += 1;
+      if (step === 1) {
+        // the agent answers on its own prompt cycle before any daemon wake lands
+        n.send({ from: "worker", to: ["owner"], subject: `Re: ${PROBE_SUBJECT_PREFIX} x`, body: PROBE_REPLY_MARKER, thread: probe.thread, reply_to: probe.id });
+      }
+    },
+  });
+  const target = report.targets.find((x) => x.name === "worker")!;
+  assert.equal(report.ok, false);
+  assert.match(target.reason!, /no wake\.attempt/);
+  assert.equal(target.reply !== null, true, "the early reply is still recorded");
+});
+
+test("storeProbeIO: admitted wake without a reply is a no-reply failure", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-probe-noreply-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  bindWakeLease(n, { agent: "worker", cli: "kimi", session_id: "term-1", pid: process.pid });
+
+  const base = storeProbeIO(n, { sender: "owner" });
+  let probe: SentProbe = { id: "", thread: "", at: 0 };
+  const io: ProbeIO = { ...base, send: (name) => { probe = base.send(name); return probe; } };
+  let clock = Date.now();
+  let step = 0;
+  const report = await runProbe(io, {
+    sender: "owner", deadlineMs: 10_000, now: () => clock, pollMs: 1_000,
+    sleep: async () => {
+      clock += 1_000;
+      step += 1;
+      if (step === 1) {
+        n.store.audit("wake.attempt", { agent: "worker", outcome: "admitted", receipt: "strong", native: "native-1" });
+        n.setDelivery(probe.id, "worker", "read");
+      }
+    },
+  });
+  const target = report.targets.find((x) => x.name === "worker")!;
+  assert.equal(report.ok, false);
+  assert.match(target.reason!, /woke but did not reply/);
+  assert.equal(target.wake!.outcome, "admitted");
+});
