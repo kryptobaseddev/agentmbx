@@ -9,7 +9,7 @@ import { relayState, ROLLBACK_REASON } from "./relay-v2.js";
 import { kimiHostedServer, kimiInstances } from "./kimi-web.js";
 import { kimiDesktop } from "./kimi-desktop.js";
 import { version } from "./version.js";
-import { MbxNode, RETRY_HOURS } from "./node.js";
+import { GROK_NO_PUSH, MbxNode, RETRY_HOURS } from "./node.js";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.js";
 import { detect, edits, grokMcpConfiguredCommand, skillDest, skillStatus, statuslineConfiguredCommand, statuslineForms, statuslineState, wired } from "./setup.js";
 import { mailboxLiveness } from "./receipts.js";
@@ -262,6 +262,8 @@ export async function doctor(ctx, mbxHome, opts = {}) {
         // T384: a command string that matches what setup would write is still "wired". Flag the path
         // itself when that file is gone, including a stale …/agentmbx that install would rewrite.
         if (d.cli === "grok") {
+            // T385: this is a fact about the harness, not a broken install. Setup cannot add a push path.
+            add("info", `grok: ${GROK_NO_PUSH}`);
             const command = grokMcpConfiguredCommand(ctx.home);
             if (command && command.includes("/") && !existsSync(command))
                 add("fail", `grok: MCP command path does not exist (${command})`, "agentmbx setup --only grok");

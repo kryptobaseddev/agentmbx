@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { kimiHostedServer } from "./kimi-web.js";
 import { desktopRpc, kimiDesktop, RpcError } from "./kimi-desktop.js";
-import { MbxNode, trustLabel } from "./node.js";
+import { GROK_NO_PUSH, MbxNode, trustLabel } from "./node.js";
 import { captureWakeIdentity } from "./wake-identity.js";
 import { policyBrief } from "./policy.js";
 import { ulid } from "./crypto.js";
@@ -51,6 +51,14 @@ catch {
 } };
 const CODEX = () => process.env.MBX_CODEX_BIN || which("codex") || join(homedir(), ".local/bin/codex");
 const OPENCODE = () => process.env.MBX_OPENCODE_BIN || which("opencode") || join(homedir(), ".opencode/bin/opencode");
+/** Grok's interactive session cannot be handed a prompt from outside. Nothing is spawned or written.
+ *  `unsupported` holds: retrying cannot grow a path the CLI does not have. */
+export async function wakeGrok(_sessionId, _text, o = {}) {
+    const via = "grok none";
+    if (o.recheck && !o.recheck())
+        return outcome(via, { kind: "not_submitted", reason: "fenced" }, "wake authority changed");
+    return outcome(via, { kind: "not_submitted", reason: "unsupported", detail: GROK_NO_PUSH }, GROK_NO_PUSH);
+}
 export async function wakeCodex(threadId, text, o = {}) {
     const via = "codex queue";
     if (o.recheck && !o.recheck())
@@ -459,10 +467,13 @@ export async function dispatchWakes(node, now = Date.now()) {
                 result = await wakeOpencode(s.session_id, text, { recheck });
             else if (s.cli === "kimi")
                 result = kimiDesktop(s.pid) ? await wakeKimiDesktop(s, text, { recheck }) : await wakeKimi(s, text, { recheck });
+            else if (s.cli === "grok")
+                result = await wakeGrok(s.session_id, text, { recheck });
             else
                 continue;
             attempts++;
             node.store.audit("wake.attempt", { agent, attempt: marker.attemptId, session: `${s.cli}:${s.session_id}`, outcome: result.outcome?.kind ?? null,
+                ...(result.outcome && "reason" in result.outcome ? { reason: result.outcome.reason } : {}),
                 ...(result.outcome?.kind === "admitted" ? { receipt: result.outcome.receipt.strength, native: result.outcome.receipt.nativeId } : {}) });
             const o = result.outcome, kind = o?.kind;
             if (o?.kind === "not_submitted" && o.reason === "fenced") {

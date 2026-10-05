@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Grok has no idle push; Stop continues a turn that is ending (T385):** Grok's interactive session has no first-party way to accept a prompt from outside. There is no `grok queue` command, `~/.grok/leader.sock` is not a prompt socket, and `grok -p --resume` starts another process. `wakeGrok` submits nothing and reports `not_submitted` / `unsupported` with that reason. A send receipt for a live Grok session with no watcher says the same sentence, and `agentmbx doctor` records it as info. `agentmbx setup` now also installs a Grok `Stop` hook. On a genuine `end_turn` it prints `{"decision":"block","reason":"..."}`, which Grok feeds back as another round of the same turn. A session-end Stop does not block. Idle mail still waits for the next prompt, a desktop notice, or `agentmbx watch`.
+
 ## 0.5.9 (2026-10-05)
 
 Grok sessions get their own hooks and the register prompt, `agentmbx statusline suggest` proposes where the MBX segment goes, and send receipts stop calling a re-arming Kimi watcher dead.

@@ -2,6 +2,7 @@
 // "stored in a mailbox" for "an agent will see it". Liveness comes from the identity lease and its existing process
 // evidence. Native push eligibility uses the dispatcher's exact lease/binding guard.
 import { IdentityLeases, identityLeaseStatus } from "./identity-leases.js";
+import { GROK_NO_PUSH } from "./node.js";
 import { hasWakeAuthority, liveWatcher, watcherKey } from "./wake.js";
 import { captureWakeIdentity } from "./wake-identity.js";
 import { procTable } from "./proc.js";
@@ -93,7 +94,7 @@ export function recipientReceipts(node, msgId, targets, now = Date.now()) {
                     || (!mode.startsWith("push") && verified.every((s) => s.cli === "kimi")));
             const why = !m ? "message not found" : !node.wantsWake(name, m) ? "this kind does not wake (status, or no needs_reply/mention)"
                 : !watcher && sessions.length && !verified.length ? "the current lease or session binding could not be verified"
-                    : !mode.startsWith("push") && !rearming ? "the session has no push path"
+                    : !mode.startsWith("push") && !rearming ? (mode === GROK_NO_PUSH ? GROK_NO_PUSH : "the session has no push path")
                         : !hasWakeAuthority(node, name, m) ? "no owner policy lets this sender wake it" : null;
             state = why ? "live-next-prompt" : "live-wake";
             detail = why ? `${live.detail}; seen on its next prompt: ${why}`

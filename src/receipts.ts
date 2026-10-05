@@ -3,7 +3,7 @@
 // evidence. Native push eligibility uses the dispatcher's exact lease/binding guard.
 import { IdentityLeases, identityLeaseStatus, type IdentityLease } from "./identity-leases.ts";
 import type { Envelope } from "./envelope.ts";
-import type { MbxNode, RouteTarget } from "./node.ts";
+import { GROK_NO_PUSH, type MbxNode, type RouteTarget } from "./node.ts";
 import type { MessageRow } from "./store.ts";
 import { hasWakeAuthority, liveWatcher, watcherKey } from "./wake.ts";
 import { captureWakeIdentity } from "./wake-identity.ts";
@@ -83,7 +83,7 @@ export function recipientReceipts(node: MbxNode, msgId: string, targets: RouteTa
           || (!mode.startsWith("push") && verified.every((s) => s.cli === "kimi")));
       const why = !m ? "message not found" : !node.wantsWake(name, m) ? "this kind does not wake (status, or no needs_reply/mention)"
         : !watcher && sessions.length && !verified.length ? "the current lease or session binding could not be verified"
-        : !mode.startsWith("push") && !rearming ? "the session has no push path"
+        : !mode.startsWith("push") && !rearming ? (mode === GROK_NO_PUSH ? GROK_NO_PUSH : "the session has no push path")
         : !hasWakeAuthority(node, name, m) ? "no owner policy lets this sender wake it" : null;
       state = why ? "live-next-prompt" : "live-wake";
       detail = why ? `${live.detail}; seen on its next prompt: ${why}`

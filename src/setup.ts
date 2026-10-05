@@ -405,9 +405,9 @@ export function grokMcpConfiguredCommand(home: string): string | null {
   } catch { return null; }
 }
 
-/** Grok events whose stdout the harness actually delivers (PostToolUse) or still runs
- *  (SessionStart, UserPromptSubmit). Stop and PermissionRequest stay out: wake is T385. */
-const GROK_HOOK_EVENTS = [["SessionStart", "session-start"], ["UserPromptSubmit", "prompt"], ["PostToolUse", "post-tool"]] as const;
+/** Grok events the harness runs. PostToolUse is the one whose additionalContext is delivered.
+ *  Stop continues a turn that is ending (T385, user-guide 10-hooks.md). PermissionRequest stays out. */
+const GROK_HOOK_EVENTS = [["SessionStart", "session-start"], ["UserPromptSubmit", "prompt"], ["PostToolUse", "post-tool"], ["Stop", "stop"]] as const;
 const grokHookSub = (event: string) => GROK_HOOK_EVENTS.find((e) => e[0] === event)?.[1] ?? null;
 
 /** Ours is exactly `…/agentmbx hook <sub> --cli grok` (bare or quoted path). A composed command
@@ -882,7 +882,7 @@ export function edits(ctx: SetupCtx, cli: CliId): Edit[] {
         { cli, kind: "statusline", item: "[ui.status_line] (MBX segment)", path: config, ...grokStatusLine(home, cmd),
           isWired: (cur) => { try { const st = grokStatus(cur ?? ""); return st.form === "section" && isOurStatusline(home, "grok", cmd, grokCommandValue(st.body) ?? undefined); } catch { return false; } } },
         // T384: same file, same parse-guard and byte-exact uninstall as the MCP and status line edits.
-        { cli, kind: "hooks", item: "hooks SessionStart + UserPromptSubmit + PostToolUse", path: config, ...grokHooks(cmd) },
+        { cli, kind: "hooks", item: "hooks SessionStart + UserPromptSubmit + PostToolUse + Stop", path: config, ...grokHooks(cmd) },
       ];
     }
     case "hermes":
