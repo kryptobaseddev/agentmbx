@@ -2,7 +2,7 @@
 // "stored in a mailbox" for "an agent will see it". Liveness comes from the identity lease and its existing process
 // evidence. Native push eligibility uses the dispatcher's exact lease/binding guard.
 import { IdentityLeases, identityLeaseStatus } from "./identity-leases.js";
-import { hasWakeAuthority, liveWatcher } from "./wake.js";
+import { hasWakeAuthority, liveWatcher, watcherKey } from "./wake.js";
 import { captureWakeIdentity } from "./wake-identity.js";
 import { procTable } from "./proc.js";
 import { activityKey, parseActivity, SHARED_IDLE_MS } from "./identity-availability.js";
@@ -83,12 +83,22 @@ export function recipientReceipts(node, msgId, targets, now = Date.now()) {
             const verified = sessions.filter(s => captureWakeIdentity(node, s));
             const mode = node.deliveryMode(name, verified);
             const watcher = liveWatcher(node, name, now);
+            // T386: a watcher-delivered session whose watcher is not live at this instant still gets the
+            // wake — the record outlives a between-fires tick, and a terminal kimi session re-arms its
+            // watcher at turn end by design (T348), so the dispatcher admits the wake moments later.
+            // Only a verified binding may read as live-wake (T376's guard above); with no watcher
+            // evidence at all, "no push path" stays the answer.
+            const rearming = !watcher && verified.length > 0
+                && (node.store.get(watcherKey(name)) != null
+                    || (!mode.startsWith("push") && verified.every((s) => s.cli === "kimi")));
             const why = !m ? "message not found" : !node.wantsWake(name, m) ? "this kind does not wake (status, or no needs_reply/mention)"
                 : !watcher && sessions.length && !verified.length ? "the current lease or session binding could not be verified"
-                    : !mode.startsWith("push") || (mode.includes("mbx watcher") && !watcher) ? "the session has no push path"
+                    : !mode.startsWith("push") && !rearming ? "the session has no push path"
                         : !hasWakeAuthority(node, name, m) ? "no owner policy lets this sender wake it" : null;
             state = why ? "live-next-prompt" : "live-wake";
-            detail = why ? `${live.detail}; seen on its next prompt: ${why}` : `${live.detail}; eligible for wake (${mode}); dispatcher admission pending`;
+            detail = why ? `${live.detail}; seen on its next prompt: ${why}`
+                : rearming && !watcher ? `${live.detail}; eligible for wake (mbx watcher: its exit starts your next turn); watcher re-arm pending, dispatcher admission pending`
+                    : `${live.detail}; eligible for wake (${mode}); dispatcher admission pending`;
         }
         if (t.renamed_from) {
             detail = `${t.renamed_from} was renamed to ${name}; ${state}: ${detail}`;
