@@ -51,9 +51,10 @@ const WAKEABLE = new Set(["codex", "opencode"]);
  *  is the leader for config and MCP watches, not a prompt socket (user-guide 26-config-reference.md).
  *  `grok -p --resume` starts another process (user-guide 14-headless-mode.md). ACP `session/prompt`
  *  talks to `grok agent`, a different server (user-guide 15-agent-mode.md). A Stop hook can continue
- *  a turn that is ending (user-guide 10-hooks.md, Stop Decision Control) and cannot open a new one. */
+ *  a turn that is ending (user-guide 10-hooks.md, Stop Decision Control) and cannot open a new one.
+ *  The remedy is a session-tracked `agentmbx watch`; the post-tool and Stop hooks remind when it is down (T435). */
 export const GROK_NO_PUSH =
-  "the session has no push path: Grok has no idle-session inject (no queue command, no TUI prompt socket; grok -p --resume starts another process). A Stop hook continues only a turn that is ending";
+  "the session has no push path: Grok has no idle-session inject (no queue command, no TUI prompt socket; grok -p --resume starts another process). Run agentmbx watch in this session; the post-tool and Stop hooks remind you when it is down. A Stop hook continues only a turn that is ending";
 /** Adapter boundary (T067): node core never imports kimi-web; the adapter registers the real check in wake-check. */
 const sessionWakeable = (x: { cli: string; session_id: string; pid?: number | null; channel?: number | boolean }): boolean =>
   !!x.channel || ((WAKEABLE.has(x.cli) || (x.cli === "kimi" && kimiHostedCheck(x.pid))) && !x.session_id.startsWith("mcp-"));

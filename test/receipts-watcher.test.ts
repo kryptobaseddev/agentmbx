@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { generateKeyPair } from "../src/crypto.ts";
 import { IdentityLeases, inspectLeaseProcess } from "../src/identity-leases.ts";
-import { MbxNode } from "../src/node.ts";
+import { GROK_NO_PUSH, MbxNode } from "../src/node.ts";
 import { recipientReceipts } from "../src/receipts.ts";
 import { liveWatcher, watcherKey } from "../src/wake.ts";
 import { bindWakeLease } from "./helpers/wake-lease.ts";
@@ -75,6 +75,29 @@ test("AC2: a session with no watcher configured at all still reports live-next-p
   assert.equal(r.state, "live-next-prompt");
   assert.match(r.detail, /seen on its next prompt: the session has no push path/);
   assert.doesNotMatch(r.detail, /re-arm pending/);
+});
+
+test("T435: a lapsed grok session with a stale watcher key stays live-next-prompt", (t) => {
+  const { n, receipt } = world(t);
+  bindWakeLease(n, { agent: "worker", cli: "grok", session_id: "grok-1", pid: process.pid });
+  n.store.set(watcherKey("worker"), JSON.stringify({ pid: process.pid, at: Date.now() - 60_000 }));
+  assert.equal(liveWatcher(n, "worker"), false, "fixture: the watcher is not live at this instant");
+  assert.equal(n.deliveryMode("worker"), GROK_NO_PUSH);
+  const r = receipt("worker");
+  assert.equal(r.state, "live-next-prompt");
+  assert.match(r.detail, /post-tool and Stop hooks/);
+  assert.equal(r.detail.endsWith(GROK_NO_PUSH), true, r.detail);
+  assert.doesNotMatch(r.detail, /re-arm pending/);
+});
+
+test("a claude session with a stale watcher key still reports re-arm pending", (t) => {
+  const { n, receipt } = world(t);
+  bindWakeLease(n, { agent: "worker", cli: "claude", session_id: "thread-1", pid: process.pid });
+  n.store.set(watcherKey("worker"), JSON.stringify({ pid: process.pid, at: Date.now() - 60_000 }));
+  assert.equal(liveWatcher(n, "worker"), false);
+  const r = receipt("worker");
+  assert.equal(r.state, "live-wake");
+  assert.match(r.detail, ELIGIBLE);
 });
 
 test("T376 guard kept: an unverifiable binding with a stale watcher record is never live-wake", (t) => {
