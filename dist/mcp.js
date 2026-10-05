@@ -330,7 +330,8 @@ export async function runMcp(existing) {
     // T434: the birth time is a fixed property of this process — only the READ can fail (a ps starved
     // at boot by dozens of concurrent starts, the x64 release runner). Caching a null here would poison
     // every later claim with IDENTITY_LEASE_CONFIG for the server's whole life, so re-read lazily.
-    const holderStart = () => inspectLeaseProcess(process.pid).start;
+    let holderStartCache = null;
+    const holderStart = () => holderStartCache ??= inspectLeaseProcess(process.pid).start ?? null;
     // One MCP process serving many conversations: the Codex/OpenCode transports and hosted Kimi (desktop app, kimi web).
     const hosted = env.cli === "kimi" && kimiMultiHost(env.ppid);
     const base = { agent: "", sessionId: env.sessionId, key: generateKeyPair(), parent: null };
