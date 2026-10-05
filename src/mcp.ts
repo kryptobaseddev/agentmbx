@@ -302,7 +302,11 @@ export async function runMcp(existing?: MbxNode) {
   const launch = process.env.MBX_AGENT ? agentName(process.cwd(), env.cli) : null;
   const parentAgent = process.env[REEXEC_PARENT_AGENT] || null;
   const leases = new IdentityLeases(node.store, { idleTtlMs: process.env.MBX_IDENTITY_IDLE_TTL_MS === undefined ? undefined : Number(process.env.MBX_IDENTITY_IDLE_TTL_MS) });
-  const holderStart = inspectLeaseProcess(process.pid).start;
+  // T434: the birth time is a fixed property of this process — only the READ can fail (a ps starved
+  // at boot by dozens of concurrent starts, the x64 release runner). Caching a null here would poison
+  // every later claim with IDENTITY_LEASE_CONFIG for the server's whole life, so re-read lazily.
+  let holderStartCache: string | null = null;
+  const holderStart = () => holderStartCache ??= inspectLeaseProcess(process.pid).start ?? null;
   // One MCP process serving many conversations: the Codex/OpenCode transports and hosted Kimi (desktop app, kimi web).
   const hosted = env.cli === "kimi" && kimiMultiHost(env.ppid);
   type State = { agent: string; sessionId: string; key: ReturnType<typeof generateKeyPair>; leaseToken?: string; released?: boolean;
@@ -331,8 +335,9 @@ export async function runMcp(existing?: MbxNode) {
   const preparedBindings = new AsyncLocalStorage<Map<string, LegacyBinding>>();
   const controlDescriptor = (state: State, sessionId: string): IdentityControlDescriptor | null => {
     const parent = leases.processEvidence(env.ppid);
-    return parent.alive === true && parent.start && holderStart ? { v: 1, cli: env.cli, session_id: sessionId, lease_session_id: state.sessionId,
-      control_key: fingerprint(state.key.publicKey), mcp_pid: process.pid, mcp_start: holderStart,
+    const start = holderStart();
+    return parent.alive === true && parent.start && start ? { v: 1, cli: env.cli, session_id: sessionId, lease_session_id: state.sessionId,
+      control_key: fingerprint(state.key.publicKey), mcp_pid: process.pid, mcp_start: start,
       parent_pid: env.ppid, parent_start: parent.start, agent: state.agent, generation: identityGeneration(state.leaseToken) } : null;
   };
   const publishControl = (state: State) => {
@@ -407,7 +412,7 @@ export async function runMcp(existing?: MbxNode) {
     try { node.store.set(activityKey(state.agent), JSON.stringify({ at: now, shared: sharedState(state) })); } catch { /* advisory */ }
   };
   const claimFor = (state: State, agent: string, explicit: boolean): string => {
-    const evidence = { pid: process.pid, start: holderStart ?? "", keyFp: fingerprint(state.key.publicKey), cli: env.cli, sessionId: state.sessionId };
+    const evidence = { pid: process.pid, start: holderStart() ?? "", keyFp: fingerprint(state.key.publicKey), cli: env.cli, sessionId: state.sessionId };
     // Anchor for a first catch-up checkpoint: the lease row about to be replaced, so a crashed holder's
     // window is the origin, never the current end (spec R3).
     const previous = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(agent) as IdentityLease | undefined;
@@ -418,7 +423,7 @@ export async function runMcp(existing?: MbxNode) {
     try { return finish(leases.claim(agent, evidence).token); }
     catch (e) {
       const prior = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(agent) as IdentityLease | undefined;
-      const action = leaseCollisionAction(e, prior, { pid: process.pid, start: holderStart ?? null, baseSessionId: env.sessionId, stateSessionId: state.sessionId });
+      const action = leaseCollisionAction(e, prior, { pid: process.pid, start: holderStart(), baseSessionId: env.sessionId, stateSessionId: state.sessionId });
       if (action === "adopt" && prior) return finish(prior.token);
       if (action === "transfer" && prior) {
         leases.release(agent, prior.token);
@@ -729,7 +734,7 @@ export async function runMcp(existing?: MbxNode) {
   /** What this running connector actually serves (T183): version, loaded build and tool catalog, keyed by its own
    *  process birth so diagnostics can tell it apart from the installed CLI and from a reused PID. */
   const publishConnector = () => {
-    try { node.store.set(connectorKey(process.pid), JSON.stringify({ v: 1, pid: process.pid, start: holderStart, version: version(), build: boot,
+    try { node.store.set(connectorKey(process.pid), JSON.stringify({ v: 1, pid: process.pid, start: holderStart(), version: version(), build: boot,
       tools: [...tools].sort(), cli: env.cli, at: new Date().toISOString() })); } catch { /* best effort: diagnostics then reports no observation */ }
   };
   const register = server.registerTool.bind(server) as (...a: unknown[]) => unknown;
