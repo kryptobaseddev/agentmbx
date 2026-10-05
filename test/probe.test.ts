@@ -47,7 +47,7 @@ test("buildProbeReport: default gate passes on the reply alone; strict demands a
   const plan = planProbe([identity("worker", "held", { cli: "kimi", session_id: "s", pid: 1 })], "owner");
   const sent = new Map([["worker", { id: "m1", thread: "t1", at: 1_000 }]]);
   const base = { plan, sent, startedAt: 1_000, finishedAt: 61_000, deadlineMs: 60_000, host: "alpha", sender: "owner" };
-  const admitted = { outcome: "admitted", via: "watcher", receipt: "transport", at: 1_500 };
+  const admitted = { outcome: "admitted", via: "watcher", receipt: "transport", session: "conv-1", at: 1_500 };
   const inTurn = OBS({ reply: { id: "r1", at: 4_000 }, readAt: 3_500 });
 
   // Default: the reply is the gate — no wake row at all is a pass on the "in-turn" path.
@@ -73,16 +73,43 @@ test("buildProbeReport: default gate passes on the reply alone; strict demands a
   // A wake attempted but not admitted, with no reply, reports the outcome and via either way.
   for (const requireIdleWake of [false, true]) {
     const r = buildProbeReport({ ...base, requireIdleWake,
-      observations: new Map([["worker", OBS({ wake: { outcome: "not_submitted", via: "kimi web", receipt: null, at: 2_000 } })]]) });
+      observations: new Map([["worker", OBS({ wake: { outcome: "not_submitted", via: "kimi web", receipt: null, session: null, at: 2_000 } })]]) });
     assert.match(r.targets[0].reason!, /never admitted \(last outcome: not_submitted via kimi web\)/);
   }
+});
+
+test("requireIdleWake: a watcher admit counts only with the session that observes the exit", () => {
+  const plan = planProbe([identity("worker", "held", { cli: "kimi", session_id: "s", pid: 1 })], "owner");
+  const sent = new Map([["worker", { id: "m1", thread: "t1", at: 1_000 }]]);
+  const base = { plan, sent, startedAt: 1_000, finishedAt: 61_000, deadlineMs: 60_000, host: "alpha", sender: "owner" };
+  const reply = { id: "r1", at: 4_000 };
+  const printed = OBS({ wake: { outcome: "admitted", via: "watcher", receipt: "transport", session: null, at: 1_500 }, reply, readAt: 2_000 });
+  const leased = OBS({ wake: { outcome: "admitted", via: "watcher", receipt: "transport", session: "mcp-40673", at: 1_500 }, reply, readAt: 2_000 });
+  const observed = OBS({ wake: { outcome: "admitted", via: "watcher", receipt: "transport", session: "conv-1", at: 1_500 }, reply, readAt: 2_000 });
+
+  const strictPrinted = buildProbeReport({ ...base, requireIdleWake: true, observations: new Map([["worker", printed]]) });
+  assert.equal(strictPrinted.ok, false);
+  assert.equal(strictPrinted.targets[0].path, "in-turn");
+  assert.match(strictPrinted.targets[0].reason!, /--require-idle-wake requires one/);
+
+  const strictLeased = buildProbeReport({ ...base, requireIdleWake: true, observations: new Map([["worker", leased]]) });
+  assert.equal(strictLeased.ok, false);
+  assert.equal(strictLeased.targets[0].path, "in-turn");
+
+  const strictObserved = buildProbeReport({ ...base, requireIdleWake: true, observations: new Map([["worker", observed]]) });
+  assert.equal(strictObserved.ok, true);
+  assert.equal(strictObserved.targets[0].path, "idle-wake");
+
+  const defaultPrinted = buildProbeReport({ ...base, observations: new Map([["worker", printed]]) });
+  assert.equal(defaultPrinted.ok, true);
+  assert.equal(defaultPrinted.targets[0].path, "in-turn");
 });
 
 test("buildProbeReport: pass needs an admitted wake and a reply; reasons name the failure", () => {
   const plan = planProbe([identity("worker", "held", { cli: "kimi", session_id: "s", pid: 1 })], "owner");
   const sent = new Map([["worker", { id: "m1", thread: "t1", at: 1_000 }]]);
   const base = { plan, sent, startedAt: 1_000, finishedAt: 61_000, deadlineMs: 60_000, host: "alpha", sender: "owner" };
-  const admitted = { outcome: "admitted", via: "watcher", receipt: "transport", at: 1_500 };
+  const admitted = { outcome: "admitted", via: "watcher", receipt: "transport", session: "conv-1", at: 1_500 };
 
   const pass = buildProbeReport({ ...base, observations: new Map([["worker", OBS({ wake: admitted, readAt: 2_000, ackedAt: 3_000, ackNote: "done", reply: { id: "r1", at: 4_000 } })]]) });
   assert.equal(pass.ok, true);
@@ -98,7 +125,7 @@ test("buildProbeReport: pass needs an admitted wake and a reply; reasons name th
   const noWakeNoReply = buildProbeReport({ ...base, observations: new Map([["worker", OBS()]]) });
   assert.equal(noWakeNoReply.ok, false);
   assert.match(noWakeNoReply.targets[0].reason!, /no wake\.attempt for worker within 60s/);
-  const notAdmitted = buildProbeReport({ ...base, observations: new Map([["worker", OBS({ wake: { outcome: "not_submitted", via: "kimi web", receipt: null, at: 2_000 }, reply: { id: "r", at: 3_000 } })]]) });
+  const notAdmitted = buildProbeReport({ ...base, observations: new Map([["worker", OBS({ wake: { outcome: "not_submitted", via: "kimi web", receipt: null, session: null, at: 2_000 }, reply: { id: "r", at: 3_000 } })]]) });
   assert.equal(notAdmitted.ok, true, "a reply rescues a non-admitted wake on the default gate");
   assert.equal(notAdmitted.targets[0].path, "in-turn");
   const noReply = buildProbeReport({ ...base, observations: new Map([["worker", OBS({ wake: admitted, readAt: 2_000 })]]) });
@@ -127,7 +154,7 @@ function fakeIO(targets: IdentityStatus[], script: Record<string, TargetObservat
 const noSleep = () => Promise.resolve();
 
 test("runProbe passes when every target wakes, reads and replies, and stops polling early", async () => {
-  const done = OBS({ wake: { outcome: "admitted", via: "watcher", receipt: "transport", at: 100 },
+  const done = OBS({ wake: { outcome: "admitted", via: "watcher", receipt: "transport", session: "conv-1", at: 100 },
     readAt: 200, ackedAt: 300, reply: { id: "r1", at: 400 } });
   const io = fakeIO([identity("a", "held", { cli: "kimi", session_id: "s", pid: 1 }), identity("b", "held", { cli: "claude", session_id: "s", pid: 1 })],
     { a: [OBS(), done], b: [done] });
@@ -151,7 +178,7 @@ test("runProbe: no-wake and no-reply fail with reasons, waiting out the deadline
   assert.equal(sleeps, 5, "the loop slept until the deadline (5 x 1s polls)");
 
   const noReplyIO = fakeIO([identity("quiet", "held", { cli: "kimi", session_id: "s", pid: 1 })],
-    { quiet: [OBS({ wake: { outcome: "admitted", via: "watcher", receipt: "transport", at: 100 }, readAt: 200 })] });
+    { quiet: [OBS({ wake: { outcome: "admitted", via: "watcher", receipt: "transport", session: "conv-1", at: 100 }, readAt: 200 })] });
   clock = 0;
   const noReply = await runProbe(noReplyIO, { sender: "owner", deadlineMs: 3_000, now: () => clock, sleep: async () => { clock += 1_000; }, pollMs: 1_000 });
   assert.equal(noReply.ok, false);
@@ -186,7 +213,7 @@ test("storeProbeIO against a real store: admitted wake + read + reply + ack pass
       clock += 1_000;
       step += 1;
       if (step === 1) {
-        n.store.audit("wake.attempt", { agent: "worker", outcome: "admitted", receipt: "transport", via: "watcher" });
+        n.store.audit("wake.attempt", { agent: "worker", outcome: "admitted", receipt: "transport", via: "watcher", session: "term-1" });
       } else if (step === 2) {
         // one autonomous wake turn: read, reply in the thread, then ack
         n.setDelivery(probe.id, "worker", "read");
@@ -200,6 +227,8 @@ test("storeProbeIO against a real store: admitted wake + read + reply + ack pass
   assert.equal(target.message_id, probe.id);
   assert.equal(target.wake!.outcome, "admitted");
   assert.equal(target.wake!.via, "watcher");
+  assert.equal(target.wake!.session, "term-1");
+  assert.equal(target.path, "idle-wake");
   assert.equal(target.read!.latency_ms! >= 0, true);
   assert.match(target.reply!.id, /^[0-9A-Z]/);
   assert.equal(target.ack !== null, true);

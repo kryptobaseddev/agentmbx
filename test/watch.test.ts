@@ -14,6 +14,8 @@ import { dispatchWakes, liveWatcher } from "../src/wake.ts";
 import { selfWatchInstruction, WATCHER_INSTRUCTION } from "../src/mcp.ts";
 import { delegateWake } from "./helpers/wake-lease.ts";
 import { sendLeased } from "./helpers/leased-send.ts";
+import { findIdentityControl, publishIdentityControl } from "../src/identity-control.ts";
+import { procStart } from "../src/proc.ts";
 
 const until = async (ok: () => boolean, ms = 10_000) => { for (const end = Date.now() + ms; !ok() && Date.now() < end;) await new Promise(r => setTimeout(r, 50)); return ok(); };
 
@@ -44,6 +46,64 @@ test("agentmbx watch skips status mail, exits with a no-body hint for a request,
   assert.match(out, /start this watcher again/);
   assert.equal(liveWatcher(n, "worker"), false, "an exited watcher no longer holds wakes back");
   assert.ok(n.store.db.prepare("SELECT 1 FROM audit WHERE event='wake.attempt' AND detail LIKE '%watcher%'").get());
+});
+
+test("T438: watch admits only the current conversation, and records that session and the watcher pid", async (t) => {
+  const { spawnSync } = await import("node:child_process");
+  const home = mkdtempSync(join(tmpdir(), "mbx-watch-admit-"));
+  const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "watch-admit", version: "1" });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const env = { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "kimi", MBX_AGENT: "worker", MBX_NO_DESKTOP: "1", MBX_DEBUG: "" } as Record<string, string>;
+  await c.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"], env }));
+  delegateWake(n, "worker");
+  const prompt = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", "prompt", "--cli", "kimi"],
+    { input: JSON.stringify({ session_id: "conv-current", cwd: process.cwd(), prompt: "hi" }), encoding: "utf8", env });
+  assert.equal(prompt.status, 0, prompt.stderr);
+  const current = n.sessionsFor("worker").find((s) => s.session_id === "conv-current");
+  assert.ok(current, JSON.stringify(n.sessionsFor("worker")));
+  n.store.db.prepare("INSERT INTO sessions (agent,cli,session_id,cwd,pid,session_key,channel,updated_at,pid_start) VALUES (?,?,?,?,?,?,?,?,?)")
+    .run(current.agent, current.cli, "conv-old", current.cwd, current.pid, current.session_key, current.channel, new Date(Date.now() - 60_000).toISOString(), current.pid_start);
+  publishIdentityControl(n.store, { ...findIdentityControl(n.store, "kimi", "conv-current"), session_id: "conv-old" });
+
+  const attempts = () => (n.store.db.prepare("SELECT detail FROM audit WHERE event='wake.attempt'").all() as { detail: string }[])
+    .map((r) => JSON.parse(r.detail) as { outcome?: string; session?: string; pid?: number; via?: string; receipt?: string });
+  const runWatch = async (session: string) => {
+    const child = spawn(process.execPath, [resolve("bin/agentmbx.js"), "watch", "--cli", "kimi", "--session", session],
+      { env: { ...env, MBX_AGENT: "", MBX_WATCH_INTERVAL_MS: "200" } });
+    let out = "", err = "";
+    child.stdout.on("data", (d) => { out += d; });
+    child.stderr.on("data", (d) => { err += d; });
+    t.after(() => { child.kill(); });
+    const code = await new Promise<number | null>((r) => child.on("exit", r));
+    return { code, pid: child.pid, out, err };
+  };
+  const send = () => sendLeased(n, { from: "boss", to: ["worker"], subject: "please review", body: "secret body", kind: "request" });
+
+  send();
+  const previous = await runWatch("conv-old");
+  assert.equal(previous.code, 0, previous.out + previous.err);
+  const previousRows = attempts();
+  assert.equal(previousRows.some((a) => a.outcome === "admitted"), false);
+  assert.ok(previousRows.some((a) => a.via === "watcher" && a.session === "conv-old" && a.pid === previous.pid && a.outcome === "not_submitted"));
+
+  send();
+  const admitted = await runWatch("conv-current");
+  assert.equal(admitted.code, 0, admitted.out + admitted.err);
+  const admittedRows = attempts().filter((a) => a.outcome === "admitted");
+  assert.equal(admittedRows.length, 1);
+  assert.equal(admittedRows[0].session, "conv-current");
+  assert.equal(admittedRows[0].pid, admitted.pid);
+  assert.equal(admittedRows[0].via, "watcher");
+  assert.equal(admittedRows[0].receipt, "transport");
+
+  n.store.db.prepare("DELETE FROM sessions WHERE cli='kimi' AND session_id='conv-old'").run();
+  const holder = (n.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE name='worker'").get() as { holder_pid: number }).holder_pid;
+  n.store.db.prepare("UPDATE sessions SET pid=?, pid_start=? WHERE cli='kimi' AND session_id='conv-current'").run(holder, procStart(holder));
+  send();
+  const elsewhere = await runWatch("conv-current");
+  assert.equal(elsewhere.code, 0, elsewhere.out + elsewhere.err);
+  assert.equal(attempts().filter((a) => a.outcome === "admitted").length, 1, "a watcher outside the session process tree is not admitted");
+  assert.ok(attempts().some((a) => a.outcome === "not_submitted" && a.session === "conv-current" && a.pid === elsewhere.pid));
 });
 
 test("T435: agentmbx watch exits for unread desktop-notified mail and ignores read mail", async (t) => {

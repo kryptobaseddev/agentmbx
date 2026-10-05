@@ -173,6 +173,24 @@ function opencodeStub(t: { after: (fn: () => void | Promise<void>) => unknown },
   return { calls, listen: () => new Promise<string>((r) => server.listen(0, "127.0.0.1", () => r(`http://127.0.0.1:${(server.address() as AddressInfo).port}`))) };
 }
 
+test("T438: an admitted opencode wake stores nativeStatus on the wake.attempt audit", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-wake-ocstatus-")), n = new MbxNode(home, { host: "alpha" });
+  const stub = opencodeStub(t, "ses_exact");
+  const old = { MBX_OPENCODE_URL: process.env.MBX_OPENCODE_URL, MBX_NO_DESKTOP: process.env.MBX_NO_DESKTOP };
+  Object.assign(process.env, { MBX_NO_DESKTOP: "1" });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
+  process.env.MBX_OPENCODE_URL = await stub.listen();
+  bindWakeLease(n, { agent: "worker", cli: "opencode", session_id: "ses_exact", pid: process.pid });
+  sendLeased(n, { from: "sender", to: ["worker"], subject: "wake", body: "private", kind: "request" });
+  const [out] = await dispatchWakes(n);
+  assert.equal(out?.result.ok, true, JSON.stringify(out));
+  const detail = JSON.parse((n.store.db.prepare("SELECT detail FROM audit WHERE event='wake.attempt' ORDER BY rowid DESC LIMIT 1").get() as { detail: string }).detail);
+  assert.equal(detail.outcome, "admitted");
+  assert.equal(detail.native, "msg_stub");
+  assert.equal(detail.nativeStatus, "queued");
+});
+
 test("an MCP-only opencode binding never wakes a guessed session from its directory (exact claimed session only)", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-wake-ocdir-")), n = new MbxNode(home, { host: "alpha" });
   const stub = opencodeStub(t, "ses_resolved");
