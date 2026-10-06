@@ -1080,6 +1080,321 @@ function hermesServer(cmd) {
         },
     };
 }
+// ---- Hermes hooks (T460) ---------------------------------------------------------------------
+// Hermes shell hooks live in a top-level `hooks:` mapping of ~/.hermes/config.yaml: `<event>:` -> a list of {command, timeout}.
+// There is no UserPromptSubmit event; pre_llm_call fires once per turn at the same place and injects {"context": "..."} into the
+// user message. on_session_start is an observer whose output Hermes drops, so it only carries the real session id for the binding.
+// The file is hand-edited YAML, so this is a minimal line edit like hermesServer: only lines of ours are added or removed and every
+// other byte stays. A layout that cannot be edited with certainty (flow style, duplicate keys, tabs, anchors, mixed line endings)
+// is refused and reported, never rewritten. Hermes runs a new (event, command) pair only after it was approved: see hermesApprovals.
+export const HERMES_HOOK_EVENTS = [["on_session_start", "session-start"], ["pre_llm_call", "prompt"]];
+const HERMES_MARK = "# managed by agentmbx setup";
+/** Ours is `…/agentmbx hook <sub> --cli <cli>` (bare or quoted path), or exactly the command this setup would write. A command
+ *  composed with anything else is someone else's hook and is left alone. */
+function isOurHookCommand(command, sub, cli, exact) {
+    if (exact !== undefined && command === exact)
+        return true;
+    const tail = ` hook ${sub} --cli ${cli}`;
+    if (!command.endsWith(tail))
+        return false;
+    let bin = command.slice(0, -tail.length);
+    if (bin.startsWith("'") && bin.endsWith("'"))
+        bin = bin.slice(1, -1).replace(/'\\''/g, "'");
+    else if (/\s/.test(bin))
+        return false;
+    return /(^|\/)agentmbx$/.test(bin);
+}
+/** The string a YAML scalar spells, for the forms a hand-written `command:` takes; null for anything else (block scalar, anchor, flow). */
+function yamlString(raw) {
+    const t = raw.trim();
+    if (t.startsWith("\"")) {
+        const m = /^"((?:[^"\\]|\\.)*)"[ \t]*(?:#.*)?$/.exec(t);
+        if (!m)
+            return null;
+        try {
+            return JSON.parse(`"${m[1]}"`);
+        }
+        catch {
+            return null;
+        }
+    }
+    if (t.startsWith("'")) {
+        const m = /^'((?:[^']|'')*)'[ \t]*(?:#.*)?$/.exec(t);
+        return m ? m[1].replace(/''/g, "'") : null;
+    }
+    if (t === "" || /^[|>&*!\[{#]/.test(t))
+        return null;
+    return t.replace(/[ \t]+#.*$/, "");
+}
+const yamlBlank = (l) => /^\s*(#.*)?$/.test(l);
+const yamlIndent = (l) => /^ */.exec(l)[0].length;
+function hermesLayout(lines) {
+    const heads = lines.flatMap((l, i) => /^["']?hooks["']?[ \t]*:/.test(l) ? [i] : []);
+    if (!heads.length)
+        return { kind: "absent" };
+    if (heads.length > 1)
+        return { kind: "unsafe", reason: "hooks: is defined more than once" };
+    const h = heads[0];
+    const plain = /^hooks:[ \t]*(#.*)?$/.exec(lines[h].replace(/\r$/, ""));
+    const emptyForm = /^hooks: (\{\}|null|~)$/.exec(lines[h].replace(/\r$/, ""));
+    if (!plain && !emptyForm)
+        return { kind: "unsafe", reason: "hooks: is written inline or quoted, which setup does not edit" };
+    let end = h + 1;
+    while (end < lines.length && !/^[^\s#]/.test(lines[end]))
+        end++;
+    const marked = !!plain?.[1]?.startsWith(HERMES_MARK);
+    const was = /; was: (\{\}|null|~)$/.exec(plain?.[1] ?? "")?.[1] ?? null;
+    const body = [];
+    for (let i = h + 1; i < end; i++)
+        if (!yamlBlank(lines[i]))
+            body.push(i);
+    if (emptyForm && body.length)
+        return { kind: "unsafe", reason: "hooks: has an inline value and indented lines" };
+    if (!body.length)
+        return { kind: "empty", h, end, marked: marked || !!emptyForm, was: emptyForm ? emptyForm[1] : was };
+    if (body.some((i) => /^ *\t/.test(lines[i])))
+        return { kind: "unsafe", reason: "hooks: is indented with tabs" };
+    const ind = yamlIndent(lines[body[0]]);
+    const keyRe = new RegExp(`^ {${ind}}([A-Za-z_][A-Za-z0-9_-]*):(.*)$`);
+    const keys = new Map();
+    let current = null;
+    for (const i of body) {
+        const l = lines[i].replace(/\r$/, "");
+        if (yamlIndent(l) < ind)
+            return { kind: "unsafe", reason: "hooks: has inconsistent indentation" };
+        if (yamlIndent(l) === ind && !/^ *-(\s|$)/.test(l)) {
+            const m = keyRe.exec(l);
+            if (!m)
+                return { kind: "unsafe", reason: `hooks: has a key that is not a plain event name (${l.trim().slice(0, 40)})` };
+            if (keys.has(m[1]))
+                return { kind: "unsafe", reason: `hooks.${m[1]} is defined more than once` };
+            current = { key: i, rest: m[2], last: i };
+            keys.set(m[1], current);
+        }
+        else if (!current)
+            return { kind: "unsafe", reason: "hooks: starts with a list item" };
+        else
+            current.last = i;
+    }
+    return { kind: "block", h, end, ind, last: body[body.length - 1], marked, keys };
+}
+/** The list under one event key. `rest` of the key line must be empty (or a comment): an inline value is not edited. */
+function hermesEvent(lines, lay, event) {
+    const k = lay.keys.get(event);
+    if (!k)
+        return null;
+    if (!/^\s*(#.*)?$/.test(k.rest))
+        return { reason: `hooks.${event} is written inline, which setup does not edit` };
+    const body = [];
+    for (let i = k.key + 1; i <= k.last; i++)
+        if (!yamlBlank(lines[i]))
+            body.push(i);
+    if (!body.length)
+        return { key: k.key, last: k.last, itemInd: lay.ind + 2, items: [] };
+    const itemInd = yamlIndent(lines[body[0]]);
+    const starts = [];
+    for (const i of body) {
+        const l = lines[i].replace(/\r$/, ""), ci = yamlIndent(l);
+        if (ci < itemInd)
+            return { reason: `hooks.${event} has inconsistent indentation` };
+        if (ci === itemInd) {
+            if (!/^ *-(\s|$)/.test(l))
+                return { reason: `hooks.${event} is not a plain list` };
+            starts.push(i);
+        }
+    }
+    const items = starts.map((start, n) => {
+        const stop = n + 1 < starts.length ? starts[n + 1] : k.last + 1;
+        const mine = body.filter((i) => i >= start && i < stop);
+        const first = /^( *)-( *)(.*)$/.exec(lines[start].replace(/\r$/, ""));
+        const keyCol = first[3] ? first[1].length + 1 + first[2].length : yamlIndent(lines[mine[1]] ?? "");
+        let command = null, commandLine = -1;
+        for (const i of mine) {
+            const text = (i === start ? first[3] : lines[i].replace(/\r$/, "").slice(keyCol)), col = i === start ? keyCol : yamlIndent(lines[i]);
+            const m = col === keyCol ? /^command:[ \t]*(.*)$/.exec(text) : null;
+            if (m) {
+                command = yamlString(m[1]);
+                commandLine = i;
+                break;
+            }
+        }
+        return { start, end: mine[mine.length - 1] + 1, command, commandLine };
+    });
+    return { key: k.key, last: k.last, itemInd, items };
+}
+/** Lines split on \n only: a CRLF file keeps its \r inside each line, so every line we do not touch is returned byte-for-byte and a
+ *  file that already mixes endings (hermesServer appends with \n) is edited line by line instead of refused. New lines take the
+ *  file's dominant ending. */
+const hermesSplit = (cur) => ({ cr: cur.includes("\r\n") ? "\r" : "", lines: cur.split("\n") });
+const endCr = (l) => (l.endsWith("\r") ? "\r" : "");
+function hermesHooks(cmd) {
+    const want = (sub) => hookCommand(cmd, sub, "hermes");
+    const sp = (n) => " ".repeat(n);
+    const item = (n, command) => [`${sp(n)}- command: ${JSON.stringify(command)}`, `${sp(n + 2)}timeout: 10`];
+    const ours = (command, sub) => command !== null && isOurHookCommand(command, sub, "hermes", want(sub));
+    const fresh = (ind) => HERMES_HOOK_EVENTS.flatMap(([ev, sub]) => [`${sp(ind)}${ev}:  ${HERMES_MARK}`, ...item(ind + 2, want(sub))]);
+    const blocked = (cur) => {
+        if (cur === null)
+            return null;
+        const { lines } = hermesSplit(cur), lay = hermesLayout(lines);
+        if (lay.kind === "unsafe")
+            return lay.reason;
+        if (lay.kind === "block")
+            for (const [event] of HERMES_HOOK_EVENTS) {
+                const e = hermesEvent(lines, lay, event);
+                if (e && "reason" in e)
+                    return e.reason;
+            }
+        return null;
+    };
+    return {
+        blocked,
+        install: (cur) => {
+            if (cur === null || blocked(cur) !== null)
+                return cur;
+            const { cr, lines } = hermesSplit(cur), lay = hermesLayout(lines);
+            const nl = (ls) => ls.map((l) => l + cr);
+            if (lay.kind === "absent") {
+                const block = nl(["hooks:  " + HERMES_MARK, ...fresh(2)]).join("\n");
+                // a file that ends without a newline gets none at the end either: uninstall then returns it byte-for-byte
+                return cur === "" ? block + "\n" : cur.endsWith("\n") ? `${cur}${cr}\n${block}\n` : `${cur}\n${cr}\n${block.slice(0, block.length - cr.length)}`;
+            }
+            if (lay.kind === "empty") {
+                const head = lay.was ? `hooks:  ${HERMES_MARK}; was: ${lay.was}${endCr(lines[lay.h])}` : lines[lay.h];
+                return [...lines.slice(0, lay.h), head, ...nl(fresh(2)), ...lines.slice(lay.h + 1)].join("\n");
+            }
+            let out = lines.slice();
+            for (const [event, sub] of HERMES_HOOK_EVENTS) {
+                const l = hermesLayout(out), e = hermesEvent(out, l, event);
+                const wanted = want(sub);
+                if (!e) {
+                    out.splice(l.last + 1, 0, ...nl([`${sp(l.ind)}${event}:  ${HERMES_MARK}`, ...item(l.ind + 2, wanted)]));
+                    continue;
+                }
+                const mine = e.items.filter((it) => ours(it.command, sub));
+                if (!mine.length) {
+                    out.splice(e.items.length ? e.last + 1 : e.key + 1, 0, ...nl(item(e.items.length ? e.itemInd : l.ind + 2, wanted)));
+                    continue;
+                }
+                // a function replacer: a path containing $& or $' must not be read as a replacement pattern
+                if (mine[0].command !== wanted)
+                    out[mine[0].commandLine] = out[mine[0].commandLine].replace(/(command:[ \t]*).*/, (_m, p1) => p1 + JSON.stringify(wanted));
+                for (const extra of mine.slice(1).reverse())
+                    out.splice(extra.start, extra.end - extra.start);
+            }
+            return out.join("\n");
+        },
+        uninstall: (cur) => {
+            if (cur === null || blocked(cur) !== null)
+                return cur;
+            const { lines } = hermesSplit(cur);
+            let out = lines.slice();
+            for (const [event, sub] of HERMES_HOOK_EVENTS) {
+                const l = hermesLayout(out);
+                if (l.kind !== "block")
+                    break;
+                const e = hermesEvent(out, l, event);
+                const mine = e?.items.filter((it) => ours(it.command, sub)) ?? [];
+                if (!e || !mine.length)
+                    continue;
+                for (const it of [...mine].reverse())
+                    out.splice(it.start, it.end - it.start);
+                const after = hermesLayout(out);
+                const left = after.kind === "block" ? hermesEvent(out, after, event) : null;
+                if (left && !left.items.length && out[left.key].replace(/\r$/, "").endsWith(HERMES_MARK))
+                    out.splice(left.key, left.last - left.key + 1);
+            }
+            const l = hermesLayout(out);
+            if (l.kind === "empty" && l.marked) {
+                if (l.was)
+                    out[l.h] = `hooks: ${l.was}${endCr(out[l.h])}`;
+                else
+                    return removeBlock(out.join("\n"), l.h, l.h + 1);
+            }
+            return out.join("\n");
+        },
+    };
+}
+/** Hermes asks for each unseen (event, command) pair before it runs a shell hook, and in the TUI (no tty) it silently skips an
+ *  unapproved one. The owner chose that setup writes our pairs into ~/.hermes/shell-hooks-allowlist.json (the documented manual
+ *  allowlist format): a guarded JSON edit that adds and removes only entries of ours and leaves every other entry byte-for-byte. */
+export const hermesAllowlistPath = (home) => join(home, ".hermes/shell-hooks-allowlist.json");
+export const hermesConfigPath = (home) => join(home, ".hermes/config.yaml");
+function hermesApprovals(cmd) {
+    const wanted = HERMES_HOOK_EVENTS.map(([event, sub]) => ({ event, command: hookCommand(cmd, sub, "hermes") }));
+    const isObj = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+    const ours = (e) => isObj(e) && typeof e.event === "string" && typeof e.command === "string"
+        && HERMES_HOOK_EVENTS.some(([ev, sub]) => ev === e.event && isOurHookCommand(e.command, sub, "hermes"));
+    const parse = (cur) => {
+        if (cur === null || !cur.trim())
+            return { obj: {}, approvals: [] };
+        let v;
+        try {
+            v = JSON.parse(cur);
+        }
+        catch {
+            return "shell-hooks-allowlist.json is not valid JSON";
+        }
+        if (!isObj(v))
+            return "shell-hooks-allowlist.json is not a JSON object";
+        if (v.approvals !== undefined && !Array.isArray(v.approvals))
+            return "shell-hooks-allowlist.json has an approvals value that is not a list";
+        return { obj: v, approvals: v.approvals ?? [] };
+    };
+    const has = (approvals, w) => approvals.some((e) => isObj(e) && e.event === w.event && e.command === w.command);
+    return {
+        blocked: (cur) => { const p = parse(cur); return typeof p === "string" ? p : null; },
+        install: (cur) => {
+            const p = parse(cur);
+            if (typeof p === "string")
+                return cur;
+            // an approval of an older command of ours (the binary moved) can never match again: replace it, never accumulate
+            const kept = p.approvals.filter((e) => !ours(e) || wanted.some((w) => has([e], w)));
+            const add = wanted.filter((w) => !has(kept, w)).map((w) => ({ approved_at: new Date().toISOString(), command: w.command, event: w.event, script_mtime_at_approval: null }));
+            if (!add.length && kept.length === p.approvals.length)
+                return cur;
+            return jsonOut({ ...p.obj, approvals: [...kept, ...add] }, cur);
+        },
+        uninstall: (cur) => {
+            if (cur === null)
+                return null;
+            const p = parse(cur);
+            if (typeof p === "string")
+                return cur;
+            const kept = p.approvals.filter((e) => !ours(e));
+            if (kept.length === p.approvals.length)
+                return cur;
+            if (!kept.length && Object.keys(p.obj).every((k) => k === "approvals"))
+                return null; // a file setup created holds nothing else
+            return jsonOut({ ...p.obj, approvals: kept }, cur);
+        },
+    };
+}
+/** Are the hooks setup wrote approved to run? `auto` when hooks_auto_accept is on in config.yaml; HERMES_ACCEPT_HOOKS / --accept-hooks
+ *  are per-process and cannot be seen from here. Read-only: doctor reports it, setup writes it. */
+export function hermesConsent(ctx) {
+    const wanted = HERMES_HOOK_EVENTS.map(([event, sub]) => ({ event, command: hookCommand(ctx.cmd, sub, "hermes") }));
+    if (/^hooks_auto_accept:[ \t]*true[ \t]*(#.*)?\r?$/m.test(read(hermesConfigPath(ctx.home)) ?? ""))
+        return { state: "auto", missing: [] };
+    const text = read(hermesAllowlistPath(ctx.home));
+    if (text === null)
+        return { state: "missing", missing: wanted.map((w) => w.event) };
+    let approvals;
+    try {
+        const parsed = JSON.parse(text);
+        // the same shapes hermesApprovals refuses: setup cannot repair them, so doctor must not call them merely "missing"
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+            return { state: "unreadable", missing: wanted.map((w) => w.event) };
+        approvals = parsed.approvals ?? [];
+    }
+    catch {
+        return { state: "unreadable", missing: wanted.map((w) => w.event) };
+    }
+    if (!Array.isArray(approvals))
+        return { state: "unreadable", missing: wanted.map((w) => w.event) };
+    const missing = wanted.filter((w) => !approvals.some((e) => !!e && typeof e === "object" && e.event === w.event && e.command === w.command)).map((w) => w.event);
+    return { state: missing.length ? "missing" : "approved", missing };
+}
 export function detect(ctx) {
     const h = ctx.home;
     const d = (cli, bin, dir) => {
@@ -1191,15 +1506,22 @@ export function edits(ctx, cli) {
                 { cli, kind: "hooks", item: "hooks SessionStart + UserPromptSubmit + PostToolUse + Stop", path: config, ...grokHooks(cmd) },
             ];
         }
-        case "hermes":
-            return [{ cli, kind: "mcp", item: "mcp_servers.mbx", path: join(home, ".hermes/config.yaml"), ...hermesServer(cmd) }];
+        case "hermes": {
+            // T460: hooks live in the same config.yaml as the MCP server; the allowlist is Hermes's own consent store for them.
+            const hh = hermesHooks(cmd), ap = hermesApprovals(cmd);
+            return [
+                { cli, kind: "mcp", item: "mcp_servers.mbx", path: join(home, ".hermes/config.yaml"), ...hermesServer(cmd) },
+                { cli, kind: "hooks", item: "hooks on_session_start + pre_llm_call", path: hermesConfigPath(home), ...hh },
+                { cli, kind: "consent", item: "shell-hooks-allowlist.json approvals", path: hermesAllowlistPath(home), mode: 0o600, ...ap },
+            ];
+        }
     }
 }
 /** Is this edit already in its installed state? (Used by doctor.) */
 export function wired(e) {
     const cur = read(e.path);
     try {
-        return cur !== null && (e.isWired?.(cur) || e.install(cur) === cur);
+        return cur !== null && !e.blocked?.(cur) && (e.isWired?.(cur) || e.install(cur) === cur);
     }
     catch {
         return false;
@@ -1382,10 +1704,25 @@ export function runSetup(ctx, o) {
             rows.push({ cli: d.cli, item: "-", path: "-", action: "skipped", note: d.why });
             continue;
         }
+        const refused = new Set(); // T460: a cli whose hooks edit was refused: its consent edit has nothing to approve
         for (const e of edits(ctx, d.cli)) {
             const row = { cli: e.cli, item: e.item, path: e.path, action: "unchanged" };
             try {
                 const cur = read(e.path);
+                // T460: a layout we cannot edit without risking the user's content is reported, never rewritten (and never half-wired).
+                const why = cur !== null ? e.blocked?.(cur) ?? null : null;
+                if (why && (o.mode === "install" || (cur !== null && cur.includes(`--cli ${e.cli}`)))) {
+                    refused.add(`${e.cli}:${e.kind}`);
+                    const what = e.kind === "consent" ? "approve the agentmbx hooks yourself (hermes hooks list, or hooks_auto_accept: true)"
+                        : o.mode === "install" ? `add the agentmbx hooks by hand: ${HERMES_HOOK_EVENTS.map(([ev, sub]) => `${ev} -> ${hookCommand(ctx.cmd, sub, e.cli)}`).join("; ")}`
+                            : "remove the agentmbx hooks by hand";
+                    rows.push({ ...row, action: "manual", note: `${why}; left untouched. ${what}` });
+                    continue;
+                }
+                if (o.mode === "install" && e.kind === "consent" && refused.has(`${e.cli}:hooks`)) {
+                    rows.push(row);
+                    continue;
+                }
                 const next = o.mode === "install" ? e.install(cur) : e.uninstall(cur);
                 if (next === cur) {
                     rows.push(row);
@@ -1403,7 +1740,7 @@ export function runSetup(ctx, o) {
                             rmSync(e.path, { force: true });
                         else {
                             mkdirSync(dirname(e.path), { recursive: true });
-                            writeFileSync(e.path, next);
+                            writeFileSync(e.path, next, e.mode !== undefined ? { mode: e.mode } : undefined);
                         }
                     }
                     else
@@ -1418,6 +1755,9 @@ export function runSetup(ctx, o) {
         }
         if (d.cli === "codex" && o.mode === "install" && rows.some((r) => r.cli === "codex" && r.item.startsWith("hooks") && r.action !== "unchanged"))
             rows.push({ cli: "codex", item: "note", path: "-", action: "manual", note: "Codex may ask you to review/trust the new hooks on next start" });
+        // T460: Hermes registers shell hooks when it builds a session's agent, so a session that is already running keeps what it had.
+        if (d.cli === "hermes" && o.mode === "install" && rows.some((r) => r.cli === "hermes" && r.item.startsWith("hooks") && (r.action === "added" || r.action === "updated")))
+            rows.push({ cli: "hermes", item: "note", path: "-", action: "manual", note: "Hermes reads hooks when a session starts: they apply to sessions started after this" });
         // T347: a user's own status line is never overwritten — report it and print the snippet instead.
         if (o.mode === "install" && (d.cli === "claude" || d.cli === "kimi" || d.cli === "grok") && statuslineState(ctx.home, d.cli, ctx.cmd) === "foreign")
             rows.push({ cli: d.cli, item: "statusLine", path: "-", action: "manual",

@@ -12,7 +12,7 @@ import { kimiDesktop } from "./kimi-desktop.ts";
 import { version } from "./version.ts";
 import { GROK_NO_PUSH, MbxNode, RETRY_HOURS } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
-import { detect, edits, grokMcpConfiguredCommand, skillDest, skillStatus, statuslineConfiguredCommand, statuslineForms, statuslineState, wired, type SetupCtx } from "./setup.ts";
+import { detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConsent, skillDest, skillStatus, statuslineConfiguredCommand, statuslineForms, statuslineState, wired, type SetupCtx } from "./setup.ts";
 import { mailboxLiveness } from "./receipts.ts";
 import { liveWatcher } from "./wake.ts";
 import { listIdentityControls } from "./identity-control.ts";
@@ -179,6 +179,27 @@ export async function opencodeServiceCheck(node: MbxNode, service: () => Promise
   };
 }
 
+/** T460: Hermes runs a shell hook only after its (event, command) pair was approved, and in the TUI (no tty) it silently skips an
+ *  unapproved one: hooks that are wired but not approved look installed and do nothing. Reads the same state setup writes. A warn
+ *  never fails doctor. Silent until the hooks are wired, because the generic hooks row already says so then. */
+export function hermesHooksChecks(ctx: SetupCtx): Check[] {
+  const hooks = edits(ctx, "hermes").find((e) => e.kind === "hooks");
+  if (!hooks) return [];
+  const cur = existsSync(hooks.path) ? readFileSync(hooks.path, "utf8") : null;
+  const why = cur !== null ? hooks.blocked?.(cur) ?? null : null;
+  if (why) return [{ level: "warn", label: `hermes: hooks cannot be wired automatically: ${why}`,
+    fix: `add them to ${hooks.path.replace(ctx.home, "~")} by hand: on_session_start and pre_llm_call running \`${ctx.cmd.join(" ")} hook session-start|prompt --cli hermes\`` }];
+  if (!wired(hooks)) return [];
+  const c = hermesConsent(ctx);
+  const where = hermesAllowlistPath(ctx.home).replace(ctx.home, "~");
+  if (c.state === "approved") return [{ level: "ok", label: `hermes: hooks approved to run (${where})` }];
+  if (c.state === "auto") return [{ level: "ok", label: "hermes: hooks approved to run (hooks_auto_accept: true)" }];
+  if (c.state === "unreadable") return [{ level: "warn", label: `hermes: hooks are wired but ${where} cannot be read, so Hermes may skip them`,
+    fix: "fix or remove that file, then: agentmbx setup --only hermes   (or approve them with `hermes hooks list`)" }];
+  return [{ level: "warn", label: `hermes: hooks are wired but not approved (${c.missing.join(", ")}), so Hermes skips them`,
+    fix: "agentmbx setup --only hermes   (writes the approvals), or set hooks_auto_accept: true in ~/.hermes/config.yaml" }];
+}
+
 export function statuslineChecks(ctx: SetupCtx, cli: string): Check[] {
   if (cli === "opencode")
     return [{ level: "info", label: "opencode: no custom status line feature (built-in segments only: anomalyco/opencode#30295); nothing to verify" }];
@@ -239,6 +260,8 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     // T391: the opencode service check is its own function (never a new top-level grok/opencode
     // collision — see the T435 note above) and runs only when an opencode mailbox is bound.
     if (d.cli === "opencode" && node) { const c = await opencodeServiceCheck(node); if (c) out.push(c); }
+    // T460: its own function too (the T435 rule): a refused hooks layout and the not-approved state are Hermes facts.
+    if (d.cli === "hermes") for (const c of hermesHooksChecks(ctx)) out.push(c);
     // T384: a command string that matches what setup would write is still "wired". Flag the path
     // itself when that file is gone, including a stale …/agentmbx that install would rewrite.
     if (d.cli === "grok") {

@@ -363,6 +363,8 @@ export const noPush = (cli, channel, hosted = false) => !channel && !hosted && !
 /** T460: Hermes turns a finished `terminal(background=true, notify=true)` process into the next turn (process_registry
  *  completion_queue -> the TUI notification poller), so the watcher is event-driven there too. Its tool arguments differ from Kimi's. */
 export const HERMES_WATCHER_INSTRUCTION = `[mbx] This session can't be woken from outside, so it wakes itself: unless a background process running "agentmbx watch" is already live, start one now with your terminal tool: command "agentmbx watch", background true, notify true. It prints nothing and costs nothing until mail that wants you arrives, then exits with a no-body hint; its completion starts your next turn. When it completes, handle the mail (mbx_inbox, mbx_read, act within the policy, mbx_reply, mbx_ack) and start it again the same way. Do this without comment. If you cannot run background processes, skip the watcher and keep any cron job whose prompt starts with "[mbx-watch]" that you have.`;
+/** The repeat of it: no watcher is running, and the full text was already given this session. */
+export const HERMES_WATCHER_REMINDER = `[mbx] No mbx watcher is running, so mail cannot wake this session. Start it: terminal command "agentmbx watch", background true, notify true.`;
 const sh = (cmd, args) => { try {
     return execFileSync(cmd, args, { encoding: "utf8" }).trim();
 }

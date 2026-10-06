@@ -15,7 +15,8 @@ import { SqliteRelayStore } from "./relay-store.js";
 import { backupStore, readOps, restoredFrom, restoreStore, rotateEpochOp, STORE_DB, waitForLock } from "./relay-ops.js";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.js";
 import { HUD_ALIVE_MAX_MS, HUD_SCHEMA, hudAlivePath, hudDir, hudPidLinePath, hudPidPath, hudSessionLinePath, hudSessionPath, hudStatus, writeHud } from "./hud.js";
-import { detectHost, MCP_HEARTBEAT_MS, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
+import { detectHost, HERMES_WATCHER_INSTRUCTION, HERMES_WATCHER_REMINDER, MCP_HEARTBEAT_MS, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
+import { HERMES_NAG_MS, hermesHookInput, hermesHookOutput } from "./hermes-hook.js";
 import { ancestors, processEvidenceSpawns, withProcSnapshot } from "./proc.js";
 import { bumpPostToolMarkersForAgent, readPostToolMarker, writePostToolLast } from "./posttool.js";
 import { resolveStatusIdentity } from "./status-identity.js";
@@ -43,7 +44,7 @@ import { diagnosticSnapshot } from "./diagnostics.js";
 import { configuredRetention, prune, retentionDays } from "./retention.js";
 import { exportIdentity, identityInitialized, importIdentity } from "./identity-backup.js";
 import { listIdentityStatus } from "./identity-status.js";
-import { withCliIdentity, withHookIdentity } from "./cli-identity.js";
+import { REBINDING_CLIS, withCliIdentity, withHookIdentity } from "./cli-identity.js";
 import { declaredOriginWarning, readSessionTaint, refuseAgentOrigin, taintSendWarning } from "./session-taint.js";
 import { runProbe, storeProbeIO } from "./probe.js";
 import { DEFAULT_LOGIN_BASE_URL, defaultLoginIO, parseLoginBase, runLogin } from "./login.js";
@@ -135,7 +136,7 @@ Install
 
 Agent integration
   agentmbx mcp                                  stdio MCP server (add to Claude/Codex/OpenCode/Kimi/Hermes MCP config)
-  agentmbx hook session-start --cli <codex|kimi|claude|opencode>   bind the running session (reads the hook JSON on stdin)
+  agentmbx hook session-start --cli <codex|kimi|claude|opencode|hermes>   bind the running session (reads the hook JSON on stdin)
   agentmbx hook session-end --cli claude         release the exact session on terminal exit (keeps /clear and /resume bindings)
   agentmbx hook prompt --cli <…>                adds "N unread mbx messages" to the next turn when there is mail
   agentmbx hook post-tool --cli claude          surfaces new unread mail between tool calls (bundled sh fast path: zero node starts in steady state, T342)
@@ -1599,6 +1600,12 @@ async function hook(node, event, cli) {
         input = JSON.parse(raw || "{}");
     }
     catch { /* not JSON */ }
+    if (cli === "hermes") { // T460: Hermes's `{session_id, cwd, extra:{user_message, platform}}` onto the shared contract
+        const mapped = hermesHookInput(input);
+        if (mapped.skip)
+            return; // a delegated subagent is not this conversation: never bind, count or nag for it
+        input = mapped.input;
+    }
     if (event === "permission") { // fail closed: any problem means no output and the CLI's normal prompt
         let parsed = null;
         try {
@@ -1653,9 +1660,11 @@ async function hook(node, event, cli) {
             if ((event === "prompt" || event === "session-start") && sid) {
                 // Claude /clear keeps its MCP holder but replaces its real session ID. Use the
                 // guarded holder's existing key explicitly; bindSession never guesses across real sessions.
-                const source = bootstrap && cli === "claude" ? node.sessionsFor(agent).find(s => s.cli === cli && s.pid === process.ppid
+                // T460: Hermes (one conversation per TUI/CLI process) rebinds the same way: /new and /resume give the same holder a new id.
+                const rebinding = REBINDING_CLIS.includes(cli);
+                const source = bootstrap && rebinding ? node.sessionsFor(agent).find(s => s.cli === cli && s.pid === process.ppid
                     && s.session_key && fingerprint(s.session_key) === descriptor.control_key && node.sameSession(s.pid, s, { proof: true })) : undefined;
-                if (bootstrap && cli === "claude" && !source)
+                if (bootstrap && rebinding && !source)
                     throw new Error("hook holder has no current session binding");
                 const bound = node.bindSession({ agent, cli, session_id: sid, cwd, pid: process.ppid,
                     ...(source ? { session_key: source.session_key, channel: !!source.channel } : {}) });
@@ -1738,6 +1747,12 @@ async function hook(node, event, cli) {
                     lines.push(`[mbx] ${n} unread for ${agent}@${node.host}: mbx_inbox${event === "post-tool" ? " before continuing" : ""}.${newBrief ? brief : ""}`);
                     if (newBrief)
                         node.store.set(briefKey, brief);
+                }
+                // T460: Hermes drops on_session_start output, and a finished watcher is what wakes it: say so while none runs (bounded).
+                if (event === "prompt" && cli === "hermes" && !liveWatcher(node, agent)) {
+                    const w = hermesWatcherNote(node, agent, sid ?? process.ppid, !!delegationNote(node.store.db, agent, node.host));
+                    if (w)
+                        lines.push(w);
                 }
                 // Kimi drops SessionStart output and MCP server instructions: a terminal session learns to start its watcher here,
                 // on every prompt until one is running (T033).
@@ -1846,10 +1861,13 @@ async function hook(node, event, cli) {
             }
             catch { /* advisory */ }
         // Guidance on session start; Kimi drops SessionStart context, so a Kimi session gets it once on its first prompt.
-        const guided = `guided:${cli}:${sid}`, first = cli === "kimi" && !node.store.get(guided);
+        // Kimi and Hermes drop SessionStart output, so their first prompt carries the guidance (Hermes: pre_llm_call context).
+        const guided = `guided:${cli}:${sid}`, first = (cli === "kimi" || cli === "hermes") && !node.store.get(guided);
         if (event === "session-start") {
-            node.store.set(guided, new Date().toISOString());
-            emit(cli, "SessionStart", link ? `${unbound}\n${link}` : unbound);
+            if (cli !== "hermes") {
+                node.store.set(guided, new Date().toISOString());
+                emit(cli, "SessionStart", link ? `${unbound}\n${link}` : unbound);
+            }
         }
         else if (grokUnboundPost)
             emit(cli, "PostToolUse", link ? `${unbound}\n${link}` : unbound);
@@ -2051,7 +2069,26 @@ async function watch(node, selection) {
         await new Promise(r => setTimeout(r, every));
     }
 }
+/** The Hermes watcher note for one prompt: the full instruction once per session, then a one-line reminder at most every
+ *  HERMES_NAG_MS while no watcher runs (it rides in the user message of the turn and persists with it). An explicit
+ *  MBX_SELF_WATCH choice (cron minutes, or off) is the full text once and is not repeated as a watcher reminder. */
+function hermesWatcherNote(node, agent, session, delegated) {
+    const full = selfWatchInstruction({ delegated, cli: "hermes" });
+    if (!full)
+        return null;
+    const key = `hermesnag:${session}:${agent}`, last = Date.parse(node.store.get(key) ?? "");
+    if (Number.isFinite(last) && (full !== HERMES_WATCHER_INSTRUCTION || Date.now() - last < HERMES_NAG_MS))
+        return null;
+    node.store.set(key, new Date().toISOString());
+    return Number.isFinite(last) ? HERMES_WATCHER_REMINDER : full;
+}
 function emit(cli, event, context) {
+    if (cli === "hermes") {
+        const out = hermesHookOutput(event, context);
+        if (out)
+            console.log(out);
+        return;
+    } // T460: {"context"} on pre_llm_call only
     // B2b (T391): Kimi and OpenCode have no hookSpecificOutput protocol. OpenCode's plugin captures
     // plain hook stdout and injects only the [mbx]/probe-ok runs it recognizes as ours (see
     // opencodePluginSource in setup.ts). Claude Code reads the JSON shape; Codex and Grok keep theirs.
