@@ -32,7 +32,7 @@ export function parseProviderRecord(raw) {
             return null;
         if (typeof start !== "string" || start.length === 0 || start.length > 300)
             return null;
-        return { pid, start };
+        return { pid, start, ...(parsed.harness === true ? { harness: true } : {}) };
     }
     catch {
         return null;
@@ -75,8 +75,19 @@ export function holderProviderPid(table, holderPid, callerProvider, recorded, ev
  * caller does not walk up to a live ancestor. A reused or missing record uses the ancestry walk, and a live ancestor is
  * then alive.
  */
-export function holderProviderView(table, holderPid, callerProvider, recorded, evidence) {
+export function holderProviderView(table, holderPid, callerProvider, recorded, evidence, canonicalHarness = false) {
     const verdict = recorded && evidence ? recordedProviderVerdict(table, recorded, evidence) : null;
+    // A proven harness caller may normalize an older connector's runtime provider record.
+    if (canonicalHarness && verdict === "valid" && recorded && callerProvider !== undefined) {
+        for (let p = recorded.pid, n = 0; p > 1 && n < 16; n++) {
+            if (p === callerProvider)
+                return { holderProviderPid: callerProvider, holderProviderAlive: true };
+            const parent = table.get(p)?.ppid;
+            if (!parent)
+                break;
+            p = parent;
+        }
+    }
     const useRecord = verdict === "valid" || verdict === "dead";
     const holderProvider = holderProviderPid(table, holderPid, callerProvider, useRecord ? recorded : null, useRecord ? evidence : null);
     const holderProviderAlive = verdict === "valid" ? true : verdict === "dead" ? false : holderProvider != null ? true : null;
