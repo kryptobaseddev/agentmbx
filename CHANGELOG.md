@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **OpenCode hooks bind the remembered session, and a shared serve no longer lends its one control (T466).** A post-tool or stop hook looks up the exact `ses_` control. That row is missing before the session's first mailbox tool call, and after a serve restart it is stale, so the hook returned quietly and no stop or post-tool marker was written. The hook now republishes that `ses_` id only when `name:opencode:<sid>` names an agent whose one live lease holder is an MCP child of this serve. A missing name, a dead holder, or two holders still refuse. `agentmbx send` under OpenCode requires `--session` and does not attach to the single control that shares the serve. On startup an OpenCode MCP resumes those sessions only when the holder's process is dead. A live holder stays on the co-use path, which keeps the conversation's external taint.
+
 ## 0.5.15 (2026-10-06)
 
 Hotfix: OpenCode connectors of one session co-use the mailbox lease instead of deadlocking, and an in-place reload no longer drops the MCP connection on install.
