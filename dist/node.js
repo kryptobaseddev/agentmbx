@@ -50,6 +50,10 @@ const WAKEABLE = new Set(["codex", "opencode"]);
  *  a turn that is ending (user-guide 10-hooks.md, Stop Decision Control) and cannot open a new one.
  *  The remedy is a session-tracked `agentmbx watch`; the post-tool and Stop hooks remind when it is down (T435). */
 export const GROK_NO_PUSH = "the session has no push path: Grok has no idle-session inject (no queue command, no TUI prompt socket; grok -p --resume starts another process). Run agentmbx watch in this session; the post-tool and Stop hooks remind you when it is down. A Stop hook continues only a turn that is ending";
+/** Hermes (T460) has no inbound socket, queue command or API that opens a turn in a running TUI/CLI session. What it does
+ *  have: a finished `terminal(background=true, notify=true)` process starts the next turn. Keeps the `no push:` prefix the
+ *  receipts and tests key on. */
+export const HERMES_NO_PUSH = "no push: Hermes has no idle-session inject. Run `agentmbx watch` with terminal(background=true, notify=true): its exit starts your next turn (start it again after each wake). Without it, new mail shows on your user's next prompt";
 /** Adapter boundary (T067): node core never imports kimi-web; the adapter registers the real check in wake-check. */
 const sessionWakeable = (x) => !!x.channel || ((WAKEABLE.has(x.cli) || (x.cli === "kimi" && kimiHostedCheck(x.pid))) && !x.session_id.startsWith("mcp-"));
 export const defaultHome = () => process.env.MBX_HOME || join(homedir(), ".local", "share", "agentmbx");
@@ -415,6 +419,8 @@ export class MbxNode {
             catch { /* gone */ }
         if (ss.length > 0 && ss.every((x) => x.cli === "grok"))
             return GROK_NO_PUSH;
+        if (ss.length > 0 && ss.every((x) => x.cli === "hermes"))
+            return HERMES_NO_PUSH;
         return "no push: new mail shows on your user's next prompt, or when your mbx watcher or [mbx-watch] self-check runs";
     }
     sessionsFor(agent) {
