@@ -208,14 +208,14 @@ function handOverToFreshProcess(pauseStdin: boolean, parentAgent?: string, provi
     if (code === 0 && !process.env[REEXEC_ENV]) {
       // T449: poll the generation record and exit when the current live generation dies. This avoids the
       // stdin.once("end") bug: a paused stdin never emits "end" on EOF, so the proxy would leak forever.
+      // Use process.kill(pid, 0) directly: inspectLeaseProcess relies on ps, whose cache can report a
+      // just-spawned generation as missing and make the proxy exit prematurely (closing stdin and killing it).
       const poller = setInterval(() => {
         const rec = readGeneration(originalPid);
         if (!rec) return; // no generation bound yet; the child is still starting up
-        const evidence = inspectLeaseProcess(rec.pid);
-        // A missing start in the record means the write happened before ps evidence was available;
-        // check liveness only in that case so the proxy does not mistake a fresh generation for a reused pid.
-        const stale = evidence.alive !== true || (rec.start !== "" && evidence.start !== rec.start);
-        if (stale) {
+        let genAlive = false;
+        try { process.kill(rec.pid, 0); genAlive = true; } catch { /* dead or permission denied */ }
+        if (!genAlive) {
           clearGeneration(originalPid);
           process.exit(0);
         }
