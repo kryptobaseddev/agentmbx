@@ -1,8 +1,19 @@
 import { execFileSync } from "node:child_process";
 import { basename } from "node:path";
+import { readlinkSync } from "node:fs";
 import { procTable } from "./proc.js";
 /** Resolve runtime siblings to their OpenCode server, without crossing an agent's shell. */
 export function opencodeProviderPid(pid, table = procTable(), command = (p) => {
+    // Linux comm is a mutable, truncated task name, not the executable identity.
+    // Fail closed if procfs cannot establish the executable; argv is caller-controlled too.
+    if (process.platform === "linux") {
+        try {
+            return readlinkSync(`/proc/${p}/exe`);
+        }
+        catch {
+            return "";
+        }
+    }
     try {
         return execFileSync("ps", ["-o", "comm=", "-p", String(p)], { encoding: "utf8", timeout: 1000 }).trim();
     }

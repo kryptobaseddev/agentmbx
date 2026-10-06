@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, copyFileSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -31,22 +31,48 @@ test("provider resolution crosses Node/Bun runtimes, stops at shells and unknown
   assert.equal(holderProviderView(table, 10, 30, recorded, { alive: null, start: null }, true).holderProviderAlive, true);
 });
 
+test("Linux provider resolution ignores a forged or truncated process title", { skip: process.platform !== "linux" }, () => {
+  const title = process.title;
+  try {
+    process.title = "opencode";
+    assert.equal(opencodeProviderPid(process.pid, new Map([[process.pid, { ppid: 1 }]])), null);
+    process.title = "a-runtime-title-longer-than-linux-comm";
+    assert.equal(opencodeProviderPid(process.pid, new Map([[process.pid, { ppid: 1 }]])), null);
+  } finally { process.title = title; }
+});
+
 test("OpenCode runtime reconnects co-use, shell-spawned MCPs refuse, other conversations stay isolated, EOF resumes", async t => {
+  if (!process.env.T469_HARNESS_FIXTURE) {
+    const fixture = mkdtempSync(join(tmpdir(), "mbx-t469-executable-"));
+    t.after(() => rmSync(fixture, { recursive: true, force: true }));
+    const executable = join(fixture, "opencode");
+    copyFileSync(process.execPath, executable); chmodSync(executable, 0o755);
+    const env: NodeJS.ProcessEnv = { ...process.env, T469_HARNESS_FIXTURE: "1" };
+    // A fresh test runner must not inherit the parent's internal worker context.
+    delete env.NODE_TEST_CONTEXT;
+    const child = spawnSync(executable, ["--test", "--test-name-pattern=^OpenCode runtime", "--test-timeout=120000", "--test-force-exit", import.meta.filename], {
+      env, encoding: "utf8", timeout: 150000,
+    });
+    assert.equal(child.status, 0, `${child.error ?? ""}\n${child.stdout}\n${child.stderr}`);
+    assert.match(child.stdout, /(?:#|ℹ) pass 1\b/, "the executable fixture must actually run its integration test");
+    return;
+  }
   const home = mkdtempSync(join(tmpdir(), "mbx-t469-")), node = new MbxNode(home, { host: "scratch" });
-  const title = process.title; process.title = "opencode"; // OS-visible harness stand-in, not an MBX_CLI override.
   const clients: Client[] = [];
-  t.after(async () => { for (const c of clients.reverse()) await c.close().catch(() => {}); process.title = title; node.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { for (const c of clients.reverse()) await c.close().catch(() => {}); node.close(); rmSync(home, { recursive: true, force: true }); });
+  // Real executable names work on both Linux procfs and macOS ps. Mutable titles do not.
+  const runtime = join(home, "node"), shellRuntime = join(home, "zsh");
+  for (const executable of [runtime, shellRuntime]) { copyFileSync(process.execPath, executable); chmodSync(executable, 0o755); }
   const wrapper = join(home, "runtime.mjs");
   writeFileSync(wrapper, `import { spawn } from 'node:child_process';
-if (process.env.SHELL_FIXTURE) process.title = 'zsh';
-const c = spawn(process.execPath, process.argv.slice(2), { stdio: 'inherit' });
+const c = spawn(process.env.T469_NODE, process.argv.slice(2), { stdio: 'inherit' });
 c.on('exit', code => process.exit(code ?? 1));
 process.on('SIGTERM', () => c.kill('SIGTERM'));`);
   const connect = async (shell = false) => {
     const c = new Client({ name: "runtime", version: "test" }); clients.push(c);
-    const env = { ...process.env, MBX_HOME: home, OPENCODE_CONFIG_DIR: home, MBX_CLI: "opencode", MBX_NO_DESKTOP: "1", AGENTMBX_DEV: "1", ...(shell ? { SHELL_FIXTURE: "1" } : {}) } as Record<string, string>;
+    const env = { ...process.env, T469_NODE: runtime, MBX_HOME: home, OPENCODE_CONFIG_DIR: home, MBX_CLI: "opencode", MBX_NO_DESKTOP: "1", AGENTMBX_DEV: "1" } as Record<string, string>;
     for (const k of Object.keys(env)) if (k.startsWith("MBX_MCP_") || ["MBX_AGENT", "MBX_ROLE", "MBX_CHANNEL"].includes(k)) delete env[k];
-    await c.connect(new StdioClientTransport({ command: process.execPath, args: [wrapper, join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"], env }));
+    await c.connect(new StdioClientTransport({ command: shell ? shellRuntime : runtime, args: [wrapper, join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"], env }));
     return c;
   };
   const call = (c: Client, name: string, args = {}, sid = "ses_t469") => c.callTool({ name, arguments: args, _meta: { sessionID: sid } });
