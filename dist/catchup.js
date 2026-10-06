@@ -77,10 +77,33 @@ export function catchupHint(store, name) {
  * Advance the checkpoint to a page the agent durably captured (spec R8). Monotonic only: rewinds fail,
  * identical re-commits are no-ops, and a rotated epoch refuses the commit until an explicit restart.
  */
+/**
+ * A fetch that does not pass `commit` leaves the checkpoint where it was, so the next fetch
+ * repeats this page. Say that, and say the exact argument that advances it.
+ */
+export function catchupUnchanged(nextCursor) {
+    return {
+        unchanged: true,
+        hint: `This page is unchanged because the checkpoint was not committed. After you capture it, call mbx_catchup with commit set to this next_cursor: ${nextCursor}. Fetching again without commit returns this same page.`,
+    };
+}
+/** A cursor that does not decode is a format error, not a different mailbox. */
+function parseCatchupCursor(cursor) {
+    try {
+        return parseReplayFrame(cursor);
+    }
+    catch (err) {
+        const code = err.code;
+        if (code === "CURSOR_INVALID") {
+            fail("CURSOR_MALFORMED", "Catch-up cursor is malformed or corrupt. Restart from the checkpoint: call mbx_catchup with no cursor.");
+        }
+        throw err;
+    }
+}
 export function commitCatchup(store, name, cursor, by) {
     const record = readCatchup(store, name) ?? fail("CURSOR_INVALID", "no catch-up checkpoint for this identity; call mbx_catchup without commit first");
     const epoch = store.get("replay:epoch") ?? fail("CURSOR_EXPIRED", "Replay generation is unavailable; initialize this store before catch-up");
-    const frame = parseReplayFrame(cursor);
+    const frame = parseCatchupCursor(cursor);
     if (frame.mailbox !== name || frame.filter !== CATCHUP_FILTER)
         fail("CURSOR_SCOPE_MISMATCH", "catch-up commits must come from this identity's unfiltered catch-up pages");
     if (frame.epoch !== epoch)

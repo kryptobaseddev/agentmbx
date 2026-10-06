@@ -33,7 +33,7 @@ import { claudeSessionId, claudeSessionTracker, grokSessionId, grokSessionTracke
 import { updateAvailable } from "./update.js";
 import { installKind, version } from "./version.js";
 import { connectorKey } from "./diagnostics.js";
-import { catchupHint, commitCatchup, ensureCatchup, missedCount, moveCatchup, readCatchup, restartCatchup, CATCHUP_FILTER } from "./catchup.js";
+import { catchupHint, catchupUnchanged, commitCatchup, ensureCatchup, missedCount, moveCatchup, readCatchup, restartCatchup, CATCHUP_FILTER } from "./catchup.js";
 import { encodeReplayFrame, replayMaximum } from "./replay.js";
 import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wake.js";
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
@@ -1541,7 +1541,8 @@ export async function runMcp(existing) {
         const from = cursor ?? encodeReplayFrame({ v: 1, epoch: record.epoch, mailbox: state.agent, filter: CATCHUP_FILTER, position: record.position, end: replayMaximum(node.store, state.agent) });
         const page = node.replay(state.agent, state.leaseToken, { cursor: from, limit, maxBytes });
         const missed = missedCount(node.store, state.agent);
-        return text(JSON.stringify({ ...page, catchup: { position: record.position, missed: missed.missed } }, null, 2), { ...page, catchup: { position: record.position, missed: missed.missed } });
+        const catchup = { position: record.position, missed: missed.missed, ...catchupUnchanged(page.next_cursor) };
+        return text(JSON.stringify({ ...page, catchup }, null, 2), { ...page, catchup });
     });
     server.registerTool("mbx_send", {
         title: "Send an mbx message",

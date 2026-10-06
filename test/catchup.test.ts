@@ -109,14 +109,12 @@ test("T465: a corrupt cursor is a format error, and a different mailbox stays a 
     assert.match(err.message ?? "", /malformed/);
     assert.match(err.message ?? "", /no cursor/);
     assert.equal((err.message ?? "").includes("different mailbox"), false);
-    assert.equal(err.code === "CURSOR_SCOPE_MISMATCH", false);
     return true;
   });
   assert.throws(() => commitCatchup(n.store, "worker", "not-a-cursor", "typo"), (err: { code?: string }) => err.code === "CURSOR_MALFORMED");
   const other = encodeReplayFrame({ v: 1, epoch, mailbox: "someone-else", filter: readCatchup(n.store, "worker")!.filter, position: 1, end: 1 });
   assert.throws(() => commitCatchup(n.store, "worker", other, "other"), (err: { code?: string; message?: string }) => {
     assert.equal(err.code, "CURSOR_SCOPE_MISMATCH");
-    assert.equal(err.code === "CURSOR_MALFORMED", false);
     return true;
   });
 });
