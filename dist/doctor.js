@@ -1,8 +1,8 @@
 // `agentmbx doctor`: one checklist that says what works, what doesn't, and the one command that fixes it.
 import { rotationLog } from "./key-rotation.js";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { phantomMailboxes, returnDays } from "./stranded.js";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { fingerprint } from "./crypto.js";
 import { signHop } from "./http.js";
 import { relayState, ROLLBACK_REASON } from "./relay-v2.js";
@@ -269,12 +269,71 @@ export function statuslineChecks(ctx, cli) {
     }
     return out;
 }
+/** A POSIX single-quoted word. The fix is a command the owner can paste. */
+function shQuote(text) {
+    return `'${text.replace(/'/g, `'\\''`)}'`;
+}
+/** True when `path` is an executable regular file. Symlinks follow. A directory or a dangling link is not. */
+function executableFile(path) {
+    try {
+        if (!statSync(path).isFile())
+            return false;
+        accessSync(path, constants.X_OK);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+function sameFile(a, b) {
+    try {
+        return realpathSync(a) === realpathSync(b);
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * T314: a legacy `mbx` that is not AgentMBX and sits in an earlier PATH directory than `agentmbx`.
+ * The old NAS mailbox shim is that case. The same file reached through another name is not foreign.
+ * A warn does not fail doctor. Null means there is nothing to flag.
+ */
+export function legacyMbxShim(pathEnv = process.env.PATH ?? "") {
+    const dirs = pathEnv.split(delimiter).filter((dir) => dir.length > 0);
+    let mbxAt = -1;
+    let agentAt = -1;
+    for (let i = 0; i < dirs.length; i++) {
+        if (mbxAt < 0 && executableFile(join(dirs[i], "mbx")))
+            mbxAt = i;
+        if (agentAt < 0 && executableFile(join(dirs[i], "agentmbx")))
+            agentAt = i;
+        if (mbxAt >= 0 && agentAt >= 0)
+            break;
+    }
+    if (mbxAt < 0)
+        return null;
+    // Same directory, or agentmbx earlier: `mbx` is not ahead of `agentmbx`.
+    if (agentAt >= 0 && mbxAt >= agentAt)
+        return null;
+    const mbx = join(dirs[mbxAt], "mbx");
+    if (agentAt >= 0 && sameFile(mbx, join(dirs[agentAt], "agentmbx")))
+        return null;
+    return {
+        level: "warn",
+        label: `legacy mbx shim is ahead of agentmbx on PATH (${mbx})`,
+        fix: `mv ${shQuote(mbx)} ${shQuote(`${mbx}.legacy`)}`,
+    };
+}
 export async function doctor(ctx, mbxHome, opts = {}) {
     const out = [];
     const add = (level, label, fix) => out.push({ level, label, fix });
     add("info", `agentmbx ${VERSION} (node ${process.versions.node})`);
     if (Number(process.versions.node.split(".")[0]) < 24)
         add("fail", `Node ${process.versions.node} is too old`, "install Node 24 or later");
+    // T314: stay out of the grok block. OpenCode's own doctor function must not collide with this.
+    const legacy = legacyMbxShim();
+    if (legacy)
+        out.push(legacy);
     const initialized = existsSync(join(mbxHome, "config.json"));
     let node = null;
     if (!initialized)
