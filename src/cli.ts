@@ -49,6 +49,7 @@ import { declaredOriginWarning, readSessionTaint, refuseAgentOrigin, taintSendWa
 import { runProbe, storeProbeIO } from "./probe.ts";
 import { buildIdentityTakeover, type IdentityTakeoverApproval } from "./identity-takeover.ts";
 import { publishIdentityControl, findIdentityControl, identityControlReceipt, resolveIdentityControlReceipt, submitIdentityControl, type IdentityControlReceipt } from "./identity-control.ts";
+import { armDaemonSync } from "./sync-daemon.ts";
 
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
 
@@ -878,6 +879,7 @@ If the codes differ, do not approve: someone is in the middle.`);
         });
       }
       setInterval(tick, 2000);
+      armDaemonSync(node);
       // Presence (T201): announce this host's addresses on start, within ~10 s of an address change, and every 5 min.
       let lastAddrs = addrSignature(node), lastBeacon = 0;
       const beacon = () => { const sig = addrSignature(node); if (sig !== lastAddrs || Date.now() - lastBeacon > 300_000) { lastAddrs = sig; lastBeacon = Date.now(); void sendPresence(node).catch(() => {}); } };
