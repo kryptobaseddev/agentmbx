@@ -158,7 +158,6 @@ function handOverToFreshProcess(pauseStdin, parentAgent, providerPid, detached, 
         // T317: a re-exec generation has done its job once the replacement is running; exit cleanly so we do
         // not accumulate nested MCP processes. The original proxy stays on its transport below.
         if (process.env[REEXEC_ENV]) {
-            process.stderr.write(`[mbx] re-exec generation ${process.pid} handing off to ${child.pid}\n`);
             process.exit(0);
         }
     });
