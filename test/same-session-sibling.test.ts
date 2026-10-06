@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { MbxNode } from "../src/node.ts";
+import { readSessionTaint } from "../src/session-taint.ts";
 import { identityAvailability } from "../src/identity-availability.ts";
 import type { IdentityLease, ProcessEvidence } from "../src/identity-leases.ts";
 
@@ -133,6 +134,14 @@ test("a sibling stops acting as the identity once the holder's lease is released
   const after = await call(sibling, "mbx_inbox");
   assert.equal(after.isError, true, "a released lease is not co-used");
   assert.deepEqual(lease("sib-fenced"), released, "the failing call claimed nothing");
+  // T440: whoami must not undo the holder's explicit release. An explicit claim still can.
+  const releasedWho = json(await call(sibling, "mbx_whoami"));
+  assert.equal(releasedWho.agent, null, JSON.stringify(releasedWho));
+  assert.deepEqual(lease("sib-fenced"), released, "whoami left the lease released");
+  const claimed = await call(sibling, "mbx_identity", { action: "claim", name: "sib-fenced" });
+  assert.notEqual(claimed.isError, true, textOf(claimed));
+  assert.equal(lease("sib-fenced").released_at, null, "an explicit claim takes the released lease");
+  assert.equal(json(await call(sibling, "mbx_whoami")).agent, "sib-fenced");
 
   // A later sibling of a different session never co-uses: co-use needs the same session as the holder.
   const other = await connect();
@@ -140,15 +149,47 @@ test("a sibling stops acting as the identity once the holder's lease is released
   assert.equal(json(stranger).agent, null);
 });
 
+test("a co-using sibling sends with the holder's conversation taint (T346)", async (t) => {
+  const { node, call, pair } = fixture(t, "opencode");
+  const { holder, sibling } = await pair("sib-taint");
+  node.registerAgent("peer", { role: "peer" });
+  const outside = node.send({ from: "scout", to: ["sib-taint"], subject: "page", body: "copied from a web page", origin: "external" }).envelope;
+  assert.notEqual((await call(holder, "mbx_read", { ids: [outside.id] })).isError, true, "holder reads the outside mail");
+  const stored = readSessionTaint(node.store, "opencode", SESSIONS.opencode.sessionID);
+  assert.ok(stored, "the holder persisted taint:<cli>:<session_id>");
+  assert.equal(stored.id, outside.id);
+  assert.equal(stored.from, "scout@alpha");
+  assert.ok(stored.relay_depth.some((h) => h.from === "scout@alpha" && h.hop === 0));
+
+  const who = await call(sibling, "mbx_whoami");
+  assert.equal(json(who).agent, "sib-taint");
+  const ext = (who.structuredContent as { external?: { tainted?: boolean; root_exposure?: string } } | undefined)?.external;
+  assert.equal(ext?.tainted, true, "the sibling restored the shared conversation key");
+  assert.equal(ext?.root_exposure, new Date(stored.root).toISOString());
+
+  const send = await call(sibling, "mbx_send", { to: ["peer"], subject: "onward", body: "still outside" });
+  assert.notEqual(send.isError, true, textOf(send));
+  const id = (send.structuredContent as { id?: string } | undefined)?.id;
+  assert.equal(typeof id, "string");
+  const envelope = JSON.parse(node.message(id!)!.envelope) as { meta: { origin?: string; external_source?: string; external_since?: string; hop?: number } };
+  assert.equal(envelope.meta.origin, "external");
+  assert.equal(envelope.meta.external_source, "inherited");
+  assert.equal(envelope.meta.external_since, new Date(stored.root).toISOString());
+  assert.equal(envelope.meta.hop, 1, "the sibling kept the holder's hop history");
+});
+
 test("co-use requires the same session and the holder's own provider process", () => {
   const now = 1_000_000;
   const lease = { name: "x", token: "t", holder_pid: 50, holder_start: "s", key_fp: "k", cli: "opencode", session_id: "ses_a",
     claimed_at: now, heartbeat_at: now, idle_ttl: 60_000, released_at: null, release_reason: null } as IdentityLease;
   const live: ProcessEvidence = { alive: true, start: "s" };
-  const at = (caller: { cli: string; sessionId: string; providerPid?: number; holderProviderPid?: number | null }, evidence: ProcessEvidence = live) =>
+  const at = (caller: { cli: string; sessionId: string; providerPid?: number; holderProviderPid?: number | null; holderProviderAlive?: boolean | null }, evidence: ProcessEvidence = live) =>
     identityAvailability({ lease, evidence, activity: null, now, caller });
   assert.equal(at({ cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: 10 }).coUse, true, "same session, same provider");
-  assert.equal(at({ cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: 20 }).coUse, undefined, "restarted provider: takeover, not co-use");
+  assert.equal(at({ cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: 20 }).coUse, undefined, "a different provider is not co-use");
+  assert.equal(at({ cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: 20, holderProviderAlive: false }).takeover, "same-session", "dead provider is takeover");
+  assert.equal(at({ cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: 20, holderProviderAlive: true }).takeover, undefined, "a live provider is not takeover");
+  assert.equal(at({ cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: 20, holderProviderAlive: true }).claimable, false);
   assert.equal(at({ cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: null }).coUse, undefined, "unknown parentage");
   assert.equal(at({ cli: "opencode", sessionId: "ses_a" }).coUse, undefined, "no provider evidence");
   assert.equal(at({ cli: "opencode", sessionId: "ses_b", providerPid: 10, holderProviderPid: 10 }).coUse, undefined, "another session");

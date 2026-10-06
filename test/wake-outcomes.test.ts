@@ -165,7 +165,8 @@ test("a wake hint names its message ids and says a handled message needs no acti
     assert.match(text, /^\[mbx\]/, "still an AgentMBX prompt: never resets relay depth");
     for (const m of ms.slice(0, 5)) assert.ok(text.includes(m.id));
     assert.match(text, /\+2 more/);
-    assert.match(text, /mbx_inbox or mbx_read, reply, ack\. Already handled: no action needed\./);
+    assert.match(text, /mbx_inbox or mbx_read, reply, ack\. If you already handled these ids, no action is needed\./);
+    assert.doesNotMatch(text, /Already handled: no action needed/, "T442: never asserts unread mail is handled");
     assert.ok(!text.includes("secret body"), "never a body");
   } finally { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });

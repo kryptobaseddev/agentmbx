@@ -17,7 +17,7 @@ const matches = (d: IdentityControlDescriptor, row: IdentityLease | undefined): 
 export interface CliIdentitySelection { as?: string; cli?: string; session?: string; readOnly?: boolean }
 
 /** Proof collection happens outside SQLite; authorization and operation share the lease transaction. */
-export function withCliIdentity<T>(node: MbxNode, selection: CliIdentitySelection, operation: (agent: string) => T): T {
+export function withCliIdentity<T>(node: MbxNode, selection: CliIdentitySelection, operation: (agent: string, descriptor: IdentityControlDescriptor) => T): T {
   if (operation.constructor.name === "AsyncFunction") throw refused("mailbox operations must be synchronous");
   if (!!selection.cli !== !!selection.session) throw refused("select both --cli and --session, or neither");
   const descriptors = selection.cli && selection.session ? [findIdentityControl(node.store, selection.cli, selection.session)] : listIdentityControls(node.store);

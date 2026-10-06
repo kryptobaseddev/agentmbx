@@ -1,19 +1,22 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { MbxNode } from "../src/node.ts";
+import { providerRecordKey } from "../src/identity-availability.ts";
 import { IdentityLeases, inspectLeaseProcess } from "../src/identity-leases.ts";
 
 for (const cli of ["codex", "opencode"]) test(`${cli} a newer process of the same session takes over its remembered identity; another session's memory never does`, async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-resume-conflict-")), node = new MbxNode(home, { host: "alpha" });
   const previous = new Client({ name: "previous", version: "test" }), replacement = new Client({ name: "replacement", version: "test" });
   t.after(async () => { await previous.close(); await replacement.close(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
-  // The newer process runs under a restarted provider (a stand-in parent process): a second server under the SAME live
-  // provider never takes over (T383, test/same-session-takeover.test.ts).
+  // The replacement's parent is a different live process. That alone does not take over (T440; covered in
+  // test/same-session-takeover.test.ts). The same-session claim below overwrites the holder's provider record with a
+  // process that has already exited, which is the confirmed-dead proof.
   const provider = join(home, "provider.mjs");
   writeFileSync(provider, "import { spawn } from 'node:child_process'; const c = spawn(process.execPath, process.argv.slice(2), { stdio: 'inherit' }); c.on('exit', code => process.exit(code ?? 1)); process.on('SIGTERM', () => c.kill('SIGTERM'));");
   let restarted = false;
@@ -36,6 +39,21 @@ for (const cli of ["codex", "opencode"]) test(`${cli} a newer process of the sam
   assert.equal((await call(replacement, "mbx_read", { ids: [mail] }, other)).isError, true);
   assert.deepEqual(node.store.db.prepare("SELECT token,holder_pid FROM identity_leases WHERE name='circle'").get(), holder);
   assert.notEqual((await call(replacement, "mbx_identity", { action: "list" }, other)).isError, true, "identity controls stay usable while unbound");
+  // Confirmed-dead provider: the holder's MCP is still alive, and so is its real parent. The record is the proof.
+  const dummy = spawn(process.execPath, ["-e", "setInterval(() => {}, 1e9)"], { stdio: "ignore" });
+  const dummyPid = dummy.pid;
+  assert.ok(dummyPid);
+  const dummyStart = inspectLeaseProcess(dummyPid).start;
+  assert.ok(dummyStart);
+  dummy.kill("SIGKILL");
+  const deadDeadline = Date.now() + 5_000;
+  for (;;) {
+    try { process.kill(dummyPid, 0); }
+    catch { break; }
+    assert.ok(Date.now() < deadDeadline, "dummy provider did not exit");
+    await new Promise(r => setTimeout(r, 25));
+  }
+  node.store.set(providerRecordKey(holder.holder_pid as number), JSON.stringify({ providerPid: dummyPid, providerStart: dummyStart }));
   // The same session served by a newer process resumes its identity: it takes the lease over from the older process.
   const identity = await call(replacement, "mbx_whoami");
   assert.notEqual(identity.isError, true, JSON.stringify(identity));

@@ -44,9 +44,11 @@ import { configuredRetention, prune, retentionDays } from "./retention.js";
 import { exportIdentity, identityInitialized, importIdentity } from "./identity-backup.js";
 import { listIdentityStatus } from "./identity-status.js";
 import { withCliIdentity, withHookIdentity } from "./cli-identity.js";
+import { declaredOriginWarning, readSessionTaint, refuseAgentOrigin, taintSendWarning } from "./session-taint.js";
 import { runProbe, storeProbeIO } from "./probe.js";
 import { buildIdentityTakeover } from "./identity-takeover.js";
 import { publishIdentityControl, findIdentityControl, identityControlReceipt, resolveIdentityControlReceipt, submitIdentityControl } from "./identity-control.js";
+import { armDaemonSync } from "./sync-daemon.js";
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
 
 Start here
@@ -57,7 +59,7 @@ Start here
 
 Messages
   agentmbx send --as <agent> --to <a,b,role:x,*,owner> --subject "…" [-m "body" | --body-file f | stdin]
-           [--kind message|request|reply|status|decision|alert|task] [--reply-to <id>] [--needs-reply] [--ref path]… [--new-mailbox]
+           [--kind message|request|reply|status|decision|alert|task] [--reply-to <id>] [--needs-reply] [--origin agent|external] [--ref path]… [--new-mailbox]
   agentmbx replay [--cursor <token>] [--limit 50] [--max-bytes 65536] [--scan-limit 1000]
                   [--project <id> --project-host <host>] [--topic <tag>] [--thread <id>]
                   bounded read-only JSON; current provider lease required; bodies are data
@@ -356,7 +358,7 @@ async function run(argv) {
     const { values: o, positionals: pos } = parseArgs({ args: rest, allowPositionals: true, strict: cmd !== "hook" && cmd !== "mcp", options: {
             help: { type: "boolean", short: "h" }, force: { type: "boolean" },
             as: { type: "string" }, to: { type: "string" }, subject: { type: "string" }, m: { type: "string", short: "m" },
-            "body-file": { type: "string" }, kind: { type: "string" }, schema: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" }, "new-mailbox": { type: "boolean" },
+            "body-file": { type: "string" }, kind: { type: "string" }, origin: { type: "string" }, schema: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" }, "new-mailbox": { type: "boolean" },
             ref: { type: "string", multiple: true }, all: { type: "boolean" }, json: { type: "boolean" }, note: { type: "string" },
             mailbox: { type: "string" }, limit: { type: "string" }, host: { type: "string" }, port: { type: "string" }, cli: { type: "string" }, session: { type: "string" }, caps: { type: "string" },
             ttl: { type: "string" }, bind: { type: "string" }, role: { type: "string" }, description: { type: "string" }, thread: { type: "string" }, from: { type: "string" }, check: { type: "boolean" }, yes: { type: "boolean", short: "y" },
@@ -776,23 +778,41 @@ async function run(argv) {
                 die("--to is required");
             if (!str("subject") && !str("reply-to"))
                 die("--subject is required");
+            const originArg = str("origin");
+            if (originArg !== undefined && originArg !== "agent" && originArg !== "external")
+                die("--origin must be agent or external");
             // Read external input before acquiring the lease's database lock.
             const body = str("m") ?? (str("body-file") ? readFileSync(str("body-file"), "utf8") : process.stdin.isTTY ? "" : readStdin());
             // T205: never create a mailbox by typo; --new-mailbox deliberately leaves mail for an agent that has not started yet
             if (!str("reply-to") && !o["new-mailbox"])
                 assertKnownRecipients(node, (str("to") ?? "").split(",").map(s => s.trim()).filter(Boolean));
-            const send = (from, unverified = false) => {
+            // T345: a live taint:<cli>:<session_id> record sends as inherited external. --origin external
+            // declares this body first-hand. --origin agent does not send while the record is live.
+            const send = (from, unverified = false, taint = null) => {
+                if (originArg === "agent" && taint)
+                    die(refuseAgentOrigin(taint));
+                const declared = originArg === "external";
                 const reply = str("reply-to") ? node.read(str("reply-to"), from.split("@")[0]) : undefined;
                 return node.send({ from, to: (str("to") ?? die("--to is required")).split(",").map(s => s.trim()).filter(Boolean),
                     subject: str("subject") ?? (reply ? (reply.subject.startsWith("Re: ") ? reply.subject : `Re: ${reply.subject}`) : die("--subject is required")),
                     body, kind: (str("kind") ?? "message"), reply_to: reply?.id ?? null, thread: reply?.thread,
-                    needs_reply: !!o["needs-reply"], refs: o.ref ?? [], unverifiedSender: unverified });
+                    needs_reply: !!o["needs-reply"], refs: o.ref ?? [], unverifiedSender: unverified,
+                    ...(declared || taint ? { origin: "external" } : {}),
+                    ...(!declared && taint ? { external_since: new Date(taint.root).toISOString() } : {}) });
+            };
+            const noteOrigin = (sent, taint) => {
+                if (originArg === "external")
+                    sent.warnings.push(declaredOriginWarning(taint));
+                else if (taint)
+                    sent.warnings.push(taintSendWarning(taint));
+                return sent;
             };
             let entered = false, r;
             try {
-                r = withCliIdentity(node, { as: str("as") ?? (process.env.MBX_AGENT || undefined), cli: str("cli"), session: str("session") }, me => {
+                r = withCliIdentity(node, { as: str("as") ?? (process.env.MBX_AGENT || undefined), cli: str("cli"), session: str("session") }, (me, descriptor) => {
                     entered = true;
-                    return send(me);
+                    const taint = readSessionTaint(node.store, descriptor.cli, descriptor.session_id);
+                    return noteOrigin(send(me, false, taint), taint);
                 });
             }
             catch (error) {
@@ -806,7 +826,7 @@ async function run(argv) {
                         throw Object.assign(new Error("this sender name is leased; use its owning session or explicitly recover the identity"), { code: "IDENTITY_LEASE_REQUIRED" });
                     if (!node.agents().some(a => a.name === name && a.host === node.host))
                         node.registerAgent(name, { cli: "cli" });
-                    return send(sender, true);
+                    return noteOrigin(send(sender, true, null), null);
                 });
                 r.warnings.push("unverified-sender: no current identity lease; recipients must not treat the claimed name as delegated authority");
             }
@@ -1054,6 +1074,7 @@ If the codes differ, do not approve: someone is in the middle.`);
                 });
             }
             setInterval(tick, 2000);
+            armDaemonSync(node);
             // Presence (T201): announce this host's addresses on start, within ~10 s of an address change, and every 5 min.
             let lastAddrs = addrSignature(node), lastBeacon = 0;
             const beacon = () => { const sig = addrSignature(node); if (sig !== lastAddrs || Date.now() - lastBeacon > 300_000) {
@@ -1788,6 +1809,27 @@ async function hook(node, event, cli) {
  */
 export const watcherEvidenceRetryable = (e) => e?.code === "IDENTITY_STATUS_UNKNOWN"
     || /caller process evidence became stale|process status is unknown/.test(e?.message ?? "");
+/** The conversation that will see this watcher's exit, or null when only an `mcp-*` lease matches.
+ *  Current row: the newest live non-provisional session whose pid is this process or an ancestor.
+ *  `--session` must name that row. With no `--session`, exactly one such row is required. */
+function watcherObservingSession(node, agent, selection) {
+    const chain = new Set([process.pid, ...ancestors()]);
+    const live = node.sessionsFor(agent).filter((r) => {
+        const pid = r.pid;
+        return !!pid && !r.session_id.startsWith("mcp-") && chain.has(pid) && node.sameSession(pid, r)
+            && (!selection.cli || r.cli === selection.cli);
+    });
+    const current = live[0]; // sessionsFor is updated_at DESC
+    if (!current)
+        return null;
+    if (selection.session) {
+        if (selection.session !== current.session_id)
+            return null;
+    }
+    else if (live.length !== 1)
+        return null;
+    return { session: current.session_id, pid: process.pid };
+}
 async function watch(node, selection) {
     const every = Math.max(200, Number(process.env.MBX_WATCH_INTERVAL_MS) || 2_000);
     // T343: MCP leases heartbeat every MCP_HEARTBEAT_MS (mcp.ts). While the holder's heartbeat
@@ -1902,8 +1944,16 @@ async function watch(node, selection) {
                     if (r.delivery_note === "desktop")
                         node.store.db.prepare("UPDATE deliveries SET note=NULL, updated_at=? WHERE msg_id=? AND agent=? AND state='notified' AND note='desktop'").run(new Date().toISOString(), r.id, mailbox);
                 }
-                if (wanted.length)
-                    node.store.audit("wake.attempt", { agent: mailbox, outcome: "admitted", receipt: "transport", via: "watcher" });
+                if (wanted.length) {
+                    // Admitted only for the conversation that can observe this exit. A matching mcp-* lease
+                    // token still lets the process run; it does not make the printed hint an idle wake.
+                    const observed = watcherObservingSession(node, agent, selection);
+                    const session = observed?.session ?? (selection.session && !selection.session.startsWith("mcp-") ? selection.session : undefined);
+                    node.store.audit("wake.attempt", {
+                        agent: mailbox, outcome: observed ? "admitted" : "not_submitted", receipt: observed ? "transport" : "none",
+                        via: "watcher", pid: process.pid, ...(session ? { session } : {}),
+                    });
+                }
             }
             report = lines.length ? lines.join("\n") : null;
             failures = 0;
