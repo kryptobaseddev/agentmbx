@@ -134,6 +134,14 @@ test("a sibling stops acting as the identity once the holder's lease is released
   const after = await call(sibling, "mbx_inbox");
   assert.equal(after.isError, true, "a released lease is not co-used");
   assert.deepEqual(lease("sib-fenced"), released, "the failing call claimed nothing");
+  // T440: whoami must not undo the holder's explicit release. An explicit claim still can.
+  const releasedWho = json(await call(sibling, "mbx_whoami"));
+  assert.equal(releasedWho.agent, null, JSON.stringify(releasedWho));
+  assert.deepEqual(lease("sib-fenced"), released, "whoami left the lease released");
+  const claimed = await call(sibling, "mbx_identity", { action: "claim", name: "sib-fenced" });
+  assert.notEqual(claimed.isError, true, textOf(claimed));
+  assert.equal(lease("sib-fenced").released_at, null, "an explicit claim takes the released lease");
+  assert.equal(json(await call(sibling, "mbx_whoami")).agent, "sib-fenced");
 
   // A later sibling of a different session never co-uses: co-use needs the same session as the holder.
   const other = await connect();
@@ -175,10 +183,13 @@ test("co-use requires the same session and the holder's own provider process", (
   const lease = { name: "x", token: "t", holder_pid: 50, holder_start: "s", key_fp: "k", cli: "opencode", session_id: "ses_a",
     claimed_at: now, heartbeat_at: now, idle_ttl: 60_000, released_at: null, release_reason: null } as IdentityLease;
   const live: ProcessEvidence = { alive: true, start: "s" };
-  const at = (caller: { cli: string; sessionId: string; providerPid?: number; holderProviderPid?: number | null }, evidence: ProcessEvidence = live) =>
+  const at = (caller: { cli: string; sessionId: string; providerPid?: number; holderProviderPid?: number | null; holderProviderAlive?: boolean | null }, evidence: ProcessEvidence = live) =>
     identityAvailability({ lease, evidence, activity: null, now, caller });
   assert.equal(at({ cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: 10 }).coUse, true, "same session, same provider");
-  assert.equal(at({ cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: 20 }).coUse, undefined, "restarted provider: takeover, not co-use");
+  assert.equal(at({ cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: 20 }).coUse, undefined, "a different provider is not co-use");
+  assert.equal(at({ cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: 20, holderProviderAlive: false }).takeover, "same-session", "dead provider is takeover");
+  assert.equal(at({ cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: 20, holderProviderAlive: true }).takeover, undefined, "a live provider is not takeover");
+  assert.equal(at({ cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: 20, holderProviderAlive: true }).claimable, false);
   assert.equal(at({ cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: null }).coUse, undefined, "unknown parentage");
   assert.equal(at({ cli: "opencode", sessionId: "ses_a" }).coUse, undefined, "no provider evidence");
   assert.equal(at({ cli: "opencode", sessionId: "ses_b", providerPid: 10, holderProviderPid: 10 }).coUse, undefined, "another session");

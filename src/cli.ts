@@ -22,7 +22,7 @@ import { resolveStatusIdentity } from "./status-identity.ts";
 import { runStatuslineSuggest } from "./statusline-suggest.ts";
 import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.ts";
 import { retirePhantoms, returnNeverClaimed } from "./stranded.ts";
-import { activeLead, leadSummary, makeLead, makeLeadRevocation, revokeLead, storeLead } from "./project-ledger.ts";
+import { activeLead, leadSummary, makeLead, makeLeadRevocation, projectLeadLine, projectLeadView, revokeLead, storeLead } from "./project-ledger.ts";
 import { DEFAULT_PORT, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.ts";
 import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary,
   type Level, type PolicyClass, type PolicyRecord, type Revocation } from "./policy.ts";
@@ -36,7 +36,7 @@ import { kimiMultiHost } from "./kimi-web.ts";
 import { bindInstruction, issueBindTicket } from "./bind-ticket.ts";
 import { activityKey } from "./identity-availability.ts";
 import { identityLeaseStatus, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
-import { AUTO_NAME_RE, linkedKey, projectOf, recordSessionHint, registeredIdentity } from "./registry.ts";
+import { AUTO_NAME_RE, identityProjects, linkedKey, projectOf, recordSessionHint, registeredIdentity } from "./registry.ts";
 import { applyForward, buildForward, pruneCandidates, retireMailbox } from "./identity-cleanup.ts";
 import { installDesktopPlugin, kimiDesktop, kimiDesktopDir, removeDesktopPlugin, writeDesktopPlugin } from "./kimi-desktop.ts";
 import { approveKimi, decidePermission, opencodePermissionPass, type Lookup } from "./permission.ts";
@@ -712,6 +712,7 @@ async function run(argv: string[]) {
         if (edit) node.registerAgent(name, { role: str("role"), description: str("description") });
         const a = node.agents().find(x => x.name === name && x.host === node.host);
         console.log(`${name}@${node.host}${a?.role ? `  role:${a.role}` : ""}  (${a?.cli ?? "?"})  unacked: ${node.unreadCount(name)}${a?.description ? `\n${a.description}` : ""}`);
+        console.log(projectLeadLine(projectLeadView(node, identityProjects(node.store, name)[0] ?? projectOf(process.cwd()))));
         console.log(`delivery: ${node.deliveryMode(name)}`);
         console.log(delegationNote(node.store.db, name, node.host) ?? "policy: none (ask): other agents' requests need your user's OK");
       });
@@ -752,7 +753,8 @@ async function run(argv: string[]) {
             owner_authority: counts.reduce((sum, c) => sum + c.owner_authority, 0),
             outbox: (node.store.db.prepare("SELECT count(DISTINCT o.msg_id) n FROM outbox o JOIN messages m ON m.id=o.msg_id WHERE m.from_addr=?")
               .get(`${agent}@${node.host}`) as { n: number }).n };
-          return console.log(o.json ? JSON.stringify(out) : `${out.address}: ${out.unread} unread · ${out.needs_reply} needs reply · ${out.owner_authority} owner · ${out.outbox} outbox`);
+          const leadLine = projectLeadLine(projectLeadView(node, identityProjects(node.store, agent)[0]));
+          return console.log(o.json ? JSON.stringify(out) : `${out.address}: ${out.unread} unread · ${out.needs_reply} needs reply · ${out.owner_authority} owner · ${out.outbox} outbox\n${leadLine}`);
         });
       }
       const q = (sql: string) => (node.store.db.prepare(sql).get() as { n: number }).n;
@@ -760,6 +762,7 @@ async function run(argv: string[]) {
 messages ${q("SELECT count(*) n FROM messages")}  unacked ${q("SELECT count(*) n FROM deliveries WHERE state <> 'acked'")}  outbox ${q("SELECT count(*) n FROM outbox")}
 peers ${node.peers().map((p) => `${p.host}(${p.state})`).join(" ") || "none"}  active grants ${q(`SELECT count(*) n FROM grants WHERE revoked=0 AND exp>'${new Date().toISOString()}'`)}
 version ${version()} (${installKind()})`);
+      console.log(projectLeadLine(projectLeadView(node, projectOf(process.cwd()))));
       const upd = updateAvailable(node.store);
       if (upd) console.log(`update available: ${upd} (run: agentmbx update)`);
       const stored = storedPolicies(node.store.db);
