@@ -1888,7 +1888,7 @@ async function watch(node, selection) {
     // advances, the lease row itself is the liveness proof — no process evidence, no ps spawns. A
     // stale heartbeat pays ONE rate-limited probe, classified by identityLeaseStatus: live carries
     // on, unknown is retryable (T206/T340: unknown is never a stop), expired stops with the reason.
-    let watching, failures = 0, evidenceRetries = 0;
+    let watching, failures = 0, evidenceRetries = 0, releaseRetries = 0;
     // The pinned lease identity (review blocker): a takeover or reclaim that swaps token, holder
     // pid or holder start must stop this watcher — by name alone it would keep consuming the new
     // session's wakes. Mono clock (performance.now) so a backward wall step can't hide a crash.
@@ -1932,8 +1932,18 @@ async function watch(node, selection) {
             const agent = watching;
             const lease = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?")
                 .get(agent);
-            if (!lease || lease.released_at !== null)
+            // T452: a lease that is briefly released during a move must not stop the pinned watcher with the wrong
+            // reason. Retry for a short window; if a new holder claims with a different token, the next tick reports
+            // "moved to another holder". If the lease stays released, the retry budget exhausts and we stop.
+            if (!lease || lease.released_at !== null) {
+                if (releaseRetries < 3) {
+                    releaseRetries += 1;
+                    await new Promise(r => setTimeout(r, 250 * releaseRetries));
+                    continue;
+                }
                 throw leaseLost("no current identity lease");
+            }
+            releaseRetries = 0;
             if (!pinned) {
                 pinned = { token: lease.token, holder_pid: lease.holder_pid, holder_start: lease.holder_start };
                 lastHeartbeatAt = lease.heartbeat_at;
