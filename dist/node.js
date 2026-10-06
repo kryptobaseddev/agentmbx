@@ -16,6 +16,7 @@ import { procStart, procTable, provenProcess, sameProcess } from "./proc.js";
 import { bumpPostToolMarker, bumpPostToolMarkersForAgent } from "./posttool.js";
 import { privatePath } from "./private-files.js";
 import { backfillRegistry } from "./registry.js";
+import { resolveLeadRecipients } from "./lead-record.js";
 import { Store } from "./store.js";
 export const DEFAULT_PORT = 7373;
 export const RETRY_HOURS = 72;
@@ -729,14 +730,18 @@ export class MbxNode {
         const pub = this.ownerPub;
         if (!pub)
             throw new Error("no owner key on this machine: run 'agentmbx owner init'");
-        const req = ownerSignRequest(buildEnvelope({ ...d, from: `owner@${this.host}` }), pub);
-        return this.send({ ...d, from: "owner" }, undefined, undefined, withOwnerSig(req.envelope, (await sign(req.payload)).sig));
+        const to = resolveLeadRecipients(this, "owner", d.to, d.project);
+        const req = ownerSignRequest(buildEnvelope({ ...d, to, from: `owner@${this.host}` }), pub);
+        return this.send({ ...d, to, from: "owner" }, undefined, undefined, withOwnerSig(req.envelope, (await sign(req.payload)).sig));
     }
     send(d, session, owner, prebuilt) {
         const fromName = d.from.includes("@") ? d.from.split("@")[0] : d.from;
         if (!NAME_RE.test(fromName) && fromName !== "owner")
             throw new Error(`invalid sender name "${fromName}"`);
-        let e = prebuilt ?? buildEnvelope({ ...d, from: `${fromName}@${this.host}` });
+        // A prebuilt envelope is already signed, so its `to` stays. Callers that build one (sendAsOwner)
+        // resolve lead tokens before that signature.
+        const to = prebuilt ? d.to : resolveLeadRecipients(this, fromName, d.to, d.project);
+        let e = prebuilt ?? buildEnvelope({ ...d, to, from: `${fromName}@${this.host}` });
         // Positive host attestation comes from the current lease operation, never a draft flag.
         // A prebuilt owner-signed envelope is immutable: changing metadata would invalidate its approval.
         if (prebuilt?.meta.sender_verification === "leased" && (e.from !== `${fromName}@${this.host}` || !hasHeldIdentity(this.store, fromName)))

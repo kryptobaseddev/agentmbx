@@ -1,7 +1,7 @@
 // Daemon sync client (T262). One POST writer, one seq per host. No network call
-// unless a local link record exists. SyncAck cannot turn the path opt-in on.
+// unless a local link record exists. SyncAck cannot turn the path or lead opt-in on.
 import {
-  CONTRACT_VERSION, PATH_FLAG_PREFIX, PROJECT_PATHS_SINCE, projectSync, type Projection, type SyncSnapshot,
+  CONTRACT_VERSION, PATH_FLAG_PREFIX, PROJECT_LEADS_SINCE, PROJECT_PATHS_SINCE, projectSync, type Projection, type SyncSnapshot,
 } from "./sync-projection.ts";
 
 export const LINK_KEY = "sync.link";
@@ -15,6 +15,8 @@ export interface SyncLink {
   contract: { min: number; max: number };
   /** Set by local enrolment when the spoken schema lists HostReport.project_paths. Never by a SyncAck. */
   project_paths?: boolean;
+  /** Set by local enrolment when the spoken schema lists HostReport.project_leads. Never by a SyncAck. */
+  project_leads?: boolean;
 }
 
 interface Pending { seq: number; body: string; receiptKeys: string[]; snapshotHash: string }
@@ -37,7 +39,7 @@ export interface SyncDeps {
   fetch: typeof fetch;
   now: number;
   /** Called only when a new batch will be sent. Not called when unlinked, waiting, or resending. */
-  source: (ctx: { now: string; seq: number; full: boolean; contract: number; contractAllowsProjectPaths: boolean; sentReceipts: string[] }) => Omit<SyncSnapshot, "now" | "seq" | "full" | "contract" | "contractAllowsProjectPaths" | "sentReceipts">;
+  source: (ctx: { now: string; seq: number; full: boolean; contract: number; contractAllowsProjectPaths: boolean; contractAllowsProjectLeads: boolean; sentReceipts: string[] }) => Omit<SyncSnapshot, "now" | "seq" | "full" | "contract" | "contractAllowsProjectPaths" | "contractAllowsProjectLeads" | "sentReceipts">;
   audit?: (event: string, detail: Record<string, string | number | boolean>) => void;
 }
 
@@ -60,7 +62,8 @@ export function readLink(get: Kv["get"]): SyncLink | null {
   const l = parsed as Partial<SyncLink>;
   if (l.v !== 1 || typeof l.sync_url !== "string" || !l.sync_url || typeof l.token !== "string" || !l.token) return null;
   if (!l.contract || typeof l.contract.min !== "number" || typeof l.contract.max !== "number") return null;
-  return { v: 1, sync_url: l.sync_url, token: l.token, contract: { min: l.contract.min, max: l.contract.max }, ...(l.project_paths === true ? { project_paths: true } : {}) };
+  return { v: 1, sync_url: l.sync_url, token: l.token, contract: { min: l.contract.min, max: l.contract.max },
+    ...(l.project_paths === true ? { project_paths: true } : {}), ...(l.project_leads === true ? { project_leads: true } : {}) };
 }
 
 function blank(): SyncState {
@@ -137,9 +140,10 @@ export async function syncOnce(o: SyncDeps): Promise<SyncResult> {
   if (!pending) {
     const seq = state.ack_seq + 1;
     const allowsPaths = contract >= PROJECT_PATHS_SINCE && link.project_paths === true;
+    const allowsLeads = contract >= PROJECT_LEADS_SINCE && link.project_leads === true;
     const sentAt = new Date(o.now).toISOString();
-    const snap = o.source({ now: sentAt, seq, full: true, contract, contractAllowsProjectPaths: allowsPaths, sentReceipts: state.sent_receipts });
-    const common = { ...snap, now: sentAt, seq, contract, contractAllowsProjectPaths: allowsPaths, sentReceipts: state.sent_receipts };
+    const snap = o.source({ now: sentAt, seq, full: true, contract, contractAllowsProjectPaths: allowsPaths, contractAllowsProjectLeads: allowsLeads, sentReceipts: state.sent_receipts });
+    const common = { ...snap, now: sentAt, seq, contract, contractAllowsProjectPaths: allowsPaths, contractAllowsProjectLeads: allowsLeads, sentReceipts: state.sent_receipts };
     const fullTry: Projection = projectSync({ ...common, full: true });
     if (!fullTry.ok) {
       state.next_at = o.now + 15_000;
@@ -218,7 +222,7 @@ async function send(o: SyncDeps, link: SyncLink, state: SyncState, pending: Pend
 
 function refusePathCommands(o: SyncDeps, commands: unknown): void {
   const text = JSON.stringify(commands ?? null);
-  if (!text.includes(PATH_FLAG_PREFIX) && !text.includes("local_path") && !text.includes("project_paths")) return;
+  if (!text.includes(PATH_FLAG_PREFIX) && !text.includes("local_path") && !text.includes("project_paths") && !text.includes("project_leads")) return;
   o.audit?.("sync.command", { code: "OP_NOT_ALLOWED_FROM_CONSOLE" });
 }
 

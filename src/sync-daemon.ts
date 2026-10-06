@@ -6,10 +6,11 @@ import { missedCount } from "./catchup.ts";
 import { fingerprint } from "./crypto.ts";
 import type { MbxNode } from "./node.ts";
 import { storedPolicies } from "./policy.ts";
+import { activeLead } from "./lead-record.ts";
 import { projectKey } from "./registry.ts";
 import { relayFor } from "./relay-client.ts";
 import { syncOnce, type SyncDeps, type SyncResult } from "./sync-client.ts";
-import { PATH_FLAG_PREFIX, PROJECT_KEY_RE, type AgentInput, type HostInput, type PathInput, type PolicyInput, type ReceiptInput, type SyncSnapshot, type ThreadInput } from "./sync-projection.ts";
+import { CAPS, PATH_FLAG_PREFIX, PROJECT_KEY_RE, type AgentInput, type HostInput, type LeadInput, type PathInput, type PolicyInput, type ReceiptInput, type SyncSnapshot, type ThreadInput } from "./sync-projection.ts";
 import type { Store } from "./store.ts";
 import { version } from "./version.ts";
 
@@ -20,7 +21,7 @@ const DELIVERY_STATES = new Set(["queued", "handed-over", "delivered", "notified
 const NAME_RE = /^[a-z0-9][a-z0-9-]{1,39}$/;
 const ADDR_RE = /^[a-z0-9][a-z0-9-]{1,39}@[a-z0-9][a-z0-9-]{1,39}$/;
 
-export type SyncSource = Omit<SyncSnapshot, "now" | "seq" | "full" | "contract" | "contractAllowsProjectPaths" | "sentReceipts">;
+export type SyncSource = Omit<SyncSnapshot, "now" | "seq" | "full" | "contract" | "contractAllowsProjectPaths" | "contractAllowsProjectLeads" | "sentReceipts">;
 
 export interface SyncTickDeps {
   fetch?: typeof fetch;
@@ -138,6 +139,21 @@ export function loadSyncSnapshot(node: MbxNode, ctx: { contractAllowsProjectPath
     }
   }
 
+  // Always collected. projectSync attaches host.project_leads only when the spoken contract lists it.
+  // The checkout path is the lookup key and is not a field: a signature over that path would leak it.
+  const leads: LeadInput[] = [];
+  const seenLead = new Set<string>();
+  for (const row of db.prepare("SELECT DISTINCT project FROM project_leads ORDER BY project").all() as { project: string }[]) {
+    if (leads.length >= CAPS.leads) break;
+    const rec = activeLead(node, row.project);
+    if (!rec || !NAME_RE.test(rec.agent) || !NAME_RE.test(rec.host)) continue;
+    let key: string | undefined;
+    try { key = projectKeyOf(row.project); } catch { key = undefined; }
+    if (!key || !PROJECT_KEY_RE.test(key) || seenLead.has(key)) continue;
+    seenLead.add(key);
+    leads.push({ project_key: key, agent: rec.agent, host: rec.host, exp: rec.exp, id: rec.id });
+  }
+
   return {
     host: {
       daemon_version: version(),
@@ -157,6 +173,7 @@ export function loadSyncSnapshot(node: MbxNode, ctx: { contractAllowsProjectPath
     policies: policyInputs(node, nowMs),
     approvals: [],
     paths,
+    leads,
   };
 }
 

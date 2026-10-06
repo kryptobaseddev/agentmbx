@@ -22,7 +22,7 @@ import { resolveStatusIdentity } from "./status-identity.ts";
 import { runStatuslineSuggest } from "./statusline-suggest.ts";
 import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.ts";
 import { retirePhantoms, returnNeverClaimed } from "./stranded.ts";
-import { activeLead, leadSummary, makeLead, makeLeadRevocation, revokeLead, storeLead } from "./project-ledger.ts";
+import { activeLead, leadSummary, makeLead, makeLeadRevocation, projectLeadLine, projectLeadView, revokeLead, storeLead } from "./project-ledger.ts";
 import { DEFAULT_PORT, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.ts";
 import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary,
   type Level, type PolicyClass, type PolicyRecord, type Revocation } from "./policy.ts";
@@ -36,7 +36,7 @@ import { kimiMultiHost } from "./kimi-web.ts";
 import { bindInstruction, issueBindTicket } from "./bind-ticket.ts";
 import { activityKey } from "./identity-availability.ts";
 import { identityLeaseStatus, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
-import { AUTO_NAME_RE, linkedKey, projectOf, recordSessionHint, registeredIdentity } from "./registry.ts";
+import { AUTO_NAME_RE, identityProjects, linkedKey, projectOf, recordSessionHint, registeredIdentity } from "./registry.ts";
 import { applyForward, buildForward, pruneCandidates, retireMailbox } from "./identity-cleanup.ts";
 import { installDesktopPlugin, kimiDesktop, kimiDesktopDir, removeDesktopPlugin, writeDesktopPlugin } from "./kimi-desktop.ts";
 import { approveKimi, decidePermission, opencodePermissionPass, type Lookup } from "./permission.ts";
@@ -74,7 +74,7 @@ Messages
   agentmbx status --cli <provider> --session <id> --json   current session identity and mailbox counts (read-only)
   agentmbx status --cli <provider> [--session <id>] --json --schema mbx.status/v1   HUD snapshot for harnesses; no lease needed (T311)
   agentmbx statusline <claude|codex|kimi|opencode|grok|copilot|cursor|gemini>   render one MBX segment from the HUD snapshot (T313)
-  agentmbx probe [--project <dir>] [--deadline 120s] [--require-idle-wake] [--json]   autonomy probe: every live leased identity must answer the [mbx-probe] request with no human prompt (T388 gate; T392)
+  agentmbx probe [--project <dir>] [--deadline 120s] [--require-idle-wake] [--only a,b] [--exclude glob] [--plan] [--json]   autonomy probe: every live leased identity must answer the [mbx-probe] request with no human prompt (T388 gate; T392, T445)
   agentmbx identity list [--project <dir>] [--all] [--json]   identities with role, holder, claimable and unread (read-only)
   agentmbx identity prune [--days 7] [--apply]   retire mailboxes older versions generated that nobody holds (dry run by default)
   agentmbx identity forward <from> <to>          move a mailbox's unread mail to another, with your owner signature
@@ -324,7 +324,7 @@ async function run(argv: string[]) {
     backend: { type: "string" }, "no-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
     project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }, "wait-ms": { type: "string" }, "store-dir": { type: "string" }, "trust-proxy": { type: "boolean" },
     "older-than": { type: "string" }, minutes: { type: "string" }, apply: { type: "boolean" }, days: { type: "string" }, fix: { type: "boolean" }, key: { type: "string" },
-    deadline: { type: "string" }, "require-idle-wake": { type: "boolean" } } });
+    deadline: { type: "string" }, "require-idle-wake": { type: "boolean" }, "exclude": { type: "string" }, plan: { type: "boolean" } } });
   if (o.help) return console.log(commandHelp(cmd));
   const str = (k: string) => (typeof (o as Record<string, unknown>)[k] === "string" ? (o as Record<string, unknown>)[k] as string : undefined);
 
@@ -548,10 +548,28 @@ async function run(argv: string[]) {
     })();
     const dir = str("project") ?? dirs[0]; // --project is a multiple option
     const project = dir ? (projectOf(resolve(dir)) ?? die(`${dir} is the home folder or /, not a project`)) : undefined;
+    // T445: target selection controls. Values are comma-separated (and repeatable); --exclude
+    // accepts globs (* and ?). --plan prints the targets and sends nothing.
+    const names = (key: "only" | "exclude"): string[] => {
+      const v = o[key];
+      const raw = Array.isArray(v) ? v : typeof v === "string" ? [v] : [];
+      return raw.flatMap((s) => String(s).split(",")).map((s) => s.trim()).filter(Boolean);
+    };
+    const only = names("only");
+    const exclude = names("exclude");
+    const planOnly = !!o.plan;
     try {
       const report = await runProbe(storeProbeIO(node, { project, sender }),
-        { sender, project, deadlineMs, requireIdleWake: !!o["require-idle-wake"] });
-      if (o.json) console.log(JSON.stringify(report, null, 2));
+        { sender, project, deadlineMs, requireIdleWake: !!o["require-idle-wake"], planOnly,
+          ...(only.length ? { only } : {}), ...(exclude.length ? { exclude } : {}) });
+      if (planOnly) {
+        if (o.json) console.log(JSON.stringify(report.targets.map((t) => ({ name: t.name, state: t.state, holder: t.holder })), null, 2));
+        else {
+          console.log(`probe plan: ${report.targets.length} target(s)${project ? ` in ${project}` : ""}${only.length ? `, --only ${only.join(", ")}` : ""}${exclude.length ? `, --exclude ${exclude.join(", ")}` : ""}`);
+          for (const t of report.targets) console.log(`  ${t.name} (${t.state})${t.holder ? ` holder ${t.holder.cli}:${t.holder.session_id}` : ""}`);
+          if (!report.targets.length && report.reason) console.log(report.reason);
+        }
+      } else if (o.json) console.log(JSON.stringify(report, null, 2));
       else {
         console.log(`probe: ${report.summary.passed}/${report.summary.total} passed (sender ${report.sender}@${node.host}, deadline ${Math.round(report.deadline_ms / 1000)}s${report.require_idle_wake ? ", strict idle-wake" : ""})`);
         for (const t of report.targets) {
@@ -565,7 +583,7 @@ async function run(argv: string[]) {
         }
         if (!report.targets.length && report.reason) console.log(report.reason);
       }
-      process.exitCode = report.ok ? 0 : 1;
+      process.exitCode = planOnly ? 0 : report.ok ? 0 : 1;
     } finally { node.close(); }
     return;
   }
@@ -694,6 +712,7 @@ async function run(argv: string[]) {
         if (edit) node.registerAgent(name, { role: str("role"), description: str("description") });
         const a = node.agents().find(x => x.name === name && x.host === node.host);
         console.log(`${name}@${node.host}${a?.role ? `  role:${a.role}` : ""}  (${a?.cli ?? "?"})  unacked: ${node.unreadCount(name)}${a?.description ? `\n${a.description}` : ""}`);
+        console.log(projectLeadLine(projectLeadView(node, identityProjects(node.store, name)[0] ?? projectOf(process.cwd()))));
         console.log(`delivery: ${node.deliveryMode(name)}`);
         console.log(delegationNote(node.store.db, name, node.host) ?? "policy: none (ask): other agents' requests need your user's OK");
       });
@@ -734,7 +753,8 @@ async function run(argv: string[]) {
             owner_authority: counts.reduce((sum, c) => sum + c.owner_authority, 0),
             outbox: (node.store.db.prepare("SELECT count(DISTINCT o.msg_id) n FROM outbox o JOIN messages m ON m.id=o.msg_id WHERE m.from_addr=?")
               .get(`${agent}@${node.host}`) as { n: number }).n };
-          return console.log(o.json ? JSON.stringify(out) : `${out.address}: ${out.unread} unread · ${out.needs_reply} needs reply · ${out.owner_authority} owner · ${out.outbox} outbox`);
+          const leadLine = projectLeadLine(projectLeadView(node, identityProjects(node.store, agent)[0]));
+          return console.log(o.json ? JSON.stringify(out) : `${out.address}: ${out.unread} unread · ${out.needs_reply} needs reply · ${out.owner_authority} owner · ${out.outbox} outbox\n${leadLine}`);
         });
       }
       const q = (sql: string) => (node.store.db.prepare(sql).get() as { n: number }).n;
@@ -742,6 +762,7 @@ async function run(argv: string[]) {
 messages ${q("SELECT count(*) n FROM messages")}  unacked ${q("SELECT count(*) n FROM deliveries WHERE state <> 'acked'")}  outbox ${q("SELECT count(*) n FROM outbox")}
 peers ${node.peers().map((p) => `${p.host}(${p.state})`).join(" ") || "none"}  active grants ${q(`SELECT count(*) n FROM grants WHERE revoked=0 AND exp>'${new Date().toISOString()}'`)}
 version ${version()} (${installKind()})`);
+      console.log(projectLeadLine(projectLeadView(node, projectOf(process.cwd()))));
       const upd = updateAvailable(node.store);
       if (upd) console.log(`update available: ${upd} (run: agentmbx update)`);
       const stored = storedPolicies(node.store.db);
