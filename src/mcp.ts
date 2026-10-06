@@ -27,7 +27,7 @@ import { consumeIdentityControl, identityControlAliases, identityControlKey, ide
 import { alive, didWarning, formatFor, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
 import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy.ts";
 import { assertKnownRecipients, deliveryReceipts, offlineWarnings, receiptLine, recipientReceipts, sentPage } from "./receipts.ts";
-import { forwardMessage, ledgerPage } from "./project-ledger.ts";
+import { forwardMessage, ledgerPage, projectLeadLine, projectLeadView } from "./project-ledger.ts";
 import { skillFiles } from "./setup.ts";
 import { claudeSessionId, claudeSessionTracker, grokSessionId, grokSessionTracker, procStart, procTable, withProcSnapshot } from "./proc.ts";
 import { updateAvailable } from "./update.ts";
@@ -1162,7 +1162,9 @@ export async function runMcp(existing?: MbxNode) {
     if (!bound(state)) {
       if (name) return identityOperation({ action: registeredIdentity(node.store, name) || AUTO_NAME_RE.test(name) ? "claim" : "register", name, role, description });
       const list = listIdentityStatus(node.home, { project, caller: { cli: env.cli, sessionId: state.sessionId, pid: process.pid, providerPid: env.ppid } });
-      const out = { agent: null, host: node.host, cli: env.cli, unbound: true, project: project ?? null, pending: state.pending ?? null,
+      const leadView = projectLeadView(node, project);
+      const out = { agent: null, host: node.host, cli: env.cli, unbound: true, project: project ?? null,
+        lead: leadView.address && leadView.exp ? { address: leadView.address, exp: leadView.exp } : null, pending: state.pending ?? null,
         reason: state.lostTo ? `claimed by ${state.lostTo}` : state.pendingReason ?? null, next: unboundMessage(state),
         project_identities: list.identities.map(i => ({ name: i.name, role: i.role, state: i.state, claimable: i.claimable, unread: i.unread, reason: i.reason })),
         version: version() };
@@ -1192,8 +1194,10 @@ export async function runMcp(existing?: MbxNode) {
     const s = session();
     const me = node.agents().find((a) => a.name === agent && a.host === node.host);
     const reg = registeredIdentity(node.store, agent);
+    const leadView = projectLeadView(node, project);
     const out = { agent, host: node.host, address: `${agent}@${node.host}`, role: reg?.role ?? me?.role ?? null, description: reg?.description ?? me?.description ?? null,
-      registered: !!reg, project: project ?? null, cli: env.cli, session: fingerprint(key.publicKey), ...(state.coUse ? { co_use: CO_USE_NOTE } : {}),
+      registered: !!reg, project: project ?? null, lead: leadView.address && leadView.exp ? { address: leadView.address, exp: leadView.exp } : null,
+      cli: env.cli, session: fingerprint(key.publicKey), ...(state.coUse ? { co_use: CO_USE_NOTE } : {}),
       owner_grant: s.grant ? { caps: s.grant.caps, expires: s.grant.exp } : null, delivery: node.deliveryMode(agent), unread: node.unreadCount(agent),
       missed: missedCount(node.store, agent).missed,
       // T344: whether this session's sends go out external, since when (root exposure), why, and when that ends
@@ -1246,7 +1250,7 @@ export async function runMcp(existing?: MbxNode) {
 
   server.registerTool("mbx_send", {
     title: "Send an mbx message",
-    description: "Start a new conversation with other agents (to answer a message, use mbx_reply instead). `to` accepts agent names (vida-dev), agent@host (vida-dev@fedora), role:<role>, * (everyone), or owner; find names with mbx_agents. Kind decides waking: request/task/decision/alert wake an idle recipient; message/reply wake only with needs_reply=true or an @mention; status NEVER wakes (it waits for the recipient's next prompt). Use kind=request/task with needs_reply=true when you need an answer. A successful send is acceptance, not recipient delivery, reply or task completion; queued transport retry is not a draft API. Avoid manually resending an uncertain send. The result's recipients[] says per recipient: live-wake (eligible for wake; dispatcher admission pending), live-next-prompt (seen on its next prompt), offline (no live session; it waits), forwarded (renamed mailbox) or remote (queued for a paired host). A name that never existed on this host is refused with suggestions. Next: check mbx_inbox for answers.",
+    description: "Start a new conversation with other agents (to answer a message, use mbx_reply instead). `to` accepts agent names (vida-dev), agent@host (vida-dev@fedora), role:<role>, lead and role:lead (the owner-designated lead of this session's project; refused when that project has none), * (everyone), or owner; find names with mbx_agents. Kind decides waking: request/task/decision/alert wake an idle recipient; message/reply wake only with needs_reply=true or an @mention; status NEVER wakes (it waits for the recipient's next prompt). Use kind=request/task with needs_reply=true when you need an answer. A successful send is acceptance, not recipient delivery, reply or task completion; queued transport retry is not a draft API. Avoid manually resending an uncertain send. The result's recipients[] says per recipient: live-wake (eligible for wake; dispatcher admission pending), live-next-prompt (seen on its next prompt), offline (no live session; it waits), forwarded (renamed mailbox) or remote (queued for a paired host). A name that never existed on this host is refused with suggestions. Next: check mbx_inbox for answers.",
     inputSchema: {
       to: z.array(z.string().min(1)).min(1).max(20), subject: z.string().min(1).max(200), body: z.string().max(256 * 1024),
       kind: z.enum(KINDS).default("message").describe("request/task/decision/alert wake the recipient; message/reply wake only with needs_reply or an @mention; status never wakes"),
@@ -1386,8 +1390,10 @@ export async function runMcp(existing?: MbxNode) {
     annotations: { readOnlyHint: true },
   }, () => {
     const rows = node.agents();
-    return text(rows.map((a) => `${a.name}@${a.host}${a.role ? `  role:${a.role}` : ""}${a.cli ? `  (${a.cli})` : ""}  last seen ${a.last_seen ?? "never"}${a.description ? `  — ${a.description}` : ""}`).join("\n") || "No agents yet.",
-      { agents: rows });
+    const leadView = projectLeadView(node, project);
+    const lead = leadView.address && leadView.exp ? { address: leadView.address, exp: leadView.exp } : null;
+    const lines = rows.map((a) => `${a.name}@${a.host}${a.role ? `  role:${a.role}` : ""}${a.cli ? `  (${a.cli})` : ""}  last seen ${a.last_seen ?? "never"}${a.description ? `  — ${a.description}` : ""}`).join("\n") || "No agents yet.";
+    return text(`${lines}\n${projectLeadLine(leadView)}`, { agents: rows, lead });
   });
 
   server.registerTool("mbx_sent", {
