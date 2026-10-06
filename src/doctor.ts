@@ -1,17 +1,18 @@
 // `agentmbx doctor`: one checklist that says what works, what doesn't, and the one command that fixes it.
 import { rotationLog } from "./key-rotation.ts";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { phantomMailboxes, returnDays } from "./stranded.ts";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { fingerprint } from "./crypto.ts";
 import { signHop } from "./http.ts";
 import { relayState, ROLLBACK_REASON } from "./relay-v2.ts";
 import { kimiHostedServer, kimiInstances } from "./kimi-web.ts";
+import { opencodeService } from "./wake.ts";
 import { kimiDesktop } from "./kimi-desktop.ts";
 import { version } from "./version.ts";
 import { GROK_NO_PUSH, MbxNode, RETRY_HOURS } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
-import { detect, edits, grokMcpConfiguredCommand, skillDest, skillStatus, statuslineConfiguredCommand, statuslineForms, statuslineState, wired, type SetupCtx } from "./setup.ts";
+import { detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConsent, skillDest, skillStatus, statuslineConfiguredCommand, statuslineForms, statuslineState, wired, type SetupCtx } from "./setup.ts";
 import { mailboxLiveness } from "./receipts.ts";
 import { liveWatcher } from "./wake.ts";
 import { listIdentityControls } from "./identity-control.ts";
@@ -163,6 +164,42 @@ export function pruneSummary(node: MbxNode): Check {
  *  and grok are replace-only — `command` replaces the footer and never renders alongside the user's
  *  other keys. opencode has no custom status line feature at all (built-in segments only), so the
  *  honest result is an explicit skip note, not a check against an invented config path. */
+/** T391: the OpenCode service is the wake path for every opencode mailbox — when one is bound,
+ *  doctor proves the service answers and says how to start it when it does not. A warn never
+ *  fails doctor (the T435 rule for separate per-CLI functions). Unbound hosts stay silent. */
+export async function opencodeServiceCheck(node: MbxNode, service: () => Promise<{ url: string; auth: string } | null> = opencodeService): Promise<Check | null> {
+  const bound = node.store.db.prepare("SELECT agent FROM sessions WHERE cli='opencode' AND session_id NOT LIKE 'mcp-%'").all() as { agent: string }[];
+  if (!bound.length) return null;
+  const svc = await service().catch(() => null);
+  if (svc) return { level: "ok", label: `opencode: service reachable (${svc.url}) — wake path for ${bound.length} bound mailbox(es)` };
+  return {
+    level: "warn",
+    label: "opencode: service not reachable, so bound OpenCode mailboxes cannot be woken",
+    fix: "run any opencode command (or `opencode service start`) so the service API comes up; config: ~/.config/opencode/service.json",
+  };
+}
+
+/** T460: Hermes runs a shell hook only after its (event, command) pair was approved, and in the TUI (no tty) it silently skips an
+ *  unapproved one: hooks that are wired but not approved look installed and do nothing. Reads the same state setup writes. A warn
+ *  never fails doctor. Silent until the hooks are wired, because the generic hooks row already says so then. */
+export function hermesHooksChecks(ctx: SetupCtx): Check[] {
+  const hooks = edits(ctx, "hermes").find((e) => e.kind === "hooks");
+  if (!hooks) return [];
+  const cur = existsSync(hooks.path) ? readFileSync(hooks.path, "utf8") : null;
+  const why = cur !== null ? hooks.blocked?.(cur) ?? null : null;
+  if (why) return [{ level: "warn", label: `hermes: hooks cannot be wired automatically: ${why}`,
+    fix: `add them to ${hooks.path.replace(ctx.home, "~")} by hand: on_session_start and pre_llm_call running \`${ctx.cmd.join(" ")} hook session-start|prompt --cli hermes\`` }];
+  if (!wired(hooks)) return [];
+  const c = hermesConsent(ctx);
+  const where = hermesAllowlistPath(ctx.home).replace(ctx.home, "~");
+  if (c.state === "approved") return [{ level: "ok", label: `hermes: hooks approved to run (${where})` }];
+  if (c.state === "auto") return [{ level: "ok", label: "hermes: hooks approved to run (hooks_auto_accept: true)" }];
+  if (c.state === "unreadable") return [{ level: "warn", label: `hermes: hooks are wired but ${where} cannot be read, so Hermes may skip them`,
+    fix: "fix or remove that file, then: agentmbx setup --only hermes   (or approve them with `hermes hooks list`)" }];
+  return [{ level: "warn", label: `hermes: hooks are wired but not approved (${c.missing.join(", ")}), so Hermes skips them`,
+    fix: "agentmbx setup --only hermes   (writes the approvals), or set hooks_auto_accept: true in ~/.hermes/config.yaml" }];
+}
+
 export function statuslineChecks(ctx: SetupCtx, cli: string): Check[] {
   if (cli === "opencode")
     return [{ level: "info", label: "opencode: no custom status line feature (built-in segments only: anomalyco/opencode#30295); nothing to verify" }];
@@ -192,11 +229,61 @@ export function statuslineChecks(ctx: SetupCtx, cli: string): Check[] {
   return out;
 }
 
+/** A POSIX single-quoted word. The fix is a command the owner can paste. */
+function shQuote(text: string): string {
+  return `'${text.replace(/'/g, `'\\''`)}'`;
+}
+
+/** True when `path` is an executable regular file. Symlinks follow. A directory or a dangling link is not. */
+function executableFile(path: string): boolean {
+  try {
+    if (!statSync(path).isFile()) return false;
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sameFile(a: string, b: string): boolean {
+  try { return realpathSync(a) === realpathSync(b); } catch { return false; }
+}
+
+/**
+ * T314: a legacy `mbx` that is not AgentMBX and sits in an earlier PATH directory than `agentmbx`.
+ * The old NAS mailbox shim is that case. The same file reached through another name is not foreign.
+ * A warn does not fail doctor. Null means there is nothing to flag.
+ */
+export function legacyMbxShim(pathEnv: string = process.env.PATH ?? ""): Check | null {
+  const dirs = pathEnv.split(delimiter).filter((dir) => dir.length > 0);
+  let mbxAt = -1;
+  let agentAt = -1;
+  for (let i = 0; i < dirs.length; i++) {
+    if (mbxAt < 0 && executableFile(join(dirs[i], "mbx"))) mbxAt = i;
+    if (agentAt < 0 && executableFile(join(dirs[i], "agentmbx"))) agentAt = i;
+    if (mbxAt >= 0 && agentAt >= 0) break;
+  }
+  if (mbxAt < 0) return null;
+  // Same directory, or agentmbx earlier: `mbx` is not ahead of `agentmbx`.
+  if (agentAt >= 0 && mbxAt >= agentAt) return null;
+  const mbx = join(dirs[mbxAt]!, "mbx");
+  if (agentAt >= 0 && sameFile(mbx, join(dirs[agentAt]!, "agentmbx"))) return null;
+  return {
+    level: "warn",
+    label: `legacy mbx shim is ahead of agentmbx on PATH (${mbx})`,
+    fix: `mv ${shQuote(mbx)} ${shQuote(`${mbx}.legacy`)}`,
+  };
+}
+
 export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeoutMs?: number } = {}): Promise<Check[]> {
   const out: Check[] = [];
   const add = (level: Level, label: string, fix?: string) => out.push({ level, label, fix });
   add("info", `agentmbx ${VERSION} (node ${process.versions.node})`);
   if (Number(process.versions.node.split(".")[0]) < 24) add("fail", `Node ${process.versions.node} is too old`, "install Node 24 or later");
+
+  // T314: stay out of the grok block. OpenCode's own doctor function must not collide with this.
+  const legacy = legacyMbxShim();
+  if (legacy) out.push(legacy);
 
   const initialized = existsSync(join(mbxHome, "config.json"));
   let node: MbxNode | null = null;
@@ -220,6 +307,11 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     // The status line is optional and never fails doctor (review minor 7). T368: the checks are
     // static and per-CLI — ours must be a CURRENT form, foreign must be truly foreign.
     for (const c of statuslineChecks(ctx, d.cli)) out.push(c);
+    // T391: the opencode service check is its own function (never a new top-level grok/opencode
+    // collision — see the T435 note above) and runs only when an opencode mailbox is bound.
+    if (d.cli === "opencode" && node) { const c = await opencodeServiceCheck(node); if (c) out.push(c); }
+    // T460: its own function too (the T435 rule): a refused hooks layout and the not-approved state are Hermes facts.
+    if (d.cli === "hermes") for (const c of hermesHooksChecks(ctx)) out.push(c);
     // T384: a command string that matches what setup would write is still "wired". Flag the path
     // itself when that file is gone, including a stale …/agentmbx that install would rewrite.
     if (d.cli === "grok") {

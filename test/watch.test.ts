@@ -218,7 +218,7 @@ test("Kimi sessions get the event-driven watcher instruction; other no-push CLIs
   assert.match(WATCHER_INSTRUCTION, /cannot run background tasks, skip the watcher and keep/, "T348 review: a session without background tasks keeps its cron");
   assert.match(selfWatchInstruction({ delegated: true, cli: "kimi", env: { MBX_SELF_WATCH: "15" } })!, /cron/);
   assert.match(selfWatchInstruction({ delegated: true, cli: "kimi", env: { MBX_SELF_WATCH: "off" } })!, /mbx watcher/);
-  assert.equal(selfWatchInstruction({ delegated: false, cli: "hermes", env: {} }), null);
+  assert.equal(selfWatchInstruction({ delegated: false, cli: "grok", env: {} }), null);
 });
 
 test("a terminal Kimi prompt carries the watcher instruction until a watcher runs (Kimi drops SessionStart context)", async (t) => {

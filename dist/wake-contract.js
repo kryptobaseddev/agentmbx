@@ -22,6 +22,9 @@ export const CURRENT_CAPABILITIES = {
     opencode: { ...none, provider: "opencode", exactSession: "native", admissionReceipt: "native" },
     kimi: { ...none, provider: "kimi", exactSession: "native", busyInspection: true, admissionReceipt: "native" },
     claude: { ...none, provider: "claude", exactSession: "native", admissionReceipt: "transport", channelDelivery: true },
+    // T460: Hermes has no adapter that submits a hint to an exact session; an idle Hermes is woken by its own background-process
+    // completion (`agentmbx watch` as terminal(background=true, notify=true)), and the watcher's receipt comes from process ancestry
+    // (cli.ts watcherObservingSession), not from this contract. These two stay "none" for that reason.
     hermes: { ...none, provider: "hermes", exactSession: "none", admissionReceipt: "none" },
     desktop: { ...none, provider: "desktop", exactSession: "none", admissionReceipt: "none", noticeOnly: true },
 };

@@ -1,7 +1,7 @@
 // `agentmbx setup` / `doctor` against a fake HOME whose configs copy the STRUCTURE of real ones (fake values only).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -113,8 +113,13 @@ test("setup wires every CLI, backs files up, leaves other hook groups alone, and
   assert.ok(kt.startsWith(FILES[".kimi-code/config.toml"]));
   assert.match(kt, /event = "UserPromptSubmit"\ncommand = "\/opt\/bin\/agentmbx hook prompt --cli kimi"/);
 
-  // Hermes
-  assert.match(rd(home, ".hermes/config.yaml"), /\nmcp_servers:\n  mbx:\n    command: "\/opt\/bin\/agentmbx"\n    args: \["mcp"\]\n$/);
+  // Hermes: the MCP server, then (T460) the shell hooks and their approvals
+  const hy = rd(home, ".hermes/config.yaml");
+  assert.match(hy, /\nmcp_servers:\n  mbx:\n    command: "\/opt\/bin\/agentmbx"\n    args: \["mcp"\]\n/);
+  assert.match(hy, /\nhooks:  # managed by agentmbx setup\n  on_session_start:  # managed by agentmbx setup\n    - command: "\/opt\/bin\/agentmbx hook session-start --cli hermes"\n      timeout: 10\n  pre_llm_call:  # managed by agentmbx setup\n    - command: "\/opt\/bin\/agentmbx hook prompt --cli hermes"\n      timeout: 10\n$/);
+  assert.deepEqual(JSON.parse(rd(home, ".hermes/shell-hooks-allowlist.json")).approvals.map((a: { event: string; command: string }) => [a.event, a.command]),
+    [["on_session_start", "/opt/bin/agentmbx hook session-start --cli hermes"], ["pre_llm_call", "/opt/bin/agentmbx hook prompt --cli hermes"]]);
+  assert.equal((statSync(join(home, ".hermes/shell-hooks-allowlist.json")).mode & 0o777), 0o600, "a file setup creates for consent is private");
 
   // Skill copied + linked
   assert.match(readFileSync(join(skillDest(home), "SKILL.md"), "utf8"), /^---\nname: agentmbx\n/);
@@ -153,6 +158,13 @@ test("setup updates a stale command path in place instead of adding a duplicate"
   assert.equal((rd(home, ".config/opencode/opencode.jsonc").match(/"mbx"/g) ?? []).length, 1);
   assert.equal((rd(home, ".kimi-code/config.toml").match(/>>> agentmbx/g) ?? []).length, 1);
   assert.equal((rd(home, ".hermes/config.yaml").match(/mbx:/g) ?? []).length, 1);
+  // T460: a moved binary rewrites our hook commands in place and replaces (never accumulates) the approvals
+  const hy = rd(home, ".hermes/config.yaml");
+  assert.equal((hy.match(/agentmbx hook /g) ?? []).length, 2, "still exactly two hook commands");
+  assert.match(hy, /command: "\/new\/bin\/agentmbx hook prompt --cli hermes"/);
+  assert.doesNotMatch(hy, /\/opt\/bin\/agentmbx hook/);
+  assert.deepEqual(JSON.parse(rd(home, ".hermes/shell-hooks-allowlist.json")).approvals.map((a: { command: string }) => a.command),
+    ["/new/bin/agentmbx hook session-start --cli hermes", "/new/bin/agentmbx hook prompt --cli hermes"]);
 });
 
 test("dry run writes nothing; --only limits the CLIs", () => {

@@ -33,7 +33,7 @@ import { claudeSessionId, claudeSessionTracker, grokSessionId, grokSessionTracke
 import { updateAvailable } from "./update.js";
 import { installKind, version } from "./version.js";
 import { connectorKey } from "./diagnostics.js";
-import { catchupHint, commitCatchup, ensureCatchup, missedCount, moveCatchup, readCatchup, restartCatchup, CATCHUP_FILTER } from "./catchup.js";
+import { catchupHint, catchupUnchanged, commitCatchup, ensureCatchup, missedCount, moveCatchup, readCatchup, restartCatchup, CATCHUP_FILTER } from "./catchup.js";
 import { encodeReplayFrame, replayMaximum } from "./replay.js";
 import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wake.js";
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
@@ -343,6 +343,8 @@ export function selfWatchInstruction(opts) {
     // Kimi Code turns a finished background task into a new turn: an event-driven watcher costs nothing while idle (T033)
     if (opts.cli === "kimi" && raw === undefined)
         return WATCHER_INSTRUCTION;
+    if (opts.cli === "hermes" && raw === undefined)
+        return HERMES_WATCHER_INSTRUCTION;
     if (!opts.delegated && raw === undefined)
         return null;
     const min = raw === undefined ? 15 : Number(raw);
@@ -358,6 +360,11 @@ export function selfWatchInstruction(opts) {
 export const WATCHER_INSTRUCTION = `[mbx] This session can't be woken from outside, so it wakes itself: unless a background task described "mbx watcher" is already running, start one now with your shell tool: command "agentmbx watch", run_in_background true, disable_timeout true, description "mbx watcher". It prints nothing and costs nothing until mail that wants you arrives, then exits with a no-body hint. When it completes, handle the mail (mbx_inbox, mbx_read, act within the policy, mbx_reply, mbx_ack) and start it again the same way. Do this without comment. If you cannot run background tasks, skip the watcher and keep any CronCreate job whose prompt starts with "[mbx-watch]" that you have. Once the background task is confirmed running, delete that cron job (CronDelete) — the watcher replaces it.`;
 /** No push delivery into this session from outside? */
 export const noPush = (cli, channel, hosted = false) => !channel && !hosted && !["codex", "opencode"].includes(cli);
+/** T460: Hermes turns a finished `terminal(background=true, notify=true)` process into the next turn (process_registry
+ *  completion_queue -> the TUI notification poller), so the watcher is event-driven there too. Its tool arguments differ from Kimi's. */
+export const HERMES_WATCHER_INSTRUCTION = `[mbx] This session can't be woken from outside, so it wakes itself: unless a background process running "agentmbx watch" is already live, start one now with your terminal tool: command "agentmbx watch", background true, notify true. It prints nothing and costs nothing until mail that wants you arrives, then exits with a no-body hint; its completion starts your next turn. When it completes, handle the mail (mbx_inbox, mbx_read, act within the policy, mbx_reply, mbx_ack) and start it again the same way. Do this without comment. If you cannot run background processes, skip the watcher and keep any cron job whose prompt starts with "[mbx-watch]" that you have.`;
+/** The repeat of it: no watcher is running, and the full text was already given this session. */
+export const HERMES_WATCHER_REMINDER = `[mbx] No mbx watcher is running, so mail cannot wake this session. Start it: terminal command "agentmbx watch", background true, notify true.`;
 const sh = (cmd, args) => { try {
     return execFileSync(cmd, args, { encoding: "utf8" }).trim();
 }
@@ -1541,7 +1548,8 @@ export async function runMcp(existing) {
         const from = cursor ?? encodeReplayFrame({ v: 1, epoch: record.epoch, mailbox: state.agent, filter: CATCHUP_FILTER, position: record.position, end: replayMaximum(node.store, state.agent) });
         const page = node.replay(state.agent, state.leaseToken, { cursor: from, limit, maxBytes });
         const missed = missedCount(node.store, state.agent);
-        return text(JSON.stringify({ ...page, catchup: { position: record.position, missed: missed.missed } }, null, 2), { ...page, catchup: { position: record.position, missed: missed.missed } });
+        const catchup = { position: record.position, missed: missed.missed, ...catchupUnchanged(page.next_cursor) };
+        return text(JSON.stringify({ ...page, catchup }, null, 2), { ...page, catchup });
     });
     server.registerTool("mbx_send", {
         title: "Send an mbx message",
