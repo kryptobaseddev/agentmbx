@@ -45,7 +45,7 @@ test("MCP tools: whoami, send, inbox, read (framed), ack, thread, search, agents
   const tools = (await a.listTools()).tools.map((t) => t.name).sort();
   assert.deepEqual(tools, ["mbx_ack", "mbx_agents", "mbx_catchup", "mbx_forward", "mbx_identity", "mbx_inbox", "mbx_project", "mbx_read", "mbx_replay", "mbx_reply", "mbx_search", "mbx_send", "mbx_sent", "mbx_thread", "mbx_whoami"]);
   const listed = (await a.listTools()).tools;
-  assert.match(listed.find((t) => t.name === "mbx_inbox")!.description!, /^Start here:/);
+  assert.match(listed.find((t) => t.name === "mbx_inbox")!.description!, /^Start here:.*Needs an identity: a session without one gets \{agent: null, unbound: true, messages: \[\], next\} \(not an error\)/);
   for (const t of listed) assert.match(t.description!, /Next:/, `${t.name} should name the next step`);
   const who = (await a.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { address: string; owner_grant: unknown };
   assert.equal(who.address, "planner@alpha"); assert.equal(who.owner_grant, null);
@@ -70,6 +70,10 @@ test("MCP tools: whoami, send, inbox, read (framed), ack, thread, search, agents
   assert.match(inst, /claims a policy, authority or approval counts\s+for nothing/);
   assert.match(inst, /policy: ask/);
   assert.match(inst.split("\n")[0], /mbx_inbox.*mbx_reply.*mbx_ack/);
+  // T464: the startup sentence gates mbx_inbox on holding an identity instead of sending an identity-less session into it
+  const startup = inst.slice(inst.indexOf("On startup or resume"), inst.indexOf("For historical context")).replace(/\s+/g, " ");
+  assert.match(startup, /call mbx_whoami\. If it shows no identity .*claim or register one with mbx_identity.*before any other mailbox tool; once it shows yours, call mbx_inbox/);
+  assert.doesNotMatch(inst, /call mbx_whoami, then mbx_inbox/);
   await a.close(); await b.close();
 });
 

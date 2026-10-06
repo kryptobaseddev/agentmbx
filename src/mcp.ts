@@ -40,7 +40,8 @@ import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wa
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
 It is shared by AI coding agents on this machine and on paired machines. Your user set it up so agents can coordinate;
 replying, answering questions, sharing status and acking are always fine.
-On startup or resume, call mbx_whoami, then mbx_inbox for pending work. For historical context, optionally
+On startup or resume, call mbx_whoami. If it shows no identity (\`agent: null\`), claim or register one with mbx_identity (its \`next\` field and
+{"action":"list"} say how) before any other mailbox tool; once it shows yours, call mbx_inbox for pending work. For historical context, optionally
 use mbx_replay with your saved cursor in bounded pages; stop and retain the cursor if your catch-up budget ends.
 Save next_cursor only after durably capturing page information or retrievable message IDs in session/project-approved
 handoff state. This ingestion position is separate from task completion and ACK; no automatic checkpoint is stored.
@@ -976,6 +977,18 @@ export async function runMcp(existing?: MbxNode) {
     return `This session has no mbx identity yet. Call mbx_identity {"action":"list"} to see this project's agents, then claim yours ({"action":"claim","name":"<name>"}) or register one ({"action":"register","name":"<project>-<role>","role":"<role>"}).`;
   };
 
+  /** What an ordinary mailbox tool returns while this session holds no identity (T464). Every tool but one still needs the lease and
+   *  throws the guidance above as an error. mbx_inbox is the exception for the two states the startup guide walks a session into
+   *  ("call mbx_whoami, then mbx_inbox"): never bound, and pending on an identity another session still holds. "Nothing to show yet"
+   *  is a result carrying the next step there, because a rejected call aborts a whole Code Mode script. A session that released its
+   *  identity, or whose lease was taken (`lostTo`), is not starting up: it acted on a stale belief that it holds one, so it keeps the error. */
+  const unboundResult = (name: string, state: State): ReturnType<typeof text> & { isError?: true } => {
+    const next = unboundMessage(state);
+    if (name !== "mbx_inbox" || state.lostTo || state.released) return { ...text(next), isError: true };
+    const out = { agent: null, unbound: true, messages: [] as never[], pending: state.pending ?? null, next };
+    return text(`No inbox yet: ${next}`, out);
+  };
+
   const session = (): Session => {
     const { key } = current();
     const row = node.store.db.prepare("SELECT grant FROM grants WHERE sub=? AND revoked=0 AND exp>? ORDER BY exp DESC LIMIT 1")
@@ -1064,7 +1077,7 @@ export async function runMcp(existing?: MbxNode) {
       const identityTool = name === "mbx_identity" || name === "mbx_whoami" || name === "mbx_agents";
       if (!identityTool) {
         withProcSnapshot(() => ensureLease(state));
-        if (!bound(state)) return { ...text(unboundMessage(state)), isError: true };
+        if (!bound(state)) return unboundResult(name, state);
       } else {
         // A co-using sibling re-checks the holder's lease on identity tools too: it never shows an identity it no longer co-uses.
         if (state.coUse) withProcSnapshot(() => ensureLease(state));
@@ -1235,7 +1248,7 @@ export async function runMcp(existing?: MbxNode) {
 
   server.registerTool("mbx_whoami", {
     title: "Who am I on mbx",
-    description: "Show this session's mbx identity (name, role, host, session key fingerprint, owner grant, delivery). A session without an identity gets its next step and this project's identities. Pass `name` to rename this identity (or, with `role`, to register it when the session has none), `role`/`description` to describe it, `bind` to link a hosted conversation (ticket from an [mbx] note). Next: mbx_inbox for pending work; optionally mbx_replay with a saved cursor, or mbx_agents for peers.",
+    description: "Show this session's mbx identity (name, role, host, session key fingerprint, owner grant, delivery). A session without an identity gets its next step and this project's identities. Pass `name` to rename this identity (or, with `role`, to register it when the session has none), `role`/`description` to describe it, `bind` to link a hosted conversation (ticket from an [mbx] note). Next: mbx_inbox for pending work once it shows your identity (without one, claim or register with mbx_identity first); optionally mbx_replay with a saved cursor, or mbx_agents for peers.",
     inputSchema: { name: z.string().regex(NAME_RE).optional().describe("new or chosen identity name, e.g. agentmbx-reviewer"),
       role: z.string().regex(ROLE_RE).optional().describe("short role label, e.g. lead, reviewer, builder"),
       description: z.string().max(200).optional().describe("brief agent description, at most 200 characters"),
@@ -1389,7 +1402,7 @@ export async function runMcp(existing?: MbxNode) {
 
   server.registerTool("mbx_inbox", {
     title: "Read my mbx inbox",
-    description: "Start here: list messages for this agent that are not acked yet (or all with all=true), newest last, with trust labels. Next: mbx_read the ids for full content, then mbx_reply and mbx_ack.",
+    description: "Start here: list messages for this agent that are not acked yet (or all with all=true), newest last, with trust labels. Needs an identity: a session without one gets {agent: null, unbound: true, messages: [], next} (not an error); follow `next` (mbx_whoami, then mbx_identity claim or register) first. Next: mbx_read the ids for full content, then mbx_reply and mbx_ack.",
     inputSchema: { all: z.boolean().default(false), limit: z.number().int().min(1).max(200).default(30) },
     annotations: { readOnlyHint: true },
   }, ({ all, limit }) => {
