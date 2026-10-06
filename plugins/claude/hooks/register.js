@@ -1,30 +1,52 @@
-import { execFile as execFileCb } from "node:child_process";
+/**
+ * Claude Code 2.1.291 mod. The hooks sandbox imports nothing but relative
+ * files and "claude-code", and it has no Node built-ins.
+ *
+ * Session id: `session.start` is only `{ cwd }`. The binary sets
+ * `CLAUDE_CODE_SESSION_ID` on the process and on child env, and substitutes
+ * `${CLAUDE_SESSION_ID}`. Those two names are read with `$.env.get` (a string
+ * literal, which `claude plugin validate` can see). If both are missing or
+ * blank, the band says "unbound" and does not call status.
+ *
+ * Status: `$.http.fetch` against the local daemon, keyed by cli and session.
+ * Documented init has no timeout; a throw, a non-OK response, or a body that
+ * is not an mbx.status/v1 or v2 snapshot renders "mbx: unavailable".
+ * https://code.claude.com/docs/en/plugins/mods/api
+ */
 
-/** How long a successful snapshot may be reused. A failure is never cached. */
+const DAEMON_ORIGIN = "http://127.0.0.1:7373";
 const CACHE_MS = 2000;
-/** Fail closed if the status command does not return. */
-const TIMEOUT_MS = 2000;
 
 /**
- * Claude Code 2.1.291 puts the current session id in `CLAUDE_CODE_SESSION_ID`
- * (`process.env.CLAUDE_CODE_SESSION_ID = K()` and child env
- * `CLAUDE_CODE_SESSION_ID: e.sessionId`). `${CLAUDE_SESSION_ID}` is the same
- * value in its templates. The mod event `session.start` is only `{ cwd }`,
- * so the id is not on that event.
- * @param {NodeJS.ProcessEnv} env
+ * @param {Record<string, string | undefined>} env
  * @returns {string | null}
  */
-export function resolveSessionId(env = process.env) {
-  for (const key of ["CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID"]) {
-    const value = env[key];
-    if (typeof value === "string" && value.trim()) return value.trim();
-  }
+export function resolveSessionId(env) {
+  const code = env.CLAUDE_CODE_SESSION_ID;
+  if (typeof code === "string" && code.trim()) return code.trim();
+  const alias = env.CLAUDE_SESSION_ID;
+  if (typeof alias === "string" && alias.trim()) return alias.trim();
   return null;
 }
 
 /**
- * Render a status snapshot. This function does not derive counts.
- * A missing session id is "unbound". Anything else that is not a v1 or v2
+ * Fixed daemon origin. The session id is only a query value.
+ * @param {string} sessionId
+ * @returns {string}
+ */
+export function statusRequestUrl(sessionId) {
+  const url = new URL("/v1/status", DAEMON_ORIGIN);
+  url.searchParams.set("cli", "claude");
+  url.searchParams.set("session", sessionId);
+  if (url.origin !== DAEMON_ORIGIN || url.pathname !== "/v1/status") {
+    throw new Error("status url left the local daemon");
+  }
+  return url.toString();
+}
+
+/**
+ * Render one snapshot. This function does not fetch or derive counts.
+ * A missing session id is "unbound". Anything that is not a v1 or v2
  * snapshot is "mbx: unavailable".
  * @param {string | null} sessionId
  * @param {unknown} snapshot
@@ -61,61 +83,61 @@ function count(value) {
 }
 
 /**
- * @param {{ sessionId: string | null, execFileImpl?: typeof execFileCb, bin?: string, timeoutMs?: number }} opts
- * @returns {Promise<{ text: string, snapshot: unknown }>}
+ * @param {{ ok?: boolean, text?: unknown }} response
+ * @param {string} sessionId
+ * @returns {{ text: string, snapshot: unknown, raw: string | null }}
  */
-export function readStatus(opts) {
-  const sessionId = opts.sessionId;
-  if (!sessionId) return Promise.resolve({ text: "unbound", snapshot: null });
-  const execFileImpl = opts.execFileImpl ?? execFileCb;
-  const bin = opts.bin ?? "agentmbx";
-  const timeoutMs = opts.timeoutMs ?? TIMEOUT_MS;
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (text, snapshot = null) => {
-      if (settled) return;
-      settled = true;
-      resolve({ text, snapshot });
-    };
-    try {
-      const child = execFileImpl(
-        bin,
-        ["status", "--cli", "claude", "--session", sessionId, "--json", "--schema", "mbx.status/v1"],
-        { timeout: timeoutMs },
-        (err, stdout) => {
-          if (err) return finish("mbx: unavailable");
-          try {
-            const snapshot = JSON.parse(String(stdout));
-            finish(renderStatus(sessionId, snapshot), snapshot);
-          } catch {
-            finish("mbx: unavailable");
-          }
-        },
-      );
-      if (child && typeof child.on === "function") {
-        child.on("error", () => finish("mbx: unavailable"));
-      }
-    } catch {
-      finish("mbx: unavailable");
-    }
-  });
+function fromResponse(response, sessionId) {
+  if (!response || response.ok !== true || typeof response.text !== "string") {
+    return { text: "mbx: unavailable", snapshot: null, raw: null };
+  }
+  try {
+    const snapshot = JSON.parse(response.text);
+    const text = renderStatus(sessionId, snapshot);
+    if (text === "mbx: unavailable") return { text, snapshot: null, raw: null };
+    return { text, snapshot, raw: response.text };
+  } catch {
+    return { text: "mbx: unavailable", snapshot: null, raw: null };
+  }
 }
 
-/** @type {{ sessionId: string, at: number, text: string } | null} */
+/**
+ * @param {{ sessionId: string | null, fetchImpl?: (url: string) => Promise<{ ok?: boolean, text?: unknown }> }} opts
+ * @returns {Promise<{ text: string, snapshot: unknown, raw: string | null }>}
+ */
+export async function readStatus(opts) {
+  const sessionId = opts.sessionId;
+  if (!sessionId) return { text: "unbound", snapshot: null, raw: null };
+  if (!opts.fetchImpl) return { text: "mbx: unavailable", snapshot: null, raw: null };
+  try {
+    const response = await opts.fetchImpl(statusRequestUrl(sessionId));
+    return fromResponse(response, sessionId);
+  } catch {
+    return { text: "mbx: unavailable", snapshot: null, raw: null };
+  }
+}
+
+/** @type {{ sessionId: string, at: number, raw: string } | null} */
 let cache = null;
 
 /**
- * @param {NodeJS.ProcessEnv} env
- * @param {{ execFileImpl?: typeof execFileCb, bin?: string, now?: number }} [deps]
+ * @param {Record<string, string | undefined>} env
+ * @param {{ fetchImpl?: (url: string) => Promise<{ ok?: boolean, text?: unknown }>, now?: number }} [deps]
  * @returns {Promise<string>}
  */
 export async function statusText(env, deps = {}) {
   const sessionId = resolveSessionId(env);
   if (!sessionId) return "unbound";
-  const now = deps.now ?? Date.now();
-  if (cache && cache.sessionId === sessionId && now - cache.at < CACHE_MS) return cache.text;
-  const result = await readStatus({ sessionId, execFileImpl: deps.execFileImpl, bin: deps.bin });
-  if (result.text !== "mbx: unavailable") cache = { sessionId, at: now, text: result.text };
+  const now = deps.now ?? 0;
+  if (cache && cache.sessionId === sessionId && now - cache.at < CACHE_MS) {
+    try {
+      return renderStatus(sessionId, JSON.parse(cache.raw));
+    } catch {
+      cache = null;
+    }
+  }
+  const result = await readStatus({ sessionId, fetchImpl: deps.fetchImpl });
+  if (result.raw) cache = { sessionId, at: now, raw: result.raw };
   return result.text;
 }
 
@@ -125,8 +147,33 @@ export function resetStatusCache() {
 }
 
 /**
+ * @param {unknown} value
+ * @returns {string}
+ */
+function envString(value) {
+  return typeof value === "string" ? value : "";
+}
+
+/**
+ * Production read. `$` stays on this top-level function so `claude plugin validate`
+ * sees `$.env.get`, `$.clock.now`, and `$.http.fetch`.
+ * @param {{ env: { get: (name: string) => Promise<unknown> }, clock: { now: () => Promise<number> }, http: { fetch: (url: string) => Promise<{ ok?: boolean, text?: unknown }> } }} $
+ * @returns {Promise<string>}
+ */
+export async function loadBand($) {
+  const env = {
+    CLAUDE_CODE_SESSION_ID: envString(await $.env.get("CLAUDE_CODE_SESSION_ID")),
+    CLAUDE_SESSION_ID: envString(await $.env.get("CLAUDE_SESSION_ID")),
+  };
+  const now = await $.clock.now();
+  return statusText(env, {
+    now: typeof now === "number" ? now : 0,
+    fetchImpl: (url) => $.http.fetch(url),
+  });
+}
+
+/**
  * Claude Code mod entry. Draws the AbovePrompt band and answers /mbx-status.
- * Both paths render the status command's JSON and nothing else.
  * @param {(event: string, matcherOrHook: unknown, hook?: unknown) => unknown} on
  */
 export function register(on) {
@@ -138,9 +185,9 @@ export function register(on) {
     return next(e);
   });
 
-  on("command.run", { command: "mbx-status" }, async () => {
+  on("command.run", { command: "mbx-status" }, async ($) => {
     try {
-      return { text: await statusText(process.env) };
+      return { text: await loadBand($) };
     } catch {
       return { text: "mbx: unavailable" };
     }
@@ -150,7 +197,7 @@ export function register(on) {
     try {
       if (e?.props?.hasSurvey) return next(e);
       const { Text } = $.ui.resolve(e);
-      const text = await statusText(process.env);
+      const text = await loadBand($);
       return Text({ children: [text] });
     } catch {
       return next(e);

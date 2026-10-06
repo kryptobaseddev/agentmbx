@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **A Claude Code mod renders this session's status (T414):** `plugins/claude` is a mod that registers `/mbx-status` and draws an AbovePrompt band. Both call `agentmbx status --cli claude --session <id> --json --schema mbx.status/v1` with an argv array and a two-second timeout. The session id comes from `CLAUDE_CODE_SESSION_ID` or `CLAUDE_SESSION_ID`. If neither is set, the band says `unbound` and does not guess. A spawn error, timeout, or bad payload says `mbx: unavailable` and does not throw.
+- **A Claude Code mod renders this session's status (T414):** `plugins/claude` registers `/mbx-status` and draws an AbovePrompt band. The hooks module imports nothing but relative files and `claude-code`. It reads `CLAUDE_CODE_SESSION_ID` or `CLAUDE_SESSION_ID` with `$.env.get`. If neither is set, the band says `unbound` and does not guess. Status is `$.http.fetch` of `http://127.0.0.1:7373/v1/status?cli=claude&session=<id>`. A throw, a non-OK response, or a body that is not an `mbx.status/v1` or `v2` snapshot says `mbx: unavailable` and does not throw.
 
 ## 0.5.13 (2026-10-06)
 
