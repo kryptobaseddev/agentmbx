@@ -8,8 +8,9 @@ import { canonical, fingerprint, signData, ulid } from "../src/crypto.ts";
 import { MbxNode } from "../src/node.ts";
 import { createOwnerKey, unlockOwnerKey } from "../src/owner.ts";
 import { acceptSigned, makePolicy } from "../src/policy.ts";
+import { makeLead, storeLead } from "../src/project-ledger.ts";
 import { registerIdentity } from "../src/registry.ts";
-import { LINK_KEY, STATE_KEY, postUrl, syncOnce, type Kv, type SyncLink } from "../src/sync-client.ts";
+import { LINK_KEY, STATE_KEY, postUrl, readLink, syncOnce, type Kv, type SyncLink } from "../src/sync-client.ts";
 import { loadSyncSnapshot, policyScope, syncTick } from "../src/sync-daemon.ts";
 import { PATH_FLAG_PREFIX, type AgentInput, type HostInput, type SyncSnapshot } from "../src/sync-projection.ts";
 
@@ -26,8 +27,8 @@ function link(over: Partial<SyncLink> = {}): SyncLink {
 function host(): HostInput {
   return { daemon_version: "0.5.10", os: "macos", owner_fp: null, authority_owner: false, relay_enrolled: false, peers: [], findings: [] };
 }
-function body(): Omit<SyncSnapshot, "now" | "seq" | "full" | "contract" | "contractAllowsProjectPaths" | "sentReceipts"> {
-  return { host: host(), agents: [], threads: [], receipts: [], policies: [], approvals: [], paths: [] };
+function body(): Omit<SyncSnapshot, "now" | "seq" | "full" | "contract" | "contractAllowsProjectPaths" | "contractAllowsProjectLeads" | "sentReceipts"> {
+  return { host: host(), agents: [], threads: [], receipts: [], policies: [], approvals: [], paths: [], leads: [] };
 }
 function ok(seq: number, extra: Record<string, unknown> = {}, status = 200, headers?: Record<string, string>): Response {
   return new Response(JSON.stringify({ ack_seq: seq, next_sync_seconds: 15, ...extra }), { status, headers });
@@ -261,4 +262,56 @@ test("a local policy path is not sent and an invalid policy reason is not sent",
   assert.equal(policies[0].has_local_scope, true);
   assert.equal(policies[0].source, "cli");
   assert.deepEqual(policyScope([secret, KEY]), { project_keys: [KEY], has_local_scope: true });
+});
+
+test("readLink keeps project_leads only when it is true", () => {
+  const kv = mem();
+  kv.set(LINK_KEY, JSON.stringify({ ...link(), project_leads: "yes", project_paths: 1, extra: true }));
+  const stripped = readLink((k) => kv.get(k));
+  assert.equal(stripped?.project_leads, undefined);
+  assert.equal(stripped?.project_paths, undefined);
+  assert.equal("extra" in (stripped ?? {}), false);
+  kv.set(LINK_KEY, JSON.stringify(link({ project_leads: true, project_paths: true })));
+  const kept = readLink((k) => kv.get(k));
+  assert.equal(kept?.project_leads, true);
+  assert.equal(kept?.project_paths, true);
+});
+
+test("a console command that names project_leads is refused", async () => {
+  const kv = mem();
+  kv.set(LINK_KEY, JSON.stringify(link()));
+  const audits: string[] = [];
+  const result = await syncOnce({
+    kv, now: 0, fetch: async () => ok(1, { commands: [{ op: "set", project_leads: true }] }), source: () => body(),
+    audit: (event, detail) => { audits.push(`${event}:${String(detail.code)}`); },
+  });
+  assert.equal(result.outcome, "acked");
+  assert.ok(audits.includes("sync.command:OP_NOT_ALLOWED_FROM_CONSOLE"));
+});
+
+test("loadSyncSnapshot keeps one allowlisted lead per project key and drops a project with no key", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-sync-lead-"));
+  createOwnerKey(home, PASS);
+  const n = new MbxNode(home, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  const owner = unlockOwnerKey(home, PASS);
+  const keyed = `${homedir()}/SECRET-LEAD-PATH`;
+  const bare = `${homedir()}/SECRET-LEAD-NOKEY`;
+  const sign = (project: string, agent: string) => {
+    const rec = makeLead({ project, agent, host: "alpha", ownerPub: owner.publicKey });
+    storeLead(n, rec, signData(owner.privateKey, canonical(rec)));
+    return rec;
+  };
+  const kept = sign(keyed, "agentmbx-lead");
+  sign(bare, "other-lead");
+  const sameKey = makeLead({ project: `${keyed}/other`, agent: "second-lead", host: "alpha", ownerPub: owner.publicKey });
+  storeLead(n, sameKey, signData(owner.privateKey, canonical(sameKey)));
+  const keyOf = (project: string) => project === bare ? undefined : KEY;
+  const snap = loadSyncSnapshot(n, { contractAllowsProjectPaths: false }, keyOf);
+  assert.deepEqual(snap.leads, [{ project_key: KEY, agent: "agentmbx-lead", host: "alpha", exp: kept.exp, id: kept.id }]);
+  assert.equal(JSON.stringify(snap.leads).includes(keyed), false);
+  assert.equal(JSON.stringify(snap.leads).includes("SECRET-LEAD"), false);
+  const expired = makeLead({ project: `${homedir()}/expired`, agent: "stale-lead", host: "alpha", ownerPub: owner.publicKey, now: new Date(Date.now() - 10_000), ttlMs: 1000 });
+  storeLead(n, expired, signData(owner.privateKey, canonical(expired)));
+  assert.equal(loadSyncSnapshot(n, { contractAllowsProjectPaths: false }, keyOf).leads.length, 1);
 });

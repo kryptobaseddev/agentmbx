@@ -1,12 +1,15 @@
 // Allowlisted SyncBatch projection (T262, daemon-sync-protocol-v1 version 3).
 // OpenAPI 1.0.0-draft.5 shapes. This daemon speaks contract 1, which has no
-// HostReport.project_paths (additionalProperties is false). local_path is computed
-// for an opted-in project and attached only when the caller says the spoken
-// contract lists that field.
+// HostReport.project_paths or HostReport.project_leads (additionalProperties is
+// false). local_path is computed for an opted-in project and attached only when
+// the caller says the spoken contract lists that field. A lead row is the project
+// key, agent, host, expiry and record id — never the checkout path — and is
+// attached only when the spoken contract lists project_leads (T393).
 
 export const CONTRACT_VERSION = 1;
 export const PROJECT_PATHS_SINCE = 2;
-export const CAPS = { agents: 500, threads: 1000, receipts: 2000, policies: 200, approvals: 200, peers: 64, paths: 64 } as const;
+export const PROJECT_LEADS_SINCE = 2;
+export const CAPS = { agents: 500, threads: 1000, receipts: 2000, policies: 200, approvals: 200, peers: 64, paths: 64, leads: 64 } as const;
 export const PATH_FLAG_PREFIX = "sync.project_path:";
 
 const NAME_RE = /^[a-z0-9][a-z0-9-]{1,39}$/;
@@ -25,6 +28,9 @@ const TRUSTS = new Set(["local", "verified", "unverified"]);
 export interface DoctorFinding { code: string; severity: "info" | "warn" | "error" }
 
 export interface PathInput { project_key: string; absolute: string; home: string; username: string; windows: boolean }
+
+/** Allowlisted lead row. The absolute project path and the owner signature stay on the host. */
+export interface LeadInput { project_key: string; agent: string; host: string; exp: string; id: string }
 
 export interface AgentInput {
   name: string;
@@ -95,6 +101,7 @@ export interface SyncSnapshot {
   full: boolean;
   contract: number;
   contractAllowsProjectPaths: boolean;
+  contractAllowsProjectLeads: boolean;
   host: HostInput;
   agents: AgentInput[];
   threads: ThreadInput[];
@@ -102,6 +109,7 @@ export interface SyncSnapshot {
   policies: PolicyInput[];
   approvals: { approval_id: string }[];
   paths: PathInput[];
+  leads: LeadInput[];
   /** Receipt dedup keys already accepted. Those receipts are not appended again. */
   sentReceipts: string[];
 }
@@ -205,12 +213,27 @@ function projectPaths(input: SyncSnapshot, findings: DoctorFinding[]): { project
   return rows;
 }
 
+function projectLeads(input: SyncSnapshot): LeadInput[] | undefined {
+  if (!input.contractAllowsProjectLeads) return undefined;
+  const rows: LeadInput[] = [];
+  const seen = new Set<string>();
+  for (const row of input.leads) {
+    if (!PROJECT_KEY_RE.test(row.project_key) || seen.has(row.project_key)) continue;
+    if (!NAME_RE.test(row.agent) || !NAME_RE.test(row.host) || !ULID_RE.test(row.id) || Number.isNaN(Date.parse(row.exp))) continue;
+    seen.add(row.project_key);
+    if (rows.length >= CAPS.leads) break;
+    rows.push({ project_key: row.project_key, agent: row.agent, host: row.host, exp: row.exp, id: row.id });
+  }
+  return rows;
+}
+
 export function projectSync(input: SyncSnapshot): Projection {
   if (input.agents.length > CAPS.agents || input.threads.length > CAPS.threads || input.policies.length > CAPS.policies || input.approvals.length > CAPS.approvals) {
     return { ok: false, code: "sync.cap" };
   }
   const findings = input.host.findings.filter((f) => /^[a-z0-9_.-]{1,64}$/.test(f.code)).slice(0, 50);
   const project_paths = projectPaths(input, findings);
+  const project_leads = projectLeads(input);
   const host: Record<string, unknown> = {
     daemon_version: input.host.daemon_version,
     os: input.host.os,
@@ -233,6 +256,7 @@ export function projectSync(input: SyncSnapshot): Projection {
     doctor: { checked_at: input.now, findings: findings.slice(0, 50) },
   };
   if (project_paths) host.project_paths = project_paths;
+  if (project_leads) host.project_leads = project_leads;
 
   const agents = input.agents.filter((a) => NAME_RE.test(a.name)).map((a) => ({
     name: a.name,
