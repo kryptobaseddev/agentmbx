@@ -18,7 +18,7 @@ import { readSessionTaint, taintKey, writeSessionTaint } from "./session-taint.j
 import { kimiMultiHost } from "./kimi-web.js";
 import { BIND_TICKET_RE, takeBindTicket } from "./bind-ticket.js";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess } from "./identity-leases.js";
-import { activityKey, holderProviderPid, identityAvailability, parseActivity } from "./identity-availability.js";
+import { activityKey, holderProviderView, identityAvailability, parseActivity, parseProviderRecord, providerRecordKey } from "./identity-availability.js";
 import { reviveMailbox } from "./identity-cleanup.js";
 import { AUTO_NAME_RE, linkedKey, noteProject, projectKey, projectOf, registeredIdentity, registerIdentity, renameRegistration, ROLE_RE, sessionHint, UNSPECIFIED_ROLE } from "./registry.js";
 import { applyIdentityTakeover } from "./identity-takeover.js";
@@ -422,10 +422,51 @@ export async function runMcp(existing) {
             control_key: fingerprint(state.key.publicKey), mcp_pid: process.pid, mcp_start: start,
             parent_pid: env.ppid, parent_start: parent.start, agent: state.agent, generation: identityGeneration(state.leaseToken) } : null;
     };
+    const controlSessionIds = (state) => [state.sessionId, ...(state.controlAliases ?? []),
+        ...identityControlAliases(node.store, fingerprint(state.key.publicKey)).map(d => d.session_id),
+        ...node.store.db.prepare("SELECT session_id FROM sessions WHERE cli=? AND session_key=?").all(env.cli, state.key.publicKey).map(r => r.session_id)];
+    /** Existing endpoint for `sid`, or null when there is none or it cannot be parsed. */
+    const existingControl = (sid) => {
+        try {
+            const raw = node.store.get(identityControlKey(env.cli, sid));
+            if (!raw)
+                return null;
+            const parsed = JSON.parse(raw);
+            if (typeof parsed.control_key !== "string")
+                return null;
+            return { control_key: parsed.control_key,
+                ...(typeof parsed.mcp_pid === "number" && Number.isSafeInteger(parsed.mcp_pid) && parsed.mcp_pid > 0 ? { mcp_pid: parsed.mcp_pid } : {}),
+                ...(typeof parsed.mcp_start === "string" ? { mcp_start: parsed.mcp_start } : {}) };
+        }
+        catch {
+            return null;
+        }
+    };
+    /**
+     * T436: do not replace a live foreign control endpoint. Own key always publishes. The handover successor's OS parent
+     * is `process.ppid` (detectHost rewrites `env.ppid` to the original provider, so that is not the predecessor).
+     * A dead or reborn pid may be replaced. Unknown liveness fails closed.
+     */
+    const foreignControlLive = (sid, ownKey) => {
+        const existing = existingControl(sid);
+        if (!existing || existing.control_key === ownKey)
+            return false;
+        if (existing.mcp_pid === undefined)
+            return true;
+        if (existing.mcp_pid === process.pid || existing.mcp_pid === process.ppid)
+            return false;
+        const evidence = leases.processEvidence(existing.mcp_pid);
+        if (evidence.alive === false)
+            return false;
+        if (evidence.alive === true && evidence.start !== null && evidence.start !== existing.mcp_start)
+            return false;
+        return true;
+    };
     const publishControl = (state) => {
-        const ids = new Set([state.sessionId, ...(state.controlAliases ?? []), ...identityControlAliases(node.store, fingerprint(state.key.publicKey)).map(d => d.session_id),
-            ...node.store.db.prepare("SELECT session_id FROM sessions WHERE cli=? AND session_key=?").all(env.cli, state.key.publicKey).map(r => r.session_id)]);
-        for (const sid of ids) {
+        const ownKey = fingerprint(state.key.publicKey);
+        for (const sid of new Set(controlSessionIds(state))) {
+            if (foreignControlLive(sid, ownKey))
+                continue;
             const descriptor = controlDescriptor(state, sid);
             if (descriptor)
                 publishIdentityControl(node.store, descriptor);
@@ -456,6 +497,19 @@ export async function runMcp(existing) {
                 }
                 catch { /* malformed legacy evidence stays unknown */ }
             }
+        }
+        // Recorded providers and foreign control endpoints are read inside the claim/publish transaction. Prepare them
+        // here: an unprepared pid is unknown evidence, which would hide a confirmed-dead provider and fail closed forever.
+        for (const name of names) {
+            const holder = node.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE name=?").get(name);
+            const recorded = holder ? parseProviderRecord(node.store.get(providerRecordKey(holder.holder_pid))) : null;
+            if (recorded)
+                pids.add(recorded.pid);
+        }
+        for (const sid of controlSessionIds(state)) {
+            const mcpPid = existingControl(sid)?.mcp_pid;
+            if (mcpPid)
+                pids.add(mcpPid);
         }
         return preparedBindings.run(new Map(rows.map(row => [bindingId(row), row])), () => withProcSnapshot(() => leases.prepare([...names], [...pids], operation)));
     };
@@ -546,8 +600,11 @@ export async function runMcp(existing) {
                 throw e;
             // The same availability answer the list shows (R4.3): an older process of this same session, or (explicit claims
             // only) a conversation of a shared provider process that has gone quiet.
+            const recorded = parseProviderRecord(node.store.get(providerRecordKey(prior.holder_pid)));
+            const recordedEvidence = recorded ? leases.processEvidence(recorded.pid) : null;
             const a = identityAvailability({ lease: prior, evidence: leases.processEvidence(prior.holder_pid), activity: parseActivity(node.store.get(activityKey(agent))),
-                now: Date.now(), caller: { cli: env.cli, sessionId: state.sessionId, providerPid: env.ppid, holderProviderPid: holderProviderPid(procTable(), prior.holder_pid, env.ppid) } });
+                now: Date.now(), caller: { cli: env.cli, sessionId: state.sessionId, providerPid: env.ppid,
+                    ...holderProviderView(procTable(), prior.holder_pid, env.ppid, recorded, recordedEvidence) } });
             if (a.takeover === "same-session" || (explicit && a.takeover === "idle-conversation")) {
                 leases.release(agent, prior.token);
                 node.store.audit("identity.takeover", { name: agent, kind: a.takeover, previous: { cli: prior.cli, session: prior.session_id, pid: prior.holder_pid }, by: { cli: env.cli, session: state.sessionId } });
@@ -604,6 +661,28 @@ export async function runMcp(existing) {
         touch(state, true);
         restoreSessionTaint(state);
     };
+    /**
+     * T440: the provider this MCP process claimed under. A re-exec child records the env it was given (detectHost already
+     * verified that pid and start). An original server records `env.ppid` only when that process is alive with a birth time.
+     * Co-use never reaches here. Identity release does not delete it; retire() does.
+     */
+    const rememberProvider = () => {
+        const reexecPid = Number(process.env.MBX_MCP_PROVIDER_PID), reexecStart = process.env.MBX_MCP_PROVIDER_START ?? "";
+        let providerPid = null, providerStart = null;
+        if (process.env[REEXEC_ENV] && Number.isSafeInteger(reexecPid) && reexecPid > 0 && reexecStart.length > 0 && reexecStart.length <= 300) {
+            providerPid = reexecPid;
+            providerStart = reexecStart;
+        }
+        else {
+            const evidence = leases.processEvidence(env.ppid);
+            if (evidence.alive === true && evidence.start) {
+                providerPid = env.ppid;
+                providerStart = evidence.start;
+            }
+        }
+        if (providerPid !== null && providerStart)
+            node.store.set(providerRecordKey(process.pid), JSON.stringify({ providerPid, providerStart }));
+    };
     const bind = (state, explicit = false) => state.coUse ? undefined : prepareState(state, undefined, () => {
         const result = node.store.tx(() => {
             if (state.leaseToken)
@@ -617,6 +696,7 @@ export async function runMcp(existing) {
             if (!state.leaseToken)
                 checkLegacy(agent, state, legacy);
             const leaseToken = state.leaseToken ?? claimFor(state, agent, explicit);
+            rememberProvider();
             node.registerAgent(agent, { cli: env.cli, role: process.env.MBX_ROLE, description: process.env.MBX_DESCRIPTION });
             noteProject(node.store, agent, project);
             publishControl({ ...state, agent, leaseToken });
@@ -769,7 +849,7 @@ export async function runMcp(existing) {
     const ensureLease = (state) => {
         if (!state.leaseToken || state.released)
             return retryResume(state);
-        const row = node.store.db.prepare("SELECT token,released_at,release_reason,cli,session_id,heartbeat_at,idle_ttl FROM identity_leases WHERE name=?").get(state.agent);
+        const row = node.store.db.prepare("SELECT token,released_at,release_reason,cli,session_id,heartbeat_at,idle_ttl,holder_pid FROM identity_leases WHERE name=?").get(state.agent);
         const now = Date.now();
         if (row && row.token === state.leaseToken && row.released_at === null && now - row.heartbeat_at < row.idle_ttl) {
             touch(state);
@@ -777,6 +857,16 @@ export async function runMcp(existing) {
         }
         const name = state.agent;
         if (state.coUse) {
+            // T440: an explicit mbx_identity release deletes the name binding and leaves the holder alive. Retire() uses the
+            // same release_reason but keeps the name binding, so a process exit still lets this sibling resume. Unknown
+            // liveness does not stick: a dead holder must stay claimable.
+            const remembered = row ? node.store.get(`name:${row.cli}:${row.session_id}`) : undefined;
+            const explicitRelease = !!row && row.released_at !== null && row.release_reason === "released" && remembered !== name
+                && leases.processEvidence(row.holder_pid).alive === true;
+            if (explicitRelease) {
+                Object.assign(state, { agent: "", leaseToken: undefined, coUse: undefined, released: true, pending: undefined, pendingReason: undefined });
+                return;
+            }
             // T439: the session's live server released, lost or handed off the lease this sibling co-used. Fail closed: this call
             // does not act as the identity. The name stays pending and is re-evaluated (co-use, claim or wait) on the next call.
             Object.assign(state, { agent: "", leaseToken: undefined, coUse: undefined, pending: name,
@@ -1572,6 +1662,8 @@ export async function runMcp(existing) {
                     node.store.db.prepare("DELETE FROM sessions WHERE cli=? AND session_key=? AND session_id GLOB 'mcp-*'").run(env.cli, key.publicKey);
                     node.store.db.prepare("UPDATE sessions SET session_key=NULL, channel=0 WHERE cli=? AND session_key=?").run(env.cli, key.publicKey);
                 }
+                // One record per process. Identity release keeps it; only this process's exit removes it (T440).
+                node.store.db.prepare("DELETE FROM kv WHERE k=?").run(providerRecordKey(process.pid));
             });
         }
         catch (e) {

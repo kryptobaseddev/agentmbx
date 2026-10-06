@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { inspectLeaseProcess, type IdentityLease, type ProcessEvidence } from "./identity-leases.ts";
-import { activityKey, holderProviderPid, identityAvailability, parseActivity, type LeaseActivity } from "./identity-availability.ts";
+import { activityKey, holderProviderView, identityAvailability, parseActivity, parseProviderRecord, type LeaseActivity, type RecordedProvider } from "./identity-availability.ts";
 import { procTable } from "./proc.ts";
 import { SCHEMA_VERSION } from "./store.ts";
 
@@ -36,6 +36,7 @@ export function listIdentityStatus(home: string, options: { now?: number; inspec
   if (typeof config.host !== "string" || !config.host) throw new Error("mailbox host configuration is invalid");
   const db = new DatabaseSync(path, { readOnly: true });
   const rows = new Map<string, IdentityStatus>(), leases: IdentityLease[] = [], conflicts = new Set<string>(), activityByName = new Map<string, LeaseActivity>();
+  const providerByHolder = new Map<number, RecordedProvider>();
   const inProject = new Set<string>(), retired = new Set<string>();
   let schema: number;
   const row = (name: string) => {
@@ -65,6 +66,13 @@ export function listIdentityStatus(home: string, options: { now?: number; inspec
     for (const r of db.prepare("SELECT k,v FROM kv WHERE k LIKE 'lease-activity:%'").all()) {
       const a = parseActivity(r.v as string); if (a) activityByName.set((r.k as string).slice(activityKey("").length), a);
     }
+    // Read before the connection closes: sameSessionProvider runs after this transaction (T440).
+    for (const r of db.prepare("SELECT k,v FROM kv WHERE k LIKE 'mcp-provider:%'").all()) {
+      const suffix = (r.k as string).slice("mcp-provider:".length);
+      const mcpPid = Number(suffix);
+      const recorded = parseProviderRecord(r.v as string);
+      if (Number.isSafeInteger(mcpPid) && mcpPid > 0 && recorded) providerByHolder.set(mcpPid, recorded);
+    }
     for (const r of db.prepare("SELECT name,role FROM agents WHERE host=? AND role IS NOT NULL").all(config.host)) row(r.name as string).role = r.role as string;
     const has = (table: string) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table);
     if (has("identities")) for (const r of db.prepare("SELECT name,role,description FROM identities").all()) {
@@ -82,9 +90,13 @@ export function listIdentityStatus(home: string, options: { now?: number; inspec
   // a claim must recheck the current generation under its own write lock.
   const inspect = options.inspect ?? inspectLeaseProcess;
   // The provider process a same-session holder serves under (T383), read only for a lease of the caller's own session.
-  const sameSessionProvider = (lease: IdentityLease, caller: { cli: string; sessionId: string; providerPid?: number }) =>
-    lease.cli === caller.cli && lease.session_id === caller.sessionId
-      ? { holderProviderPid: holderProviderPid((options.processTable ?? procTable)(), lease.holder_pid, caller.providerPid) } : {};
+  const sameSessionProvider = (lease: IdentityLease, caller: { cli: string; sessionId: string; providerPid?: number }) => {
+    if (lease.cli !== caller.cli || lease.session_id !== caller.sessionId) return {};
+    const recorded = providerByHolder.get(lease.holder_pid) ?? null;
+    let evidence: ProcessEvidence | null = null;
+    if (recorded) { try { evidence = inspect(recorded.pid); } catch { evidence = { alive: null, start: null }; } }
+    return holderProviderView((options.processTable ?? procTable)(), lease.holder_pid, caller.providerPid, recorded, evidence);
+  };
   for (const lease of leases) {
     const item = row(lease.name); activity(item, lease.heartbeat_at); activity(item, lease.released_at);
     let evidence: ProcessEvidence = { alive: null, start: null };
