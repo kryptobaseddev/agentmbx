@@ -791,6 +791,186 @@ function kimiHooks(cmd) {
         },
     };
 }
+// ---- OpenCode hooks plugin (T391) -------------------------------------------------------------
+// OpenCode has no settings-file hooks: its first-party mechanism is a plugin module that the TUI
+// auto-loads from ~/.config/opencode/plugins/. The plugin below translates OpenCode events onto the
+// same `agentmbx hook <event> --cli opencode` contract every other CLI uses:
+//   session.created -> session-start (bind + inbox note)   tool.execute.after -> post-tool
+//   session.idle    -> stop (Stop continuation)
+// Ours-detection is a first-line marker; a file without it is foreign and is never touched (T347
+// bar: byte-exact install, byte-exact uninstall, local edits reported instead of overwritten).
+export const opencodePluginPath = (home) => join(home, ".config/opencode/plugins/agentmbx.ts");
+const OPENCODE_PLUGIN_MARKER = "// agentmbx-plugin v1 (T391) — managed by `agentmbx setup --only opencode`";
+/** True when the file's first line starts with our marker: ours-current or ours-stale, never a user's edit. */
+const isOpencodePluginOurs = (cur) => cur !== null && cur.split("\n", 1)[0].trim().startsWith(OPENCODE_PLUGIN_MARKER);
+/** The exact plugin source setup writes. `cmd` is embedded as a JSON string[] and executed with
+ *  node:child_process execFile (each element a literal argv entry — B3); AGENTMBX_DEV is stripped
+ *  from the child env because the npm-installed launcher runs src/*.ts under it and Node refuses
+ *  type-stripping under node_modules (an env leak into an OpenCode server process silently killed
+ *  every hook call on 2026-10-06). */
+export function opencodePluginSource(cmd, ver) {
+    const bin = JSON.stringify(cmd);
+    return `${OPENCODE_PLUGIN_MARKER} (agentmbx ${ver})
+// Local edits make this file foreign: setup stops managing it and doctor reports it.
+// Uninstall with: agentmbx setup --uninstall --only opencode
+import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+/** Only text we produced ourselves is ever injected: a Stop {"decision":"block"} reason, or a
+ *  run of [mbx]/probe-ok lines (a session-start note is several of our lines joined by newline).
+ *  Anything else on hook stdout is ignored (B1b/B2). */
+const hookReason = (out: string): string | null => {
+  const lines = out.split("\\n");
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (!t) continue;
+    try {
+      const j = JSON.parse(t) as { decision?: unknown; reason?: unknown };
+      if (j && j.decision === "block" && typeof j.reason === "string" && j.reason) return j.reason;
+    } catch { /* not JSON */ }
+    if (t.startsWith("[mbx]") || t.startsWith("probe ok")) {
+      const run = [t]; // B2b: capture the whole consecutive run of ours, never a partial note
+      for (let k = i + 1; k < lines.length; k++) {
+        const u = lines[k].trim();
+        if (!u.startsWith("[mbx]") && !u.startsWith("probe ok")) break;
+        run.push(u);
+      }
+      return run.join("\\n");
+    }
+  }
+  return null;
+};
+
+/** The spawn seam: tests replace globalThis.__mbxSpawn (read per call); production runs the real
+ *  CLI. AGENTMBX_DEV is stripped from the child env: the npm-installed launcher runs src/*.ts
+ *  under it and Node refuses type-stripping under node_modules (the 2026-10-06 env leak silently
+ *  killed every hook). */
+type Spawn = (bin: string[], args: string[], input: string, cb: (out: string) => void) => void;
+const realSpawn: Spawn = (bin, args, input, cb) => {
+  try {
+    const env = { ...process.env };
+    delete env.AGENTMBX_DEV;
+    const child = execFile(bin[0], [...bin.slice(1), ...args], { encoding: "utf8", timeout: 20_000, env }, (e, out) => cb(e ? "" : String(out ?? "")));
+    child.stdin?.end(input);
+  } catch { cb(""); }
+};
+const spawnCli: Spawn = (bin, args, input, cb) => ((globalThis as { __mbxSpawn?: Spawn }).__mbxSpawn ?? realSpawn)(bin, args, input, cb);
+
+/** Inject a note as a queued synthetic user message through the OpenCode service — the same
+ *  receipt-verified path the daemon's wake uses (src/wake.ts wakeOpencode: POST
+ *  {svc}/api/session/:id/synthetic {text, delivery:"queue", resume:true}). Service URL from
+ *  MBX_OPENCODE_URL or \`opencode service status\` (wake.ts opencodeService); Basic auth from
+ *  ~/.config/opencode/service.json. B1c: no SDK client prompt API is cited for 2.0.23, so the
+ *  plugin speaks the endpoint the daemon already proves on every wake. */
+const inject = async (sid: string, text: string): Promise<boolean> => {
+  try {
+    let status = process.env.MBX_OPENCODE_URL ?? "";
+    if (!status) {
+      status = await new Promise<string>((resolve) => spawnCli(["opencode"], ["service", "status"], "", (out) => resolve(out)));
+    }
+    const url = status.split(/\\s+/).find((w) => w.startsWith("http"))?.replace(/\\/$/, "");
+    if (!url) return false;
+    let auth = "";
+    try {
+      const cfg = JSON.parse(readFileSync(join(homedir(), ".config/opencode/service.json"), "utf8")) as { password?: string };
+      if (cfg.password) auth = "Basic " + Buffer.from(\`opencode:\${cfg.password}\`).toString("base64");
+    } catch { /* no service.json: a local service may run without a password */ }
+    const res = await fetch(\`\${url}/api/session/\${encodeURIComponent(sid)}/synthetic\`, {
+      method: "POST", headers: { "content-type": "application/json", ...(auth ? { authorization: auth } : {}) },
+      body: JSON.stringify({ text, delivery: "queue", resume: true }), signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return false;
+    const j = await res.json().catch(() => null) as { data?: { id?: unknown; sessionID?: unknown; type?: unknown; delivery?: unknown; payload?: { text?: unknown } } } | null;
+    const r = j?.data;
+    return !!r && typeof r.id === "string" && r.id.startsWith("msg_") && r.sessionID === sid && r.type === "synthetic" && r.delivery === "queue" && r.payload?.text === text;
+  } catch { return false; }
+};
+
+/** One hook call: the JSON payload goes in on stdin; stdout is captured; a reason we recognize is
+ *  injected into the session through the service's synthetic endpoint. A failure never surfaces. */
+const call = async (bin: string[], event: string, payload: Record<string, unknown>): Promise<void> => {
+  try {
+    const out = await new Promise<string>((resolve) => spawnCli(bin, ["hook", event, "--cli", "opencode"], JSON.stringify(payload), resolve));
+    const reason = hookReason(out);
+    const sid = typeof payload.session_id === "string" ? payload.session_id : null;
+    if (reason && sid) await inject(sid, reason);
+  } catch { /* hook failures must never surface in the host TUI */ }
+};
+
+const runFor = (bin: string[], cwd: string | undefined) => (event: string, payload: Record<string, unknown>) => call(bin, event, { cwd, ...payload });
+
+const sidOf = (v: unknown): string | undefined => {
+  const o = v as { sessionID?: unknown; session_id?: unknown; id?: unknown; info?: unknown; session?: unknown; properties?: unknown } | undefined;
+  const info = (o?.info ?? o?.session ?? o?.properties) as { id?: unknown; directory?: unknown } | undefined;
+  return typeof o?.sessionID === "string" ? o.sessionID : typeof o?.session_id === "string" ? o.session_id
+    : typeof o?.id === "string" && o.id.startsWith("ses_") ? o.id : typeof info?.id === "string" ? info.id : undefined;
+};
+
+/** OpenCode v1 generation: the loader calls this factory with { $, client, directory } and runs the
+ *  returned hooks object (v1 names: session.created/session.idle/tool.execute.after). */
+export const AgentMBXHooks = async ({ directory }: { $?: unknown; client?: unknown; directory?: string }) => {
+  const run = runFor(${bin}, directory);
+  return {
+    event: async ({ event }: { event?: { type?: string; properties?: Record<string, unknown> } }) => {
+      const sid = sidOf(event?.properties);
+      if (!sid) return;
+      if (event?.type === "session.created") return run("session-start", { session_id: sid, cwd: directory });
+      if (event?.type === "session.idle") return run("stop", { session_id: sid });
+    },
+    "tool.execute.after": async (input: { sessionID?: unknown; session_id?: unknown }) => {
+      const sid = sidOf(input);
+      if (sid) return run("post-tool", { session_id: sid });
+    },
+  };
+};
+
+// OpenCode v2 validates a DEFAULT plugin object ({ id, ... effect/setup }) and dispatches through
+// the CONTEXT API — the v1 returned-hooks object is never consumed (verified against the
+// v2-native opencode-goal server: ctx.event.subscribe() as an async iterable, filtered by
+// event.location.directory, and ctx.tool.hook("execute.after", fn)). v1's session.idle is v2's
+// session.execution.succeeded; both map to the same stop contract, bounded by the stopseen marker.
+export default {
+  id: "agentmbx-hooks",
+  server: AgentMBXHooks,
+  async setup(ctx: {
+    location?: { directory?: string };
+    event?: { subscribe?: (o?: unknown) => AsyncIterable<{ type?: string; location?: { directory?: string }; data?: unknown }> };
+    tool?: { hook?: (name: "execute.after", fn: (input: unknown) => unknown) => unknown };
+  }) {
+    const dir = ctx?.location?.directory;
+    const run = runFor(${bin}, dir);
+    const here = (ev: { location?: { directory?: string } }) => !ev.location?.directory || !dir || ev.location.directory === dir;
+    const ctl = new AbortController();
+    void (async () => {
+      try {
+        const stream = ctx?.event?.subscribe?.({ signal: ctl.signal });
+        if (!stream) return;
+        for await (const ev of stream) {
+          const sid = sidOf(ev?.data);
+          if (!sid || !here(ev)) continue;
+          if (ev.type === "session.created") void run("session-start", { session_id: sid, cwd: dir });
+          else if (ev.type === "session.idle" || ev.type === "session.execution.succeeded") void run("stop", { session_id: sid });
+          else if (ev.type === "session.tool.called" && !ctx?.tool?.hook) void run("post-tool", { session_id: sid });
+        }
+      } catch { /* aborted or the stream ended: never surface in the host */ }
+    })();
+    try { ctx?.tool?.hook?.("execute.after", (input: unknown) => { const sid = sidOf(input); if (sid) void run("post-tool", { session_id: sid }); }); } catch { /* optional */ }
+    return () => ctl.abort();
+  },
+};
+`;
+}
+/** The OpenCode hooks edit: one whole file we own. Foreign content is left alone and reported. */
+export function opencodeHooks(cmd, ver) {
+    const content = opencodePluginSource(cmd, ver);
+    return {
+        install: (cur) => (cur === null || isOpencodePluginOurs(cur)) && cur !== content ? content : cur,
+        uninstall: (cur) => (cur === null || isOpencodePluginOurs(cur)) ? null : cur,
+        isWired: (cur) => cur === content,
+    };
+}
 // ---- OpenCode (JSONC) ------------------------------------------------------------------------
 function opencodeServer(cmd) {
     const desired = { type: "local", command: [...cmd, "mcp"] };
@@ -975,7 +1155,13 @@ export function edits(ctx, cli) {
                     ...jsonHooks(STOP_EVENTS, "codex", cmd) },
             ];
         case "opencode":
-            return [{ cli, kind: "mcp", item: "mcp.servers.mbx", path: opencodeConfig(home), ...opencodeServer(cmd) }];
+            // T391: OpenCode has no settings-file hooks — the first-party mechanism is the plugin module
+            // auto-loaded from ~/.config/opencode/plugins/, translating OpenCode events onto the shared
+            // `agentmbx hook ... --cli opencode` contract (session-start / post-tool / stop continuation).
+            return [
+                { cli, kind: "mcp", item: "mcp.servers.mbx", path: opencodeConfig(home), ...opencodeServer(cmd) },
+                { cli, kind: "hooks", item: "plugin session.created + tool.execute.after + session.idle", path: opencodePluginPath(home), ...opencodeHooks(cmd, version()) },
+            ];
         case "kimi": {
             const kimi = (home === homedir() && process.env.KIMI_CODE_HOME) || join(home, ".kimi-code");
             const srv = jsonServer("mcpServers", { command: cmd[0], args: mcpArgs }, (e) => e.command === cmd[0] && same(e.args ?? [], mcpArgs), true);

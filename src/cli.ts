@@ -514,7 +514,7 @@ async function run(argv: string[]) {
     return;
   }
   if (cmd === "login") {
-    // T256: device authorization only. The access token is not stored (T257 exchanges it).
+    // T257: device authorization, then the host-key-bound exchange. The access token is not stored.
     if (pos.length) die("login accepts options, not positional arguments");
     const base = str("base-url") ?? DEFAULT_LOGIN_BASE_URL;
     parseLoginBase(base);
@@ -525,6 +525,8 @@ async function run(argv: string[]) {
         host: n.host,
         fingerprint: fingerprint(n.key.publicKey),
         openBrowser: !o["no-browser"],
+        home: n.home,
+        hostKey: n.key,
       }, { ...defaultLoginIO(), log: (line) => console.log(line) });
       if (!outcome.ok) process.exitCode = 1;
     } finally { n.close(); }
@@ -1378,7 +1380,7 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
           if (!liveWatcher(node, agent)) emit(cli, "PostToolUse", grokWatchReminder(sid));
           return;
         }
-        if (cli !== "claude") return;
+        if (cli !== "claude" && cli !== "opencode") return;
         // Track IDs, not counts or sender timestamps: replacing one acked message with a new one must notify,
         // including delayed remote mail. Never fetch or inject message bodies into a tool hook.
         // T342: read the fast-path marker BEFORE querying the mailbox. A delivery that commits
@@ -1424,7 +1426,10 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
         // owner has delegated work or signed the request, only for mail newer than what was already surfaced, within the wake caps.
         // T385: Grok continues the same turn on {"decision":"block","reason"} (user-guide 10-hooks.md,
         // Stop Decision Control). A session-end Stop, reason other than end_turn, has no turn left to continue.
-        if (!["claude", "codex", "kimi", "grok"].includes(cli)) return;
+        // T391: OpenCode Stop arrives from the plugin's session.idle (the turn just ended); the block
+        // reason is injected back into the session by the plugin's client, and the stopseen marker +
+        // allowContinue cap below bound the loop the injection could otherwise create.
+        if (!["claude", "codex", "kimi", "grok", "opencode"].includes(cli)) return;
         if (cli === "grok" && typeof input.reason === "string" && input.reason !== "end_turn") return;
         const mark = `stopseen:${cli}:${sid ?? process.ppid}`, seen = node.store.get(mark) ?? new Date(Date.now() - 10 * 60_000).toISOString();
         const fresh = node.inbox(agent, { limit: 50 })
@@ -1526,7 +1531,7 @@ async function watch(node: MbxNode, selection: CliIdentitySelection) {
   // advances, the lease row itself is the liveness proof — no process evidence, no ps spawns. A
   // stale heartbeat pays ONE rate-limited probe, classified by identityLeaseStatus: live carries
   // on, unknown is retryable (T206/T340: unknown is never a stop), expired stops with the reason.
-  let watching: string | undefined, failures = 0, evidenceRetries = 0;
+  let watching: string | undefined, failures = 0, evidenceRetries = 0, releaseRetries = 0;
   // The pinned lease identity (review blocker): a takeover or reclaim that swaps token, holder
   // pid or holder start must stop this watcher — by name alone it would keep consuming the new
   // session's wakes. Mono clock (performance.now) so a backward wall step can't hide a crash.
@@ -1564,7 +1569,18 @@ async function watch(node: MbxNode, selection: CliIdentitySelection) {
       const agent = watching;
       const lease = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?")
         .get(agent) as IdentityLease | undefined;
-      if (!lease || lease.released_at !== null) throw leaseLost("no current identity lease");
+      // T452: a lease that is briefly released during a move must not stop the pinned watcher with the wrong
+      // reason. Retry for a short window; if a new holder claims with a different token, the next tick reports
+      // "moved to another holder". If the lease stays released, the retry budget exhausts and we stop.
+      if (!lease || lease.released_at !== null) {
+        if (releaseRetries < 3) {
+          releaseRetries += 1;
+          await new Promise(r => setTimeout(r, 250 * releaseRetries));
+          continue;
+        }
+        throw leaseLost("no current identity lease");
+      }
+      releaseRetries = 0;
       if (!pinned) {
         pinned = { token: lease.token, holder_pid: lease.holder_pid, holder_start: lease.holder_start };
         lastHeartbeatAt = lease.heartbeat_at; heartbeatAdvancedMono = performance.now();
@@ -1652,7 +1668,10 @@ async function watch(node: MbxNode, selection: CliIdentitySelection) {
 }
 
 function emit(cli: string, event: string, context: string) {
-  if (cli === "kimi") return console.log(context);               // Kimi adds plain stdout to the context
+  // B2b (T391): Kimi and OpenCode have no hookSpecificOutput protocol. OpenCode's plugin captures
+  // plain hook stdout and injects only the [mbx]/probe-ok runs it recognizes as ours (see
+  // opencodePluginSource in setup.ts). Claude Code reads the JSON shape; Codex and Grok keep theirs.
+  if (cli === "kimi" || cli === "opencode") return console.log(context);
   console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: context } }));
 }
 
