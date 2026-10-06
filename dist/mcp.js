@@ -5,7 +5,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -24,7 +24,7 @@ import { AUTO_NAME_RE, linkedKey, noteProject, projectKey, projectOf, registered
 import { applyIdentityTakeover } from "./identity-takeover.js";
 import { listIdentityStatus } from "./identity-status.js";
 import { consumeIdentityControl, identityControlAliases, identityControlKey, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl } from "./identity-control.js";
-import { alive, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
+import { alive, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
 import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy.js";
 import { assertKnownRecipients, deliveryReceipts, offlineWarnings, receiptLine, recipientReceipts, sentPage } from "./receipts.js";
 import { forwardMessage, ledgerPage, projectLeadLine, projectLeadView } from "./project-ledger.js";
@@ -100,10 +100,39 @@ export function reloadFromDisk(e) {
     handOverToFreshProcess(false, process.env[REEXEC_PARENT_AGENT]);
 }
 /** Env for the re-exec child: remembers the attempted build and the parent's identity. */
-export const reexecEnv = (parentAgent, providerPid, detached) => ({ ...process.env, [REEXEC_ENV]: "1", [REEXEC_BUILD_ENV]: codeFingerprint(), ...(parentAgent ? { [REEXEC_PARENT_AGENT]: parentAgent } : {}),
+export const reexecEnv = (parentAgent, providerPid, detached, originalPid) => ({ ...process.env, [REEXEC_ENV]: "1", [REEXEC_BUILD_ENV]: codeFingerprint(), ...(parentAgent ? { [REEXEC_PARENT_AGENT]: parentAgent } : {}),
     ...(detached ? { MBX_MCP_DETACHED: JSON.stringify(detachedReloadSchema.parse(detached)) } : {}),
-    ...(providerPid ? { MBX_MCP_PROVIDER_PID: String(providerPid), MBX_MCP_PROVIDER_START: inspectLeaseProcess(providerPid).start ?? "" } : {}) });
+    ...(providerPid ? { MBX_MCP_PROVIDER_PID: String(providerPid), MBX_MCP_PROVIDER_START: inspectLeaseProcess(providerPid).start ?? "" } : {}),
+    ...(originalPid ? { MBX_MCP_ORIGINAL_PID: String(originalPid) } : {}) });
 const REEXEC_PARENT_AGENT = "MBX_MCP_PARENT_AGENT";
+/**
+ * T449: the original proxy tracks the current live generation through a small file record instead of waiting
+ * on stdin EOF (a paused stdin never emits "end"). Each generation writes the pid of its replacement before
+ * exiting; the original polls the record and exits when the recorded pid is dead or reused.
+ */
+const generationDir = () => join(defaultHome(), "mcp-generation");
+const generationPath = (originalPid) => join(generationDir(), String(originalPid));
+function writeGeneration(originalPid, pid) {
+    try {
+        mkdirSync(generationDir(), { recursive: true, mode: 0o700 });
+        writeFileSync(generationPath(originalPid), JSON.stringify({ pid, start: inspectLeaseProcess(pid).start ?? "" }), "utf8");
+    }
+    catch { /* best-effort: the proxy still falls back to the child's exit code */ }
+}
+function readGeneration(originalPid) {
+    try {
+        return JSON.parse(readFileSync(generationPath(originalPid), "utf8"));
+    }
+    catch {
+        return null;
+    }
+}
+function clearGeneration(originalPid) {
+    try {
+        unlinkSync(generationPath(originalPid));
+    }
+    catch { /* already gone */ }
+}
 /**
  * T317: the provider to hand to a re-exec child must be the *original* CLI provider process, not this MCP
  * process's current ppid. After the first re-exec, the MCP parent is itself a re-exec generation and may soon
@@ -138,9 +167,10 @@ const handoverProvider = (node, ppid) => {
  * pending handover state.
  */
 function handOverToFreshProcess(pauseStdin, parentAgent, providerPid, detached, retired, onAbort) {
+    const originalPid = Number(process.env.MBX_MCP_ORIGINAL_PID) || process.pid;
     let child;
     try {
-        child = handoverSpawn(parentAgent, providerPid, detached);
+        child = handoverSpawn(parentAgent, providerPid, detached, originalPid);
     }
     catch (e) {
         process.stderr.write(`[mbx] build handover failed before the replacement started; this session keeps running on the loaded build: ${e.message}\n`);
@@ -158,8 +188,16 @@ function handOverToFreshProcess(pauseStdin, parentAgent, providerPid, detached, 
         // T317: a re-exec generation has done its job once the replacement is running; exit cleanly so we do
         // not accumulate nested MCP processes. The original proxy stays on its transport below.
         if (process.env[REEXEC_ENV]) {
+            // T449: tell the original which pid is now serving, then exit. The original watches this pid and
+            // mirrors its exit, so a crash or a clean stop both close the provider transport.
+            if (child.pid)
+                writeGeneration(originalPid, child.pid);
             process.exit(0);
         }
+        // T449: the original records its direct child so the poller below has a pid to watch even when this
+        // child never hands off again.
+        if (child.pid)
+            writeGeneration(originalPid, child.pid);
     });
     child.once("error", (err) => {
         if (!spawned) {
@@ -183,9 +221,22 @@ function handOverToFreshProcess(pauseStdin, parentAgent, providerPid, detached, 
         // T317: the original proxy keeps the provider transport alive. A zero exit means the replacement has
         // itself handed off to a newer generation; a non-zero exit means the replacement died and we mirror it.
         if (code === 0 && !process.env[REEXEC_ENV]) {
-            // The child handle is gone; keep this proxy alive until the provider closes the transport.
-            const keepAlive = setInterval(() => { }, 60_000);
-            process.stdin.once("end", () => clearInterval(keepAlive));
+            // T449: poll the generation record and exit when the current live generation dies. This avoids the
+            // stdin.once("end") bug: a paused stdin never emits "end" on EOF, so the proxy would leak forever.
+            const poller = setInterval(() => {
+                const rec = readGeneration(originalPid);
+                if (!rec)
+                    return; // no generation bound yet; the child is still starting up
+                const evidence = inspectLeaseProcess(rec.pid);
+                // A missing start in the record means the write happened before ps evidence was available;
+                // check liveness only in that case so the proxy does not mistake a fresh generation for a reused pid.
+                const stale = evidence.alive !== true || (rec.start !== "" && evidence.start !== rec.start);
+                if (stale) {
+                    clearGeneration(originalPid);
+                    process.exit(0);
+                }
+            }, 1_000);
+            process.once("exit", () => clearInterval(poller));
             return;
         }
         if (code !== 0)
@@ -203,10 +254,10 @@ function handOverToFreshProcess(pauseStdin, parentAgent, providerPid, detached, 
  * (error | throw | exit7) fakes the child process so tests can exercise every handover failure mode without a
  * real install; any other environment always spawns for real.
  */
-function handoverSpawn(parentAgent, providerPid, detached) {
+function handoverSpawn(parentAgent, providerPid, detached, originalPid) {
     const mode = process.env.AGENTMBX_DEV ? process.env.MBX_TEST_SPAWN_FAIL : undefined;
     if (!mode)
-        return spawn(process.execPath, process.argv.slice(1), { stdio: "inherit", env: reexecEnv(parentAgent, providerPid, detached) });
+        return spawn(process.execPath, process.argv.slice(1), { stdio: "inherit", env: reexecEnv(parentAgent, providerPid, detached, originalPid) });
     if (mode === "throw")
         throw new Error("injected synchronous spawn failure");
     const fake = new EventEmitter();

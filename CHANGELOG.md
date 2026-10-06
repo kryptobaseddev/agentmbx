@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **The original MCP proxy no longer leaks after reloads (T449):** the T317 keep-alive waited on `stdin.once("end")`, but stdin is paused during handover and never emits `"end"` on EOF, so the original proxy lingered forever after its session ended and held the provider transport open when the current generation crashed. Each generation now writes the pid of its replacement to a `$MBX_HOME/mcp-generation/<originalPid>` record before exiting, and the original polls that record once a second, exiting when the recorded pid is dead or reused. Lifecycle tests cover stdin EOF after two reloads and a SIGKILL crash of the current generation, asserting zero live MCP processes within a deadline.
+
 ## 0.5.12 (2026-10-06)
 
 In-place MCP reloads no longer accumulate nested processes, and `agentmbx probe` targets only identities currently working in the project.

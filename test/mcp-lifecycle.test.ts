@@ -101,3 +101,129 @@ test(`after ${RELOADS} reloads only the current lease-holder's MCP process is al
   // Sanity: the final server can still serve.
   assert.notEqual((await client.callTool({ name: "mbx_inbox", arguments: {} })).isError, true);
 });
+
+// T449: after reloads, closing the provider transport must stop the original proxy too. The T317 keep-alive
+// waited on stdin.once("end"), but stdin is paused during handover and never emits "end", leaking the proxy.
+test("closing stdin stops every MCP process after 2 reloads", async t => {
+  const root = mkdtempSync(join(tmpdir(), "mbx-lifecycle-eof-")), install = join(root, "install"), home = join(root, "mail");
+  mkdirSync(install);
+  for (const path of ["bin", "dist", "package.json"]) cpSync(resolve(path), join(install, path), { recursive: true });
+  const mcpPath = join(install, "dist/mcp.js"), currentMcp = readFileSync(mcpPath, "utf8");
+  const start = currentMcp.indexOf('server.registerTool("mbx_replay",');
+  const end = currentMcp.indexOf('server.registerTool("mbx_ack",', start);
+  assert.ok(start >= 0 && end > start, "fixture must remove exactly the replay registration");
+  writeFileSync(mcpPath, currentMcp.slice(0, start) + currentMcp.slice(end));
+  symlinkSync(resolve("node_modules"), join(install, "node_modules"), "dir");
+
+  const node = new MbxNode(home, { host: "alpha" }), client = new Client({ name: "lifecycle-eof", version: "1" });
+  t.after(async () => { await client.close().catch(() => {}); node.close(); rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+
+  const env: NodeJS.ProcessEnv = { ...process.env, MBX_HOME: home, MBX_AGENT: "eof-reader", MBX_CLI: "claude", MBX_NO_DESKTOP: "1" };
+  delete env.AGENTMBX_DEV; delete env.MBX_MCP_REEXEC; delete env.MBX_MCP_REEXEC_BUILD; delete env.MBX_MCP_DETACHED; delete env.MBX_MCP_PROVIDER_PID;
+
+  const transport = new StdioClientTransport({ command: process.execPath, args: [join(install, "bin/agentmbx.js"), "mcp"], env: env as Record<string, string>, stderr: "pipe" });
+  const stderrLines: string[] = [];
+  (transport as unknown as { stderr: { on: (ev: string, cb: (d: unknown) => void) => void } }).stderr.on("data", d => stderrLines.push(String(d)));
+  await client.connect(transport);
+  assert.notEqual((await client.callTool({ name: "mbx_whoami", arguments: { name: "eof-reader", role: "builder" } })).isError, true);
+
+  const holderPids: number[] = [];
+  const pushHolderPid = () => {
+    const row = node.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE name=?").get("eof-reader") as { holder_pid: number } | undefined;
+    assert.ok(row, "lease row must exist");
+    holderPids.push(row.holder_pid);
+  };
+  pushHolderPid();
+
+  for (let generation = 1; generation <= 2; generation++) {
+    if (generation === 1) writeFileSync(mcpPath, currentMcp);
+    appendFileSync(join(install, "dist/cli.js"), `\n// deployed build ${generation}\n`);
+    assert.notEqual((await client.callTool({ name: "mbx_whoami", arguments: {} })).isError, true, "trigger call must finish");
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const row = node.store.db.prepare("SELECT holder_pid, released_at FROM identity_leases WHERE name=?").get("eof-reader") as { holder_pid: number; released_at: string | null } | undefined;
+      if (row && row.holder_pid !== holderPids[holderPids.length - 1] && row.released_at === null) break;
+      await new Promise(r => setTimeout(r, 25));
+    }
+    pushHolderPid();
+  }
+
+  // Close the provider transport: stdin EOF for the whole process tree.
+  await client.close();
+
+  // Every MCP process for this session must exit within the deadline: the original proxy watches the
+  // generation record and exits when the current generation dies on EOF.
+  const deadline = Date.now() + 15_000;
+  let live = countLiveMcpProcesses(install);
+  while (live > 0 && Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 250));
+    live = countLiveMcpProcesses(install);
+  }
+  assert.equal(live, 0, `expected zero live MCP processes after stdin close, found ${live} (pids=${holderPids.join(",")}; stderr: ${stderrLines.join(" | ")})`);
+});
+
+// T449: when the current generation crashes, the original proxy must exit so the provider sees the transport
+// close instead of hanging on a dead session.
+test("a crashed current generation closes the provider transport", async t => {
+  const root = mkdtempSync(join(tmpdir(), "mbx-lifecycle-crash-")), install = join(root, "install"), home = join(root, "mail");
+  mkdirSync(install);
+  for (const path of ["bin", "dist", "package.json"]) cpSync(resolve(path), join(install, path), { recursive: true });
+  const mcpPath = join(install, "dist/mcp.js"), currentMcp = readFileSync(mcpPath, "utf8");
+  const start = currentMcp.indexOf('server.registerTool("mbx_replay",');
+  const end = currentMcp.indexOf('server.registerTool("mbx_ack",', start);
+  assert.ok(start >= 0 && end > start, "fixture must remove exactly the replay registration");
+  writeFileSync(mcpPath, currentMcp.slice(0, start) + currentMcp.slice(end));
+  symlinkSync(resolve("node_modules"), join(install, "node_modules"), "dir");
+
+  const node = new MbxNode(home, { host: "alpha" }), client = new Client({ name: "lifecycle-crash", version: "1" });
+  t.after(async () => { await client.close().catch(() => {}); node.close(); rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+
+  const env: NodeJS.ProcessEnv = { ...process.env, MBX_HOME: home, MBX_AGENT: "crash-reader", MBX_CLI: "claude", MBX_NO_DESKTOP: "1" };
+  delete env.AGENTMBX_DEV; delete env.MBX_MCP_REEXEC; delete env.MBX_MCP_REEXEC_BUILD; delete env.MBX_MCP_DETACHED; delete env.MBX_MCP_PROVIDER_PID;
+
+  const transport = new StdioClientTransport({ command: process.execPath, args: [join(install, "bin/agentmbx.js"), "mcp"], env: env as Record<string, string>, stderr: "pipe" });
+  const stderrLines: string[] = [];
+  (transport as unknown as { stderr: { on: (ev: string, cb: (d: unknown) => void) => void } }).stderr.on("data", d => stderrLines.push(String(d)));
+  await client.connect(transport);
+  assert.notEqual((await client.callTool({ name: "mbx_whoami", arguments: { name: "crash-reader", role: "builder" } })).isError, true);
+
+  const holderPids: number[] = [];
+  const pushHolderPid = () => {
+    const row = node.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE name=?").get("crash-reader") as { holder_pid: number } | undefined;
+    assert.ok(row, "lease row must exist");
+    holderPids.push(row.holder_pid);
+  };
+  pushHolderPid();
+
+  // One reload.
+  writeFileSync(mcpPath, currentMcp);
+  appendFileSync(join(install, "dist/cli.js"), `\n// deployed build 1\n`);
+  assert.notEqual((await client.callTool({ name: "mbx_whoami", arguments: {} })).isError, true, "trigger call must finish");
+  const reloadDeadline = Date.now() + 10_000;
+  while (Date.now() < reloadDeadline) {
+    const row = node.store.db.prepare("SELECT holder_pid, released_at FROM identity_leases WHERE name=?").get("crash-reader") as { holder_pid: number; released_at: string | null } | undefined;
+    if (row && row.holder_pid !== holderPids[holderPids.length - 1] && row.released_at === null) break;
+    await new Promise(r => setTimeout(r, 25));
+  }
+  pushHolderPid();
+
+  // Crash the current generation (SIGKILL, never the graceful path).
+  const current = holderPids[holderPids.length - 1];
+  process.kill(current, "SIGKILL");
+
+  // The original proxy must exit and the transport must close. The client sees the close.
+  const closePromise = new Promise<void>(resolve => {
+    (transport as unknown as { onclose?: () => void }).onclose = () => resolve();
+    setTimeout(resolve, 15_000);
+  });
+  await closePromise;
+
+  // No MCP processes remain for this session.
+  const deadline = Date.now() + 10_000;
+  let live = countLiveMcpProcesses(install);
+  while (live > 0 && Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 250));
+    live = countLiveMcpProcesses(install);
+  }
+  assert.equal(live, 0, `expected zero live MCP processes after current-generation crash, found ${live} (pids=${holderPids.join(",")}; stderr: ${stderrLines.join(" | ")})`);
+});
