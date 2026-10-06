@@ -1380,7 +1380,7 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
           if (!liveWatcher(node, agent)) emit(cli, "PostToolUse", grokWatchReminder(sid));
           return;
         }
-        if (cli !== "claude") return;
+        if (cli !== "claude" && cli !== "opencode") return;
         // Track IDs, not counts or sender timestamps: replacing one acked message with a new one must notify,
         // including delayed remote mail. Never fetch or inject message bodies into a tool hook.
         // T342: read the fast-path marker BEFORE querying the mailbox. A delivery that commits
@@ -1426,7 +1426,10 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
         // owner has delegated work or signed the request, only for mail newer than what was already surfaced, within the wake caps.
         // T385: Grok continues the same turn on {"decision":"block","reason"} (user-guide 10-hooks.md,
         // Stop Decision Control). A session-end Stop, reason other than end_turn, has no turn left to continue.
-        if (!["claude", "codex", "kimi", "grok"].includes(cli)) return;
+        // T391: OpenCode Stop arrives from the plugin's session.idle (the turn just ended); the block
+        // reason is injected back into the session by the plugin's client, and the stopseen marker +
+        // allowContinue cap below bound the loop the injection could otherwise create.
+        if (!["claude", "codex", "kimi", "grok", "opencode"].includes(cli)) return;
         if (cli === "grok" && typeof input.reason === "string" && input.reason !== "end_turn") return;
         const mark = `stopseen:${cli}:${sid ?? process.ppid}`, seen = node.store.get(mark) ?? new Date(Date.now() - 10 * 60_000).toISOString();
         const fresh = node.inbox(agent, { limit: 50 })
@@ -1665,7 +1668,10 @@ async function watch(node: MbxNode, selection: CliIdentitySelection) {
 }
 
 function emit(cli: string, event: string, context: string) {
-  if (cli === "kimi") return console.log(context);               // Kimi adds plain stdout to the context
+  // B2b (T391): Kimi and OpenCode have no hookSpecificOutput protocol. OpenCode's plugin captures
+  // plain hook stdout and injects only the [mbx]/probe-ok runs it recognizes as ours (see
+  // opencodePluginSource in setup.ts). Claude Code reads the JSON shape; Codex and Grok keep theirs.
+  if (cli === "kimi" || cli === "opencode") return console.log(context);
   console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: context } }));
 }
 
