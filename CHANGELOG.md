@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Probe targets current-session identities and adds --only, --exclude, --plan (T445):** `planProbe()` now matches live sessions by their current working directory when `project` is given, ignoring stale historical `identity_projects` memberships. The `agentmbx probe` CLI accepts `--only <glob>[,...]`, `--exclude <glob>[,...]`, and `--plan`; `--plan` lists targets and exits without sending. `ProbeIO` gained `holderProject()` so tests can assert the cwd filter, and `runProbe()` and `buildProbeReport()` respect `only`, `exclude`, and `plannedOnly`.
+
 ## 0.5.11 (2026-10-06)
 
 Autonomy hardening across harnesses: a sibling MCP server of a live session now co-uses its identity instead of waiting (OpenCode code mode), a failed build handover can no longer half-retire the server, Grok and Kimi re-arm a down watcher, wake hints stop claiming unread mail is handled, a conversation's external taint survives release/claim and applies to shell sends, and the daemon gains a sync client that stays off until the device is linked.

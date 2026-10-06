@@ -46,10 +46,36 @@ export interface ProbeTarget {
 }
 
 /** Every live leased identity in the project, excluding the sender. Live = identity-status's
- *  held/idle states (its claim path uses the same identityAvailability computation). */
-export function planProbe(identities: readonly IdentityStatus[], sender: string): ProbeTarget[] {
+ *  held/idle states (its claim path uses the same identityAvailability computation).
+ *
+ *  T445: when `project` is set, historical identity_projects membership never suffices — a target
+ *  must prove its LIVE holder currently works in the project (the holder session binding's cwd,
+ *  via `holderProject`). `only` restricts to exact names; `exclude` drops exact names or globs
+ *  (`*` and `?`). Filters apply in that order; skipped names simply never appear in the plan. */
+export interface ProbePlanOptions {
+  project?: string;
+  only?: readonly string[];
+  exclude?: readonly string[];
+  holderProject?: (holder: { cli: string; session_id: string }) => string | null;
+}
+
+/** Minimal glob for --exclude: `*` any run, `?` one char, everything else literal. */
+export function globMatch(pattern: string, name: string): boolean {
+  const re = new RegExp("^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$");
+  return re.test(name);
+}
+
+export function planProbe(identities: readonly IdentityStatus[], sender: string, options: ProbePlanOptions = {}): ProbeTarget[] {
+  const only = options.only?.length ? new Set(options.only) : null;
   return identities
     .filter((i) => i.name !== sender && (i.state === "held" || i.state === "idle"))
+    .filter((i) => {
+      if (!options.project || !options.holderProject) return true;
+      const cwd = i.holder ? options.holderProject(i.holder) : null;
+      return cwd === options.project;
+    })
+    .filter((i) => !only || only.has(i.name))
+    .filter((i) => !(options.exclude ?? []).some((p) => globMatch(p, i.name)))
     .map((i) => ({ name: i.name, state: i.state, holder: i.holder ? { cli: i.holder.cli, session_id: i.holder.session_id } : null, reason: i.reason }))
     .sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -73,6 +99,8 @@ export interface TargetObservation {
 export interface ProbeIO {
   host(): string;
   listTargets(): IdentityStatus[];
+  /** The cwd of a holder's live session binding row, or null when it has none (T445). */
+  holderProject?(holder: { cli: string; session_id: string }): string | null;
   send(target: string): SentProbe;
   observe(target: string, sent: SentProbe): TargetObservation;
 }
@@ -89,6 +117,13 @@ export function storeProbeIO(node: MbxNode, o: { project?: string; sender: strin
   return {
     host: () => node.host,
     listTargets: () => listIdentityStatus(node.home, { project: o.project, ...(o.caller ? { caller: o.caller } : {}) }).identities,
+    holderProject: (holder) => {
+      // The live holder proves current project work through its session binding row — historical
+      // identity_projects membership never suffices (T445).
+      const row = db.prepare("SELECT cwd FROM sessions WHERE cli=? AND session_id=? ORDER BY updated_at DESC LIMIT 1")
+        .get(holder.cli, holder.session_id) as { cwd: string | null } | undefined;
+      return row?.cwd ?? null;
+    },
     send: (target) => {
       const at = Date.now();
       const draft = { from: o.sender, to: [target], subject: probeSubject(new Date(at)), body: probeBody(),
@@ -148,6 +183,8 @@ export function storeProbeIO(node: MbxNode, o: { project?: string; sender: strin
 
 export interface ProbeAgentReport {
   name: string;
+  /** Planning state from identity-status (held/idle). Present even in --plan output. */
+  state: string;
   holder: { cli: string; session_id: string } | null;
   message_id: string;
   sent_at: string;
@@ -210,27 +247,31 @@ export function buildProbeReport(o: {
   sender: string;
   requireIdleWake?: boolean;
   noTargetsReason?: string;
+  /** --plan: targets were computed but nothing was sent, so no pass/fail reasons apply. */
+  plannedOnly?: boolean;
 }): ProbeReport {
   const deadlineS = Math.round(o.deadlineMs / 1000);
   const requireIdleWake = o.requireIdleWake ?? false;
   const targets: ProbeAgentReport[] = o.plan.map((t) => {
-    const sent = o.sent.get(t.name)!;
+    const sent = o.sent.get(t.name);
     const ob = o.observations.get(t.name) ?? { wake: null, readAt: null, ackedAt: null, ackNote: null, reply: null };
     const admitted = ob.wake?.outcome === "admitted";
     const idleWake = watcherObservesExit(ob.wake);
     const path: ProbeAgentReport["path"] = ob.reply ? (idleWake ? "idle-wake" : "in-turn") : null;
-    const reason = o.sendErrors?.get(t.name) ? `probe message could not be sent: ${o.sendErrors.get(t.name)}`
+    const reason = o.plannedOnly ? null
+      : o.sendErrors?.get(t.name) ? `probe message could not be sent: ${o.sendErrors.get(t.name)}`
       : !ob.reply && !ob.wake ? `no wake.attempt for ${t.name} within ${deadlineS}s of the probe`
       : !ob.reply && !admitted ? `wake for ${t.name} never admitted (last outcome: ${ob.wake!.outcome ?? "unknown"}${ob.wake!.via ? ` via ${ob.wake!.via}` : ""})`
       : !ob.reply ? `${t.name} woke but did not reply in the probe thread within ${deadlineS}s`
       : requireIdleWake && !idleWake ? `in-turn answer without an admitted idle wake (last wake outcome: ${ob.wake?.outcome ?? "none"}${ob.wake?.via ? ` via ${ob.wake.via}` : ""}); --require-idle-wake requires one`
       : null;
     return {
-      name: t.name, holder: t.holder, message_id: sent.id, sent_at: iso(sent.at), path,
-      wake: ob.wake ? { ...ob.wake, latency_ms: latency(ob.wake.at, sent.at) } : null,
-      read: ob.readAt !== null ? { at: iso(ob.readAt), latency_ms: latency(ob.readAt, sent.at)! } : null,
-      ack: ob.ackedAt !== null ? { at: iso(ob.ackedAt), note: ob.ackNote, latency_ms: latency(ob.ackedAt, sent.at)! } : null,
-      reply: ob.reply ? { id: ob.reply.id, at: iso(ob.reply.at), latency_ms: latency(ob.reply.at, sent.at)! } : null,
+      name: t.name, state: t.state, holder: t.holder, message_id: sent?.id ?? "", sent_at: sent ? iso(sent.at) : "",
+      path,
+      wake: ob.wake && sent ? { ...ob.wake, latency_ms: latency(ob.wake.at, sent.at) } : null,
+      read: ob.readAt !== null && sent ? { at: iso(ob.readAt), latency_ms: latency(ob.readAt, sent.at)! } : null,
+      ack: ob.ackedAt !== null && sent ? { at: iso(ob.ackedAt), note: ob.ackNote, latency_ms: latency(ob.ackedAt, sent.at)! } : null,
+      reply: ob.reply && sent ? { id: ob.reply.id, at: iso(ob.reply.at), latency_ms: latency(ob.reply.at, sent.at)! } : null,
       ok: reason === null,
       reason,
     };
@@ -252,6 +293,12 @@ export async function runProbe(io: ProbeIO, o: {
   sender: string;
   project?: string;
   deadlineMs?: number;
+  /** Restrict targets to these exact names (after the live-project check). */
+  only?: readonly string[];
+  /** Drop these names (exact or glob) after every other filter. */
+  exclude?: readonly string[];
+  /** Print the plan only: compute targets, send nothing, wait for nothing. */
+  planOnly?: boolean;
   /** Strict gate (the T388 harness rows): an admitted idle wake AND the reply. Default is
    *  reply-only — an agent answering mid-turn through its in-turn hook passes as "in-turn". */
   requireIdleWake?: boolean;
@@ -266,11 +313,18 @@ export async function runProbe(io: ProbeIO, o: {
   const pollMs = o.pollMs ?? PROBE_POLL_MS;
   const startedAt = now();
 
-  const plan = planProbe(io.listTargets(), o.sender);
+  const plan = planProbe(io.listTargets(), o.sender, {
+    project: o.project, only: o.only, exclude: o.exclude,
+    holderProject: io.holderProject ? (h) => io.holderProject!(h) : undefined,
+  });
   if (!plan.length) {
     return buildProbeReport({ plan, sent: new Map(), observations: new Map(), startedAt, finishedAt: now(),
       deadlineMs, host: io.host(), project: o.project, sender: o.sender, requireIdleWake: o.requireIdleWake,
       noTargetsReason: "no live leased identities to probe (excluding the sender)" });
+  }
+  if (o.planOnly) {
+    return buildProbeReport({ plan, sent: new Map(), observations: new Map(), startedAt, finishedAt: now(),
+      deadlineMs, host: io.host(), project: o.project, sender: o.sender, requireIdleWake: o.requireIdleWake, plannedOnly: true });
   }
 
   const sent = new Map<string, SentProbe>();
