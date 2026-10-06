@@ -179,8 +179,10 @@ test("identityAvailability: one answer for list and claim", () => {
   assert.equal(identityAvailability({ lease, evidence: live, activity: { at: now, shared: true }, now }).claimable, false);
   assert.equal(identityAvailability({ lease, evidence: live, activity: { at: now - SHARED_IDLE_MS, shared: true }, now }).takeover, "idle-conversation");
   assert.equal(identityAvailability({ lease, evidence: live, activity: { at: now - SHARED_IDLE_MS, shared: false }, now }).claimable, false, "a dedicated session is never idle-claimed");
-  // T383: only a holder under a different (restarted) provider process is "older"; a live one under the caller's own provider keeps it.
-  assert.equal(identityAvailability({ lease, evidence: live, activity: null, now, caller: { cli: "codex", sessionId: "thread-1", providerPid: 10, holderProviderPid: 20 } }).takeover, "same-session");
+  // T440: a different provider is takeover only when that provider is confirmed dead. A live one keeps the lease.
+  assert.equal(identityAvailability({ lease, evidence: live, activity: null, now, caller: { cli: "codex", sessionId: "thread-1", providerPid: 10, holderProviderPid: 20, holderProviderAlive: false } }).takeover, "same-session");
+  assert.equal(identityAvailability({ lease, evidence: live, activity: null, now, caller: { cli: "codex", sessionId: "thread-1", providerPid: 10, holderProviderPid: 20, holderProviderAlive: true } }).takeover, undefined);
+  assert.equal(identityAvailability({ lease, evidence: live, activity: null, now, caller: { cli: "codex", sessionId: "thread-1", providerPid: 10, holderProviderPid: 20, holderProviderAlive: true } }).claimable, false);
   assert.equal(identityAvailability({ lease, evidence: live, activity: null, now, caller: { cli: "codex", sessionId: "thread-1", providerPid: 10, holderProviderPid: 10 } }).claimable, false);
   assert.equal(identityAvailability({ lease, evidence: live, activity: null, now, conflict: true }).state, "conflict");
 });

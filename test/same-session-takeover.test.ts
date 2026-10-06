@@ -1,15 +1,34 @@
 // T383: a second MCP connection of the same provider session must not evict that session's live server.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { appendFileSync, cpSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { MbxNode } from "../src/node.ts";
-import { holderProviderPid, identityAvailability } from "../src/identity-availability.ts";
+import { holderProviderPid, identityAvailability, parseProviderRecord, providerRecordKey } from "../src/identity-availability.ts";
+import { findIdentityControl } from "../src/identity-control.ts";
 import { detachedReloadState, reexecEnv } from "../src/mcp.ts";
-import type { IdentityLease } from "../src/identity-leases.ts";
+import { inspectLeaseProcess, type IdentityLease } from "../src/identity-leases.ts";
+
+/** A process that has already exited, with the birth time it had while alive. */
+async function exitedProvider(): Promise<{ pid: number; start: string }> {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1e9)"], { stdio: "ignore" });
+  const pid = child.pid;
+  if (!pid) throw new Error("dummy provider did not start");
+  const start = inspectLeaseProcess(pid).start;
+  if (!start) throw new Error("dummy provider has no start time");
+  child.kill("SIGKILL");
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    try { process.kill(pid, 0); }
+    catch { return { pid, start }; }
+    assert.ok(Date.now() < deadline, "dummy provider did not exit");
+    await new Promise(r => setTimeout(r, 25));
+  }
+}
 
 const THREAD = "33333333-3333-4333-8333-333333333333";
 const bin = join(import.meta.dirname, "../bin/agentmbx.js");
@@ -87,6 +106,8 @@ test("a second live connection of the same session and provider never takes the 
   }
   assert.notEqual(lease("same-reader").holder_pid, held.holder_pid);
   assert.notEqual((await call(later, "mbx_read", { ids: [mail] })).isError, true);
+  assert.equal(node.store.get(providerRecordKey(held.holder_pid)), undefined, "exit removes only this process's provider record");
+  assert.ok(parseProviderRecord(node.store.get(providerRecordKey(lease("same-reader").holder_pid))), "the resuming server recorded its provider");
 });
 
 test("a dead holder of the same session is still taken over", async t => {
@@ -107,15 +128,56 @@ test("a dead holder of the same session is still taken over", async t => {
   assert.notEqual(lease("dead-reader").holder_pid, held.holder_pid);
 });
 
-test("a live holder under a different (restarted) provider process is taken over", async t => {
+test("a co-using sibling and a pending newcomer leave the holder's control endpoint in place", async t => {
+  const { node, connect, call, lease } = fixture(t);
+  const holder = await connect();
+  assert.notEqual((await call(holder, "mbx_identity", { action: "register", name: "moved-reader", role: "reader" })).isError, true);
+  const held = lease("moved-reader");
+  const before = findIdentityControl(node.store, "codex", THREAD);
+  assert.equal(before.mcp_pid, held.holder_pid);
+  const recorded = parseProviderRecord(node.store.get(providerRecordKey(held.holder_pid)));
+  assert.ok(recorded, "claim records mcp-provider:<mcpPid>");
+  assert.equal(inspectLeaseProcess(recorded.pid).alive, true, "the holder's recorded provider is alive");
+
+  const sibling = await connect();
+  const shared = who(await call(sibling, "mbx_whoami")) as ReturnType<typeof who> & { co_use?: string };
+  assert.equal(shared.agent, "moved-reader");
+  assert.match(String(shared.co_use), /co-using/);
+  assert.equal(findIdentityControl(node.store, "codex", THREAD).control_key, before.control_key);
+  assert.deepEqual(lease("moved-reader"), held);
+
+  // A shell parent is a different process. While the recorded provider is alive this stays pending (T440).
+  const newcomer = await connect({ restarted: true });
+  const pending = who(await call(newcomer, "mbx_whoami"));
+  assert.equal(pending.agent, null, JSON.stringify(pending));
+  assert.deepEqual(lease("moved-reader"), held, "a live foreign parent does not take over");
+  assert.equal(node.store.db.prepare("SELECT 1 FROM audit WHERE event='identity.takeover'").get(), undefined);
+  const during = findIdentityControl(node.store, "codex", THREAD);
+  assert.equal(during.mcp_pid, held.holder_pid);
+  assert.equal(during.control_key, before.control_key, "the newcomer did not publish over the holder");
+
+  await sibling.close();
+  await newcomer.close();
+  await new Promise(r => setTimeout(r, 300));
+  const after = findIdentityControl(node.store, "codex", THREAD);
+  assert.equal(after.mcp_pid, held.holder_pid);
+  assert.equal(after.control_key, before.control_key, "exit removed only their own endpoints");
+  assert.deepEqual(lease("moved-reader"), held);
+  assert.equal(who(await call(holder, "mbx_whoami")).agent, "moved-reader");
+});
+
+test("a live holder is taken over when its recorded provider is confirmed dead", async t => {
   const { node, connect, call, lease } = fixture(t);
   const original = await connect();
-  assert.notEqual((await call(original, "mbx_identity", { action: "register", name: "moved-reader", role: "reader" })).isError, true);
-  const held = lease("moved-reader");
+  assert.notEqual((await call(original, "mbx_identity", { action: "register", name: "dead-provider", role: "reader" })).isError, true);
+  const held = lease("dead-provider");
+  // The holder's real parent (this test) is still alive. The record is what the newcomer must believe.
+  const dead = await exitedProvider();
+  node.store.set(providerRecordKey(held.holder_pid), JSON.stringify({ providerPid: dead.pid, providerStart: dead.start }));
   const replacement = await connect({ restarted: true });
   const resumed = await call(replacement, "mbx_whoami");
-  assert.equal(who(resumed).agent, "moved-reader", JSON.stringify(resumed));
-  assert.notEqual(lease("moved-reader").holder_pid, held.holder_pid);
+  assert.equal(who(resumed).agent, "dead-provider", JSON.stringify(resumed));
+  assert.notEqual(lease("dead-provider").holder_pid, held.holder_pid);
   assert.ok(node.store.db.prepare("SELECT 1 FROM audit WHERE event='identity.takeover' AND detail LIKE '%same-session%'").get());
   const fenced = await call(original, "mbx_inbox");
   assert.equal(fenced.isError, true, "the older process is fenced");
@@ -128,7 +190,10 @@ test("same-session availability depends on the holder's provider process", () =>
   const live = { alive: true, start: "s" };
   const caller = (providerPid: number | undefined, holder: number | null | undefined) => ({ cli: "codex", sessionId: THREAD, providerPid, holderProviderPid: holder });
   assert.equal(identityAvailability({ lease, evidence: live, activity: null, now, caller: caller(10, 10) }).claimable, false, "same provider: live server keeps it");
-  assert.equal(identityAvailability({ lease, evidence: live, activity: null, now, caller: caller(10, 20) }).takeover, "same-session", "restarted provider");
+  assert.equal(identityAvailability({ lease, evidence: live, activity: null, now, caller: { ...caller(10, 20), holderProviderAlive: false } }).takeover, "same-session", "provider confirmed dead");
+  assert.equal(identityAvailability({ lease, evidence: live, activity: null, now, caller: { ...caller(10, 20), holderProviderAlive: true } }).takeover, undefined, "a live provider is not takeover");
+  assert.equal(identityAvailability({ lease, evidence: live, activity: null, now, caller: { ...caller(10, 20), holderProviderAlive: true } }).claimable, false);
+  assert.equal(identityAvailability({ lease, evidence: live, activity: null, now, caller: caller(10, 20) }).takeover, undefined, "a pid mismatch alone is not takeover");
   assert.equal(identityAvailability({ lease, evidence: live, activity: null, now, caller: caller(10, null) }).claimable, false, "unknown parentage never evicts");
   assert.equal(identityAvailability({ lease, evidence: live, activity: null, now, caller: caller(undefined, undefined) }).claimable, false);
   assert.equal(identityAvailability({ lease, evidence: { alive: false, start: null }, activity: null, now, caller: caller(10, 10) }).claimable, true, "dead holder");
@@ -137,6 +202,14 @@ test("same-session availability depends on the holder's provider process", () =>
   assert.equal(holderProviderPid(table, 50, 10), 10);
   assert.equal(holderProviderPid(table, 50, 99), 40);
   assert.equal(holderProviderPid(table, 77, 10), null);
+  // T440: a valid record is preferred, a reused pid falls back, a missing record falls back, a dead record returns that pid.
+  const withRecord = new Map([...table, [7, { ppid: 1 }]]);
+  const recorded = { pid: 7, start: "s" };
+  assert.equal(holderProviderPid(withRecord, 50, 99, recorded, { alive: true, start: "s" }), 7, "valid record beats ancestry");
+  assert.equal(holderProviderPid(withRecord, 50, 99, recorded, { alive: true, start: "other" }), 40, "pid reuse falls back to ancestry");
+  assert.equal(holderProviderPid(table, 50, 99, null, null), 40, "no record falls back to ancestry");
+  assert.equal(holderProviderPid(table, 50, 99, recorded, { alive: false, start: null }), 7, "a dead record does not walk up to a live ancestor");
+  assert.equal(holderProviderPid(table, 50, 99, recorded, { alive: null, start: null }), 40, "unknown record evidence falls back");
 });
 
 test("reload metadata accepts a base that lost its lease (no agent)", () => {
