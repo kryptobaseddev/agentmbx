@@ -24,7 +24,11 @@ export function withCliIdentity<T>(node: MbxNode, selection: CliIdentitySelectio
   return withIdentity(node, selection, descriptors, operation);
 }
 
-/** Hook bootstrap requires one holder; only Claude may change real session IDs within that holder. */
+/** CLIs whose one provider process holds one conversation at a time: /clear, /new and /resume replace the session id
+ *  of the same process and the same MCP holder (T460: Hermes TUI/CLI). A multi-session host is not one of them. */
+export const REBINDING_CLIS: readonly string[] = ["claude", "hermes"];
+
+/** Hook bootstrap requires one holder; only Claude and Hermes may change real session IDs within that holder. */
 export function withHookIdentity<T>(node: MbxNode, cli: string, session: string | undefined,
   operation: (agent: string, descriptor: IdentityControlDescriptor, bootstrap: boolean) => T, allowBootstrap = false): T {
   if (operation.constructor.name === "AsyncFunction") throw refused("hook operations must be synchronous");
@@ -32,15 +36,18 @@ export function withHookIdentity<T>(node: MbxNode, cli: string, session: string 
     throw refused("hook requires a valid non-provisional session id");
   const all = listIdentityControls(node.store).filter(d => d.cli === cli && d.parent_pid === process.ppid);
   let descriptors: IdentityControlDescriptor[], bootstrap = false;
-  const rebindClaude = allowBootstrap && cli === "claude" && !node.store.db.prepare("SELECT 1 FROM sessions WHERE cli=? AND session_id=?").get(cli, session);
+  const rebinds = REBINDING_CLIS.includes(cli);
+  const rebindClaude = allowBootstrap && rebinds && !node.store.db.prepare("SELECT 1 FROM sessions WHERE cli=? AND session_id=?").get(cli, session);
   if (node.store.get(identityControlKey(cli, session)) !== undefined && !rebindClaude) descriptors = [findIdentityControl(node.store, cli, session)];
   else {
     // Hosted providers must first publish an exact session binding. Never bootstrap by directory.
     // Claude's /clear, /resume and compaction replace the session id of the same process, whose MCP holder carries the
     // id it started with: the provider's own session file naming exactly this session is the proof of that rotation.
     const rotated = cli === "claude" && claudeSessionId(process.ppid) === session;
-    if (!allowBootstrap || !["claude", "kimi"].includes(cli) || (cli === "kimi" && kimiInstances().some(instance => instance.pid === process.ppid)) || new Set(all.map(d => d.control_key)).size !== 1
-      || all.some(d => (!d.lease_session_id.startsWith("mcp-") && !rotated) || (cli !== "claude" && !d.session_id.startsWith("mcp-"))
+    // Hermes: every alias of the one holder differs only in session_id (the canonical check below), so a real id left by an
+    // earlier conversation of this process is replaced, never mistaken for a second holder.
+    if (!allowBootstrap || ![...REBINDING_CLIS, "kimi"].includes(cli) || (cli === "kimi" && kimiInstances().some(instance => instance.pid === process.ppid)) || new Set(all.map(d => d.control_key)).size !== 1
+      || all.some(d => (!d.lease_session_id.startsWith("mcp-") && !rotated) || (!rebinds && !d.session_id.startsWith("mcp-"))
         || !matches(d, rowFor(node, d.agent)) || canonical({ ...d, session_id: "" }) !== canonical({ ...all[0], session_id: "" })))
       throw refused("hook session has no exact current MCP binding");
     descriptors = all; bootstrap = true;
