@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.15 (2026-10-06)
+
+Hotfix: OpenCode connectors of one session co-use the mailbox lease instead of deadlocking, and an in-place reload no longer drops the MCP connection on install.
+
 - **OpenCode reconnects no longer deadlock the mailbox (T469, P0):** OpenCode starts the mbx MCP through different runtime wrappers (its main loop and the Code Mode runtime) and reconnects it often. Each connector was recorded under a different provider, so a second connector of the same session was told the identity was held by a live server whose provider was still running, and agents killed MCP processes to escape. The provider is now resolved through Node/Bun runtime parents to the shared `opencode serve` (never across a shell), so connectors of one session co-use the lease. A hand-spawned `agentmbx mcp` cannot use a live harness identity, `identity takeover --force` refuses to target your own live session, doctor warns on more than 5 claims in 10 minutes, and the instructions say never to kill or hand-spawn MBX MCP servers.
 - **An in-place reload no longer drops the MCP connection (T469):** every MCP timer was unref'd, so a re-exec generation whose inherited stdin did not hold the event loop exited right after its catalog notification, released its fresh lease and closed the client's transport, on every install. The heartbeat now keeps the process alive until EOF, close or a handover retire.
 
