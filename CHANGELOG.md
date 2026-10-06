@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **The daemon serves one session's status to in-harness plugins (T407):** `GET /v1/status?cli=<cli>&session=<id>` on the local daemon returns that session's mbx.status snapshot, the same one `agentmbx status --json --schema mbx.status/v1` prints. Identity resolves by (cli, session) only, so it never shows another identity's mail; an unknown session gets an explicit unbound snapshot. Session reads are loopback-only; without parameters the route keeps its public runtime and challenge responses. The Claude mod and the OpenCode sidebar read this one route instead of computing status themselves.
+
 ## 0.5.14 (2026-10-06)
 
 The OpenCode v2 plugin's hooks reach a CLI that handles them (session start, post-tool unread notes and Stop continuation), Hermes gets hooks with setup-written approvals and a watcher wake path, an identity-less session is guided to claim before reading its inbox, catch-up says when a page was not committed, and doctor flags a legacy `mbx` ahead of `agentmbx` on PATH.
