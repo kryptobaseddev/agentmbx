@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Setup links the agentmbx skill into each installed CLI's skills directory when that directory already exists (T448):** Hermes (`~/.hermes/skills`), OpenCode (`~/.config/opencode/skills`), Kimi Code (`$KIMI_CODE_HOME/skills` or `~/.kimi-code/skills`), and Grok (`$GROK_HOME/skills` or `~/.grok/skills`) join Claude and Codex. Missing directories are not created. A symlink that already points at `~/.agents/skills/agentmbx` is left unchanged. `agentmbx doctor` names each missing or wrong link and the fix is `agentmbx setup --only skill`. Uninstall removes only those symlinks.
+
 ## 0.5.12 (2026-10-06)
 
 In-place MCP reloads no longer accumulate nested processes, and `agentmbx probe` targets only identities currently working in the project.
