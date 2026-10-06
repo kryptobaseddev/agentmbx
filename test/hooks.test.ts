@@ -29,8 +29,11 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} startup 
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "working", AGENTMBX_DEV: "1" },
   });
   assert.equal(result.status, 0, result.stderr);
-  const context = cli === "kimi" ? result.stdout : JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
-  if (cli !== "kimi") assert.equal(JSON.parse(result.stdout).hookSpecificOutput.hookEventName, "SessionStart");
+  // B2b (T391): kimi and opencode have no hookSpecificOutput protocol — their hooks print the
+  // note as plain stdout (the generated OpenCode plugin injects recognized [mbx] runs from it).
+  const plain = cli === "kimi" || cli === "opencode";
+  const context = plain ? result.stdout : JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+  if (!plain) assert.equal(JSON.parse(result.stdout).hookSpecificOutput.hookEventName, "SessionStart");
   assert.match(context, /no mailbox identity yet/); assert.match(context, /mbx_whoami/);
   assert.match(context, /"action\\?":\\?"claim\\?"/); assert.match(context, /"action\\?":\\?"register\\?"/);
   assert.doesNotMatch(context, /SECRET BODY|PRIVATE SUBJECT/);

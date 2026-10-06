@@ -803,79 +803,162 @@ export const opencodePluginPath = (home) => join(home, ".config/opencode/plugins
 const OPENCODE_PLUGIN_MARKER = "// agentmbx-plugin v1 (T391) — managed by `agentmbx setup --only opencode`";
 /** True when the file's first line starts with our marker: ours-current or ours-stale, never a user's edit. */
 const isOpencodePluginOurs = (cur) => cur !== null && cur.split("\n", 1)[0].trim().startsWith(OPENCODE_PLUGIN_MARKER);
-/** The exact plugin source setup writes. `cmd` is embedded as a JSON string[] so Bun's `$` spreads
- *  it with each element escaped (an interpolated string would arrive as ONE argument — B3). */
+/** The exact plugin source setup writes. `cmd` is embedded as a JSON string[] and executed with
+ *  node:child_process execFile (each element a literal argv entry — B3); AGENTMBX_DEV is stripped
+ *  from the child env because the npm-installed launcher runs src/*.ts under it and Node refuses
+ *  type-stripping under node_modules (an env leak into an OpenCode server process silently killed
+ *  every hook call on 2026-10-06). */
 export function opencodePluginSource(cmd, ver) {
     const bin = JSON.stringify(cmd);
     return `${OPENCODE_PLUGIN_MARKER} (agentmbx ${ver})
 // Local edits make this file foreign: setup stops managing it and doctor reports it.
 // Uninstall with: agentmbx setup --uninstall --only opencode
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
-type Shell = (parts: TemplateStringsArray, ...args: unknown[]) => { quiet(): { text(): Promise<string> } };
-
-/** Only text we produced ourselves is ever injected: a Stop {"decision":"block"} reason, or an
- *  [mbx] note. Anything else on hook stdout is ignored (B1b/B2). */
+/** Only text we produced ourselves is ever injected: a Stop {"decision":"block"} reason, or a
+ *  run of [mbx]/probe-ok lines (a session-start note is several of our lines joined by newline).
+ *  Anything else on hook stdout is ignored (B1b/B2). */
 const hookReason = (out: string): string | null => {
-  for (const line of out.split("\\n")) {
-    const t = line.trim();
+  const lines = out.split("\\n");
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim();
     if (!t) continue;
     try {
       const j = JSON.parse(t) as { decision?: unknown; reason?: unknown };
       if (j && j.decision === "block" && typeof j.reason === "string" && j.reason) return j.reason;
     } catch { /* not JSON */ }
-    if (t.startsWith("[mbx]") || t.startsWith("probe ok")) return t;
+    if (t.startsWith("[mbx]") || t.startsWith("probe ok")) {
+      const run = [t]; // B2b: capture the whole consecutive run of ours, never a partial note
+      for (let k = i + 1; k < lines.length; k++) {
+        const u = lines[k].trim();
+        if (!u.startsWith("[mbx]") && !u.startsWith("probe ok")) break;
+        run.push(u);
+      }
+      return run.join("\\n");
+    }
   }
   return null;
 };
 
-/** One hook call: JSON payload in via a temp-file redirect; stdout is captured; a reason we
- *  recognize is injected into the session through the plugin client. A failure never surfaces. */
-const call = async ($: Shell, client: unknown, bin: string[], event: string, payload: Record<string, unknown>): Promise<void> => {
-  let dir: string | null = null;
+/** The spawn seam: tests replace globalThis.__mbxSpawn (read per call); production runs the real
+ *  CLI. AGENTMBX_DEV is stripped from the child env: the npm-installed launcher runs src/*.ts
+ *  under it and Node refuses type-stripping under node_modules (the 2026-10-06 env leak silently
+ *  killed every hook). */
+type Spawn = (bin: string[], args: string[], input: string, cb: (out: string) => void) => void;
+const realSpawn: Spawn = (bin, args, input, cb) => {
   try {
-    dir = mkdtempSync(join(tmpdir(), "agentmbx-hook-"));
-    const f = join(dir, "payload.json");
-    writeFileSync(f, JSON.stringify(payload));
-    const out = await $\`\${bin} hook \${event} --cli opencode < \${f}\`.quiet().text();
-    const reason = hookReason(out);
-    const sid = typeof payload.session_id === "string" ? payload.session_id : null;
-    if (reason && sid) {
-      const c = client as { session?: { promptAsync?: (i: object) => Promise<unknown>; prompt?: (i: object) => Promise<unknown> } };
-      try { await c.session?.promptAsync?.({ sessionID: sid, text: reason }); return; } catch { /* older client */ }
-      try { await c.session?.prompt?.({ sessionID: sid, text: reason }); } catch { /* never break the session */ }
+    const env = { ...process.env };
+    delete env.AGENTMBX_DEV;
+    const child = execFile(bin[0], [...bin.slice(1), ...args], { encoding: "utf8", timeout: 20_000, env }, (e, out) => cb(e ? "" : String(out ?? "")));
+    child.stdin?.end(input);
+  } catch { cb(""); }
+};
+const spawnCli: Spawn = (bin, args, input, cb) => ((globalThis as { __mbxSpawn?: Spawn }).__mbxSpawn ?? realSpawn)(bin, args, input, cb);
+
+/** Inject a note as a queued synthetic user message through the OpenCode service — the same
+ *  receipt-verified path the daemon's wake uses (src/wake.ts wakeOpencode: POST
+ *  {svc}/api/session/:id/synthetic {text, delivery:"queue", resume:true}). Service URL from
+ *  MBX_OPENCODE_URL or \`opencode service status\` (wake.ts opencodeService); Basic auth from
+ *  ~/.config/opencode/service.json. B1c: no SDK client prompt API is cited for 2.0.23, so the
+ *  plugin speaks the endpoint the daemon already proves on every wake. */
+const inject = async (sid: string, text: string): Promise<boolean> => {
+  try {
+    let status = process.env.MBX_OPENCODE_URL ?? "";
+    if (!status) {
+      status = await new Promise<string>((resolve) => spawnCli(["opencode"], ["service", "status"], "", (out) => resolve(out)));
     }
-  } catch { /* hook failures must never surface in the host TUI */ }
-  finally { if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } } }
+    const url = status.split(/\\s+/).find((w) => w.startsWith("http"))?.replace(/\\/$/, "");
+    if (!url) return false;
+    let auth = "";
+    try {
+      const cfg = JSON.parse(readFileSync(join(homedir(), ".config/opencode/service.json"), "utf8")) as { password?: string };
+      if (cfg.password) auth = "Basic " + Buffer.from(\`opencode:\${cfg.password}\`).toString("base64");
+    } catch { /* no service.json: a local service may run without a password */ }
+    const res = await fetch(\`\${url}/api/session/\${encodeURIComponent(sid)}/synthetic\`, {
+      method: "POST", headers: { "content-type": "application/json", ...(auth ? { authorization: auth } : {}) },
+      body: JSON.stringify({ text, delivery: "queue", resume: true }), signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return false;
+    const j = await res.json().catch(() => null) as { data?: { id?: unknown; sessionID?: unknown; type?: unknown; delivery?: unknown; payload?: { text?: unknown } } } | null;
+    const r = j?.data;
+    return !!r && typeof r.id === "string" && r.id.startsWith("msg_") && r.sessionID === sid && r.type === "synthetic" && r.delivery === "queue" && r.payload?.text === text;
+  } catch { return false; }
 };
 
-export const AgentMBXHooks = async ({ $, client, directory }: { $: Shell; client?: unknown; directory?: string }) => {
-  const run = (event: string, payload: Record<string, unknown>) => call($, client, ${bin}, event, { cwd: directory, ...payload });
+/** One hook call: the JSON payload goes in on stdin; stdout is captured; a reason we recognize is
+ *  injected into the session through the service's synthetic endpoint. A failure never surfaces. */
+const call = async (bin: string[], event: string, payload: Record<string, unknown>): Promise<void> => {
+  try {
+    const out = await new Promise<string>((resolve) => spawnCli(bin, ["hook", event, "--cli", "opencode"], JSON.stringify(payload), resolve));
+    const reason = hookReason(out);
+    const sid = typeof payload.session_id === "string" ? payload.session_id : null;
+    if (reason && sid) await inject(sid, reason);
+  } catch { /* hook failures must never surface in the host TUI */ }
+};
+
+const runFor = (bin: string[], cwd: string | undefined) => (event: string, payload: Record<string, unknown>) => call(bin, event, { cwd, ...payload });
+
+const sidOf = (v: unknown): string | undefined => {
+  const o = v as { sessionID?: unknown; session_id?: unknown; id?: unknown; info?: unknown; session?: unknown; properties?: unknown } | undefined;
+  const info = (o?.info ?? o?.session ?? o?.properties) as { id?: unknown; directory?: unknown } | undefined;
+  return typeof o?.sessionID === "string" ? o.sessionID : typeof o?.session_id === "string" ? o.session_id
+    : typeof o?.id === "string" && o.id.startsWith("ses_") ? o.id : typeof info?.id === "string" ? info.id : undefined;
+};
+
+/** OpenCode v1 generation: the loader calls this factory with { $, client, directory } and runs the
+ *  returned hooks object (v1 names: session.created/session.idle/tool.execute.after). */
+export const AgentMBXHooks = async ({ directory }: { $?: unknown; client?: unknown; directory?: string }) => {
+  const run = runFor(${bin}, directory);
   return {
     event: async ({ event }: { event?: { type?: string; properties?: Record<string, unknown> } }) => {
-      const p = event?.properties ?? {};
-      const info = (p.info ?? p.session) as { id?: unknown; directory?: unknown } | undefined;
-      const sid = typeof info?.id === "string" ? info.id : typeof p.sessionID === "string" ? p.sessionID : undefined;
+      const sid = sidOf(event?.properties);
       if (!sid) return;
-      if (event?.type === "session.created") return run("session-start", { session_id: sid, cwd: typeof info?.directory === "string" ? info.directory : directory });
+      if (event?.type === "session.created") return run("session-start", { session_id: sid, cwd: directory });
       if (event?.type === "session.idle") return run("stop", { session_id: sid });
     },
     "tool.execute.after": async (input: { sessionID?: unknown; session_id?: unknown }) => {
-      const sid = typeof input?.sessionID === "string" ? input.sessionID : typeof input?.session_id === "string" ? input.session_id : undefined;
+      const sid = sidOf(input);
       if (sid) return run("post-tool", { session_id: sid });
     },
   };
 };
 
-// OpenCode v2's loader validates a DEFAULT plugin object ({ id, ... effect/setup }); v1 ran named
-// factories. Export both so the same file loads on either generation: without this the module
-// fails with PluginModule.LoadError (SchemaError Missing key ["default"]) and no hook ever runs.
+// OpenCode v2 validates a DEFAULT plugin object ({ id, ... effect/setup }) and dispatches through
+// the CONTEXT API — the v1 returned-hooks object is never consumed (verified against the
+// v2-native opencode-goal server: ctx.event.subscribe() as an async iterable, filtered by
+// event.location.directory, and ctx.tool.hook("execute.after", fn)). v1's session.idle is v2's
+// session.execution.succeeded; both map to the same stop contract, bounded by the stopseen marker.
 export default {
   id: "agentmbx-hooks",
   server: AgentMBXHooks,
-  setup: AgentMBXHooks,
+  async setup(ctx: {
+    location?: { directory?: string };
+    event?: { subscribe?: (o?: unknown) => AsyncIterable<{ type?: string; location?: { directory?: string }; data?: unknown }> };
+    tool?: { hook?: (name: "execute.after", fn: (input: unknown) => unknown) => unknown };
+  }) {
+    const dir = ctx?.location?.directory;
+    const run = runFor(${bin}, dir);
+    const here = (ev: { location?: { directory?: string } }) => !ev.location?.directory || !dir || ev.location.directory === dir;
+    const ctl = new AbortController();
+    void (async () => {
+      try {
+        const stream = ctx?.event?.subscribe?.({ signal: ctl.signal });
+        if (!stream) return;
+        for await (const ev of stream) {
+          const sid = sidOf(ev?.data);
+          if (!sid || !here(ev)) continue;
+          if (ev.type === "session.created") void run("session-start", { session_id: sid, cwd: dir });
+          else if (ev.type === "session.idle" || ev.type === "session.execution.succeeded") void run("stop", { session_id: sid });
+          else if (ev.type === "session.tool.called" && !ctx?.tool?.hook) void run("post-tool", { session_id: sid });
+        }
+      } catch { /* aborted or the stream ended: never surface in the host */ }
+    })();
+    try { ctx?.tool?.hook?.("execute.after", (input: unknown) => { const sid = sidOf(input); if (sid) void run("post-tool", { session_id: sid }); }); } catch { /* optional */ }
+    return () => ctl.abort();
+  },
 };
 `;
 }

@@ -1356,7 +1356,7 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
           if (!liveWatcher(node, agent)) emit(cli, "PostToolUse", grokWatchReminder(sid));
           return;
         }
-        if (cli !== "claude") return;
+        if (cli !== "claude" && cli !== "opencode") return;
         // Track IDs, not counts or sender timestamps: replacing one acked message with a new one must notify,
         // including delayed remote mail. Never fetch or inject message bodies into a tool hook.
         // T342: read the fast-path marker BEFORE querying the mailbox. A delivery that commits
@@ -1633,7 +1633,10 @@ async function watch(node: MbxNode, selection: CliIdentitySelection) {
 }
 
 function emit(cli: string, event: string, context: string) {
-  if (cli === "kimi") return console.log(context);               // Kimi adds plain stdout to the context
+  // B2b (T391): Kimi and OpenCode have no hookSpecificOutput protocol. OpenCode's plugin captures
+  // plain hook stdout and injects only the [mbx]/probe-ok runs it recognizes as ours (see
+  // opencodePluginSource in setup.ts). Claude Code reads the JSON shape; Codex and Grok keep theirs.
+  if (cli === "kimi" || cli === "opencode") return console.log(context);
   console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: context } }));
 }
 
