@@ -126,7 +126,11 @@ export function suggestNames(node: MbxNode, name: string): string[] {
 /** Refuse a send to a local name that never existed instead of silently creating a mailbox (T205). Checked before
  *  anything is stored; `name@otherhost` is the other host's business. */
 export function assertKnownRecipients(node: MbxNode, to: string[]): void {
-  const unknown = node.route(to).targets.filter((t) => t.unknown).map((t) => t.name!);
+  // `lead` and `role:lead` name the owner-designated lead. They are resolved in node.send, after this
+  // check, so a missing agent of that literal name is not a typo.
+  const concrete = to.filter((t) => t !== "lead" && t !== "role:lead");
+  if (!concrete.length) return;
+  const unknown = node.route(concrete).targets.filter((t) => t.unknown).map((t) => t.name!);
   if (!unknown.length) return;
   const lines = unknown.map((n) => { const s = suggestNames(node, n); return `"${n}" is not an agent on ${node.host}${s.length ? `; did you mean ${s.join(", ")}?` : ""}`; });
   throw Object.assign(new Error(`not sent: ${lines.join("; ")}. List agents with mbx_agents; a mailbox exists once an agent has held it.`), { code: "UNKNOWN_RECIPIENT" });

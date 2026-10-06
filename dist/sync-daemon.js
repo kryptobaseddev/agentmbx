@@ -5,10 +5,11 @@ import { homedir, userInfo } from "node:os";
 import { missedCount } from "./catchup.js";
 import { fingerprint } from "./crypto.js";
 import { storedPolicies } from "./policy.js";
+import { activeLead } from "./lead-record.js";
 import { projectKey } from "./registry.js";
 import { relayFor } from "./relay-client.js";
 import { syncOnce } from "./sync-client.js";
-import { PATH_FLAG_PREFIX, PROJECT_KEY_RE } from "./sync-projection.js";
+import { CAPS, PATH_FLAG_PREFIX, PROJECT_KEY_RE } from "./sync-projection.js";
 import { version } from "./version.js";
 export const SYNC_INTERVAL_MS = 15_000;
 const LIVE_MS = 60_000;
@@ -137,6 +138,28 @@ export function loadSyncSnapshot(node, ctx, projectKeyOf = projectKey) {
             paths.push({ project_key, absolute: row.absolute, home, username, windows });
         }
     }
+    // Always collected. projectSync attaches host.project_leads only when the spoken contract lists it.
+    // The checkout path is the lookup key and is not a field: a signature over that path would leak it.
+    const leads = [];
+    const seenLead = new Set();
+    for (const row of db.prepare("SELECT DISTINCT project FROM project_leads ORDER BY project").all()) {
+        if (leads.length >= CAPS.leads)
+            break;
+        const rec = activeLead(node, row.project);
+        if (!rec || !NAME_RE.test(rec.agent) || !NAME_RE.test(rec.host))
+            continue;
+        let key;
+        try {
+            key = projectKeyOf(row.project);
+        }
+        catch {
+            key = undefined;
+        }
+        if (!key || !PROJECT_KEY_RE.test(key) || seenLead.has(key))
+            continue;
+        seenLead.add(key);
+        leads.push({ project_key: key, agent: rec.agent, host: rec.host, exp: rec.exp, id: rec.id });
+    }
     return {
         host: {
             daemon_version: version(),
@@ -156,6 +179,7 @@ export function loadSyncSnapshot(node, ctx, projectKeyOf = projectKey) {
         policies: policyInputs(node, nowMs),
         approvals: [],
         paths,
+        leads,
     };
 }
 export async function syncTick(node, deps = {}) {

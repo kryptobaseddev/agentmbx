@@ -1,6 +1,6 @@
 // Daemon sync client (T262). One POST writer, one seq per host. No network call
-// unless a local link record exists. SyncAck cannot turn the path opt-in on.
-import { CONTRACT_VERSION, PATH_FLAG_PREFIX, PROJECT_PATHS_SINCE, projectSync, } from "./sync-projection.js";
+// unless a local link record exists. SyncAck cannot turn the path or lead opt-in on.
+import { CONTRACT_VERSION, PATH_FLAG_PREFIX, PROJECT_LEADS_SINCE, PROJECT_PATHS_SINCE, projectSync, } from "./sync-projection.js";
 export const LINK_KEY = "sync.link";
 export const STATE_KEY = "sync.state";
 export { PATH_FLAG_PREFIX };
@@ -22,7 +22,8 @@ export function readLink(get) {
         return null;
     if (!l.contract || typeof l.contract.min !== "number" || typeof l.contract.max !== "number")
         return null;
-    return { v: 1, sync_url: l.sync_url, token: l.token, contract: { min: l.contract.min, max: l.contract.max }, ...(l.project_paths === true ? { project_paths: true } : {}) };
+    return { v: 1, sync_url: l.sync_url, token: l.token, contract: { min: l.contract.min, max: l.contract.max },
+        ...(l.project_paths === true ? { project_paths: true } : {}), ...(l.project_leads === true ? { project_leads: true } : {}) };
 }
 function blank() {
     return { ack_seq: 0, next_at: 0, attempt: 0, sent_receipts: [], floor_seconds: 5 };
@@ -103,9 +104,10 @@ export async function syncOnce(o) {
     if (!pending) {
         const seq = state.ack_seq + 1;
         const allowsPaths = contract >= PROJECT_PATHS_SINCE && link.project_paths === true;
+        const allowsLeads = contract >= PROJECT_LEADS_SINCE && link.project_leads === true;
         const sentAt = new Date(o.now).toISOString();
-        const snap = o.source({ now: sentAt, seq, full: true, contract, contractAllowsProjectPaths: allowsPaths, sentReceipts: state.sent_receipts });
-        const common = { ...snap, now: sentAt, seq, contract, contractAllowsProjectPaths: allowsPaths, sentReceipts: state.sent_receipts };
+        const snap = o.source({ now: sentAt, seq, full: true, contract, contractAllowsProjectPaths: allowsPaths, contractAllowsProjectLeads: allowsLeads, sentReceipts: state.sent_receipts });
+        const common = { ...snap, now: sentAt, seq, contract, contractAllowsProjectPaths: allowsPaths, contractAllowsProjectLeads: allowsLeads, sentReceipts: state.sent_receipts };
         const fullTry = projectSync({ ...common, full: true });
         if (!fullTry.ok) {
             state.next_at = o.now + 15_000;
@@ -188,7 +190,7 @@ async function send(o, link, state, pending) {
 }
 function refusePathCommands(o, commands) {
     const text = JSON.stringify(commands ?? null);
-    if (!text.includes(PATH_FLAG_PREFIX) && !text.includes("local_path") && !text.includes("project_paths"))
+    if (!text.includes(PATH_FLAG_PREFIX) && !text.includes("local_path") && !text.includes("project_paths") && !text.includes("project_leads"))
         return;
     o.audit?.("sync.command", { code: "OP_NOT_ALLOWED_FROM_CONSOLE" });
 }

@@ -1,7 +1,7 @@
 // T262: the SyncBatch projection sends only allowlisted fields.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CAPS, projectLocalPath, projectSync, type AgentInput, type HostInput, type PathInput, type PolicyInput, type ReceiptInput, type SyncSnapshot, type ThreadInput } from "../src/sync-projection.ts";
+import { CAPS, projectLocalPath, projectSync, type AgentInput, type HostInput, type LeadInput, type PathInput, type PolicyInput, type ReceiptInput, type SyncSnapshot, type ThreadInput } from "../src/sync-projection.ts";
 import { ulid } from "../src/crypto.ts";
 
 const USER = "zzadaqq";
@@ -14,8 +14,8 @@ function host(): HostInput {
 }
 function snap(over: Partial<SyncSnapshot> = {}): SyncSnapshot {
   return {
-    now: "2026-10-05T00:00:00.000Z", seq: 1, full: true, contract: 1, contractAllowsProjectPaths: false,
-    host: host(), agents: [], threads: [], receipts: [], policies: [], approvals: [], paths: [], sentReceipts: [], ...over,
+    now: "2026-10-05T00:00:00.000Z", seq: 1, full: true, contract: 1, contractAllowsProjectPaths: false, contractAllowsProjectLeads: false,
+    host: host(), agents: [], threads: [], receipts: [], policies: [], approvals: [], paths: [], leads: [], sentReceipts: [], ...over,
   };
 }
 function pathOf(absolute: string, over: Partial<PathInput> = {}): PathInput {
@@ -81,6 +81,32 @@ test("an opted-in path is sent only when the contract lists project_paths, and a
   assert.equal(sent.body.includes(HOME), false);
   assert.equal(sent.body.includes(absolute), false);
   assert.deepEqual(sent.redacted, []);
+});
+
+test("a lead row is sent only when the contract lists project_leads, and the checkout path stays off the wire", () => {
+  const absolute = `${HOME}/work/${USER}/repo`;
+  const id = ulid(1_700_000_000_000);
+  const row: LeadInput = { project_key: KEY, agent: "agentmbx-lead", host: "alpha", exp: "2026-11-05T00:00:00.000Z", id };
+  const leaked: LeadInput = { ...row, project_key: absolute, id: ulid(1_700_000_000_001) };
+  const withheld = projectSync(snap({ leads: [row, leaked], paths: [pathOf(absolute)] }));
+  assert.equal(withheld.ok, true);
+  if (!withheld.ok) return;
+  assert.equal(withheld.body.includes("project_leads"), false);
+  assert.equal(withheld.body.includes(absolute), false);
+  assert.equal("project_leads" in (withheld.batch.host as object), false);
+
+  const sent = projectSync(snap({ contract: 2, contractAllowsProjectLeads: true, leads: [row, leaked, row] }));
+  assert.equal(sent.ok, true);
+  if (!sent.ok) return;
+  assert.deepEqual((sent.batch.host as { project_leads: LeadInput[] }).project_leads, [row]);
+  assert.equal(sent.body.includes(absolute), false);
+  assert.equal(sent.body.includes(HOME), false);
+  const empty = projectSync(snap({ contract: 2, contractAllowsProjectLeads: true }));
+  assert.equal(empty.ok, true);
+  if (!empty.ok) return;
+  assert.deepEqual((empty.batch.host as { project_leads: LeadInput[] }).project_leads, []);
+  assert.equal(sent.snapshotHash, empty.snapshotHash, "lead rows are not part of the snapshot hash");
+  assert.notEqual(sent.body, empty.body);
 });
 
 test("a path outside home is omitted when it names the user, and the batch still sends", () => {

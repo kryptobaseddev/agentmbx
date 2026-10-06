@@ -22,7 +22,7 @@ import { resolveStatusIdentity } from "./status-identity.js";
 import { runStatuslineSuggest } from "./statusline-suggest.js";
 import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.js";
 import { retirePhantoms, returnNeverClaimed } from "./stranded.js";
-import { activeLead, leadSummary, makeLead, makeLeadRevocation, revokeLead, storeLead } from "./project-ledger.js";
+import { activeLead, leadSummary, makeLead, makeLeadRevocation, projectLeadLine, projectLeadView, revokeLead, storeLead } from "./project-ledger.js";
 import { DEFAULT_PORT, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
 import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary } from "./policy.js";
 import { authHelperPath, createKeychainOwner, createOwnerKey, defaultOwnerBackend, ownerInfo, ownerSignCanonical, readPassphraseFromTTY } from "./owner.js";
@@ -35,7 +35,7 @@ import { kimiMultiHost } from "./kimi-web.js";
 import { bindInstruction, issueBindTicket } from "./bind-ticket.js";
 import { activityKey } from "./identity-availability.js";
 import { identityLeaseStatus, inspectLeaseProcess } from "./identity-leases.js";
-import { AUTO_NAME_RE, linkedKey, projectOf, recordSessionHint, registeredIdentity } from "./registry.js";
+import { AUTO_NAME_RE, identityProjects, linkedKey, projectOf, recordSessionHint, registeredIdentity } from "./registry.js";
 import { applyForward, buildForward, pruneCandidates, retireMailbox } from "./identity-cleanup.js";
 import { installDesktopPlugin, kimiDesktop, kimiDesktopDir, removeDesktopPlugin, writeDesktopPlugin } from "./kimi-desktop.js";
 import { approveKimi, decidePermission, opencodePermissionPass } from "./permission.js";
@@ -847,6 +847,7 @@ async function run(argv) {
                     node.registerAgent(name, { role: str("role"), description: str("description") });
                 const a = node.agents().find(x => x.name === name && x.host === node.host);
                 console.log(`${name}@${node.host}${a?.role ? `  role:${a.role}` : ""}  (${a?.cli ?? "?"})  unacked: ${node.unreadCount(name)}${a?.description ? `\n${a.description}` : ""}`);
+                console.log(projectLeadLine(projectLeadView(node, identityProjects(node.store, name)[0] ?? projectOf(process.cwd()))));
                 console.log(`delivery: ${node.deliveryMode(name)}`);
                 console.log(delegationNote(node.store.db, name, node.host) ?? "policy: none (ask): other agents' requests need your user's OK");
             });
@@ -886,7 +887,8 @@ async function run(argv) {
                         owner_authority: counts.reduce((sum, c) => sum + c.owner_authority, 0),
                         outbox: node.store.db.prepare("SELECT count(DISTINCT o.msg_id) n FROM outbox o JOIN messages m ON m.id=o.msg_id WHERE m.from_addr=?")
                             .get(`${agent}@${node.host}`).n };
-                    return console.log(o.json ? JSON.stringify(out) : `${out.address}: ${out.unread} unread · ${out.needs_reply} needs reply · ${out.owner_authority} owner · ${out.outbox} outbox`);
+                    const leadLine = projectLeadLine(projectLeadView(node, identityProjects(node.store, agent)[0]));
+                    return console.log(o.json ? JSON.stringify(out) : `${out.address}: ${out.unread} unread · ${out.needs_reply} needs reply · ${out.owner_authority} owner · ${out.outbox} outbox\n${leadLine}`);
                 });
             }
             const q = (sql) => node.store.db.prepare(sql).get().n;
@@ -894,6 +896,7 @@ async function run(argv) {
 messages ${q("SELECT count(*) n FROM messages")}  unacked ${q("SELECT count(*) n FROM deliveries WHERE state <> 'acked'")}  outbox ${q("SELECT count(*) n FROM outbox")}
 peers ${node.peers().map((p) => `${p.host}(${p.state})`).join(" ") || "none"}  active grants ${q(`SELECT count(*) n FROM grants WHERE revoked=0 AND exp>'${new Date().toISOString()}'`)}
 version ${version()} (${installKind()})`);
+            console.log(projectLeadLine(projectLeadView(node, projectOf(process.cwd()))));
             const upd = updateAvailable(node.store);
             if (upd)
                 console.log(`update available: ${upd} (run: agentmbx update)`);
