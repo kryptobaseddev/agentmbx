@@ -120,13 +120,13 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} hooks re
     assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before);
   }
   const stopped = run("stop");
+  // T391: opencode now blocks like claude/codex (the plugin injects the reason); kimi keeps exit 2.
   if (cli === "kimi") {
     assert.equal(stopped.status, 2);
     assert.match(stopped.stderr, /Before stopping/);
     assert.match(stopped.stderr, /agentmbx watch/, "the first fresh-mail continuation may carry the one watcher nag");
   }
-  else if (cli !== "opencode") { assert.equal(stopped.status, 0); assert.equal(JSON.parse(stopped.stdout).decision, "block"); }
-  else assert.equal(stopped.stdout, "");
+  else { assert.equal(stopped.status, 0); assert.equal(JSON.parse(stopped.stdout).decision, "block"); }
   const repeat = run("stop");
   assert.equal(repeat.stdout, "", "the same mail does not block twice");
   assert.equal(repeat.status, 0, repeat.stderr);
@@ -146,8 +146,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} hooks re
     assert.match(deepStop.stderr, /Before stopping/);
     assert.doesNotMatch(deepStop.stderr, /agentmbx watch/, "a later mail continuation does not append another nag");
   }
-  else if (cli !== "opencode") assert.equal(JSON.parse(deepStop.stdout).decision, "block");
-  else assert.equal(deepStop.stdout, "");
+  else assert.equal(JSON.parse(deepStop.stdout).decision, "block"); // T391: opencode blocks like the rest
   n.ack(deep, agent);
   assert.notEqual((await call("mbx_identity", { action: "release" })).isError, true);
   const before = n.store.db.prepare("SELECT * FROM sessions").all();
