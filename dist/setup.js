@@ -803,9 +803,10 @@ export const opencodePluginPath = (home) => join(home, ".config/opencode/plugins
 const OPENCODE_PLUGIN_MARKER = "// agentmbx-plugin v1 (T391) — managed by `agentmbx setup --only opencode`";
 /** True when the file's first line starts with our marker: ours-current or ours-stale, never a user's edit. */
 const isOpencodePluginOurs = (cur) => cur !== null && cur.split("\n", 1)[0].trim().startsWith(OPENCODE_PLUGIN_MARKER);
-/** The exact plugin source setup writes. `bin` is the absolute agentmbx argv joined for the shell. */
+/** The exact plugin source setup writes. `cmd` is embedded as a JSON string[] so Bun's `$` spreads
+ *  it with each element escaped (an interpolated string would arrive as ONE argument — B3). */
 export function opencodePluginSource(cmd, ver) {
-    const bin = JSON.stringify(shJoin(cmd));
+    const bin = JSON.stringify(cmd);
     return `${OPENCODE_PLUGIN_MARKER} (agentmbx ${ver})
 // Local edits make this file foreign: setup stops managing it and doctor reports it.
 // Uninstall with: agentmbx setup --uninstall --only opencode
@@ -813,22 +814,45 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-type Shell = (parts: TemplateStringsArray, ...args: string[]) => { quiet(): Promise<unknown> };
+type Shell = (parts: TemplateStringsArray, ...args: unknown[]) => { quiet(): { text(): Promise<string> } };
 
-/** One hook call: the JSON payload goes in via a temp-file redirect; a failure never breaks the session. */
-const call = async ($: Shell, bin: string, event: string, payload: Record<string, unknown>): Promise<void> => {
+/** Only text we produced ourselves is ever injected: a Stop {"decision":"block"} reason, or an
+ *  [mbx] note. Anything else on hook stdout is ignored (B1b/B2). */
+const hookReason = (out: string): string | null => {
+  for (const line of out.split("\\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      const j = JSON.parse(t) as { decision?: unknown; reason?: unknown };
+      if (j && j.decision === "block" && typeof j.reason === "string" && j.reason) return j.reason;
+    } catch { /* not JSON */ }
+    if (t.startsWith("[mbx]") || t.startsWith("probe ok")) return t;
+  }
+  return null;
+};
+
+/** One hook call: JSON payload in via a temp-file redirect; stdout is captured; a reason we
+ *  recognize is injected into the session through the plugin client. A failure never surfaces. */
+const call = async ($: Shell, client: unknown, bin: string[], event: string, payload: Record<string, unknown>): Promise<void> => {
   let dir: string | null = null;
   try {
     dir = mkdtempSync(join(tmpdir(), "agentmbx-hook-"));
     const f = join(dir, "payload.json");
     writeFileSync(f, JSON.stringify(payload));
-    await \`\${bin} hook \${event} --cli opencode < \${f}\`.quiet() as unknown as Promise<unknown>;
+    const out = await $\`\${bin} hook \${event} --cli opencode < \${f}\`.quiet().text();
+    const reason = hookReason(out);
+    const sid = typeof payload.session_id === "string" ? payload.session_id : null;
+    if (reason && sid) {
+      const c = client as { session?: { promptAsync?: (i: object) => Promise<unknown>; prompt?: (i: object) => Promise<unknown> } };
+      try { await c.session?.promptAsync?.({ sessionID: sid, text: reason }); return; } catch { /* older client */ }
+      try { await c.session?.prompt?.({ sessionID: sid, text: reason }); } catch { /* never break the session */ }
+    }
   } catch { /* hook failures must never surface in the host TUI */ }
   finally { if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } } }
 };
 
-export const AgentMBXHooks = async ({ $, directory }: { $: Shell; directory?: string }) => {
-  const run = (event: string, payload: Record<string, unknown>) => call($, ${bin}, event, { cwd: directory, ...payload });
+export const AgentMBXHooks = async ({ $, client, directory }: { $: Shell; client?: unknown; directory?: string }) => {
+  const run = (event: string, payload: Record<string, unknown>) => call($, client, ${bin}, event, { cwd: directory, ...payload });
   return {
     event: async ({ event }: { event?: { type?: string; properties?: Record<string, unknown> } }) => {
       const p = event?.properties ?? {};
