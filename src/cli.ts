@@ -75,7 +75,7 @@ Messages
   agentmbx status --cli <provider> --session <id> --json   current session identity and mailbox counts (read-only)
   agentmbx status --cli <provider> [--session <id>] --json --schema mbx.status/v1   HUD snapshot for harnesses; no lease needed (T311)
   agentmbx statusline <claude|codex|kimi|opencode|grok|copilot|cursor|gemini>   render one MBX segment from the HUD snapshot (T313)
-  agentmbx probe [--project <dir>] [--deadline 120s] [--require-idle-wake] [--json]   autonomy probe: every live leased identity must answer the [mbx-probe] request with no human prompt (T388 gate; T392)
+  agentmbx probe [--project <dir>] [--deadline 120s] [--require-idle-wake] [--only a,b] [--exclude glob] [--plan] [--json]   autonomy probe: every live leased identity must answer the [mbx-probe] request with no human prompt (T388 gate; T392, T445)
   agentmbx identity list [--project <dir>] [--all] [--json]   identities with role, holder, claimable and unread (read-only)
   agentmbx identity prune [--days 7] [--apply]   retire mailboxes older versions generated that nobody holds (dry run by default)
   agentmbx identity forward <from> <to>          move a mailbox's unread mail to another, with your owner signature
@@ -328,7 +328,7 @@ async function run(argv: string[]) {
     backend: { type: "string" }, "no-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
     project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }, "wait-ms": { type: "string" }, "store-dir": { type: "string" }, "trust-proxy": { type: "boolean" },
     "older-than": { type: "string" }, minutes: { type: "string" }, apply: { type: "boolean" }, days: { type: "string" }, fix: { type: "boolean" }, key: { type: "string" },
-    deadline: { type: "string" }, "require-idle-wake": { type: "boolean" },
+    deadline: { type: "string" }, "require-idle-wake": { type: "boolean" }, "exclude": { type: "string" }, plan: { type: "boolean" },
     "base-url": { type: "string" }, "no-browser": { type: "boolean" } } });
   if (o.help) return console.log(commandHelp(cmd));
   const str = (k: string) => (typeof (o as Record<string, unknown>)[k] === "string" ? (o as Record<string, unknown>)[k] as string : undefined);
@@ -570,10 +570,28 @@ async function run(argv: string[]) {
     })();
     const dir = str("project") ?? dirs[0]; // --project is a multiple option
     const project = dir ? (projectOf(resolve(dir)) ?? die(`${dir} is the home folder or /, not a project`)) : undefined;
+    // T445: target selection controls. Values are comma-separated (and repeatable); --exclude
+    // accepts globs (* and ?). --plan prints the targets and sends nothing.
+    const names = (key: "only" | "exclude"): string[] => {
+      const v = o[key];
+      const raw = Array.isArray(v) ? v : typeof v === "string" ? [v] : [];
+      return raw.flatMap((s) => String(s).split(",")).map((s) => s.trim()).filter(Boolean);
+    };
+    const only = names("only");
+    const exclude = names("exclude");
+    const planOnly = !!o.plan;
     try {
       const report = await runProbe(storeProbeIO(node, { project, sender }),
-        { sender, project, deadlineMs, requireIdleWake: !!o["require-idle-wake"] });
-      if (o.json) console.log(JSON.stringify(report, null, 2));
+        { sender, project, deadlineMs, requireIdleWake: !!o["require-idle-wake"], planOnly,
+          ...(only.length ? { only } : {}), ...(exclude.length ? { exclude } : {}) });
+      if (planOnly) {
+        if (o.json) console.log(JSON.stringify(report.targets.map((t) => ({ name: t.name, state: t.state, holder: t.holder })), null, 2));
+        else {
+          console.log(`probe plan: ${report.targets.length} target(s)${project ? ` in ${project}` : ""}${only.length ? `, --only ${only.join(", ")}` : ""}${exclude.length ? `, --exclude ${exclude.join(", ")}` : ""}`);
+          for (const t of report.targets) console.log(`  ${t.name} (${t.state})${t.holder ? ` holder ${t.holder.cli}:${t.holder.session_id}` : ""}`);
+          if (!report.targets.length && report.reason) console.log(report.reason);
+        }
+      } else if (o.json) console.log(JSON.stringify(report, null, 2));
       else {
         console.log(`probe: ${report.summary.passed}/${report.summary.total} passed (sender ${report.sender}@${node.host}, deadline ${Math.round(report.deadline_ms / 1000)}s${report.require_idle_wake ? ", strict idle-wake" : ""})`);
         for (const t of report.targets) {
@@ -587,7 +605,7 @@ async function run(argv: string[]) {
         }
         if (!report.targets.length && report.reason) console.log(report.reason);
       }
-      process.exitCode = report.ok ? 0 : 1;
+      process.exitCode = planOnly ? 0 : report.ok ? 0 : 1;
     } finally { node.close(); }
     return;
   }

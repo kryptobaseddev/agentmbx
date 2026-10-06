@@ -1,0 +1,103 @@
+// T317: repeated in-place reloads must not leave a chain of nested MCP processes.
+// Each re-exec generation exits once it has spawned its replacement; the original proxy stays on the
+// provider transport. After N reloads only the current lease-holder's MCP process is still alive.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { appendFileSync, cpSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { MbxNode } from "../src/node.ts";
+import { inspectLeaseProcess } from "../src/identity-leases.ts";
+import { psEvidenceTable } from "../src/proc.ts";
+import { execFileSync } from "node:child_process";
+
+const RELOADS = 3;
+
+const countLiveMcpProcesses = (install: string) => {
+  const lines = String(execFileSync("/bin/ps", ["-eo", "pid,args"])).split("\n");
+  return lines.filter(l => l.includes(join(install, "bin/agentmbx.js")) && l.includes(" mcp")).length;
+};
+
+test(`after ${RELOADS} reloads only the current lease-holder's MCP process is alive`, async t => {
+  const root = mkdtempSync(join(tmpdir(), "mbx-lifecycle-")), install = join(root, "install"), home = join(root, "mail");
+  mkdirSync(install);
+  for (const path of ["bin", "dist", "package.json"]) cpSync(resolve(path), join(install, path), { recursive: true });
+  // Model a build-change trigger: the running mcp.js is missing a tool and will be replaced.
+  const mcpPath = join(install, "dist/mcp.js"), currentMcp = readFileSync(mcpPath, "utf8");
+  const start = currentMcp.indexOf('server.registerTool("mbx_replay",');
+  const end = currentMcp.indexOf('server.registerTool("mbx_ack",', start);
+  assert.ok(start >= 0 && end > start, "fixture must remove exactly the replay registration");
+  writeFileSync(mcpPath, currentMcp.slice(0, start) + currentMcp.slice(end));
+  symlinkSync(resolve("node_modules"), join(install, "node_modules"), "dir");
+
+  const node = new MbxNode(home, { host: "alpha" }), client = new Client({ name: "lifecycle-test", version: "1" });
+  t.after(async () => { await client.close().catch(() => {}); node.close(); rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+
+  const env: NodeJS.ProcessEnv = { ...process.env, MBX_HOME: home, MBX_AGENT: "lifecycle-reader", MBX_CLI: "claude", MBX_NO_DESKTOP: "1" };
+  delete env.AGENTMBX_DEV;
+  delete env.MBX_MCP_REEXEC;
+  delete env.MBX_MCP_REEXEC_BUILD;
+  delete env.MBX_MCP_DETACHED;
+  delete env.MBX_MCP_PROVIDER_PID;
+
+  const transport = new StdioClientTransport({ command: process.execPath, args: [join(install, "bin/agentmbx.js"), "mcp"], env: env as Record<string, string>, stderr: "pipe" });
+  const stderrLines: string[] = [];
+  (transport as unknown as { stderr: { on: (ev: string, cb: (d: unknown) => void) => void } }).stderr.on("data", d => stderrLines.push(String(d)));
+  await client.connect(transport);
+  assert.notEqual((await client.callTool({ name: "mbx_whoami", arguments: { name: "lifecycle-reader", role: "builder" } })).isError, true);
+
+  const holderPids: number[] = [];
+  const pushHolderPid = () => {
+    const row = node.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE name=?").get("lifecycle-reader") as { holder_pid: number } | undefined;
+    assert.ok(row, "lease row must exist");
+    holderPids.push(row.holder_pid);
+  };
+  pushHolderPid();
+
+  for (let generation = 1; generation <= RELOADS; generation++) {
+    // Restore the missing tool so the replacement can serve it; append a no-op to cli.js so the
+    // code fingerprint changes and a handover is triggered.
+    if (generation === 1) writeFileSync(mcpPath, currentMcp);
+    appendFileSync(join(install, "dist/cli.js"), `\n// deployed build ${generation}\n`);
+    assert.notEqual((await client.callTool({ name: "mbx_whoami", arguments: {} })).isError, true, "trigger call must finish");
+
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const row = node.store.db.prepare("SELECT holder_pid, released_at FROM identity_leases WHERE name=?").get("lifecycle-reader") as { holder_pid: number; released_at: string | null } | undefined;
+      if (row && row.holder_pid !== holderPids[holderPids.length - 1] && row.released_at === null) break;
+      await new Promise(r => setTimeout(r, 25));
+    }
+    pushHolderPid();
+
+    // The original proxy (generation 1) stays on its transport; every re-exec generation in between
+    // must have exited once it spawned its replacement. No N+1 chain. ps evidence is cached for up to 1 s,
+    // so refresh it explicitly and retry briefly while the exited generation is reaped by its parent.
+    const waitForDead = (pid: number, label: string) => {
+      const deadline = Date.now() + 2_000;
+      while (Date.now() < deadline) {
+        psEvidenceTable(0);
+        const evidence = inspectLeaseProcess(pid);
+        if (evidence.alive !== true) return;
+      }
+      assert.fail(`${label} pid ${pid} must not still be alive (stderr: ${stderrLines.join(" | ")})`);
+    };
+    for (let i = 1; i < holderPids.length - 1; i++) {
+      waitForDead(holderPids[i], `re-exec generation ${i + 1}`);
+    }
+
+    // The current generation is the only live lease-holding MCP process.
+    const current = holderPids[holderPids.length - 1];
+    psEvidenceTable(0);
+    assert.equal(inspectLeaseProcess(current).alive, true, `current generation ${holderPids.length} must be alive (stderr: ${stderrLines.join(" | ")})`);
+
+    // At most two processes remain: the original proxy plus the current server. This proves the
+    // chain does not accumulate nested processes across reloads.
+    const live = countLiveMcpProcesses(install);
+    assert.ok(live <= 2, `expected at most 2 live MCP processes after reload ${generation}, found ${live} (pids=${holderPids.join(",")}; stderr: ${stderrLines.join(" | ")})`);
+  }
+
+  // Sanity: the final server can still serve.
+  assert.notEqual((await client.callTool({ name: "mbx_inbox", arguments: {} })).isError, true);
+});

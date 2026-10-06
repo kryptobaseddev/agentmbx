@@ -898,7 +898,35 @@ export function wired(e: Edit): boolean {
 
 // ---- skill -----------------------------------------------------------------------------------
 export const skillDest = (home: string) => join(home, ".agents/skills/agentmbx");
-const skillLinks = (home: string) => [join(home, ".claude/skills"), join(home, ".codex/skills")].filter((d) => existsSync(d)).map((d) => join(d, "agentmbx"));
+
+// T448: link the bundled skill into every installed CLI that reads a skills directory, when that
+// directory already exists. The parent is never created. A symlink whose readlink is already
+// skillDest is left unchanged, so a hand-made absolute link (Hermes) is reported "unchanged".
+// A relative link does not match that string and is skipped, same as any other occupant.
+//
+// Hermes: ~/.hermes/skills/ — https://hermes-agent.nousresearch.com/docs/guides/work-with-skills
+// OpenCode: ~/.config/opencode/skills/<name>/SKILL.md — https://opencode.ai/docs/skills/
+// Kimi Code CLI (this repo's `kimi`): $KIMI_CODE_HOME/skills or ~/.kimi-code/skills, and it also
+//   reads ~/.agents/skills/ — https://www.kimi.com/code/docs/en/kimi-code-cli/customization/skills.html
+//   ~/.kimi/skills is Moonshot kimi-cli's brand directory and is mutually exclusive with
+//   ~/.claude/skills and ~/.codex/skills
+//   (https://github.com/moonshotai/kimi-cli/blob/main/docs/en/customization/skills.md). Not linked.
+// Grok: ~/.grok/skills/ (user-guide 08-skills.md). Grok also scans ~/.agents/skills and
+//   ~/.claude/skills, so a missing ~/.grok/skills is not created.
+// KIMI_CODE_HOME and GROK_HOME match edits(): honored only when `home` is the real homedir.
+const skillLinks = (home: string): { cli: CliId; path: string }[] => {
+  const fromEnv = (envName: string, fallback: string) =>
+    join((home === homedir() && process.env[envName]) || join(home, fallback), "skills");
+  const candidates: { cli: CliId; dir: string }[] = [
+    { cli: "claude", dir: join(home, ".claude/skills") },
+    { cli: "codex", dir: join(home, ".codex/skills") },
+    { cli: "hermes", dir: join(home, ".hermes/skills") },
+    { cli: "opencode", dir: join(home, ".config/opencode/skills") },
+    { cli: "kimi", dir: fromEnv("KIMI_CODE_HOME", ".kimi-code") },
+    { cli: "grok", dir: fromEnv("GROK_HOME", ".grok") },
+  ];
+  return candidates.filter((c) => existsSync(c.dir)).map((c) => ({ cli: c.cli, path: join(c.dir, "agentmbx") }));
+};
 
 function filesIn(dir: string, rel = ""): string[] {
   return readdirSync(join(dir, rel), { withFileTypes: true }).flatMap((e) => e.isDirectory() ? filesIn(dir, join(rel, e.name)) : [join(rel, e.name)]);
@@ -961,11 +989,11 @@ export function selfHealSkill(home: string, env: NodeJS.ProcessEnv = process.env
   } catch { return "outdated"; } // read-only home or a race with another session: the next start tries again
 }
 
-export function skillStatus(home: string): { installed: boolean; state: SkillState; detail: string; links: { path: string; ok: boolean }[] } {
+export function skillStatus(home: string): { installed: boolean; state: SkillState; detail: string; links: { cli: CliId; path: string; ok: boolean }[] } {
   const dest = skillDest(home);
   const st = skillState(home);
   return { installed: st.state === "current" || st.state === "skills-cli", ...st,
-    links: skillLinks(home).map((p) => { let ok = false; try { ok = readlinkSync(p) === dest; } catch { /* missing */ } return { path: p, ok }; }) };
+    links: skillLinks(home).map((l) => { let ok = false; try { ok = readlinkSync(l.path) === dest; } catch { /* missing */ } return { cli: l.cli, path: l.path, ok }; }) };
 }
 
 function skill(ctx: SetupCtx, mode: "install" | "uninstall", dryRun: boolean): Row[] {
@@ -977,13 +1005,13 @@ function skill(ctx: SetupCtx, mode: "install" | "uninstall", dryRun: boolean): R
     rows.push({ cli: "skill", item: "agentmbx skill", path: dest, action: !diff.length ? "unchanged" : existsSync(join(dest, "SKILL.md")) || dryRun && existsSync(dest) ? "updated" : "added" });
   }
   for (const link of skillLinks(ctx.home)) {
-    let st: ReturnType<typeof lstatSync> | null = null; try { st = lstatSync(link); } catch { /* missing */ }
-    const ours = !!st?.isSymbolicLink() && readlinkSync(link) === dest;
+    let st: ReturnType<typeof lstatSync> | null = null; try { st = lstatSync(link.path); } catch { /* missing */ }
+    const ours = !!st?.isSymbolicLink() && readlinkSync(link.path) === dest;
     if (mode === "install") {
-      if (ours) rows.push({ cli: "skill", item: "symlink", path: link, action: "unchanged" });
-      else if (st) rows.push({ cli: "skill", item: "symlink", path: link, action: "skipped", note: "something else already exists there" });
-      else { if (!dryRun) symlinkSync(dest, link); rows.push({ cli: "skill", item: "symlink", path: link, action: "added" }); }
-    } else if (ours) { if (!dryRun) unlinkSync(link); rows.push({ cli: "skill", item: "symlink", path: link, action: "removed" }); }
+      if (ours) rows.push({ cli: "skill", item: "symlink", path: link.path, action: "unchanged" });
+      else if (st) rows.push({ cli: "skill", item: "symlink", path: link.path, action: "skipped", note: "something else already exists there" });
+      else { if (!dryRun) symlinkSync(dest, link.path); rows.push({ cli: "skill", item: "symlink", path: link.path, action: "added" }); }
+    } else if (ours) { if (!dryRun) unlinkSync(link.path); rows.push({ cli: "skill", item: "symlink", path: link.path, action: "removed" }); }
   }
   if (mode === "uninstall") {
     const ours = /^name:\s*agentmbx\s*$/m.test(read(join(dest, "SKILL.md")) ?? "");

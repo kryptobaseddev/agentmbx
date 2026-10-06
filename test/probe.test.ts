@@ -9,7 +9,7 @@ import { join, resolve } from "node:path";
 import { MbxNode } from "../src/node.ts";
 import type { IdentityStatus } from "../src/identity-status.ts";
 import {
-  PROBE_REPLY_MARKER, PROBE_SUBJECT_PREFIX, buildProbeReport, planProbe, probeBody, probeSubject, runProbe,
+  PROBE_REPLY_MARKER, PROBE_SUBJECT_PREFIX, buildProbeReport, globMatch, planProbe, probeBody, probeSubject, runProbe,
   storeProbeIO, type ProbeIO, type SentProbe, type TargetObservation,
 } from "../src/probe.ts";
 import { bindWakeLease } from "./helpers/wake-lease.ts";
@@ -397,4 +397,85 @@ test("CLI: --json prints the report shape; the sender is excluded from its own t
   assert.deepEqual(report.targets, []);
   assert.deepEqual(report.summary, { total: 0, passed: 0, failed: 0 });
   assert.match(report.reason, /no live leased identities to probe/);
+});
+
+test("planProbe: historical project membership is not enough — the live holder must work in the project (T445)", () => {
+  const identities = [
+    identity("local-worker", "held", { cli: "kimi", session_id: "s1", pid: 1 }),
+    identity("outsider", "held", { cli: "claude", session_id: "s2", pid: 2 }),
+    identity("no-holder", "idle", null),
+  ];
+  const cwdOf = new Map([["kimi:s1", "/proj"], ["claude:s2", "/other"]]);
+  const holderProject = (h: { cli: string; session_id: string }) => cwdOf.get(`${h.cli}:${h.session_id}`) ?? null;
+  const plan = planProbe(identities, "sender", { project: "/proj", holderProject });
+  assert.deepEqual(plan.map((t) => t.name), ["local-worker"]);
+  // No project: the cwd check stays inactive (previous behaviour).
+  assert.equal(planProbe(identities, "sender").length, 3);
+});
+
+test("planProbe matches subdirectories, excludes shared-prefix siblings, and falls back to git-origin key", () => {
+  const ids = [
+    identity("root", "held", { cli: "kimi", session_id: "r", pid: 1 }),
+    identity("src-subdir", "held", { cli: "kimi", session_id: "s", pid: 1 }),
+    identity("cloud", "held", { cli: "kimi", session_id: "c", pid: 1 }),
+    identity("other", "held", { cli: "kimi", session_id: "o", pid: 1 }),
+    identity("worktree", "held", { cli: "kimi", session_id: "w", pid: 1 }),
+  ];
+  const cwdOf = new Map([
+    ["kimi:r", "/x/agentmbx"],
+    ["kimi:s", "/x/agentmbx/src"],
+    ["kimi:c", "/x/agentmbx-cloud"],
+    ["kimi:o", "/y/other"],
+    ["kimi:w", "/z/agentmbx-worktree"],
+  ]);
+  const holderProject = (h: { cli: string; session_id: string }) => cwdOf.get(`${h.cli}:${h.session_id}`) ?? null;
+  const keyOf = (p: string) => {
+    if (p.includes("agentmbx") && !p.includes("cloud")) return "agentmbx-key";
+    if (p.includes("other")) return "other-key";
+    return undefined;
+  };
+  const plan = planProbe(ids, "sender", { project: "/x/agentmbx", holderProject, projectKeyOf: keyOf });
+  assert.deepEqual(plan.map((t) => t.name), ["root", "src-subdir", "worktree"]);
+});
+
+test("planProbe: --only restricts and --exclude drops exact names and globs", () => {
+  const ids = ["a1", "a2", "b1", "axiom-lab-staff"].map((n) => identity(n, "held", { cli: "kimi", session_id: n, pid: 1 }));
+  assert.deepEqual(planProbe(ids, "sender", { only: ["a1", "b1"] }).map((t) => t.name), ["a1", "b1"]);
+  assert.deepEqual(planProbe(ids, "sender", { exclude: ["a*"] }).map((t) => t.name), ["b1"]);
+  assert.deepEqual(planProbe(ids, "sender", { exclude: ["axiom-*"] }).map((t) => t.name), ["a1", "a2", "b1"]);
+  assert.deepEqual(planProbe(ids, "sender", { only: ["a1", "b1"], exclude: ["b1"] }).map((t) => t.name), ["a1"]);
+  assert.ok(globMatch("axiom-*", "axiom-lab-staff"));
+  assert.ok(!globMatch("axiom-*", "b1"));
+  assert.ok(globMatch("a?1", "ax1"));
+  assert.ok(!globMatch("a?1", "ax12"));
+});
+
+test("runProbe --plan computes the report but sends nothing", async () => {
+  const sends: string[] = [];
+  const io: ProbeIO = {
+    host: () => "alpha",
+    listTargets: () => [identity("a", "held", { cli: "kimi", session_id: "s", pid: 1 }), identity("b", "idle", { cli: "kimi", session_id: "s2", pid: 1 })],
+    send: (name) => { sends.push(name); return { id: `msg-${name}`, thread: `thread-${name}`, at: 0 }; },
+    observe: () => ({ wake: null, readAt: null, ackedAt: null, ackNote: null, reply: null }),
+  };
+  const report = await runProbe(io, { sender: "me", planOnly: true, deadlineMs: 1000 });
+  assert.deepEqual(sends, [], "--plan must not send");
+  assert.deepEqual(report.targets.map((t) => [t.name, t.state]), [["a", "held"], ["b", "idle"]]);
+  assert.equal(report.ok, true);
+  assert.equal(report.targets.every((t) => t.reason === null), true, "planned-only targets carry no failure reasons");
+});
+
+test("storeProbeIO: historical membership but a live session elsewhere is not targeted (T445)", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-probe-t445-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  bindWakeLease(n, { agent: "local-worker", cli: "kimi", session_id: "term-local", pid: process.pid, cwd: "/proj" });
+  bindWakeLease(n, { agent: "outsider", cli: "claude", session_id: "term-elsewhere", pid: process.pid, cwd: "/other" });
+  bindWakeLease(n, { agent: "probe-runner", cli: "claude", session_id: "runner-1", pid: process.pid, cwd: "/proj" });
+  // outsider once worked in /proj — historical identity_projects membership only.
+  n.store.db.prepare("INSERT INTO identity_projects (name,project,first_seen,last_seen) VALUES (?,?,?,?)")
+    .run("outsider", "/proj", new Date().toISOString(), new Date().toISOString());
+  const report = await runProbe(storeProbeIO(n, { sender: "probe-runner", project: "/proj" }),
+    { sender: "probe-runner", project: "/proj", planOnly: true, deadlineMs: 1000 });
+  assert.deepEqual(report.targets.map((x) => x.name), ["local-worker"], JSON.stringify(report.targets));
 });
