@@ -57,6 +57,8 @@ test("T391 generated plugin maps OpenCode events, embeds argv as an array, injec
   assert.ok(!src.includes(`call($, client, ${JSON.stringify(CMD.join(" "))}, event`), "no single-string shJoin form (B3)");
   assert.ok(src.includes(".quiet().text()"), "hook stdout is captured (B1b)");
   assert.ok(src.includes("promptAsync"), "reasons injected through the plugin client (B1b/B2)");
+  assert.match(src, /export default \{\r?\n  id: "agentmbx-hooks",/, "OpenCode v2 default export object (err_2b28184e fix)");
+  assert.ok(src.includes("server: AgentMBXHooks") && src.includes("setup: AgentMBXHooks"), "factory wired for v1 (server) and v2 (setup)");
 });
 
 function shJoinedQuoted(): string { return JSON.stringify(CMD.join(" ")); }
@@ -134,6 +136,21 @@ function fakeShell(out: () => string, calls: FakeCall[], boom = false) {
 function fakeClient(prompts: { sessionID: string; text: string }[]) {
   return { session: { promptAsync: async (i: { sessionID: string; text: string }) => { prompts.push(i); } } };
 }
+
+test("T391 default export satisfies OpenCode v2's plugin schema: id + effect/setup (load-fix)", async () => {
+  const { mod, dir } = await loadPlugin();
+  try {
+    const def = (mod as unknown as { default: { id?: unknown; server?: unknown; setup?: unknown } }).default;
+    assert.ok(def, "module has a default export");
+    assert.equal(def.id, "agentmbx-hooks", "plugin id");
+    assert.equal(typeof def.server, "function", "v1 factory under server");
+    assert.equal(typeof def.setup, "function", "v2 setup/effect present");
+    // The default must resolve to the SAME factory, so v2 sessions run identical hook logic.
+    const calls: FakeCall[] = [], prompts: { sessionID: string; text: string }[] = [];
+    const hooks = await (def.setup as (ctx: unknown) => Promise<Record<string, unknown>>)({ $: fakeShell(() => "", calls), client: fakeClient(prompts), directory: "/work" });
+    assert.equal(typeof hooks.event, "function", "setup returns the hooks object");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test("T391 B4(a): session.created runs session-start with the sid (generated plugin, live evaluation)", async () => {
   const { mod, dir } = await loadPlugin();

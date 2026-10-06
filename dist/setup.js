@@ -868,6 +868,15 @@ export const AgentMBXHooks = async ({ $, client, directory }: { $: Shell; client
     },
   };
 };
+
+// OpenCode v2's loader validates a DEFAULT plugin object ({ id, ... effect/setup }); v1 ran named
+// factories. Export both so the same file loads on either generation: without this the module
+// fails with PluginModule.LoadError (SchemaError Missing key ["default"]) and no hook ever runs.
+export default {
+  id: "agentmbx-hooks",
+  server: AgentMBXHooks,
+  setup: AgentMBXHooks,
+};
 `;
 }
 /** The OpenCode hooks edit: one whole file we own. Foreign content is left alone and reported. */
