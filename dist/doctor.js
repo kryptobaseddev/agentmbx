@@ -289,7 +289,7 @@ export async function doctor(ctx, mbxHome, opts = {}) {
     add(sk.installed ? "ok" : sk.state === "outdated" ? "info" : "warn", `skill ${sk.detail} (~/.agents/skills/agentmbx)`, sk.installed || sk.state === "outdated" ? undefined : sk.state === "missing" ? "agentmbx setup --only skill (or: npx skills add kryptobaseddev/agentmbx -g)" : "agentmbx setup --only skill");
     for (const l of sk.links)
         if (!l.ok)
-            add("warn", `skill not linked at ${l.path.replace(ctx.home, "~")}`, "agentmbx setup --only skill");
+            add("warn", `${l.cli}: skill not linked at ${l.path.replace(ctx.home, "~")}`, "agentmbx setup --only skill");
     if (node) {
         const owner = ownerInfo(node.home);
         if (!owner)

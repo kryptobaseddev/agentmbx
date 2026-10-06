@@ -46,6 +46,7 @@ import { listIdentityStatus } from "./identity-status.js";
 import { withCliIdentity, withHookIdentity } from "./cli-identity.js";
 import { declaredOriginWarning, readSessionTaint, refuseAgentOrigin, taintSendWarning } from "./session-taint.js";
 import { runProbe, storeProbeIO } from "./probe.js";
+import { DEFAULT_LOGIN_BASE_URL, defaultLoginIO, parseLoginBase, runLogin } from "./login.js";
 import { buildIdentityTakeover } from "./identity-takeover.js";
 import { publishIdentityControl, findIdentityControl, identityControlReceipt, resolveIdentityControlReceipt, submitIdentityControl } from "./identity-control.js";
 import { armDaemonSync } from "./sync-daemon.js";
@@ -85,6 +86,9 @@ Messages
 
 Machines (pairing: run 'agentmbx pair' on one host, then the 'agentmbx join …' line it prints on the other)
   agentmbx init [--host <name>] [--port 7373]       agentmbx discover            (hosts on the LAN, via mDNS)
+  agentmbx login [--base-url <url>] [--no-browser]
+                  print the user code and host-key fingerprint, open the verification page, and poll (RFC 8628)
+                  default server https://accounts.agentmbx.com/api/auth; SSH and --no-browser print the URL
   agentmbx pair [--ttl 10m]                         one-time pairing token (single use, default 10 min)
   agentmbx join <host|host:port> <TOKEN>            pair with the host that printed the token
   agentmbx pair --compare <host:port>               manual alternative: compare a 6-digit code, then on BOTH hosts
@@ -367,7 +371,8 @@ async function run(argv) {
             backend: { type: "string" }, "no-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
             project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }, "wait-ms": { type: "string" }, "store-dir": { type: "string" }, "trust-proxy": { type: "boolean" },
             "older-than": { type: "string" }, minutes: { type: "string" }, apply: { type: "boolean" }, days: { type: "string" }, fix: { type: "boolean" }, key: { type: "string" },
-            deadline: { type: "string" }, "require-idle-wake": { type: "boolean" }, "exclude": { type: "string" }, plan: { type: "boolean" }
+            deadline: { type: "string" }, "require-idle-wake": { type: "boolean" }, "exclude": { type: "string" }, plan: { type: "boolean" },
+            "base-url": { type: "string" }, "no-browser": { type: "boolean" }
         } });
     if (o.help)
         return console.log(commandHelp(cmd));
@@ -616,6 +621,30 @@ async function run(argv) {
                 process.stdout.write(readFileSync(hudPidLinePath(home, which, process.ppid, `ps-utc:${out.replace(/\s+/g, " ")}`), "utf8"));
         }
         catch { /* no pid snapshot: render nothing */ }
+        return;
+    }
+    if (cmd === "login") {
+        // T257: device authorization, then the host-key-bound exchange. The access token is not stored.
+        if (pos.length)
+            die("login accepts options, not positional arguments");
+        const base = str("base-url") ?? DEFAULT_LOGIN_BASE_URL;
+        parseLoginBase(base);
+        const n = new MbxNode();
+        try {
+            const outcome = await runLogin({
+                baseUrl: base,
+                host: n.host,
+                fingerprint: fingerprint(n.key.publicKey),
+                openBrowser: !o["no-browser"],
+                home: n.home,
+                hostKey: n.key,
+            }, { ...defaultLoginIO(), log: (line) => console.log(line) });
+            if (!outcome.ok)
+                process.exitCode = 1;
+        }
+        finally {
+            n.close();
+        }
         return;
     }
     // A relay box needs no host identity: serving, keys, backups and restores work on the relay store alone.
