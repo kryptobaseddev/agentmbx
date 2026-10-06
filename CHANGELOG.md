@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Setup links the agentmbx skill into each installed CLI's skills directory when that directory already exists (T448):** Hermes (`~/.hermes/skills`), OpenCode (`~/.config/opencode/skills`), Kimi Code (`$KIMI_CODE_HOME/skills` or `~/.kimi-code/skills`), and Grok (`$GROK_HOME/skills` or `~/.grok/skills`) join Claude and Codex. Missing directories are not created. A symlink that already points at `~/.agents/skills/agentmbx` is left unchanged. `agentmbx doctor` names each missing or wrong link and the fix is `agentmbx setup --only skill`. Uninstall removes only those symlinks.
 - **The launcher no longer runs TypeScript source from an installed package (T451):** the npm package ships `src/`, so under `AGENTMBX_DEV` an installed tree passed the T443 guard and ran `src/cli.ts`, which Node refuses under `node_modules` (`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`); an MCP server started that way never came up. The launcher now prefers source only when it is not inside `node_modules`.
 ## 0.5.12 (2026-10-06)
 
