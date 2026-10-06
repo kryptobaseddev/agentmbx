@@ -33,7 +33,7 @@ import { claudeSessionId, claudeSessionTracker, grokSessionId, grokSessionTracke
 import { updateAvailable } from "./update.ts";
 import { installKind, version } from "./version.ts";
 import { connectorKey } from "./diagnostics.ts";
-import { catchupHint, commitCatchup, ensureCatchup, missedCount, moveCatchup, readCatchup, restartCatchup, CATCHUP_FILTER } from "./catchup.ts";
+import { catchupHint, catchupUnchanged, commitCatchup, ensureCatchup, missedCount, moveCatchup, readCatchup, restartCatchup, CATCHUP_FILTER } from "./catchup.ts";
 import { encodeReplayFrame, replayMaximum } from "./replay.ts";
 import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wake.ts";
 
@@ -1329,8 +1329,8 @@ export async function runMcp(existing?: MbxNode) {
     const from = cursor ?? encodeReplayFrame({ v: 1, epoch: record.epoch, mailbox: state.agent, filter: CATCHUP_FILTER, position: record.position, end: replayMaximum(node.store, state.agent) });
     const page = node.replay(state.agent, state.leaseToken!, { cursor: from, limit, maxBytes });
     const missed = missedCount(node.store, state.agent);
-    return text(JSON.stringify({ ...page, catchup: { position: record.position, missed: missed.missed } }, null, 2),
-      { ...page, catchup: { position: record.position, missed: missed.missed } });
+    const catchup = { position: record.position, missed: missed.missed, ...catchupUnchanged(page.next_cursor) };
+    return text(JSON.stringify({ ...page, catchup }, null, 2), { ...page, catchup });
   });
 
   server.registerTool("mbx_send", {

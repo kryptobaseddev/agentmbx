@@ -85,10 +85,34 @@ export function catchupHint(store: Store, name: string): string | null {
  * Advance the checkpoint to a page the agent durably captured (spec R8). Monotonic only: rewinds fail,
  * identical re-commits are no-ops, and a rotated epoch refuses the commit until an explicit restart.
  */
+/**
+ * A fetch that does not pass `commit` leaves the checkpoint where it was, so the next fetch
+ * repeats this page. Say that, and say the exact argument that advances it.
+ */
+export function catchupUnchanged(nextCursor: string): { unchanged: true; hint: string } {
+  return {
+    unchanged: true,
+    hint: `This page is unchanged because the checkpoint was not committed. After you capture it, call mbx_catchup with commit set to this next_cursor: ${nextCursor}. Fetching again without commit returns this same page.`,
+  };
+}
+
+/** A cursor that does not decode is a format error, not a different mailbox. */
+function parseCatchupCursor(cursor: string): ReturnType<typeof parseReplayFrame> {
+  try {
+    return parseReplayFrame(cursor);
+  } catch (err) {
+    const code = (err as { code?: string }).code;
+    if (code === "CURSOR_INVALID") {
+      fail("CURSOR_MALFORMED", "Catch-up cursor is malformed or corrupt. Restart from the checkpoint: call mbx_catchup with no cursor.");
+    }
+    throw err;
+  }
+}
+
 export function commitCatchup(store: Store, name: string, cursor: string, by: string): { from: number; to: number; noop: boolean } {
   const record = readCatchup(store, name) ?? fail("CURSOR_INVALID", "no catch-up checkpoint for this identity; call mbx_catchup without commit first");
   const epoch = store.get("replay:epoch") ?? fail("CURSOR_EXPIRED", "Replay generation is unavailable; initialize this store before catch-up");
-  const frame = parseReplayFrame(cursor);
+  const frame = parseCatchupCursor(cursor);
   if (frame.mailbox !== name || frame.filter !== CATCHUP_FILTER) fail("CURSOR_SCOPE_MISMATCH", "catch-up commits must come from this identity's unfiltered catch-up pages");
   if (frame.epoch !== epoch) fail("CURSOR_EXPIRED", "the store was restored or reset; restart catch-up explicitly (restart: all | now)");
   if (frame.end > replayMaximum(store, name)) fail("CURSOR_INVALID", "catch-up commit exceeds available history");
