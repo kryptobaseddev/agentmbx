@@ -413,6 +413,31 @@ test("planProbe: historical project membership is not enough — the live holder
   assert.equal(planProbe(identities, "sender").length, 3);
 });
 
+test("planProbe matches subdirectories, excludes shared-prefix siblings, and falls back to git-origin key", () => {
+  const ids = [
+    identity("root", "held", { cli: "kimi", session_id: "r", pid: 1 }),
+    identity("src-subdir", "held", { cli: "kimi", session_id: "s", pid: 1 }),
+    identity("cloud", "held", { cli: "kimi", session_id: "c", pid: 1 }),
+    identity("other", "held", { cli: "kimi", session_id: "o", pid: 1 }),
+    identity("worktree", "held", { cli: "kimi", session_id: "w", pid: 1 }),
+  ];
+  const cwdOf = new Map([
+    ["kimi:r", "/x/agentmbx"],
+    ["kimi:s", "/x/agentmbx/src"],
+    ["kimi:c", "/x/agentmbx-cloud"],
+    ["kimi:o", "/y/other"],
+    ["kimi:w", "/z/agentmbx-worktree"],
+  ]);
+  const holderProject = (h: { cli: string; session_id: string }) => cwdOf.get(`${h.cli}:${h.session_id}`) ?? null;
+  const keyOf = (p: string) => {
+    if (p.includes("agentmbx") && !p.includes("cloud")) return "agentmbx-key";
+    if (p.includes("other")) return "other-key";
+    return undefined;
+  };
+  const plan = planProbe(ids, "sender", { project: "/x/agentmbx", holderProject, projectKeyOf: keyOf });
+  assert.deepEqual(plan.map((t) => t.name), ["root", "src-subdir", "worktree"]);
+});
+
 test("planProbe: --only restricts and --exclude drops exact names and globs", () => {
   const ids = ["a1", "a2", "b1", "axiom-lab-staff"].map((n) => identity(n, "held", { cli: "kimi", session_id: n, pid: 1 }));
   assert.deepEqual(planProbe(ids, "sender", { only: ["a1", "b1"] }).map((t) => t.name), ["a1", "b1"]);

@@ -1,5 +1,8 @@
 import { IdentityLeases } from "./identity-leases.js";
 import { listIdentityStatus } from "./identity-status.js";
+import { projectKey as defaultProjectKey } from "./registry.js";
+import { realpathSync } from "node:fs";
+import { sep } from "node:path";
 export const PROBE_SUBJECT_PREFIX = "[mbx-probe]";
 /** The exact reply marker the convention asks for; replies are matched on this or the prefix. */
 export const PROBE_REPLY_MARKER = "probe ok";
@@ -29,13 +32,27 @@ export function globMatch(pattern, name) {
 }
 export function planProbe(identities, sender, options = {}) {
     const only = options.only?.length ? new Set(options.only) : null;
+    const keyOf = options.projectKeyOf ?? defaultProjectKey;
+    const projectKey = options.project ? keyOf(options.project) : undefined;
     return identities
         .filter((i) => i.name !== sender && (i.state === "held" || i.state === "idle"))
         .filter((i) => {
         if (!options.project || !options.holderProject)
             return true;
-        const cwd = i.holder ? options.holderProject(i.holder) : null;
-        return cwd === options.project;
+        const rawCwd = i.holder ? options.holderProject(i.holder) : null;
+        if (!rawCwd)
+            return false;
+        const cwd = (() => { try {
+            return realpathSync(rawCwd);
+        }
+        catch {
+            return rawCwd;
+        } })();
+        const project = options.project;
+        if (cwd === project || cwd.startsWith(project + sep))
+            return true;
+        const targetKey = keyOf(cwd);
+        return targetKey !== undefined && projectKey !== undefined && targetKey === projectKey;
     })
         .filter((i) => !only || only.has(i.name))
         .filter((i) => !(options.exclude ?? []).some((p) => globMatch(p, i.name)))
