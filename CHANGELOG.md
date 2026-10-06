@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **A Claude Code mod renders this session's status (T414):** `plugins/claude` is a mod that registers `/mbx-status` and draws an AbovePrompt band. Both call `agentmbx status --cli claude --session <id> --json --schema mbx.status/v1` with an argv array and a two-second timeout. The session id comes from `CLAUDE_CODE_SESSION_ID` or `CLAUDE_SESSION_ID`. If neither is set, the band says `unbound` and does not guess. A spawn error, timeout, or bad payload says `mbx: unavailable` and does not throw.
+
 ## 0.5.13 (2026-10-06)
 
 The original MCP proxy no longer leaks after in-place reloads (fixing the v0.5.12 regression, which was never published), a watcher survives a lease move, `agentmbx login` runs the device sign-in and keeps a per-host cloud key, setup links the skill for Hermes, OpenCode, Kimi Code and Grok, and an installed package always runs its compiled build.
