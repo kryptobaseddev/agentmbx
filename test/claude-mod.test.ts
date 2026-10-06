@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
+// register.js is the hooks sandbox module and ships without a declaration file.
+// @ts-expect-error TS7016
 import { readStatus, renderStatus, resetStatusCache, resolveSessionId, statusRequestUrl, statusText } from "../plugins/claude/hooks/register.js";
 
 const MINE = {
@@ -72,7 +74,7 @@ test("T414: a status failure is unavailable and does not throw", async () => {
   const urls: string[] = [];
   const broken = await readStatus({
     sessionId: "sess-mine",
-    fetchImpl: async (url) => {
+    fetchImpl: async (url: string) => {
       urls.push(url);
       throw Object.assign(new Error("timed out"), { code: "ETIMEDOUT" });
     },
