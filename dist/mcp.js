@@ -115,7 +115,7 @@ const generationPath = (originalPid) => join(generationDir(), String(originalPid
 function writeGeneration(originalPid, pid) {
     try {
         mkdirSync(generationDir(), { recursive: true, mode: 0o700 });
-        writeFileSync(generationPath(originalPid), JSON.stringify({ pid, start: inspectLeaseProcess(pid).start ?? "" }), "utf8");
+        writeFileSync(generationPath(originalPid), JSON.stringify({ pid, start: "" }), "utf8");
     }
     catch { /* best-effort: the proxy still falls back to the child's exit code */ }
 }

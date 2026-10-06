@@ -87,10 +87,18 @@ test(`after ${RELOADS} reloads only the current lease-holder's MCP process is al
       waitForDead(holderPids[i], `re-exec generation ${i + 1}`);
     }
 
-    // The current generation is the only live lease-holding MCP process.
+    // The current generation is the only live lease-holding MCP process. ps evidence is cached for up to
+    // 1 s, so refresh it explicitly and retry briefly while the new generation is fully started.
     const current = holderPids[holderPids.length - 1];
-    psEvidenceTable(0);
-    assert.equal(inspectLeaseProcess(current).alive, true, `current generation ${holderPids.length} must be alive (stderr: ${stderrLines.join(" | ")})`);
+    let evidence = inspectLeaseProcess(current);
+    for (let i = 0; i < 20 && evidence.alive !== true; i++) {
+      await new Promise(r => setTimeout(r, 100));
+      psEvidenceTable(0);
+      evidence = inspectLeaseProcess(current);
+    }
+    if (evidence.alive !== true) {
+      assert.fail(`current generation ${holderPids.length} pid ${current} must be alive (evidence=${JSON.stringify(evidence)}; stderr: ${stderrLines.join(" | ")})`);
+    }
 
     // At most two processes remain: the original proxy plus the current server. This proves the
     // chain does not accumulate nested processes across reloads.
