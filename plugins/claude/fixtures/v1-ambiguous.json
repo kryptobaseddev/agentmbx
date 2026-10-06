@@ -1,0 +1,18 @@
+{
+  "schema": "mbx.status/v1",
+  "mbx_version": "0.5.13",
+  "update_available": null,
+  "identity": {
+    "name": null,
+    "role": null,
+    "state": "ambiguous",
+    "candidates": ["agentmbx-claude", "someone-else"]
+  },
+  "unread": 7,
+  "needs_reply": 7,
+  "from_owner": 1,
+  "outbox_unsent": 1,
+  "policy": ["autonomous"],
+  "health": "ok",
+  "resolved_by": "none"
+}

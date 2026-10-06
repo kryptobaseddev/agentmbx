@@ -60,18 +60,47 @@ export function renderStatus(sessionId, snapshot) {
   const identity = row.identity && typeof row.identity === "object"
     ? /** @type {Record<string, unknown>} */ (row.identity)
     : null;
-  const who = identity && identity.bound === true && typeof identity.name === "string"
-    ? `${identity.name}${typeof identity.host === "string" ? "@" + identity.host : ""}${typeof identity.role === "string" ? " (" + identity.role + ")" : ""}`
-    : "unbound";
+  if (!identity || identity.state === "unbound" || (identity.state !== "bound" && identity.state !== "ambiguous")) return "unbound";
+  if (identity.state === "ambiguous") return "ambiguous";
+  if (typeof identity.name !== "string" || !identity.name.trim()) return "unbound";
+  const role = typeof identity.role === "string" && identity.role ? ` (${identity.role})` : "";
+  const source = row.inbox && typeof row.inbox === "object"
+    ? /** @type {Record<string, unknown>} */ (row.inbox)
+    : row;
   const lines = [
-    `mbx ${who}`,
-    `unread ${count(row.unread)}`,
-    `needs_reply ${count(row.needs_reply)}`,
-    `from_owner ${count(row.from_owner)}`,
-    `outbox_unsent ${count(row.outbox_unsent)}`,
+    `mbx ${identity.name.trim()}${role}`,
+    `unread ${count(source.unread)}`,
+    `needs_reply ${count(source.needs_reply)}`,
+    `from_owner ${count(source.from_owner)}`,
+    `outbox_unsent ${count(source.outbox_unsent)}`,
   ];
-  if (typeof row.policy === "string" && row.policy) lines.push(`policy ${row.policy}`);
+  const policy = policyText(row);
+  if (policy) lines.push(`policy ${policy}`);
   return lines.join("\n");
+}
+
+/**
+ * v1 carries policy at the top. v2 carries it on harness. Never pick a name from either.
+ * @param {Record<string, unknown>} row
+ * @returns {string}
+ */
+function policyText(row) {
+  const direct = joinPolicy(row.policy);
+  if (direct) return direct;
+  const harness = row.harness && typeof row.harness === "object"
+    ? /** @type {Record<string, unknown>} */ (row.harness)
+    : null;
+  return harness ? joinPolicy(harness.policy) : "";
+}
+
+/**
+ * @param {unknown} value
+ * @returns {string}
+ */
+function joinPolicy(value) {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (!Array.isArray(value)) return "";
+  return value.filter((item) => typeof item === "string" && item.trim()).join(", ");
 }
 
 /**

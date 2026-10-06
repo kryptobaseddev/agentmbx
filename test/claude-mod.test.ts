@@ -1,27 +1,25 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { readStatus, renderStatus, resetStatusCache, resolveSessionId, statusRequestUrl, statusText } from "../plugins/claude/hooks/register.js";
 
 const MINE = {
   schema: "mbx.status/v1",
   mbx_version: "0.5.13",
-  host: "macbook",
-  cli: "claude",
-  session_id: "sess-mine",
-  identity: { bound: true, name: "agentmbx-claude", host: "macbook", role: "claude" },
-  policy: "autonomous [read, edit]",
+  update_available: null,
+  identity: { name: "agentmbx-claude", role: "claude", state: "bound" },
+  policy: ["autonomous"],
   unread: 2,
   needs_reply: 1,
   from_owner: 0,
   outbox_unsent: 3,
   health: "ok",
+  resolved_by: "session_id",
 };
 
 const THEIRS = {
   ...MINE,
-  session_id: "sess-other",
-  identity: { bound: true, name: "someone-else", host: "macbook", role: "claude" },
+  identity: { name: "someone-else", role: "claude", state: "bound" },
   unread: 9,
 };
 
@@ -57,12 +55,12 @@ test("T414: a missing session id is unbound and does not call status", async () 
 
 test("T414: the band renders only the snapshot for the given session id", () => {
   const text = renderStatus("sess-mine", MINE);
-  assert.match(text, /agentmbx-claude@macbook \(claude\)/);
+  assert.match(text, /agentmbx-claude \(claude\)/);
   assert.match(text, /unread 2/);
   assert.match(text, /needs_reply 1/);
   assert.match(text, /from_owner 0/);
   assert.match(text, /outbox_unsent 3/);
-  assert.match(text, /policy autonomous \[read, edit\]/);
+  assert.match(text, /policy autonomous/);
   assert.equal(text.includes("someone-else"), false);
   assert.equal(text.includes("unread 9"), false);
   const other = renderStatus("sess-other", THEIRS);
@@ -133,6 +131,36 @@ test("T414: the cache does not reuse another session's snapshot", async () => {
   assert.equal(other.includes("agentmbx-claude"), false);
   assert.deepEqual(calls, ["sess-mine", "sess-other"]);
   resetStatusCache();
+});
+
+test("T417: fixture v1 and v2 snapshots render only that snapshot's identity", () => {
+  const dir = new URL("../plugins/claude/fixtures/", import.meta.url);
+  const names = readdirSync(dir).filter((name) => name.endsWith(".json")).sort();
+  assert.deepEqual(names, ["v1-ambiguous.json", "v1-bound.json", "v1-unbound.json", "v2-bound.json", "v2-unbound.json"]);
+  const read = (name: string): unknown => JSON.parse(readFileSync(new URL(name, dir), "utf8"));
+
+  const v1 = renderStatus("sess-mine", read("v1-bound.json"));
+  assert.match(v1, /^mbx agentmbx-claude \(claude\)/);
+  assert.match(v1, /unread 2/);
+  assert.match(v1, /needs_reply 1/);
+  assert.match(v1, /policy autonomous/);
+
+  const v2 = renderStatus("sess-mine", read("v2-bound.json"));
+  assert.match(v2, /^mbx agentmbx-claude \(claude\)/);
+  assert.match(v2, /unread 2/);
+  assert.match(v2, /needs_reply 1/);
+  assert.match(v2, /from_owner 0/);
+  assert.match(v2, /outbox_unsent 3/);
+  assert.match(v2, /policy autonomous/);
+  assert.equal(v2.includes("someone-else"), false);
+
+  assert.equal(renderStatus("sess-mine", read("v1-unbound.json")), "unbound");
+  assert.equal(renderStatus("sess-mine", read("v2-unbound.json")), "unbound");
+  const ambiguous = renderStatus("sess-mine", read("v1-ambiguous.json"));
+  assert.equal(ambiguous, "ambiguous");
+  assert.equal(ambiguous.includes("agentmbx-claude"), false);
+  assert.equal(ambiguous.includes("someone-else"), false);
+  assert.equal(ambiguous.includes("unread"), false);
 });
 
 test("T414: the hooks module imports nothing but relative files and claude-code", () => {

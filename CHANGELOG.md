@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **A Claude Code mod renders this session's status (T414):** `plugins/claude` registers `/mbx-status` and draws an AbovePrompt band. The hooks module imports nothing but relative files and `claude-code`. It reads `CLAUDE_CODE_SESSION_ID` or `CLAUDE_SESSION_ID` with `$.env.get`. If neither is set, the band says `unbound` and does not guess. Status is `$.http.fetch` of `http://127.0.0.1:7373/v1/status?cli=claude&session=<id>`. A throw, a non-OK response, or a body that is not an `mbx.status/v1` or `v2` snapshot says `mbx: unavailable` and does not throw.
+- **A Claude Code mod renders this session's status (T414):** `plugins/claude` registers `/mbx-status` and draws an AbovePrompt band. The hooks module imports nothing but relative files and `claude-code`. It reads `CLAUDE_CODE_SESSION_ID` or `CLAUDE_SESSION_ID` with `$.env.get`. If neither is set, the band says `unbound` and does not guess. Status is `$.http.fetch` of `http://127.0.0.1:7373/v1/status?cli=claude&session=<id>`. A throw, a non-OK response, or a body that is not an `mbx.status/v1` or `v2` snapshot says `mbx: unavailable` and does not throw. Fixture snapshots in `plugins/claude/fixtures` cover v1 bound, unbound, and ambiguous, and v2 bound and unbound (T417). An ambiguous snapshot renders `ambiguous` and does not name a candidate.
 
 ## 0.5.13 (2026-10-06)
 
