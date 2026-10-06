@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.11 (2026-10-06)
+
+Autonomy hardening across harnesses: a sibling MCP server of a live session now co-uses its identity instead of waiting (OpenCode code mode), a failed build handover can no longer half-retire the server, Grok and Kimi re-arm a down watcher, wake hints stop claiming unread mail is handled, a conversation's external taint survives release/claim and applies to shell sends, and the daemon gains a sync client that stays off until the device is linked.
+
 - **Release and claim keep a conversation's external taint (T346):** the MCP server writes `taint:<cli>:<session_id>` whenever a read updates the live taint, including `relay_depth` (the per-sender hop history). Release does not delete that key. Claim, release, and resume load it back into the session, so a send after release and claim stays `origin: external` with the original root until an hour after that root. A co-using sibling of the same conversation reads and writes the same key.
 - **CLI send follows the conversation's external taint (T345):** `agentmbx send` from a leased session reads `taint:<cli>:<session_id>` and, while that root is less than an hour old, sends `origin: external` with `external_since` set to the stored root (`external_source: inherited`). `--origin external` still declares the body first-hand. `--origin agent` is refused while the record is live, and no message is written. The MCP server writes the key when the session reads mail (T346).
 - **The launcher no longer crashes on a dev-flagged installed tree (T443):** `bin/agentmbx.js` prefers `../src/cli.ts` under `AGENTMBX_DEV`, which crashed an installed tree (no `src/`) with `ERR_MODULE_NOT_FOUND`. The source entry is now preferred only when `../src` actually exists; otherwise the launcher runs the compiled `../dist/cli.js` like any install.
