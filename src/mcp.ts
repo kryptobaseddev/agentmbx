@@ -109,15 +109,36 @@ export const reexecEnv = (parentAgent: string | undefined, providerPid?: number,
 const REEXEC_PARENT_AGENT = "MBX_MCP_PARENT_AGENT";
 
 /**
+ * T317: the provider to hand to a re-exec child must be the *original* CLI provider process, not this MCP
+ * process's current ppid. After the first re-exec, the MCP parent is itself a re-exec generation and may soon
+ * exit; if reparented to launchd the ppid walk sees pid 1. Use the record this process stored at claim time,
+ * falling back to the env it inherited (which is already the original provider) and finally to the live ppid
+ * only for an original process that has not bound an identity yet.
+ */
+const handoverProvider = (node: MbxNode | undefined, ppid: number): number | undefined => {
+  const recorded = node ? parseProviderRecord(node.store.get(providerRecordKey(process.pid))) : null;
+  if (recorded) return recorded.pid;
+  const envPid = Number(process.env.MBX_MCP_PROVIDER_PID);
+  if (Number.isSafeInteger(envPid) && envPid > 0) return envPid;
+  return ppid;
+};
+
+/**
  * Re-exec this server from disk and hand over the transport, but keep serving the current call with the
  * loaded code: the parent's stdin is paused so every subsequent request is read by the new process alone.
  * Used both for store upgrades and for picking up a newly deployed build without restarting the agent session.
  *
+ * T317: the original proxy (the process the provider launched) stays on its transport; each re-exec
+ * generation exits(0) as soon as its replacement has spawned. This prevents an N+1 chain of nested MCP
+ * processes after repeated in-place reloads. The original only exits when the replacement fails before
+ * spawning (it keeps serving), when the replacement dies abnormally (it mirrors the failure), or when the
+ * provider closes the transport.
+ *
  * T441: nothing is torn down until the replacement has provably started. `retired` (when given) runs only on
  * the child's "spawn" event, so a spawn failure leaves this process fully serving on the loaded build — never
- * half-retired with its leases, timers and control endpoints gone. A child that dies after spawning mirrors
- * its exit, which the proxy reports. Returns false when the handover aborted before the child spawned;
- * `onAbort` also runs for an ASYNC pre-spawn child error, so callers can reset any pending handover state.
+ * half-retired with its leases, timers and control endpoints gone. Returns false when the handover aborted
+ * before the child spawned; `onAbort` also runs for an ASYNC pre-spawn child error, so callers can reset any
+ * pending handover state.
  */
 function handOverToFreshProcess(pauseStdin: boolean, parentAgent?: string, providerPid?: number, detached?: DetachedReload, retired?: () => void, onAbort?: () => void): boolean {
   let child: ReturnType<typeof spawn>;
@@ -135,6 +156,11 @@ function handOverToFreshProcess(pauseStdin: boolean, parentAgent?: string, provi
     } catch (e) {
       process.stderr.write(`[mbx] session teardown failed during handover: ${(e as Error).message}\n`);
     }
+    // T317: a re-exec generation has done its job once the replacement is running; exit cleanly so we do
+    // not accumulate nested MCP processes. The original proxy stays on its transport below.
+    if (process.env[REEXEC_ENV]) {
+      process.exit(0);
+    }
   });
   child.once("error", (err) => {
     if (!spawned) {
@@ -146,7 +172,18 @@ function handOverToFreshProcess(pauseStdin: boolean, parentAgent?: string, provi
     process.stderr.write(`[mbx] the replacement exited before serving; this session is shutting down: ${err.message}\n`);
     process.exit(1);
   });
-  child.on("exit", (code, signal) => { if (signal) { process.kill(process.pid, signal); return; } process.exit(code ?? 0); });
+  child.on("exit", (code, signal) => {
+    if (signal) { process.kill(process.pid, signal); return; }
+    // T317: the original proxy keeps the provider transport alive. A zero exit means the replacement has
+    // itself handed off to a newer generation; a non-zero exit means the replacement died and we mirror it.
+    if (code === 0 && !process.env[REEXEC_ENV]) {
+      // The child handle is gone; keep this proxy alive until the provider closes the transport.
+      const keepAlive = setInterval(() => {}, 60_000);
+      process.stdin.once("end", () => clearInterval(keepAlive));
+      return;
+    }
+    if (code !== 0) process.exit(code ?? 0);
+  });
   if (pauseStdin) try { process.stdin.pause(); } catch { /* already closed */ }
   return true;
 }
@@ -940,7 +977,7 @@ export async function runMcp(existing?: MbxNode) {
           // Validate the payload first and let handOverToFreshProcess retire only once the replacement has
           // provably spawned: a failure here leaves this server fully serving (T441).
           const detached = detachedReloadSchema.parse(detachedForReload());
-          handOverToFreshProcess(false, bound(base) ? base.agent : undefined, env.ppid, detached, retire);
+          handOverToFreshProcess(false, bound(base) ? base.agent : undefined, handoverProvider(node, env.ppid), detached, retire);
         } else reloadFromDisk(e);
         throw e;
       }
@@ -970,7 +1007,7 @@ export async function runMcp(existing?: MbxNode) {
             handedOver = false;
             try { process.stdin.resume(); } catch { /* already closed */ }
           };
-          if (!handOverToFreshProcess(true, bound(base) ? base.agent : undefined, env.ppid, detached, retire, abortHandover)) abortHandover();
+          if (!handOverToFreshProcess(true, bound(base) ? base.agent : undefined, handoverProvider(node, env.ppid), detached, retire, abortHandover)) abortHandover();
         });
       }
       const state = contextFor(a[1]);

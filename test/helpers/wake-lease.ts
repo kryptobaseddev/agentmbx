@@ -7,7 +7,7 @@ import type { MbxNode } from "../../src/node.ts";
 
 const holders = new WeakMap<MbxNode, Map<string, { key: ReturnType<typeof generateKeyPair>; token: string; canonicalSession: string }>>();
 /** Component fixture with real process birth evidence, an explicit lease and a signed test-only owner policy. */
-export function bindWakeLease(n: MbxNode, s: { agent: string; cli: string; session_id: string; pid: number; channel?: boolean }) {
+export function bindWakeLease(n: MbxNode, s: { agent: string; cli: string; session_id: string; pid: number; channel?: boolean; cwd?: string }) {
   let map = holders.get(n); if (!map) { map = new Map(); holders.set(n, map); }
   const leases = new IdentityLeases(n.store), start = inspectLeaseProcess(process.pid).start!;
   let holder = map.get(s.agent);
