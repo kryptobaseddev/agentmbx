@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **The launcher no longer runs TypeScript source from an installed package (T451):** the npm package ships `src/`, so under `AGENTMBX_DEV` an installed tree passed the T443 guard and ran `src/cli.ts`, which Node refuses under `node_modules` (`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`); an MCP server started that way never came up. The launcher now prefers source only when it is not inside `node_modules`.
 ## 0.5.12 (2026-10-06)
 
 In-place MCP reloads no longer accumulate nested processes, and `agentmbx probe` targets only identities currently working in the project.
