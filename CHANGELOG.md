@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.12 (2026-10-06)
+
+In-place MCP reloads no longer accumulate nested processes, and `agentmbx probe` targets only identities currently working in the project.
+
 - **In-place MCP reloads no longer accumulate nested processes (T317):** each build- or store-mismatch handover previously left the old MCP process alive to mirror its replacement's exit, producing an N+1 chain of nested agents after repeated reloads. The original proxy now stays on its provider transport while every re-exec generation exits(0) as soon as its successor has spawned. The handover passes the original CLI provider identity using the recorded `mcp-provider:<mcpPid>` kv instead of the live ppid, so reparenting to launchd no longer breaks co-use or takeover proofs. A lifecycle test verifies that after three reloads at most two MCP processes remain (the proxy plus the current server).
 - **Probe targets current-session identities and adds --only, --exclude, --plan (T445):** `planProbe()` now matches live sessions by their current working directory when `project` is given, ignoring stale historical `identity_projects` memberships. The `agentmbx probe` CLI accepts `--only <glob>[,...]`, `--exclude <glob>[,...]`, and `--plan`; `--plan` lists targets and exits without sending. `ProbeIO` gained `holderProject()` so tests can assert the cwd filter, and `runProbe()` and `buildProbeReport()` respect `only`, `exclude`, and `plannedOnly`.
 - **The project lead is an address (T393):** `lead` and `role:lead` resolve to the owner-designated lead of the sender's project before the envelope is signed, and are refused when that sender has no project or the project has no lead. An agent whose role label is `lead` is not that address. `agentmbx status`, `agentmbx whoami`, `mbx_whoami` and `mbx_agents` show the lead. The sync snapshot carries the lead's project key, agent, host, expiry and record id, and withholds `project_leads` until the spoken contract lists it, the same way `project_paths` is withheld. A console command that would set that flag is refused.
