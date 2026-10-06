@@ -624,7 +624,7 @@ async function run(argv) {
         return;
     }
     if (cmd === "login") {
-        // T256: device authorization only. The access token is not stored (T257 exchanges it).
+        // T257: device authorization, then the host-key-bound exchange. The access token is not stored.
         if (pos.length)
             die("login accepts options, not positional arguments");
         const base = str("base-url") ?? DEFAULT_LOGIN_BASE_URL;
@@ -636,6 +636,8 @@ async function run(argv) {
                 host: n.host,
                 fingerprint: fingerprint(n.key.publicKey),
                 openBrowser: !o["no-browser"],
+                home: n.home,
+                hostKey: n.key,
             }, { ...defaultLoginIO(), log: (line) => console.log(line) });
             if (!outcome.ok)
                 process.exitCode = 1;

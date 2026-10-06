@@ -4,11 +4,16 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main } from "../src/cli.ts";
-import { fingerprint } from "../src/crypto.ts";
+import {
+  CLOUD_ENROLMENT_FILE, CLOUD_KEY_FILE, cloudPopMessage,
+  ENROL_CHALLENGE_PATH, ENROL_PATH, REVOKE_SESSION_PATH,
+  type CloudCertificate,
+} from "../src/cloud-key.ts";
+import { canonical, fingerprint, verifyData } from "../src/crypto.ts";
 import {
   DEFAULT_LOGIN_BASE_URL, DEVICE_CODE_PATH, DEVICE_GRANT_TYPE, DEVICE_TOKEN_PATH, LOGIN_CLIENT_ID,
   defaultLoginIO, openVerificationPage, parseLoginBase, runLogin, sshSession,
@@ -30,7 +35,11 @@ const readBody = (req: IncomingMessage) => new Promise<string>((resolve, reject)
 
 type Step = Record<string, unknown> | "drop";
 
-async function fakeAuth(script: { device?: Step; polls: Step[] }): Promise<{
+async function fakeAuth(script: {
+  device?: Step;
+  polls: Step[];
+  onJson?: (req: { url: string; body: string; authorization: string }) => Step | undefined;
+}): Promise<{
   base: string;
   requests: () => { url: string; type: string; body: string }[];
   close: () => Promise<void>;
@@ -41,7 +50,9 @@ async function fakeAuth(script: { device?: Step; polls: Step[] }): Promise<{
     req.on("error", () => {});
     const body = await readBody(req);
     requests.push({ url: req.url ?? "", type: String(req.headers["content-type"] ?? ""), body });
-    const step = req.url === DEVICE_CODE_PATH ? (script.device ?? deviceBody()) : req.url === DEVICE_TOKEN_PATH ? script.polls[polls++] : undefined;
+    const step = req.url === DEVICE_CODE_PATH ? (script.device ?? deviceBody())
+      : req.url === DEVICE_TOKEN_PATH ? script.polls[polls++]
+      : script.onJson?.({ url: req.url ?? "", body, authorization: String(req.headers.authorization ?? "") });
     answer(res, step);
   });
   server.on("clientError", () => {});
@@ -273,10 +284,26 @@ test("a bad device response and the default accounts base do not open a page", a
   assert.ok(run.lines.includes(`Could not reach the sign-in server at ${DEFAULT_LOGIN_BASE_URL}.`));
 });
 
-test("agentmbx login prints the code, stores nothing, and fails closed", async () => {
+test("agentmbx login exchanges the device session and fails closed", async () => {
+  const hits: { url: string; body: string; authorization: string }[] = [];
+  const storedEnrolment = {
+    host_id: "host_test_1",
+    client_id: LOGIN_CLIENT_ID,
+    token_endpoint: "http://127.0.0.1/token",
+    jwks_uri: "http://127.0.0.1/jwks",
+    resources: { api: "http://127.0.0.1/api", relay: "http://127.0.0.1/relay" },
+  };
   const auth = await fakeAuth({
     device: deviceBody({ interval: 1 }),
     polls: [{ access_token: TOKEN, token_type: "Bearer" }, { access_token: TOKEN, token_type: "Bearer" }],
+    onJson: (req) => {
+      hits.push(req);
+      if (req.authorization !== `Bearer ${TOKEN}`) return { error: "invalid_token" };
+      if (req.url === ENROL_CHALLENGE_PATH) return { nonce: "nonce-cloud-pop-01", expires_in: 60 };
+      if (req.url === ENROL_PATH) return { ...storedEnrolment, sync_url: "https://sync.example/v1", note: "dropped-sync-secret" };
+      if (req.url === REVOKE_SESSION_PATH) return {};
+      return undefined;
+    },
   });
   const home = mkdtempSync(join(tmpdir(), "mbx-login-"));
   try {
@@ -291,19 +318,55 @@ test("agentmbx login prints the code, stores nothing, and fails closed", async (
     assert.ok(ok.out.includes(`Open this URL: http://verify.example/device?user_code=${USER}`));
     assert.ok(ok.out.includes("No browser on this machine. Open the URL above and enter the user code."));
     assert.ok(ok.out.includes("Signed in."));
-    assert.ok(ok.out.includes(`Host key: ${fp}`));
-    assert.ok(ok.out.includes("No credential was stored."));
+    assert.ok(ok.out.includes("Session revoked."));
+    assert.ok(ok.out.includes("No bearer secret was stored."));
+    assert.equal(ok.out.includes("No credential was stored."), false);
     assert.equal(ok.out.includes(TOKEN), false);
     assert.equal(ok.out.includes(DEVICE), false);
     assert.equal(treeHas(home, TOKEN), false);
     assert.equal(treeHas(home, DEVICE), false);
+    assert.equal(treeHas(home, "dropped-sync-secret"), false);
+    const cloud = JSON.parse(readFileSync(join(home, CLOUD_KEY_FILE), "utf8")) as { publicKey: string; privateKey: string };
+    assert.ok(ok.out.includes(`Cloud key: ${fingerprint(cloud.publicKey)}`));
+    assert.equal(ok.out.includes(cloud.privateKey), false);
+    assert.equal(statSync(join(home, CLOUD_KEY_FILE)).mode & 0o777, 0o600);
+    assert.equal(statSync(join(home, CLOUD_ENROLMENT_FILE)).mode & 0o777, 0o600);
+    assert.deepEqual(JSON.parse(readFileSync(join(home, CLOUD_ENROLMENT_FILE), "utf8")), storedEnrolment);
 
     const sshHome = mkdtempSync(join(tmpdir(), "mbx-login-ssh-"));
     const ssh = await cli({ MBX_HOME: sshHome, SSH_CONNECTION: "127.0.0.1 1 127.0.0.1 2" }, ["login", "--base-url", auth.base]);
     assert.equal(ssh.code, 0, ssh.err);
     assert.ok(ssh.out.includes("No browser on this machine. Open the URL above and enter the user code."));
     assert.equal(ssh.out.includes("Opened the verification page."), false);
+    assert.equal(ssh.out.includes(TOKEN), false);
     assert.equal(treeHas(sshHome, TOKEN), false);
+    assert.equal(treeHas(sshHome, "dropped-sync-secret"), false);
+    assert.deepEqual(JSON.parse(readFileSync(join(sshHome, CLOUD_ENROLMENT_FILE), "utf8")), storedEnrolment);
+
+    const enrols = hits.filter((hit) => hit.url === ENROL_PATH);
+    assert.equal(hits.filter((hit) => hit.url === ENROL_CHALLENGE_PATH).length, 2);
+    assert.equal(enrols.length, 2);
+    assert.equal(hits.filter((hit) => hit.url === REVOKE_SESSION_PATH).length, 2);
+    for (const hit of enrols) {
+      const body = JSON.parse(hit.body) as { host_pub: string; nonce: string; proof: string; certificate: CloudCertificate };
+      assert.equal(hit.authorization, `Bearer ${TOKEN}`);
+      assert.equal(hit.body.includes(TOKEN), false);
+      assert.equal(body.nonce, "nonce-cloud-pop-01");
+      assert.equal(body.certificate.payload.aud, auth.base);
+      assert.equal("account_id" in body.certificate.payload, false);
+      assert.equal(verifyData(body.host_pub, canonical(body.certificate.payload), body.certificate.sig), true);
+      assert.equal(verifyData(body.certificate.payload.cloud_pub, cloudPopMessage({
+        nonce: body.nonce,
+        hostPublicKey: body.host_pub,
+        cloudPublicKey: body.certificate.payload.cloud_pub,
+        aud: body.certificate.payload.aud,
+      }), body.proof), true);
+    }
+    for (const hit of hits.filter((h) => h.url === REVOKE_SESSION_PATH)) {
+      assert.equal(hit.authorization, `Bearer ${TOKEN}`);
+      assert.equal(hit.body, "{}");
+      assert.equal(hit.body.includes(TOKEN), false);
+    }
   } finally { await auth.close(); }
 
   const deny = await fakeAuth({ device: deviceBody({ interval: 1 }), polls: [{ error: "access_denied" }] });

@@ -1,9 +1,11 @@
 // `agentmbx login` device authorization (T256, RFC 8628).
 // T251 (the cloud endpoint) is not deployed. `--base-url` names the server, and the
 // paths are better-auth's device plugin: POST {base}/device/code and POST {base}/device/token.
-// A successful poll reports success and the host-key fingerprint. It stores nothing.
-// Trading the session for a host-key-bound credential is T257.
+// With a mailbox home and host key (the CLI), the approved session is exchanged for a
+// host-key-bound enrolment and revoked (T257). The access token is never stored.
+// Without those, a successful poll reports success and stores nothing.
 import { spawn } from "node:child_process";
+import { exchangeDeviceSession, postJson } from "./cloud-key.js";
 export const DEFAULT_LOGIN_BASE_URL = "https://accounts.agentmbx.com/api/auth";
 export const LOGIN_CLIENT_ID = "agentmbx-cli";
 export const DEVICE_CODE_PATH = "/device/code";
@@ -107,6 +109,7 @@ export async function postForm(url, body) {
 export function defaultLoginIO() {
     return {
         post: postForm,
+        postJson,
         open: (url) => openVerificationPage(url),
         now: () => Date.now(),
         sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -141,10 +144,16 @@ function oauthError(body) {
     return typeof error === "string" && /^[a-z_]{1,64}$/.test(error) ? error : null;
 }
 function accessToken(body) {
+    return readAccessToken(body) !== null;
+}
+/** Header-safe device token. A value that could break a header is refused, not logged. */
+function readAccessToken(body) {
     if (!body || typeof body !== "object")
-        return false;
+        return null;
     const token = body.access_token;
-    return typeof token === "string" && token.length > 0;
+    if (typeof token !== "string" || !/^[\x21-\x7E]{1,8192}$/.test(token))
+        return null;
+    return token;
 }
 function parseDevice(body) {
     if (!body || typeof body !== "object")
@@ -189,7 +198,7 @@ function expired(io) {
 /**
  * Run the device flow. Prints the user code, the host-key fingerprint, and the verification URL.
  * Opens the page when a browser is available. Polls until approval, denial, expiry, or a network failure.
- * The access token is not returned, logged, or written.
+ * The access token is not returned or logged. With home and hostKey it is exchanged and revoked.
  */
 export async function runLogin(opts, io) {
     const base = parseLoginBase(opts.baseUrl);
@@ -222,7 +231,7 @@ export async function runLogin(opts, io) {
         io.log("Opened the verification page.");
     else
         io.log("Could not open a browser. Open the URL above and enter the user code.");
-    // RFC 8628 §3.5: slow_down adds 5 seconds to the interval. The token itself is discarded.
+    // RFC 8628 §3.5: slow_down adds 5 seconds to the interval. The token is not stored.
     let interval = device.interval;
     const deadline = io.now() + device.expires_in * 1000;
     for (;;) {
@@ -263,6 +272,17 @@ export async function runLogin(opts, io) {
             return { ok: false };
         }
         if (polled.status === 200 && accessToken(polled.body)) {
+            const token = readAccessToken(polled.body);
+            if (opts.home && opts.hostKey && token) {
+                return exchangeDeviceSession({
+                    home: opts.home,
+                    hostKey: opts.hostKey,
+                    hostName: host,
+                    audience: base,
+                    deviceToken: token,
+                }, { postJson: io.postJson, now: () => io.now(), log: (line) => io.log(line) });
+            }
+            // No host key was supplied: report success and keep nothing.
             io.log("Signed in.");
             io.log(`Host key: ${fp}`);
             io.log("No credential was stored.");
