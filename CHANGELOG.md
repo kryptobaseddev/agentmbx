@@ -4,6 +4,20 @@
 
 - **The daemon serves one session's status to in-harness plugins (T407):** `GET /v1/status?cli=<cli>&session=<id>` on the local daemon returns that session's mbx.status snapshot, the same one `agentmbx status --json --schema mbx.status/v1` prints. Identity resolves by (cli, session) only, so it never shows another identity's mail; an unknown session gets an explicit unbound snapshot. Session reads are loopback-only; without parameters the route keeps its public runtime and challenge responses. The Claude mod and the OpenCode sidebar read this one route instead of computing status themselves.
 
+## 0.5.16 (2026-10-07)
+
+Hotfix: OpenCode hooks bind the named session on a shared `opencode serve`, and shell sends under OpenCode require `--session`.
+
+- **OpenCode 2.0.24 turn end already reaches Stop (T466).** The v2 plugin receives `session.execution.succeeded` with `data.sessionID` and no `location`. That frame maps to one `hook stop`. A second stop for the same wake mail stays silent because the stopseen marker advanced on the first, so the synthetic continuation does not start another wake.
+- **OpenCode hooks bind the remembered session, and a shared serve no longer lends its one control (T466).** A post-tool or stop hook looks up the exact `ses_` control. That row is missing before the session's first mailbox tool call, and after a serve restart it is stale, so the hook returned quietly and no stop or post-tool marker was written. The hook now republishes that `ses_` id only when `name:opencode:<sid>` names an agent whose one live lease holder is an MCP child of this serve. A missing name, a dead holder, or two holders still refuse. `agentmbx send` under OpenCode requires `--session` and does not attach to the single control that shares the serve.
+
+## 0.5.15 (2026-10-06)
+
+Hotfix: OpenCode connectors of one session co-use the mailbox lease instead of deadlocking, and an in-place reload no longer drops the MCP connection on install.
+
+- **OpenCode reconnects no longer deadlock the mailbox (T469, P0):** OpenCode starts the mbx MCP through different runtime wrappers (its main loop and the Code Mode runtime) and reconnects it often. Each connector was recorded under a different provider, so a second connector of the same session was told the identity was held by a live server whose provider was still running, and agents killed MCP processes to escape. The provider is now resolved through Node/Bun runtime parents to the shared `opencode serve` (never across a shell), so connectors of one session co-use the lease. A hand-spawned `agentmbx mcp` cannot use a live harness identity, `identity takeover --force` refuses to target your own live session, doctor warns on more than 5 claims in 10 minutes, and the instructions say never to kill or hand-spawn MBX MCP servers.
+- **An in-place reload no longer drops the MCP connection (T469):** every MCP timer was unref'd, so a re-exec generation whose inherited stdin did not hold the event loop exited right after its catalog notification, released its fresh lease and closed the client's transport, on every install. The heartbeat now keeps the process alive until EOF, close or a handover retire.
+
 ## 0.5.14 (2026-10-06)
 
 The OpenCode v2 plugin's hooks reach a CLI that handles them (session start, post-tool unread notes and Stop continuation), Hermes gets hooks with setup-written approvals and a watcher wake path, an identity-less session is guided to claim before reading its inbox, catch-up says when a page was not committed, and doctor flags a legacy `mbx` ahead of `agentmbx` on PATH.

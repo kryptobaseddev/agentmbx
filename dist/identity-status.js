@@ -118,7 +118,7 @@ export function listIdentityStatus(home, options = {}) {
                 evidence = { alive: null, start: null };
             }
         }
-        return holderProviderView((options.processTable ?? procTable)(), lease.holder_pid, caller.providerPid, recorded, evidence);
+        return holderProviderView((options.processTable ?? procTable)(), lease.holder_pid, caller.providerPid, recorded, evidence, caller.canonicalHarness);
     };
     for (const lease of leases) {
         const item = row(lease.name);
