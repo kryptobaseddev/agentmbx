@@ -186,22 +186,17 @@ export function pruneSummary(node) {
         ? { level: "warn", label: `${retire.length} generated mailbox(es) with no holder, no unread mail and no recent traffic would be retired`, fix: "review the list: agentmbx identity prune   (a dry run), then apply it: agentmbx identity prune --apply" }
         : { level: "info", label: "no generated mailboxes eligible for prune" };
 }
-/** T368: static verification of one CLI's status line integration. Optional and never fails doctor.
- *  "ours" must be a CURRENT form — an older recognized form is a warn with the upgrade fix, as is
- *  ours pointing at a deleted bundled script. "foreign" is info, unless the foreign command embeds
- *  the agentmbx render command (wrapped, re-quoted, extra flags): that is a partial AgentMBX write,
- *  not a user's own line. Claude composes, so its wired command must be the composing adapter; kimi
- *  and grok are replace-only — `command` replaces the footer and never renders alongside the user's
- *  other keys. opencode has no custom status line feature at all (built-in segments only), so the
- *  honest result is an explicit skip note, not a check against an invented config path. */
 /** OpenCode's LocationActivity drops an idle service about every 60 minutes, and the plugin then releases and claims again.
- *  A claim within ~65 minutes of its release, with those pairs about 61 minutes apart, is that eviction. One restart is not. */
+ *  A claim within ~65 minutes of its release, with those pairs about 61 minutes apart, is that eviction. One restart is not.
+ *  Only the last 24 hours of audit rows are read. */
 const EVICT_FOLLOW_MS = 65 * 60 * 1000;
 const EVICT_REPEAT_MIN_MS = 50 * 60 * 1000;
 const EVICT_REPEAT_MAX_MS = 75 * 60 * 1000;
+const EVICT_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 /** Info when an OpenCode holder's audit shows the hourly release/claim signature. Silent otherwise. Not an install failure. */
 export function opencodeEvictionCheck(db) {
-    const rows = db.prepare("SELECT at, event, detail FROM audit WHERE event IN ('identity.release', 'identity.claim') ORDER BY at").all();
+    const since = new Date(Date.now() - EVICT_LOOKBACK_MS).toISOString();
+    const rows = db.prepare("SELECT at, event, detail FROM audit WHERE event IN ('identity.release', 'identity.claim') AND at > ? ORDER BY at").all(since);
     const byName = new Map();
     for (const row of rows) {
         if (!row || typeof row !== "object")
@@ -261,6 +256,14 @@ function hourlyOpencodeEviction(events) {
     }
     return false;
 }
+/** T368: static verification of one CLI's status line integration. Optional and never fails doctor.
+ *  "ours" must be a CURRENT form — an older recognized form is a warn with the upgrade fix, as is
+ *  ours pointing at a deleted bundled script. "foreign" is info, unless the foreign command embeds
+ *  the agentmbx render command (wrapped, re-quoted, extra flags): that is a partial AgentMBX write,
+ *  not a user's own line. Claude composes, so its wired command must be the composing adapter; kimi
+ *  and grok are replace-only — `command` replaces the footer and never renders alongside the user's
+ *  other keys. opencode has no custom status line feature at all (built-in segments only), so the
+ *  honest result is an explicit skip note, not a check against an invented config path. */
 /** T391: the OpenCode service is the wake path for every opencode mailbox — when one is bound,
  *  doctor proves the service answers and says how to start it when it does not. A warn never
  *  fails doctor (the T435 rule for separate per-CLI functions). Unbound hosts stay silent. */

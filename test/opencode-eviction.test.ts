@@ -34,7 +34,7 @@ function pair(node: MbxNode, atMs: number, cli = "opencode"): void {
 test("T450: two OpenCode release/claim pairs about 61 minutes apart are known upstream behaviour", () => {
   const { home, node } = homeNode();
   try {
-    const t0 = Date.parse("2026-10-06T18:00:00.000Z");
+    const t0 = Date.now() - 3 * HOUR;
     pair(node, t0);
     pair(node, t0 + HOUR);
     pair(node, t0 + 2 * HOUR + 8000);
@@ -60,11 +60,16 @@ test("T450: one pair, a short gap, a long gap, and a non-OpenCode holder stay si
       stamp(node, t0 + 3 * HOUR, "identity.release", "opencode");
       stamp(node, t0 + 3 * HOUR + 70 * 60 * 1000, "identity.claim", "opencode");
     },
+    (node) => {
+      const old = Date.now() - 30 * 60 * 60 * 1000;
+      pair(node, old);
+      pair(node, old + HOUR);
+    },
   ];
   for (const fill of cases) {
     const { home, node } = homeNode();
     try {
-      fill(node, Date.parse("2026-10-06T18:00:00.000Z"));
+      fill(node, Date.now() - 4 * HOUR);
       assert.equal(opencodeEvictionCheck(node.store.db), null);
     } finally { node.store.db.close(); rmSync(home, { recursive: true, force: true }); }
   }
@@ -73,7 +78,7 @@ test("T450: one pair, a short gap, a long gap, and a non-OpenCode holder stay si
 test("T450: doctor reports the eviction when OpenCode is detected and stays quiet otherwise", async () => {
   const { home, node } = homeNode();
   try {
-    const t0 = Date.parse("2026-10-06T18:00:00.000Z");
+    const t0 = Date.now() - 3 * HOUR;
     pair(node, t0);
     pair(node, t0 + HOUR);
     node.close();
