@@ -441,11 +441,15 @@ export function socketPush(text, env = process.env) {
         });
     });
 }
-/** Default agent name: $MBX_AGENT, else the project folder; a session started in the home folder (or /) is named after
- *  its CLI ("claude", "codex", "kimi", "opencode"), because "keatonhoskins" says nothing about which agent it is. */
-export function agentName(cwd = process.cwd(), cli) {
+/** Default agent name: $MBX_AGENT when the owner set one, otherwise the project folder. The home folder and `/` are
+ *  not projects, so they do not invent a name from the harness or from the account. An existing mailbox the owner
+ *  names with MBX_AGENT, including one already named after a harness, is kept. */
+export function agentName(cwd = process.cwd()) {
+    const explicit = process.env.MBX_AGENT;
     const inHome = resolve(cwd) === resolve(homedir()) || resolve(cwd) === "/";
-    const raw = process.env.MBX_AGENT || (inHome && cli && cli !== "unknown" ? cli : basename(cwd));
+    const raw = explicit || (inHome ? "" : basename(cwd));
+    if (!raw)
+        return null;
     const n = raw.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
     return NAME_RE.test(n) ? n : "agent";
 }
@@ -496,7 +500,7 @@ export async function runMcp(existing) {
     const detached = detachedReloadState(process.env);
     // Chosen identities only (T204): the launch config (MBX_AGENT) or the identity this provider session held before. A
     // re-exec child reclaims the name its parent released at handover. Nothing else ever names a session.
-    const launch = process.env.MBX_AGENT ? agentName(process.cwd(), env.cli) : null;
+    const launch = process.env.MBX_AGENT ? agentName(process.cwd()) : null;
     const parentAgent = process.env[REEXEC_PARENT_AGENT] || null;
     const leases = new IdentityLeases(node.store, { idleTtlMs: process.env.MBX_IDENTITY_IDLE_TTL_MS === undefined ? undefined : Number(process.env.MBX_IDENTITY_IDLE_TTL_MS) });
     // T434: the birth time is a fixed property of this process — only the READ can fail (a ps starved
