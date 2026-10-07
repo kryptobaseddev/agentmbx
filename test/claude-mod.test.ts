@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import {
-  bandText, readStatus, register, renderSections, renderStatus, resetStatusCache, resetStatusState, resolveSessionId,
+  bandText, currentSnapshot, readStatus, register, renderSections, renderStatus, resetStatusCache, resetStatusState, resolveSessionId,
   statusLineText, statusRequestUrl, statusText,
 } from "../plugins/claude/hooks/register.js";
 
@@ -325,4 +325,38 @@ test("T415: the hooks module exposes the new surface for claude plugin validate"
   assert.match(source, /\$\.clock\.every\(INDICATOR_MS/);
   assert.match(source, /on\("ui\.render", \{ component: "Pane" \}/);
   assert.equal(source.includes("setInterval"), false, "the sandbox has no timer globals: $.clock.every only");
+});
+
+test("T415/T308 AC2: a stale snapshot never survives a session change or a failed fetch", async () => {
+  resetStatusState();
+  // session A fetches fine
+  const ok = await readStatus({
+    sessionId: "sess-a",
+    fetchImpl: async () => ({ ok: true, status: 200, text: JSON.stringify({ ...SHARED_V2, identity: { name: "agent-a", role: "qa", state: "bound" } }) }),
+  });
+  assert.match(ok.text, /agent-a/);
+  assert.equal(currentSnapshot("sess-a") !== null, true);
+  assert.match(bandText("sess-a", currentSnapshot("sess-a")), /agent-a/);
+
+  // session id changes to B and the fetch fails: B shows unavailable, never A's data, anywhere
+  const failed = await readStatus({ sessionId: "sess-b", fetchImpl: async () => ({ ok: false, status: 500, text: "" }) });
+  assert.equal(failed.text, "mbx: unavailable");
+  assert.equal(currentSnapshot("sess-b"), null);
+  assert.equal(currentSnapshot("sess-a"), null, "the failure cleared the store entirely");
+  assert.equal(bandText("sess-b", currentSnapshot("sess-b")), "mbx: unavailable");
+  assert.equal(bandText("sess-b", currentSnapshot("sess-b")).includes("agent-a"), false);
+  assert.deepEqual(renderSections(currentSnapshot("sess-b")), null, "the pane gets nothing to render");
+
+  // a failed fetch for the SAME session also shows unavailable, not stale counts
+  const ok2 = await readStatus({ sessionId: "sess-c", fetchImpl: async () => ({ ok: true, status: 200, text: JSON.stringify(SHARED_V2) }) });
+  assert.match(ok2.text, /agentmbx-kimi/);
+  const failed2 = await readStatus({ sessionId: "sess-c", fetchImpl: async () => { throw new Error("down"); } });
+  assert.equal(failed2.text, "mbx: unavailable");
+  assert.equal(currentSnapshot("sess-c"), null, "no stale counts after the failure");
+  assert.equal(bandText("sess-c", currentSnapshot("sess-c")), "mbx: unavailable");
+
+  // an unbound read (no session id) clears the store too
+  await readStatus({ sessionId: null, fetchImpl: async () => ({ ok: true, status: 200, text: JSON.stringify(SHARED_V2) }) });
+  assert.equal(currentSnapshot("sess-c"), null);
+  resetStatusState();
 });

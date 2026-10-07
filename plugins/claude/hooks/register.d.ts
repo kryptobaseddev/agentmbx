@@ -7,6 +7,7 @@ export function renderStatus(sessionId: string | null, snapshot: unknown): strin
 export function statusLineText(snapshot: unknown): string | null;
 export function bandText(sessionId: string | null, snapshot: unknown): string;
 export function renderSections(snapshot: unknown): string[] | null;
+export function currentSnapshot(sessionId: string | null): unknown;
 export function readStatus(opts: {
   sessionId: string | null;
   fetchImpl?: (url: string) => Promise<{ ok?: boolean; status?: number; text?: unknown }>;

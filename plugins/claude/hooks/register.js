@@ -250,21 +250,43 @@ export function renderSections(snapshot) {
 }
 
 /**
+ * The last snapshot the band or command fetched, keyed by the session it belongs to, for the
+ * pane to render. T308 AC2: never render another session's data — cleared on every failed or
+ * unavailable fetch and on any session-id change, and consumers compare the key.
+ * @type {{ sessionId: string, snapshot: unknown } | null}
+ */
+let lastStatus = null;
+
+/**
+ * The stored snapshot, only when it belongs to the given session; null otherwise.
+ * @param {string | null} sessionId
+ * @returns {unknown}
+ */
+export function currentSnapshot(sessionId) {
+  return sessionId && lastStatus && lastStatus.sessionId === sessionId ? lastStatus.snapshot : null;
+}
+
+/**
  * @param {{ ok?: boolean, text?: unknown }} response
  * @param {string} sessionId
  * @returns {{ text: string, snapshot: unknown, raw: string | null }}
  */
 function fromResponse(response, sessionId) {
   if (!response || response.ok !== true || typeof response.text !== "string") {
+    lastStatus = null;
     return { text: "mbx: unavailable", snapshot: null, raw: null };
   }
   try {
     const snapshot = JSON.parse(response.text);
     const text = renderStatus(sessionId, snapshot);
-    if (text === "mbx: unavailable") return { text, snapshot: null, raw: null };
-    lastSnapshot = snapshot;
+    if (text === "mbx: unavailable") {
+      lastStatus = null;
+      return { text, snapshot: null, raw: null };
+    }
+    lastStatus = { sessionId, snapshot };
     return { text, snapshot, raw: response.text };
   } catch {
+    lastStatus = null;
     return { text: "mbx: unavailable", snapshot: null, raw: null };
   }
 }
@@ -275,12 +297,19 @@ function fromResponse(response, sessionId) {
  */
 export async function readStatus(opts) {
   const sessionId = opts.sessionId;
-  if (!sessionId) return { text: "unbound", snapshot: null, raw: null };
-  if (!opts.fetchImpl) return { text: "mbx: unavailable", snapshot: null, raw: null };
+  if (!sessionId) {
+    lastStatus = null;
+    return { text: "unbound", snapshot: null, raw: null };
+  }
+  if (!opts.fetchImpl) {
+    lastStatus = null;
+    return { text: "mbx: unavailable", snapshot: null, raw: null };
+  }
   try {
     const response = await opts.fetchImpl(statusRequestUrl(sessionId));
     return fromResponse(response, sessionId);
   } catch {
+    lastStatus = null;
     return { text: "mbx: unavailable", snapshot: null, raw: null };
   }
 }
@@ -322,9 +351,6 @@ function envString(value) {
   return typeof value === "string" ? value : "";
 }
 
-/** The last snapshot the band or command fetched, for the pane to render. */
-let lastSnapshot = null;
-
 /**
  * Production read. `$` stays on this top-level function so `claude plugin validate`
  * sees `$.env.get`, `$.clock.now`, and `$.http.fetch`.
@@ -342,8 +368,8 @@ export async function loadStatus($) {
     now: typeof now === "number" ? now : 0,
     fetchImpl: (url) => $.http.fetch(url),
   });
-  // statusText answered from the same read path; re-read the snapshot it parsed for the pane.
-  const snapshot = lastSnapshot;
+  // the snapshot belongs to this session only (currentSnapshot keys by id; failures clear it)
+  const snapshot = currentSnapshot(sessionId);
   const sections = renderSections(snapshot) ?? [band];
   return { band, sections, snapshot };
 }
@@ -351,7 +377,7 @@ export async function loadStatus($) {
 /** Test-only reset so one case cannot reuse another's snapshot. */
 export function resetStatusState() {
   resetStatusCache();
-  lastSnapshot = null;
+  lastStatus = null;
 }
 
 /**
@@ -371,7 +397,6 @@ export function register(on) {
     $.clock.every(INDICATOR_MS, async () => {
       try {
         const { snapshot } = await loadStatus($);
-        lastSnapshot = snapshot;
         const line = statusLineText(snapshot);
         if (line) $.ui.status(line);
         $.ui.invalidate("ui.render");
@@ -410,7 +435,8 @@ export function register(on) {
         now: typeof now === "number" ? now : 0,
         fetchImpl: (url) => $.http.fetch(url),
       });
-      return Text({ children: [bandText(resolveSessionId(env), lastSnapshot)] });
+      const sid = resolveSessionId(env);
+      return Text({ children: [bandText(sid, currentSnapshot(sid))] });
     } catch {
       return next(e);
     }
@@ -420,7 +446,14 @@ export function register(on) {
     try {
       if (e.requestId !== PANE_ID) return next(e);
       const { Box, Text } = $.ui.resolve(e);
-      const sections = renderSections(lastSnapshot) ?? ["mbx: unavailable"];
+      // The pane must never show another session's snapshot either: resolve the current
+      // session id and read only the snapshot stored under it (T308 AC2).
+      const env = {
+        CLAUDE_CODE_SESSION_ID: envString(await $.env.get("CLAUDE_CODE_SESSION_ID")),
+        CLAUDE_SESSION_ID: envString(await $.env.get("CLAUDE_SESSION_ID")),
+      };
+      const sid = resolveSessionId(env);
+      const sections = renderSections(currentSnapshot(sid)) ?? ["mbx: unavailable"];
       return Box({
         flexDirection: "column",
         children: sections.map((line, i) => Text({ key: `s${i}`, children: [line] })),
