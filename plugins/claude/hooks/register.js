@@ -13,11 +13,19 @@
  * answers v1; `renderStatus` still tolerates a v1 body, so the band degrades rather than breaks.
  * Documented init has no timeout; a throw, a non-OK response, or a body that is not an
  * mbx.status/v1 or v2 snapshot renders "mbx: unavailable".
+ *
+ * Surfaces (T415): the AbovePrompt band shows one compact line with a `●` unread marker;
+ * `/mbx-status` opens a pane (on wide terminals) and always prints the full v2 sections, which
+ * is also the fallback where mods cannot draw (headless `claude -p`, a narrow terminal, or a
+ * render the engine refuses). A 5 s `$.clock.every` timer keeps `$.ui.status` under the prompt
+ * current — the persistent unread indicator — and asks for a redraw.
  * https://code.claude.com/docs/en/plugins/mods/api
  */
 
 const DAEMON_ORIGIN = "http://127.0.0.1:7373";
 const CACHE_MS = 2000;
+const PANE_ID = "mbx-status";
+const INDICATOR_MS = 5_000;
 
 /**
  * @param {Record<string, string | undefined>} env
@@ -117,6 +125,131 @@ function count(value) {
 }
 
 /**
+ * The one-line under-prompt indicator (`$.ui.status`). Null when there is
+ * nothing worth pinning: unbound, unavailable, or zero unread everywhere.
+ * Pure: renders one fetched snapshot, derives nothing.
+ * @param {unknown} snapshot
+ * @returns {string | null}
+ */
+export function statusLineText(snapshot) {
+  const sections = renderSections(snapshot);
+  if (!sections) return null;
+  const row = /** @type {Record<string, unknown>} */ (snapshot);
+  const inbox = row.inbox && typeof row.inbox === "object"
+    ? /** @type {Record<string, unknown>} */ (row.inbox)
+    : row;
+  const unread = typeof inbox.unread === "number" ? inbox.unread : 0;
+  const needsReply = typeof inbox.needs_reply === "number" ? inbox.needs_reply : 0;
+  const fromOwner = typeof inbox.from_owner === "number" ? inbox.from_owner : 0;
+  if (!unread && !needsReply && !fromOwner) return null;
+  const seg = [`${unread}↑`];
+  if (needsReply) seg.push(`${needsReply}↺`);
+  if (fromOwner) seg.push(`owner:${fromOwner}`);
+  return `mbx: ${seg.join(" ")}`;
+}
+
+/**
+ * The compact band line, with the unread marker T415 AC2 asks for: a `●`
+ * prefix while the fetched snapshot has unread mail. Pure.
+ * @param {string | null} sessionId
+ * @param {unknown} snapshot
+ * @returns {string}
+ */
+export function bandText(sessionId, snapshot) {
+  const text = renderStatus(sessionId, snapshot);
+  if (text.startsWith("mbx ") && statusLineText(snapshot)) return `● ${text}`;
+  return text;
+}
+
+/**
+ * One line per v2 section: identity, registration + lease, inbox, harness,
+ * cloud, devices, project (T415 AC1). The renderer is pure and derives
+ * nothing — every value is read from the one fetched snapshot. Returns null
+ * for a v1 body (the pane is a v2 surface; v1 falls back to the compact
+ * render) and for anything that is not a status snapshot.
+ * @param {unknown} snapshot
+ * @returns {string[] | null}
+ */
+export function renderSections(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  const row = /** @type {Record<string, unknown>} */ (snapshot);
+  if (row.schema !== "mbx.status/v2") return null;
+  const identity = row.identity && typeof row.identity === "object"
+    ? /** @type {Record<string, unknown>} */ (row.identity)
+    : null;
+  const state = identity?.state;
+  if (!identity || state === "unbound") return ["mbx unbound"];
+  if (state === "ambiguous") {
+    const candidates = Array.isArray(identity.candidates) ? identity.candidates.length : 0;
+    return [`mbx ambiguous (${candidates} candidates)`];
+  }
+  if (state !== "bound" || typeof identity.name !== "string" || !identity.name.trim()) return ["mbx unbound"];
+  const role = typeof identity.role === "string" && identity.role ? `(${identity.role})` : "";
+  const lines = [`identity ${identity.name.trim()}${role}`];
+
+  const registration = row.registration && typeof row.registration === "object"
+    ? /** @type {Record<string, unknown>} */ (row.registration)
+    : null;
+  const lease = registration?.lease && typeof registration.lease === "object"
+    ? /** @type {Record<string, unknown>} */ (registration.lease)
+    : null;
+  lines.push(lease
+    ? `registration ${registration?.registered === true ? "registered" : "unregistered"} · lease ${String(lease.holder_cli)}/${String(lease.holder_session)}${lease.verified === true ? " verified" : " unverified"}`
+    : `registration ${registration?.registered === true ? "registered" : "not registered"} · no lease`);
+
+  const inbox = row.inbox && typeof row.inbox === "object"
+    ? /** @type {Record<string, unknown>} */ (row.inbox)
+    : {};
+  lines.push(`inbox ${count(inbox.unread)} unread · ${count(inbox.needs_reply)} needs reply · ${count(inbox.from_owner)} from owner · ${count(inbox.outbox_unsent)} unsent`);
+
+  const harness = row.harness && typeof row.harness === "object"
+    ? /** @type {Record<string, unknown>} */ (row.harness)
+    : null;
+  if (harness) {
+    const policy = joinPolicy(harness.policy);
+    const wake = typeof harness.wake_path === "string" ? harness.wake_path : "none";
+    lines.push(`harness ${String(harness.cli)} ${String(harness.session_id ?? "—")} · wake ${wake}${policy ? ` · policy ${policy}` : ""}`);
+  }
+
+  const cloud = row.cloud && typeof row.cloud === "object"
+    ? /** @type {Record<string, unknown>} */ (row.cloud)
+    : null;
+  if (cloud) {
+    const relay = cloud.relay && typeof cloud.relay === "object"
+      ? /** @type {Record<string, unknown>} */ (cloud.relay)
+      : null;
+    const relayText = relay?.url
+      ? `relay ${String(relay.state)} (${String(relay.url)})`
+      : `relay ${String(relay?.state ?? "unset")}`;
+    const keyAd = typeof cloud.key_ad_expiry === "string" ? ` · key ad until ${cloud.key_ad_expiry.slice(0, 10)}` : "";
+    const account = typeof cloud.account === "string" ? ` · account ${cloud.account}` : "";
+    lines.push(`cloud ${relayText}${keyAd}${account}`);
+  }
+
+  if (Array.isArray(row.devices)) {
+    if (row.devices.length === 0) lines.push("devices none paired");
+    for (const device of row.devices.slice(0, 8)) {
+      if (device && typeof device === "object") {
+        const d = /** @type {Record<string, unknown>} */ (device);
+        const last = typeof d.last_presence === "string" ? ` · seen ${d.last_presence.slice(0, 16).replace("T", " ")}` : "";
+        lines.push(`device ${String(d.host)} at ${String(d.address)} (${String(d.reachability)})${last}`);
+      }
+    }
+  }
+
+  const project = row.project && typeof row.project === "object"
+    ? /** @type {Record<string, unknown>} */ (row.project)
+    : null;
+  if (project) {
+    const members = Array.isArray(project.members) ? project.members.filter((m) => typeof m === "string").join(", ") : "";
+    lines.push(`project ${String(project.directory)} · lead ${String(project.lead ?? "—")} · members ${members}`);
+  } else {
+    lines.push("project none");
+  }
+  return lines;
+}
+
+/**
  * @param {{ ok?: boolean, text?: unknown }} response
  * @param {string} sessionId
  * @returns {{ text: string, snapshot: unknown, raw: string | null }}
@@ -129,6 +262,7 @@ function fromResponse(response, sessionId) {
     const snapshot = JSON.parse(response.text);
     const text = renderStatus(sessionId, snapshot);
     if (text === "mbx: unavailable") return { text, snapshot: null, raw: null };
+    lastSnapshot = snapshot;
     return { text, snapshot, raw: response.text };
   } catch {
     return { text: "mbx: unavailable", snapshot: null, raw: null };
@@ -188,26 +322,41 @@ function envString(value) {
   return typeof value === "string" ? value : "";
 }
 
+/** The last snapshot the band or command fetched, for the pane to render. */
+let lastSnapshot = null;
+
 /**
  * Production read. `$` stays on this top-level function so `claude plugin validate`
  * sees `$.env.get`, `$.clock.now`, and `$.http.fetch`.
  * @param {{ env: { get: (name: string) => Promise<unknown> }, clock: { now: () => Promise<number> }, http: { fetch: (url: string) => Promise<{ ok?: boolean, text?: unknown }> } }} $
- * @returns {Promise<string>}
+ * @returns {Promise<{ band: string, sections: string[], snapshot: unknown }>}
  */
-export async function loadBand($) {
+export async function loadStatus($) {
   const env = {
     CLAUDE_CODE_SESSION_ID: envString(await $.env.get("CLAUDE_CODE_SESSION_ID")),
     CLAUDE_SESSION_ID: envString(await $.env.get("CLAUDE_SESSION_ID")),
   };
+  const sessionId = resolveSessionId(env);
   const now = await $.clock.now();
-  return statusText(env, {
+  const band = await statusText(env, {
     now: typeof now === "number" ? now : 0,
     fetchImpl: (url) => $.http.fetch(url),
   });
+  // statusText answered from the same read path; re-read the snapshot it parsed for the pane.
+  const snapshot = lastSnapshot;
+  const sections = renderSections(snapshot) ?? [band];
+  return { band, sections, snapshot };
+}
+
+/** Test-only reset so one case cannot reuse another's snapshot. */
+export function resetStatusState() {
+  resetStatusCache();
+  lastSnapshot = null;
 }
 
 /**
- * Claude Code mod entry. Draws the AbovePrompt band and answers /mbx-status.
+ * Claude Code mod entry. Draws the AbovePrompt band, answers /mbx-status, and
+ * renders the full v2 sections in a pane the command opens.
  * @param {(event: string, matcherOrHook: unknown, hook?: unknown) => unknown} on
  */
 export function register(on) {
@@ -216,12 +365,33 @@ export function register(on) {
       name: "mbx-status",
       description: "Show this session's AgentMBX status",
     });
+    // The persistent unread indicator (T415 AC2): poll the same endpoint the band uses and
+    // keep one line under the prompt current; the invalidate keeps band and pane fresh. The
+    // callback closes over `$` (documented for timers); a failed poll leaves the old line.
+    $.clock.every(INDICATOR_MS, async () => {
+      try {
+        const { snapshot } = await loadStatus($);
+        lastSnapshot = snapshot;
+        const line = statusLineText(snapshot);
+        if (line) $.ui.status(line);
+        $.ui.invalidate("ui.render");
+      } catch { /* next tick */ }
+    });
     return next(e);
   });
 
   on("command.run", { command: "mbx-status" }, async ($) => {
     try {
-      return { text: await loadBand($) };
+      const { sections } = await loadStatus($);
+      // The pane is the visual surface; the printed sections are the same content, so a session
+      // where mods cannot draw (headless, narrow terminal) still gets the full answer (AC3).
+      try {
+        const placed = await $.ui.open({ id: PANE_ID, title: "MBX", closeOnEscape: true });
+        if (placed && placed.isPlaced === false) {
+          $.ui.toast(`mbx: pane waiting for a wider terminal (${placed.reason ?? "narrow"}); the sections print below`);
+        }
+      } catch { /* pane unavailable: the printed sections below are the fallback */ }
+      return { text: sections.join("\n") };
     } catch {
       return { text: "mbx: unavailable" };
     }
@@ -231,8 +401,30 @@ export function register(on) {
     try {
       if (e?.props?.hasSurvey) return next(e);
       const { Text } = $.ui.resolve(e);
-      const text = await loadBand($);
-      return Text({ children: [text] });
+      const env = {
+        CLAUDE_CODE_SESSION_ID: envString(await $.env.get("CLAUDE_CODE_SESSION_ID")),
+        CLAUDE_SESSION_ID: envString(await $.env.get("CLAUDE_SESSION_ID")),
+      };
+      const now = await $.clock.now();
+      await statusText(env, {
+        now: typeof now === "number" ? now : 0,
+        fetchImpl: (url) => $.http.fetch(url),
+      });
+      return Text({ children: [bandText(resolveSessionId(env), lastSnapshot)] });
+    } catch {
+      return next(e);
+    }
+  });
+
+  on("ui.render", { component: "Pane" }, async ($, e, next) => {
+    try {
+      if (e.requestId !== PANE_ID) return next(e);
+      const { Box, Text } = $.ui.resolve(e);
+      const sections = renderSections(lastSnapshot) ?? ["mbx: unavailable"];
+      return Box({
+        flexDirection: "column",
+        children: sections.map((line, i) => Text({ key: `s${i}`, children: [line] })),
+      });
     } catch {
       return next(e);
     }

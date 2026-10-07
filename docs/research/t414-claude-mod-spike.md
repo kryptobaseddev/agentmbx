@@ -57,3 +57,27 @@ session id, so one session's snapshot is never reused for another.
   `src/setup.ts`, currently unheld.
 - Live verification in a real Claude Code session (band visible above the prompt) is the T415
   acceptance; the render path is fully covered by tests here.
+
+## T415 addendum — the full mod (band + pane + indicator + fallbacks)
+
+Verified against the published mods API (code.claude.com/docs/en/plugins/mods/api and /interface):
+
+- **Pane**: `$.ui.open({ id, title, closeOnEscape? })` → `{ isPlaced, reason? }`. A mod-opened pane
+  needs a ≥144-column terminal (110 after the user opened it once); `isPlaced: false` means it is
+  waiting — the mod toasts and the command's printed text carries the same content. `ui.render`
+  `{ component: 'Pane' }` matches `e.requestId`; the tree is `Box({ flexDirection: 'column',
+  children: [Text...] })` from `$.ui.resolve(e)`. Redraw with `$.ui.invalidate('ui.render')`.
+- **Unread indicator (T415 AC2)**: two surfaces. The band line takes a `● ` prefix while the fetched
+  snapshot has unread mail, and a `$.clock.every(5 s)` timer (started in `session.start`, closing
+  over `$` — documented) pins one line under the prompt with `$.ui.status("mbx: N↑ M↺")` and asks
+  for a redraw. `$.ui.status` text starts with `⚠ <mod>` in the host; a null line (nothing unread)
+  leaves the old line untouched rather than clearing it.
+- **Fallbacks (T415 AC3)**: headless `claude -p` never fires `ui.render` — `/mbx-status` prints the
+  full sections and is the universal surface. A narrow terminal reports `isPlaced: false` → toast +
+  printed sections. Any tree the engine refuses to validate draws the host's own version of the
+  site (nothing crashes), and every hook catch defers to `next(e)`.
+- **v1 tolerance**: the pane is a v2 surface (`renderSections` returns null for v1); the band keeps
+  the T414 compact v1 render, so a daemon older than v0.5.17 degrades to the one-line band.
+- **State**: `lastSnapshot` (module scope) feeds the pane between fetches; tests reset it with
+  `resetStatusState()`. `$.state`/`$.store` persistence was deliberately not used — the snapshot is
+  refetched every 2–5 s and must not survive `/clear`.

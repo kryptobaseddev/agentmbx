@@ -1,7 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
-import { readStatus, renderStatus, resetStatusCache, resolveSessionId, statusRequestUrl, statusText } from "../plugins/claude/hooks/register.js";
+import {
+  bandText, readStatus, register, renderSections, renderStatus, resetStatusCache, resetStatusState, resolveSessionId,
+  statusLineText, statusRequestUrl, statusText,
+} from "../plugins/claude/hooks/register.js";
 
 const MINE = {
   schema: "mbx.status/v1",
@@ -194,4 +197,132 @@ test("T414: the hooks module imports nothing but relative files and claude-code"
     assert.equal(allowed, true, line);
   }
   assert.equal(imports.length, 0);
+});
+
+// ---- T415: the full mod — every v2 section, the unread indicator, the fallbacks ----
+
+const SHARED_V2 = JSON.parse(readFileSync(new URL("./fixtures/status-v2-bound.json", import.meta.url), "utf8"));
+
+const RICH_V2 = {
+  ...SHARED_V2,
+  identity: { name: "probe-staff", role: "builder", state: "bound" },
+  cloud: {
+    relay: { url: "https://relay.agentmbx.com", state: "connected", last_ack: "2026-10-07T16:00:00Z" },
+    key_ad_expiry: "2026-11-05T04:06:34.926Z",
+    account: "acct_owner",
+  },
+  devices: [
+    { host: "fedora", address: "10.0.10.136:7373", reachability: "paired", last_presence: "2026-10-07T15:58:00Z" },
+    { host: "mini", address: "10.0.10.20:7373", reachability: "unknown", last_presence: null },
+  ],
+  project: { directory: "/work/rich", lead: "agentmbx-lead", members: ["probe-staff", "agentmbx-lead"] },
+};
+
+test("T415: every v2 section renders from the shared fixture, pure and complete", () => {
+  const lines = renderSections(SHARED_V2);
+  assert.ok(lines);
+  const text = lines.join("\n");
+  assert.match(text, /^identity agentmbx-kimi\(builder\)/);
+  assert.match(text, /registration registered · lease kimi\/sess-fixture verified/);
+  assert.match(text, /inbox 2 unread · 1 needs reply · 0 from owner · 3 unsent/);
+  assert.match(text, /harness kimi sess-fixture · wake watcher · policy autonomous/);
+  assert.match(text, /cloud relay unset$/m, "nulls render as honest facts, never invented");
+  assert.match(text, /devices none paired/);
+  assert.match(text, /project \/work\/fixture · lead agentmbx-lead · members agentmbx-kimi/);
+});
+
+test("T415: populated cloud, devices and project render one line each", () => {
+  const lines = renderSections(RICH_V2)!;
+  assert.match(lines.join("\n"), /cloud relay connected \(https:\/\/relay\.agentmbx\.com\) · key ad until 2026-11-05 · account acct_owner/);
+  assert.match(lines.join("\n"), /device fedora at 10\.0\.10\.136:7373 \(paired\) · seen 2026-10-07 15:58/);
+  assert.match(lines.join("\n"), /device mini at 10\.0\.10\.20:7373 \(unknown\)/);
+  assert.match(lines.join("\n"), /project \/work\/rich · lead agentmbx-lead · members probe-staff, agentmbx-lead/);
+  assert.equal(renderSections(MINE), null, "v1 has no sections: the pane is a v2 surface");
+  assert.equal(renderSections(null), null);
+  assert.equal(renderSections({ service: "agentmbx" }), null);
+  assert.deepEqual(renderSections({ ...SHARED_V2, identity: { name: null, role: null, state: "unbound" } }), ["mbx unbound"]);
+});
+
+test("T415: the unread indicator — band marker and the persistent status line", () => {
+  assert.match(bandText("sess-fixture", SHARED_V2), /^● mbx agentmbx-kimi/, "unread mail marks the band");
+  const quiet = { ...SHARED_V2, inbox: { unread: 0, needs_reply: 0, from_owner: 0, outbox_unsent: 0 } };
+  assert.match(bandText("sess-fixture", quiet), /^mbx agentmbx-kimi/, "no unread: no marker");
+  assert.doesNotMatch(bandText("sess-fixture", quiet), /^●/);
+  assert.equal(statusLineText(SHARED_V2), "mbx: 2↑ 1↺");
+  assert.equal(statusLineText({ ...SHARED_V2, inbox: { ...SHARED_V2.inbox, from_owner: 1 } }), "mbx: 2↑ 1↺ owner:1");
+  assert.equal(statusLineText(quiet), null, "nothing to show: no status line");
+  assert.equal(statusLineText(MINE), null, "v1 has no indicator line; the band text still renders");
+});
+
+test("T415: register wires the pane, the command fallback, and passes foreign render sites through", async () => {
+  const handlers: Record<string, ((...args: unknown[]) => unknown)[]> = {};
+  const on = (event: string, matcherOrHook: unknown, hook?: unknown) => {
+    const fn = (typeof matcherOrHook === "function" ? matcherOrHook : hook) as (...args: unknown[]) => unknown;
+    const key = typeof matcherOrHook === "object" && matcherOrHook ? `${event}:${JSON.stringify(matcherOrHook)}` : event;
+    (handlers[key] ??= []).push(fn);
+  };
+  const uiLog: string[] = [];
+  const $ = {
+    env: { get: async (name: string) => (name === "CLAUDE_CODE_SESSION_ID" ? "sess-mine" : "") },
+    clock: { now: async () => 1_000, every: (ms: number, fn: () => unknown) => { handlers["timer"] = [fn]; return { cancel: () => {} }; } },
+    http: { fetch: async () => ({ ok: true, status: 200, text: JSON.stringify(SHARED_V2) }) },
+    command: { register: async (c: unknown) => { uiLog.push(`command:${(c as { name: string }).name}`); } },
+    ui: {
+      open: async (o: unknown) => { uiLog.push(`open:${(o as { id: string }).id}`); return { isPlaced: true }; },
+      toast: (t: string) => { uiLog.push(`toast:${t}`); },
+      status: (t: string) => { uiLog.push(`status:${t}`); },
+      invalidate: (s: string) => { uiLog.push(`invalidate:${s}`); },
+      resolve: (e: unknown) => ({
+        Box: (p: { children: unknown[] }) => ({ kind: "Box", children: p.children }),
+        Text: (p: { children: unknown[] }) => ({ kind: "Text", children: p.children }),
+      }),
+    },
+  };
+  register(on);
+  // the host fires session.start: the command registers and the indicator timer arms
+  await handlers["session.start"]![0]!($, {}, async () => "started");
+  assert.deepEqual(uiLog, ["command:mbx-status"]);
+
+  // /mbx-status: opens the pane and prints the full sections (the fallback surface)
+  const ran = handlers["command.run:{\"command\":\"mbx-status\"}"]![0]!;
+  const result = (await ran($, {})) as { text: string };
+  assert.deepEqual(uiLog.slice(1), ["open:mbx-status"]);
+  assert.match(result.text, /^identity agentmbx-kimi\(builder\)/);
+  assert.match(result.text, /inbox 2 unread · 1 needs reply/);
+  assert.match(result.text, /project \/work\/fixture/);
+
+  // the pane renders the same sections as a tree
+  const paneHook = handlers['ui.render:{"component":"Pane"}']![0]!;
+  const tree = (await paneHook($, { requestId: "mbx-status" }, async () => "passed-on")) as { kind: string; children: { children: string[] }[] };
+  assert.equal(tree.kind, "Box");
+  assert.match(tree.children.map((c) => c.children.join("")).join("\n"), /registration registered/);
+
+  // foreign panes and the hasSurvey band defer to the host
+  let passed = 0;
+  const passThrough = async () => { passed += 1; return "engine-ref"; };
+  await paneHook($, { requestId: "someone-else" }, passThrough);
+  assert.equal(passed, 1);
+  const bandHook = handlers['ui.render:{"component":"AbovePrompt"}']![0]!;
+  const band = (await bandHook($, { props: { hasSurvey: true } }, passThrough)) as string;
+  assert.equal(band, "engine-ref");
+  assert.equal(passed, 2);
+  const bandTree = (await bandHook($, { props: {} }, passThrough)) as { children: string[] };
+  assert.match(bandTree.children.join(""), /^● mbx agentmbx-kimi/);
+
+  // the indicator timer polls, pins the status line, and asks for a redraw
+  uiLog.length = 0;
+  await handlers["timer"]![0]!();
+  assert.ok(uiLog.includes("status:mbx: 2↑ 1↺"));
+  assert.ok(uiLog.includes("invalidate:ui.render"));
+  resetStatusState();
+});
+
+test("T415: the hooks module exposes the new surface for claude plugin validate", () => {
+  const source = readFileSync(new URL("../plugins/claude/hooks/register.js", import.meta.url), "utf8");
+  assert.match(source, /\$\.ui\.open\(\{ id: PANE_ID/);
+  assert.match(source, /\$\.ui\.status\(line\)/);
+  assert.match(source, /\$\.ui\.invalidate\("ui\.render"\)/);
+  assert.match(source, /\$\.clock\.every\(INDICATOR_MS/);
+  assert.match(source, /on\("ui\.render", \{ component: "Pane" \}/);
+  assert.equal(source.includes("setInterval"), false, "the sandbox has no timer globals: $.clock.every only");
 });
