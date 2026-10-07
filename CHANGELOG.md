@@ -3,6 +3,8 @@
 ## Unreleased
 
 - **Setup recognizes hooks after config comments are lost (T479).** Kimi doctor checks the hook event and command pairs, and setup adds only missing pairs when managed markers are absent, preserving existing hooks and user config. Hermes wiring is also checked by its hook commands, with regression coverage for unmarked and missing hooks.
+- **The daemon sync client signs with the enrolled cloud key (T468):** each `POST /v1/host/sync` sends `X-MBX-Host-Id`, `X-MBX-Timestamp` (unix seconds), `X-MBX-Nonce` (32 random bytes, base64url), and `X-MBX-Signature` (Ed25519, base64, the cloud key). The signed string is `agentmbx-sync-pop-v1`, the api origin, the host id, `POST`, `/v1/host/sync`, the sha256 of the exact body, the timestamp, and the nonce. Every attempt, including a retry of the same pending body, uses a fresh timestamp and nonce. No bearer is read or sent. The spoken contract stays version 1.
+- **The daemon serves one session's status to in-harness plugins (T407):** `GET /v1/status?cli=<cli>&session=<id>` on the local daemon returns that session's mbx.status snapshot, the same one `agentmbx status --json --schema mbx.status/v1` prints. Identity resolves by (cli, session) only, so it never shows another identity's mail; an unknown session gets an explicit unbound snapshot. Session reads are loopback-only; without parameters the route keeps its public runtime and challenge responses. The Claude mod and the OpenCode sidebar read this one route instead of computing status themselves.
 
 ## 0.5.16 (2026-10-07)
 

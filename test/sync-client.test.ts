@@ -1,16 +1,18 @@
 // T262: link gate, seq, backoff, resume, and the daemon loader's allowlist.
+import { createHash } from "node:crypto";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
-import { canonical, fingerprint, signData, ulid } from "../src/crypto.ts";
+import { CLOUD_ENROLMENT_FILE, CLOUD_KEY_FILE } from "../src/cloud-key.ts";
+import { canonical, fingerprint, generateKeyPair, signData, ulid, verifyData, type KeyPair } from "../src/crypto.ts";
 import { MbxNode } from "../src/node.ts";
 import { createOwnerKey, unlockOwnerKey } from "../src/owner.ts";
 import { acceptSigned, makePolicy } from "../src/policy.ts";
 import { makeLead, storeLead } from "../src/project-ledger.ts";
 import { registerIdentity } from "../src/registry.ts";
-import { LINK_KEY, STATE_KEY, postUrl, readLink, syncOnce, type Kv, type SyncLink } from "../src/sync-client.ts";
+import { LINK_KEY, STATE_KEY, newSyncNonce, postUrl, readLink, syncOnce, syncPopString, type Kv, type SyncLink, type SyncSigner } from "../src/sync-client.ts";
 import { loadSyncSnapshot, policyScope, syncTick } from "../src/sync-daemon.ts";
 import { PATH_FLAG_PREFIX, type AgentInput, type HostInput, type SyncSnapshot } from "../src/sync-projection.ts";
 
@@ -22,7 +24,30 @@ function mem(): Kv & { raw: Map<string, string> } {
   return { raw, get: (k) => raw.get(k), set: (k, v) => { raw.set(k, v); } };
 }
 function link(over: Partial<SyncLink> = {}): SyncLink {
-  return { v: 1, sync_url: "https://cloud.example/v1/host/sync", token: "sekret-token-value", contract: { min: 1, max: 1 }, ...over };
+  return { v: 1, sync_url: "https://cloud.example/v1/host/sync", contract: { min: 1, max: 1 }, ...over };
+}
+
+const FIXTURE = generateKeyPair();
+let popN = 0;
+const pop: SyncSigner = {
+  hostId: "host_test",
+  apiOrigin: "https://api.agentmbx.test",
+  sign: (message) => signData(FIXTURE.privateKey, message),
+  timestamp: () => 1_710_000_000 + popN,
+  nonce: () => Buffer.alloc(32, popN++).toString("base64url"),
+};
+
+function enrol(home: string, over: { api?: string; hostId?: string; key?: KeyPair } = {}): KeyPair {
+  const key = over.key ?? generateKeyPair();
+  writeFileSync(join(home, CLOUD_KEY_FILE), JSON.stringify(key) + "\n", { mode: 0o600 });
+  writeFileSync(join(home, CLOUD_ENROLMENT_FILE), JSON.stringify({
+    host_id: over.hostId ?? "host_test",
+    client_id: "client_test",
+    token_endpoint: "https://accounts.agentmbx.test/token",
+    jwks_uri: "https://accounts.agentmbx.test/jwks",
+    resources: { api: over.api ?? "https://api.agentmbx.test/ignored-path", relay: "https://relay.agentmbx.test" },
+  }) + "\n", { mode: 0o600 });
+  return key;
 }
 function host(): HostInput {
   return { daemon_version: "0.5.10", os: "macos", owner_fp: null, authority_owner: false, relay_enrolled: false, peers: [], findings: [] };
@@ -48,7 +73,7 @@ test("postUrl rewrites a websocket sync URL to HTTP", () => {
 
 test("no link means no fetch and no source call", async () => {
   let fetches = 0, sources = 0;
-  const result = await syncOnce({
+  const result = await syncOnce({ signer: pop,
     kv: mem(), now: 0,
     fetch: async () => { fetches++; return ok(1); },
     source: () => { sources++; return body(); },
@@ -63,7 +88,7 @@ test("a contract range that excludes version 1 makes no network call", async () 
   kv.set(LINK_KEY, JSON.stringify(link({ contract: { min: 2, max: 4 } })));
   const audits: string[] = [];
   let fetches = 0;
-  const result = await syncOnce({
+  const result = await syncOnce({ signer: pop,
     kv, now: 0, fetch: async () => { fetches++; return ok(1); }, source: () => body(),
     audit: (event) => { audits.push(event); },
   });
@@ -76,7 +101,7 @@ test("over cap does not fetch", async () => {
   const kv = mem();
   kv.set(LINK_KEY, JSON.stringify(link()));
   let fetches = 0;
-  const result = await syncOnce({
+  const result = await syncOnce({ signer: pop,
     kv, now: 0, fetch: async () => { fetches++; return ok(1); },
     source: () => ({ ...body(), agents: Array.from({ length: 501 }, () => ({ name: "worker" } as AgentInput)) }),
   });
@@ -88,12 +113,15 @@ test("seq resumes the same bytes, then a delta, and a path command does not chan
   const kv = mem();
   kv.set(LINK_KEY, JSON.stringify(link({ sync_url: "wss://cloud.example/v1/host/sync", project_paths: true })));
   const absolute = "/Users/zzadaqq/work/zzadaqq/repo";
-  const sent: { url: string; body: string; auth: string }[] = [];
+  const sent: { url: string; body: string; auth: string | undefined; host: string | undefined; sig: string | undefined }[] = [];
   let sources = 0;
   let step = 0;
   const fetch: typeof globalThis.fetch = async (input, init) => {
     const headers = init?.headers as Record<string, string>;
-    sent.push({ url: String(input), body: String(init?.body), auth: headers.authorization });
+    sent.push({
+      url: String(input), body: String(init?.body), auth: headers.authorization,
+      host: headers["X-MBX-Host-Id"], sig: headers["X-MBX-Signature"],
+    });
     step++;
     if (step === 1) throw new Error("reset");
     if (step === 2) return ok(1, { commands: [{ key: `${PATH_FLAG_PREFIX}${KEY}`, value: "1" }, { local_path: absolute }] });
@@ -103,22 +131,24 @@ test("seq resumes the same bytes, then a delta, and a path command does not chan
     sources++;
     return { ...body(), paths: [{ project_key: KEY, absolute, home: "/Users/zzadaqq", username: "zzadaqq", windows: false }] };
   };
-  const first = await syncOnce({ kv, fetch, now: 0, source });
+  const first = await syncOnce({ signer: pop, kv, fetch, now: 0, source });
   assert.deepEqual(first, { outcome: "retry", seq: 1 });
   assert.equal(sources, 1);
   assert.equal(JSON.parse(kv.get(STATE_KEY)!).snapshot_hash, undefined);
-  const second = await syncOnce({ kv, fetch, now: 5_000, source });
+  const second = await syncOnce({ signer: pop, kv, fetch, now: 5_000, source });
   assert.deepEqual(second, { outcome: "acked", seq: 1 });
   assert.equal(sources, 1, "a drop before ack resends the stored bytes");
   assert.equal(sent[0].body, sent[1].body);
   assert.equal(sent[1].url, "https://cloud.example/v1/host/sync");
-  assert.equal(sent[1].auth, "Bearer sekret-token-value");
-  assert.equal(sent[1].body.includes("sekret-token-value"), false);
+  assert.equal(sent[1].auth, undefined);
+  assert.equal(sent[1].host, "host_test");
+  assert.equal(typeof sent[1].sig, "string");
+  assert.equal(sent[1].body.includes("Bearer"), false);
   assert.equal(sent[1].body.includes("zzadaqq"), false);
   assert.equal(sent[1].body.includes("project_paths"), false);
   assert.equal(JSON.parse(sent[1].body).full, true);
   assert.equal([...kv.raw.keys()].some((k) => k.startsWith(PATH_FLAG_PREFIX)), false);
-  const third = await syncOnce({ kv, fetch, now: 20_000, source });
+  const third = await syncOnce({ signer: pop, kv, fetch, now: 20_000, source });
   assert.equal(third.outcome, "acked");
   assert.equal(JSON.parse(sent[2].body).full, false);
   assert.equal(sources, 2);
@@ -135,10 +165,10 @@ test("429 waits at least the last next_sync_seconds and never more than 300s", a
     const header = n === 2 ? "1" : "1000";
     return new Response(JSON.stringify({ ack_seq: 1 }), { status: 429, headers: { "retry-after": header } });
   };
-  await syncOnce({ kv, fetch, now: 1_000, source: () => body() });
-  await syncOnce({ kv, fetch, now: 1_000 + 40_000, source: () => body() });
+  await syncOnce({ signer: pop, kv, fetch, now: 1_000, source: () => body() });
+  await syncOnce({ signer: pop, kv, fetch, now: 1_000 + 40_000, source: () => body() });
   waits.push(JSON.parse(kv.get(STATE_KEY)!).next_at);
-  await syncOnce({ kv, fetch, now: waits[0], source: () => body() });
+  await syncOnce({ signer: pop, kv, fetch, now: waits[0], source: () => body() });
   const afterCap = JSON.parse(kv.get(STATE_KEY)!).next_at as number;
   assert.equal(waits[0], 1_000 + 40_000 + 40_000, "Retry-After 1s cannot outrun the 40s floor");
   assert.equal(afterCap - waits[0], 300_000);
@@ -158,9 +188,9 @@ test("401 retries the same seq and 409 forces a new full snapshot at ack+1", asy
     assert.equal(batch.full, true);
     return ok(batch.seq);
   };
-  await syncOnce({ kv, fetch, now: 0, source: () => body() });
-  await syncOnce({ kv, fetch, now: 5_000, source: () => body() });
-  const result = await syncOnce({ kv, fetch, now: 5_000, source: () => body() });
+  await syncOnce({ signer: pop, kv, fetch, now: 0, source: () => body() });
+  await syncOnce({ signer: pop, kv, fetch, now: 5_000, source: () => body() });
+  const result = await syncOnce({ signer: pop, kv, fetch, now: 5_000, source: () => body() });
   assert.deepEqual(seqs, [1, 1, 8]);
   assert.deepEqual(result, { outcome: "acked", seq: 8 });
 });
@@ -209,6 +239,7 @@ test("the daemon tick stays silent without a link, and a linked tick does not se
   process.env.MBX_RELAY_URL = "https://relay.example/SECRETRELAY-9f3a";
   t.after(() => { if (previous === undefined) delete process.env.MBX_RELAY_URL; else process.env.MBX_RELAY_URL = previous; });
   n.store.set(LINK_KEY, JSON.stringify(link({ project_paths: true })));
+  enrol(n.home);
   let posted = "";
   const result = await syncTick(n, {
     now: 0, projectKeyOf: keyOf,
@@ -248,6 +279,7 @@ test("a local policy path is not sent and an invalid policy reason is not sent",
   const rec = makePolicy({ level: "collaborate", agents: ["worker"], hosts: ["alpha"], projects: [secret, KEY], ownerPub: owner.publicKey });
   assert.equal(acceptSigned(n.store.db, { rec, sig: signData(owner.privateKey, canonical(rec)) }, n.host), null);
   n.store.set(LINK_KEY, JSON.stringify(link()));
+  enrol(home);
   let posted = "";
   const result = await syncTick(n, {
     now: 0, projectKeyOf: () => undefined,
@@ -281,7 +313,7 @@ test("a console command that names project_leads is refused", async () => {
   const kv = mem();
   kv.set(LINK_KEY, JSON.stringify(link()));
   const audits: string[] = [];
-  const result = await syncOnce({
+  const result = await syncOnce({ signer: pop,
     kv, now: 0, fetch: async () => ok(1, { commands: [{ op: "set", project_leads: true }] }), source: () => body(),
     audit: (event, detail) => { audits.push(`${event}:${String(detail.code)}`); },
   });
@@ -314,4 +346,156 @@ test("loadSyncSnapshot keeps one allowlisted lead per project key and drops a pr
   const expired = makeLead({ project: `${homedir()}/expired`, agent: "stale-lead", host: "alpha", ownerPub: owner.publicKey, now: new Date(Date.now() - 10_000), ttlMs: 1000 });
   storeLead(n, expired, signData(owner.privateKey, canonical(expired)));
   assert.equal(loadSyncSnapshot(n, { contractAllowsProjectPaths: false }, keyOf).leads.length, 1);
+});
+
+function popLines(input: { apiOrigin: string; hostId: string; body: string; timestamp: string; nonce: string }): string {
+  const hash = createHash("sha256").update(input.body).digest("hex");
+  return ["agentmbx-sync-pop-v1", input.apiOrigin, input.hostId, "POST", "/v1/host/sync", hash, input.timestamp, input.nonce].join("\n");
+}
+
+test("POST /v1/host/sync is signed with the frozen sync-pop-v1 string", async () => {
+  const key = generateKeyPair();
+  let n = 0;
+  const signer: SyncSigner = {
+    hostId: "host_exact",
+    apiOrigin: "https://api.agentmbx.test",
+    sign: (message) => signData(key.privateKey, message),
+    timestamp: () => 1_710_000_000 + n,
+    nonce: () => Buffer.alloc(32, n++).toString("base64url"),
+  };
+  const kv = mem();
+  kv.set(LINK_KEY, JSON.stringify(link()));
+  let captured: { headers: Record<string, string>; body: string } | undefined;
+  const result = await syncOnce({
+    signer, kv, fetch: async (_url, init) => {
+      captured = { headers: init?.headers as Record<string, string>, body: String(init?.body) };
+      return ok(1);
+    }, now: 0, source: () => body(),
+  });
+  assert.equal(result.outcome, "acked");
+  assert.ok(captured);
+  const timestamp = "1710000000";
+  const nonce = Buffer.alloc(32, 0).toString("base64url");
+  const message = popLines({ apiOrigin: "https://api.agentmbx.test", hostId: "host_exact", body: captured.body, timestamp, nonce });
+  assert.equal(message.endsWith("\n"), false);
+  assert.equal(syncPopString({ apiOrigin: "https://api.agentmbx.test", hostId: "host_exact", body: captured.body, timestamp, nonce }), message);
+  assert.equal(captured.headers["content-type"], "application/json");
+  assert.equal(captured.headers["X-MBX-Host-Id"], "host_exact");
+  assert.equal(captured.headers["X-MBX-Timestamp"], timestamp);
+  assert.equal(captured.headers["X-MBX-Nonce"], nonce);
+  assert.equal(captured.headers.authorization, undefined);
+  assert.equal(captured.headers.Authorization, undefined);
+  assert.equal(verifyData(key.publicKey, message, captured.headers["X-MBX-Signature"]), true);
+});
+
+test("a retried pending body is signed again with a fresh timestamp and nonce", async () => {
+  const key = generateKeyPair();
+  let n = 7;
+  const signer: SyncSigner = {
+    hostId: "host_retry",
+    apiOrigin: "https://api.agentmbx.test",
+    sign: (message) => signData(key.privateKey, message),
+    timestamp: () => 1_710_000_000 + n,
+    nonce: () => Buffer.alloc(32, n++).toString("base64url"),
+  };
+  const kv = mem();
+  kv.set(LINK_KEY, JSON.stringify(link()));
+  const seen: { body: string; timestamp: string; nonce: string; sig: string }[] = [];
+  const fetch: typeof globalThis.fetch = async (_url, init) => {
+    const headers = init?.headers as Record<string, string>;
+    seen.push({
+      body: String(init?.body),
+      timestamp: headers["X-MBX-Timestamp"] ?? "",
+      nonce: headers["X-MBX-Nonce"] ?? "",
+      sig: headers["X-MBX-Signature"] ?? "",
+    });
+    return seen.length === 1 ? ok(0, {}, 500) : ok(1);
+  };
+  const first = await syncOnce({ signer, kv, fetch, now: 0, source: () => body() });
+  assert.equal(first.outcome, "retry");
+  const second = await syncOnce({ signer, kv, fetch, now: 60_000, source: () => body() });
+  assert.equal(second.outcome, "acked");
+  assert.equal(seen.length, 2);
+  assert.equal(seen[0]!.body, seen[1]!.body);
+  assert.notEqual(seen[0]!.nonce, seen[1]!.nonce);
+  assert.notEqual(seen[0]!.timestamp, seen[1]!.timestamp);
+  for (const row of seen) {
+    const message = popLines({ apiOrigin: "https://api.agentmbx.test", hostId: "host_retry", body: row.body, timestamp: row.timestamp, nonce: row.nonce });
+    assert.equal(verifyData(key.publicKey, message, row.sig), true);
+  }
+});
+
+test("newSyncNonce is 32 bytes of base64url", () => {
+  const a = newSyncNonce();
+  const b = newSyncNonce();
+  assert.equal(Buffer.from(a, "base64url").length, 32);
+  assert.notEqual(a, b);
+  assert.match(a, /^[A-Za-z0-9_-]+$/);
+});
+
+test("readLink ignores a stored bearer and the request sends none", async () => {
+  const kv = mem();
+  kv.set(LINK_KEY, JSON.stringify({ ...link(), token: "sekret-token-value" }));
+  const got = readLink(kv.get.bind(kv));
+  assert.ok(got);
+  assert.equal("token" in got, false);
+  let auth: string | undefined = "unset";
+  const result = await syncOnce({
+    signer: pop, kv, fetch: async (_url, init) => {
+      const headers = init?.headers as Record<string, string>;
+      auth = headers.authorization ?? headers.Authorization;
+      return ok(1);
+    }, now: 0, source: () => body(),
+  });
+  assert.equal(result.outcome, "acked");
+  assert.equal(auth, undefined);
+  assert.equal(kv.raw.get(LINK_KEY)?.includes("sekret-token-value"), true);
+});
+
+test("syncOnce does not fetch when no signer is injected", async () => {
+  const kv = mem();
+  kv.set(LINK_KEY, JSON.stringify(link()));
+  let fetches = 0;
+  const result = await syncOnce({
+    kv, fetch: async () => { fetches += 1; return ok(1); }, now: 0, source: () => body(),
+  });
+  assert.equal(result.outcome, "unlinked");
+  assert.equal(fetches, 0);
+});
+
+test("a linked daemon tick does not fetch without enrolment and the cloud key", async (t) => {
+  const n = tempNode(t);
+  let fetches = 0;
+  n.store.set(LINK_KEY, JSON.stringify(link()));
+  const result = await syncTick(n, { fetch: async () => { fetches += 1; return ok(1); }, now: 0 });
+  assert.equal(result.outcome, "unlinked");
+  assert.equal(fetches, 0);
+});
+
+test("the daemon tick signs the api origin and sends no bearer", async (t) => {
+  const n = tempNode(t);
+  const key = enrol(n.home, { api: "https://api.agentmbx.test/ignored-path" });
+  let captured: { headers: Record<string, string>; body: string } | undefined;
+  n.store.set(LINK_KEY, JSON.stringify(link()));
+  const result = await syncTick(n, {
+    fetch: async (_url, init) => {
+      captured = { headers: init?.headers as Record<string, string>, body: String(init?.body) };
+      return ok(1);
+    },
+    now: 1_710_000_000_000,
+  });
+  assert.equal(result.outcome, "acked");
+  assert.ok(captured);
+  assert.equal(captured.headers.authorization, undefined);
+  assert.equal(captured.headers["X-MBX-Host-Id"], "host_test");
+  assert.equal(captured.headers["X-MBX-Timestamp"], "1710000000");
+  const message = popLines({
+    apiOrigin: "https://api.agentmbx.test",
+    hostId: "host_test",
+    body: captured.body,
+    timestamp: captured.headers["X-MBX-Timestamp"] ?? "",
+    nonce: captured.headers["X-MBX-Nonce"] ?? "",
+  });
+  assert.equal(message.includes("/ignored-path"), false);
+  assert.equal(verifyData(key.publicKey, message, captured.headers["X-MBX-Signature"] ?? ""), true);
 });
