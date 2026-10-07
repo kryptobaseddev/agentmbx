@@ -207,6 +207,34 @@ test("T391 v2 setup: ctx.event.subscribe drives session-start and stop; ctx.tool
   } finally { restoreSpawn(); restoreFetch(); rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("T466 OpenCode 2.0.24 turn end is session.execution.succeeded with data.sessionID and no location", async () => {
+  const { mod, dir } = await loadPlugin();
+  const calls: Spawned[] = [], posts: SyntheticPost[] = [];
+  const restoreSpawn = stubSpawn(calls, () => JSON.stringify({ decision: "block", reason: "[mbx] 1 new message(s) for worker." }));
+  const restoreFetch = stubSynthetic(posts);
+  try {
+    // Captured from ctx.event.subscribe on OpenCode 2.0.24. There is no location and no session.idle.
+    await (mod.default.setup as (c: unknown) => Promise<unknown>)({
+      location: { directory: "/work" },
+      event: { subscribe: async function* () {
+        yield {
+          type: "session.execution.succeeded",
+          data: { sessionID: "ses_t466frame" },
+          durable: { aggregateID: "ses_t466frame", seq: 1, version: "1" },
+        };
+      } },
+      tool: { hook: () => undefined },
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    const stops = calls.filter((c) => c.args[1] === "stop");
+    assert.equal(stops.length, 1, "one stop for the one turn-end frame");
+    assert.equal(stops[0]?.input.session_id, "ses_t466frame");
+    assert.equal(calls.filter((c) => c.args[1] === "session-start" || c.args[1] === "post-tool").length, 0, "the turn-end frame is not a session-start or post-tool");
+    assert.equal(posts.length, 1, "one synthetic continuation for that stop");
+    assert.ok(posts[0]?.url.endsWith("/api/session/ses_t466frame/synthetic"));
+  } finally { restoreSpawn(); restoreFetch(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("T391 B4(a): v1 factory session.created runs session-start with the sid (generated plugin)", async () => {
   const { mod, dir } = await loadPlugin();
   const calls: Spawned[] = [], posts: SyntheticPost[] = [];

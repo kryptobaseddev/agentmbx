@@ -22,6 +22,21 @@ import type { IdentityLease } from "./identity-leases.ts";
 export type Level = "ok" | "fail" | "warn" | "info";
 export interface Check { level: Level; label: string; fix?: string }
 
+export const CLAIM_CHURN_LIMIT = 5;
+/** Ten-minute claim/release storms indicate connector fights, not useful session work. */
+export function identityClaimChurn(node: MbxNode, now = Date.now()): Check[] {
+  const rows = node.store.db.prepare("SELECT detail FROM audit WHERE event='identity.claim' AND at>=? ORDER BY at")
+    .all(new Date(now - 10 * 60_000).toISOString()) as { detail: string }[];
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    try { const name = JSON.parse(row.detail).name; if (typeof name === "string") counts.set(name, (counts.get(name) ?? 0) + 1); }
+    catch { /* malformed historical audit is not a claim */ }
+  }
+  return [...counts].filter(([, count]) => count > CLAIM_CHURN_LIMIT).map(([name, count]) => ({ level: "warn",
+    label: `${name}: identity claim/release churn (${count} claims in 10 minutes; limit ${CLAIM_CHURN_LIMIT}); reconnecting or competing MCP connectors may be fighting the lease`,
+    fix: "update AgentMBX and reconnect with the harness MCP controls; same-session connectors co-use the lease. Never kill MBX MCPs, hand-spawn agentmbx mcp, or force-takeover your own live session; use exact-session diagnostics and the mailbox CLI --as instead" }));
+}
+
 export const VERSION = (() => {
   try { return (JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version; } catch { return "unknown"; }
 })();
@@ -363,6 +378,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     // T211: mailboxes nobody is holding, sessions waiting on a remembered identity, prune weight
     for (const c of strandedMail(node)) out.push(c);
     for (const c of pendingIdentities(node)) out.push(c);
+    for (const c of identityClaimChurn(node)) out.push(c);
     out.push(pruneSummary(node));
     const peers = node.peers();
     const approved = peers.filter((p) => p.state === "approved");
