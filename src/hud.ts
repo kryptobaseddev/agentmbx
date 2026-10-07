@@ -6,9 +6,13 @@
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { activePolicies } from "./policy.ts";
-import { registeredIdentity } from "./registry.ts";
+import { registeredIdentity, projectIdentities, projectOf } from "./registry.ts";
+import { projectLeadView } from "./lead-record.ts";
+import { identityLeaseStatus, inspectLeaseProcess, inspectLeaseProcesses, type IdentityLease } from "./identity-leases.ts";
+import { relayFor } from "./relay-client.ts";
+import { relayState } from "./relay-v2.ts";
 import { resolveStatusIdentity } from "./status-identity.ts";
-import { inspectLeaseProcesses } from "./identity-leases.ts";
+import { STATUS_V2_SCHEMA, type StatusV2 } from "./status-schema.ts";
 import { sweepPostToolMarkers } from "./posttool.ts";
 import { procStart } from "./proc.ts";
 import { updateAvailable } from "./update.ts";
@@ -190,4 +194,86 @@ export function writeHud(node: MbxNode, now = Date.now()): void {
   // Heartbeat: adapters refuse to render from a snapshot older than HUD_ALIVE_MAX_MS.
   const alive = String(now);
   try { if (readFileSync(hudAlivePath(node.home), "utf8") !== alive) writeFileSync(hudAlivePath(node.home), alive, { mode: 0o600 }); } catch { writeFileSync(hudAlivePath(node.home), alive, { mode: 0o600 }); }
+}
+
+/** How a cli session is woken when mail wants it; informational, from the cli's wiring (src/wake.ts). */
+const WAKE_PATH: Record<string, string> = {
+  claude: "channel", // pushed through the session's inbox socket (sessions.channel)
+  codex: "queue", // `codex queue`
+  opencode: "api", // service API synthetic endpoint
+  kimi: "watcher", // terminal Kimi wakes through `agentmbx watch`; the desktop app has its own socket
+  hermes: "watcher", // the Hermes bg-process watcher is the wake path (T460)
+  grok: "watcher", // Grok wakes through `agentmbx watch` (T435)
+  copilot: "none",
+  cursor: "none",
+  gemini: "none",
+};
+
+/**
+ * The mbx.status/v2 emitter (T404): one v2 snapshot for a (cli, session) pair, built on top of the v1
+ * hudStatus snapshot so the two schemas never disagree on counts. Identity resolution is the caller's
+ * (the T310 resolver at every call site): an unbound session yields an explicit unbound result, never an
+ * error and never another identity's mailbox. Served by the T407 loopback endpoint and `agentmbx status
+ * --schema mbx.status/v2` (T406); `sessionId` may be null for pid-resolved CLI calls, which skip the
+ * lease/session-row lookups that need a session id.
+ */
+export function hudStatusV2(node: MbxNode, o: {
+  cli: string;
+  sessionId: string | null;
+  agent: string | null;
+  state: HudStatus["identity"]["state"];
+  resolvedBy: HudResolvedBy;
+  candidates?: string[];
+}): StatusV2 {
+  const v1 = hudStatus(node, { agent: o.agent, state: o.state, resolvedBy: o.resolvedBy, candidates: o.candidates });
+  const name = o.agent;
+  const sessionRow = o.sessionId
+    ? node.store.db.prepare("SELECT cwd, channel FROM sessions WHERE cli=? AND session_id=?").get(o.cli, o.sessionId) as { cwd: string | null; channel: number } | undefined
+    : undefined;
+  const leaseRow = name && o.sessionId
+    ? node.store.db.prepare("SELECT * FROM identity_leases WHERE name=? AND cli=? AND session_id=? AND released_at IS NULL")
+        .get(name, o.cli, o.sessionId) as IdentityLease | undefined
+    : undefined;
+  const projectDir = sessionRow?.cwd ? projectOf(sessionRow.cwd) : undefined;
+  const relayUrl = relayFor(node);
+  const relay = relayUrl ? relayState(node, relayUrl) : null;
+  return {
+    schema: STATUS_V2_SCHEMA,
+    mbx_version: v1.mbx_version,
+    identity: v1.identity,
+    registration: {
+      registered: name ? registeredIdentity(node.store, name) !== null : false,
+      lease: leaseRow
+        ? {
+            holder_cli: leaseRow.cli,
+            holder_session: leaseRow.session_id,
+            verified: identityLeaseStatus(leaseRow, Date.now(), inspectLeaseProcess(leaseRow.holder_pid)).state === "live",
+          }
+        : null,
+    },
+    inbox: { unread: v1.unread, needs_reply: v1.needs_reply, from_owner: v1.from_owner, outbox_unsent: v1.outbox_unsent },
+    harness: {
+      cli: o.cli,
+      session_id: o.sessionId,
+      wake_path: name ? (sessionRow?.channel ? "channel" : (WAKE_PATH[o.cli] ?? "none")) : "none",
+      policy: v1.policy,
+    },
+    cloud: relayUrl
+      ? {
+          relay: { url: relayUrl, state: relay?.state ?? "unreachable", last_ack: relay?.at ?? null },
+          key_ad_expiry: relay?.enc_ad_exp ?? null,
+          account: null, // no daemon-side account link until the cloud sync client (T402)
+        }
+      : { relay: { url: null, state: "unset", last_ack: null }, key_ad_expiry: null, account: null },
+    devices: node.peers().filter((p) => p.state === "approved").map((p) => ({
+      host: p.host,
+      address: p.addr,
+      reachability: "unknown", // no presence probe behind this; last LAN contact is not tracked yet
+      last_presence: null,
+    })),
+    project: name && projectDir
+      ? { directory: projectDir, lead: projectLeadView(node, projectDir).address, members: [...projectIdentities(node.store, projectDir)].sort() }
+      : null,
+    resolved_by: v1.resolved_by,
+  };
 }
