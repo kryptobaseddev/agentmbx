@@ -54,13 +54,13 @@ test("a fresh session is unbound until it registers a chosen name and role; mail
   assert.notEqual(inbox.isError, true, textOf(inbox));
   const empty = json(inbox);
   assert.deepEqual([empty.agent, empty.unbound, empty.messages, empty.pending], [null, true, [], null]);
-  assert.match(String(empty.next), /no mbx identity yet.*mbx_identity \{"action":"list"\}.*claim.*register/s);
+  assert.match(String(empty.next), /no mailbox identity yet.*No mailboxes for this directory.*\"action\":\"claim\".*\"action\":\"register\"/s);
   assert.equal(empty.next, who.next, "the same next step mbx_whoami gives");
-  assert.match(textOf(inbox), /^No inbox yet: This session has no mbx identity yet\./);
+  assert.match(textOf(inbox), /^No inbox yet: This session has no mailbox identity yet\./);
   for (const [name, args] of [["mbx_read", { ids: ["000000"] }], ["mbx_ack", { ids: ["000000"] }], ["mbx_send", { to: ["x"], subject: "s", body: "b" }], ["mbx_replay", {}]] as const) {
     const refused = await c.callTool({ name, arguments: args });
     assert.equal(refused.isError, true, `${name} still needs an identity`);
-    assert.match(textOf(refused), /no mbx identity yet.*mbx_identity \{"action":"list"\}/s, name);
+    assert.match(textOf(refused), /no mailbox identity yet.*No mailboxes for this directory/s, name);
   }
 
   const noRole = await c.callTool({ name: "mbx_identity", arguments: { action: "register", name: "orbit-lead" } });

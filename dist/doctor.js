@@ -15,9 +15,37 @@ import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.js";
 import { detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConsent, skillDest, skillStatus, statuslineConfiguredCommand, statuslineForms, statuslineState, wired } from "./setup.js";
 import { mailboxLiveness } from "./receipts.js";
 import { liveWatcher } from "./wake.js";
-import { listIdentityControls } from "./identity-control.js";
+import { findIdentityControl, listIdentityControls } from "./identity-control.js";
 import { pruneCandidates } from "./identity-cleanup.js";
+import { inspectLeaseProcess } from "./identity-leases.js";
+import { providerLabel, sameLiveProvider } from "./identity-takeover.js";
 export const CLAIM_CHURN_LIMIT = 5;
+/** T481: one session id leased by an MCP under a different OpenCode serve than the published control endpoint. */
+export function foreignSessionProvider(node) {
+    const rows = node.store.db.prepare("SELECT * FROM identity_leases WHERE released_at IS NULL").all();
+    const out = [];
+    for (const row of rows) {
+        let claimant;
+        try {
+            claimant = findIdentityControl(node.store, row.cli, row.session_id);
+        }
+        catch {
+            continue;
+        }
+        const evidence = inspectLeaseProcess(row.holder_pid);
+        if (!(evidence.alive === true && evidence.start === row.holder_start))
+            continue;
+        if (sameLiveProvider(row.holder_pid, claimant))
+            continue;
+        const last = new Date(row.heartbeat_at).toISOString();
+        out.push({
+            level: "warn",
+            label: `${row.cli} session ${row.session_id} is leased by pid ${row.holder_pid} under provider ${providerLabel(row.holder_pid)} (last activity ${last}), while this session's control endpoint is pid ${claimant.mcp_pid} under provider ${providerLabel(claimant.mcp_pid)}`,
+            fix: `agentmbx identity takeover --force ${row.name} --cli ${row.cli} --session ${row.session_id}`,
+        });
+    }
+    return out;
+}
 /** Ten-minute claim/release storms indicate connector fights, not useful session work. */
 export function identityClaimChurn(node, now = Date.now()) {
     const rows = node.store.db.prepare("SELECT detail FROM audit WHERE event='identity.claim' AND at>=? ORDER BY at")
@@ -204,6 +232,76 @@ export function pruneSummary(node) {
         ? { level: "warn", label: `${retire.length} generated mailbox(es) with no holder, no unread mail and no recent traffic would be retired`, fix: "review the list: agentmbx identity prune   (a dry run), then apply it: agentmbx identity prune --apply" }
         : { level: "info", label: "no generated mailboxes eligible for prune" };
 }
+/** OpenCode's LocationActivity drops an idle service about every 60 minutes, and the plugin then releases and claims again.
+ *  A claim within ~65 minutes of its release, with those pairs about 61 minutes apart, is that eviction. One restart is not.
+ *  Only the last 24 hours of audit rows are read. */
+const EVICT_FOLLOW_MS = 65 * 60 * 1000;
+const EVICT_REPEAT_MIN_MS = 50 * 60 * 1000;
+const EVICT_REPEAT_MAX_MS = 75 * 60 * 1000;
+const EVICT_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+/** Info when an OpenCode holder's audit shows the hourly release/claim signature. Silent otherwise. Not an install failure. */
+export function opencodeEvictionCheck(db) {
+    const since = new Date(Date.now() - EVICT_LOOKBACK_MS).toISOString();
+    const rows = db.prepare("SELECT at, event, detail FROM audit WHERE event IN ('identity.release', 'identity.claim') AND at > ? ORDER BY at").all(since);
+    const byName = new Map();
+    for (const row of rows) {
+        if (!row || typeof row !== "object")
+            continue;
+        const rec = row;
+        if (typeof rec.at !== "string" || (rec.event !== "identity.release" && rec.event !== "identity.claim"))
+            continue;
+        const t = Date.parse(rec.at);
+        if (!Number.isFinite(t))
+            continue;
+        let detail;
+        try {
+            detail = typeof rec.detail === "string" ? JSON.parse(rec.detail) : null;
+        }
+        catch {
+            continue;
+        }
+        if (!detail || typeof detail !== "object")
+            continue;
+        const parsed = detail;
+        if (parsed.holder?.cli !== "opencode" || typeof parsed.name !== "string" || parsed.name === "")
+            continue;
+        const list = byName.get(parsed.name) ?? [];
+        list.push({ t, kind: rec.event === "identity.release" ? "release" : "claim" });
+        byName.set(parsed.name, list);
+    }
+    for (const events of byName.values()) {
+        if (!hourlyOpencodeEviction(events))
+            continue;
+        return {
+            level: "info",
+            label: "opencode: identity.release then identity.claim about every 61 minutes is OpenCode evicting its idle service (LocationActivity timeToLive). That is known upstream behaviour, not a broken install. During the gap, mailbox tools fail closed until the service is touched again; waking the agent still works.",
+            fix: "Any OpenCode command restarts the service. The durable fix is upstream: a configurable LocationActivity timeToLive, or an exemption for the MCP server.",
+        };
+    }
+    return null;
+}
+function hourlyOpencodeEviction(events) {
+    const pairs = [];
+    let pending = null;
+    for (const event of events) {
+        if (event.kind === "release") {
+            pending = event.t;
+            continue;
+        }
+        if (pending === null)
+            continue;
+        const follow = event.t - pending;
+        if (follow > 0 && follow <= EVICT_FOLLOW_MS)
+            pairs.push(pending);
+        pending = null;
+    }
+    for (let i = 1; i < pairs.length; i++) {
+        const between = pairs[i] - pairs[i - 1];
+        if (between >= EVICT_REPEAT_MIN_MS && between <= EVICT_REPEAT_MAX_MS)
+            return true;
+    }
+    return false;
+}
 /** T368: static verification of one CLI's status line integration. Optional and never fails doctor.
  *  "ours" must be a CURRENT form — an older recognized form is a warn with the upgrade fix, as is
  *  ours pointing at a deleted bundled script. "foreign" is info, unless the foreign command embeds
@@ -387,6 +485,11 @@ export async function doctor(ctx, mbxHome, opts = {}) {
             if (c)
                 out.push(c);
         }
+        if (d.cli === "opencode" && node) {
+            const c = opencodeEvictionCheck(node.store.db);
+            if (c)
+                out.push(c);
+        }
         // T460: its own function too (the T435 rule): a refused hooks layout and the not-approved state are Hermes facts.
         if (d.cli === "hermes")
             for (const c of hermesHooksChecks(ctx))
@@ -446,6 +549,8 @@ export async function doctor(ctx, mbxHome, opts = {}) {
         for (const c of pendingIdentities(node))
             out.push(c);
         for (const c of identityClaimChurn(node))
+            out.push(c);
+        for (const c of foreignSessionProvider(node))
             out.push(c);
         out.push(pruneSummary(node));
         const peers = node.peers();
