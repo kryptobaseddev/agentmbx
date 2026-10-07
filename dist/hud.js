@@ -24,6 +24,9 @@ export const hudDir = (home) => join(home, "hud");
 export const hudSessionPath = (home, cli, sessionId) => join(hudDir(home), `${cli}-${sessionId}.json`);
 /** Pid snapshots carry cli, pid AND birth time: two processes started in the same second never collide. */
 export const hudPidPath = (home, cli, pid, start) => join(hudDir(home), `${cli}-pid-${pid}-${start.replaceAll(/[^0-9A-Za-z_-]/g, "")}.json`);
+/** V2 siblings leave the v1 cache contract and one-cat line adapters unchanged. */
+export const hudSessionV2Path = (home, cli, sessionId) => hudSessionPath(home, cli, sessionId).replace(/\.json$/, ".v2.json");
+export const hudPidV2Path = (home, cli, pid, start) => hudPidPath(home, cli, pid, start).replace(/\.json$/, ".v2.json");
 export const hudSessionLinePath = (home, cli, sessionId) => join(hudDir(home), `${cli}-${sessionId}.line`);
 export const hudPidLinePath = (home, cli, pid, start) => join(hudDir(home), `${cli}-pid-${pid}-${start.replaceAll(/[^0-9A-Za-z_-]/g, "")}.line`);
 export const hudAlivePath = (home) => join(hudDir(home), ".alive");
@@ -108,7 +111,15 @@ export function writeHud(node, now = Date.now()) {
     const rows = node.store.db.prepare(`SELECT agent, cli, session_id, pid, pid_start, updated_at FROM sessions
     WHERE session_id NOT LIKE 'mcp-%'`).all();
     const wanted = new Set();
-    const perAgent = new Map(); // computed once per agent, not per row (review low 8)
+    const perAgent = new Map(); // mailbox/authority/policy counts once per agent
+    const snapshotFor = (name, resolvedBy) => {
+        let base = perAgent.get(name);
+        if (!base) {
+            base = hudStatus(node, { agent: name, state: "bound", resolvedBy });
+            perAgent.set(name, base);
+        }
+        return { ...base, resolved_by: resolvedBy };
+    };
     const pidDone = new Set();
     // One ps for every distinct pid, not one per row (review low 4).
     const pids = [...new Set(rows.map((r) => r.pid).filter((p) => !!p))];
@@ -138,14 +149,21 @@ export function writeHud(node, now = Date.now()) {
             const resolved = resolveStatusIdentity(node, row.cli, { sessionId: row.session_id, pid: row.pid });
             if (resolved.state !== "bound" || !resolved.name)
                 continue; // never render unbound or ambiguous (review low 9)
-            let snapshot = perAgent.get(resolved.name);
-            if (snapshot === undefined) {
-                snapshot = JSON.stringify(hudStatus(node, { agent: resolved.name, state: "bound", resolvedBy: resolved.resolved_by === "pid" ? "pid" : "session_id" }));
-                perAgent.set(resolved.name, snapshot);
+            const resolvedBy = resolved.resolved_by ?? "none";
+            const snapshot = snapshotFor(resolved.name, resolvedBy);
+            const sessionPath = hudSessionPath(node.home, row.cli, row.session_id);
+            wanted.add(sessionPath);
+            writeIfChanged(sessionPath, JSON.stringify(snapshot));
+            const v2Path = hudSessionV2Path(node.home, row.cli, row.session_id);
+            try {
+                const v2 = hudStatusV2(node, {
+                    cli: row.cli, sessionId: row.session_id, agent: resolved.name, state: "bound", resolvedBy,
+                }, { v1: snapshot, processes: evidence, now });
+                writeIfChanged(v2Path, JSON.stringify(v2));
+                wanted.add(v2Path);
             }
-            wanted.add(hudSessionPath(node.home, row.cli, row.session_id));
-            writeIfChanged(hudSessionPath(node.home, row.cli, row.session_id), snapshot);
-            const line = cliLine(row.cli, JSON.parse(snapshot));
+            catch { /* v2 metadata failure must not suppress legacy statuslines; stale v2 prunes */ }
+            const line = cliLine(row.cli, snapshot);
             wanted.add(hudSessionLinePath(node.home, row.cli, row.session_id));
             writeSeg(hudSessionLinePath(node.home, row.cli, row.session_id), line);
             // Critical fix: a pid file is written per (cli, pid) only when a pid-ONLY resolution proves a
@@ -157,18 +175,22 @@ export function writeHud(node, now = Date.now()) {
                 if (byPid.state === "bound" && byPid.name && byPid.resolved_by === "pid") {
                     const start = evidence.get(row.pid)?.start ?? null;
                     if (start) {
-                        const pidKey = `pid:${byPid.name}`; // never reuse a session-keyed snapshot's resolved_by
-                        let pidSnap = perAgent.get(pidKey);
-                        if (pidSnap === undefined) {
-                            pidSnap = JSON.stringify(hudStatus(node, { agent: byPid.name, state: "bound", resolvedBy: "pid" }));
-                            perAgent.set(pidKey, pidSnap);
-                        }
+                        const pidSnap = snapshotFor(byPid.name, "pid");
                         const p = hudPidPath(node.home, row.cli, row.pid, start);
                         wanted.add(p);
-                        writeIfChanged(p, pidSnap);
+                        writeIfChanged(p, JSON.stringify(pidSnap));
+                        const pv2 = hudPidV2Path(node.home, row.cli, row.pid, start);
+                        try {
+                            const v2 = hudStatusV2(node, {
+                                cli: row.cli, sessionId: null, agent: byPid.name, state: "bound", resolvedBy: "pid",
+                            }, { v1: pidSnap, processes: evidence, now });
+                            writeIfChanged(pv2, JSON.stringify(v2));
+                            wanted.add(pv2);
+                        }
+                        catch { /* preserve the v1 pid adapter when v2 metadata is unavailable */ }
                         const pl = hudPidLinePath(node.home, row.cli, row.pid, start);
                         wanted.add(pl);
-                        writeSeg(pl, cliLine(row.cli, JSON.parse(pidSnap)));
+                        writeSeg(pl, cliLine(row.cli, pidSnap));
                     }
                 }
             }
@@ -217,8 +239,8 @@ const WAKE_PATH = {
  * --schema mbx.status/v2` (T406); `sessionId` may be null for pid-resolved CLI calls, which skip the
  * lease/session-row lookups that need a session id.
  */
-export function hudStatusV2(node, o) {
-    const v1 = hudStatus(node, { agent: o.agent, state: o.state, resolvedBy: o.resolvedBy, candidates: o.candidates });
+export function hudStatusV2(node, o, cached) {
+    const v1 = cached?.v1 ?? hudStatus(node, { agent: o.agent, state: o.state, resolvedBy: o.resolvedBy, candidates: o.candidates });
     const name = o.agent;
     const sessionRow = o.sessionId
         ? node.store.db.prepare("SELECT cwd, channel FROM sessions WHERE cli=? AND session_id=?").get(o.cli, o.sessionId)
@@ -240,7 +262,7 @@ export function hudStatusV2(node, o) {
                 ? {
                     holder_cli: leaseRow.cli,
                     holder_session: leaseRow.session_id,
-                    verified: identityLeaseStatus(leaseRow, Date.now(), inspectLeaseProcess(leaseRow.holder_pid)).state === "live",
+                    verified: identityLeaseStatus(leaseRow, cached?.now ?? Date.now(), cached ? (cached.processes.get(leaseRow.holder_pid) ?? { alive: null, start: null }) : inspectLeaseProcess(leaseRow.holder_pid)).state === "live",
                 }
                 : null,
         },

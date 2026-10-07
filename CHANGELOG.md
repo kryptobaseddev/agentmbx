@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- T405: daemon writes private, atomic v2 HUD snapshots beside v1 JSON and statusline files, reusing mailbox counts and process evidence per tick.
 - **Doctor explains OpenCode's hourly identity eviction (T450):** when an OpenCode holder releases its identity and claims it again about every 61 minutes, `agentmbx doctor` reports that as OpenCode dropping its idle service (`LocationActivity` `timeToLive`). That is known upstream behaviour, not a broken install. During the gap, mailbox tools fail closed until the service is touched again; waking the agent still works. Doctor reads only the last 24 hours of those audit rows. One restart, a different CLI, or a gap that is not about an hour stays silent.
 - **OpenCode takeover can recover a session leased by another serve (T481).** `identity takeover --force` still refuses to replace this session's own live MCP under the same OpenCode serve. A holder under a different serve, named by the serve process or by that holder's parent, is not that MCP, so the owner's force takeover can recover it. Doctor names the session, the other provider, the holder's last activity, and the recovery command.
 - **Session start lists the claimable mailboxes for this directory (T328).** An unbound hook shows each claimable mailbox's name, role, last activity, and unread count, ten at a time, then `mbx_identity list` for the rest. The only actions are claim and register, and the session stays unbound. A directory with no mailboxes says so and suggests `<folder>-<role>`.
