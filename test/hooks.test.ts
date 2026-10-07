@@ -29,9 +29,12 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} startup 
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "working", AGENTMBX_DEV: "1" },
   });
   assert.equal(result.status, 0, result.stderr);
-  const context = cli === "kimi" ? result.stdout : JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
-  if (cli !== "kimi") assert.equal(JSON.parse(result.stdout).hookSpecificOutput.hookEventName, "SessionStart");
-  assert.match(context, /no mailbox identity yet/); assert.match(context, /mbx_whoami/);
+  // B2b (T391): kimi and opencode have no hookSpecificOutput protocol — their hooks print the
+  // note as plain stdout (the generated OpenCode plugin injects recognized [mbx] runs from it).
+  const plain = cli === "kimi" || cli === "opencode";
+  const context = plain ? result.stdout : JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+  if (!plain) assert.equal(JSON.parse(result.stdout).hookSpecificOutput.hookEventName, "SessionStart");
+  assert.match(context, /no mailbox identity yet/); assert.match(context, /No mailboxes for this directory/);
   assert.match(context, /"action\\?":\\?"claim\\?"/); assert.match(context, /"action\\?":\\?"register\\?"/);
   assert.doesNotMatch(context, /SECRET BODY|PRIVATE SUBJECT/);
   assert.deepEqual(node.store.db.prepare("SELECT * FROM identity_leases").all(), before);
@@ -120,13 +123,13 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} hooks re
     assert.deepEqual(n.store.db.prepare("SELECT * FROM sessions").all(), before);
   }
   const stopped = run("stop");
+  // T391: opencode now blocks like claude/codex (the plugin injects the reason); kimi keeps exit 2.
   if (cli === "kimi") {
     assert.equal(stopped.status, 2);
     assert.match(stopped.stderr, /Before stopping/);
     assert.match(stopped.stderr, /agentmbx watch/, "the first fresh-mail continuation may carry the one watcher nag");
   }
-  else if (cli !== "opencode") { assert.equal(stopped.status, 0); assert.equal(JSON.parse(stopped.stdout).decision, "block"); }
-  else assert.equal(stopped.stdout, "");
+  else { assert.equal(stopped.status, 0); assert.equal(JSON.parse(stopped.stdout).decision, "block"); }
   const repeat = run("stop");
   assert.equal(repeat.stdout, "", "the same mail does not block twice");
   assert.equal(repeat.status, 0, repeat.stderr);
@@ -146,8 +149,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} hooks re
     assert.match(deepStop.stderr, /Before stopping/);
     assert.doesNotMatch(deepStop.stderr, /agentmbx watch/, "a later mail continuation does not append another nag");
   }
-  else if (cli !== "opencode") assert.equal(JSON.parse(deepStop.stdout).decision, "block");
-  else assert.equal(deepStop.stdout, "");
+  else assert.equal(JSON.parse(deepStop.stdout).decision, "block"); // T391: opencode blocks like the rest
   n.ack(deep, agent);
   assert.notEqual((await call("mbx_identity", { action: "release" })).isError, true);
   const before = n.store.db.prepare("SELECT * FROM sessions").all();

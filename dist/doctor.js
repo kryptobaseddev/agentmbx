@@ -1,21 +1,68 @@
 // `agentmbx doctor`: one checklist that says what works, what doesn't, and the one command that fixes it.
 import { rotationLog } from "./key-rotation.js";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { phantomMailboxes, returnDays } from "./stranded.js";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { fingerprint } from "./crypto.js";
 import { signHop } from "./http.js";
 import { relayState, ROLLBACK_REASON } from "./relay-v2.js";
 import { kimiHostedServer, kimiInstances } from "./kimi-web.js";
+import { opencodeService } from "./wake.js";
 import { kimiDesktop } from "./kimi-desktop.js";
 import { version } from "./version.js";
 import { GROK_NO_PUSH, MbxNode, RETRY_HOURS } from "./node.js";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.js";
-import { detect, edits, grokMcpConfiguredCommand, skillDest, skillStatus, statuslineConfiguredCommand, statuslineForms, statuslineState, wired } from "./setup.js";
+import { detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConsent, skillDest, skillStatus, statuslineConfiguredCommand, statuslineForms, statuslineState, wired } from "./setup.js";
 import { mailboxLiveness } from "./receipts.js";
 import { liveWatcher } from "./wake.js";
-import { listIdentityControls } from "./identity-control.js";
+import { findIdentityControl, listIdentityControls } from "./identity-control.js";
 import { pruneCandidates } from "./identity-cleanup.js";
+import { inspectLeaseProcess } from "./identity-leases.js";
+import { providerLabel, sameLiveProvider } from "./identity-takeover.js";
+export const CLAIM_CHURN_LIMIT = 5;
+/** T481: one session id leased by an MCP under a different OpenCode serve than the published control endpoint. */
+export function foreignSessionProvider(node) {
+    const rows = node.store.db.prepare("SELECT * FROM identity_leases WHERE released_at IS NULL").all();
+    const out = [];
+    for (const row of rows) {
+        let claimant;
+        try {
+            claimant = findIdentityControl(node.store, row.cli, row.session_id);
+        }
+        catch {
+            continue;
+        }
+        const evidence = inspectLeaseProcess(row.holder_pid);
+        if (!(evidence.alive === true && evidence.start === row.holder_start))
+            continue;
+        if (sameLiveProvider(row.holder_pid, claimant))
+            continue;
+        const last = new Date(row.heartbeat_at).toISOString();
+        out.push({
+            level: "warn",
+            label: `${row.cli} session ${row.session_id} is leased by pid ${row.holder_pid} under provider ${providerLabel(row.holder_pid)} (last activity ${last}), while this session's control endpoint is pid ${claimant.mcp_pid} under provider ${providerLabel(claimant.mcp_pid)}`,
+            fix: `agentmbx identity takeover --force ${row.name} --cli ${row.cli} --session ${row.session_id}`,
+        });
+    }
+    return out;
+}
+/** Ten-minute claim/release storms indicate connector fights, not useful session work. */
+export function identityClaimChurn(node, now = Date.now()) {
+    const rows = node.store.db.prepare("SELECT detail FROM audit WHERE event='identity.claim' AND at>=? ORDER BY at")
+        .all(new Date(now - 10 * 60_000).toISOString());
+    const counts = new Map();
+    for (const row of rows) {
+        try {
+            const name = JSON.parse(row.detail).name;
+            if (typeof name === "string")
+                counts.set(name, (counts.get(name) ?? 0) + 1);
+        }
+        catch { /* malformed historical audit is not a claim */ }
+    }
+    return [...counts].filter(([, count]) => count > CLAIM_CHURN_LIMIT).map(([name, count]) => ({ level: "warn",
+        label: `${name}: identity claim/release churn (${count} claims in 10 minutes; limit ${CLAIM_CHURN_LIMIT}); reconnecting or competing MCP connectors may be fighting the lease`,
+        fix: "update AgentMBX and reconnect with the harness MCP controls; same-session connectors co-use the lease. Never kill MBX MCPs, hand-spawn agentmbx mcp, or force-takeover your own live session; use exact-session diagnostics and the mailbox CLI --as instead" }));
+}
 export const VERSION = (() => {
     try {
         return JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
@@ -185,6 +232,76 @@ export function pruneSummary(node) {
         ? { level: "warn", label: `${retire.length} generated mailbox(es) with no holder, no unread mail and no recent traffic would be retired`, fix: "review the list: agentmbx identity prune   (a dry run), then apply it: agentmbx identity prune --apply" }
         : { level: "info", label: "no generated mailboxes eligible for prune" };
 }
+/** OpenCode's LocationActivity drops an idle service about every 60 minutes, and the plugin then releases and claims again.
+ *  A claim within ~65 minutes of its release, with those pairs about 61 minutes apart, is that eviction. One restart is not.
+ *  Only the last 24 hours of audit rows are read. */
+const EVICT_FOLLOW_MS = 65 * 60 * 1000;
+const EVICT_REPEAT_MIN_MS = 50 * 60 * 1000;
+const EVICT_REPEAT_MAX_MS = 75 * 60 * 1000;
+const EVICT_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+/** Info when an OpenCode holder's audit shows the hourly release/claim signature. Silent otherwise. Not an install failure. */
+export function opencodeEvictionCheck(db) {
+    const since = new Date(Date.now() - EVICT_LOOKBACK_MS).toISOString();
+    const rows = db.prepare("SELECT at, event, detail FROM audit WHERE event IN ('identity.release', 'identity.claim') AND at > ? ORDER BY at").all(since);
+    const byName = new Map();
+    for (const row of rows) {
+        if (!row || typeof row !== "object")
+            continue;
+        const rec = row;
+        if (typeof rec.at !== "string" || (rec.event !== "identity.release" && rec.event !== "identity.claim"))
+            continue;
+        const t = Date.parse(rec.at);
+        if (!Number.isFinite(t))
+            continue;
+        let detail;
+        try {
+            detail = typeof rec.detail === "string" ? JSON.parse(rec.detail) : null;
+        }
+        catch {
+            continue;
+        }
+        if (!detail || typeof detail !== "object")
+            continue;
+        const parsed = detail;
+        if (parsed.holder?.cli !== "opencode" || typeof parsed.name !== "string" || parsed.name === "")
+            continue;
+        const list = byName.get(parsed.name) ?? [];
+        list.push({ t, kind: rec.event === "identity.release" ? "release" : "claim" });
+        byName.set(parsed.name, list);
+    }
+    for (const events of byName.values()) {
+        if (!hourlyOpencodeEviction(events))
+            continue;
+        return {
+            level: "info",
+            label: "opencode: identity.release then identity.claim about every 61 minutes is OpenCode evicting its idle service (LocationActivity timeToLive). That is known upstream behaviour, not a broken install. During the gap, mailbox tools fail closed until the service is touched again; waking the agent still works.",
+            fix: "Any OpenCode command restarts the service. The durable fix is upstream: a configurable LocationActivity timeToLive, or an exemption for the MCP server.",
+        };
+    }
+    return null;
+}
+function hourlyOpencodeEviction(events) {
+    const pairs = [];
+    let pending = null;
+    for (const event of events) {
+        if (event.kind === "release") {
+            pending = event.t;
+            continue;
+        }
+        if (pending === null)
+            continue;
+        const follow = event.t - pending;
+        if (follow > 0 && follow <= EVICT_FOLLOW_MS)
+            pairs.push(pending);
+        pending = null;
+    }
+    for (let i = 1; i < pairs.length; i++) {
+        const between = pairs[i] - pairs[i - 1];
+        if (between >= EVICT_REPEAT_MIN_MS && between <= EVICT_REPEAT_MAX_MS)
+            return true;
+    }
+    return false;
+}
 /** T368: static verification of one CLI's status line integration. Optional and never fails doctor.
  *  "ours" must be a CURRENT form — an older recognized form is a warn with the upgrade fix, as is
  *  ours pointing at a deleted bundled script. "foreign" is info, unless the foreign command embeds
@@ -193,6 +310,48 @@ export function pruneSummary(node) {
  *  and grok are replace-only — `command` replaces the footer and never renders alongside the user's
  *  other keys. opencode has no custom status line feature at all (built-in segments only), so the
  *  honest result is an explicit skip note, not a check against an invented config path. */
+/** T391: the OpenCode service is the wake path for every opencode mailbox — when one is bound,
+ *  doctor proves the service answers and says how to start it when it does not. A warn never
+ *  fails doctor (the T435 rule for separate per-CLI functions). Unbound hosts stay silent. */
+export async function opencodeServiceCheck(node, service = opencodeService) {
+    const bound = node.store.db.prepare("SELECT agent FROM sessions WHERE cli='opencode' AND session_id NOT LIKE 'mcp-%'").all();
+    if (!bound.length)
+        return null;
+    const svc = await service().catch(() => null);
+    if (svc)
+        return { level: "ok", label: `opencode: service reachable (${svc.url}) — wake path for ${bound.length} bound mailbox(es)` };
+    return {
+        level: "warn",
+        label: "opencode: service not reachable, so bound OpenCode mailboxes cannot be woken",
+        fix: "run any opencode command (or `opencode service start`) so the service API comes up; config: ~/.config/opencode/service.json",
+    };
+}
+/** T460: Hermes runs a shell hook only after its (event, command) pair was approved, and in the TUI (no tty) it silently skips an
+ *  unapproved one: hooks that are wired but not approved look installed and do nothing. Reads the same state setup writes. A warn
+ *  never fails doctor. Silent until the hooks are wired, because the generic hooks row already says so then. */
+export function hermesHooksChecks(ctx) {
+    const hooks = edits(ctx, "hermes").find((e) => e.kind === "hooks");
+    if (!hooks)
+        return [];
+    const cur = existsSync(hooks.path) ? readFileSync(hooks.path, "utf8") : null;
+    const why = cur !== null ? hooks.blocked?.(cur) ?? null : null;
+    if (why)
+        return [{ level: "warn", label: `hermes: hooks cannot be wired automatically: ${why}`,
+                fix: `add them to ${hooks.path.replace(ctx.home, "~")} by hand: on_session_start and pre_llm_call running \`${ctx.cmd.join(" ")} hook session-start|prompt --cli hermes\`` }];
+    if (!wired(hooks))
+        return [];
+    const c = hermesConsent(ctx);
+    const where = hermesAllowlistPath(ctx.home).replace(ctx.home, "~");
+    if (c.state === "approved")
+        return [{ level: "ok", label: `hermes: hooks approved to run (${where})` }];
+    if (c.state === "auto")
+        return [{ level: "ok", label: "hermes: hooks approved to run (hooks_auto_accept: true)" }];
+    if (c.state === "unreadable")
+        return [{ level: "warn", label: `hermes: hooks are wired but ${where} cannot be read, so Hermes may skip them`,
+                fix: "fix or remove that file, then: agentmbx setup --only hermes   (or approve them with `hermes hooks list`)" }];
+    return [{ level: "warn", label: `hermes: hooks are wired but not approved (${c.missing.join(", ")}), so Hermes skips them`,
+            fix: "agentmbx setup --only hermes   (writes the approvals), or set hooks_auto_accept: true in ~/.hermes/config.yaml" }];
+}
 export function statuslineChecks(ctx, cli) {
     if (cli === "opencode")
         return [{ level: "info", label: "opencode: no custom status line feature (built-in segments only: anomalyco/opencode#30295); nothing to verify" }];
@@ -226,12 +385,71 @@ export function statuslineChecks(ctx, cli) {
     }
     return out;
 }
+/** A POSIX single-quoted word. The fix is a command the owner can paste. */
+function shQuote(text) {
+    return `'${text.replace(/'/g, `'\\''`)}'`;
+}
+/** True when `path` is an executable regular file. Symlinks follow. A directory or a dangling link is not. */
+function executableFile(path) {
+    try {
+        if (!statSync(path).isFile())
+            return false;
+        accessSync(path, constants.X_OK);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+function sameFile(a, b) {
+    try {
+        return realpathSync(a) === realpathSync(b);
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * T314: a legacy `mbx` that is not AgentMBX and sits in an earlier PATH directory than `agentmbx`.
+ * The old NAS mailbox shim is that case. The same file reached through another name is not foreign.
+ * A warn does not fail doctor. Null means there is nothing to flag.
+ */
+export function legacyMbxShim(pathEnv = process.env.PATH ?? "") {
+    const dirs = pathEnv.split(delimiter).filter((dir) => dir.length > 0);
+    let mbxAt = -1;
+    let agentAt = -1;
+    for (let i = 0; i < dirs.length; i++) {
+        if (mbxAt < 0 && executableFile(join(dirs[i], "mbx")))
+            mbxAt = i;
+        if (agentAt < 0 && executableFile(join(dirs[i], "agentmbx")))
+            agentAt = i;
+        if (mbxAt >= 0 && agentAt >= 0)
+            break;
+    }
+    if (mbxAt < 0)
+        return null;
+    // Same directory, or agentmbx earlier: `mbx` is not ahead of `agentmbx`.
+    if (agentAt >= 0 && mbxAt >= agentAt)
+        return null;
+    const mbx = join(dirs[mbxAt], "mbx");
+    if (agentAt >= 0 && sameFile(mbx, join(dirs[agentAt], "agentmbx")))
+        return null;
+    return {
+        level: "warn",
+        label: `legacy mbx shim is ahead of agentmbx on PATH (${mbx})`,
+        fix: `mv ${shQuote(mbx)} ${shQuote(`${mbx}.legacy`)}`,
+    };
+}
 export async function doctor(ctx, mbxHome, opts = {}) {
     const out = [];
     const add = (level, label, fix) => out.push({ level, label, fix });
     add("info", `agentmbx ${VERSION} (node ${process.versions.node})`);
     if (Number(process.versions.node.split(".")[0]) < 24)
         add("fail", `Node ${process.versions.node} is too old`, "install Node 24 or later");
+    // T314: stay out of the grok block. OpenCode's own doctor function must not collide with this.
+    const legacy = legacyMbxShim();
+    if (legacy)
+        out.push(legacy);
     const initialized = existsSync(join(mbxHome, "config.json"));
     let node = null;
     if (!initialized)
@@ -260,6 +478,22 @@ export async function doctor(ctx, mbxHome, opts = {}) {
         // static and per-CLI — ours must be a CURRENT form, foreign must be truly foreign.
         for (const c of statuslineChecks(ctx, d.cli))
             out.push(c);
+        // T391: the opencode service check is its own function (never a new top-level grok/opencode
+        // collision — see the T435 note above) and runs only when an opencode mailbox is bound.
+        if (d.cli === "opencode" && node) {
+            const c = await opencodeServiceCheck(node);
+            if (c)
+                out.push(c);
+        }
+        if (d.cli === "opencode" && node) {
+            const c = opencodeEvictionCheck(node.store.db);
+            if (c)
+                out.push(c);
+        }
+        // T460: its own function too (the T435 rule): a refused hooks layout and the not-approved state are Hermes facts.
+        if (d.cli === "hermes")
+            for (const c of hermesHooksChecks(ctx))
+                out.push(c);
         // T384: a command string that matches what setup would write is still "wired". Flag the path
         // itself when that file is gone, including a stale …/agentmbx that install would rewrite.
         if (d.cli === "grok") {
@@ -313,6 +547,10 @@ export async function doctor(ctx, mbxHome, opts = {}) {
         for (const c of strandedMail(node))
             out.push(c);
         for (const c of pendingIdentities(node))
+            out.push(c);
+        for (const c of identityClaimChurn(node))
+            out.push(c);
+        for (const c of foreignSessionProvider(node))
             out.push(c);
         out.push(pruneSummary(node));
         const peers = node.peers();

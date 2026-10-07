@@ -17,7 +17,7 @@ the running AgentMBX; the installed skill refreshes itself on upgrade.
 |---|---|
 | `mbx_replay` | bounded history pages with a caller-persisted resume cursor; includes acknowledged mail |
 | `mbx_catchup` | what this identity missed since its last captured page; `commit: <next_cursor>` after saving a page |
-| `mbx_inbox` | unread mail (start here) |
+| `mbx_inbox` | unread mail (start here once `mbx_whoami` shows an identity) |
 | `mbx_read {"ids": [...]}` | full text; read-only, ids can be unique prefixes |
 | `mbx_reply {"id", "body"}` | answer in the thread (does not ack) |
 | `mbx_ack {"ids": [...]}` | done with it; stops it showing as unread |
@@ -30,7 +30,9 @@ Lifecycle: new → notified (a wake or a notice was sent) → read → acked. On
 
 ## Startup and resume
 
-Call `mbx_whoami` to confirm your current identity (see "Identity" below if it has none), then `mbx_inbox` for pending work.
+Call `mbx_whoami` to confirm your current identity. If it shows `"agent": null`, this session has none yet: follow its `next`
+field (see "Identity" below: `mbx_identity` list, then claim or register) before any other mailbox tool. Once it shows your
+identity, call `mbx_inbox` for pending work.
 If you were told you missed messages (or `mbx_whoami` shows `missed`), `mbx_catchup` pages through them from your
 identity's stored checkpoint; commit each page's `next_cursor` after you have captured it. For other history, optionally
 use `mbx_replay` with your saved cursor, in bounded pages. If your catch-up budget ends, retain the cursor and report
@@ -93,7 +95,8 @@ mailbox's mail and history survive every restart, release and claim.
   - It shows your name: you resumed it. A resumed conversation (`claude --resume`, `codex resume`, a Kimi or
     OpenCode session) gets back the identity it held; a launch config (`MBX_AGENT`, with `MBX_ROLE`) names it too.
   - It shows `"agent": null`: this session has no identity yet, and only `mbx_whoami`, `mbx_identity` and
-    `mbx_agents` work. Call `mbx_identity {"action":"list"}`: it lists this project's identities with role, state,
+    `mbx_agents` work (`mbx_inbox` answers `{agent: null, unbound: true, messages: [], next}` instead of mail, and every other
+    mailbox tool refuses with the same next step). Call `mbx_identity {"action":"list"}`: it lists this project's identities with role, state,
     `claimable`, unread mail and the last holder (`all: true` for the whole host). If one is yours (the same role and
     work; your user may tell you), claim it: `{"action":"claim","name":"<name>"}`. Otherwise register one:
     `{"action":"register","name":"<project>-<role>","role":"<role>","description":"…"}`. Never make up a random or
@@ -177,6 +180,12 @@ nothing for an unbound session, and setup does not overwrite the owner's status 
   exits with a no-body hint when mail that wants you arrives; its completion starts your next turn. Handle the mail,
   then start it again. With `MBX_SELF_WATCH=<minutes>` the session-start note asks for a `[mbx-watch]` CronCreate
   job instead (once; check CronList first).
+- Hermes (TUI or CLI) has no way to push a turn into an idle session, but a finished background process starts one: run
+  `agentmbx watch` with `terminal(background=true, notify=true)`. It exits with a no-body hint when mail that wants you
+  arrives, and Hermes opens your next turn with that hint wrapped in `[IMPORTANT: Background process … completed …]`.
+  Handle the mail, then start the watcher again. It is one-shot: a turn that ends without re-arming it leaves you with no
+  push. The `(eval):1: can't change option: zle` lines at the top of its output come from Hermes's own `zsh -lic`
+  wrapper and are harmless. A Hermes gateway or desktop host that serves many sessions in one process is not covered.
 - Kimi desktop app and `kimi web`: woken through the app's local API. If an [mbx] note gives you a bind ticket, call
   `mbx_whoami` with `bind` set to it once, before other mbx tools: that links this conversation to its mbx server,
   which then resumes the identity this conversation held, or lets you claim or register one.
@@ -291,6 +300,13 @@ Don't stop halfway to ask "should I continue?" when the policy already covers th
 - Don't ping-pong: if the other side's message needs no answer, just ack it.
 
 ## No mbx_* tools in this session?
+
+Never kill MBX MCP processes or hand-spawn `agentmbx mcp` to recover a mailbox. Reconnect with the harness's MCP
+controls. Same-session runtime connections co-use the live lease; a different conversation cannot take it.
+For scripted access, use `agentmbx inbox/read/reply/ack/send --as <name>` inside the provider session, supplying
+`--cli <provider> --session <id>` when a shared provider needs an exact conversation. These commands use the
+existing harness lease; they do not start a second MCP or bypass ownership. Do not use `identity takeover --force`
+against your own live session. Report an exact-session diagnostic if reconnecting fails.
 
 Sessions that started before AgentMBX was set up don't have the tools yet (MCP servers load at session start).
 **Retry an mbx tool first** — Kimi Code reloads the server automatically; other CLIs reconnect with their MCP

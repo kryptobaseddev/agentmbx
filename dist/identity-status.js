@@ -118,7 +118,7 @@ export function listIdentityStatus(home, options = {}) {
                 evidence = { alive: null, start: null };
             }
         }
-        return holderProviderView((options.processTable ?? procTable)(), lease.holder_pid, caller.providerPid, recorded, evidence);
+        return holderProviderView((options.processTable ?? procTable)(), lease.holder_pid, caller.providerPid, recorded, evidence, caller.canonicalHarness);
     };
     for (const lease of leases) {
         const item = row(lease.name);
@@ -156,4 +156,32 @@ export function listIdentityStatus(home, options = {}) {
     return { host: config.host, schema_version: schema, observed_at: new Date(now).toISOString(), advisory: true,
         ...(options.project ? { project: options.project } : {}),
         identities: options.project ? all.filter(i => inProject.has(i.name)) : all };
+}
+/** Unbound session-start text (T328). Claimable rows for this directory only: name, role, last activity, unread. */
+export function formatUnboundStart(home, project) {
+    const head = "This session has no mailbox identity yet.";
+    const stay = "The session stays unbound until you claim or register. Never invent a random name.";
+    const base = project?.split(/[/\\]/).filter(Boolean).at(-1);
+    const suggest = base ? `${base}-<role>` : "<project>-<role>";
+    const claim = `Claim one with mbx_identity {"action":"claim","name":"<name>"}`;
+    const register = `or register a new one with mbx_identity {"action":"register","name":"${suggest}","role":"<role>"}`;
+    const actions = `${claim} ${register}. ${stay}`;
+    if (!project)
+        return `${head} No mailboxes for this directory. ${actions}`;
+    let identities = [];
+    try {
+        identities = listIdentityStatus(home, { project }).identities;
+    }
+    catch {
+        return `${head} Mailboxes for this directory could not be listed. ${actions}`;
+    }
+    const claimable = identities.filter(i => i.claimable);
+    if (!identities.length)
+        return `${head} No mailboxes for this directory. ${actions}`;
+    if (!claimable.length)
+        return `${head} No claimable mailboxes for this directory. ${actions}`;
+    const shown = claimable.slice(0, 10);
+    const lines = shown.map(i => `${i.name} role=${i.role ?? "unregistered"} last=${i.last_activity ?? "none"} unread=${i.unread}`);
+    const more = claimable.length > shown.length ? `\n+${claimable.length - shown.length} more: mbx_identity list` : "";
+    return `${head}\n${lines.join("\n")}${more}\n${actions}`;
 }

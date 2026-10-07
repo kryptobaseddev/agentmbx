@@ -1,6 +1,6 @@
 // CLI ownership comes from the provider's exact current MCP lease, never from --as alone.
 import { canonical } from "./crypto.js";
-import { findIdentityControl, identityControlKey, identityGeneration, inspectIdentityControlCaller, listIdentityControls } from "./identity-control.js";
+import { findIdentityControl, identityControlKey, identityGeneration, inspectIdentityControlCaller, listIdentityControls, publishIdentityControl } from "./identity-control.js";
 import { IdentityLeases, inspectLeaseProcess, UNKNOWN_RETRY_DELAYS_MS } from "./identity-leases.js";
 import { claudeSessionId, sleepSync } from "./proc.js";
 import { kimiInstances } from "./kimi-web.js";
@@ -20,7 +20,54 @@ export function withCliIdentity(node, selection, operation) {
     const descriptors = selection.cli && selection.session ? [findIdentityControl(node.store, selection.cli, selection.session)] : listIdentityControls(node.store);
     return withIdentity(node, selection, descriptors, operation);
 }
-/** Hook bootstrap requires one holder; only Claude may change real session IDs within that holder. */
+/** CLIs whose one provider process holds one conversation at a time: /clear, /new and /resume replace the session id
+ *  of the same process and the same MCP holder (T460: Hermes TUI/CLI). A multi-session host is not one of them. */
+export const REBINDING_CLIS = ["claude", "hermes"];
+/** A live OpenCode control under this serve whose lease still matches. A dead pid or a stale generation is not live. */
+function opencodeHolderLive(node, descriptor) {
+    const evidence = inspectLeaseProcess(descriptor.mcp_pid);
+    return descriptor.parent_pid === process.ppid && evidence.alive === true && matches(descriptor, rowFor(node, descriptor.agent));
+}
+/** The exact ses_ row, when it still belongs to a live MCP child of this serve. */
+function liveOpencode(node, session) {
+    if (node.store.get(identityControlKey("opencode", session)) === undefined)
+        return null;
+    const current = findIdentityControl(node.store, "opencode", session);
+    return opencodeHolderLive(node, current) ? current : null;
+}
+/**
+ * Publish this ses_ id onto the one live MCP that already holds the agent named by `name:opencode:<sid>`.
+ * Missing name, no live holder, or two holders: return null. Never pick "the one control under this parent".
+ */
+function restoreOpencode(node, session) {
+    const named = node.store.get(`name:opencode:${session}`);
+    if (!named)
+        return null;
+    const holders = new Map();
+    for (const descriptor of listIdentityControls(node.store)) {
+        if (descriptor.cli !== "opencode" || descriptor.agent !== named || descriptor.session_id === session)
+            continue;
+        if (!opencodeHolderLive(node, descriptor))
+            continue;
+        const kept = holders.get(descriptor.control_key);
+        if (!kept || descriptor.session_id === descriptor.lease_session_id)
+            holders.set(descriptor.control_key, descriptor);
+    }
+    if (holders.size !== 1)
+        return null;
+    const holder = [...holders.values()][0];
+    if (!holder)
+        return null;
+    if (node.store.get(identityControlKey("opencode", session)) !== undefined) {
+        const current = findIdentityControl(node.store, "opencode", session);
+        if (opencodeHolderLive(node, current) && current.agent !== named)
+            return null;
+    }
+    const alias = { ...holder, session_id: session };
+    publishIdentityControl(node.store, alias);
+    return alias;
+}
+/** Hook bootstrap requires one holder; only Claude and Hermes may change real session IDs within that holder. */
 export function withHookIdentity(node, cli, session, operation, allowBootstrap = false) {
     if (operation.constructor.name === "AsyncFunction")
         throw refused("hook operations must be synchronous");
@@ -28,16 +75,26 @@ export function withHookIdentity(node, cli, session, operation, allowBootstrap =
         throw refused("hook requires a valid non-provisional session id");
     const all = listIdentityControls(node.store).filter(d => d.cli === cli && d.parent_pid === process.ppid);
     let descriptors, bootstrap = false;
-    const rebindClaude = allowBootstrap && cli === "claude" && !node.store.db.prepare("SELECT 1 FROM sessions WHERE cli=? AND session_id=?").get(cli, session);
-    if (node.store.get(identityControlKey(cli, session)) !== undefined && !rebindClaude)
+    const rebinds = REBINDING_CLIS.includes(cli);
+    const rebindClaude = allowBootstrap && rebinds && !node.store.db.prepare("SELECT 1 FROM sessions WHERE cli=? AND session_id=?").get(cli, session);
+    if (cli === "opencode") {
+        // The parent set is ambiguous on a shared serve. Restore only the named agent's one live holder.
+        const live = liveOpencode(node, session) ?? restoreOpencode(node, session);
+        if (!live)
+            throw refused("hook session has no exact current MCP binding");
+        descriptors = [live];
+    }
+    else if (node.store.get(identityControlKey(cli, session)) !== undefined && !rebindClaude)
         descriptors = [findIdentityControl(node.store, cli, session)];
     else {
         // Hosted providers must first publish an exact session binding. Never bootstrap by directory.
         // Claude's /clear, /resume and compaction replace the session id of the same process, whose MCP holder carries the
         // id it started with: the provider's own session file naming exactly this session is the proof of that rotation.
         const rotated = cli === "claude" && claudeSessionId(process.ppid) === session;
-        if (!allowBootstrap || !["claude", "kimi"].includes(cli) || (cli === "kimi" && kimiInstances().some(instance => instance.pid === process.ppid)) || new Set(all.map(d => d.control_key)).size !== 1
-            || all.some(d => (!d.lease_session_id.startsWith("mcp-") && !rotated) || (cli !== "claude" && !d.session_id.startsWith("mcp-"))
+        // Hermes: every alias of the one holder differs only in session_id (the canonical check below), so a real id left by an
+        // earlier conversation of this process is replaced, never mistaken for a second holder.
+        if (!allowBootstrap || ![...REBINDING_CLIS, "kimi"].includes(cli) || (cli === "kimi" && kimiInstances().some(instance => instance.pid === process.ppid)) || new Set(all.map(d => d.control_key)).size !== 1
+            || all.some(d => (!d.lease_session_id.startsWith("mcp-") && !rotated) || (!rebinds && !d.session_id.startsWith("mcp-"))
                 || !matches(d, rowFor(node, d.agent)) || canonical({ ...d, session_id: "" }) !== canonical({ ...all[0], session_id: "" })))
             throw refused("hook session has no exact current MCP binding");
         descriptors = all;
@@ -45,7 +102,7 @@ export function withHookIdentity(node, cli, session, operation, allowBootstrap =
     }
     if (descriptors.some(d => d.parent_pid !== process.ppid))
         throw refused("hook does not belong to this provider process");
-    return withIdentity(node, {}, descriptors, (agent, descriptor) => {
+    return withIdentity(node, { cli, session }, descriptors, (agent, descriptor) => {
         if (bootstrap && canonical(listIdentityControls(node.store).filter(d => d.cli === cli && d.parent_pid === process.ppid)) !== canonical(all))
             throw refused("hook bootstrap bindings changed before the operation");
         return operation(agent, descriptor, bootstrap);
@@ -84,6 +141,9 @@ function withIdentity(node, selection, descriptors, operation) {
         if (!candidates.size)
             throw Object.assign(refused("no current identity lease belongs to this caller. Run mailbox commands inside the provider session that holds the lease (your agent session, through its mbx tools); inspect holders with `agentmbx identity list`. The owner can replace a live holder with `agentmbx identity takeover <name> --force --cli <provider> --session <id>`"), { code: "IDENTITY_NO_CALLER_LEASE" });
         const { descriptor, token } = [...candidates.values()][0];
+        // OpenCode shells share the serve. A lone control is still not this session unless --session named it.
+        if (!selection.session && descriptor.cli === "opencode")
+            throw refused("opencode serves many sessions: specify --cli and --session");
         const [name, host, extra] = selection.as?.split("@") ?? [descriptor.agent];
         if (name !== descriptor.agent || (host !== undefined && host !== node.host) || extra !== undefined)
             throw refused(`this session holds ${descriptor.agent}@${node.host}, not the requested identity`);

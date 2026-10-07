@@ -80,6 +80,11 @@ test("the MCP server serves the version-matched guide as a resource and a prompt
   const read = await c.readResource({ uri: "mbx://guide" });
   const text = (read.contents[0] as { text: string }).text;
   assert.match(text, /^# AgentMBX/); assert.doesNotMatch(text, /^---/, "frontmatter stripped");
+  // T464: the guide a session reads on startup gates mbx_inbox on holding an identity, and says what an unbound inbox returns
+  const startup = text.slice(text.indexOf("## Startup and resume"), text.indexOf("If you were told you missed messages")).replace(/\s+/g, " ");
+  assert.match(startup, /If it shows `"agent": null`, this session has none yet: follow its `next` field .*before any other mailbox tool\. Once it shows your identity, call `mbx_inbox`/);
+  assert.doesNotMatch(startup, /, then `mbx_inbox` for pending work/);
+  assert.match(text.replace(/\s+/g, " "), /`mbx_inbox` answers `\{agent: null, unbound: true, messages: \[\], next\}` instead of mail/);
   const prompts = await c.listPrompts();
   assert.ok(prompts.prompts.some((p) => p.name === "mbx_guide"));
   const p = await c.getPrompt({ name: "mbx_guide" });

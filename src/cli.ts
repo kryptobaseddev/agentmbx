@@ -14,8 +14,10 @@ import { DEFAULT_QUOTA, parseRelayKey, RelayCore, startRelayServer } from "./rel
 import { SqliteRelayStore } from "./relay-store.ts";
 import { backupStore, readOps, restoredFrom, restoreStore, rotateEpochOp, STORE_DB, waitForLock } from "./relay-ops.ts";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.ts";
-import { HUD_ALIVE_MAX_MS, HUD_SCHEMA, hudAlivePath, hudDir, hudPidLinePath, hudPidPath, hudSessionLinePath, hudSessionPath, hudStatus, writeHud, type HudStatus } from "./hud.ts";
-import { detectHost, MCP_HEARTBEAT_MS, noPush, runMcp, selfWatchInstruction } from "./mcp.ts";
+import { HUD_ALIVE_MAX_MS, HUD_SCHEMA, hudAlivePath, hudDir, hudPidLinePath, hudPidPath, hudSessionLinePath, hudSessionPath, hudStatus, hudStatusV2, writeHud, type HudStatus } from "./hud.ts";
+import { STATUS_V2_SCHEMA } from "./status-schema.ts";
+import { detectHost, HERMES_WATCHER_INSTRUCTION, HERMES_WATCHER_REMINDER, MCP_HEARTBEAT_MS, noPush, runMcp, selfWatchInstruction } from "./mcp.ts";
+import { HERMES_NAG_MS, hermesHookInput, hermesHookOutput } from "./hermes-hook.ts";
 import { ancestors, processEvidenceSpawns, withProcSnapshot } from "./proc.ts";
 import { bumpPostToolMarkersForAgent, readPostToolMarker, writePostToolLast } from "./posttool.ts";
 import { resolveStatusIdentity } from "./status-identity.ts";
@@ -43,8 +45,8 @@ import { approveKimi, decidePermission, opencodePermissionPass, type Lookup } fr
 import { diagnosticSnapshot, type RuntimeObservation } from "./diagnostics.ts";
 import { configuredRetention, prune, retentionDays } from "./retention.ts";
 import { exportIdentity, identityInitialized, importIdentity } from "./identity-backup.ts";
-import { listIdentityStatus } from "./identity-status.ts";
-import { withCliIdentity, withHookIdentity, type CliIdentitySelection } from "./cli-identity.ts";
+import { formatUnboundStart, listIdentityStatus } from "./identity-status.ts";
+import { REBINDING_CLIS, withCliIdentity, withHookIdentity, type CliIdentitySelection } from "./cli-identity.ts";
 import { declaredOriginWarning, readSessionTaint, refuseAgentOrigin, taintSendWarning, type SessionTaint } from "./session-taint.ts";
 import { runProbe, storeProbeIO } from "./probe.ts";
 import { DEFAULT_LOGIN_BASE_URL, defaultLoginIO, parseLoginBase, runLogin } from "./login.ts";
@@ -74,6 +76,7 @@ Messages
     New sends without a lease are marked unverified-sender and grant no delegated authority.
   agentmbx status --cli <provider> --session <id> --json   current session identity and mailbox counts (read-only)
   agentmbx status --cli <provider> [--session <id>] --json --schema mbx.status/v1   HUD snapshot for harnesses; no lease needed (T311)
+  agentmbx status --cli <provider> [--session <id>] --json --schema mbx.status/v2   unified status model: registration, cloud, devices, project (T406)
   agentmbx statusline <claude|codex|kimi|opencode|grok|copilot|cursor|gemini>   render one MBX segment from the HUD snapshot (T313)
   agentmbx probe [--project <dir>] [--deadline 120s] [--require-idle-wake] [--only a,b] [--exclude glob] [--plan] [--json]   autonomy probe: every live leased identity must answer the [mbx-probe] request with no human prompt (T388 gate; T392, T445)
   agentmbx identity list [--project <dir>] [--all] [--json]   identities with role, holder, claimable and unread (read-only)
@@ -137,7 +140,7 @@ Install
 
 Agent integration
   agentmbx mcp                                  stdio MCP server (add to Claude/Codex/OpenCode/Kimi/Hermes MCP config)
-  agentmbx hook session-start --cli <codex|kimi|claude|opencode>   bind the running session (reads the hook JSON on stdin)
+  agentmbx hook session-start --cli <codex|kimi|claude|opencode|hermes>   bind the running session (reads the hook JSON on stdin)
   agentmbx hook session-end --cli claude         release the exact session on terminal exit (keeps /clear and /resume bindings)
   agentmbx hook prompt --cli <…>                adds "N unread mbx messages" to the next turn when there is mail
   agentmbx hook post-tool --cli claude          surfaces new unread mail between tool calls (bundled sh fast path: zero node starts in steady state, T342)
@@ -746,6 +749,22 @@ async function run(argv: string[]) {
       return node.agents().forEach((a) => console.log(`${a.name}@${a.host}\t${a.host === node.host ? (live.has(a.name) ? "live" : "offline") : "remote"}\t${a.role ?? ""}\t${a.cli ?? ""}\t${a.last_seen ?? ""}\t${a.description ?? ""}`));
     }
     case "status": {
+      if (o.json && str("schema") === STATUS_V2_SCHEMA) {
+        // T406: mbx.status/v2 for harness plugins. Same resolver rules as the v1 branch below and the
+        // T407 loopback endpoint: identity comes from the T310 resolver (never a shared directory name,
+        // never another session's data), an explicit --session that does not resolve is unbound, and a
+        // pid-resolved call (no --session) reports session_id null. The v2 model is built on the v1
+        // snapshot, so the two schemas never disagree on counts.
+        const sid = str("session") ?? null;
+        const cli = str("cli") ?? "";
+        const resolved = sid
+          ? resolveStatusIdentity(node, cli, { sessionId: sid })
+          : resolveStatusIdentity(node, cli, { pid: process.ppid });
+        return console.log(JSON.stringify(hudStatusV2(node, {
+          cli, sessionId: sid, agent: resolved.name, state: resolved.state,
+          resolvedBy: resolved.resolved_by ?? "none", candidates: resolved.candidates,
+        }), null, 2));
+      }
       if (o.json && str("schema") === HUD_SCHEMA) {
         // T311: mbx.status/v1 for harnesses, behind an explicit schema flag so the existing
         // status --json contract (lease-gated) is unchanged. Identity comes from the T310 resolver
@@ -1301,6 +1320,11 @@ function grokWatchArmed(input: Record<string, unknown>, sid?: string): boolean {
 async function hook(node: MbxNode, event: string | undefined, cli: string) {
   const raw = process.stdin.isTTY ? "{}" : readStdin();
   let input: Record<string, unknown> = {}; try { input = JSON.parse(raw || "{}"); } catch { /* not JSON */ }
+  if (cli === "hermes") { // T460: Hermes's `{session_id, cwd, extra:{user_message, platform}}` onto the shared contract
+    const mapped = hermesHookInput(input);
+    if (mapped.skip) return; // a delegated subagent is not this conversation: never bind, count or nag for it
+    input = mapped.input;
+  }
   if (event === "permission") { // fail closed: any problem means no output and the CLI's normal prompt
     let parsed: unknown = null; try { parsed = JSON.parse(raw); } catch { /* malformed */ }
     const d = decidePermission(parsed, cli, yoloLookup(node), { node, pid: process.ppid });
@@ -1331,7 +1355,8 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
     return;
   }
   // Chosen identities (T204): a session either holds the identity it chose, or is told how to resume or register one.
-  const unbound = "[mbx] This session has no mailbox identity yet. If you will message other agents, call mbx_whoami: it lists this project's agents (name, role, live or offline, unread). Resume yours with mbx_identity {\"action\":\"claim\",\"name\":\"<name>\"} or create one with mbx_identity {\"action\":\"register\",\"name\":\"<project>-<role>\",\"role\":\"<role>\"}. Never invent a random name. When the owner ends this session or hands it off, call mbx_identity release after your final mailbox work.";
+  // Every line starts with [mbx] so OpenCode's plugin keeps the whole list (it drops a run at the first other line).
+  const unbound = `${formatUnboundStart(node.home, projectOf(cwd) ?? undefined).split("\n").map(line => `[mbx] ${line}`).join("\n")}\n[mbx] When the owner ends this session or hands it off, call mbx_identity release after your final mailbox work.`;
   const held = (agent: string) => `[mbx] You are ${agent}@${node.host}${((r) => r ? ` (role: ${r.role})` : "")(registeredIdentity(node.store, agent))}. When the owner ends this session or hands it off, call mbx_identity release after your final mailbox work; finishing a turn is not ending a session.`;
   // Inspect provider capabilities and processes before the lease transaction. No directory-based session discovery.
   const host = cli === "claude" ? detectHost(process.ppid) : null;
@@ -1344,9 +1369,11 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
       if ((event === "prompt" || event === "session-start") && sid) {
         // Claude /clear keeps its MCP holder but replaces its real session ID. Use the
         // guarded holder's existing key explicitly; bindSession never guesses across real sessions.
-        const source = bootstrap && cli === "claude" ? node.sessionsFor(agent).find(s => s.cli === cli && s.pid === process.ppid
+        // T460: Hermes (one conversation per TUI/CLI process) rebinds the same way: /new and /resume give the same holder a new id.
+        const rebinding = REBINDING_CLIS.includes(cli);
+        const source = bootstrap && rebinding ? node.sessionsFor(agent).find(s => s.cli === cli && s.pid === process.ppid
           && s.session_key && fingerprint(s.session_key) === descriptor.control_key && node.sameSession(s.pid, s, { proof: true })) : undefined;
-        if (bootstrap && cli === "claude" && !source) throw new Error("hook holder has no current session binding");
+        if (bootstrap && rebinding && !source) throw new Error("hook holder has no current session binding");
         const bound = node.bindSession({ agent, cli, session_id: sid, cwd, pid: process.ppid,
           ...(source ? { session_key: source.session_key!, channel: !!source.channel } : {}) });
         const row = node.store.db.prepare("SELECT agent,session_key FROM sessions WHERE cli=? AND session_id=?").get(cli, sid);
@@ -1380,7 +1407,7 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
           if (!liveWatcher(node, agent)) emit(cli, "PostToolUse", grokWatchReminder(sid));
           return;
         }
-        if (cli !== "claude") return;
+        if (cli !== "claude" && cli !== "opencode") return;
         // Track IDs, not counts or sender timestamps: replacing one acked message with a new one must notify,
         // including delayed remote mail. Never fetch or inject message bodies into a tool hook.
         // T342: read the fast-path marker BEFORE querying the mailbox. A delivery that commits
@@ -1407,6 +1434,11 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
           lines.push(`[mbx] ${n} unread for ${agent}@${node.host}: mbx_inbox${event === "post-tool" ? " before continuing" : ""}.${newBrief ? brief : ""}`);
           if (newBrief) node.store.set(briefKey, brief);
         }
+        // T460: Hermes drops on_session_start output, and a finished watcher is what wakes it: say so while none runs (bounded).
+        if (event === "prompt" && cli === "hermes" && !liveWatcher(node, agent)) {
+          const w = hermesWatcherNote(node, agent, sid ?? process.ppid, !!delegationNote(node.store.db, agent, node.host));
+          if (w) lines.push(w);
+        }
         // Kimi drops SessionStart output and MCP server instructions: a terminal session learns to start its watcher here,
         // on every prompt until one is running (T033).
         if (event === "prompt" && cli === "kimi" && !kimiMultiHost(process.ppid) && !liveWatcher(node, agent)) {
@@ -1426,7 +1458,10 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
         // owner has delegated work or signed the request, only for mail newer than what was already surfaced, within the wake caps.
         // T385: Grok continues the same turn on {"decision":"block","reason"} (user-guide 10-hooks.md,
         // Stop Decision Control). A session-end Stop, reason other than end_turn, has no turn left to continue.
-        if (!["claude", "codex", "kimi", "grok"].includes(cli)) return;
+        // T391: OpenCode Stop arrives from the plugin's session.idle (the turn just ended); the block
+        // reason is injected back into the session by the plugin's client, and the stopseen marker +
+        // allowContinue cap below bound the loop the injection could otherwise create.
+        if (!["claude", "codex", "kimi", "grok", "opencode"].includes(cli)) return;
         if (cli === "grok" && typeof input.reason === "string" && input.reason !== "end_turn") return;
         const mark = `stopseen:${cli}:${sid ?? process.ppid}`, seen = node.store.get(mark) ?? new Date(Date.now() - 10 * 60_000).toISOString();
         const fresh = node.inbox(agent, { limit: 50 })
@@ -1489,8 +1524,9 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
     // A dedicated provider process tells its mbx server which session it is, so a resumed session gets its identity back.
     if (!multi && !["codex", "opencode"].includes(cli)) try { recordSessionHint(node.store, cli, process.ppid, inspectLeaseProcess(process.ppid).start, sid); } catch { /* advisory */ }
     // Guidance on session start; Kimi drops SessionStart context, so a Kimi session gets it once on its first prompt.
-    const guided = `guided:${cli}:${sid}`, first = cli === "kimi" && !node.store.get(guided);
-    if (event === "session-start") { node.store.set(guided, new Date().toISOString()); emit(cli, "SessionStart", link ? `${unbound}\n${link}` : unbound); }
+    // Kimi and Hermes drop SessionStart output, so their first prompt carries the guidance (Hermes: pre_llm_call context).
+    const guided = `guided:${cli}:${sid}`, first = (cli === "kimi" || cli === "hermes") && !node.store.get(guided);
+    if (event === "session-start") { if (cli !== "hermes") { node.store.set(guided, new Date().toISOString()); emit(cli, "SessionStart", link ? `${unbound}\n${link}` : unbound); } }
     else if (grokUnboundPost) emit(cli, "PostToolUse", link ? `${unbound}\n${link}` : unbound);
     else if (link || first) { node.store.set(guided, new Date().toISOString()); emit(cli, "UserPromptSubmit", first ? (link ? `${unbound}\n${link}` : unbound) : link!); }
   }
@@ -1664,8 +1700,24 @@ async function watch(node: MbxNode, selection: CliIdentitySelection) {
   }
 }
 
+/** The Hermes watcher note for one prompt: the full instruction once per session, then a one-line reminder at most every
+ *  HERMES_NAG_MS while no watcher runs (it rides in the user message of the turn and persists with it). An explicit
+ *  MBX_SELF_WATCH choice (cron minutes, or off) is the full text once and is not repeated as a watcher reminder. */
+function hermesWatcherNote(node: MbxNode, agent: string, session: string | number, delegated: boolean): string | null {
+  const full = selfWatchInstruction({ delegated, cli: "hermes" });
+  if (!full) return null;
+  const key = `hermesnag:${session}:${agent}`, last = Date.parse(node.store.get(key) ?? "");
+  if (Number.isFinite(last) && (full !== HERMES_WATCHER_INSTRUCTION || Date.now() - last < HERMES_NAG_MS)) return null;
+  node.store.set(key, new Date().toISOString());
+  return Number.isFinite(last) ? HERMES_WATCHER_REMINDER : full;
+}
+
 function emit(cli: string, event: string, context: string) {
-  if (cli === "kimi") return console.log(context);               // Kimi adds plain stdout to the context
+  if (cli === "hermes") { const out = hermesHookOutput(event, context); if (out) console.log(out); return; } // T460: {"context"} on pre_llm_call only
+  // B2b (T391): Kimi and OpenCode have no hookSpecificOutput protocol. OpenCode's plugin captures
+  // plain hook stdout and injects only the [mbx]/probe-ok runs it recognizes as ours (see
+  // opencodePluginSource in setup.ts). Claude Code reads the JSON shape; Codex and Grok keep theirs.
+  if (cli === "kimi" || cli === "opencode") return console.log(context);
   console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: context } }));
 }
 

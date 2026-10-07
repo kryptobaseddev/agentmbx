@@ -33,7 +33,11 @@ export const hasWakeAuthority = (node, agent, message) => node.policyFor(message
 /** kv key: when the owner last typed a prompt in a session holding `agent` (hook "prompt"; ends relay chains, T104). */
 export const humanPromptKey = (agent) => `human-prompt:${agent}`;
 /** Prompts AgentMBX itself submits (wakes, [mbx-watch] self-checks) are not the owner and never end a relay chain. */
-export const isHumanPrompt = (prompt) => typeof prompt === "string" && !!prompt.trim() && !/^\s*\[mbx(-watch)?\]/.test(prompt);
+/** T460: Hermes wraps a finished background process (our watcher) in its own `[IMPORTANT: Background process <id> completed …]`
+ *  turn, so the wake hint sits inside the text instead of at its start. Only that wrapper around our own hint is machine-made. */
+const HERMES_WATCH_WRAPPER = /^\s*\[IMPORTANT: (?:Background process \S+ |\d+ background processes )[\s\S]*?\[mbx(?:-watch)?\]/;
+export const isHumanPrompt = (prompt) => typeof prompt === "string" && !!prompt.trim() && !/^\s*\[mbx(-watch)?\]/.test(prompt)
+    && !HERMES_WATCH_WRAPPER.test(prompt);
 export function wakeText(agent, msgs) {
     const senders = [...new Set(msgs.map((m) => `${m.from_addr} [${trustLabel(m).split(" · ")[0].split(" (")[0]}]`))].join(", ");
     const owner = msgs.some(m => JSON.parse(m.envelope).authority) ? " Includes an owner-authority claim; verify its current mbx_read header." : "";

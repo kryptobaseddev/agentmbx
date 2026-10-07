@@ -7,6 +7,9 @@ import { hostname, networkInterfaces } from "node:os";
 import { canonical, fingerprint, joinTranscript, nonce as newNonce, pairingCode, pairMac, pairTokenKey, safeEqual, sha256, signData, verifyData, } from "./crypto.js";
 import { NAME_RE, sealEnvelope } from "./envelope.js";
 import { MbxNode, RETRY_HOURS } from "./node.js";
+import { resolveStatusIdentity } from "./status-identity.js";
+import { hudStatus, hudStatusV2 } from "./hud.js";
+import { STATUS_V2_SCHEMA } from "./status-schema.js";
 import { notifyDesktop } from "./wake.js";
 import { version } from "./version.js";
 import { rotationLog, saveRotationLog } from "./key-rotation.js";
@@ -245,6 +248,9 @@ export const addrSignature = (node) => selfAddrs(node).slice().sort().join(",");
 export const advertisedAddr = (node) => process.env.MBX_ADVERTISE || `${hostname().replace(/\.local$/, "").toLowerCase()}.local:${node.config.port}`;
 export const DEFAULT_LIMITS = { maxRequestBytes: 4 * 1024 * 1024, peerReqsPerMin: 600, headersTimeoutMs: 10_000, requestTimeoutMs: 30_000, keepAliveTimeoutMs: 5_000 };
 const httpError = (status, message) => Object.assign(new Error(message), { status });
+/** True when a request arrived over loopback (IPv4, IPv6, or a v4-mapped address). T407 session-scoped
+ *  status reads are restricted to these: same-host plugins need them, and the snapshot is host-local. */
+export const isLoopbackRemote = (addr) => addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
 const readBody = (req, max) => new Promise((res, rej) => {
     const tooBig = () => httpError(413, `request body over ${max} bytes`);
     if (Number(req.headers["content-length"]) > max)
@@ -374,6 +380,30 @@ export function startServer(node, port = node.config.port, bind = node.config.bi
             if (url.pathname === "/v1/status") {
                 if (req.method !== "GET")
                     return send(405, { error: "method not allowed" });
+                // T407: session-scoped status for in-harness renderers (the Claude mod, #143; the OpenCode
+                // sidebar, T399). `cli`+`session` answer with the same mbx.status snapshot the T311 CLI and
+                // the statusline adapters produce: identity resolution is by (cli, session_id) alone, so a
+                // query can never surface another identity's data (T308 AC2), and an unknown session gets
+                // an explicit `unbound` snapshot rather than an error. Session-scoped reads are loopback
+                // only: they carry one mailbox's unread counts, which is host-local information; peers keep
+                // the public runtime/challenge contract below. The default answer is the v1 snapshot;
+                // `schema=mbx.status/v2` (T404) returns the v2 model from src/status-schema.ts — the mod
+                // and the sidebar migrate by changing one query parameter, nothing else.
+                const cli = url.searchParams.get("cli"), session = url.searchParams.get("session");
+                if (cli && session) {
+                    if (!isLoopbackRemote(req.socket.remoteAddress ?? ""))
+                        return send(403, { error: "session-scoped status is loopback only" });
+                    const resolved = resolveStatusIdentity(node, cli, { sessionId: session });
+                    if (url.searchParams.get("schema") === STATUS_V2_SCHEMA)
+                        return send(200, hudStatusV2(node, {
+                            cli, sessionId: session, agent: resolved.name, state: resolved.state,
+                            resolvedBy: resolved.resolved_by ?? "none", candidates: resolved.candidates,
+                        }));
+                    return send(200, hudStatus(node, {
+                        agent: resolved.name, state: resolved.state,
+                        resolvedBy: resolved.resolved_by ?? "none", candidates: resolved.candidates,
+                    }));
+                }
                 const challenge = url.searchParams.get("challenge");
                 if (challenge === null)
                     return send(200, runtime);

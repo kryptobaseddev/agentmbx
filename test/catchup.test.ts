@@ -84,9 +84,39 @@ test("CU-02 + CU-06: fetching pages does not advance the checkpoint and mutates 
   assert.equal(page.catchup.missed, 2);
   const record = readCatchup(n.store, "worker")!;
   assert.ok(record.position < Number(n.store.db.prepare("SELECT MAX(seq) seq FROM mailbox_visibility WHERE mailbox='worker'").get()!.seq));
-  const again = (await c.callTool({ name: "mbx_catchup", arguments: {} })).structuredContent as { messages: { id: string }[] };
+  const again = (await c.callTool({ name: "mbx_catchup", arguments: {} })).structuredContent as { messages: { id: string }[]; next_cursor: string; catchup: { unchanged: boolean; hint: string; position: number } };
   assert.deepEqual(again.messages.map((m) => m.id), [m1.id, m2.id], "re-fetch from the stored position returns the same page");
+  assert.equal(again.catchup.unchanged, true, "a re-fetch without commit says the page is unchanged");
+  assert.match(again.catchup.hint, /unchanged/);
+  assert.match(again.catchup.hint, new RegExp(`commit set to this next_cursor: ${again.next_cursor.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.equal(again.catchup.position, page.catchup.position, "the re-fetch did not advance the checkpoint");
   assert.deepEqual(n.store.db.prepare("SELECT * FROM deliveries ORDER BY msg_id").all(), before, "fetch mutates no delivery state");
+});
+
+test("T465: a corrupt cursor is a format error, and a different mailbox stays a scope mismatch", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-t465-")), n = new MbxNode(home, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  claimDirect(n, "worker");
+  ensureCatchup(n.store, "worker", leaseRow(n, "worker"), "s");
+  n.send({ from: "boss", to: ["worker"], subject: "one", body: "b" });
+  const epoch = n.store.get("replay:epoch")!;
+  const good = encodeReplayFrame({ v: 1, epoch, mailbox: "worker", filter: readCatchup(n.store, "worker")!.filter, position: replayMaximum(n.store, "worker"), end: replayMaximum(n.store, "worker") });
+  const chars = good.split("");
+  chars[10] = chars[10] === "A" ? "B" : "A";
+  const flipped = chars.join("");
+  assert.throws(() => commitCatchup(n.store, "worker", flipped, "typo"), (err: { code?: string; message?: string }) => {
+    assert.equal(err.code, "CURSOR_MALFORMED");
+    assert.match(err.message ?? "", /malformed/);
+    assert.match(err.message ?? "", /no cursor/);
+    assert.equal((err.message ?? "").includes("different mailbox"), false);
+    return true;
+  });
+  assert.throws(() => commitCatchup(n.store, "worker", "not-a-cursor", "typo"), (err: { code?: string }) => err.code === "CURSOR_MALFORMED");
+  const other = encodeReplayFrame({ v: 1, epoch, mailbox: "someone-else", filter: readCatchup(n.store, "worker")!.filter, position: 1, end: 1 });
+  assert.throws(() => commitCatchup(n.store, "worker", other, "other"), (err: { code?: string; message?: string }) => {
+    assert.equal(err.code, "CURSOR_SCOPE_MISMATCH");
+    return true;
+  });
 });
 
 test("CU-03: commits are monotonic; rewinds fail; identical re-commit is a no-op", async (t) => {
