@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **The harness-validation recipe gains its status-surface check (T431):** `docs/harness-validation-recipe.md` is the canonical seven-check recipe (the T377/T379 pattern), and check 7 now covers every status surface — per-CLI statusline segments, the v1 and v2 HUD snapshots, both CLI schemas, the T407 loopback endpoint, and both plugin surfaces (Claude mod, OpenCode sidebar) — each with its machine-checkable evidence (fixture render, snapshot file, endpoint JSON, or audit row). `test/fixtures/status-v2-bound.json` is the shared v2 contract fixture, and `test/status-surface.test.ts` renders it through the line renderer and automates the statusline check for a composing CLI (opencode) and the alert-only CLI (kimi): own session renders its segment, an unknown session renders nothing (T308 AC2).
+
 ## 0.5.17 (2026-10-07)
 
 OpenCode reliability and the unified status model: owner takeover recovers a lease held under another OpenCode process, doctor explains OpenCode's hourly eviction, session start lists claimable mailboxes, mailbox names never default to the harness, and mbx.status/v2 ships end to end (schema, CLI, endpoint, daemon snapshots, OpenCode sidebar spike).
