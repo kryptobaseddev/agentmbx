@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Setup recognizes hooks after config comments are lost (T479).** Kimi doctor checks the hook event and command pairs, and setup adds only missing pairs when managed markers are absent, preserving existing hooks and user config. Hermes wiring is also checked by its hook commands, with regression coverage for unmarked and missing hooks.
+
 ## 0.5.16 (2026-10-07)
 
 Hotfix: OpenCode hooks bind the named session on a shared `opencode serve`, and shell sends under OpenCode require `--session`.
