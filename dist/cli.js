@@ -44,7 +44,7 @@ import { approveKimi, decidePermission, opencodePermissionPass } from "./permiss
 import { diagnosticSnapshot } from "./diagnostics.js";
 import { configuredRetention, prune, retentionDays } from "./retention.js";
 import { exportIdentity, identityInitialized, importIdentity } from "./identity-backup.js";
-import { listIdentityStatus } from "./identity-status.js";
+import { formatUnboundStart, listIdentityStatus } from "./identity-status.js";
 import { REBINDING_CLIS, withCliIdentity, withHookIdentity } from "./cli-identity.js";
 import { declaredOriginWarning, readSessionTaint, refuseAgentOrigin, taintSendWarning } from "./session-taint.js";
 import { runProbe, storeProbeIO } from "./probe.js";
@@ -1666,7 +1666,8 @@ async function hook(node, event, cli) {
         return;
     }
     // Chosen identities (T204): a session either holds the identity it chose, or is told how to resume or register one.
-    const unbound = "[mbx] This session has no mailbox identity yet. If you will message other agents, call mbx_whoami: it lists this project's agents (name, role, live or offline, unread). Resume yours with mbx_identity {\"action\":\"claim\",\"name\":\"<name>\"} or create one with mbx_identity {\"action\":\"register\",\"name\":\"<project>-<role>\",\"role\":\"<role>\"}. Never invent a random name. When the owner ends this session or hands it off, call mbx_identity release after your final mailbox work.";
+    // Every line starts with [mbx] so OpenCode's plugin keeps the whole list (it drops a run at the first other line).
+    const unbound = `${formatUnboundStart(node.home, projectOf(cwd) ?? undefined).split("\n").map(line => `[mbx] ${line}`).join("\n")}\n[mbx] When the owner ends this session or hands it off, call mbx_identity release after your final mailbox work.`;
     const held = (agent) => `[mbx] You are ${agent}@${node.host}${((r) => r ? ` (role: ${r.role})` : "")(registeredIdentity(node.store, agent))}. When the owner ends this session or hands it off, call mbx_identity release after your final mailbox work; finishing a turn is not ending a session.`;
     // Inspect provider capabilities and processes before the lease transaction. No directory-based session discovery.
     const host = cli === "claude" ? detectHost(process.ppid) : null;

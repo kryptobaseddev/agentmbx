@@ -15,9 +15,37 @@ import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.js";
 import { detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConsent, skillDest, skillStatus, statuslineConfiguredCommand, statuslineForms, statuslineState, wired } from "./setup.js";
 import { mailboxLiveness } from "./receipts.js";
 import { liveWatcher } from "./wake.js";
-import { listIdentityControls } from "./identity-control.js";
+import { findIdentityControl, listIdentityControls } from "./identity-control.js";
 import { pruneCandidates } from "./identity-cleanup.js";
+import { inspectLeaseProcess } from "./identity-leases.js";
+import { providerLabel, sameLiveProvider } from "./identity-takeover.js";
 export const CLAIM_CHURN_LIMIT = 5;
+/** T481: one session id leased by an MCP under a different OpenCode serve than the published control endpoint. */
+export function foreignSessionProvider(node) {
+    const rows = node.store.db.prepare("SELECT * FROM identity_leases WHERE released_at IS NULL").all();
+    const out = [];
+    for (const row of rows) {
+        let claimant;
+        try {
+            claimant = findIdentityControl(node.store, row.cli, row.session_id);
+        }
+        catch {
+            continue;
+        }
+        const evidence = inspectLeaseProcess(row.holder_pid);
+        if (!(evidence.alive === true && evidence.start === row.holder_start))
+            continue;
+        if (sameLiveProvider(row.holder_pid, claimant))
+            continue;
+        const last = new Date(row.heartbeat_at).toISOString();
+        out.push({
+            level: "warn",
+            label: `${row.cli} session ${row.session_id} is leased by pid ${row.holder_pid} under provider ${providerLabel(row.holder_pid)} (last activity ${last}), while this session's control endpoint is pid ${claimant.mcp_pid} under provider ${providerLabel(claimant.mcp_pid)}`,
+            fix: `agentmbx identity takeover --force ${row.name} --cli ${row.cli} --session ${row.session_id}`,
+        });
+    }
+    return out;
+}
 /** Ten-minute claim/release storms indicate connector fights, not useful session work. */
 export function identityClaimChurn(node, now = Date.now()) {
     const rows = node.store.db.prepare("SELECT detail FROM audit WHERE event='identity.claim' AND at>=? ORDER BY at")
@@ -521,6 +549,8 @@ export async function doctor(ctx, mbxHome, opts = {}) {
         for (const c of pendingIdentities(node))
             out.push(c);
         for (const c of identityClaimChurn(node))
+            out.push(c);
+        for (const c of foreignSessionProvider(node))
             out.push(c);
         out.push(pruneSummary(node));
         const peers = node.peers();
