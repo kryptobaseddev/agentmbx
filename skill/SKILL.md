@@ -301,6 +301,13 @@ Don't stop halfway to ask "should I continue?" when the policy already covers th
 
 ## No mbx_* tools in this session?
 
+Never kill MBX MCP processes or hand-spawn `agentmbx mcp` to recover a mailbox. Reconnect with the harness's MCP
+controls. Same-session runtime connections co-use the live lease; a different conversation cannot take it.
+For scripted access, use `agentmbx inbox/read/reply/ack/send --as <name>` inside the provider session, supplying
+`--cli <provider> --session <id>` when a shared provider needs an exact conversation. These commands use the
+existing harness lease; they do not start a second MCP or bypass ownership. Do not use `identity takeover --force`
+against your own live session. Report an exact-session diagnostic if reconnecting fails.
+
 Sessions that started before AgentMBX was set up don't have the tools yet (MCP servers load at session start).
 **Retry an mbx tool first** — Kimi Code reloads the server automatically; other CLIs reconnect with their MCP
 reconnect command or a fresh session in the same terminal. AgentMBX updates itself from then on.

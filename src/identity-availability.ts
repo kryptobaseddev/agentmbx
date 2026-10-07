@@ -37,18 +37,18 @@ export interface Availability {
 const minutes = (ms: number) => `${Math.max(1, Math.round(ms / 60_000))} min`;
 
 /** The provider a holder recorded at claim (`mcp-provider:<mcpPid>`). Start is the lease-layer birth time, not a proc-table field. */
-export interface RecordedProvider { pid: number; start: string }
+export interface RecordedProvider { pid: number; start: string; harness?: true }
 export const providerRecordKey = (mcpPid: number): string => `mcp-provider:${mcpPid}`;
 
 /** A kv value is a provider record only when both fields are present and bounded. Anything else is "no record". */
 export function parseProviderRecord(raw: string | null | undefined): RecordedProvider | null {
   if (!raw) return null;
   try {
-    const parsed = JSON.parse(raw) as { providerPid?: unknown; providerStart?: unknown };
+    const parsed = JSON.parse(raw) as { providerPid?: unknown; providerStart?: unknown; harness?: unknown };
     const pid = parsed.providerPid, start = parsed.providerStart;
     if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) return null;
     if (typeof start !== "string" || start.length === 0 || start.length > 300) return null;
-    return { pid, start };
+    return { pid, start, ...(parsed.harness === true ? { harness: true as const } : {}) };
   } catch { return null; }
 }
 
@@ -90,8 +90,17 @@ export function holderProviderPid(table: Map<number, { ppid: number }>, holderPi
  * then alive.
  */
 export function holderProviderView(table: Map<number, { ppid: number }>, holderPid: number, callerProvider: number | undefined,
-  recorded: RecordedProvider | null, evidence: ProcessEvidence | null): { holderProviderPid: number | null; holderProviderAlive: boolean | null } {
+  recorded: RecordedProvider | null, evidence: ProcessEvidence | null, canonicalHarness = false): { holderProviderPid: number | null; holderProviderAlive: boolean | null } {
   const verdict = recorded && evidence ? recordedProviderVerdict(table, recorded, evidence) : null;
+  // A proven harness caller may normalize an older connector's runtime provider record.
+  if (canonicalHarness && verdict === "valid" && recorded && callerProvider !== undefined) {
+    for (let p = recorded.pid, n = 0; p > 1 && n < 16; n++) {
+      if (p === callerProvider) return { holderProviderPid: callerProvider, holderProviderAlive: true };
+      const parent = table.get(p)?.ppid;
+      if (!parent) break;
+      p = parent;
+    }
+  }
   const useRecord = verdict === "valid" || verdict === "dead";
   const holderProvider = holderProviderPid(table, holderPid, callerProvider, useRecord ? recorded : null, useRecord ? evidence : null);
   const holderProviderAlive = verdict === "valid" ? true : verdict === "dead" ? false : holderProvider != null ? true : null;

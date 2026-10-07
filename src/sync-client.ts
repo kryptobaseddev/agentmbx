@@ -1,5 +1,6 @@
-// Daemon sync client (T262). One POST writer, one seq per host. No network call
-// unless a local link record exists. SyncAck cannot turn the path or lead opt-in on.
+// Daemon sync client (T262, T468). One POST writer, one seq per host. No network call
+// unless a local link record exists, and no bearer token. SyncAck cannot turn the path or lead opt-in on.
+import { createHash, randomBytes } from "node:crypto";
 import {
   CONTRACT_VERSION, PATH_FLAG_PREFIX, PROJECT_LEADS_SINCE, PROJECT_PATHS_SINCE, projectSync, type Projection, type SyncSnapshot,
 } from "./sync-projection.ts";
@@ -11,7 +12,6 @@ export { PATH_FLAG_PREFIX };
 export interface SyncLink {
   v: 1;
   sync_url: string;
-  token: string;
   contract: { min: number; max: number };
   /** Set by local enrolment when the spoken schema lists HostReport.project_paths. Never by a SyncAck. */
   project_paths?: boolean;
@@ -34,12 +34,46 @@ interface SyncState {
 
 export interface Kv { get(k: string): string | undefined; set(k: string, v: string): void }
 
+/** Signs one POST attempt. `timestamp` and `nonce` run at send time, including a retry of a stored body. */
+export interface SyncSigner {
+  hostId: string;
+  /** Scheme, host, and port only. No path and no trailing slash. */
+  apiOrigin: string;
+  /** Ed25519 signature of the exact UTF-8 string, standard base64. */
+  sign(message: string): string;
+  /** Unix seconds. */
+  timestamp(): number;
+  /** 32 random bytes, base64url. */
+  nonce(): string;
+}
+
+/** The bytes the cloud verifies. No trailing newline. */
+export function syncPopString(input: { apiOrigin: string; hostId: string; body: string; timestamp: string; nonce: string }): string {
+  const hash = createHash("sha256").update(input.body).digest("hex");
+  return [
+    "agentmbx-sync-pop-v1",
+    input.apiOrigin,
+    input.hostId,
+    "POST",
+    "/v1/host/sync",
+    hash,
+    input.timestamp,
+    input.nonce,
+  ].join("\n");
+}
+
+/** 32 random bytes as base64url. A new value on every call. */
+export function newSyncNonce(): string {
+  return randomBytes(32).toString("base64url");
+}
+
 export interface SyncDeps {
   kv: Kv;
   fetch: typeof fetch;
   now: number;
   /** Called only when a new batch will be sent. Not called when unlinked, waiting, or resending. */
   source: (ctx: { now: string; seq: number; full: boolean; contract: number; contractAllowsProjectPaths: boolean; contractAllowsProjectLeads: boolean; sentReceipts: string[] }) => Omit<SyncSnapshot, "now" | "seq" | "full" | "contract" | "contractAllowsProjectPaths" | "contractAllowsProjectLeads" | "sentReceipts">;
+  signer?: SyncSigner;
   audit?: (event: string, detail: Record<string, string | number | boolean>) => void;
 }
 
@@ -60,9 +94,9 @@ export function readLink(get: Kv["get"]): SyncLink | null {
   try { parsed = JSON.parse(raw); } catch { return null; }
   if (!parsed || typeof parsed !== "object") return null;
   const l = parsed as Partial<SyncLink>;
-  if (l.v !== 1 || typeof l.sync_url !== "string" || !l.sync_url || typeof l.token !== "string" || !l.token) return null;
+  if (l.v !== 1 || typeof l.sync_url !== "string" || !l.sync_url) return null;
   if (!l.contract || typeof l.contract.min !== "number" || typeof l.contract.max !== "number") return null;
-  return { v: 1, sync_url: l.sync_url, token: l.token, contract: { min: l.contract.min, max: l.contract.max },
+  return { v: 1, sync_url: l.sync_url, contract: { min: l.contract.min, max: l.contract.max },
     ...(l.project_paths === true ? { project_paths: true } : {}), ...(l.project_leads === true ? { project_leads: true } : {}) };
 }
 
@@ -168,11 +202,22 @@ export async function syncOnce(o: SyncDeps): Promise<SyncResult> {
 }
 
 async function send(o: SyncDeps, link: SyncLink, state: SyncState, pending: Pending): Promise<SyncResult> {
+  const signer = o.signer;
+  if (!signer) return { outcome: "unlinked" };
+  const timestamp = String(signer.timestamp());
+  const nonce = signer.nonce();
+  const message = syncPopString({ apiOrigin: signer.apiOrigin, hostId: signer.hostId, body: pending.body, timestamp, nonce });
   let res: Response;
   try {
     res = await o.fetch(postUrl(link.sync_url), {
       method: "POST",
-      headers: { authorization: `Bearer ${link.token}`, "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        "X-MBX-Host-Id": signer.hostId,
+        "X-MBX-Timestamp": timestamp,
+        "X-MBX-Nonce": nonce,
+        "X-MBX-Signature": signer.sign(message),
+      },
       body: pending.body,
     });
   } catch {

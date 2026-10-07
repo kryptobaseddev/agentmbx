@@ -27,7 +27,7 @@ export interface IdentityStatus {
 }
 
 export function listIdentityStatus(home: string, options: { now?: number; inspect?: (pid: number) => ProcessEvidence;
-  project?: string; caller?: { cli: string; sessionId: string; pid?: number; providerPid?: number }; includeRetired?: boolean;
+  project?: string; caller?: { cli: string; sessionId: string; pid?: number; providerPid?: number; canonicalHarness?: boolean }; includeRetired?: boolean;
   processTable?: () => Map<number, { ppid: number }> } = {}) {
   const path = join(home, "mbx.db"), now = options.now ?? Date.now();
   if (!Number.isSafeInteger(now) || now < 0 || now > 8.64e15) throw new Error("invalid identity observation time");
@@ -90,12 +90,12 @@ export function listIdentityStatus(home: string, options: { now?: number; inspec
   // a claim must recheck the current generation under its own write lock.
   const inspect = options.inspect ?? inspectLeaseProcess;
   // The provider process a same-session holder serves under (T383), read only for a lease of the caller's own session.
-  const sameSessionProvider = (lease: IdentityLease, caller: { cli: string; sessionId: string; providerPid?: number }) => {
+  const sameSessionProvider = (lease: IdentityLease, caller: { cli: string; sessionId: string; providerPid?: number; canonicalHarness?: boolean }) => {
     if (lease.cli !== caller.cli || lease.session_id !== caller.sessionId) return {};
     const recorded = providerByHolder.get(lease.holder_pid) ?? null;
     let evidence: ProcessEvidence | null = null;
     if (recorded) { try { evidence = inspect(recorded.pid); } catch { evidence = { alive: null, start: null }; } }
-    return holderProviderView((options.processTable ?? procTable)(), lease.holder_pid, caller.providerPid, recorded, evidence);
+    return holderProviderView((options.processTable ?? procTable)(), lease.holder_pid, caller.providerPid, recorded, evidence, caller.canonicalHarness);
   };
   for (const lease of leases) {
     const item = row(lease.name); activity(item, lease.heartbeat_at); activity(item, lease.released_at);

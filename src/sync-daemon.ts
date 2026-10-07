@@ -3,13 +3,14 @@
 // syncOnce returns before fetch and before loadSyncSnapshot runs.
 import { homedir, userInfo } from "node:os";
 import { missedCount } from "./catchup.ts";
-import { fingerprint } from "./crypto.ts";
+import { readCloudEnrolment, readCloudKey } from "./cloud-key.ts";
+import { fingerprint, signData } from "./crypto.ts";
 import type { MbxNode } from "./node.ts";
 import { storedPolicies } from "./policy.ts";
 import { activeLead } from "./lead-record.ts";
 import { projectKey } from "./registry.ts";
 import { relayFor } from "./relay-client.ts";
-import { syncOnce, type SyncDeps, type SyncResult } from "./sync-client.ts";
+import { newSyncNonce, syncOnce, type SyncDeps, type SyncResult, type SyncSigner } from "./sync-client.ts";
 import { CAPS, PATH_FLAG_PREFIX, PROJECT_KEY_RE, type AgentInput, type HostInput, type LeadInput, type PathInput, type PolicyInput, type ReceiptInput, type SyncSnapshot, type ThreadInput } from "./sync-projection.ts";
 import type { Store } from "./store.ts";
 import { version } from "./version.ts";
@@ -177,12 +178,30 @@ export function loadSyncSnapshot(node: MbxNode, ctx: { contractAllowsProjectPath
   };
 }
 
+function syncSigner(home: string, nowMs: number): SyncSigner | undefined {
+  const enrolment = readCloudEnrolment(home);
+  const key = readCloudKey(home);
+  if (!enrolment || !key) return undefined;
+  let apiOrigin: string;
+  try { apiOrigin = new URL(enrolment.resources.api).origin; }
+  catch { return undefined; }
+  return {
+    hostId: enrolment.host_id,
+    apiOrigin,
+    sign: (message) => signData(key.privateKey, message),
+    timestamp: () => Math.floor(nowMs / 1000),
+    nonce: newSyncNonce,
+  };
+}
+
 export async function syncTick(node: MbxNode, deps: SyncTickDeps = {}): Promise<SyncResult> {
   const projectKeyOf = deps.projectKeyOf ?? projectKey;
+  const now = deps.now ?? Date.now();
   return syncOnce({
+    signer: syncSigner(node.home, now),
     kv: node.store,
     fetch: deps.fetch ?? fetch,
-    now: deps.now ?? Date.now(),
+    now,
     audit: (event, detail) => {
       try { node.store.audit(event, detail); } catch { /* the batch already moved; a busy audit is not a retry */ }
       deps.audit?.(event, detail);

@@ -271,6 +271,15 @@ function loginAudience(raw: string): string | null {
   } catch { return null; }
 }
 
+/** Reads `cloud.key` without creating it. A symlink is refused. A missing file is null. */
+export function readCloudKey(home: string): KeyPair | null {
+  const path = join(home, CLOUD_KEY_FILE);
+  const existing = statFile(path);
+  if (existing === "symlink") throw new Error("cloud key path is a symlink");
+  if (existing !== "file") return null;
+  return parseCloudKey(readFileSync(path, "utf8"));
+}
+
 function parseCloudKey(raw: string): KeyPair {
   let parsed: unknown;
   try { parsed = JSON.parse(raw); }
@@ -330,6 +339,16 @@ function httpUrl(value: unknown): string | null {
 function tokenId(value: unknown): string | null {
   if (typeof value !== "string" || !/^[\x21-\x7E]{1,200}$/.test(value)) return null;
   return value;
+}
+
+/** Reads `cloud-enrolment.json` without writing it. A missing or unreadable file is null. */
+export function readCloudEnrolment(home: string): HostEnrolment | null {
+  const path = join(home, CLOUD_ENROLMENT_FILE);
+  const existing = statFile(path);
+  if (existing === "symlink") throw new Error("enrolment path is a symlink");
+  if (existing !== "file") return null;
+  try { return parseEnrolment(JSON.parse(readFileSync(path, "utf8"))); }
+  catch { return null; }
 }
 
 function parseEnrolment(body: unknown): HostEnrolment | null {
