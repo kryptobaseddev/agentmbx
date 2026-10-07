@@ -78,8 +78,7 @@ test("/v1/status?cli=&session=<unknown> is an explicit unbound snapshot, not an 
   } finally { s.close(); n.store.db.close?.(); }
 });
 
-test("/v1/status?challenge= still answers the signed host status (T151, unchanged)", async () => {
-  const n = newNode();
+test("/v1/status?challenge= still answers the signed host status (T151, unchanged)", async () => {  const n = newNode();
   const s = await startServer(n, 0, "127.0.0.1");
   try {
     const { port } = s.address() as AddressInfo;
@@ -90,6 +89,66 @@ test("/v1/status?challenge= still answers the signed host status (T151, unchange
     assert.equal(j.service, "agentmbx");
     assert.equal(j.challenge, challenge);
     assert.ok(typeof j.sig === "string" && j.sig.length > 0);
+  } finally { s.close(); n.store.db.close?.(); }
+});
+
+test("/v1/status?cli=&session=&schema=mbx.status/v2 returns the unified v2 model (T404)", async () => {
+  const n = newNode();
+  bindSession(n, "claude", "ses_v2bound", "axiom-lab-staff");
+  n.send({ from: "boss", to: ["axiom-lab-staff"], subject: "one", body: "b" });
+  n.send({ from: "boss", to: ["axiom-lab-staff"], subject: "two", body: "b", needs_reply: true });
+  n.send({ from: "boss", to: ["someone-else"], subject: "not yours", body: "b" });
+  const s = await startServer(n, 0, "127.0.0.1");
+  try {
+    const { port } = s.address() as AddressInfo;
+    const res = await fetch(`http://127.0.0.1:${port}/v1/status?cli=claude&session=ses_v2bound&schema=${encodeURIComponent("mbx.status/v2")}`);
+    assert.equal(res.status, 200);
+    const j = await res.json() as Record<string, any>;
+    assert.equal(j.schema, "mbx.status/v2");
+    assert.deepEqual(j.identity, { name: "axiom-lab-staff", role: null, state: "bound" });
+    assert.equal(j.inbox.unread, 2, "only the resolved identity's mail is counted (T308 AC2)");
+    assert.equal(j.inbox.needs_reply, 1);
+    assert.deepEqual(j.registration, { registered: false, lease: null }, "no lease claim in this fixture");
+    assert.equal(j.harness.cli, "claude");
+    assert.equal(j.harness.session_id, "ses_v2bound");
+    assert.equal(j.harness.wake_path, "channel", "claude's wiring is the inbox channel (no channel row needed for the map)");
+    assert.equal(j.resolved_by, "session_id");
+    assert.deepEqual(j.devices, []);
+    assert.deepEqual(j.cloud.relay, { url: null, state: "unset", last_ack: null });
+    assert.equal(j.project, null, "the raw binding inserted no cwd");
+    assert.ok(typeof j.mbx_version === "string");
+  } finally { s.close(); n.store.db.close?.(); }
+});
+
+test("/v1/status v2 for an unknown session is an explicit unbound result", async () => {
+  const n = newNode();
+  bindSession(n, "claude", "ses_v2other", "someone-else");
+  const s = await startServer(n, 0, "127.0.0.1");
+  try {
+    const { port } = s.address() as AddressInfo;
+    const res = await fetch(`http://127.0.0.1:${port}/v1/status?cli=claude&session=ses_v2unknown&schema=${encodeURIComponent("mbx.status/v2")}`);
+    assert.equal(res.status, 200);
+    const j = await res.json() as Record<string, any>;
+    assert.equal(j.schema, "mbx.status/v2");
+    assert.deepEqual(j.identity, { name: null, role: null, state: "unbound" });
+    assert.deepEqual(j.registration, { registered: false, lease: null });
+    assert.equal(j.inbox.unread, 0, "unbound never surfaces anyone's counts (T308 AC2)");
+    assert.equal(j.harness.wake_path, "none");
+    assert.equal(j.project, null);
+  } finally { s.close(); n.store.db.close?.(); }
+});
+
+test("/v1/status without schema keeps answering v1 (the mod migrates by adding one parameter)", async () => {
+  const n = newNode();
+  bindSession(n, "opencode", "ses_default", "axiom-lab-staff");
+  const s = await startServer(n, 0, "127.0.0.1");
+  try {
+    const { port } = s.address() as AddressInfo;
+    const res = await fetch(`http://127.0.0.1:${port}/v1/status?cli=opencode&session=ses_default`);
+    assert.equal(res.status, 200);
+    const j = await res.json() as Record<string, any>;
+    assert.equal(j.schema, "mbx.status/v1");
+    assert.equal(j.identity.name, "axiom-lab-staff");
   } finally { s.close(); n.store.db.close?.(); }
 });
 
