@@ -202,8 +202,8 @@ const WAKE_PATH: Record<string, string> = {
   codex: "queue", // `codex queue`
   opencode: "api", // service API synthetic endpoint
   kimi: "watcher", // terminal Kimi wakes through `agentmbx watch`; the desktop app has its own socket
-  hermes: "watcher",
-  grok: "none",
+  hermes: "watcher", // the Hermes bg-process watcher is the wake path (T460)
+  grok: "watcher", // Grok wakes through `agentmbx watch` (T435)
   copilot: "none",
   cursor: "none",
   gemini: "none",

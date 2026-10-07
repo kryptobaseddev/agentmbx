@@ -47,7 +47,7 @@ test("/v1/status without params keeps the public runtime response", async () => 
 
 test("/v1/status?cli=&session= returns the session-scoped snapshot for a bound session", async () => {
   const n = newNode();
-  bindSession(n, "opencode", "ses_t407bound", "axiom-lab-staff");
+  bindSession(n, "opencode", "ses_t407bound", "probe-staff");
   const s = await startServer(n, 0, "127.0.0.1");
   try {
     const { port } = s.address() as AddressInfo;
@@ -55,7 +55,7 @@ test("/v1/status?cli=&session= returns the session-scoped snapshot for a bound s
     assert.equal(res.status, 200);
     const j = await res.json() as { schema: string; identity: { name: string | null; state: string }; resolved_by: string; unread: number };
     assert.equal(j.schema, "mbx.status/v1");
-    assert.equal(j.identity.name, "axiom-lab-staff");
+    assert.equal(j.identity.name, "probe-staff");
     assert.equal(j.identity.state, "bound");
     assert.equal(j.resolved_by, "session_id");
     assert.equal(j.unread, 0);
@@ -78,7 +78,8 @@ test("/v1/status?cli=&session=<unknown> is an explicit unbound snapshot, not an 
   } finally { s.close(); n.store.db.close?.(); }
 });
 
-test("/v1/status?challenge= still answers the signed host status (T151, unchanged)", async () => {  const n = newNode();
+test("/v1/status?challenge= still answers the signed host status (T151, unchanged)", async () => {
+  const n = newNode();
   const s = await startServer(n, 0, "127.0.0.1");
   try {
     const { port } = s.address() as AddressInfo;
@@ -94,9 +95,9 @@ test("/v1/status?challenge= still answers the signed host status (T151, unchange
 
 test("/v1/status?cli=&session=&schema=mbx.status/v2 returns the unified v2 model (T404)", async () => {
   const n = newNode();
-  bindSession(n, "claude", "ses_v2bound", "axiom-lab-staff");
-  n.send({ from: "boss", to: ["axiom-lab-staff"], subject: "one", body: "b" });
-  n.send({ from: "boss", to: ["axiom-lab-staff"], subject: "two", body: "b", needs_reply: true });
+  bindSession(n, "claude", "ses_v2bound", "probe-staff");
+  n.send({ from: "boss", to: ["probe-staff"], subject: "one", body: "b" });
+  n.send({ from: "boss", to: ["probe-staff"], subject: "two", body: "b", needs_reply: true });
   n.send({ from: "boss", to: ["someone-else"], subject: "not yours", body: "b" });
   const s = await startServer(n, 0, "127.0.0.1");
   try {
@@ -105,7 +106,7 @@ test("/v1/status?cli=&session=&schema=mbx.status/v2 returns the unified v2 model
     assert.equal(res.status, 200);
     const j = await res.json() as Record<string, any>;
     assert.equal(j.schema, "mbx.status/v2");
-    assert.deepEqual(j.identity, { name: "axiom-lab-staff", role: null, state: "bound" });
+    assert.deepEqual(j.identity, { name: "probe-staff", role: null, state: "bound" });
     assert.equal(j.inbox.unread, 2, "only the resolved identity's mail is counted (T308 AC2)");
     assert.equal(j.inbox.needs_reply, 1);
     assert.deepEqual(j.registration, { registered: false, lease: null }, "no lease claim in this fixture");
@@ -140,7 +141,7 @@ test("/v1/status v2 for an unknown session is an explicit unbound result", async
 
 test("/v1/status without schema keeps answering v1 (the mod migrates by adding one parameter)", async () => {
   const n = newNode();
-  bindSession(n, "opencode", "ses_default", "axiom-lab-staff");
+  bindSession(n, "opencode", "ses_default", "probe-staff");
   const s = await startServer(n, 0, "127.0.0.1");
   try {
     const { port } = s.address() as AddressInfo;
@@ -148,7 +149,7 @@ test("/v1/status without schema keeps answering v1 (the mod migrates by adding o
     assert.equal(res.status, 200);
     const j = await res.json() as Record<string, any>;
     assert.equal(j.schema, "mbx.status/v1");
-    assert.equal(j.identity.name, "axiom-lab-staff");
+    assert.equal(j.identity.name, "probe-staff");
   } finally { s.close(); n.store.db.close?.(); }
 });
 
