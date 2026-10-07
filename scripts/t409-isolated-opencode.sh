@@ -54,7 +54,11 @@ if [ "${1:-}" = "audit" ]; then
   child=$(pgrep -P "$tui" | head -1 || true)
   [ -n "$child" ] && record "$child" "opencode serve child"
   sleep 8
-  leaked=$(lsof -p "$tui" ${child:+-p "$child"} 2>/dev/null | grep -E "/Users/|/home/" | grep -v "$ROOT" || true)
+  # The exec'd binary itself always shows as a txt entry (the kernel must read the file to run
+  # it) — that is not an escape. Everything else under the real HOME would be.
+  oc_real=$(readlink -f "$OC_BIN" 2>/dev/null || echo "$OC_BIN")
+  leaked=$(lsof -p "$tui" ${child:+-p "$child"} 2>/dev/null \
+    | grep -E "/Users/|/home/" | grep -v "$ROOT" | grep -vF "$oc_real" || true)
   if [ -n "$leaked" ]; then
     echo "ESCAPE AUDIT FAILED — open paths outside $ROOT:" >&2
     echo "$leaked" >&2
