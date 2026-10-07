@@ -9,6 +9,8 @@ import {
 } from "./crypto.ts";
 import { NAME_RE, sealEnvelope, type Envelope } from "./envelope.ts";
 import { MbxNode, RETRY_HOURS } from "./node.ts";
+import { resolveStatusIdentity } from "./status-identity.ts";
+import { hudStatus } from "./hud.ts";
 import { notifyDesktop } from "./wake.ts";
 import { version } from "./version.ts";
 import { rotationLog, saveRotationLog, type SignedRotation } from "./key-rotation.ts";
@@ -226,6 +228,11 @@ export interface ServerLimits { maxRequestBytes: number; peerReqsPerMin: number;
 export const DEFAULT_LIMITS: ServerLimits = { maxRequestBytes: 4 * 1024 * 1024, peerReqsPerMin: 600, headersTimeoutMs: 10_000, requestTimeoutMs: 30_000, keepAliveTimeoutMs: 5_000 };
 
 const httpError = (status: number, message: string) => Object.assign(new Error(message), { status });
+
+/** True when a request arrived over loopback (IPv4, IPv6, or a v4-mapped address). T407 session-scoped
+ *  status reads are restricted to these: same-host plugins need them, and the snapshot is host-local. */
+export const isLoopbackRemote = (addr: string): boolean =>
+  addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
 const readBody = (req: IncomingMessage, max: number) => new Promise<string>((res, rej) => {
   const tooBig = () => httpError(413, `request body over ${max} bytes`);
   if (Number(req.headers["content-length"]) > max) return rej(tooBig());
@@ -344,6 +351,24 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
       // Public diagnostic metadata only: this neither issues pairing nonces nor grants authority.
       if (url.pathname === "/v1/status") {
         if (req.method !== "GET") return send(405, { error: "method not allowed" });
+        // T407: session-scoped status for in-harness renderers (the Claude mod, #143; the OpenCode
+        // sidebar, T399). `cli`+`session` answer with the same mbx.status snapshot the T311 CLI and
+        // the statusline adapters produce: identity resolution is by (cli, session_id) alone, so a
+        // query can never surface another identity's data (T308 AC2), and an unknown session gets
+        // an explicit `unbound` snapshot rather than an error. Session-scoped reads are loopback
+        // only: they carry one mailbox's unread counts, which is host-local information; peers keep
+        // the public runtime/challenge contract below. The `schema` hint is accepted (v1 today;
+        // mbx.status/v2 arrives with T404) and answered with the snapshot's own `schema` field.
+        const cli = url.searchParams.get("cli"), session = url.searchParams.get("session");
+        if (cli && session) {
+          if (!isLoopbackRemote(req.socket.remoteAddress ?? ""))
+            return send(403, { error: "session-scoped status is loopback only" });
+          const resolved = resolveStatusIdentity(node, cli, { sessionId: session });
+          return send(200, hudStatus(node, {
+            agent: resolved.name, state: resolved.state,
+            resolvedBy: resolved.resolved_by ?? "none", candidates: resolved.candidates,
+          }));
+        }
         const challenge = url.searchParams.get("challenge");
         if (challenge === null) return send(200, runtime);
         if (!isStr(challenge, 64)) return send(400, { error: "bad challenge" });
