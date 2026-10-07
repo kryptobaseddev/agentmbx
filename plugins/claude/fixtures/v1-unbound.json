@@ -1,0 +1,13 @@
+{
+  "schema": "mbx.status/v1",
+  "mbx_version": "0.5.13",
+  "update_available": null,
+  "identity": { "name": null, "role": null, "state": "unbound" },
+  "unread": 4,
+  "needs_reply": 4,
+  "from_owner": 1,
+  "outbox_unsent": 2,
+  "policy": [],
+  "health": "ok",
+  "resolved_by": "none"
+}

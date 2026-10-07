@@ -1,0 +1,13 @@
+{
+  "schema": "mbx.status/v1",
+  "mbx_version": "0.5.13",
+  "update_available": null,
+  "identity": { "name": "agentmbx-claude", "role": "claude", "state": "bound" },
+  "unread": 2,
+  "needs_reply": 1,
+  "from_owner": 0,
+  "outbox_unsent": 3,
+  "policy": ["autonomous"],
+  "health": "ok",
+  "resolved_by": "session_id"
+}
