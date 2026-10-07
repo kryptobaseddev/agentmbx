@@ -395,11 +395,11 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
   for (const d of detect(ctx)) {
     if (!d.found) { if (d.why !== "not found") add("info", `${d.cli}: ${d.why}`); continue; }
     const es = edits(ctx, d.cli);
-    for (const kind of ["mcp", "hooks"] as const) {
+    for (const kind of ["mcp", "hooks", "sidebar"] as const) {
       const e = es.filter((x) => x.kind === kind);
       if (!e.length) continue;
       const ok = e.every(wired);
-      const what = kind === "mcp" ? "MCP server" : "hooks";
+      const what = kind === "mcp" ? "MCP server" : kind === "sidebar" ? "sidebar plugin" : "hooks";
       add(ok ? "ok" : "fail", `${d.cli}: ${what} ${ok ? "wired" : "not wired"} (${e.map((x) => x.path.replace(ctx.home, "~")).join(", ")})`, ok ? undefined : `agentmbx setup --only ${d.cli}`);
     }
     // The status line is optional and never fails doctor (review minor 7). T368: the checks are

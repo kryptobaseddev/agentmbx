@@ -1,15 +1,18 @@
-// T409 spike: the OpenCode 2 sidebar plugin source. OpenCode 2.0.x loads TUI plugins with a
-// packaged-plugin shape: a directory whose package.json declares separate "opencode" entrypoints
-// for the server runtime ({"server": ...}) and the TUI runtime ({"tui": ...}); a LOOSE file in
-// plugins/ gets only the server context, which has no ui/storage.store (proven empirically on
-// 2.0.24, see docs/research/t409-opencode-sidebar-spike.md). The sidebar renders one mbx.status/v2
-// snapshot in the sidebar.content slot. It is READ-ONLY: it fetches the daemon's loopback status
-// endpoint and renders what arrives — zero schema re-derivation, zero mailbox logic (that is the
-// T404 contract: one producer, N renderers). This spike ships the source generators and their
-// tests; `agentmbx setup` wiring is deliberately out of scope (src/setup.ts is Codex's), as is
-// full-sidebar polish (T410).
+// The OpenCode 2 sidebar plugin source. OpenCode 2.0.x loads TUI plugins with a packaged-plugin
+// shape: a directory whose package.json declares separate "opencode" entrypoints for the server
+// runtime ({"server": ...}) and the TUI runtime ({"tui": ...}); a LOOSE file in plugins/ gets only
+// the server context, which has no ui/storage.store (proven empirically on 2.0.24, see
+// docs/research/t409-opencode-sidebar-spike.md). The sidebar renders one mbx.status/v2 snapshot in
+// the sidebar.content slot. It is READ-ONLY: it fetches the daemon's loopback status endpoint and
+// renders what arrives — zero schema re-derivation, zero mailbox logic (that is the T404 contract:
+// one producer, N renderers). `agentmbx setup --only opencode` (T411) installs the generated
+// package under ~/.config/opencode/plugins/agentmbx-sidebar/ and registers it in tui.json;
+// full-sidebar polish is T410.
 import { version } from "./version.js";
-export const OPENCODE_SIDEBAR_MARKER = "// agentmbx-sidebar v1 (T409 spike)";
+/** Line 1 of every file we manage in the sidebar package. The ` (agentmbx <ver>)` suffix on the
+ *  entrypoint sources and package.json's "version" are the MANAGED VERSION HEADER (T486): a file
+ *  that differs from the current template only there is still ours and still wired. */
+export const OPENCODE_SIDEBAR_MARKER = "// agentmbx-sidebar v1 — managed by `agentmbx setup --only opencode`";
 /** package.json for the packaged-plugin layout (the only shape that reaches the TUI runtime). */
 export function opencodeSidebarPackageJson() {
     return `${JSON.stringify({
@@ -32,7 +35,8 @@ export default { id: "agentmbx-sidebar", setup: () => {} };
 export function opencodeSidebarSource(ver) {
     return `${OPENCODE_SIDEBAR_MARKER} (agentmbx ${ver})
 // Renders mbx.status/v2 in the OpenCode sidebar. Read-only: fetches the daemon loopback status
-// endpoint and renders; it never derives status itself. Uninstall: delete this file.
+// endpoint and renders; it never derives status itself. Local edits make this file foreign:
+// setup stops managing it and doctor reports it. Uninstall with: agentmbx setup --uninstall --only opencode
 
 /** Pure render: one v2 snapshot -> one display line. Free of any UI import so tests exercise
  *  exactly what the TUI shows. Field-for-field with src/status-schema.ts; unknown shapes degrade

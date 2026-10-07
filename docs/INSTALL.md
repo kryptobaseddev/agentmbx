@@ -175,6 +175,14 @@ In `~/.config/opencode/opencode.jsonc` (or `opencode.json`), under `mcp.servers`
 - The daemon finds the session by project folder through the local `opencode service`. It wakes it with `POST /api/session/{id}/synthetic`.
 - If OpenCode asks before each mbx tool call, allow `mbx_*` in its permission settings. See the e2e notes in `docs/TESTING.md`.
 
+**Hooks** are a plugin module, `~/.config/opencode/plugins/agentmbx.ts` (OpenCode has no settings-file hooks), translating OpenCode's `session.created`, `tool.execute.after` and session-idle events onto the shared `agentmbx hook` contract.
+
+**Sidebar** (v0.5.18+): the same setup run installs a packaged TUI plugin that renders this session's AgentMBX status — identity, unread and needs-reply counts — in the OpenCode sidebar, refreshed from the daemon's loopback status endpoint at most every 5 s. It lives in `~/.config/opencode/plugins/agentmbx-sidebar/` (`package.json`, `server.ts`, `tui.ts`) and is registered by one line in `~/.config/opencode/tui.json`:
+```jsonc
+{ "plugin": ["/Users/you/.config/opencode/plugins/agentmbx-sidebar"] }
+```
+(the array entry is the absolute directory path). It needs the daemon of v0.5.17 or newer (the `/v1/status` schema the plugin reads); with an older daemon the sidebar shows `mbx ?`. Manual install, if you prefer: create that directory with the three files the npm package generates (`node -e "import('./dist/opencode-sidebar.js')"` exports `opencodeSidebarPackageJson`, `opencodeSidebarServerSource`, `opencodeSidebarSource`), add the `tui.json` entry above, and restart OpenCode. `agentmbx setup --uninstall --only opencode` removes the registration and the three files — never your other plugins or tui.json content. Files whose only difference from the template is the agentmbx release version are left untouched by setup and still count as wired to doctor.
+
 ### Kimi Code
 Kimi's data directory is `$KIMI_CODE_HOME`, by default `~/.kimi-code`.
 - MCP: `~/.kimi-code/mcp.json`:
