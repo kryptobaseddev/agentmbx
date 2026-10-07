@@ -1058,40 +1058,6 @@ export async function runMcp(existing) {
         }
         return state;
     };
-    // A restarted serve still has name:opencode:<sid>. Resume this directory's sessions before the next hook.
-    // A session recorded in another directory stays with that directory's MCP.
-    if (env.cli === "opencode") {
-        let here = process.cwd();
-        try {
-            here = realpathSync(here);
-        }
-        catch { /* compare the path this process was given */ }
-        const names = node.store.db.prepare("SELECT k, v FROM kv WHERE k GLOB 'name:opencode:ses_*'").all();
-        for (const row of names) {
-            const sid = row.k.slice("name:opencode:".length);
-            if (!/^ses_[a-zA-Z0-9]{1,128}$/.test(sid))
-                continue;
-            const bound = node.store.db.prepare("SELECT cwd FROM sessions WHERE cli='opencode' AND session_id=? AND agent=?").get(sid, row.v);
-            if (!bound?.cwd)
-                continue;
-            let cwd = bound.cwd;
-            try {
-                cwd = realpathSync(cwd);
-            }
-            catch { /* the stored directory may already be gone */ }
-            if (cwd !== here)
-                continue;
-            // A live holder is co-use: the tool call attaches and restores that conversation. Startup
-            // resume is only for a dead holder, which is a serve restart.
-            const lease = node.store.db.prepare("SELECT holder_pid, released_at FROM identity_leases WHERE name=?").get(row.v);
-            if (lease && lease.released_at === null && inspectLeaseProcess(lease.holder_pid).alive === true)
-                continue;
-            try {
-                contextFor({ _meta: { sessionID: sid } });
-            }
-            catch { /* a refused resume stays unbound */ }
-        }
-    }
     // relay tracking: a message this session sends after reading one is one hop further, and inherits an external origin.
     // `reply`: the session is answering this message (mbx_reply, mbx_send reply_to), which re-exposes it to the content.
     const noteRead = (rows, { reply = false } = {}) => {
