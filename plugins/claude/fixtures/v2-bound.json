@@ -1,24 +1,19 @@
 {
   "schema": "mbx.status/v2",
-  "mbx_version": "0.5.13",
-  "identity": { "name": "agentmbx-claude", "role": "claude", "state": "bound" },
+  "mbx_version": "0.5.16",
+  "identity": { "name": "agentmbx-kimi", "role": "builder", "state": "bound" },
   "registration": {
     "registered": true,
-    "lease": { "holder_cli": "claude", "holder_session": "sess-mine", "verified": true }
+    "lease": { "holder_cli": "kimi", "holder_session": "sess-fixture", "verified": true }
   },
   "inbox": { "unread": 2, "needs_reply": 1, "from_owner": 0, "outbox_unsent": 3 },
-  "harness": {
-    "cli": "claude",
-    "session_id": "sess-mine",
-    "wake_path": "channel",
-    "policy": ["autonomous"]
-  },
+  "harness": { "cli": "kimi", "session_id": "sess-fixture", "wake_path": "watcher", "policy": ["autonomous"] },
   "cloud": {
     "relay": { "url": null, "state": "unset", "last_ack": null },
     "key_ad_expiry": null,
     "account": null
   },
   "devices": [],
-  "project": { "directory": "/Users/keatonhoskins/projects/agentmbx", "lead": "agentmbx-lead", "members": ["agentmbx-claude"] },
+  "project": { "directory": "/work/fixture", "lead": "agentmbx-lead", "members": ["agentmbx-kimi"] },
   "resolved_by": "session_id"
 }

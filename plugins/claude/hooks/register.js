@@ -8,9 +8,11 @@
  * literal, which `claude plugin validate` can see). If both are missing or
  * blank, the band says "unbound" and does not call status.
  *
- * Status: `$.http.fetch` against the local daemon, keyed by cli and session.
- * Documented init has no timeout; a throw, a non-OK response, or a body that
- * is not an mbx.status/v1 or v2 snapshot renders "mbx: unavailable".
+ * Status: `$.http.fetch` against the local daemon, keyed by cli and session, asking for
+ * `mbx.status/v2` — the same snapshot the OpenCode sidebar reads. A daemon older than v0.5.17
+ * answers v1; `renderStatus` still tolerates a v1 body, so the band degrades rather than breaks.
+ * Documented init has no timeout; a throw, a non-OK response, or a body that is not an
+ * mbx.status/v1 or v2 snapshot renders "mbx: unavailable".
  * https://code.claude.com/docs/en/plugins/mods/api
  */
 
@@ -30,7 +32,9 @@ export function resolveSessionId(env) {
 }
 
 /**
- * Fixed daemon origin. The session id is only a query value.
+ * Fixed daemon origin. The session id is only a query value. v2 is requested: the band reads the
+ * same mbx.status/v2 snapshot as the OpenCode sidebar (T414 AC1); renderStatus still tolerates a
+ * v1 body from a daemon older than v0.5.17.
  * @param {string} sessionId
  * @returns {string}
  */
@@ -38,6 +42,7 @@ export function statusRequestUrl(sessionId) {
   const url = new URL("/v1/status", DAEMON_ORIGIN);
   url.searchParams.set("cli", "claude");
   url.searchParams.set("session", sessionId);
+  url.searchParams.set("schema", "mbx.status/v2");
   if (url.origin !== DAEMON_ORIGIN || url.pathname !== "/v1/status") {
     throw new Error("status url left the local daemon");
   }

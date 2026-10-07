@@ -83,7 +83,11 @@ test("T414: a status failure is unavailable and does not throw", async () => {
   assert.equal(parsed.pathname, "/v1/status");
   assert.equal(parsed.searchParams.get("cli"), "claude");
   assert.equal(parsed.searchParams.get("session"), "sess-mine");
-  assert.equal(statusRequestUrl("a&b"), "http://127.0.0.1:7373/v1/status?cli=claude&session=a%26b");
+  assert.equal(parsed.searchParams.get("schema"), "mbx.status/v2");
+  assert.equal(
+    statusRequestUrl("a&b"),
+    "http://127.0.0.1:7373/v1/status?cli=claude&session=a%26b&schema=mbx.status%2Fv2",
+  );
 
   const thrown = await readStatus({
     sessionId: "sess-mine",
@@ -146,7 +150,7 @@ test("T417: fixture v1 and v2 snapshots render only that snapshot's identity", (
   assert.match(v1, /policy autonomous/);
 
   const v2 = renderStatus("sess-mine", read("v2-bound.json"));
-  assert.match(v2, /^mbx agentmbx-claude \(claude\)/);
+  assert.match(v2, /^mbx agentmbx-kimi \(builder\)/);
   assert.match(v2, /unread 2/);
   assert.match(v2, /needs_reply 1/);
   assert.match(v2, /from_owner 0/);
@@ -161,6 +165,17 @@ test("T417: fixture v1 and v2 snapshots render only that snapshot's identity", (
   assert.equal(ambiguous.includes("agentmbx-claude"), false);
   assert.equal(ambiguous.includes("someone-else"), false);
   assert.equal(ambiguous.includes("unread"), false);
+});
+
+test("T414: the band renders the shared v2 contract fixture (the same snapshot the OpenCode sidebar reads)", () => {
+  const shared = JSON.parse(readFileSync(new URL("./fixtures/status-v2-bound.json", import.meta.url), "utf8"));
+  const text = renderStatus("sess-fixture", shared);
+  assert.match(text, /^mbx agentmbx-kimi \(builder\)/);
+  assert.match(text, /unread 2/);
+  assert.match(text, /needs_reply 1/);
+  // the mod's local v2-bound fixture is the shared fixture byte for byte: one shape, two paths
+  const local = readFileSync(new URL("../plugins/claude/fixtures/v2-bound.json", import.meta.url), "utf8");
+  assert.equal(local, readFileSync(new URL("./fixtures/status-v2-bound.json", import.meta.url), "utf8"));
 });
 
 test("T414: the hooks module imports nothing but relative files and claude-code", () => {
