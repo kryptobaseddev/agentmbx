@@ -23,7 +23,7 @@ import { reviveMailbox } from "./identity-cleanup.ts";
 import { AUTO_NAME_RE, linkedKey, noteProject, projectKey, projectOf, registeredIdentity, registerIdentity, renameRegistration, ROLE_RE, sessionHint, UNSPECIFIED_ROLE } from "./registry.ts";
 import { applyIdentityTakeover, type IdentityTakeoverApproval } from "./identity-takeover.ts";
 import { opencodeProviderPid } from "./opencode-provider.ts";
-import { listIdentityStatus } from "./identity-status.ts";
+import { formatUnboundStart, listIdentityStatus } from "./identity-status.ts";
 import { consumeIdentityControl, identityControlAliases, identityControlKey, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl, type IdentityControlDescriptor } from "./identity-control.ts";
 import { alive, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
 import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy.ts";
@@ -969,7 +969,9 @@ export async function runMcp(existing?: MbxNode) {
   // Never present the provisional mailbox's identity or policy as authority for every caller.
   const shared = env.cli === "codex" || env.cli === "opencode";
   const unboundNote = !shared && !agent
-    ? `[mbx] ${base.pending ? `This session's identity ${base.pending} is held by another session (${base.pendingReason}); it resumes automatically once that holder ends.` : "This session has no mailbox identity yet."} If you will message other agents: call mbx_identity {"action":"list"} for this project's agents (role, live or offline, unread), then claim yours or register one with a name and role. Never invent a random name.`
+    ? (base.pending
+      ? `[mbx] This session's identity ${base.pending} is held by another session (${base.pendingReason}); it resumes automatically once that holder ends. If you will message other agents: call mbx_identity {"action":"list"} for this project's agents (role, live or offline, unread), then claim yours or register one with a name and role. Never invent a random name.`
+      : formatUnboundStart(node.home, project).split("\n").map(line => `[mbx] ${line}`).join("\n"))
     : null;
   const delegation = shared
     ? "[mbx] This transport can serve multiple sessions. Call mbx_whoami for your current mailbox identity and owner-signed policies. Read each mbx_read header for the policy that applies to that message; another mailbox's grant does not authorize this session."
@@ -984,7 +986,7 @@ export async function runMcp(existing?: MbxNode) {
     if (state.lostTo) return `This session lost its identity lease for ${state.pending}: ${state.lostTo} claimed it. It is not taken back automatically: call mbx_identity {"action":"list"} and claim another identity, or ask your user.`;
     if (state.released) return `This session released its identity${state.agent ? ` ${state.agent}` : ""}. Claim one with mbx_identity {"action":"claim","name":"<name>"} (see {"action":"list"}).`;
     if (state.pending) return `This session's identity ${state.pending} is not available yet: ${state.pendingReason ?? "another session holds it"}. It resumes automatically once that holder ends. Check with mbx_identity {"action":"list"}.`;
-    return `This session has no mbx identity yet. Call mbx_identity {"action":"list"} to see this project's agents, then claim yours ({"action":"claim","name":"<name>"}) or register one ({"action":"register","name":"<project>-<role>","role":"<role>"}).`;
+    return formatUnboundStart(node.home, project);
   };
 
   /** What an ordinary mailbox tool returns while this session holds no identity (T464). Every tool but one still needs the lease and
@@ -1274,7 +1276,7 @@ export async function runMcp(existing?: MbxNode) {
       const out = { agent: null, host: node.host, cli: env.cli, unbound: true, project: project ?? null,
         lead: leadView.address && leadView.exp ? { address: leadView.address, exp: leadView.exp } : null, pending: state.pending ?? null,
         reason: state.lostTo ? `claimed by ${state.lostTo}` : state.pendingReason ?? null, next: unboundMessage(state),
-        project_identities: list.identities.map(i => ({ name: i.name, role: i.role, state: i.state, claimable: i.claimable, unread: i.unread, reason: i.reason })),
+        project_identities: list.identities.map(i => ({ name: i.name, role: i.role, state: i.state, claimable: i.claimable, unread: i.unread, last_activity: i.last_activity, reason: i.reason })),
         version: version() };
       return text(JSON.stringify(out, null, 2), out);
     }
