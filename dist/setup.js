@@ -762,23 +762,37 @@ function codexServer(cmd) {
 const KIMI_BEGIN = "# >>> agentmbx (managed by agentmbx setup; remove with: agentmbx setup --uninstall) >>>";
 const KIMI_END = "# <<< agentmbx <<<";
 function kimiHooks(cmd) {
-    const block = [KIMI_BEGIN,
-        ...STOP_EVENTS.flatMap(([ev, sub]) => ["[[hooks]]", `event = "${ev}"`, `command = ${JSON.stringify(hookCommand(cmd, sub, "kimi"))}`, "timeout = 10"]),
+    const blockFor = (events) => [KIMI_BEGIN,
+        ...events.flatMap(([ev, sub]) => ["[[hooks]]", `event = "${ev}"`, `command = ${JSON.stringify(hookCommand(cmd, sub, "kimi"))}`, "timeout = 10"]),
         KIMI_END];
+    const present = (cur, ev, sub) => {
+        const hooks = tryParseToml(cur)?.hooks;
+        return Array.isArray(hooks) && hooks.some(h => h && typeof h === "object" && h.event === ev
+            && typeof h.command === "string" && isOurHookCommand(h.command, sub, "kimi", hookCommand(cmd, sub, "kimi")));
+    };
     const find = (lines) => {
         const s = lines.indexOf(KIMI_BEGIN), e = lines.indexOf(KIMI_END, s);
         return s >= 0 && e > s ? [s, e + 1] : null;
     };
     return {
+        blocked: (cur) => cur !== null && tryParseToml(cur) === null ? "config.toml is not valid TOML" : null,
+        isWired: (cur) => cur !== null && STOP_EVENTS.every(([ev, sub]) => present(cur, ev, sub)),
         install: (cur) => {
+            if (cur !== null && tryParseToml(cur) === null)
+                return cur;
             const lines = (cur ?? "").split("\n");
             const r = find(lines);
+            // Kimi can rewrite TOML and discard comments. Existing command/event pairs remain hooks
+            // without markers; preserve their bytes and add only pairs that are actually missing.
+            const outside = r ? [...lines.slice(0, r[0]), ...lines.slice(r[1])].join("\n") : cur ?? "";
+            const missing = STOP_EVENTS.filter(([ev, sub]) => !present(outside, ev, sub));
             if (!r)
-                return appendBlock(cur, block.join("\n"));
+                return missing.length ? guarded(cur, appendBlock(cur, blockFor(missing).join("\n"))) : cur;
+            const block = missing.length ? blockFor(missing) : [];
             if (same(lines.slice(r[0], r[1]), block))
                 return cur;
             lines.splice(r[0], r[1] - r[0], ...block);
-            return lines.join("\n");
+            return guarded(cur, lines.join("\n"));
         },
         uninstall: (cur) => {
             if (cur === null)
@@ -1249,6 +1263,15 @@ function hermesHooks(cmd) {
     };
     return {
         blocked,
+        isWired: (cur) => {
+            if (cur === null || blocked(cur) !== null)
+                return false;
+            const { lines } = hermesSplit(cur), lay = hermesLayout(lines);
+            return lay.kind === "block" && HERMES_HOOK_EVENTS.every(([event, sub]) => {
+                const e = hermesEvent(lines, lay, event);
+                return e !== null && !("reason" in e) && e.items.some(it => ours(it.command, sub));
+            });
+        },
         install: (cur) => {
             if (cur === null || blocked(cur) !== null)
                 return cur;
