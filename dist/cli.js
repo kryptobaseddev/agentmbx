@@ -14,7 +14,8 @@ import { DEFAULT_QUOTA, parseRelayKey, RelayCore, startRelayServer } from "./rel
 import { SqliteRelayStore } from "./relay-store.js";
 import { backupStore, readOps, restoredFrom, restoreStore, rotateEpochOp, STORE_DB, waitForLock } from "./relay-ops.js";
 import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.js";
-import { HUD_ALIVE_MAX_MS, HUD_SCHEMA, hudAlivePath, hudDir, hudPidLinePath, hudPidPath, hudSessionLinePath, hudSessionPath, hudStatus, writeHud } from "./hud.js";
+import { HUD_ALIVE_MAX_MS, HUD_SCHEMA, hudAlivePath, hudDir, hudPidLinePath, hudPidPath, hudSessionLinePath, hudSessionPath, hudStatus, hudStatusV2, writeHud } from "./hud.js";
+import { STATUS_V2_SCHEMA } from "./status-schema.js";
 import { detectHost, HERMES_WATCHER_INSTRUCTION, HERMES_WATCHER_REMINDER, MCP_HEARTBEAT_MS, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
 import { HERMES_NAG_MS, hermesHookInput, hermesHookOutput } from "./hermes-hook.js";
 import { ancestors, processEvidenceSpawns, withProcSnapshot } from "./proc.js";
@@ -73,6 +74,7 @@ Messages
     New sends without a lease are marked unverified-sender and grant no delegated authority.
   agentmbx status --cli <provider> --session <id> --json   current session identity and mailbox counts (read-only)
   agentmbx status --cli <provider> [--session <id>] --json --schema mbx.status/v1   HUD snapshot for harnesses; no lease needed (T311)
+  agentmbx status --cli <provider> [--session <id>] --json --schema mbx.status/v2   unified status model: registration, cloud, devices, project (T406)
   agentmbx statusline <claude|codex|kimi|opencode|grok|copilot|cursor|gemini>   render one MBX segment from the HUD snapshot (T313)
   agentmbx probe [--project <dir>] [--deadline 120s] [--require-idle-wake] [--only a,b] [--exclude glob] [--plan] [--json]   autonomy probe: every live leased identity must answer the [mbx-probe] request with no human prompt (T388 gate; T392, T445)
   agentmbx identity list [--project <dir>] [--all] [--json]   identities with role, holder, claimable and unread (read-only)
@@ -909,6 +911,22 @@ async function run(argv) {
             return node.agents().forEach((a) => console.log(`${a.name}@${a.host}\t${a.host === node.host ? (live.has(a.name) ? "live" : "offline") : "remote"}\t${a.role ?? ""}\t${a.cli ?? ""}\t${a.last_seen ?? ""}\t${a.description ?? ""}`));
         }
         case "status": {
+            if (o.json && str("schema") === STATUS_V2_SCHEMA) {
+                // T406: mbx.status/v2 for harness plugins. Same resolver rules as the v1 branch below and the
+                // T407 loopback endpoint: identity comes from the T310 resolver (never a shared directory name,
+                // never another session's data), an explicit --session that does not resolve is unbound, and a
+                // pid-resolved call (no --session) reports session_id null. The v2 model is built on the v1
+                // snapshot, so the two schemas never disagree on counts.
+                const sid = str("session") ?? null;
+                const cli = str("cli") ?? "";
+                const resolved = sid
+                    ? resolveStatusIdentity(node, cli, { sessionId: sid })
+                    : resolveStatusIdentity(node, cli, { pid: process.ppid });
+                return console.log(JSON.stringify(hudStatusV2(node, {
+                    cli, sessionId: sid, agent: resolved.name, state: resolved.state,
+                    resolvedBy: resolved.resolved_by ?? "none", candidates: resolved.candidates,
+                }), null, 2));
+            }
             if (o.json && str("schema") === HUD_SCHEMA) {
                 // T311: mbx.status/v1 for harnesses, behind an explicit schema flag so the existing
                 // status --json contract (lease-gated) is unchanged. Identity comes from the T310 resolver

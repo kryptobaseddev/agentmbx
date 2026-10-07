@@ -10,7 +10,8 @@ import {
 import { NAME_RE, sealEnvelope, type Envelope } from "./envelope.ts";
 import { MbxNode, RETRY_HOURS } from "./node.ts";
 import { resolveStatusIdentity } from "./status-identity.ts";
-import { hudStatus } from "./hud.ts";
+import { hudStatus, hudStatusV2 } from "./hud.ts";
+import { STATUS_V2_SCHEMA } from "./status-schema.ts";
 import { notifyDesktop } from "./wake.ts";
 import { version } from "./version.ts";
 import { rotationLog, saveRotationLog, type SignedRotation } from "./key-rotation.ts";
@@ -357,13 +358,19 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
         // query can never surface another identity's data (T308 AC2), and an unknown session gets
         // an explicit `unbound` snapshot rather than an error. Session-scoped reads are loopback
         // only: they carry one mailbox's unread counts, which is host-local information; peers keep
-        // the public runtime/challenge contract below. The `schema` hint is accepted (v1 today;
-        // mbx.status/v2 arrives with T404) and answered with the snapshot's own `schema` field.
+        // the public runtime/challenge contract below. The default answer is the v1 snapshot;
+        // `schema=mbx.status/v2` (T404) returns the v2 model from src/status-schema.ts — the mod
+        // and the sidebar migrate by changing one query parameter, nothing else.
         const cli = url.searchParams.get("cli"), session = url.searchParams.get("session");
         if (cli && session) {
           if (!isLoopbackRemote(req.socket.remoteAddress ?? ""))
             return send(403, { error: "session-scoped status is loopback only" });
           const resolved = resolveStatusIdentity(node, cli, { sessionId: session });
+          if (url.searchParams.get("schema") === STATUS_V2_SCHEMA)
+            return send(200, hudStatusV2(node, {
+              cli, sessionId: session, agent: resolved.name, state: resolved.state,
+              resolvedBy: resolved.resolved_by ?? "none", candidates: resolved.candidates,
+            }));
           return send(200, hudStatus(node, {
             agent: resolved.name, state: resolved.state,
             resolvedBy: resolved.resolved_by ?? "none", candidates: resolved.candidates,
