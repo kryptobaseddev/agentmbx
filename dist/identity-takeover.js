@@ -4,6 +4,8 @@ import { z } from "zod";
 import { canonical, fingerprint, sha256, verifyData } from "./crypto.js";
 import { NAME_RE } from "./envelope.js";
 import { inspectLeaseProcess } from "./identity-leases.js";
+import { opencodeProviderPid } from "./opencode-provider.js";
+import { procTable } from "./proc.js";
 const label = z.string().min(1).max(300).regex(/^[^\p{Cc}\p{Cf}\u2028\u2029]+$/u), fp = z.string().regex(/^[a-f0-9]{4}(?:-[a-f0-9]{4}){3}$/), hash = z.string().regex(/^[a-f0-9]{64}$/);
 const previousSchema = z.object({ generation: hash, cli: label, session_id: label, key_fp: fp,
     pid: z.number().int().positive(), start: label }).strict();
@@ -16,11 +18,40 @@ const refused = (message) => Object.assign(new Error(message), { code: "IDENTITY
 const previousHolder = (row) => ({ generation: sha256(row.token), cli: row.cli, session_id: row.session_id,
     key_fp: row.key_fp, pid: row.holder_pid, start: row.holder_start });
 const lease = (node, name) => node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(name);
+/**
+ * True when the live holder is this control endpoint, or another MCP under the same OpenCode serve.
+ * A different serve (opencodeProviderPid, or the holder's parent when that walk cannot name one) is not this session's own MCP.
+ * When neither the walk nor the parent can be read, stay locked so a missing process table cannot skip the T469 guard.
+ */
+export function sameLiveProvider(holderPid, claimant, table = procTable()) {
+    if (holderPid === claimant.mcp_pid)
+        return true;
+    const holder = opencodeProviderPid(holderPid, table);
+    const mine = opencodeProviderPid(claimant.mcp_pid, table);
+    if (holder !== null && mine !== null)
+        return holder === mine;
+    const holderParent = table.get(holderPid)?.ppid ?? 0;
+    if (holderParent > 1)
+        return holderParent === claimant.parent_pid;
+    return true;
+}
+/** The OpenCode serve that owns pid, or its parent when the serve walk cannot name one. */
+export function providerLabel(pid, table = procTable()) {
+    const serve = opencodeProviderPid(pid, table);
+    if (serve !== null)
+        return String(serve);
+    const parent = table.get(pid)?.ppid ?? 0;
+    return parent > 1 ? `parent ${parent}` : "unknown";
+}
+/** T469: a live holder under this session's own provider is the caller's own MCP, and force is not consent to replace it. */
 export function refuseSelfTakeover(row, claimant, evidence = inspectLeaseProcess(row.holder_pid)) {
     if (row.released_at !== null || row.cli !== claimant.cli || row.session_id !== claimant.lease_session_id)
         return;
-    if (evidence.alive === true && evidence.start === row.holder_start)
-        throw refused("identity takeover --force cannot target your own live session MCP; use the harness reconnect controls, never kill or hand-spawn MBX MCPs");
+    if (!(evidence.alive === true && evidence.start === row.holder_start))
+        return;
+    if (!sameLiveProvider(row.holder_pid, claimant))
+        return;
+    throw refused("identity takeover --force cannot target your own live session MCP; use the harness reconnect controls, never kill or hand-spawn MBX MCPs");
 }
 export function buildIdentityTakeover(node, claimant, name) {
     const owner = node.ownerPub;

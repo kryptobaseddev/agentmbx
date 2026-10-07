@@ -15,14 +15,36 @@ import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
 import { detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConsent, skillDest, skillStatus, statuslineConfiguredCommand, statuslineForms, statuslineState, wired, type SetupCtx } from "./setup.ts";
 import { mailboxLiveness } from "./receipts.ts";
 import { liveWatcher } from "./wake.ts";
-import { listIdentityControls } from "./identity-control.ts";
+import { findIdentityControl, listIdentityControls } from "./identity-control.ts";
 import { pruneCandidates } from "./identity-cleanup.ts";
-import type { IdentityLease } from "./identity-leases.ts";
+import { inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
+import { providerLabel, sameLiveProvider } from "./identity-takeover.ts";
 
 export type Level = "ok" | "fail" | "warn" | "info";
 export interface Check { level: Level; label: string; fix?: string }
 
 export const CLAIM_CHURN_LIMIT = 5;
+/** T481: one session id leased by an MCP under a different OpenCode serve than the published control endpoint. */
+export function foreignSessionProvider(node: MbxNode): Check[] {
+  const rows = node.store.db.prepare("SELECT * FROM identity_leases WHERE released_at IS NULL").all() as unknown as IdentityLease[];
+  const out: Check[] = [];
+  for (const row of rows) {
+    let claimant;
+    try { claimant = findIdentityControl(node.store, row.cli, row.session_id); }
+    catch { continue; }
+    const evidence = inspectLeaseProcess(row.holder_pid);
+    if (!(evidence.alive === true && evidence.start === row.holder_start)) continue;
+    if (sameLiveProvider(row.holder_pid, claimant)) continue;
+    const last = new Date(row.heartbeat_at).toISOString();
+    out.push({
+      level: "warn",
+      label: `${row.cli} session ${row.session_id} is leased by pid ${row.holder_pid} under provider ${providerLabel(row.holder_pid)} (last activity ${last}), while this session's control endpoint is pid ${claimant.mcp_pid} under provider ${providerLabel(claimant.mcp_pid)}`,
+      fix: `agentmbx identity takeover --force ${row.name} --cli ${row.cli} --session ${row.session_id}`,
+    });
+  }
+  return out;
+}
+
 /** Ten-minute claim/release storms indicate connector fights, not useful session work. */
 export function identityClaimChurn(node: MbxNode, now = Date.now()): Check[] {
   const rows = node.store.db.prepare("SELECT detail FROM audit WHERE event='identity.claim' AND at>=? ORDER BY at")
@@ -379,6 +401,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     for (const c of strandedMail(node)) out.push(c);
     for (const c of pendingIdentities(node)) out.push(c);
     for (const c of identityClaimChurn(node)) out.push(c);
+    for (const c of foreignSessionProvider(node)) out.push(c);
     out.push(pruneSummary(node));
     const peers = node.peers();
     const approved = peers.filter((p) => p.state === "approved");
