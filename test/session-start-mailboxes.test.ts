@@ -65,6 +65,7 @@ test("T328 session-start lists only this directory's claimable mailboxes, the sa
       assert.match(context, /mbx_identity \{"action":"claim","name":"<name>"\}/);
       assert.match(context, /mbx_identity \{"action":"register","name":"orbit-<role>","role":"<role>"\}/);
       assert.match(context, /The session stays unbound until you claim or register/);
+      assert.equal(context.split("\n").at(-1), "[mbx] When the owner ends this session or hands it off, call mbx_identity release after your final mailbox work.");
       assert.doesNotMatch(context, /orbit-held|elsewhere-codex|SECRET SUBJECT|SECRET BODY|HELD SUBJECT|HELD BODY|\d+ unread/);
       for (const line of context.split("\n")) assert.match(line, /^\[mbx\] /, line);
       assert.equal(node.store.db.prepare("SELECT session_id FROM sessions WHERE session_id=?").get(session), undefined);
