@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.17 (2026-10-07)
+
+OpenCode reliability and the unified status model: owner takeover recovers a lease held under another OpenCode process, doctor explains OpenCode's hourly eviction, session start lists claimable mailboxes, mailbox names never default to the harness, and mbx.status/v2 ships end to end (schema, CLI, endpoint, daemon snapshots, OpenCode sidebar spike).
+
 - **OpenCode 2 sidebar spike (T409):** `src/opencode-sidebar.ts` generates a packaged OpenCode 2 plugin (package.json with `opencode.server`/`opencode.tui` entrypoints, a no-op server entrypoint, and a TUI entrypoint) that renders one `mbx.status/v2` snapshot in the OpenCode sidebar — identity and inbox counts, refreshed at most every 5 s from the T407 loopback endpoint, with zero status logic in the plugin (read/render only, per the T404 contract). The scratch repro on OpenCode 2.0.24 proved the deployment facts the spec couldn't: loose plugin files load with the server context only (no `ctx.ui`, no `storage.store/memory`), while a packaged plugin's `tui` entrypoint receives the full TUI context with the `sidebar.content` slot; the v1 community-sidebar API does not exist in 2.0.x. See `docs/research/t409-opencode-sidebar-spike.md`. Setup wiring (T411) and the full sidebar (T410) build on this.
 - **A new mailbox is a project or a project-role, never the harness (T329).** A session started in the home folder or `/` with no `MBX_AGENT` is unnamed. It is not named after its CLI, and it is not named after the account. `MBX_AGENT` still selects the mailbox the owner asked for, including one that already uses a harness name. A project folder still defaults to that folder's name. Register suggestions stay `<project>-<role>`.
 - T405: daemon writes private, atomic v2 HUD snapshots beside v1 JSON and statusline files, reusing mailbox counts and process evidence per tick.
