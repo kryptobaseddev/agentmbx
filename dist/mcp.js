@@ -38,6 +38,7 @@ import { catchupHint, catchupUnchanged, commitCatchup, ensureCatchup, missedCoun
 import { encodeReplayFrame, replayMaximum } from "./replay.js";
 import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wake.js";
 import { isStoreBusy, withStoreBusyTimeout } from "./store.js";
+import { markMcpStarting } from "./mcp-startup.js";
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
 It is shared by AI coding agents on this machine and on paired machines. Your user set it up so agents can coordinate;
 replying, answering questions, sharing status and acking are always fine.
@@ -483,79 +484,93 @@ export const externalWarning = (origin, taint) => {
     return [`${origin === "agent" ? "origin \"agent\" overridden: " : ""}sent with origin external because this session read outside content: recipients may only read it under owner policy (no edit or outward).${until}`];
 };
 export async function runMcp(existing) {
-    // Transport initialization must not need a database, process inspection, or an identity lease.
-    // Channel support is a server capability; whether this session uses it is detected after initialize.
-    const server = new McpServer({ name: "mbx", version: version() }, {
-        instructions: INSTRUCTIONS,
-        capabilities: { experimental: { "claude/channel": {} } },
-    });
-    const transport = new StdioServerTransport();
-    let resolveReady;
-    const ready = new Promise(resolve => { resolveReady = resolve; });
-    let startupError;
-    // Initialize and ping are already registered by the SDK. Only later catalog/mailbox requests wait.
-    const setRequestHandler = server.server.setRequestHandler.bind(server.server);
-    server.server.setRequestHandler = (schema, handler) => setRequestHandler(schema, async (request, extra) => {
-        await ready;
-        if (startupError)
-            throw startupError;
-        return handler(request, extra);
-    });
-    // Install the SDK's lazy catalog handlers before connect, using public registration/removal APIs.
-    // Their maps remain live, so the first tools/list sees the complete catalog after setup, never placeholders.
-    server.registerTool("mbx_whoami", { inputSchema: {} }, () => text("")).remove();
-    server.registerResource("agentmbx-guide", "mbx://guide", {}, () => ({ contents: [] })).remove();
-    server.registerPrompt("mbx_guide", {}, () => ({ messages: [] })).remove();
-    let closed = false, resolveInitialized;
-    const initialized = new Promise(resolve => { resolveInitialized = resolve; });
-    const stopStartup = () => { closed = true; resolveInitialized(); };
-    server.server.onclose = stopStartup;
-    process.stdin.once("end", stopStartup);
-    server.server.oninitialized = () => setImmediate(resolveInitialized);
-    await server.connect(transport);
-    // A re-exec takes over an already initialized client, which will not send initialized a second time.
-    if (process.env[REEXEC_ENV])
-        resolveInitialized();
-    await initialized;
-    if (closed) {
-        resolveReady();
-        return;
-    }
-    let node;
-    if (existing)
-        node = existing;
-    else {
-        for (;;) {
-            try {
-                node = withStoreBusyTimeout(0, () => new MbxNode());
-                break;
-            }
-            catch (error) {
-                if (!isStoreBusy(error)) {
-                    startupError = error;
-                    resolveReady();
-                    reloadFromDisk(error);
-                    throw error;
+    const clearStarting = markMcpStarting(existing?.home ?? defaultHome());
+    try {
+        // Transport initialization must not need a database, process inspection, or an identity lease.
+        // Channel support is a server capability; whether this session uses it is detected after initialize.
+        const server = new McpServer({ name: "mbx", version: version() }, {
+            instructions: INSTRUCTIONS,
+            capabilities: { experimental: { "claude/channel": {} } },
+        });
+        // Startup registration changes the catalog before its first gated read. Suppress incremental notifications;
+        // a reused transport still receives the single explicit replacement notification in configureMcp.
+        const changed = { tools: server.sendToolListChanged.bind(server), resources: server.sendResourceListChanged.bind(server),
+            prompts: server.sendPromptListChanged.bind(server) };
+        server.sendToolListChanged = server.sendResourceListChanged = server.sendPromptListChanged = () => { };
+        const transport = new StdioServerTransport();
+        let resolveReady;
+        const ready = new Promise(resolve => { resolveReady = resolve; });
+        let startupError;
+        // Initialize and ping are already registered by the SDK. Only later catalog/mailbox requests wait.
+        const setRequestHandler = server.server.setRequestHandler.bind(server.server);
+        server.server.setRequestHandler = (schema, handler) => setRequestHandler(schema, async (request, extra) => {
+            await ready;
+            if (startupError)
+                throw startupError;
+            return handler(request, extra);
+        });
+        // Install the SDK's lazy catalog handlers before connect, using public registration/removal APIs.
+        // Their maps remain live, so the first tools/list sees the complete catalog after setup, never placeholders.
+        server.registerTool("mbx_whoami", { inputSchema: {} }, () => text("")).remove();
+        server.registerResource("agentmbx-guide", "mbx://guide", {}, () => ({ contents: [] })).remove();
+        server.registerPrompt("mbx_guide", {}, () => ({ messages: [] })).remove();
+        let closed = false, resolveInitialized;
+        const initialized = new Promise(resolve => { resolveInitialized = resolve; });
+        const stopStartup = () => { closed = true; resolveInitialized(); };
+        server.server.onclose = stopStartup;
+        process.stdin.once("end", stopStartup);
+        server.server.oninitialized = () => setImmediate(resolveInitialized);
+        await server.connect(transport);
+        // A re-exec takes over an already initialized client, which will not send initialized a second time.
+        if (process.env[REEXEC_ENV])
+            resolveInitialized();
+        await initialized;
+        if (closed) {
+            resolveReady();
+            return;
+        }
+        let node;
+        if (existing)
+            node = existing;
+        else {
+            for (;;) {
+                try {
+                    node = withStoreBusyTimeout(0, () => new MbxNode());
+                    break;
                 }
-                await new Promise(resolve => setTimeout(resolve, 100));
-                if (closed) {
-                    resolveReady();
-                    return;
+                catch (error) {
+                    if (!isStoreBusy(error)) {
+                        startupError = error;
+                        resolveReady();
+                        reloadFromDisk(error);
+                        throw error;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                    if (closed) {
+                        resolveReady();
+                        return;
+                    }
                 }
             }
         }
-    }
-    try {
-        await configureMcp(server, node, () => closed);
-    }
-    catch (error) {
-        startupError = error;
-        node.close();
-        throw error;
+        try {
+            await configureMcp(server, node, () => closed);
+        }
+        catch (error) {
+            startupError = error;
+            node.close();
+            throw error;
+        }
+        finally {
+            process.stdin.off("end", stopStartup);
+            server.sendToolListChanged = changed.tools;
+            server.sendResourceListChanged = changed.resources;
+            server.sendPromptListChanged = changed.prompts;
+            resolveReady();
+        }
     }
     finally {
-        process.stdin.off("end", stopStartup);
-        resolveReady();
+        clearStarting();
     }
 }
 async function configureMcp(server, node, startupClosed) {

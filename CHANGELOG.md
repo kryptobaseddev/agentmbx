@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **MCP connects before mailbox startup (T501):** `initialize` and `ping` answer while SQLite is busy. Mailbox tools wait for identity setup, retry startup lock contention, and then report the caller's signed policy through `mbx_whoami` and `mbx_inbox`. Current stores open without repeating the schema write transaction.
+- **MCP connects before mailbox startup (T501):** `initialize` and `ping` answer while SQLite is busy. Mailbox tools wait for identity setup, retry startup lock contention, and then report the caller's signed policy through `mbx_whoami` and `mbx_inbox`. Current stores open without repeating the schema write transaction. Separate-process hooks briefly wait for a resuming MCP before offering identity recovery, and build handover keeps its single catalog-change notification.
 
 ## 0.5.19 (2026-10-09)
 

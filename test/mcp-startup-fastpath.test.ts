@@ -9,6 +9,8 @@ import { performance } from "node:perf_hooks";
 import { MbxNode } from "../src/node.ts";
 import { Store, withStoreBusyTimeout } from "../src/store.ts";
 import { writeSessionTaint } from "../src/session-taint.ts";
+import { mcpStarting } from "../src/mcp-startup.ts";
+import { procTable } from "../src/proc.ts";
 
 const BIN = join(import.meta.dirname, "../bin/agentmbx.js");
 const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -87,8 +89,42 @@ function fixture(t: TestContext) {
     const dir = join(env.HOME!, ".claude", "sessions"); mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, `${process.pid}.json`), JSON.stringify({ sessionId: id }));
   };
-  return { root, home, start, holdLock, session };
+  const hook = (id: string) => {
+    const child = spawn(process.execPath, [BIN, "hook", "session-start", "--cli", "claude"], { env }); children.push(child);
+    let stdout = "", stderr = "";
+    child.stdout.on("data", data => { stdout += data; }); child.stderr.on("data", data => { stderr += data; });
+    child.stdin.end(JSON.stringify({ session_id: id, cwd: process.cwd() }));
+    return new Promise<{ code: number | null; stdout: string; stderr: string }>(resolve => child.once("exit", code => resolve({ code, stdout, stderr })));
+  };
+  return { root, home, start, holdLock, session, hook };
 }
+
+for (const recover of [true, false]) test(`a separate session-start hook ${recover ? "waits for the resumed identity" : "bounds its wait and reports resuming"}`, { timeout: 10_000 }, async t => {
+  const f = fixture(t), id = `startup-hook-${recover}`, release = join(f.root, "resume-release"), preload = join(f.root, "hold-resume.mjs");
+  f.session(id);
+  writeFileSync(preload, `import {DatabaseSync} from 'node:sqlite'; import {existsSync} from 'node:fs';
+    const prepare=DatabaseSync.prototype.prepare;
+    DatabaseSync.prototype.prepare=function(sql){const statement=prepare.call(this,sql);
+      if(sql.includes('INSERT INTO identity_leases')){const run=statement.run;
+        statement.run=function(...args){if(!existsSync(${JSON.stringify(release)}))throw Object.assign(new Error('database is locked'),{code:'SQLITE_BUSY'});
+          return run.apply(this,args)};}return statement;};`);
+  const server = f.start(preload); await server.initialized;
+  procTable(0);
+  assert.equal(mcpStarting(f.home, "claude", process.pid), true, "the marker must be visible before identity setup finishes");
+  assert.equal(mcpStarting(f.home, "codex", process.pid), false, "another provider cannot delay this hook");
+  assert.equal(mcpStarting(f.home, "claude", 2_000_000_000), false, "another process tree cannot delay this hook");
+  const started = performance.now(), hook = f.hook(id);
+  if (recover) { await pause(600); writeFileSync(release, "ready"); }
+  const result = await hook;
+  assert.equal(result.code, 0, result.stderr);
+  assert.ok(performance.now() - started < 3000, "the hook must not wait indefinitely for MCP readiness");
+  assert.doesNotMatch(result.stdout, /no mailbox identity|action.*claim|action.*register/);
+  if (recover) assert.match(result.stdout, /You are reader@alpha/);
+  else { assert.match(result.stdout, /identity is still resuming/); writeFileSync(release, "ready"); }
+  const who = await server.rpc(2, "tools/call", { name: "mbx_whoami", arguments: {} });
+  assert.equal(who.result?.structuredContent?.agent, "reader");
+  assert.equal(mcpStarting(f.home, "claude", process.pid), false, "ready removes the advisory marker");
+});
 
 test("initialize answers within 500ms during another process's 10s write lock, then startup recovers", { timeout: 25_000 }, async t => {
   const f = fixture(t), lock = await f.holdLock(10_000), server = f.start();
