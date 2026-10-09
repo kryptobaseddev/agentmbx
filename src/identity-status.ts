@@ -27,7 +27,7 @@ export interface IdentityStatus {
 }
 
 export function listIdentityStatus(home: string, options: { now?: number; inspect?: (pid: number) => ProcessEvidence;
-  project?: string; caller?: { cli: string; sessionId: string; pid?: number; providerPid?: number }; includeRetired?: boolean;
+  project?: string; caller?: { cli: string; sessionId: string; pid?: number; providerPid?: number; canonicalHarness?: boolean }; includeRetired?: boolean;
   processTable?: () => Map<number, { ppid: number }> } = {}) {
   const path = join(home, "mbx.db"), now = options.now ?? Date.now();
   if (!Number.isSafeInteger(now) || now < 0 || now > 8.64e15) throw new Error("invalid identity observation time");
@@ -90,12 +90,12 @@ export function listIdentityStatus(home: string, options: { now?: number; inspec
   // a claim must recheck the current generation under its own write lock.
   const inspect = options.inspect ?? inspectLeaseProcess;
   // The provider process a same-session holder serves under (T383), read only for a lease of the caller's own session.
-  const sameSessionProvider = (lease: IdentityLease, caller: { cli: string; sessionId: string; providerPid?: number }) => {
+  const sameSessionProvider = (lease: IdentityLease, caller: { cli: string; sessionId: string; providerPid?: number; canonicalHarness?: boolean }) => {
     if (lease.cli !== caller.cli || lease.session_id !== caller.sessionId) return {};
     const recorded = providerByHolder.get(lease.holder_pid) ?? null;
     let evidence: ProcessEvidence | null = null;
     if (recorded) { try { evidence = inspect(recorded.pid); } catch { evidence = { alive: null, start: null }; } }
-    return holderProviderView((options.processTable ?? procTable)(), lease.holder_pid, caller.providerPid, recorded, evidence);
+    return holderProviderView((options.processTable ?? procTable)(), lease.holder_pid, caller.providerPid, recorded, evidence, caller.canonicalHarness);
   };
   for (const lease of leases) {
     const item = row(lease.name); activity(item, lease.heartbeat_at); activity(item, lease.released_at);
@@ -123,4 +123,26 @@ export function listIdentityStatus(home: string, options: { now?: number; inspec
   return { host: config.host as string, schema_version: schema, observed_at: new Date(now).toISOString(), advisory: true,
     ...(options.project ? { project: options.project } : {}),
     identities: options.project ? all.filter(i => inProject.has(i.name)) : all };
+}
+
+/** Unbound session-start text (T328). Claimable rows for this directory only: name, role, last activity, unread. */
+export function formatUnboundStart(home: string, project: string | null | undefined): string {
+  const head = "This session has no mailbox identity yet.";
+  const stay = "The session stays unbound until you claim or register. Never invent a random name.";
+  const base = project?.split(/[/\\]/).filter(Boolean).at(-1);
+  const suggest = base ? `${base}-<role>` : "<project>-<role>";
+  const claim = `Claim one with mbx_identity {"action":"claim","name":"<name>"}`;
+  const register = `or register a new one with mbx_identity {"action":"register","name":"${suggest}","role":"<role>"}`;
+  const actions = `${claim} ${register}. ${stay}`;
+  if (!project) return `${head} No mailboxes for this directory. ${actions}`;
+  let identities: IdentityStatus[] = [];
+  try { identities = listIdentityStatus(home, { project }).identities; }
+  catch { return `${head} Mailboxes for this directory could not be listed. ${actions}`; }
+  const claimable = identities.filter(i => i.claimable);
+  if (!identities.length) return `${head} No mailboxes for this directory. ${actions}`;
+  if (!claimable.length) return `${head} No claimable mailboxes for this directory. ${actions}`;
+  const shown = claimable.slice(0, 10);
+  const lines = shown.map(i => `${i.name} role=${i.role ?? "unregistered"} last=${i.last_activity ?? "none"} unread=${i.unread}`);
+  const more = claimable.length > shown.length ? `\n+${claimable.length - shown.length} more: mbx_identity list` : "";
+  return `${head}\n${lines.join("\n")}${more}\n${actions}`;
 }

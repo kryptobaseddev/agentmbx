@@ -34,7 +34,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} startup 
   const plain = cli === "kimi" || cli === "opencode";
   const context = plain ? result.stdout : JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
   if (!plain) assert.equal(JSON.parse(result.stdout).hookSpecificOutput.hookEventName, "SessionStart");
-  assert.match(context, /no mailbox identity yet/); assert.match(context, /mbx_whoami/);
+  assert.match(context, /no mailbox identity yet/); assert.match(context, /No mailboxes for this directory/);
   assert.match(context, /"action\\?":\\?"claim\\?"/); assert.match(context, /"action\\?":\\?"register\\?"/);
   assert.doesNotMatch(context, /SECRET BODY|PRIVATE SUBJECT/);
   assert.deepEqual(node.store.db.prepare("SELECT * FROM identity_leases").all(), before);

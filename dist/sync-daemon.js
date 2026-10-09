@@ -3,12 +3,13 @@
 // syncOnce returns before fetch and before loadSyncSnapshot runs.
 import { homedir, userInfo } from "node:os";
 import { missedCount } from "./catchup.js";
-import { fingerprint } from "./crypto.js";
+import { readCloudEnrolment, readCloudKey } from "./cloud-key.js";
+import { fingerprint, signData } from "./crypto.js";
 import { storedPolicies } from "./policy.js";
 import { activeLead } from "./lead-record.js";
 import { projectKey } from "./registry.js";
 import { relayFor } from "./relay-client.js";
-import { syncOnce } from "./sync-client.js";
+import { newSyncNonce, syncOnce } from "./sync-client.js";
 import { CAPS, PATH_FLAG_PREFIX, PROJECT_KEY_RE } from "./sync-projection.js";
 import { version } from "./version.js";
 export const SYNC_INTERVAL_MS = 15_000;
@@ -182,12 +183,34 @@ export function loadSyncSnapshot(node, ctx, projectKeyOf = projectKey) {
         leads,
     };
 }
+function syncSigner(home, nowMs) {
+    const enrolment = readCloudEnrolment(home);
+    const key = readCloudKey(home);
+    if (!enrolment || !key)
+        return undefined;
+    let apiOrigin;
+    try {
+        apiOrigin = new URL(enrolment.resources.api).origin;
+    }
+    catch {
+        return undefined;
+    }
+    return {
+        hostId: enrolment.host_id,
+        apiOrigin,
+        sign: (message) => signData(key.privateKey, message),
+        timestamp: () => Math.floor(nowMs / 1000),
+        nonce: newSyncNonce,
+    };
+}
 export async function syncTick(node, deps = {}) {
     const projectKeyOf = deps.projectKeyOf ?? projectKey;
+    const now = deps.now ?? Date.now();
     return syncOnce({
+        signer: syncSigner(node.home, now),
         kv: node.store,
         fetch: deps.fetch ?? fetch,
-        now: deps.now ?? Date.now(),
+        now,
         audit: (event, detail) => {
             try {
                 node.store.audit(event, detail);

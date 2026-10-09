@@ -1,9 +1,28 @@
-// Daemon sync client (T262). One POST writer, one seq per host. No network call
-// unless a local link record exists. SyncAck cannot turn the path or lead opt-in on.
+// Daemon sync client (T262, T468). One POST writer, one seq per host. No network call
+// unless a local link record exists, and no bearer token. SyncAck cannot turn the path or lead opt-in on.
+import { createHash, randomBytes } from "node:crypto";
 import { CONTRACT_VERSION, PATH_FLAG_PREFIX, PROJECT_LEADS_SINCE, PROJECT_PATHS_SINCE, projectSync, } from "./sync-projection.js";
 export const LINK_KEY = "sync.link";
 export const STATE_KEY = "sync.state";
 export { PATH_FLAG_PREFIX };
+/** The bytes the cloud verifies. No trailing newline. */
+export function syncPopString(input) {
+    const hash = createHash("sha256").update(input.body).digest("hex");
+    return [
+        "agentmbx-sync-pop-v1",
+        input.apiOrigin,
+        input.hostId,
+        "POST",
+        "/v1/host/sync",
+        hash,
+        input.timestamp,
+        input.nonce,
+    ].join("\n");
+}
+/** 32 random bytes as base64url. A new value on every call. */
+export function newSyncNonce() {
+    return randomBytes(32).toString("base64url");
+}
 export function readLink(get) {
     const raw = get(LINK_KEY);
     if (!raw)
@@ -18,11 +37,11 @@ export function readLink(get) {
     if (!parsed || typeof parsed !== "object")
         return null;
     const l = parsed;
-    if (l.v !== 1 || typeof l.sync_url !== "string" || !l.sync_url || typeof l.token !== "string" || !l.token)
+    if (l.v !== 1 || typeof l.sync_url !== "string" || !l.sync_url)
         return null;
     if (!l.contract || typeof l.contract.min !== "number" || typeof l.contract.max !== "number")
         return null;
-    return { v: 1, sync_url: l.sync_url, token: l.token, contract: { min: l.contract.min, max: l.contract.max },
+    return { v: 1, sync_url: l.sync_url, contract: { min: l.contract.min, max: l.contract.max },
         ...(l.project_paths === true ? { project_paths: true } : {}), ...(l.project_leads === true ? { project_leads: true } : {}) };
 }
 function blank() {
@@ -131,11 +150,23 @@ export async function syncOnce(o) {
     return send(o, link, state, pending);
 }
 async function send(o, link, state, pending) {
+    const signer = o.signer;
+    if (!signer)
+        return { outcome: "unlinked" };
+    const timestamp = String(signer.timestamp());
+    const nonce = signer.nonce();
+    const message = syncPopString({ apiOrigin: signer.apiOrigin, hostId: signer.hostId, body: pending.body, timestamp, nonce });
     let res;
     try {
         res = await o.fetch(postUrl(link.sync_url), {
             method: "POST",
-            headers: { authorization: `Bearer ${link.token}`, "content-type": "application/json" },
+            headers: {
+                "content-type": "application/json",
+                "X-MBX-Host-Id": signer.hostId,
+                "X-MBX-Timestamp": timestamp,
+                "X-MBX-Nonce": nonce,
+                "X-MBX-Signature": signer.sign(message),
+            },
             body: pending.body,
         });
     }

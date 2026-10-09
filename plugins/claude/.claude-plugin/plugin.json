@@ -1,6 +1,6 @@
 {
   "name": "agentmbx",
-  "version": "0.5.13",
+  "version": "0.5.18",
   "description": "Renders this Claude Code session's AgentMBX status. It does not compute status itself.",
   "author": { "name": "AgentMBX" },
   "hooks": "./hooks/hooks.json"

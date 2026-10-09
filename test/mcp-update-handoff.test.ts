@@ -22,9 +22,20 @@ for (const cli of ["claude", "codex", "opencode"]) test(`${cli} build handover f
   symlinkSync(resolve("node_modules"), join(install, "node_modules"), "dir");
   const node = new MbxNode(home, { host: "alpha" }), client = new Client({ name: "handoff-test", version: "1" });
   let catalogChanges = 0;
-  client.setNotificationHandler(ToolListChangedNotificationSchema, () => { catalogChanges++; });
+  const refreshes: Promise<unknown>[] = [];
+  client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
+    catalogChanges++;
+    // Claude refreshes immediately upon notification, before the next agent tool call.
+    const refresh = client.listTools(); refresh.catch(() => {}); refreshes.push(refresh);
+  });
   t.after(async () => { await client.close(); node.close(); rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
-  const env: NodeJS.ProcessEnv = { ...process.env, MBX_HOME: home, MBX_AGENT: "update-reader", MBX_CLI: cli, MBX_NO_DESKTOP: "1" };
+  const preload = join(root, "unref-stdio.mjs");
+  writeFileSync(preload, `if (process.env.MBX_MCP_REEXEC) {
+    const input = process.stdin, on = input.on;
+    input.on = function(event, ...args) { const value = on.call(this, event, ...args);
+      if (event === 'data') queueMicrotask(() => input.unref?.()); return value; };
+  }`);
+  const env: NodeJS.ProcessEnv = { ...process.env, NODE_OPTIONS: `--import=${preload}`, MBX_HOME: home, MBX_AGENT: "update-reader", MBX_CLI: cli, MBX_NO_DESKTOP: "1" };
   delete env.AGENTMBX_DEV;
   delete env.MBX_MCP_REEXEC;
   delete env.MBX_MCP_REEXEC_BUILD;
@@ -64,6 +75,7 @@ for (const cli of ["claude", "codex", "opencode"]) test(`${cli} build handover f
       await new Promise(resolve => setTimeout(resolve, 25));
     }
     assert.equal(catalogChanges, generation, "exactly one notification per replacement");
+    await refreshes[generation - 1];
     assert.ok((await client.listTools()).tools.some(t => t.name === "mbx_replay"));
     for (const [i, sid] of ids.entries()) {
       const who = await call(sid, "mbx_whoami");

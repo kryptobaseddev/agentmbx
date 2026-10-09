@@ -48,9 +48,20 @@ test("a fresh session is unbound until it registers a chosen name and role; mail
   assert.equal(who.agent, null);
   assert.equal(who.unbound, true);
   assert.equal(node.store.db.prepare("SELECT COUNT(*) n FROM identity_leases").get()!.n, 0, "no name was invented");
+  // T464: the startup guide ("mbx_whoami, then mbx_inbox") sends every fresh session here, so an unbound inbox is a result with the next step
+  // (a thrown error aborts a whole Code Mode script); every other mailbox tool still refuses with the same guidance.
   const inbox = await c.callTool({ name: "mbx_inbox", arguments: {} });
-  assert.equal(inbox.isError, true);
-  assert.match(textOf(inbox), /no mbx identity yet.*mbx_identity \{"action":"list"\}/s);
+  assert.notEqual(inbox.isError, true, textOf(inbox));
+  const empty = json(inbox);
+  assert.deepEqual([empty.agent, empty.unbound, empty.messages, empty.pending], [null, true, [], null]);
+  assert.match(String(empty.next), /no mailbox identity yet.*No mailboxes for this directory.*\"action\":\"claim\".*\"action\":\"register\"/s);
+  assert.equal(empty.next, who.next, "the same next step mbx_whoami gives");
+  assert.match(textOf(inbox), /^No inbox yet: This session has no mailbox identity yet\./);
+  for (const [name, args] of [["mbx_read", { ids: ["000000"] }], ["mbx_ack", { ids: ["000000"] }], ["mbx_send", { to: ["x"], subject: "s", body: "b" }], ["mbx_replay", {}]] as const) {
+    const refused = await c.callTool({ name, arguments: args });
+    assert.equal(refused.isError, true, `${name} still needs an identity`);
+    assert.match(textOf(refused), /no mailbox identity yet.*No mailboxes for this directory/s, name);
+  }
 
   const noRole = await c.callTool({ name: "mbx_identity", arguments: { action: "register", name: "orbit-lead" } });
   assert.equal(noRole.isError, true);
@@ -129,6 +140,10 @@ test("a remembered identity held by another live session leaves this one unbound
   const b = await connect("sess-b");
   const who = json(await b.callTool({ name: "mbx_whoami", arguments: {} }));
   assert.deepEqual([who.agent, who.pending], [null, "orbit-lead"]);
+  const waiting = await b.callTool({ name: "mbx_inbox", arguments: {} });
+  assert.notEqual(waiting.isError, true, "T464: a session waiting on a held identity is still starting up");
+  assert.deepEqual([json(waiting).agent, json(waiting).unbound, json(waiting).messages, json(waiting).pending], [null, true, [], "orbit-lead"]);
+  assert.match(String(json(waiting).next), /orbit-lead is not available yet.*resumes automatically/s);
   assert.equal(node.store.get("name:claude:sess-b"), "orbit-lead", "a failed resume never overwrites the remembered name");
   assert.equal(node.store.db.prepare("SELECT COUNT(*) n FROM identity_leases").get()!.n, 1, "and never mints a substitute");
   await a.close();

@@ -14,6 +14,7 @@ import { parse as parseToml } from "smol-toml";
 import { fingerprint } from "./crypto.js";
 import { claudePluginStep, execCli } from "./claude-plugin.js";
 import { version } from "./version.js";
+import { opencodeSidebarPackageJson, opencodeSidebarServerSource, opencodeSidebarSource, OPENCODE_SIDEBAR_MARKER } from "./opencode-sidebar.js";
 import { authHelperPath, canPrompt, createKeychainOwner, ownerInfo } from "./owner.js";
 export const CLIS = ["claude", "codex", "opencode", "kimi", "hermes", "grok"];
 /** The bundled skill as {relative path: content}: embedded in the single executable (SEA asset), else read from ../skill. */
@@ -763,23 +764,37 @@ function codexServer(cmd) {
 const KIMI_BEGIN = "# >>> agentmbx (managed by agentmbx setup; remove with: agentmbx setup --uninstall) >>>";
 const KIMI_END = "# <<< agentmbx <<<";
 function kimiHooks(cmd) {
-    const block = [KIMI_BEGIN,
-        ...STOP_EVENTS.flatMap(([ev, sub]) => ["[[hooks]]", `event = "${ev}"`, `command = ${JSON.stringify(hookCommand(cmd, sub, "kimi"))}`, "timeout = 10"]),
+    const blockFor = (events) => [KIMI_BEGIN,
+        ...events.flatMap(([ev, sub]) => ["[[hooks]]", `event = "${ev}"`, `command = ${JSON.stringify(hookCommand(cmd, sub, "kimi"))}`, "timeout = 10"]),
         KIMI_END];
+    const present = (cur, ev, sub) => {
+        const hooks = tryParseToml(cur)?.hooks;
+        return Array.isArray(hooks) && hooks.some(h => h && typeof h === "object" && h.event === ev
+            && typeof h.command === "string" && isOurHookCommand(h.command, sub, "kimi", hookCommand(cmd, sub, "kimi")));
+    };
     const find = (lines) => {
         const s = lines.indexOf(KIMI_BEGIN), e = lines.indexOf(KIMI_END, s);
         return s >= 0 && e > s ? [s, e + 1] : null;
     };
     return {
+        blocked: (cur) => cur !== null && tryParseToml(cur) === null ? "config.toml is not valid TOML" : null,
+        isWired: (cur) => cur !== null && STOP_EVENTS.every(([ev, sub]) => present(cur, ev, sub)),
         install: (cur) => {
+            if (cur !== null && tryParseToml(cur) === null)
+                return cur;
             const lines = (cur ?? "").split("\n");
             const r = find(lines);
+            // Kimi can rewrite TOML and discard comments. Existing command/event pairs remain hooks
+            // without markers; preserve their bytes and add only pairs that are actually missing.
+            const outside = r ? [...lines.slice(0, r[0]), ...lines.slice(r[1])].join("\n") : cur ?? "";
+            const missing = STOP_EVENTS.filter(([ev, sub]) => !present(outside, ev, sub));
             if (!r)
-                return appendBlock(cur, block.join("\n"));
+                return missing.length ? guarded(cur, appendBlock(cur, blockFor(missing).join("\n"))) : cur;
+            const block = missing.length ? blockFor(missing) : [];
             if (same(lines.slice(r[0], r[1]), block))
                 return cur;
             lines.splice(r[0], r[1] - r[0], ...block);
-            return lines.join("\n");
+            return guarded(cur, lines.join("\n"));
         },
         uninstall: (cur) => {
             if (cur === null)
@@ -963,13 +978,175 @@ export default {
 };
 `;
 }
-/** The OpenCode hooks edit: one whole file we own. Foreign content is left alone and reported. */
+/** The managed version header (T486): every file we generate for OpenCode carries the agentmbx
+ *  release it was written by — the ` (agentmbx <ver>)` suffix on a managed marker line, or the
+ *  "version" field of a package.json we own. A file that differs from the current template only
+ *  there is still ours and still functional: doctor calls it wired, and setup neither rewrites it
+ *  nor restarts the OpenCode service for it (a running service only reads config at start, and a
+ *  restart mid-session is exactly the disruption T486 removes). */
+const MANAGED_VERSION_LINE = / \(agentmbx [^)\n]*\)$/;
+const stripManagedVersion = (src) => src.split("\n").map((l, i) => (i === 0 && l.startsWith("// agentmbx-") ? l.replace(MANAGED_VERSION_LINE, "") : l)).join("\n");
+/** True when `cur` differs from the current template `content` only in the managed version header
+ *  (first marker line's ` (agentmbx x.y.z)` suffix). Both must be OUR files with the same marker. */
+export const headerOnlyDiff = (cur, content) => cur !== null && stripManagedVersion(cur) === stripManagedVersion(content) && cur !== content;
+/** True when two package.json texts we generated differ only in the "version" field. */
+export const versionOnlyPackageDiff = (cur, content) => {
+    if (cur === null || cur === content)
+        return false;
+    try {
+        const a = JSON.parse(cur), b = JSON.parse(content);
+        if (a.name !== b.name || !String(a.name ?? "").startsWith("agentmbx-"))
+            return false;
+        return JSON.stringify({ ...a, version: 0 }) === JSON.stringify({ ...b, version: 0 });
+    }
+    catch {
+        return false;
+    }
+};
+/** The OpenCode hooks edit: one whole file we own. Foreign content is left alone and reported.
+ *  T486: a header-only (release-version) difference is ours and wired — install leaves the file
+ *  byte-for-byte alone, so no backup row, no rewrite, and no OpenCode service restart. */
 export function opencodeHooks(cmd, ver) {
     const content = opencodePluginSource(cmd, ver);
     return {
-        install: (cur) => (cur === null || isOpencodePluginOurs(cur)) && cur !== content ? content : cur,
+        install: (cur) => {
+            if (headerOnlyDiff(cur, content))
+                return cur;
+            return (cur === null || isOpencodePluginOurs(cur)) && cur !== content ? content : cur;
+        },
         uninstall: (cur) => (cur === null || isOpencodePluginOurs(cur)) ? null : cur,
-        isWired: (cur) => cur === content,
+        isWired: (cur) => cur === content || headerOnlyDiff(cur, content),
+    };
+}
+// ---- OpenCode sidebar plugin (T411) ------------------------------------------------------------
+// The T409 spike proved the packaged-plugin shape: a directory whose package.json declares
+// "opencode" entrypoints is loaded in BOTH host runtimes, and only the tui entrypoint's context
+// carries the slot tree. Setup installs the three generated files under
+// ~/.config/opencode/plugins/agentmbx-sidebar/ and registers that directory in tui.json's
+// "plugin" array — the list the TUI reads. The hooks plugin (agentmbx.ts) is a separate edit and
+// stays byte-for-byte untouched by this one; so does every other entry in tui.json.
+export const opencodeSidebarDir = (home) => join(home, ".config/opencode/plugins/agentmbx-sidebar");
+export const opencodeTuiConfig = (home) => join(home, ".config/opencode/tui.json");
+/** True when the file's first line starts with the sidebar marker: ours-current or ours-stale. */
+const isOpencodeSidebarOurs = (cur) => cur !== null && cur.split("\n", 1)[0].trim().startsWith(OPENCODE_SIDEBAR_MARKER);
+/** A whole-file edit we own (tui.ts / server.ts): write when absent or ours-stale, never when
+ *  foreign; header-only differences are left byte-for-byte alone (T486). */
+function opencodeSidebarFile(content, versioned) {
+    return {
+        install: (cur) => {
+            if (versioned && headerOnlyDiff(cur, content))
+                return cur;
+            return (cur === null || isOpencodeSidebarOurs(cur)) && cur !== content ? content : cur;
+        },
+        uninstall: (cur) => (cur === null || isOpencodeSidebarOurs(cur)) ? null : cur,
+        isWired: (cur) => cur === content || (versioned && headerOnlyDiff(cur, content)),
+        blocked: (cur) => cur !== null && !isOpencodeSidebarOurs(cur) ? "file exists and is not ours (first line is not the agentmbx-sidebar marker)" : null,
+    };
+}
+/** The package.json edit: same ownership rule through the package name, with the version field as
+ *  its managed version header (T486). */
+function opencodeSidebarPackage(content) {
+    const isOurs = (cur) => {
+        if (cur === null)
+            return false;
+        try {
+            return JSON.parse(cur).name === "agentmbx-sidebar";
+        }
+        catch {
+            return false;
+        }
+    };
+    return {
+        install: (cur) => {
+            if (versionOnlyPackageDiff(cur, content))
+                return cur;
+            return (cur === null || isOurs(cur)) && cur !== content ? content : cur;
+        },
+        uninstall: (cur) => (cur === null || isOurs(cur)) ? null : cur,
+        isWired: (cur) => cur === content || versionOnlyPackageDiff(cur, content),
+        blocked: (cur) => cur !== null && !isOurs(cur) ? "file exists and is not the agentmbx-sidebar package" : null,
+    };
+}
+/** Insert `valueSrc` (a JSON string) as the last element of array `arr`, preserving the rest of
+ *  the text byte-for-byte (the jsonc.ts helpers are object-shaped; arrays parse to members keyed
+ *  by index string, so removal can reuse removeMember). */
+const indentAt = (text, pos) => /^[ \t]*/.exec(text.slice(text.lastIndexOf("\n", pos - 1) + 1))[0];
+function insertArrayItem(text, arr, valueSrc) {
+    if (!arr.members.length)
+        return text.slice(0, arr.start + 1) + valueSrc + text.slice(arr.start + 1);
+    // Splice right after the last element so a matching removeMember (which drops the comma after
+    // the previous member when removing the last element) restores the original bytes exactly.
+    const last = arr.members[arr.members.length - 1].value;
+    const ind = indentAt(text, arr.members[0].value.start);
+    return text.slice(0, last.end) + `,\n${ind}${valueSrc}` + text.slice(last.end);
+}
+/** The tui.json registration edit: adds ONLY our directory to the "plugin" array — the TUI's
+ *  plugin list — leaving every other entry, key, comment and formatting byte-for-byte intact.
+ *  Uninstall removes only our entry. */
+export function opencodeTuiPlugins(entry) {
+    const src = JSON.stringify(entry);
+    const plugins = (text) => {
+        const root = parseJsonc(text);
+        if (root.kind !== "object")
+            throw new Error("expected a JSON object");
+        return member(root, "plugin")?.value;
+    };
+    return {
+        install: (cur) => {
+            const text = cur ?? `{\n  "plugin": [${src}]\n}\n`;
+            const arr = plugins(text);
+            let out;
+            if (arr === undefined)
+                out = insertMember(text, parseJsonc(text), "plugin", `[${src}]`);
+            else if (arr.kind !== "array")
+                return cur ?? text; // blocked() reports it; never guess
+            else if (arr.members.some((m) => valueOf(text, m.value) === entry))
+                return cur ?? text;
+            else
+                out = insertArrayItem(text, arr, src);
+            parseJsonc(out); // never write something we cannot read back
+            return out;
+        },
+        uninstall: (cur) => {
+            if (cur === null)
+                return null;
+            const arr = plugins(cur);
+            if (arr?.kind !== "array")
+                return cur;
+            const idx = arr.members.findIndex((m) => valueOf(cur, m.value) === entry);
+            if (idx < 0)
+                return cur;
+            const out = removeMember(cur, arr, String(idx));
+            parseJsonc(out);
+            // When the file is exactly what we would have created — our entry and nothing else — it
+            // goes away entirely; anything else the user added (other entries, other keys, comments
+            // outside our line) keeps the file.
+            const root = parseJsonc(out);
+            return root.kind === "object" && root.members.length === 1 && root.members[0].key === "plugin" && root.members[0].value.members.length === 0
+                ? null : out;
+        },
+        isWired: (cur) => {
+            if (cur === null)
+                return false;
+            const arr = plugins(cur);
+            return arr?.kind === "array" && arr.members.some((m) => valueOf(cur, m.value) === entry);
+        },
+        blocked: (cur) => {
+            if (cur === null)
+                return null;
+            try {
+                const root = parseJsonc(cur);
+                const p = root.kind === "object" ? member(root, "plugin") : undefined;
+                if (root.kind !== "object")
+                    return "tui.json is not a JSON object";
+                if (p && p.value.kind !== "array")
+                    return `"plugin" is not an array`;
+                return null;
+            }
+            catch {
+                return "tui.json does not parse as JSONC";
+            }
+        },
     };
 }
 // ---- OpenCode (JSONC) ------------------------------------------------------------------------
@@ -1250,6 +1427,15 @@ function hermesHooks(cmd) {
     };
     return {
         blocked,
+        isWired: (cur) => {
+            if (cur === null || blocked(cur) !== null)
+                return false;
+            const { lines } = hermesSplit(cur), lay = hermesLayout(lines);
+            return lay.kind === "block" && HERMES_HOOK_EVENTS.every(([event, sub]) => {
+                const e = hermesEvent(lines, lay, event);
+                return e !== null && !("reason" in e) && e.items.some(it => ours(it.command, sub));
+            });
+        },
         install: (cur) => {
             if (cur === null || blocked(cur) !== null)
                 return cur;
@@ -1474,9 +1660,17 @@ export function edits(ctx, cli) {
             // T391: OpenCode has no settings-file hooks — the first-party mechanism is the plugin module
             // auto-loaded from ~/.config/opencode/plugins/, translating OpenCode events onto the shared
             // `agentmbx hook ... --cli opencode` contract (session-start / post-tool / stop continuation).
+            // T411: the sidebar package (T409's proven shape) is installed beside it under
+            // plugins/agentmbx-sidebar/ and registered in tui.json — registration first, so a running
+            // TUI never sees a registered-but-missing package mid-edit; uninstall drops the registration
+            // before the files. The hooks plugin and every other tui.json entry are never touched.
             return [
                 { cli, kind: "mcp", item: "mcp.servers.mbx", path: opencodeConfig(home), ...opencodeServer(cmd) },
                 { cli, kind: "hooks", item: "plugin session.created + tool.execute.after + session.idle", path: opencodePluginPath(home), ...opencodeHooks(cmd, version()) },
+                { cli, kind: "sidebar", item: "tui.json plugin registration", path: opencodeTuiConfig(home), ...opencodeTuiPlugins(opencodeSidebarDir(home)) },
+                { cli, kind: "sidebar", item: "packaged plugin package.json", path: join(opencodeSidebarDir(home), "package.json"), ...opencodeSidebarPackage(opencodeSidebarPackageJson()) },
+                { cli, kind: "sidebar", item: "packaged plugin server.ts", path: join(opencodeSidebarDir(home), "server.ts"), ...opencodeSidebarFile(opencodeSidebarServerSource(), false) },
+                { cli, kind: "sidebar", item: "packaged plugin tui.ts", path: join(opencodeSidebarDir(home), "tui.ts"), ...opencodeSidebarFile(opencodeSidebarSource(version()), true) },
             ];
         case "kimi": {
             const kimi = (home === homedir() && process.env.KIMI_CODE_HOME) || join(home, ".kimi-code");
