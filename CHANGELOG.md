@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **OpenCode never runs a duplicate agent loop (T524):** OpenCode 2.x runs each `opencode --standalone` TUI on its own private `opencode serve --stdio`, while a separate shared `opencode serve --service` reads the same session database. AgentMBX pushed notes and wakes into every OpenCode session by POSTing a synthetic message with `resume: true` to the shared service, so for a session hosted by a standalone serve the service started a second agent loop on the same session and worktree (duplicate assistant chains, double compactions, interleaved git snapshots). The generated plugin now posts to the service only when it is itself loaded by the service process (its argv carries `--service` and not `--stdio`), and never runs `opencode service status` otherwise; the daemon wakes an OpenCode session only when the binding's recorded provider process is `opencode serve --service`, and returns not_submitted/no-target for standalone or unknown hosts; `agentmbx doctor` counts service-hosted and standalone bindings and says standalone ones have no push wake yet (they get mail on their next prompt). Run `agentmbx setup` to rewrite the installed plugin.
+
 ## 0.5.19 (2026-10-09)
 
 The Claude Code status mod installs with setup: `agentmbx setup` adds the package's local marketplace and installs the `agentmbx@agentmbx` plugin, doctor checks it, and foreign plugins are never touched.

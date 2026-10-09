@@ -11,6 +11,7 @@ import type { AddressInfo } from "node:net";
 import { bindWakeLease } from "./helpers/wake-lease.ts";
 import { MbxNode } from "../src/node.ts";
 import { dispatchWakes, muteWakes, UNKNOWN_HOLD_MS, wakeCodex, wakeOpencode, wakeText } from "../src/wake.ts";
+import { opencodeHostSeams } from "../src/opencode-provider.ts";
 import type { WakeOutcome } from "../src/wake-contract.ts";
 import { statusWakeWarning, type Envelope } from "../src/mcp.ts";
 
@@ -79,6 +80,9 @@ test("a mismatched receipt is unknown, and an unknown attempt is never repeated 
   const { n } = fixture(t);
   const svc = opencode(t, (session, text) => ({ data: { id: "msg_x", sessionID: `${session}-other`, type: "synthetic", delivery: "queue", payload: { text }, time: { created: 1 } } }));
   process.env.MBX_OPENCODE_URL = await svc.listen();
+  const realArgs = opencodeHostSeams.args; // T524: the bound pid is the shared service
+  opencodeHostSeams.args = () => new Map([[process.pid, ["/usr/local/bin/opencode", "serve", "--service"]]]);
+  t.after(() => { opencodeHostSeams.args = realArgs; });
   bindWakeLease(n, { agent: "worker", cli: "opencode", session_id: "ses_first", pid: process.pid });
   bindWakeLease(n, { agent: "worker", cli: "opencode", session_id: "ses_second", pid: process.pid });
   sendLeased(n, { from: "sender", to: ["worker"], subject: "wake", body: "private", kind: "request" });
@@ -98,11 +102,11 @@ test("opencode: an unreachable service is not_submitted, a timeout after the wri
   const port = await new Promise<number>((r) => closed.listen(0, "127.0.0.1", () => r((closed.address() as AddressInfo).port)));
   await new Promise<void>((r) => closed.close(() => r()));
   const service = async () => ({ url: `http://127.0.0.1:${port}`, auth: "" });
-  const refused = await wakeOpencode("ses_x", "[mbx] hint", { service });
+  const refused = await wakeOpencode("ses_x", "[mbx] hint", { host: () => "service", service });
   assert.equal(refused.outcome?.kind === "not_submitted" && refused.outcome.reason, "unavailable");
-  const slow = await wakeOpencode("ses_x", "[mbx] hint", { service, fetch: (async () => { throw Object.assign(new Error("timed out"), { name: "TimeoutError" }); }) as typeof fetch });
+  const slow = await wakeOpencode("ses_x", "[mbx] hint", { host: () => "service", service, fetch: (async () => { throw Object.assign(new Error("timed out"), { name: "TimeoutError" }); }) as typeof fetch });
   assert.equal(slow.outcome?.kind === "unknown" && slow.outcome.reason, "timeout");
-  const rejected = await wakeOpencode("ses_x", "[mbx] hint", { service, fetch: (async () => new Response("no such session", { status: 404 })) as typeof fetch });
+  const rejected = await wakeOpencode("ses_x", "[mbx] hint", { host: () => "service", service, fetch: (async () => new Response("no such session", { status: 404 })) as typeof fetch });
   assert.equal(rejected.outcome?.kind === "failed" && rejected.outcome.status, 404);
   assert.equal(rejected.ok, false);
 });

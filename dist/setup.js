@@ -874,6 +874,17 @@ const realSpawn: Spawn = (bin, args, input, cb) => {
 };
 const spawnCli: Spawn = (bin, args, input, cb) => ((globalThis as { __mbxSpawn?: Spawn }).__mbxSpawn ?? realSpawn)(bin, args, input, cb);
 
+/** T524: true only when THIS plugin is loaded by the shared OpenCode service process
+ *  (\`opencode serve --service\`): its argv carries --service and not the private --stdio transport
+ *  that every \`opencode --standalone\` TUI's own \`opencode serve --stdio --port 0\` uses. A synthetic
+ *  POST with resume:true to the service for a session a standalone serve hosts makes the service
+ *  start a SECOND agent loop on that session, so outside the service the plugin never calls it (and
+ *  never spawns \`opencode service status\`). globalThis.__mbxArgv is the test seam. */
+const inService = (): boolean => {
+  const argv = (globalThis as { __mbxArgv?: string[] }).__mbxArgv ?? process.argv;
+  return argv.some((a) => a === "--service" || a.startsWith("--service=")) && !argv.includes("--stdio");
+};
+
 /** Inject a note as a queued synthetic user message through the OpenCode service — the same
  *  receipt-verified path the daemon's wake uses (src/wake.ts wakeOpencode: POST
  *  {svc}/api/session/:id/synthetic {text, delivery:"queue", resume:true}). Service URL from
@@ -881,6 +892,7 @@ const spawnCli: Spawn = (bin, args, input, cb) => ((globalThis as { __mbxSpawn?:
  *  ~/.config/opencode/service.json. B1c: no SDK client prompt API is cited for 2.0.23, so the
  *  plugin speaks the endpoint the daemon already proves on every wake. */
 const inject = async (sid: string, text: string): Promise<boolean> => {
+  if (!inService()) return false; // T524: a standalone serve hosts this session — the note waits for the next prompt
   try {
     let status = process.env.MBX_OPENCODE_URL ?? "";
     if (!status) {
