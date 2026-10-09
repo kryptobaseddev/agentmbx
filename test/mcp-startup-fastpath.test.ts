@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { MbxNode } from "../src/node.ts";
 import { Store, withStoreBusyTimeout } from "../src/store.ts";
+import { writeSessionTaint } from "../src/session-taint.ts";
 
 const BIN = join(import.meta.dirname, "../bin/agentmbx.js");
 const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -42,7 +43,7 @@ function fixture(t: TestContext) {
     children.push(child);
     let stderr = "", buffer = "";
     child.stderr.on("data", data => { stderr += data; });
-    type RpcResult = { result?: { tools?: { name: string }[]; structuredContent?: { agent?: string } }; error?: unknown };
+    type RpcResult = { result?: { tools?: { name: string }[]; structuredContent?: { agent?: string; id?: string } }; error?: unknown };
     const pending = new Map<number, { resolve: (result: RpcResult) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
     child.stdout.on("data", data => {
       buffer += data;
@@ -82,7 +83,11 @@ function fixture(t: TestContext) {
     await new Promise<void>((resolve, reject) => { child.stdout.once("data", () => resolve()); child.once("exit", code => reject(new Error(`lock holder exited ${code}`))); });
     return child;
   };
-  return { root, home, start, holdLock };
+  const session = (id: string) => {
+    const dir = join(env.HOME!, ".claude", "sessions"); mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${process.pid}.json`), JSON.stringify({ sessionId: id }));
+  };
+  return { root, home, start, holdLock, session };
 }
 
 test("initialize answers within 500ms during another process's 10s write lock, then startup recovers", { timeout: 25_000 }, async t => {
@@ -148,6 +153,30 @@ test("a busy identity resume retries before serving whoami, without a false unbo
   assert.equal(who.error, undefined, server.stderr());
   assert.equal(who.result?.structuredContent?.agent, "reader", "an early call must wait through resume contention");
   assert.ok(readFileSync(trace, "utf8").trim().split("\n").length >= 2, "identity resume must have retried");
+});
+
+test("an immediate send waits for persisted external taint to be restored during startup", async t => {
+  const f = fixture(t), sessionId = "startup-tainted", root = Date.now(); f.session(sessionId);
+  const store = new Store(f.home);
+  writeSessionTaint(store, { v: 1, cli: "claude", session_id: sessionId, root, from: "scout@alpha", id: "outside-source",
+    how: "declared", relay_depth: [] });
+  store.close();
+  const lock = await f.holdLock(2000), server = f.start(); await server.initialized;
+  const send = server.rpc(2, "tools/call", { name: "mbx_send", arguments: { to: ["reader"], subject: "startup taint",
+    body: "inherited outside content", origin: "agent" } });
+  let answered = false; void send.then(() => { answered = true; }, () => {});
+  await pause(100); assert.equal(answered, false, "send must wait for resume and taint restore");
+  await new Promise<void>(resolve => lock.once("exit", () => resolve()));
+  const result = await send; assert.equal(result.error, undefined, server.stderr());
+  const id = result.result?.structuredContent?.id; assert.ok(id, JSON.stringify(result));
+  const read = new Store(f.home);
+  try {
+    const row = read.db.prepare("SELECT envelope FROM messages WHERE id=?").get(id)!;
+    const envelope = JSON.parse(String(row.envelope));
+    assert.equal(envelope.meta.origin, "external");
+    assert.equal(envelope.meta.external_source, "inherited");
+    assert.equal(envelope.meta.external_since, new Date(root).toISOString());
+  } finally { read.close(); }
 });
 
 test("a current Store opens without a schema write transaction while a writer holds the lock", t => {
