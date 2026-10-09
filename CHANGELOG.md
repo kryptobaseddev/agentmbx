@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **Claude Code installs the status mod as a marketplace plugin (T416):** `agentmbx setup` adds the local marketplace in this package and installs `agentmbx@agentmbx` for the user through `claude plugin`. A second run does nothing when that id already points at this package. A marketplace or plugin of the same name that points somewhere else is left alone. Uninstall removes only that id, and any other plugin record keeps the bytes it had before the CLI ran. The plugin version is the package version. `agentmbx doctor` checks that the plugin is installed and that `claude plugin validate` accepts it.
+- **Claude Code installs the status mod as a marketplace plugin (T416):** `agentmbx setup` adds the local marketplace in this package and installs `agentmbx@agentmbx` for the user through `claude plugin`. A second run does nothing when that id already points at this package. A marketplace or plugin of the same name that points somewhere else is left alone. Uninstall removes only that id, and any other plugin record keeps the bytes it had before the CLI ran. The plugin version is the package version. `agentmbx doctor` checks that the plugin is installed and that `claude plugin validate` accepts it. The npm package now ships `.claude-plugin/` and `plugins/`. The single binary bundles neither, so there setup reports the plugin row as skipped and doctor reports it as info, not as a failure.
 
 ## 0.5.18 (2026-10-09)
 

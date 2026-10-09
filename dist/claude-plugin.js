@@ -15,6 +15,14 @@ export function packageRoot() {
 export function pluginDir(root = packageRoot()) {
     return join(root, "plugins", "claude");
 }
+/** The marketplace and the plugin it lists both ship next to this package (a git or npm install). The single
+ *  executable bundles neither, so there is nothing for `claude plugin marketplace add` to read. */
+export function shipsClaudePlugin(root = packageRoot()) {
+    return existsSync(join(root, ".claude-plugin", "marketplace.json"))
+        && existsSync(join(pluginDir(root), ".claude-plugin", "plugin.json"))
+        && existsSync(join(pluginDir(root), "hooks", "register.js"));
+}
+const NOT_SHIPPED = "this agentmbx install does not ship the Claude plugin files (the single binary bundles none); install agentmbx with npm to get the mod";
 export function execCli(bin, args, opts) {
     const r = spawnSync(bin, args, { cwd: opts.cwd, env: opts.env, encoding: "utf8", timeout: 30_000 });
     return { status: r.status, stdout: String(r.stdout ?? ""), stderr: String(r.stderr ?? "") };
@@ -197,6 +205,8 @@ export function claudePluginStep(home, mode, dryRun, runner, root = packageRoot(
         return { action: "manual", path, note: state.note };
     if (mode === "install" && state.kind === "ours")
         return { action: "unchanged", path, note: `${CLAUDE_PLUGIN_ID} already installed` };
+    if (mode === "install" && !shipsClaudePlugin(root))
+        return { action: "skipped", path, note: NOT_SHIPPED };
     if (mode === "uninstall" && state.kind === "absent")
         return { action: "unchanged", path, note: "Claude plugin not installed" };
     if (dryRun)
@@ -239,6 +249,8 @@ export function claudePluginChecks(home, opts, root = packageRoot()) {
     const fix = "agentmbx setup --only claude";
     if (state.kind === "foreign")
         return [{ level: "info", label: "claude: plugin marketplace is not ours and was left alone" }];
+    if (state.kind === "absent" && !shipsClaudePlugin(root))
+        return [{ level: "info", label: `claude: plugin not installed (${NOT_SHIPPED})` }];
     if (state.kind === "absent" || state.kind === "partial")
         return [{ level: "warn", label: "claude: plugin not installed", fix }];
     const dir = pluginDir(root);

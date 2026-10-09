@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
-import { CLAUDE_PLUGIN_ID, classifyClaudePlugin, claudePluginChecks, claudePluginStep, packageRoot, pluginDir, type CliRunner } from "../src/claude-plugin.ts";
+import { test, type TestContext } from "node:test";
+import { CLAUDE_PLUGIN_ID, classifyClaudePlugin, claudePluginChecks, claudePluginStep, packageRoot, pluginDir, shipsClaudePlugin, type CliRunner } from "../src/claude-plugin.ts";
+import { doctor } from "../src/doctor.ts";
+import { MbxNode } from "../src/node.ts";
 import { parseJsonc } from "../src/jsonc.ts";
 import { runSetup, type SetupCtx } from "../src/setup.ts";
 
@@ -242,4 +244,108 @@ test("T416: setup reports the plugin row and does not spawn claude", () => {
     assert.equal(calls.length, 2);
     assert.equal(calls.every((c) => c[0] === "plugin"), true);
   } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+/** Full HOME/XDG isolation: every home-derived path in this process points into the temp home. */
+function isolate(t: TestContext, home: string): void {
+  const keys = ["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "CLAUDE_CONFIG_DIR"] as const;
+  const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  process.env.HOME = home;
+  process.env.XDG_CONFIG_HOME = join(home, ".config");
+  process.env.XDG_DATA_HOME = join(home, ".local/share");
+  process.env.XDG_STATE_HOME = join(home, ".local/state");
+  process.env.XDG_CACHE_HOME = join(home, ".cache");
+  delete process.env.CLAUDE_CONFIG_DIR;
+  t.after(() => {
+    for (const k of keys) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+}
+
+test("T416: the local marketplace lists plugins/claude and the plugin ships the T415 mod", async () => {
+  const root = packageRoot();
+  assert.equal(shipsClaudePlugin(root), true);
+  const market = JSON.parse(readFileSync(join(root, ".claude-plugin/marketplace.json"), "utf8")) as { name: string; plugins: { name: string; source: string }[] };
+  assert.equal(market.name, "agentmbx");
+  assert.deepEqual(market.plugins.map((p) => [p.name, p.source]), [["agentmbx", "./plugins/claude"]]);
+  assert.equal(`${market.plugins[0].name}@${market.name}`, CLAUDE_PLUGIN_ID);
+  const hooks = JSON.parse(readFileSync(join(pluginDir(root), "hooks/hooks.json"), "utf8")) as { modules: string[] };
+  assert.deepEqual(hooks.modules, ["./register.js"]);
+  const mod = await import(new URL("../plugins/claude/hooks/register.js", import.meta.url).href) as Record<string, unknown>;
+  for (const name of ["register", "renderSections", "bandText", "statusLineText"]) assert.equal(typeof mod[name], "function", name);
+  const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { files: string[] };
+  assert.ok(pkg.files.includes(".claude-plugin") && pkg.files.includes("plugins"), "the npm package ships the marketplace and the plugin");
+});
+
+test("T416: setup wires the plugin idempotently, doctor reports it, uninstall removes only ours", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "t416-e2e-"));
+  isolate(t, home);
+  const before = fixture(home);
+  const mbx = join(home, ".local/share/agentmbx");
+  new MbxNode(mbx, { host: "alpha", port: 1 }).close();
+  const { run, calls } = runner(home);
+  const ctx: SetupCtx = { home, cmd: ["/opt/bin/agentmbx"], which: () => null, useClis: false, runCli: run };
+  const pluginRow = (rows: { item: string; action: string }[]) => rows.find((r) => r.item === "plugin agentmbx@agentmbx");
+
+  const missing = (await doctor(ctx, mbx)).find((c) => /^claude: plugin/.test(c.label));
+  assert.equal(missing?.level, "warn");
+  assert.equal(missing?.fix, "agentmbx setup --only claude");
+
+  assert.equal(pluginRow(runSetup(ctx, { mode: "install", only: ["claude"] }))?.action, "added");
+  const installCalls = calls.length;
+  assert.equal(pluginRow(runSetup(ctx, { mode: "install", only: ["claude"] }))?.action, "unchanged");
+  assert.equal(calls.length, installCalls, "a second setup runs no claude command");
+  const settingsInstalled = readFileSync(join(home, ".claude/settings.json"), "utf8");
+
+  const ok = (await doctor(ctx, mbx)).find((c) => /^claude: plugin/.test(c.label));
+  assert.equal(ok?.level, "ok");
+  assert.equal(ok?.label, "claude: plugin installed and loads (agentmbx@agentmbx)");
+  assert.ok(calls.some((c) => c[1] === "validate" && c[2] === pluginDir()));
+  assert.equal(readFileSync(join(home, ".claude/settings.json"), "utf8"), settingsInstalled, "doctor writes nothing");
+
+  assert.equal(pluginRow(runSetup(ctx, { mode: "uninstall", only: ["claude"] }))?.action, "removed");
+  assert.equal(classifyClaudePlugin(home).kind, "absent");
+  const markets = readFileSync(join(home, ".claude/plugins/known_marketplaces.json"), "utf8");
+  const installed = readFileSync(join(home, ".claude/plugins/installed_plugins.json"), "utf8");
+  assert.equal(raw(markets, [], "cloudflare"), raw(before.markets, [], "cloudflare"));
+  assert.equal(raw(installed, ["plugins"], "cloudflare@cloudflare"), raw(before.installed, ["plugins"], "cloudflare@cloudflare"));
+  assert.equal(pluginRow(runSetup(ctx, { mode: "uninstall", only: ["claude"] }))?.action, "unchanged");
+});
+
+test("T416: a foreign agentmbx@agentmbx plugin record is never overwritten or removed", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "t416-foreign-plugin-"));
+  isolate(t, home);
+  fixture(home);
+  const path = join(home, ".claude/plugins/installed_plugins.json");
+  const text = readFileSync(path, "utf8").replace(`"plugins": {`, `"plugins": {\n    "${CLAUDE_PLUGIN_ID}": [{ "scope": "user", "version": "9.9.9", "installPath": "/opt/someone-else/agentmbx" }],`);
+  writeFileSync(path, text);
+  const { run, calls } = runner(home);
+  for (const mode of ["install", "uninstall"] as const) {
+    const step = claudePluginStep(home, mode, false, run);
+    assert.equal(step.action, "manual", mode);
+    assert.equal(readFileSync(path, "utf8"), text, mode);
+  }
+  assert.equal(calls.length, 0);
+  const check = claudePluginChecks(home, { useClis: true, which: () => "/bin/claude", runCli: run });
+  assert.equal(check[0]?.level, "info");
+});
+
+test("T416: an install without the plugin files skips instead of failing", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "t416-sea-"));
+  isolate(t, home);
+  fixture(home);
+  const bare = join(home, "pkg");
+  mkdirSync(bare, { recursive: true });
+  assert.equal(shipsClaudePlugin(bare), false);
+  const { run, calls } = runner(home);
+  const step = claudePluginStep(home, "install", false, run, bare);
+  assert.equal(step.action, "skipped");
+  assert.match(step.note ?? "", /does not ship the Claude plugin files/);
+  assert.equal(calls.length, 0);
+  assert.equal(claudePluginChecks(home, { useClis: true, which: () => "/bin/claude", runCli: run }, bare)[0]?.level, "info");
+  // a full copy of the shipped files is enough on its own
+  cpSync(join(packageRoot(), ".claude-plugin"), join(bare, ".claude-plugin"), { recursive: true });
+  cpSync(pluginDir(), pluginDir(bare), { recursive: true });
+  assert.equal(shipsClaudePlugin(bare), true);
+  assert.ok(existsSync(join(pluginDir(bare), "hooks/register.js")));
 });
