@@ -52,6 +52,7 @@ import { DEFAULT_LOGIN_BASE_URL, defaultLoginIO, parseLoginBase, runLogin } from
 import { buildIdentityTakeover } from "./identity-takeover.js";
 import { publishIdentityControl, findIdentityControl, identityControlReceipt, resolveIdentityControlReceipt, submitIdentityControl } from "./identity-control.js";
 import { armDaemonSync } from "./sync-daemon.js";
+import { mcpStarting } from "./mcp-startup.js";
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
 
 Start here
@@ -1673,7 +1674,7 @@ async function hook(node, event, cli) {
     const host = cli === "claude" ? detectHost(process.ppid) : null;
     const watch = event === "session-start" && noPush(cli, !!host && (host.channel || host.socket), cli === "kimi" && kimiMultiHost(process.ppid));
     let entered = false;
-    try {
+    const resolveHeld = () => {
         return withProcSnapshot(() => withHookIdentity(node, cli, sid, (agent, descriptor, bootstrap) => {
             entered = true;
             if ((event === "prompt" || event === "session-start") && sid) {
@@ -1850,6 +1851,25 @@ async function hook(node, event, cli) {
                 return;
             }
         }, event === "prompt" || event === "session-start"));
+    };
+    const startupDeadline = Date.now() + 1500;
+    try {
+        for (;;) {
+            try {
+                return resolveHeld();
+            }
+            catch (error) {
+                if (entered || !sid || !["session-start", "prompt"].includes(event) || !mcpStarting(node.home, cli, process.ppid))
+                    throw error;
+                if (Date.now() >= startupDeadline) {
+                    // Still starting is different from an unbound result: don't invite duplicate claims or registrations.
+                    if (cli !== "hermes" || event !== "session-start")
+                        emit(cli, event === "session-start" ? "SessionStart" : "UserPromptSubmit", "[mbx] Mailbox identity is still resuming. Call mbx_whoami and wait for its result before claiming or registering.");
+                    return;
+                }
+                await new Promise(resolve => setTimeout(resolve, 50));
+            }
+        }
     }
     catch (error) {
         // Missing ownership is a quiet hook result, not a provider failure or an invitation to recreate a binding.

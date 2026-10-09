@@ -202,6 +202,7 @@ test("MCP whoami rename ledger failure rolls back the outer held lease transacti
   await client.connect(new StdioClientTransport({ command: process.execPath,
     args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: n.home, MBX_CLI: "claude", MBX_AGENT: "before", MBX_NO_DESKTOP: "1" } as Record<string,string> }));
+  await client.callTool({ name: "mbx_whoami", arguments: {} });
   const e = send(n, ["before"]);
   const lease = n.store.db.prepare("SELECT token,released_at FROM identity_leases WHERE name='before'").get()!;
   const before = grants(n.store);

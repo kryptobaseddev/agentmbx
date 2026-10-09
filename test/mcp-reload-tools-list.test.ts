@@ -22,8 +22,8 @@ test("tools/list refreshed straight from tools/list_changed returns the full cat
   mkdirSync(install);
   for (const path of ["bin", "dist", "package.json"]) cpSync(resolve(path), join(install, path), { recursive: true });
   symlinkSync(resolve("node_modules"), join(install, "node_modules"), "dir");
-  // The catalog the running build registers, read from the installed build itself so the test follows new tools.
-  const registered = [...readFileSync(join(install, "dist/mcp.js"), "utf8").matchAll(/server\.registerTool\("([a-z_]+)"/g)].map(m => m[1]).sort();
+  // Distinct registered names: startup may temporarily register and remove a name before its real tool is installed.
+  const registered = [...new Set([...readFileSync(join(install, "dist/mcp.js"), "utf8").matchAll(/server\.registerTool\("([a-z_]+)"/g)].map(m => m[1]))].sort();
   assert.ok(registered.length > 0, "the installed build must register tools");
 
   const node = new MbxNode(home, { host: "alpha" }), client = new Client({ name: "reload-list-test", version: "1" });
@@ -53,6 +53,7 @@ test("tools/list refreshed straight from tools/list_changed returns the full cat
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(install, "bin/agentmbx.js"), "mcp"], env: env as Record<string, string> }));
 
   const before = (await client.listTools()).tools;
+  assert.equal(before.length, new Set(before.map(tool => tool.name)).size, "the live catalog has no duplicate tool names");
   assert.deepEqual(before.map(tool => tool.name).sort(), registered, "the first connection serves the full catalog");
   assert.equal(catalogChanges, 0, "fresh initialization needs no replacement notification");
   assert.deepEqual(transportEvents, []);

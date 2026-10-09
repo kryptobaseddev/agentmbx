@@ -18,6 +18,7 @@ function fixture(t: TestContext) {
     const c = new Client({ name: "replay-test", version: "1" }); clients.push(c);
     await c.connect(new StdioClientTransport({ command: process.execPath, args: [BIN, "mcp"],
       env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: cli, MBX_AGENT: name, MBX_NO_DESKTOP: "1" } as Record<string,string> }));
+    await c.callTool({ name: "mbx_whoami", arguments: {} });
     return c;
   };
   const send = (body = "mail", to = ["reader"]) => node.send({ from: "sender", to, subject: "replay", body }).envelope;

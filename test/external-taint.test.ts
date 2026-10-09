@@ -34,6 +34,8 @@ async function world(t: { after: (fn: () => Promise<void>) => void }, names: str
     await c.connect(new StdioClientTransport({ command: process.execPath, args: ["--import", preload, join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
       // keep the identity lease valid while the clock moves well past an hour
       env: { ...process.env, AGENTMBX_DEV: "1", MBX_IDENTITY_IDLE_TTL_MS: "21600000", MBX_HOME: home, MBX_CLI: "claude", MBX_AGENT: name, MBX_NO_DESKTOP: "1", MBX_SESSION_SOCKET: "0" } as Record<string, string> }));
+    // This world starts sending between named mailboxes; initialize now precedes their registration.
+    await c.callTool({ name: "mbx_whoami", arguments: {} });
     clients[name] = c;
   }
   t.after(async () => { for (const c of Object.values(clients)) await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });

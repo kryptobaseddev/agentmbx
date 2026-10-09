@@ -28,6 +28,7 @@ async function world(t: { after: (fn: () => Promise<void>) => void }, names: str
     const c = new Client({ name: `depth-${name}`, version: "1" });
     await c.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
       env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "claude", MBX_AGENT: name, MBX_NO_DESKTOP: "1", MBX_SESSION_SOCKET: "0" } as Record<string, string> }));
+    await c.callTool({ name: "mbx_whoami", arguments: {} });
     clients[name] = c;
   }
   t.after(async () => { for (const c of Object.values(clients)) await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });

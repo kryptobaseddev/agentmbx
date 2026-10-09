@@ -1,6 +1,7 @@
 // SQLite store (node:sqlite, WAL). One per host; every mbx process on the host opens it.
 import { DatabaseSync } from "node:sqlite";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { privatePath } from "./private-files.js";
@@ -134,6 +135,30 @@ CREATE TABLE IF NOT EXISTS pair_tokens (  -- one-time pairing tokens (agentmbx p
  * (an old MCP server still running after an upgrade) refuses to write instead of failing with raw SQL errors.
  */
 export const SCHEMA_VERSION = 3;
+const SCHEMA_COLUMNS = [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"]];
+const SCHEMA_OBJECTS = [...SCHEMA.matchAll(/CREATE\s+(?:VIRTUAL\s+)?(?:TABLE|INDEX|TRIGGER)\s+IF NOT EXISTS\s+(\w+)/g)].map(match => match[1]);
+const SCHEMA_DEFINITION = createHash("sha256").update(SCHEMA).update(JSON.stringify(SCHEMA_COLUMNS)).digest("hex");
+const opening = new AsyncLocalStorage();
+/** Startup can yield and retry contention without blocking the transport or leaking a partly constructed node. */
+export function withStoreBusyTimeout(busyTimeoutMs, fn) {
+    return opening.run({ busyTimeoutMs, stores: [] }, () => {
+        try {
+            return fn();
+        }
+        catch (error) {
+            for (const store of opening.getStore().stores)
+                try {
+                    store.close();
+                }
+                catch { /* already closed */ }
+            throw error;
+        }
+    });
+}
+export function isStoreBusy(error) {
+    const e = error;
+    return !!e && (e.code === "SQLITE_BUSY" || e.code === "SQLITE_LOCKED" || (typeof e.errcode === "number" && [5, 6].includes(e.errcode & 255)));
+}
 export class Store {
     db;
     #rawDb;
@@ -186,24 +211,34 @@ export class Store {
         };
         try {
             // Connection-local only: contention can occur even while reading the compatibility marker.
-            this.db.exec("PRAGMA busy_timeout=5000");
+            this.db.exec(`PRAGMA busy_timeout=${opening.getStore()?.busyTimeoutMs ?? 5000}`);
             // Read the compatibility marker before any schema, journal-mode or permission changes.
             this.assertCurrent();
             assertMigrationAllowed();
             privatePath(home, 0o700);
             privatePath(join(home, "mbx.db"), 0o600, false, existed);
-            this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON");
-            this.tx(() => {
-                this.assertCurrent(); // another opener may have migrated while we waited for the write lock
-                assertMigrationAllowed(); // an old opener may instead have initialized a previously empty database
-                this.db.exec(SCHEMA);
-                const configPath = join(home, "config.json");
-                const host = options.host ?? (existsSync(configPath) ? JSON.parse(readFileSync(configPath, "utf8")).host : null);
-                this.localHost = typeof host === "string" && host ? host : null;
-                if (this.schemaVersion() < 3) {
-                    // Legacy order is deterministic, not an assertion about historical receipt ordering.
-                    // Recipient visibility includes ACKed mail. Sender visibility matches MbxNode.canSee.
-                    this.db.prepare(`INSERT OR IGNORE INTO mailbox_visibility (mailbox,message_id)
+            if (this.db.prepare("PRAGMA journal_mode").get().journal_mode !== "wal")
+                this.db.exec("PRAGMA journal_mode=WAL");
+            this.db.exec("PRAGMA foreign_keys=ON");
+            const configPath = join(home, "config.json");
+            const host = options.host ?? (existsSync(configPath) ? JSON.parse(readFileSync(configPath, "utf8")).host : null);
+            this.localHost = typeof host === "string" && host ? host : null;
+            let definitionCurrent = this.schemaVersion() === SCHEMA_VERSION && this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='kv'").get()
+                && this.get("schema-definition") === SCHEMA_DEFINITION;
+            if (definitionCurrent) {
+                // A lost additive index/column still needs repair even when the definition marker survived.
+                const objects = new Set(this.db.prepare("SELECT name FROM sqlite_master").all().map(row => row.name));
+                definitionCurrent = SCHEMA_OBJECTS.every(name => objects.has(name)) && SCHEMA_COLUMNS.every(([table, column]) => this.db.prepare(`PRAGMA table_info(${table})`).all().some(row => row.name === column));
+            }
+            if (!definitionCurrent)
+                this.tx(() => {
+                    this.assertCurrent(); // another opener may have migrated while we waited for the write lock
+                    assertMigrationAllowed(); // an old opener may instead have initialized a previously empty database
+                    this.db.exec(SCHEMA);
+                    if (this.schemaVersion() < 3) {
+                        // Legacy order is deterministic, not an assertion about historical receipt ordering.
+                        // Recipient visibility includes ACKed mail. Sender visibility matches MbxNode.canSee.
+                        this.db.prepare(`INSERT OR IGNORE INTO mailbox_visibility (mailbox,message_id)
             SELECT visible.mailbox,visible.message_id FROM (
               SELECT d.agent mailbox,d.msg_id message_id FROM deliveries d
               UNION
@@ -211,17 +246,18 @@ export class Store {
                 FROM messages m WHERE m.origin='local' OR substr(m.from_addr,instr(m.from_addr,'@')+1)=?
             ) visible JOIN messages m ON m.id=visible.message_id
             ORDER BY m.received_at,m.id,visible.mailbox`).run(this.localHost);
-                }
-                // CREATE TABLE IF NOT EXISTS does not add columns; suppress only confirmed existing columns.
-                for (const [table, column] of [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"]]) {
-                    if (!this.db.prepare(`PRAGMA table_info(${table})`).all().some(r => r.name === column))
-                        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
-                }
-                if (this.schemaVersion() < SCHEMA_VERSION) {
-                    this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-                    this.db.prepare("INSERT OR REPLACE INTO kv (k, v) VALUES ('schema-upgraded-by', ?)").run(version());
-                }
-            });
+                    }
+                    // CREATE TABLE IF NOT EXISTS does not add columns; suppress only confirmed existing columns.
+                    for (const [table, column] of SCHEMA_COLUMNS) {
+                        if (!this.db.prepare(`PRAGMA table_info(${table})`).all().some(r => r.name === column))
+                            this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
+                    }
+                    if (this.schemaVersion() < SCHEMA_VERSION) {
+                        this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+                        this.db.prepare("INSERT OR REPLACE INTO kv (k, v) VALUES ('schema-upgraded-by', ?)").run(version());
+                    }
+                    this.set("schema-definition", SCHEMA_DEFINITION);
+                });
             for (const f of ["mbx.db-wal", "mbx.db-shm"])
                 privatePath(join(home, f), 0o600, true);
         }
@@ -229,6 +265,7 @@ export class Store {
             this.db.close();
             throw e;
         }
+        opening.getStore()?.stores.push(this);
     }
     close() { this.db.close(); }
     schemaVersion() { return this.db.prepare("PRAGMA user_version").get().user_version; }

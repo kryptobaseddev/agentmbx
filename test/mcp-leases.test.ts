@@ -16,6 +16,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} MCP clai
   const transport = new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: cli, MBX_AGENT: "reader", MBX_NO_DESKTOP: "1" } as Record<string, string> });
   await c.connect(transport);
+  await c.callTool({ name: "mbx_whoami", arguments: {} });
   const before = node.store.db.prepare("SELECT * FROM identity_leases WHERE name='reader'").get();
   assert.ok(before, "startup must claim the identity"); assert.equal(before.holder_pid, transport.pid);
   const id = node.send({ from: "sender", to: ["reader"], subject: "pending", body: "preserved" }).envelope.id;
@@ -33,6 +34,7 @@ test("a replaced MCP holder cannot mutate mail or release its successor's lease"
   t.after(async () => { await c.close(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await c.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "claude", MBX_AGENT: "reader", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
+  await c.callTool({ name: "mbx_whoami", arguments: {} });
   const id = node.send({ from: "sender", to: ["reader"], subject: "pending", body: "preserved" }).envelope.id;
   node.store.db.prepare("UPDATE identity_leases SET heartbeat_at=0 WHERE name='reader'").run();
   const successor = new IdentityLeases(node.store).claim("reader", { pid: process.pid, start: inspectLeaseProcess(process.pid).start!, keyFp: fingerprint(generateKeyPair().publicKey), cli: "test", sessionId: "replacement" });
@@ -56,6 +58,7 @@ test("MCP rename conflicts preserve the source generation, binding and pending m
   t.after(async () => { await c.close(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await c.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "claude", MBX_AGENT: "reader", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
+  await c.callTool({ name: "mbx_whoami", arguments: {} });
   const source = node.store.db.prepare("SELECT token FROM identity_leases WHERE name='reader'").get()!.token;
   const id = node.send({ from: "sender", to: ["reader"], subject: "pending", body: "preserved" }).envelope.id;
   const target = new IdentityLeases(node.store).claim("occupied", { pid: process.pid, start: inspectLeaseProcess(process.pid).start!, keyFp: fingerprint(generateKeyPair().publicKey), cli: "test", sessionId: "target" });
