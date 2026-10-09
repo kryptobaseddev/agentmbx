@@ -142,6 +142,7 @@ CREATE TABLE IF NOT EXISTS pair_tokens (  -- one-time pairing tokens (agentmbx p
 export const SCHEMA_VERSION = 3;
 
 const SCHEMA_COLUMNS = [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"]] as const;
+const SCHEMA_OBJECTS = [...SCHEMA.matchAll(/CREATE\s+(?:VIRTUAL\s+)?(?:TABLE|INDEX|TRIGGER)\s+IF NOT EXISTS\s+(\w+)/g)].map(match => match[1]);
 const SCHEMA_DEFINITION = createHash("sha256").update(SCHEMA).update(JSON.stringify(SCHEMA_COLUMNS)).digest("hex");
 const opening = new AsyncLocalStorage<{ busyTimeoutMs: number; stores: Store[] }>();
 
@@ -218,8 +219,14 @@ export class Store {
       const configPath = join(home, "config.json");
       const host = options.host ?? (existsSync(configPath) ? JSON.parse(readFileSync(configPath, "utf8")).host : null);
       this.localHost = typeof host === "string" && host ? host : null;
-      const definitionCurrent = this.schemaVersion() === SCHEMA_VERSION && this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='kv'").get()
+      let definitionCurrent = this.schemaVersion() === SCHEMA_VERSION && this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='kv'").get()
         && this.get("schema-definition") === SCHEMA_DEFINITION;
+      if (definitionCurrent) {
+        // A lost additive index/column still needs repair even when the definition marker survived.
+        const objects = new Set(this.db.prepare("SELECT name FROM sqlite_master").all().map(row => row.name));
+        definitionCurrent = SCHEMA_OBJECTS.every(name => objects.has(name)) && SCHEMA_COLUMNS.every(([table, column]) =>
+          this.db.prepare(`PRAGMA table_info(${table})`).all().some(row => row.name === column));
+      }
       if (!definitionCurrent) this.tx(() => {
         this.assertCurrent(); // another opener may have migrated while we waited for the write lock
         assertMigrationAllowed(); // an old opener may instead have initialized a previously empty database
