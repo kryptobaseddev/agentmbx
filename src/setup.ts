@@ -24,6 +24,12 @@ export const CLIS = ["claude", "codex", "opencode", "kimi", "hermes", "grok"] as
 export type CliId = (typeof CLIS)[number];
 export type Action = "added" | "updated" | "removed" | "unchanged" | "skipped" | "manual" | "error";
 
+// T502: the explicit MCP startup timeout setup writes. Measured cold starts sit close to the harness
+// defaults (OpenCode connects in ~2.2s against a 5000ms default; Claude's p99 is ~4.3s), so every
+// harness whose config format has a real startup-timeout field gets at least this much, written
+// explicitly. Claude's ~/.claude.json and Kimi's mcp.json have no such field and get none.
+export const MCP_STARTUP_TIMEOUT_SEC = 30;
+
 export interface SetupCtx {
   home: string;                              // root that holds .claude, .codex, .config/opencode, ...
   cmd: string[];                             // argv agents run for agentmbx (mcp / hook are appended)
@@ -368,24 +374,43 @@ function grokMcp(cmd: string[]) {
   const lineText = (key: string, w: string) => `${key} = ${JSON.stringify(w)}\n`;
   const argsText = `[${[...cmd.slice(1), "mcp"].map((a) => JSON.stringify(a)).join(", ")}]`;
   const wantCommand = cmd[0], wantArgs = argsText;
-  const sectionText = () => `[mcp_servers.mbx]\n${lineText("command", wantCommand)}args = ${argsText}\nenabled = true\n`;
+  // T502: grok's own schema has startup_timeout_sec (seconds); `grok mcp add` drops the field, so
+  // setup writes and repairs it itself. It goes after `enabled`, the shape `grok mcp add` verifies.
+  const timeoutLine = `startup_timeout_sec = ${MCP_STARTUP_TIMEOUT_SEC}\n`;
+  const sectionText = () => `[mcp_servers.mbx]\n${lineText("command", wantCommand)}args = ${argsText}\nenabled = true\n${timeoutLine}`;
   const ours = (body: string) => grokCommandValue(body) === wantCommand && body.includes(`args = ${wantArgs}`); // exact match (review med 5)
+  /** The section body with an adequate startup timeout: append ours when absent, raise a too-short one. */
+  const withTimeout = (body: string): string => {
+    const m = /(^|\r?\n)([ \t]*startup_timeout_sec[ \t]*=[ \t]*)(\d+)/.exec(body);
+    if (!m) return body.endsWith("\n") ? body + timeoutLine : `${body}\n${timeoutLine}`;
+    return Number(m[3]) >= MCP_STARTUP_TIMEOUT_SEC ? body : body.replace(m[0], `${m[1]}${m[2]}${MCP_STARTUP_TIMEOUT_SEC}`);
+  };
   return {
+    // T502 back-compat: a section an older setup wrote (no startup_timeout_sec) is still wired;
+    // doctor warns about the missing timeout and the next setup run repairs the line.
+    isWired: (cur: string | null) => {
+      if (cur === null) return false;
+      const st = grokMcpState(cur);
+      return st.form === "section" && ours(st.body);
+    },
     install: (cur: string | null) => {
       const st = cur === null ? { form: "absent" as const } : grokMcpState(cur);
       if (st.form === "foreign") return cur;
       if (st.form === "section") {
-        if (!ours(st.body)) {
-          const command = grokCommandValue(st.body);
+        let body = st.body;
+        if (!ours(body)) {
+          const command = grokCommandValue(body);
           // normalize only a stale path of the SAME binary (…/agentmbx); anything else is another
           // tool's mbx — never overwritten (review med 5: agentmbx-fork is not ours)
           if (command !== null && !/(^|\/)agentmbx$/.test(command)) return cur;
           // rewrite ONLY our command/args lines — the user's other keys in the section stay
-          return guarded(cur, (cur ?? "").replace(st.body, () => st.body
-            .replace(/(^|\r?\n)[ \t]*command[ \t]*=[^\n]*(\r?\n)/, (_, p1, p2) => `${p1}command = ${JSON.stringify(wantCommand)}${p2}`)
-            .replace(/(^|\r?\n)[ \t]*args[ \t]*=[^\n]*(\r?\n)/, (_, p1, p2) => `${p1}args = ${wantArgs}${p2}`)));
+          body = body
+            .replace(/(^|\r?\n)[ \t]*command[ \t]*=[^\n]*(\r?\n)/, (_, p1: string, p2: string) => `${p1}command = ${JSON.stringify(wantCommand)}${p2}`)
+            .replace(/(^|\r?\n)[ \t]*args[ \t]*=[^\n]*(\r?\n)/, (_, p1: string, p2: string) => `${p1}args = ${wantArgs}${p2}`);
         }
-        return cur;
+        const nextBody = withTimeout(body);
+        if (nextBody === st.body) return cur;
+        return guarded(cur, (cur ?? "").replace(st.body, () => nextBody));
       }
       const eol = (cur ?? "").includes("\r\n") ? "\r\n" : "\n";
       return guarded(cur, (cur ?? "") + (cur ? eol : "") + sectionText());
@@ -414,6 +439,111 @@ export function grokMcpConfiguredCommand(home: string): string | null {
     const st = grokMcpState(cur);
     return st.form === "section" ? grokCommandValue(st.body) : null;
   } catch { return null; }
+}
+
+// ---- T502/T504: what the harness configs currently hold --------------------------------------
+const entryArgv = (e: unknown): string[] | null => {
+  if (!e || typeof e !== "object") return null;
+  const o = e as { command?: unknown; args?: unknown };
+  if (typeof o.command !== "string") return null;
+  return [o.command, ...(Array.isArray(o.args) ? o.args.filter((a): a is string => typeof a === "string") : [])];
+};
+
+/** The MCP command argv a CLI's config currently holds for mbx, without the trailing "mcp"
+ *  subcommand: [node, script] for what T504's setup writes, [binary] for the older shim/direct
+ *  forms (likewise [node, script] through codex/grok's command+args shape). Null when the config
+ *  is absent, unparsable, or holds no mbx entry. */
+export function mcpConfiguredCmd(home: string, cli: CliId): string[] | null {
+  const raw = ((): string[] | null => {
+    try {
+      if (cli === "claude") return entryArgv((parseObj(read(join(home, ".claude.json"))).mcpServers as Record<string, unknown> | undefined)?.mbx);
+      if (cli === "codex") {
+        const cur = read(join(home, ".codex/config.toml"));
+        if (cur === null) return null;
+        const t = tryParseToml(cur);
+        if (!t) return null;
+        return entryArgv((t.mcp_servers as Record<string, unknown> | undefined)?.mbx);
+      }
+      if (cli === "opencode") {
+        const cur = read(opencodeConfig(home));
+        if (cur === null) return null;
+        const { target } = opencodeMcpContainer(parseJsonc(cur));
+        const e = target && member(target, "mbx")?.value;
+        if (e?.kind !== "object") return null;
+        const v = valueOf(cur, e) as { command?: unknown };
+        return Array.isArray(v?.command) ? v.command.filter((a): a is string => typeof a === "string") : null;
+      }
+      if (cli === "kimi") {
+        const dir = (home === homedir() && process.env.KIMI_CODE_HOME) || join(home, ".kimi-code");
+        const cur = read(join(dir, "mcp.json"));
+        if (cur === null) return null;
+        let obj: unknown;
+        try { obj = JSON.parse(cur); } catch { return null; }
+        return entryArgv((obj as Record<string, unknown> | null)?.mcpServers ? (obj as Record<string, Record<string, unknown>>).mcpServers.mbx : null);
+      }
+      if (cli === "grok") {
+        const dir = (home === homedir() && process.env.GROK_HOME) || join(home, ".grok");
+        const cur = read(join(dir, "config.toml"));
+        if (cur === null) return null;
+        const st = grokMcpState(cur);
+        if (st.form !== "section") return null;
+        const command = grokCommandValue(st.body);
+        if (command === null) return null;
+        const a = /^[ \t]*args[ \t]*=[ \t]*(\[[^\n]*\])/m.exec(st.body)?.[1];
+        let list: unknown = null;
+        if (a) { try { list = JSON.parse(a); } catch { list = null; } } // the JSON flow form setup writes
+        return [command, ...(Array.isArray(list) ? list.filter((x): x is string => typeof x === "string") : [])];
+      }
+      if (cli === "hermes") {
+        const cur = read(hermesConfigPath(home));
+        if (cur === null) return null;
+        const e = hermesMcpParse(cur);
+        return e && e.command !== null ? [e.command, ...(e.args ?? [])] : null;
+      }
+    } catch { return null; }
+    return null;
+  })();
+  return raw && raw[raw.length - 1] === "mcp" ? raw.slice(0, -1) : raw;
+}
+
+/** The explicit MCP startup timeout (seconds) a CLI's config currently holds for mbx — T502's
+ *  doctor check reads exactly this. Null when it is missing or unparseable; claude and kimi have
+ *  no such field in their MCP config shape and always read null (they are never checked). */
+export function mcpConfiguredTimeout(home: string, cli: CliId): number | null {
+  try {
+    if (cli === "codex") {
+      const cur = read(join(home, ".codex/config.toml"));
+      if (cur === null) return null;
+      const t = tryParseToml(cur);
+      if (!t) return null;
+      const v = ((t.mcp_servers as Record<string, unknown> | undefined)?.mbx as { startup_timeout_sec?: unknown } | undefined)?.startup_timeout_sec;
+      return typeof v === "number" ? v : null;
+    }
+    if (cli === "opencode") {
+      const cur = read(opencodeConfig(home));
+      if (cur === null) return null;
+      const { target } = opencodeMcpContainer(parseJsonc(cur));
+      const e = target && member(target, "mbx")?.value;
+      if (e?.kind !== "object") return null;
+      const v = valueOf(cur, e) as { timeout?: unknown };
+      return typeof v?.timeout === "number" ? v.timeout / 1000 : null; // opencode's field is milliseconds
+    }
+    if (cli === "grok") {
+      const dir = (home === homedir() && process.env.GROK_HOME) || join(home, ".grok");
+      const cur = read(join(dir, "config.toml"));
+      if (cur === null) return null;
+      const st = grokMcpState(cur);
+      if (st.form !== "section") return null;
+      const m = /^[ \t]*startup_timeout_sec[ \t]*=[ \t]*(\d+)/m.exec(st.body);
+      return m ? Number(m[1]) : null;
+    }
+    if (cli === "hermes") {
+      const cur = read(hermesConfigPath(home));
+      if (cur === null) return null;
+      return hermesMcpParse(cur)?.connectTimeout ?? null;
+    }
+  } catch { return null; }
+  return null;
 }
 
 /** Grok events the harness runs. PostToolUse is the one whose additionalContext is delivered.
@@ -543,16 +673,13 @@ export function isSea(): boolean {
   try { return (createRequire(import.meta.url)("node:sea") as { isSea(): boolean }).isSea(); } catch { return false; }
 }
 
-/** The argv agents should run: the SEA binary, else a stable agentmbx on PATH (mise/asdf shim first), else node + script. */
+/** The argv agents should run (T504): the SEA binary alone, else the absolute node binary running this
+ *  process plus the absolute, symlink-resolved agentmbx entry script. The mise/asdf shim is deliberately
+ *  not used: a mise upgrade or node pin rewrites or removes the shim and breaks every harness at once,
+ *  while node + script stays valid as long as the install directory does. */
 export function resolveCommand(home = homedir(), which = defaultWhich): string[] {
   if (isSea()) return [process.execPath];
-  const shims = [join(home, ".local/share/mise/shims/agentmbx"), join(home, ".asdf/shims/agentmbx")];
-  const shim = shims.find((p) => existsSync(p));
-  if (shim) return [shim];
-  const onPath = which("agentmbx");
-  if (onPath) return [onPath];
-  const nodeShims = [join(home, ".local/share/mise/shims/node"), join(home, ".asdf/shims/node"), join(home, ".volta/bin/node")];
-  return [nodeShims.find((p) => existsSync(p)) ?? process.execPath, realpathSync(fileURLToPath(new URL("../bin/agentmbx.js", import.meta.url)))];
+  return [process.execPath, realpathSync(fileURLToPath(new URL("../bin/agentmbx.js", import.meta.url)))];
 }
 
 /** macOS: `scutil --get LocalHostName`; elsewhere the short hostname. Lowercased, a-z0-9-. */
@@ -671,9 +798,20 @@ const removeBlock = (text: string, start: number, end: number) => {
 };
 
 function codexServer(cmd: string[]) {
-  const block = [`[mcp_servers.mbx]`, `command = ${JSON.stringify(cmd[0])}`, `args = ${JSON.stringify([...cmd.slice(1), "mcp"]).replace(/","/g, `", "`)}`,
-    `default_tools_approval_mode = "approve"`];
+  const mcpArgs = [...cmd.slice(1), "mcp"];
+  // T502: codex aborts an MCP whose startup exceeds startup_timeout_sec (seconds); write 30 explicitly.
+  const block = [`[mcp_servers.mbx]`, `command = ${JSON.stringify(cmd[0])}`, `args = ${JSON.stringify(mcpArgs).replace(/","/g, `", "`)}`,
+    `default_tools_approval_mode = "approve"`, `startup_timeout_sec = ${MCP_STARTUP_TIMEOUT_SEC}`];
   return {
+    // T502 back-compat: an entry an older setup wrote (no startup_timeout_sec) is still wired; doctor
+    // warns about the missing timeout and the next setup run repairs the line.
+    isWired: (cur: string | null) => {
+      if (cur === null) return false;
+      const t = tryParseToml(cur);
+      if (!t) return false;
+      const e = (t.mcp_servers as Record<string, unknown> | undefined)?.mbx as { command?: unknown; args?: unknown } | undefined;
+      return !!e && e.command === cmd[0] && JSON.stringify(e.args ?? []) === JSON.stringify(mcpArgs);
+    },
     install: (cur: string | null) => {
       const lines = (cur ?? "").split("\n");
       const r = tomlTable(lines, "mcp_servers.mbx");
@@ -1079,24 +1217,39 @@ export function opencodeTuiPlugins(entry: string) {
 }
 
 // ---- OpenCode (JSONC) ------------------------------------------------------------------------
+/** The object that holds servers: mcp.servers (OpenCode 2), or mcp itself when it already holds servers directly (1.x). */
+const opencodeMcpContainer = (root: JNode) => {
+  const mcp = member(root, "mcp")?.value;
+  if (!mcp || mcp.kind !== "object") return { mcp, target: undefined };
+  const servers = member(mcp, "servers")?.value;
+  if (servers?.kind === "object") return { mcp, target: servers };
+  const v1 = mcp.members.some((m) => m.value.kind === "object" && member(m.value, "type"));
+  return { mcp, target: v1 ? mcp : undefined };
+};
+
 function opencodeServer(cmd: string[]) {
-  const desired = { type: "local", command: [...cmd, "mcp"] };
-  const src = `{ "type": "local", "command": [${desired.command.map((s) => JSON.stringify(s)).join(", ")}] }`;
-  /** The object that holds servers: mcp.servers (OpenCode 2), or mcp itself when it already holds servers directly (1.x). */
-  const container = (root: JNode) => {
-    const mcp = member(root, "mcp")?.value;
-    if (!mcp || mcp.kind !== "object") return { mcp, target: undefined };
-    const servers = member(mcp, "servers")?.value;
-    if (servers?.kind === "object") return { mcp, target: servers };
-    const v1 = mcp.members.some((m) => m.value.kind === "object" && member(m.value, "type"));
-    return { mcp, target: v1 ? mcp : undefined };
-  };
+  // T502: opencode's local-server "timeout" (ms) bounds fetching tools at startup — the measured
+  // ~2.2s connect sits close to the 5000ms default, so write 30000 explicitly.
+  const desired = { type: "local", command: [...cmd, "mcp"], timeout: MCP_STARTUP_TIMEOUT_SEC * 1000 };
+  const src = `{ "type": "local", "command": [${desired.command.map((s) => JSON.stringify(s)).join(", ")}], "timeout": ${desired.timeout} }`;
   return {
+    // T502 back-compat: an entry an older setup wrote (no timeout) is still wired; doctor warns and
+    // the next setup run repairs the field.
+    isWired: (cur: string | null) => {
+      if (cur === null) return false;
+      try {
+        const { target } = opencodeMcpContainer(parseJsonc(cur));
+        const e = target && member(target, "mbx")?.value;
+        if (e?.kind !== "object") return false;
+        const v = valueOf(cur, e) as { type?: unknown; command?: unknown };
+        return !!v && typeof v === "object" && v.type === "local" && JSON.stringify(v.command ?? null) === JSON.stringify(desired.command);
+      } catch { return false; }
+    },
     install: (cur: string | null) => {
       const text = cur ?? `{\n  "$schema": "https://opencode.ai/config.json"\n}\n`;
       const root = parseJsonc(text);
       if (root.kind !== "object") throw new Error("expected a JSON object");
-      const { mcp, target } = container(root);
+      const { mcp, target } = opencodeMcpContainer(root);
       let out: string;
       if (!mcp) out = insertMember(text, root, "mcp", `{ "servers": { "mbx": ${src} } }`);
       else if (mcp.kind !== "object") throw new Error(`"mcp" is not an object`);
@@ -1112,7 +1265,7 @@ function opencodeServer(cmd: string[]) {
     uninstall: (cur: string | null) => {
       if (cur === null) return null;
       const root = parseJsonc(cur);
-      const { target } = container(root);
+      const { target } = opencodeMcpContainer(root);
       if (!target || !member(target, "mbx")) return cur;
       const out = removeMember(cur, target, "mbx");
       parseJsonc(out);
@@ -1122,26 +1275,57 @@ function opencodeServer(cmd: string[]) {
 }
 
 // ---- Hermes (YAML, minimal text edit) --------------------------------------------------------
+const hermesIndentOf = (l: string) => /^ */.exec(l)![0].length;
+const hermesTopLevel = (l: string) => /^[^\s#]/.test(l);
+const hermesMcpLocate = (lines: string[]) => {
+  const h = lines.findIndex((l) => /^mcp_servers:\s*(#.*)?$/.test(l) || /^mcp_servers:\s*(\{\s*\}|null|~)\s*$/.test(l));
+  if (h < 0) return null;
+  let end = h + 1; while (end < lines.length && !hermesTopLevel(lines[end])) end++;
+  const firstChild = lines.slice(h + 1, end).find((l) => l.trim() && !l.trim().startsWith("#"));
+  const ind = firstChild ? " ".repeat(hermesIndentOf(firstChild)) : "  ";
+  const mbx = lines.findIndex((l, i) => i > h && i < end && l === `${ind}mbx:`);
+  let mbxEnd = mbx + 1;
+  if (mbx >= 0) while (mbxEnd < end && (!lines[mbxEnd].trim() || hermesIndentOf(lines[mbxEnd]) > ind.length)) mbxEnd++;
+  while (mbx >= 0 && mbxEnd > mbx + 1 && !lines[mbxEnd - 1].trim()) mbxEnd--;
+  return { h, end, ind, mbx, mbxEnd, hasChildren: !!firstChild };
+};
+
+/** The mcp_servers.mbx entry of a Hermes config text as written values (T502/T504 read what is
+ *  configured; a missing block or unparseable lines read as nulls, never guesses). */
+const hermesMcpParse = (cur: string): { command: string | null; args: string[] | null; connectTimeout: number | null } | null => {
+  const lines = cur.split("\n");
+  const r = hermesMcpLocate(lines);
+  if (!r || r.mbx < 0) return null;
+  let command: string | null = null, args: string[] | null = null, connectTimeout: number | null = null;
+  for (let i = r.mbx + 1; i < r.mbxEnd; i++) {
+    const t = linesTrim(lines[i]);
+    const c = /^command:[ \t]*(.*)$/.exec(t);
+    if (c) { command = yamlString(c[1]); continue; }
+    const a = /^args:[ \t]*(\[.*\])[ \t]*(#.*)?$/.exec(t);
+    if (a) { try { const v = JSON.parse(a[1]) as unknown; args = Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : null; } catch { args = null; } continue; }
+    const ct = /^connect_timeout:[ \t]*(\d+)[ \t]*(#.*)?$/.exec(t);
+    if (ct) connectTimeout = Number(ct[1]);
+  }
+  return { command, args, connectTimeout };
+};
+const linesTrim = (l: string) => l.replace(/\r$/, "").trimStart();
+
 function hermesServer(cmd: string[]) {
-  const body = (ind: string) => [`${ind}mbx:`, `${ind}  command: ${JSON.stringify(cmd[0])}`, `${ind}  args: ${JSON.stringify([...cmd.slice(1), "mcp"]).replace(/","/g, `", "`)}`];
-  const indentOf = (l: string) => /^ */.exec(l)![0].length;
-  const topLevel = (l: string) => /^[^\s#]/.test(l);
-  const locate = (lines: string[]) => {
-    const h = lines.findIndex((l) => /^mcp_servers:\s*(#.*)?$/.test(l) || /^mcp_servers:\s*(\{\s*\}|null|~)\s*$/.test(l));
-    if (h < 0) return null;
-    let end = h + 1; while (end < lines.length && !topLevel(lines[end])) end++;
-    const firstChild = lines.slice(h + 1, end).find((l) => l.trim() && !l.trim().startsWith("#"));
-    const ind = firstChild ? " ".repeat(indentOf(firstChild)) : "  ";
-    const mbx = lines.findIndex((l, i) => i > h && i < end && l === `${ind}mbx:`);
-    let mbxEnd = mbx + 1;
-    if (mbx >= 0) while (mbxEnd < end && (!lines[mbxEnd].trim() || indentOf(lines[mbxEnd]) > ind.length)) mbxEnd++;
-    while (mbx >= 0 && mbxEnd > mbx + 1 && !lines[mbxEnd - 1].trim()) mbxEnd--;
-    return { h, end, ind, mbx, mbxEnd, hasChildren: !!firstChild };
-  };
+  const mcpArgs = [...cmd.slice(1), "mcp"];
+  // T502: hermes' per-server connect_timeout (seconds) is the initial-connection/startup knob
+  // (default 60); write it explicitly so a tightened value is visible and doctor-checked.
+  const body = (ind: string) => [`${ind}mbx:`, `${ind}  command: ${JSON.stringify(cmd[0])}`, `${ind}  args: ${JSON.stringify(mcpArgs).replace(/","/g, `", "`)}`, `${ind}  connect_timeout: 60`];
   return {
+    // T502 back-compat: an entry an older setup wrote (no connect_timeout) is still wired; doctor
+    // warns about the missing timeout and the next setup run repairs the line.
+    isWired: (cur: string | null) => {
+      if (cur === null) return false;
+      const e = hermesMcpParse(cur);
+      return !!e && e.command === cmd[0] && JSON.stringify(e.args ?? []) === JSON.stringify(mcpArgs);
+    },
     install: (cur: string | null) => {
       if (cur === null) return null;
-      const lines = cur.split("\n"); const r = locate(lines);
+      const lines = cur.split("\n"); const r = hermesMcpLocate(lines);
       if (!r) return appendBlock(cur, ["mcp_servers:", ...body("  ")].join("\n"));
       const want = body(r.ind);
       if (r.mbx >= 0) {
@@ -1152,10 +1336,10 @@ function hermesServer(cmd: string[]) {
     },
     uninstall: (cur: string | null) => {
       if (cur === null) return null;
-      const lines = cur.split("\n"); const r = locate(lines);
+      const lines = cur.split("\n"); const r = hermesMcpLocate(lines);
       if (!r || r.mbx < 0) return cur;
       lines.splice(r.mbx, r.mbxEnd - r.mbx);
-      const after = locate(lines)!;
+      const after = hermesMcpLocate(lines)!;
       if (!after.hasChildren) return removeBlock(lines.join("\n"), after.h, after.h + 1);
       return lines.join("\n");
     },
