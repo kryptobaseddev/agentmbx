@@ -11,6 +11,7 @@ import { GROK_NO_PUSH, MbxNode, trustLabel } from "./node.ts";
 import { captureWakeIdentity } from "./wake-identity.ts";
 import { policyBrief } from "./policy.ts";
 import { ulid } from "./crypto.ts";
+import { opencodeHostOf, type OpencodeHost } from "./opencode-provider.ts";
 import type { WakeOutcome, WakeReceipt } from "./wake-contract.ts";
 import type { MessageRow } from "./store.ts";
 
@@ -100,8 +101,20 @@ export async function opencodeService(): Promise<{ url: string; auth: string } |
   } catch { return null; }
 }
 
-export async function wakeOpencode(sessionId: string, text: string, o: { recheck?: () => boolean; service?: typeof opencodeService; fetch?: Fetch } = {}): Promise<WakeResult> {
+/** T524: why a session that the shared service does not host is never pushed through it. */
+export const OPENCODE_STANDALONE_NO_PUSH = "session is hosted by a standalone OpenCode serve; the shared service would start a duplicate agent loop (next-prompt delivery only)";
+
+/** Push a wake into an OpenCode session through the shared service's synthetic endpoint — ONLY when
+ *  that service is the process hosting the session (`pid` is the binding's recorded provider pid).
+ *  T524: for a session hosted by a standalone/private serve (`opencode --standalone` spawns
+ *  `opencode serve --stdio`), resume:true makes the service start a second agent loop on the same
+ *  session, so that case — and an unknown host — is not_submitted/no-target with no service call. */
+export async function wakeOpencode(sessionId: string, text: string, o: { recheck?: () => boolean; service?: typeof opencodeService; fetch?: Fetch;
+  pid?: number | null; host?: (pid: number | null | undefined) => OpencodeHost } = {}): Promise<WakeResult> {
   const via = "opencode synthetic";
+  const host = (o.host ?? opencodeHostOf)(o.pid);
+  if (host !== "service") return outcome(via, { kind: "not_submitted", reason: "no-target", detail: host === "standalone" ? OPENCODE_STANDALONE_NO_PUSH
+    : "the OpenCode process hosting this session is unknown; not pushing through the shared service, which could start a duplicate agent loop" });
   const svc = await (o.service ?? opencodeService)();
   if (!svc) return outcome(via, { kind: "not_submitted", reason: "unavailable" }, "opencode service not running");
   if (o.recheck && !o.recheck()) return outcome(via, { kind: "not_submitted", reason: "fenced" }, "wake authority changed");
@@ -412,7 +425,7 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
       const marker = { attemptId: ulid(), agent, messageIds: automatic.map((r) => r.id), sessionId: s.session_id, at: new Date(now).toISOString() };
       node.store.set(attemptKey(agent), JSON.stringify(marker)); // durable before the native write (WC-14)
       if (s.cli === "codex") result = await wakeCodex(s.session_id, text, { recheck });
-      else if (s.cli === "opencode") result = await wakeOpencode(s.session_id, text, { recheck });
+      else if (s.cli === "opencode") result = await wakeOpencode(s.session_id, text, { recheck, pid: s.pid });
       else if (s.cli === "kimi") result = kimiDesktop(s.pid) ? await wakeKimiDesktop(s, text, { recheck }) : await wakeKimi(s, text, { recheck });
       else if (s.cli === "grok") result = await wakeGrok(s.session_id, text, { recheck });
       else continue;
