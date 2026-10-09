@@ -37,11 +37,12 @@ import { connectorKey } from "./diagnostics.ts";
 import { catchupHint, catchupUnchanged, commitCatchup, ensureCatchup, missedCount, moveCatchup, readCatchup, restartCatchup, CATCHUP_FILTER } from "./catchup.ts";
 import { encodeReplayFrame, replayMaximum } from "./replay.ts";
 import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wake.ts";
+import { isStoreBusy, withStoreBusyTimeout } from "./store.ts";
 
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
 It is shared by AI coding agents on this machine and on paired machines. Your user set it up so agents can coordinate;
 replying, answering questions, sharing status and acking are always fine.
-On startup or resume, call mbx_whoami. If it shows no identity (\`agent: null\`), claim or register one with mbx_identity (its \`next\` field and
+On startup or resume, call mbx_whoami first for your current mailbox identity and owner-signed policies. If it shows no identity (\`agent: null\`), claim or register one with mbx_identity (its \`next\` field and
 {"action":"list"} say how) before any other mailbox tool; once it shows yours, call mbx_inbox for pending work. For historical context, optionally
 use mbx_replay with your saved cursor in bounded pages; stop and retain the cursor if your catch-up budget ends.
 Save next_cursor only after durably capturing page information or retrievable message IDs in session/project-approved
@@ -438,12 +439,59 @@ export const externalWarning = (origin: "agent" | "external" | undefined, taint:
 };
 
 export async function runMcp(existing?: MbxNode) {
+  // Transport initialization must not need a database, process inspection, or an identity lease.
+  // Channel support is a server capability; whether this session uses it is detected after initialize.
+  const server = new McpServer({ name: "mbx", version: version() }, {
+    instructions: INSTRUCTIONS,
+    capabilities: { experimental: { "claude/channel": {} } },
+  });
+  const transport = new StdioServerTransport();
+  let resolveReady!: () => void;
+  const ready = new Promise<void>(resolve => { resolveReady = resolve; });
+  let startupError: unknown;
+  // Initialize and ping are already registered by the SDK. Only later catalog/mailbox requests wait.
+  const setRequestHandler = server.server.setRequestHandler.bind(server.server);
+  server.server.setRequestHandler = (schema, handler) => setRequestHandler(schema, async (request, extra) => {
+    await ready;
+    if (startupError) throw startupError;
+    return handler(request, extra);
+  });
+  // Install the SDK's lazy catalog handlers before connect, using public registration/removal APIs.
+  // Their maps remain live, so the first tools/list sees the complete catalog after setup, never placeholders.
+  server.registerTool("mbx_whoami", { inputSchema: {} }, () => text("")).remove();
+  server.registerResource("agentmbx-guide", "mbx://guide", {}, () => ({ contents: [] })).remove();
+  server.registerPrompt("mbx_guide", {}, () => ({ messages: [] })).remove();
+  let closed = false, resolveInitialized!: () => void;
+  const initialized = new Promise<void>(resolve => { resolveInitialized = resolve; });
+  const stopStartup = () => { closed = true; resolveInitialized(); };
+  server.server.onclose = stopStartup;
+  process.stdin.once("end", stopStartup);
+  server.server.oninitialized = () => setImmediate(resolveInitialized);
+  await server.connect(transport);
+  // A re-exec takes over an already initialized client, which will not send initialized a second time.
+  if (process.env[REEXEC_ENV]) resolveInitialized();
+  await initialized;
+  if (closed) { resolveReady(); return; }
   let node: MbxNode;
   if (existing) node = existing;
   else {
-    try { node = new MbxNode(); }
-    catch (e) { reloadFromDisk(e); throw e; }
+    for (;;) {
+      try { node = withStoreBusyTimeout(0, () => new MbxNode()); break; }
+      catch (error) {
+        if (!isStoreBusy(error)) {
+          startupError = error; resolveReady(); reloadFromDisk(error); throw error;
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
+        if (closed) { resolveReady(); return; }
+      }
+    }
   }
+  try { await configureMcp(server, node, () => closed); }
+  catch (error) { startupError = error; node.close(); throw error; }
+  finally { process.stdin.off("end", stopStartup); resolveReady(); }
+}
+
+async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () => boolean) {
   // the project this session works in (not the home folder), stamped on what it sends and recorded per identity
   let project = projectOf(process.cwd()); // a hosted conversation moves it to its own folder when it links (bind ticket)
   const env = detectHost();
@@ -794,6 +842,7 @@ export async function runMcp(existing?: MbxNode) {
       const co = coUseError(error);
       if (co) { adoptCoUse(state, co); return true; }
       Object.assign(state, before.leaseToken ? before : { agent: "", leaseToken: undefined, coUse: undefined });
+      if (isStoreBusy(error)) throw error;
       if (o.explicit) throw error;
       const code = (error as { code?: string }).code;
       if (code === "IDENTITY_IN_USE") for (const n of ambiguousLegacy) node.store.set(`identity-conflict:${n}`, JSON.stringify({ reason: "ambiguous legacy sessions", at: new Date().toISOString() }));
@@ -870,15 +919,25 @@ export async function runMcp(existing?: MbxNode) {
     resume(state, name);
   };
   const initial = parentAgent ?? launch ?? rememberedName(base);
-  try {
-    if (base.released) prepareState(base, undefined, () => publishControl(base));
-    // bind() prepares its own process evidence once: an outer preparation would re-read bindings after a concurrent change.
-    else if (initial) resume(base, initial, { launch: !parentAgent && !!launch });
-  } catch (error) {
-    // Keep the tools reachable: the session stays unbound with the name pending, never on a substitute name.
-    base.agent = ""; base.leaseToken = undefined; base.pending = initial ?? undefined; base.pendingReason = (error as Error).message;
-    process.stderr.write(`[mbx] could not resume ${initial}: ${(error as Error).message}\n`);
+  for (;;) {
+    try {
+      if (base.released) prepareState(base, undefined, () => publishControl(base));
+      // bind() prepares its own process evidence once: an outer preparation would re-read bindings after a concurrent change.
+      else if (initial) resume(base, initial, { launch: !parentAgent && !!launch });
+      break;
+    } catch (error) {
+      if (isStoreBusy(error)) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        if (startupClosed()) { node.close(); return; }
+        continue;
+      }
+      // Keep the tools reachable: the session stays unbound with the name pending, never on a substitute name.
+      base.agent = ""; base.leaseToken = undefined; base.pending = initial ?? undefined; base.pendingReason = (error as Error).message;
+      process.stderr.write(`[mbx] could not resume ${initial}: ${(error as Error).message}\n`);
+      break;
+    }
   }
+  node.store.db.exec("PRAGMA busy_timeout=5000");
   // An unbound session stays reachable for the owner's CLI (identity claim/takeover --cli --session).
   if (!bound(base) && !base.released) try { prepareState(base, undefined, () => publishControl(base)); } catch { /* evidence unavailable: retried by later binds */ }
   const contextFor = (extra: unknown): State => {
@@ -970,22 +1029,16 @@ export async function runMcp(existing?: MbxNode) {
   };
   /** Opening mail marks the reader's own copies read (delivered/notified → read; never past acked), for sender receipts (T207). */
   const markRead = (rows: { id: string }[], agent: string) => { for (const r of rows) node.setDelivery(r.id, agent, "read"); };
-  const agent = base.agent;
-  // Initialization belongs to the transport, before per-call metadata identifies its thread.
-  // Never present the provisional mailbox's identity or policy as authority for every caller.
-  const shared = env.cli === "codex" || env.cli === "opencode";
-  const unboundNote = !shared && !agent
-    ? (base.pending
-      ? `[mbx] This session's identity ${base.pending} is held by another session (${base.pendingReason}); it resumes automatically once that holder ends. If you will message other agents: call mbx_identity {"action":"list"} for this project's agents (role, live or offline, unread), then claim yours or register one with a name and role. Never invent a random name.`
-      : formatUnboundStart(node.home, project).split("\n").map(line => `[mbx] ${line}`).join("\n"))
-    : null;
-  const delegation = shared
-    ? "[mbx] This transport can serve multiple sessions. Call mbx_whoami for your current mailbox identity and owner-signed policies. Read each mbx_read header for the policy that applies to that message; another mailbox's grant does not authorize this session."
-    : agent ? delegationNote(node.store.db, agent, node.host) : null;
-  // T158: dedicated sessions get the bounded catch-up hint; shared transports read `missed` from handoff/whoami instead.
-  const catchupNote = agent && !shared ? catchupHint(node.store, agent) : null;
-  const extra = [unboundNote, delegation, catchupNote, agent && noPush(env.cli, env.channel || env.socket, hosted)
-    ? selfWatchInstruction({ delegated: activePolicies(node.store.db, agent, node.host).length > 0, cli: env.cli }) : null].filter(Boolean).join("\n");
+  // Identity and policy notes belong to the ready caller, never the transport's provisional mailbox.
+  const sessionNotes = (state: State): string => {
+    if (!bound(state)) return "";
+    const shared = env.cli === "codex" || env.cli === "opencode";
+    return [delegationNote(node.store.db, state.agent, node.host),
+      !shared ? catchupHint(node.store, state.agent) : null,
+      noPush(env.cli, env.channel || env.socket, hosted)
+        ? selfWatchInstruction({ delegated: activePolicies(node.store.db, state.agent, node.host).length > 0, cli: env.cli }) : null]
+      .filter(Boolean).join("\n");
+  };
 
   /** Why an ordinary mailbox tool can't run yet, and the exact next step (R1.4). */
   const unboundMessage = (state: State): string => {
@@ -1014,10 +1067,6 @@ export async function runMcp(existing?: MbxNode) {
     return { priv: key.privateKey, pub: key.publicKey, grant: row ? JSON.parse(row.grant) as Grant : null };
   };
 
-  const server = new McpServer({ name: "mbx", version: version() }, {
-    instructions: extra ? `${INSTRUCTIONS}\n${extra}` : INSTRUCTIONS,
-    capabilities: env.channel ? { experimental: { "claude/channel": {} } } : {},
-  });
   // every tool first checks that a newer agentmbx hasn't upgraded the store or the build under this server
   const boot = codeFingerprint();
   const detachedForReload = (): DetachedReload => {
@@ -1123,6 +1172,10 @@ export async function runMcp(existing?: MbxNode) {
         const result = withProcSnapshot(() => name === "mbx_whoami" ? prepareState(state, target, invoke) : invoke());
         if (result && typeof result === "object" && receiptResult in result)
           return withProcSnapshot((result as ReturnType<typeof afterLease>)[receiptResult]);
+        if ((name === "mbx_whoami" || name === "mbx_inbox") && result && typeof result === "object") {
+          const notes = sessionNotes(state);
+          if (notes) (result as ReturnType<typeof text>).content.push({ type: "text", text: notes });
+        }
         return result;
       } catch (e) { Object.assign(state, before); throw e; }
     });
@@ -1565,7 +1618,6 @@ export async function runMcp(existing?: MbxNode) {
     description: "Load the AgentMBX guide for this version: how to read, answer, address and coordinate with other agents.",
   }, () => ({ messages: [{ role: "user" as const, content: { type: "text" as const, text: guide() } }] }));
 
-  const transport = new StdioServerTransport();
   const timers: ReturnType<typeof setInterval>[] = [];
   let closed = false;
   const retire = () => {
@@ -1596,7 +1648,6 @@ export async function runMcp(existing?: MbxNode) {
   // A provider that ends its servers with a signal (claude -p, a closed terminal) releases the identity cleanly instead
   // of leaving a dead holder to expire. SIGINT is left alone: a terminal's Ctrl-C interrupts a turn, not the session.
   for (const [signal, code] of [["SIGTERM", 143], ["SIGHUP", 129]] as const) process.once(signal, () => { retire(); process.exit(code); });
-  try { await server.connect(transport); } catch (e) { retire(); throw e; }
   if (closed) return;
   // The reused client does not initialize again. Registration happened before
   // connection, so announce the replacement catalog on this live transport.

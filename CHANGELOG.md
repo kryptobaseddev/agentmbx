@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **MCP connects before mailbox startup (T501):** `initialize` and `ping` answer while SQLite is busy. Mailbox tools wait for identity setup, retry startup lock contention, and then report the caller's signed policy through `mbx_whoami` and `mbx_inbox`. Current stores open without repeating the schema write transaction.
+
 ## 0.5.19 (2026-10-09)
 
 The Claude Code status mod installs with setup: `agentmbx setup` adds the package's local marketplace and installs the `agentmbx@agentmbx` plugin, doctor checks it, and foreign plugins are never touched.
