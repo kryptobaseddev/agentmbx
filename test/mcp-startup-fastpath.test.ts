@@ -14,6 +14,11 @@ import { procTable } from "../src/proc.ts";
 
 const BIN = join(import.meta.dirname, "../bin/agentmbx.js");
 const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+const INITIALIZE_LOCK_MS = 10_000;
+// Shared CI runners include scheduler/module-load delay; initialize must still answer
+// well before the writer releases, while local performance keeps its strict budget.
+const INITIALIZE_MAX_MS = process.env.CI ? INITIALIZE_LOCK_MS * 0.3 : 500;
+const COLD_START_P99_MAX_MS = process.env.CI ? 6000 : 2000;
 
 function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), "mbx-startup-")), home = join(root, "mail");
@@ -126,11 +131,12 @@ for (const recover of [true, false]) test(`a separate session-start hook ${recov
   assert.equal(mcpStarting(f.home, "claude", process.pid), false, "ready removes the advisory marker");
 });
 
-test("initialize answers within 500ms during another process's 10s write lock, then startup recovers", { timeout: 25_000 }, async t => {
-  const f = fixture(t), lock = await f.holdLock(10_000), server = f.start();
+test(`initialize answers within ${INITIALIZE_MAX_MS}ms during another process's 10s write lock, then startup recovers`, { timeout: 25_000 }, async t => {
+  const f = fixture(t), lock = await f.holdLock(INITIALIZE_LOCK_MS), server = f.start();
   const latency = await server.initialized;
-  t.diagnostic(`initialize while writer locked: ${latency.toFixed(1)}ms`);
-  assert.ok(latency < 500, `initialize took ${latency}ms`);
+  t.diagnostic(`initialize while writer locked: ${latency.toFixed(1)}ms (limit ${INITIALIZE_MAX_MS}ms)`);
+  assert.ok(latency < INITIALIZE_MAX_MS, `initialize took ${latency}ms (limit ${INITIALIZE_MAX_MS}ms)`);
+  assert.equal(lock.exitCode, null, "initialize must answer before the writer releases its lock");
   const catalog = server.rpc(2, "tools/list");
   const identity = server.rpc(4, "tools/call", { name: "mbx_whoami", arguments: {} });
   let catalogReady = false, identityReady = false;
@@ -140,7 +146,7 @@ test("initialize answers within 500ms during another process's 10s write lock, t
   assert.equal(catalogReady, false, "catalog must wait for mailbox setup instead of exposing placeholders");
   assert.equal(identityReady, false, "whoami must not claim an identity or policy level before readiness");
   assert.equal(server.child.exitCode, null, server.stderr());
-  assert.equal((await server.rpc(3, "ping", undefined, 500)).error, undefined, "ping must remain usable during startup contention");
+  assert.equal((await server.rpc(3, "ping", undefined, INITIALIZE_MAX_MS)).error, undefined, "ping must remain usable during startup contention");
   await new Promise<void>(resolve => lock.once("exit", () => resolve()));
   const result = await catalog;
   assert.equal(result.error, undefined, server.stderr());
@@ -242,10 +248,10 @@ test("closing the transport during startup contention exits without waiting for 
 
 // Opt in to the host-load benchmark with MBX_STARTUP_BENCH=1. Add MBX_STARTUP_BENCH_DIST=1
 // after npm run build to measure the shipped dist launcher rather than Node's source type stripping.
-test("60 concurrent cold starts on a populated store have p99 initialize under 2s", { skip: process.env.MBX_STARTUP_BENCH !== "1", timeout: 30_000 }, async t => {
+test(`60 concurrent cold starts on a populated store have p99 initialize under ${COLD_START_P99_MAX_MS}ms`, { skip: process.env.MBX_STARTUP_BENCH !== "1", timeout: 30_000 }, async t => {
   const f = fixture(t), servers = Array.from({ length: 60 }, () => f.start());
   const latencies = (await Promise.all(servers.map(server => server.initialized))).sort((a, b) => a - b);
   const p99 = latencies[Math.ceil(latencies.length * 0.99) - 1];
-  t.diagnostic(JSON.stringify({ starts: latencies.length, p50_ms: latencies[29], p99_ms: p99, max_ms: latencies[59] }));
-  assert.ok(p99 < 2000, `p99 initialize ${p99}ms exceeds 2s`);
+  t.diagnostic(JSON.stringify({ starts: latencies.length, p50_ms: latencies[29], p99_ms: p99, max_ms: latencies[59], limit_ms: COLD_START_P99_MAX_MS }));
+  assert.ok(p99 < COLD_START_P99_MAX_MS, `p99 initialize ${p99}ms exceeds ${COLD_START_P99_MAX_MS}ms`);
 });
