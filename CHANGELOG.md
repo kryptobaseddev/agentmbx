@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Documentation only (T523 docs):
+
+- **docs/INSTALL.md and the new docs/OPENCODE.md document the T504 MCP command form, the T502 startup timeouts, and OpenCode's two run modes:** setup registers the `mbx` MCP server as the absolute node binary plus the absolute, symlink-resolved `agentmbx` entry script (the mise/asdf shim is deliberately not used), and doctor fails the row when that path is gone or resolves a different version. INSTALL.md's per-harness MCP examples now carry the explicit startup timeout each format supports — codex and grok `startup_timeout_sec = 30`, opencode `"timeout": 30000` (milliseconds), hermes `connect_timeout: 60`; Claude and Kimi have no such field and get none, and doctor's warning-plus-repair for a missing or short timeout is documented. The new OPENCODE.md explains `opencode --standalone` (a private `opencode serve --stdio` per session) versus the shared `opencode serve --service`, why notes and wakes are pushed only into service-hosted sessions (T524: the service API is the only injection channel, and posting to it for a standalone-hosted session would start a duplicate agent loop), and that standalone sessions receive mail on their next prompt until T518/T519.
+
 ## 0.5.19 (2026-10-09)
 
 The Claude Code status mod installs with setup: `agentmbx setup` adds the package's local marketplace and installs the `agentmbx@agentmbx` plugin, doctor checks it, and foreign plugins are never touched.
