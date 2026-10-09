@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **MCP connects before mailbox startup (T501):** `initialize` and `ping` answer while SQLite is busy. Mailbox tools wait for identity setup, retry startup lock contention, and then report the caller's signed policy through `mbx_whoami` and `mbx_inbox`. Current stores open without repeating the schema write transaction. Separate-process hooks briefly wait for a resuming MCP before offering identity recovery, and build handover keeps its single catalog-change notification.
+- **OpenCode's provider walk stops at a directory boundary (T482).** `opencodeProviderPid` still climbs at most 16 `node` or `bun` parents, and a process named `opencode` still counts, including a compiled binary. It returns null instead of following a `node` or `bun` parent whose executable is in a different directory. A runtime in the same directory still counts, so a mise or Homebrew layout that shares a directory still resolves. A name with no `/` has no known directory, so a bare `node` proxy is not a boundary and a full-path reload generation under it still reaches `opencode`. Each pid is read once. macOS reads the whole chain with one `ps`.
 
 ## 0.5.19 (2026-10-09)
 
