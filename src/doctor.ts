@@ -2,18 +2,19 @@
 import { rotationLog } from "./key-rotation.ts";
 import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { phantomMailboxes, returnDays } from "./stranded.ts";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fingerprint } from "./crypto.ts";
 import { signHop } from "./http.ts";
 import { relayState, ROLLBACK_REASON } from "./relay-v2.ts";
 import { kimiHostedServer, kimiInstances } from "./kimi-web.ts";
 import { opencodeService } from "./wake.ts";
+import { opencodeHostClassifier, type OpencodeHost } from "./opencode-provider.ts";
 import { kimiDesktop } from "./kimi-desktop.ts";
 import { version } from "./version.ts";
 import { GROK_NO_PUSH, MbxNode, RETRY_HOURS } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
 import { claudePluginChecks } from "./claude-plugin.ts";
-import { detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConsent, skillDest, skillStatus, statuslineConfiguredCommand, statuslineForms, statuslineState, wired, type SetupCtx } from "./setup.ts";
+import { detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConsent, mcpConfiguredCmd, mcpConfiguredTimeout, skillDest, skillStatus, statuslineConfiguredCommand, statuslineForms, statuslineState, wired, type CliId, type SetupCtx } from "./setup.ts";
 import { mailboxLiveness } from "./receipts.ts";
 import { liveWatcher } from "./wake.ts";
 import { findIdentityControl, listIdentityControls } from "./identity-control.ts";
@@ -263,17 +264,23 @@ function hourlyOpencodeEviction(events: LeaseEvent[]): boolean {
  *  and grok are replace-only — `command` replaces the footer and never renders alongside the user's
  *  other keys. opencode has no custom status line feature at all (built-in segments only), so the
  *  honest result is an explicit skip note, not a check against an invented config path. */
-/** T391: the OpenCode service is the wake path for every opencode mailbox — when one is bound,
- *  doctor proves the service answers and says how to start it when it does not. A warn never
- *  fails doctor (the T435 rule for separate per-CLI functions). Unbound hosts stay silent. */
-export async function opencodeServiceCheck(node: MbxNode, service: () => Promise<{ url: string; auth: string } | null> = opencodeService): Promise<Check | null> {
-  const bound = node.store.db.prepare("SELECT agent FROM sessions WHERE cli='opencode' AND session_id NOT LIKE 'mcp-%'").all() as { agent: string }[];
+/** T391/T524: the shared OpenCode service is the push-wake path only for sessions it hosts itself.
+ *  Sessions hosted by a standalone serve (`opencode --standalone` → `opencode serve --stdio`) are
+ *  never pushed through the service (it would start a duplicate agent loop): they get mail on their
+ *  next prompt. Doctor counts both and proves the service answers when a service-hosted session is
+ *  bound. A warn never fails doctor (the T435 rule). Unbound hosts stay silent. */
+export async function opencodeServiceCheck(node: MbxNode, service: () => Promise<{ url: string; auth: string } | null> = opencodeService,
+  host: (pid: number | null) => OpencodeHost = opencodeHostClassifier()): Promise<Check | null> {
+  const bound = node.store.db.prepare("SELECT agent, pid FROM sessions WHERE cli='opencode' AND session_id NOT LIKE 'mcp-%'").all() as { agent: string; pid: number | null }[];
   if (!bound.length) return null;
+  const hosted = bound.filter((b) => host(b.pid) === "service").length, standalone = bound.length - hosted;
+  const rest = standalone ? `${standalone} binding(s) in a standalone OpenCode serve (or unknown host): no push wake yet, next-prompt delivery only` : "";
+  if (!hosted) return { level: "info", label: `opencode: ${rest}` };
   const svc = await service().catch(() => null);
-  if (svc) return { level: "ok", label: `opencode: service reachable (${svc.url}) — wake path for ${bound.length} bound mailbox(es)` };
+  if (svc) return { level: "ok", label: `opencode: service reachable (${svc.url}) — wake path for ${hosted} service-hosted mailbox binding(s)${rest ? `; ${rest}` : ""}` };
   return {
     level: "warn",
-    label: "opencode: service not reachable, so bound OpenCode mailboxes cannot be woken",
+    label: `opencode: service not reachable, so ${hosted} service-hosted OpenCode binding(s) cannot be woken${rest ? `; ${rest}` : ""}`,
     fix: "run any opencode command (or `opencode service start`) so the service API comes up; config: ~/.config/opencode/service.json",
   };
 }
@@ -297,6 +304,66 @@ export function hermesHooksChecks(ctx: SetupCtx): Check[] {
     fix: "fix or remove that file, then: agentmbx setup --only hermes   (or approve them with `hermes hooks list`)" }];
   return [{ level: "warn", label: `hermes: hooks are wired but not approved (${c.missing.join(", ")}), so Hermes skips them`,
     fix: "agentmbx setup --only hermes   (writes the approvals), or set hooks_auto_accept: true in ~/.hermes/config.yaml" }];
+}
+
+/** The CLIs whose MCP config format has a real startup-timeout field (T502). Claude's ~/.claude.json
+ *  and Kimi's mcp.json have none, so setup writes (and doctor checks) a timeout only for these. */
+const TIMEOUT_CLIS: CliId[] = ["codex", "opencode", "hermes", "grok"];
+/** T502: the minimum explicit startup timeout setup writes and doctor accepts (seconds). */
+export const MCP_STARTUP_TIMEOUT_MIN_SEC = 30;
+
+/** T502: a wired MCP entry should carry the explicit startup timeout setup writes (>= 30s; codex and
+ *  grok startup_timeout_sec, opencode timeout in ms, hermes connect_timeout). A config an older setup
+ *  wrote has none: a warning row, never a fail — the next `agentmbx setup` repairs the line. Silent
+ *  until the entry is wired (the generic row already says not wired) and for CLIs with no such field. */
+export function mcpTimeoutChecks(ctx: SetupCtx, cli: CliId): Check[] {
+  if (!TIMEOUT_CLIS.includes(cli)) return [];
+  const mcp = edits(ctx, cli).find((e) => e.kind === "mcp");
+  if (!mcp || !wired(mcp)) return [];
+  const fix = `agentmbx setup --only ${cli}`;
+  const secs = mcpConfiguredTimeout(ctx.home, cli);
+  if (secs === null) return [{ level: "warn", label: `${cli}: MCP startup timeout is not set`, fix }];
+  if (secs < MCP_STARTUP_TIMEOUT_MIN_SEC) return [{ level: "warn", label: `${cli}: MCP startup timeout is ${secs}s (< ${MCP_STARTUP_TIMEOUT_MIN_SEC}s)`, fix }];
+  return [];
+}
+
+/** The nearest package.json walking up from `dir` (null when none or it has no version string). T504
+ *  version-checks a configured agentmbx script without executing anything. */
+function packageVersionAt(dir: string): string | null {
+  let cur = dir;
+  for (;;) {
+    const p = join(cur, "package.json");
+    if (existsSync(p)) {
+      try {
+        const v = (JSON.parse(readFileSync(p, "utf8")) as { version?: unknown }).version;
+        return typeof v === "string" ? v : null;
+      } catch { return null; }
+    }
+    const parent = dirname(cur);
+    if (parent === cur) return null;
+    cur = parent;
+  }
+}
+
+/** T504: what setup writes is [node, script, "mcp"]. Fail when the node binary or the script path no
+ *  longer exists, or when the script's package version differs from this install (a stale path, or a
+ *  second older install the harness would actually start). Bare-binary and shim forms (older setups,
+ *  and the SEA single binary) are resolved by the harness on its own PATH or are not version-checkable
+ *  here, so they stay silent — grok's single-path check (T384) already covers its missing-path case. */
+export function mcpCommandChecks(ctx: SetupCtx, cli: CliId): Check[] {
+  const mcp = edits(ctx, cli).find((e) => e.kind === "mcp");
+  if (!mcp || !wired(mcp)) return [];
+  const argv = mcpConfiguredCmd(ctx.home, cli);
+  if (!argv?.length) return [];
+  const target = argv[argv.length - 1] === "mcp" ? argv.slice(0, -1) : argv;
+  if (target.length < 2) return [];
+  const [node, script] = [target[0], target[1]];
+  const fix = `agentmbx setup --only ${cli}`;
+  if (!existsSync(node)) return [{ level: "fail", label: `${cli}: MCP command node binary does not exist (${node})`, fix }];
+  if (!existsSync(script)) return [{ level: "fail", label: `${cli}: MCP command path does not exist (${script})`, fix }];
+  const v = packageVersionAt(dirname(script));
+  if (v !== null && v !== VERSION) return [{ level: "fail", label: `${cli}: MCP command resolves agentmbx ${v}, but this install is ${VERSION} (${script})`, fix }];
+  return [];
 }
 
 export function statuslineChecks(ctx: SetupCtx, cli: string): Check[] {
@@ -413,6 +480,11 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     if (d.cli === "opencode" && node) { const c = opencodeEvictionCheck(node.store.db); if (c) out.push(c); }
     // T460: its own function too (the T435 rule): a refused hooks layout and the not-approved state are Hermes facts.
     if (d.cli === "hermes") for (const c of hermesHooksChecks(ctx)) out.push(c);
+    // T502/T504: the explicit MCP startup timeout and the resolved command path are checked for
+    // every CLI (each function gates itself: silent until wired, and silent for CLIs whose config
+    // has no timeout field at all).
+    for (const c of mcpTimeoutChecks(ctx, d.cli)) out.push(c);
+    for (const c of mcpCommandChecks(ctx, d.cli)) out.push(c);
     // T384: a command string that matches what setup would write is still "wired". Flag the path
     // itself when that file is gone, including a stale …/agentmbx that install would rewrite.
     if (d.cli === "grok") {

@@ -1,16 +1,16 @@
 // `agentmbx setup` / `doctor` against a fake HOME whose configs copy the STRUCTURE of real ones (fake values only).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { doctor, failed } from "../src/doctor.ts";
-import { insertMember, member, parseJsonc, removeMember } from "../src/jsonc.ts";
+import { doctor, failed, VERSION } from "../src/doctor.ts";
+import { insertMember, member, parseJsonc, removeMember, valueOf } from "../src/jsonc.ts";
 import { detectHost } from "../src/mcp.ts";
 import { MbxNode } from "../src/node.ts";
 import { grokSessionId } from "../src/proc.ts";
-import { runSetup, skillDest, statuslineState, type SetupCtx } from "../src/setup.ts";
+import { mcpConfiguredCmd, mcpConfiguredTimeout, resolveCommand, runSetup, skillDest, statuslineState, type SetupCtx } from "../src/setup.ts";
 
 const ORCA = "if [ -f \"$HOME/.orca/agent-hooks/hook.sh\" ]; then /bin/sh \"$HOME/.orca/agent-hooks/hook.sh\"; fi";
 const orcaGroups = (events: string[]) => Object.fromEntries(events.map((e) => [e, [{ hooks: [{ type: "command", command: ORCA, timeout: 10 }] }]]));
@@ -95,7 +95,7 @@ test("setup wires every CLI, backs files up, leaves other hook groups alone, and
   assert.equal(s.hooks.SessionEnd[0].hooks[0].command, "/opt/bin/agentmbx hook session-end --cli claude");
 
   // Codex
-  assert.match(rd(home, ".codex/config.toml"), /\[mcp_servers\.mbx\]\ncommand = "\/opt\/bin\/agentmbx"\nargs = \["mcp"\]\ndefault_tools_approval_mode = "approve"\n$/);
+  assert.match(rd(home, ".codex/config.toml"), /\[mcp_servers\.mbx\]\ncommand = "\/opt\/bin\/agentmbx"\nargs = \["mcp"\]\ndefault_tools_approval_mode = "approve"\nstartup_timeout_sec = 30\n$/);
   const ch = JSON.parse(rd(home, ".codex/hooks.json")).hooks;
   assert.equal(ch.SessionStart.length, 2); assert.equal(ch.SessionStart[0].hooks[0].command, ORCA);
   assert.equal(ch.UserPromptSubmit[1].hooks[0].command, "/opt/bin/agentmbx hook prompt --cli codex");
@@ -104,7 +104,7 @@ test("setup wires every CLI, backs files up, leaves other hook groups alone, and
   // OpenCode: comments survive, mbx sits under mcp.servers
   const oc = rd(home, ".config/opencode/opencode.jsonc");
   for (const c of ["// my MCP servers", "// trailing comment", "/* block comment */"]) assert.ok(oc.includes(c), c);
-  assert.ok(oc.includes(`"mbx": { "type": "local", "command": ["/opt/bin/agentmbx", "mcp"] },`));
+  assert.ok(oc.includes(`"mbx": { "type": "local", "command": ["/opt/bin/agentmbx", "mcp"], "timeout": 30000 },`));
   assert.ok(member(member(member(parseJsonc(oc), "mcp")!.value, "servers")!.value, "mbx"));
 
   // Kimi: mcp.json created, hooks appended after Orca's block
@@ -115,7 +115,7 @@ test("setup wires every CLI, backs files up, leaves other hook groups alone, and
 
   // Hermes: the MCP server, then (T460) the shell hooks and their approvals
   const hy = rd(home, ".hermes/config.yaml");
-  assert.match(hy, /\nmcp_servers:\n  mbx:\n    command: "\/opt\/bin\/agentmbx"\n    args: \["mcp"\]\n/);
+  assert.match(hy, /\nmcp_servers:\n  mbx:\n    command: "\/opt\/bin\/agentmbx"\n    args: \["mcp"\]\n    connect_timeout: 60\n/);
   assert.match(hy, /\nhooks:  # managed by agentmbx setup\n  on_session_start:  # managed by agentmbx setup\n    - command: "\/opt\/bin\/agentmbx hook session-start --cli hermes"\n      timeout: 10\n  pre_llm_call:  # managed by agentmbx setup\n    - command: "\/opt\/bin\/agentmbx hook prompt --cli hermes"\n      timeout: 10\n$/);
   assert.deepEqual(JSON.parse(rd(home, ".hermes/shell-hooks-allowlist.json")).approvals.map((a: { event: string; command: string }) => [a.event, a.command]),
     [["on_session_start", "/opt/bin/agentmbx hook session-start --cli hermes"], ["pre_llm_call", "/opt/bin/agentmbx hook prompt --cli hermes"]]);
@@ -192,8 +192,127 @@ test("doctor reports wiring per CLI and fails until setup ran", async () => {
   assert.ok(after.some((c) => c.level === "fail" && /daemon not answering/.test(c.label)), "no daemon in the test");
 });
 
-test("uninstall removes exactly what setup added", () => {
-  const home = fakeHome();
+// T502: every harness whose MCP config has a real startup-timeout field gets one written explicitly
+// (>= 30s); doctor warns (never fails) on a missing or too-short one, and the next setup run repairs it.
+test("T502: setup writes an explicit MCP startup timeout for codex, opencode and hermes, and grok", async () => {
+  const home = fakeHome(); const ctx = ctxFor(home);
+  const rows = runSetup(ctx, { mode: "install", stamp: "T502" });
+  assert.ok(!rows.some((r) => r.action === "error"), JSON.stringify(rows.filter((r) => r.action === "error")));
+
+  // codex: startup_timeout_sec (seconds) — codex aborts an MCP whose startup exceeds it.
+  const codex = rd(home, ".codex/config.toml");
+  assert.match(codex, /\[mcp_servers\.mbx\]\ncommand = "\/opt\/bin\/agentmbx"\nargs = \["mcp"\]\ndefault_tools_approval_mode = "approve"\nstartup_timeout_sec = 30\n/);
+  assert.equal(mcpConfiguredTimeout(home, "codex"), 30);
+
+  // opencode: "timeout" in milliseconds — it bounds fetching tools at startup (the measured ~2.2s
+  // connect sits close to the 5000ms default).
+  const oc = rd(home, ".config/opencode/opencode.jsonc");
+  const mbx = member(member(member(parseJsonc(oc), "mcp")!.value, "servers")!.value, "mbx")!.value;
+  assert.equal((valueOf(oc, mbx) as { timeout: number }).timeout, 30_000);
+  assert.equal(mcpConfiguredTimeout(home, "opencode"), 30);
+
+  // hermes: connect_timeout (seconds) — the initial-connection/startup knob.
+  const hy = rd(home, ".hermes/config.yaml");
+  assert.match(hy, /\n  mbx:\n    command: "\/opt\/bin\/agentmbx"\n    args: \["mcp"\]\n    connect_timeout: 60\n/);
+  assert.equal(mcpConfiguredTimeout(home, "hermes"), 60);
+
+  // grok's own schema has startup_timeout_sec too (claude and kimi have no such field: nothing written).
+  const homeG = fakeHome(); mkdirSync(join(homeG, ".grok"), { recursive: true });
+  runSetup(ctxFor(homeG), { mode: "install", stamp: "T502g" });
+  assert.match(rd(homeG, ".grok/config.toml"), /\[mcp_servers\.mbx\]\ncommand = "\/opt\/bin\/agentmbx"\nargs = \["mcp"\]\nenabled = true\nstartup_timeout_sec = 30\n/);
+  assert.equal(mcpConfiguredTimeout(homeG, "grok"), 30);
+  assert.equal(mcpConfiguredTimeout(home, "claude"), null, "claude's MCP entry has no timeout field");
+  assert.equal(mcpConfiguredTimeout(home, "kimi"), null, "kimi's MCP entry has no timeout field");
+
+  // the readers see exactly what was configured
+  assert.deepEqual(mcpConfiguredCmd(home, "codex"), ["/opt/bin/agentmbx"]);
+  assert.deepEqual(mcpConfiguredCmd(home, "hermes"), ["/opt/bin/agentmbx"]);
+  assert.deepEqual(mcpConfiguredCmd(home, "claude"), ["/opt/bin/agentmbx"]);
+  assert.deepEqual(mcpConfiguredCmd(homeG, "grok"), ["/opt/bin/agentmbx"]);
+  rmSync(homeG, { recursive: true, force: true });
+
+  // a config an older setup wrote (no timeout) stays "wired"; doctor warns, and the next setup run repairs it.
+  const mbxHome = join(home, ".local/share/agentmbx");
+  new MbxNode(mbxHome, { host: "alpha", port: 1 }).close();
+  writeFileSync(join(home, ".codex/config.toml"), `model = "fake-model"\n\n[mcp_servers.mbx]\ncommand = "/opt/bin/agentmbx"\nargs = ["mcp"]\ndefault_tools_approval_mode = "approve"\n`);
+  let checks = await doctor(ctxFor(home), mbxHome);
+  assert.ok(checks.some((c) => c.level === "ok" && /^codex: MCP server wired/.test(c.label)), "an old entry without a timeout is still wired");
+  assert.ok(checks.some((c) => c.level === "warn" && c.label === "codex: MCP startup timeout is not set" && c.fix === "agentmbx setup --only codex"), JSON.stringify(checks));
+  const repair = runSetup(ctxFor(home), { mode: "install", only: ["codex"], stamp: "T502b" });
+  assert.ok(repair.some((r) => r.cli === "codex" && r.item === "[mcp_servers.mbx]" && r.action === "updated"), JSON.stringify(repair));
+  assert.equal(mcpConfiguredTimeout(home, "codex"), 30);
+  checks = await doctor(ctxFor(home), mbxHome);
+  assert.ok(!checks.some((c) => /^codex: MCP startup timeout/.test(c.label)), "no warning once the timeout is in place");
+
+  // a too-short timeout warns with the value, and setup raises it.
+  writeFileSync(join(home, ".codex/config.toml"), rd(home, ".codex/config.toml").replace("startup_timeout_sec = 30", "startup_timeout_sec = 5"));
+  checks = await doctor(ctxFor(home), mbxHome);
+  assert.ok(checks.some((c) => c.level === "warn" && c.label === "codex: MCP startup timeout is 5s (< 30s)"), JSON.stringify(checks));
+  runSetup(ctxFor(home), { mode: "install", only: ["codex"], stamp: "T502c" });
+  assert.equal(mcpConfiguredTimeout(home, "codex"), 30);
+});
+
+// T504: the MCP command setup registers is the absolute node binary plus the absolute, symlink-resolved
+// agentmbx entry script — never the mise shim — and doctor fails the row when that command cannot
+// resolve agentmbx or resolves a different version than this install.
+test("T504: resolveCommand is the absolute node binary plus the resolved entry script", () => {
+  const cmd = resolveCommand();
+  assert.equal(cmd.length, 2, "not the single shim/binary form");
+  assert.equal(cmd[0], process.execPath, "the actual node binary running setup");
+  assert.ok(isAbsolute(cmd[0]));
+  assert.equal(cmd[1], realpathSync(join(import.meta.dirname, "../bin/agentmbx.js")), "the realpath of the agentmbx entry script");
+  assert.ok(existsSync(cmd[1]));
+});
+
+test("T504: doctor fails a wired MCP command whose path is missing or whose version differs", async () => {
+  // a fake install layout: node + script, with a package.json naming the version the script resolves to.
+  const installDir = mkdtempSync(join(tmpdir(), "mbx-t504-install-"));
+  const script = join(installDir, "bin", "agentmbx.js");
+  mkdirSync(dirname(script), { recursive: true });
+  writeFileSync(script, "#!/usr/bin/env node\n");
+  const pkg = (v: string) => writeFileSync(join(installDir, "package.json"), JSON.stringify({ name: "agentmbx", version: v }));
+  pkg(VERSION);
+  const cmd = [process.execPath, script];
+  const home = fakeHome(); const ctx = ctxFor(home, cmd);
+  const mbxHome = join(home, ".local/share/agentmbx");
+  new MbxNode(mbxHome, { host: "alpha", port: 1 }).close();
+  try {
+    const rows = runSetup(ctx, { mode: "install", stamp: "T504" });
+    assert.ok(!rows.some((r) => r.action === "error"), JSON.stringify(rows.filter((r) => r.action === "error")));
+    // setup registered the node + script form in every harness config
+    assert.deepEqual(mcpConfiguredCmd(home, "claude"), cmd);
+    assert.deepEqual(mcpConfiguredCmd(home, "codex"), cmd);
+    assert.deepEqual(mcpConfiguredCmd(home, "opencode"), cmd);
+    assert.deepEqual(mcpConfiguredCmd(home, "kimi"), cmd);
+    assert.deepEqual(mcpConfiguredCmd(home, "hermes"), cmd);
+    assert.equal(JSON.parse(rd(home, ".claude.json")).mcpServers.mbx.command, process.execPath);
+    assert.deepEqual(JSON.parse(rd(home, ".claude.json")).mcpServers.mbx.args, [script, "mcp"]);
+    assert.match(rd(home, ".codex/config.toml"), new RegExp(`command = "${process.execPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`));
+
+    // everything resolves: no command-path failure
+    let checks = await doctor(ctxFor(home, cmd), mbxHome);
+    assert.ok(!checks.some((c) => /MCP command (path|node binary) does not exist|MCP command resolves agentmbx/.test(c.label)), JSON.stringify(checks));
+
+    // missing command path: every wired CLI fails its row, with the repair
+    rmSync(script);
+    checks = await doctor(ctxFor(home, cmd), mbxHome);
+    for (const cli of ["claude", "codex", "opencode", "kimi", "hermes"])
+      assert.ok(checks.some((c) => c.level === "fail" && c.label === `${cli}: MCP command path does not exist (${script})` && c.fix === `agentmbx setup --only ${cli}`), `${cli}: ${JSON.stringify(checks)}`);
+
+    // a script that resolves a different agentmbx version than this install fails the row
+    writeFileSync(script, "#!/usr/bin/env node\n");
+    pkg("0.0.0-old");
+    checks = await doctor(ctxFor(home, cmd), mbxHome);
+    assert.ok(checks.some((c) => c.level === "fail" && c.label === `codex: MCP command resolves agentmbx 0.0.0-old, but this install is ${VERSION} (${script})`), JSON.stringify(checks));
+    assert.ok(!checks.some((c) => /MCP command path does not exist/.test(c.label)), "the path exists again: only the version fails");
+
+    // and setup repairs both by rewriting the entry to this install
+    const repair = runSetup(ctxFor(home, [process.execPath, realpathSync(join(import.meta.dirname, "../bin/agentmbx.js"))]), { mode: "install", only: ["codex"], stamp: "T504b" });
+    assert.equal(repair.find((r) => r.cli === "codex" && r.item === "[mcp_servers.mbx]")?.action, "updated");
+  } finally { rmSync(installDir, { recursive: true, force: true }); rmSync(home, { recursive: true, force: true }); }
+});
+
+test("uninstall removes exactly what setup added", () => {  const home = fakeHome();
   runSetup(ctxFor(home), { mode: "install" });
   const rows = runSetup(ctxFor(home), { mode: "uninstall", stamp: "U" });
   assert.ok(!rows.some((r) => r.action === "error"));
@@ -370,7 +489,7 @@ test("T337: grok session detection, MCP and statusline wiring, never overwrites"
   mkdirSync(join(home, ".grok"), { recursive: true });
   const rows = runSetup(ctx, { mode: "install", stamp: "G1" });
   const cfg = rd(home, ".grok/config.toml");
-  assert.match(cfg, /\[mcp_servers\.mbx\]\ncommand = "\/opt\/bin\/agentmbx"\nargs = \["mcp"\]\nenabled = true/, "grok's own MCP schema");
+  assert.match(cfg, /\[mcp_servers\.mbx\]\ncommand = "\/opt\/bin\/agentmbx"\nargs = \["mcp"\]\nenabled = true\nstartup_timeout_sec = 30/, "grok's own MCP schema");
   assert.match(cfg, /\[ui\.status_line\]\ntype = "command"\ncommand = "\/opt\/bin\/agentmbx statusline grok"/, "the status line section");
   assert.ok(rows.some((r) => r.cli === "grok" && r.action === "added"));
   assert.equal(runSetup(ctx, { mode: "install", stamp: "G2" }).filter((r) => r.cli === "grok" && r.action !== "unchanged" && r.action !== "skipped").length, 0, "idempotent");

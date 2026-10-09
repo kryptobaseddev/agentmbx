@@ -11,6 +11,7 @@ import type { AddressInfo } from "node:net";
 import { bindWakeLease, delegateWake } from "./helpers/wake-lease.ts";
 import { MbxNode } from "../src/node.ts";
 import { dispatchWakes, wakeOpencode } from "../src/wake.ts";
+import { opencodeHostSeams } from "../src/opencode-provider.ts";
 import { findIdentityControl, publishIdentityControl } from "../src/identity-control.ts";
 import { captureWakeIdentity } from "../src/wake-identity.ts";
 import { recipientReceipts, receiptLine, sentPage } from "../src/receipts.ts";
@@ -106,6 +107,7 @@ for (const defect of ["released", "generation", "key", "parent", "missing-contro
 for (const current of [true, false]) test(`OpenCode rechecks after async service discovery (current: ${current})`, async () => {
   let calls = 0, ready = false;
   const result = await wakeOpencode("session-exact", "notification", {
+    host: () => "service",
     service: async () => { await Promise.resolve(); ready = true; return { url: "http://fixture.invalid", auth: "" }; },
     recheck: () => { assert.equal(ready, true); return current; },
     fetch: (async (input: string | URL | Request, options: RequestInit) => {
@@ -152,6 +154,13 @@ test("daemon routes an actual MCP holder and refuses its stale binding after rel
   assert.equal(n.unreadCount(agent), 2);
 });
 
+/** T524: make this test process look like `opencode serve --service` to the host classifier. */
+function serviceHosted(t: { after: (fn: () => void | Promise<void>) => unknown }) {
+  const real = opencodeHostSeams.args;
+  opencodeHostSeams.args = () => new Map([[process.pid, ["/usr/local/bin/opencode", "serve", "--service"]]]);
+  t.after(() => { opencodeHostSeams.args = real; });
+}
+
 /** Minimal fake of the OpenCode service: directory lookup + synthetic admission with a valid T112 receipt. */
 function opencodeStub(t: { after: (fn: () => void | Promise<void>) => unknown }, directorySession: string | null) {
   const calls: string[] = [];
@@ -181,6 +190,7 @@ test("T438: an admitted opencode wake stores nativeStatus on the wake.attempt au
   t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
   process.env.MBX_OPENCODE_URL = await stub.listen();
+  serviceHosted(t); // T524: the bound pid is the shared service, so the push path applies
   bindWakeLease(n, { agent: "worker", cli: "opencode", session_id: "ses_exact", pid: process.pid });
   sendLeased(n, { from: "sender", to: ["worker"], subject: "wake", body: "private", kind: "request" });
   const [out] = await dispatchWakes(n);

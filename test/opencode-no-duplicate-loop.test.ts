@@ -1,0 +1,155 @@
+// T524 containment: AgentMBX must never make the shared `opencode serve --service` start a second agent
+// loop on a session that a standalone serve (`opencode --standalone` -> `opencode serve --stdio --port 0`)
+// hosts. A synthetic POST with resume:true does exactly that, so (1) the generated plugin posts only when it
+// is itself loaded by the service process, (2) the daemon's wakeOpencode posts only when the binding's
+// provider pid is the service, and (3) doctor no longer claims a push wake for standalone-hosted bindings.
+// Everything runs against temp HOMEs and fakes: no real OpenCode config, process or service is touched.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { MbxNode } from "../src/node.ts";
+import { opencodePluginPath, opencodePluginSource, runSetup, type SetupCtx } from "../src/setup.ts";
+import { opencodeServiceCheck } from "../src/doctor.ts";
+import { OPENCODE_STANDALONE_NO_PUSH, wakeOpencode } from "../src/wake.ts";
+import { isOpencodeServiceArgv, opencodeHostOf } from "../src/opencode-provider.ts";
+import { version } from "../src/version.ts";
+
+const CMD = ["/opt/bin/agentmbx"];
+const SERVICE = ["/Users/x/.opencode/bin/opencode", "serve", "--service"];
+const STANDALONE = ["/Users/x/.opencode/bin/opencode", "serve", "--stdio", "--port", "0"];
+const noFetch = (async () => { throw new Error("T524: no request may reach the shared service"); }) as typeof fetch;
+const noService = async () => { throw new Error("T524: service discovery must not run for a standalone-hosted session"); };
+
+test("argv detection: only `serve --service` without --stdio is the shared service", () => {
+  assert.equal(isOpencodeServiceArgv(SERVICE.slice(1)), true);
+  assert.equal(isOpencodeServiceArgv(["serve", "--service=default"]), true);
+  assert.equal(isOpencodeServiceArgv(STANDALONE.slice(1)), false);
+  assert.equal(isOpencodeServiceArgv(["--standalone"]), false);
+  assert.equal(isOpencodeServiceArgv(["serve", "--service", "--stdio"]), false);
+});
+
+test("host classification: service, standalone, node runtime hop, foreign and unreadable", () => {
+  const table = new Map([[100, { ppid: 1 }], [200, { ppid: 1 }], [300, { ppid: 100 }], [400, { ppid: 1 }]]);
+  const args = new Map([[100, SERVICE], [200, STANDALONE], [300, ["node", "/x/runtime.js"]], [400, ["/bin/zsh"]]]);
+  assert.equal(opencodeHostOf(100, args, table), "service");
+  assert.equal(opencodeHostOf(200, args, table), "standalone");
+  assert.equal(opencodeHostOf(300, args, table), "service", "a node/bun runtime child resolves to its opencode parent");
+  assert.equal(opencodeHostOf(400, args, table), "unknown", "a non-opencode process is never treated as the service");
+  assert.equal(opencodeHostOf(999, args, table), "unknown", "an unreadable pid fails closed");
+  assert.equal(opencodeHostOf(null, args, table), "unknown");
+});
+
+test("plugin template guards the service HTTP path on running inside the service process", () => {
+  const src = opencodePluginSource(CMD, version());
+  assert.ok(src.includes("const inService = (): boolean =>"), "service-process guard present");
+  assert.ok(src.includes('argv.some((a) => a === "--service" || a.startsWith("--service=")) && !argv.includes("--stdio")'), "detects serve --service, never --stdio");
+  assert.ok(src.includes("?? process.argv"), "reads the hosting OpenCode process argv");
+  const inject = src.slice(src.indexOf("const inject = async"));
+  assert.ok(inject.indexOf("if (!inService()) return false;") < inject.indexOf('["service", "status"]'), "guard precedes any `opencode service status` spawn");
+  assert.ok(inject.indexOf("if (!inService()) return false;") < inject.indexOf("await fetch("), "guard precedes the synthetic POST");
+});
+
+async function loadPlugin() {
+  const dir = mkdtempSync(join(tmpdir(), "mbx-t524-plugin-"));
+  const file = join(dir, "agentmbx.ts");
+  writeFileSync(file, opencodePluginSource(CMD, version()));
+  return { mod: await import(file) as { AgentMBXHooks: (ctx: unknown) => Promise<Record<string, unknown>> }, dir };
+}
+
+for (const argv of [undefined, STANDALONE]) test(`plugin in a standalone serve (${argv ? "--stdio argv" : "test-runner argv"}) never posts or spawns service status`, async () => {
+  const { mod, dir } = await loadPlugin();
+  const g = globalThis as { __mbxSpawn?: unknown; __mbxArgv?: string[] };
+  const spawned: string[][] = [];
+  const realFetch = globalThis.fetch, realUrl = process.env.MBX_OPENCODE_URL;
+  let fetched = 0;
+  g.__mbxSpawn = (_bin: string[], args: string[], _input: string, cb: (out: string) => void) => {
+    spawned.push(args);
+    cb(args[0] === "hook" ? JSON.stringify({ decision: "block", reason: "[mbx] 1 new message(s) for worker." }) : "http://127.0.0.1:9");
+  };
+  if (argv) g.__mbxArgv = argv; else delete g.__mbxArgv;
+  delete process.env.MBX_OPENCODE_URL;
+  globalThis.fetch = (async () => { fetched++; throw new Error("no service call"); }) as typeof fetch;
+  try {
+    const hooks = await mod.AgentMBXHooks({ directory: "/work" });
+    await (hooks.event as (e: unknown) => Promise<void>)({ event: { type: "session.idle", properties: { info: { id: "ses_standalone" } } } });
+    assert.deepEqual(spawned.map((a) => a.slice(0, 2)), [["hook", "stop"]], "the hook still runs; no `opencode service status`");
+    assert.equal(fetched, 0, "no synthetic POST to the shared service");
+  } finally {
+    delete g.__mbxSpawn; delete g.__mbxArgv; globalThis.fetch = realFetch;
+    if (realUrl === undefined) delete process.env.MBX_OPENCODE_URL; else process.env.MBX_OPENCODE_URL = realUrl;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("setup rewrites an installed pre-T524 plugin (a body change, not header-only drift)", () => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-t524-setup-"));
+  try {
+    mkdirSync(join(home, ".config/opencode/plugins"), { recursive: true });
+    writeFileSync(join(home, ".config/opencode/opencode.jsonc"), `{\n  "$schema": "https://opencode.ai/config.json"\n}\n`);
+    const current = opencodePluginSource(CMD, version());
+    const legacy = current.replace(/\n  if \(!inService\(\)\) return false;[^\n]*/, "").replace(/\(agentmbx [^)]*\)/, "(agentmbx 0.5.19)");
+    assert.notEqual(legacy, current);
+    writeFileSync(opencodePluginPath(home), legacy);
+    const ctx: SetupCtx = { home, cmd: CMD, which: () => null, useClis: false };
+    runSetup(ctx, { mode: "install", only: ["opencode"] });
+    assert.equal(readFileSync(opencodePluginPath(home), "utf8"), current, "the guarded template replaces the old one");
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test("wakeOpencode: a standalone-hosted session is not_submitted/no-target with no service call", async () => {
+  for (const host of ["standalone", "unknown"] as const) {
+    const r = await wakeOpencode("ses_standalone", "[mbx] hint", { pid: 4242, host: () => host, service: noService, fetch: noFetch });
+    assert.equal(r.ok, false);
+    assert.equal(r.outcome?.kind, "not_submitted");
+    assert.equal(r.outcome?.kind === "not_submitted" && r.outcome.reason, "no-target");
+    if (host === "standalone") assert.equal(r.outcome?.kind === "not_submitted" && r.outcome.detail, OPENCODE_STANDALONE_NO_PUSH);
+    assert.match(r.error ?? "", /duplicate agent loop/);
+  }
+  // the real classifier with no recorded pid fails closed the same way
+  const none = await wakeOpencode("ses_x", "[mbx] hint", { pid: null, service: noService, fetch: noFetch });
+  assert.equal(none.outcome?.kind === "not_submitted" && none.outcome.reason, "no-target");
+});
+
+test("wakeOpencode: a service-hosted session still posts exactly once with a validated receipt", async () => {
+  let posts = 0;
+  const r = await wakeOpencode("ses_svc", "[mbx] hint", {
+    pid: 4242, host: (pid) => (pid === 4242 ? "service" : "unknown"),
+    service: async () => ({ url: "http://127.0.0.1:1", auth: "" }),
+    fetch: (async (url: string | URL | Request, init?: RequestInit) => {
+      posts++;
+      assert.equal(String(url), "http://127.0.0.1:1/api/session/ses_svc/synthetic");
+      assert.deepEqual(JSON.parse(String(init?.body)), { text: "[mbx] hint", delivery: "queue", resume: true });
+      return Response.json({ data: { id: "msg_1", sessionID: "ses_svc", type: "synthetic", delivery: "queue", payload: { text: "[mbx] hint" }, time: { created: 1 } } });
+    }) as typeof fetch,
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.outcome?.kind, "admitted");
+  assert.equal(posts, 1);
+});
+
+test("doctor: standalone-hosted bindings get no push-wake claim", async () => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-t524-doctor-"));
+  const node = new MbxNode(home, { host: "alpha" });
+  try {
+    const add = (sid: string, pid: number) => node.store.db.prepare("INSERT INTO sessions (agent, cli, session_id, pid, channel, updated_at) VALUES (?, 'opencode', ?, ?, 0, ?)")
+      .run(`agent-${sid}`, sid, pid, new Date().toISOString());
+    add("ses_a", 200);
+    let asked = 0;
+    const up = async () => { asked++; return { url: "http://127.0.0.1:49374", auth: "" }; };
+    const host = (pid: number | null) => (pid === 100 ? "service" as const : "standalone" as const);
+    const only = await opencodeServiceCheck(node, up, host);
+    assert.equal(only?.level, "info");
+    assert.match(only?.label ?? "", /1 binding\(s\) in a standalone OpenCode serve/);
+    assert.match(only?.label ?? "", /no push wake yet/);
+    assert.match(only?.label ?? "", /next-prompt delivery only/);
+    assert.doesNotMatch(only?.label ?? "", /wake path for/);
+    assert.equal(asked, 0, "no service probe when nothing is service-hosted");
+    add("ses_b", 100);
+    const mixed = await opencodeServiceCheck(node, up, host);
+    assert.equal(mixed?.level, "ok");
+    assert.match(mixed?.label ?? "", /wake path for 1 service-hosted/);
+    assert.match(mixed?.label ?? "", /1 binding\(s\) in a standalone OpenCode serve .*no push wake yet/);
+  } finally { node.close(); rmSync(home, { recursive: true, force: true }); }
+});
