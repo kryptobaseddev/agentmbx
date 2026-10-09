@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Setup writes an explicit MCP startup timeout where the harness supports one (T502):** measured cold starts sit close to the harness defaults (an OpenCode connect takes ~2.2s against a 5000ms default; Claude's p99 is ~4.3s), so `agentmbx setup` now writes at least a 30-second startup timeout into every MCP entry whose config format has a real field: `startup_timeout_sec = 30` for Codex and Grok, `"timeout": 30000` (milliseconds) for OpenCode, and `connect_timeout: 60` for Hermes. Claude's `~/.claude.json` and Kimi's `mcp.json` have no such field and get none. `agentmbx doctor` warns — never fails — when a wired entry's timeout is missing or under 30s, with `agentmbx setup --only <cli>` as the fix; a config an older setup wrote stays "wired" and the next setup run repairs the line in place.
+- **The MCP command is the absolute node binary plus the agentmbx entry script, not the mise shim (T504):** `agentmbx setup` now registers `command = <absolute node binary running setup>`, `args = [<absolute, symlink-resolved agentmbx entry script>, "mcp"]` in every harness config, instead of the mise/asdf shim — a mise upgrade or node pin used to rewrite the shim and break every harness at once. `agentmbx doctor` fails the row when the configured node binary or script path no longer exists, or when the script's package version differs from the installed one (a stale path or a second older install the harness would actually start), naming `agentmbx setup --only <cli>` as the fix; older single-binary and shim forms keep working and are repaired to the node + script form on the next setup run.
+
 ## 0.5.19 (2026-10-09)
 
 The Claude Code status mod installs with setup: `agentmbx setup` adds the package's local marketplace and installs the `agentmbx@agentmbx` plugin, doctor checks it, and foreign plugins are never touched.
