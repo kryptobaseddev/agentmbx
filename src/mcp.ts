@@ -471,6 +471,7 @@ export async function runMcp(existing?: MbxNode) {
      * renames or releases it, and stops acting as the identity as soon as that lease is gone.
      */
     coUse?: boolean;
+    coUseHolderPid?: number;
     activityAt?: number;
     controlAliases?: string[];
     parent: { hops: Map<string, { hop: number; from: string; at: number }>; external: Taint | null;
@@ -688,7 +689,8 @@ export async function runMcp(existing?: MbxNode) {
     state.parent = { hops, external: { how: record.how, root: record.root, from: record.from, id: record.id }, firstHand: state.parent?.firstHand ?? new Map() };
   };
   const adoptCoUse = (state: State, co: { agent: string; token: string }) => {
-    Object.assign(state, { agent: co.agent, leaseToken: co.token, coUse: true, released: false, pending: undefined, pendingReason: undefined, lostTo: undefined });
+    const holder = node.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE name=? AND token=?").get(co.agent, co.token) as { holder_pid: number } | undefined;
+    Object.assign(state, { coUseHolderPid: holder?.holder_pid, agent: co.agent, leaseToken: co.token, coUse: true, released: false, pending: undefined, pendingReason: undefined, lostTo: undefined });
     touch(state, true);
     restoreSessionTaint(state);
   };
@@ -851,6 +853,10 @@ export async function runMcp(existing?: MbxNode) {
       // does not act as the identity. The name stays pending and is re-evaluated (co-use, claim or wait) on the next call.
       Object.assign(state, { agent: "", leaseToken: undefined, coUse: undefined, pending: name,
         pendingReason: `the live MCP server of this ${env.cli} session no longer holds the lease this server co-used` });
+      // T483: re-evaluate the new generation in this call. resume/claimFor repeats the exact
+      // session/provider and live-process checks; never adopt a token just because the name matches.
+      if (row && row.released_at === null && state.coUseHolderPid !== undefined && row.holder_pid !== state.coUseHolderPid)
+        retryResume(state);
       return;
     }
     if (row && row.token !== state.leaseToken && (row.released_at === null || row.release_reason === "released")) {
