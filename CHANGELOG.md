@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **OpenCode's provider walk stops at a directory boundary (T482).** `opencodeProviderPid` still climbs at most 16 `node` or `bun` parents, and a process named `opencode` still counts, including a compiled binary. It returns null instead of following a `node` or `bun` parent whose executable is in a different directory. A runtime in the same directory still counts, so a mise or Homebrew layout that shares a directory still resolves.
+
 ## 0.5.19 (2026-10-09)
 
 The Claude Code status mod installs with setup: `agentmbx setup` adds the package's local marketplace and installs the `agentmbx@agentmbx` plugin, doctor checks it, and foreign plugins are never touched.
