@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { insertMember, member, parseJsonc, removeMember, replaceValue, valueOf, type JNode } from "./jsonc.ts";
 import { parse as parseToml } from "smol-toml";
 import { fingerprint } from "./crypto.ts";
+import { claudePluginStep, execCli, type CliRunner } from "./claude-plugin.ts";
 import { version } from "./version.ts";
 import { opencodeSidebarPackageJson, opencodeSidebarServerSource, opencodeSidebarSource, OPENCODE_SIDEBAR_MARKER } from "./opencode-sidebar.ts";
 import { authHelperPath, canPrompt, createKeychainOwner, ownerInfo } from "./owner.ts";
@@ -28,6 +29,8 @@ export interface SetupCtx {
   cmd: string[];                             // argv agents run for agentmbx (mcp / hook are appended)
   which: (bin: string) => string | null;     // PATH lookup (tests pass () => null)
   useClis: boolean;                          // may invoke `claude mcp add` / `opencode service restart` (real home only)
+  /** T416: tests pass this so plugin install never spawns the real claude binary. */
+  runCli?: CliRunner;
 }
 export interface Row { cli: string; item: string; path: string; action: Action; backup?: string; note?: string }
 
@@ -1706,6 +1709,12 @@ export function runSetup(ctx: SetupCtx, o: RunOpts): Row[] {
           : `[status_line]\ncommand = ${JSON.stringify(statuslineCommand(ctx.home, "kimi", ctx.cmd))}` }` });
   }
   if (skillRows) rows.push(...skillRows);
+  // T416: the Claude mod is a marketplace plugin. The CLI runner is injected; foreign plugin bytes are restored from the pre-image.
+  const claudeFound = detect(ctx).some((d) => d.cli === "claude" && d.found);
+  if ((o.only === undefined || o.only.includes("claude")) && (ctx.runCli !== undefined || (ctx.useClis && claudeFound))) {
+    const step = claudePluginStep(ctx.home, o.mode, o.dryRun === true, ctx.runCli ?? execCli);
+    rows.push({ cli: "claude", item: "plugin agentmbx@agentmbx", path: step.path, action: step.action, note: step.note });
+  }
   // A running OpenCode service only reads its config at start.
   const oc = rows.find((r) => r.cli === "opencode" && (r.action === "added" || r.action === "updated" || r.action === "removed"));
   if (oc && !o.dryRun && ctx.useClis && ctx.which("opencode")) {

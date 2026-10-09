@@ -1,0 +1,11 @@
+{
+  "name": "agentmbx",
+  "owner": { "name": "AgentMBX" },
+  "plugins": [
+    {
+      "name": "agentmbx",
+      "source": "./plugins/claude",
+      "description": "Renders this Claude Code session's AgentMBX status."
+    }
+  ]
+}

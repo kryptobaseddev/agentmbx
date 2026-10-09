@@ -12,6 +12,7 @@ import { kimiDesktop } from "./kimi-desktop.js";
 import { version } from "./version.js";
 import { GROK_NO_PUSH, MbxNode, RETRY_HOURS } from "./node.js";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.js";
+import { claudePluginChecks } from "./claude-plugin.js";
 import { detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConsent, skillDest, skillStatus, statuslineConfiguredCommand, statuslineForms, statuslineState, wired } from "./setup.js";
 import { mailboxLiveness } from "./receipts.js";
 import { liveWatcher } from "./wake.js";
@@ -478,6 +479,9 @@ export async function doctor(ctx, mbxHome, opts = {}) {
         // static and per-CLI — ours must be a CURRENT form, foreign must be truly foreign.
         for (const c of statuslineChecks(ctx, d.cli))
             out.push(c);
+        if (d.cli === "claude")
+            for (const c of claudePluginChecks(ctx.home, ctx))
+                out.push(c);
         // T391: the opencode service check is its own function (never a new top-level grok/opencode
         // collision — see the T435 note above) and runs only when an opencode mailbox is bound.
         if (d.cli === "opencode" && node) {

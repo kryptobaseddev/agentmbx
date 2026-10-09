@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { insertMember, member, parseJsonc, removeMember, replaceValue, valueOf } from "./jsonc.js";
 import { parse as parseToml } from "smol-toml";
 import { fingerprint } from "./crypto.js";
+import { claudePluginStep, execCli } from "./claude-plugin.js";
 import { version } from "./version.js";
 import { opencodeSidebarPackageJson, opencodeSidebarServerSource, opencodeSidebarSource, OPENCODE_SIDEBAR_MARKER } from "./opencode-sidebar.js";
 import { authHelperPath, canPrompt, createKeychainOwner, ownerInfo } from "./owner.js";
@@ -1963,6 +1964,12 @@ export function runSetup(ctx, o) {
     }
     if (skillRows)
         rows.push(...skillRows);
+    // T416: the Claude mod is a marketplace plugin. The CLI runner is injected; foreign plugin bytes are restored from the pre-image.
+    const claudeFound = detect(ctx).some((d) => d.cli === "claude" && d.found);
+    if ((o.only === undefined || o.only.includes("claude")) && (ctx.runCli !== undefined || (ctx.useClis && claudeFound))) {
+        const step = claudePluginStep(ctx.home, o.mode, o.dryRun === true, ctx.runCli ?? execCli);
+        rows.push({ cli: "claude", item: "plugin agentmbx@agentmbx", path: step.path, action: step.action, note: step.note });
+    }
     // A running OpenCode service only reads its config at start.
     const oc = rows.find((r) => r.cli === "opencode" && (r.action === "added" || r.action === "updated" || r.action === "removed"));
     if (oc && !o.dryRun && ctx.useClis && ctx.which("opencode")) {
