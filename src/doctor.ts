@@ -8,6 +8,7 @@ import { signHop } from "./http.ts";
 import { relayState, ROLLBACK_REASON } from "./relay-v2.ts";
 import { kimiHostedServer, kimiInstances } from "./kimi-web.ts";
 import { opencodeService } from "./wake.ts";
+import { opencodeHostClassifier, type OpencodeHost } from "./opencode-provider.ts";
 import { kimiDesktop } from "./kimi-desktop.ts";
 import { version } from "./version.ts";
 import { GROK_NO_PUSH, MbxNode, RETRY_HOURS } from "./node.ts";
@@ -263,17 +264,23 @@ function hourlyOpencodeEviction(events: LeaseEvent[]): boolean {
  *  and grok are replace-only — `command` replaces the footer and never renders alongside the user's
  *  other keys. opencode has no custom status line feature at all (built-in segments only), so the
  *  honest result is an explicit skip note, not a check against an invented config path. */
-/** T391: the OpenCode service is the wake path for every opencode mailbox — when one is bound,
- *  doctor proves the service answers and says how to start it when it does not. A warn never
- *  fails doctor (the T435 rule for separate per-CLI functions). Unbound hosts stay silent. */
-export async function opencodeServiceCheck(node: MbxNode, service: () => Promise<{ url: string; auth: string } | null> = opencodeService): Promise<Check | null> {
-  const bound = node.store.db.prepare("SELECT agent FROM sessions WHERE cli='opencode' AND session_id NOT LIKE 'mcp-%'").all() as { agent: string }[];
+/** T391/T524: the shared OpenCode service is the push-wake path only for sessions it hosts itself.
+ *  Sessions hosted by a standalone serve (`opencode --standalone` → `opencode serve --stdio`) are
+ *  never pushed through the service (it would start a duplicate agent loop): they get mail on their
+ *  next prompt. Doctor counts both and proves the service answers when a service-hosted session is
+ *  bound. A warn never fails doctor (the T435 rule). Unbound hosts stay silent. */
+export async function opencodeServiceCheck(node: MbxNode, service: () => Promise<{ url: string; auth: string } | null> = opencodeService,
+  host: (pid: number | null) => OpencodeHost = opencodeHostClassifier()): Promise<Check | null> {
+  const bound = node.store.db.prepare("SELECT agent, pid FROM sessions WHERE cli='opencode' AND session_id NOT LIKE 'mcp-%'").all() as { agent: string; pid: number | null }[];
   if (!bound.length) return null;
+  const hosted = bound.filter((b) => host(b.pid) === "service").length, standalone = bound.length - hosted;
+  const rest = standalone ? `${standalone} binding(s) in a standalone OpenCode serve (or unknown host): no push wake yet, next-prompt delivery only` : "";
+  if (!hosted) return { level: "info", label: `opencode: ${rest}` };
   const svc = await service().catch(() => null);
-  if (svc) return { level: "ok", label: `opencode: service reachable (${svc.url}) — wake path for ${bound.length} bound mailbox(es)` };
+  if (svc) return { level: "ok", label: `opencode: service reachable (${svc.url}) — wake path for ${hosted} service-hosted mailbox binding(s)${rest ? `; ${rest}` : ""}` };
   return {
     level: "warn",
-    label: "opencode: service not reachable, so bound OpenCode mailboxes cannot be woken",
+    label: `opencode: service not reachable, so ${hosted} service-hosted OpenCode binding(s) cannot be woken${rest ? `; ${rest}` : ""}`,
     fix: "run any opencode command (or `opencode service start`) so the service API comes up; config: ~/.config/opencode/service.json",
   };
 }
