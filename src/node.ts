@@ -1,4 +1,5 @@
-import { hasHeldIdentity, IdentityLeases } from "./identity-leases.ts";
+import { deadHolderLeases, hasHeldIdentity, IdentityLeases, inspectLeaseProcesses, processGone, sweepDeadHolderLeases, UNKNOWN_PROCESS } from "./identity-leases.ts";
+import { listIdentityControls, removeIdentityControl } from "./identity-control.ts";
 import { initializeReplay, replayQuery, type ReplayOptions, type ReplayPage } from "./replay.ts";
 import { kimiHostedCheck } from "./wake-check.ts";
 // One mbx host: its key, its store, and the rules for sending, receiving, verifying and delivering.
@@ -441,6 +442,16 @@ export class MbxNode {
     }
     if (dead.length) this.store.audit("sessions.pruned", { count: dead.length, sessions: dead.slice(0, 50).map((r) => `${r.cli}:${r.session_id}`) });
     return dead.length;
+  }
+
+  /** T507: the daemon's periodic sweep (cli.ts's 60 s interval). Force-killed MCP processes never
+   *  run their cleanup, so leases, mcp-process and identity-control rows of a positively dead
+   *  process are cleared here — within 60 s of the death. Unknown evidence keeps the row; a live
+   *  process's rows are never swept. */
+  sweepStaleRows(now = Date.now()): { leases: number; mcpProcesses: number; identityControls: number } {
+    const released = sweepDeadHolderLeases(this.store, { now });
+    const kv = sweepStaleMcpKvRows(this.store);
+    return { leases: released.length, ...kv };
   }
 
   // ---- key rotation (T030) ------------------------------------------------------------------
@@ -968,4 +979,41 @@ export function summaryLine(m: MessageRow): string {
   const e = JSON.parse(m.envelope) as Envelope;
   const flags = [m.kind, e.needs_reply ? "needs reply" : "", storedAuthority(m)?.ok ? "OWNER" : "", m.state ?? ""].filter(Boolean).join(", ");
   return `${m.id}  ${m.ts.slice(0, 16)}Z  ${m.from_addr} → ${e.to.join(",")}  [${flags}]  ${m.subject}`;
+}
+
+// ---- T507: stale-row sweep (dead MCP processes never run their cleanup) -----------------------
+
+const mcpProcessRows = (store: Store): { k: string; pid: number; start: string | null }[] =>
+  (store.db.prepare("SELECT k,v FROM kv WHERE k GLOB 'mcp-process:*'").all() as { k: string; v: string }[]).flatMap(({ k, v }) => {
+    try {
+      const o = JSON.parse(v) as { pid?: unknown; start?: unknown };
+      return Number.isSafeInteger(o.pid) && (o.pid as number) > 0 ? [{ k, pid: o.pid as number, start: typeof o.start === "string" ? o.start : null }] : [];
+    } catch { return []; } // malformed rows are not proven dead; left alone
+  });
+
+/** Read-only census of mcp-process and identity-control kv rows whose recorded MCP process is
+ *  positively gone. Doctor's row and the sweep share it, so the reported count is exactly what
+ *  the next sweep clears. Unknown evidence keeps the row (T340); a live process's row is never
+ *  counted (T507 AC2) — the start time catches a reused pid. */
+export function staleMcpKvCensus(store: Store): { mcpProcesses: string[]; identityControls: string[] } {
+  if (procTable().size === 0) return { mcpProcesses: [], identityControls: [] }; // no process listing: nothing can be proven dead
+  const rows = mcpProcessRows(store);
+  const controls = listIdentityControls(store);
+  const evidence = inspectLeaseProcesses([...rows.map((r) => r.pid), ...controls.map((d) => d.mcp_pid)]);
+  const gone = (pid: number, start: string | null) => processGone(start, evidence.get(pid) ?? UNKNOWN_PROCESS);
+  return {
+    mcpProcesses: rows.filter((r) => gone(r.pid, r.start)).map((r) => r.k),
+    identityControls: controls.filter((d) => gone(d.mcp_pid, d.mcp_start)).map((d) => d.control_key),
+  };
+}
+
+/** Delete the kv rows staleMcpKvCensus counts. identity-control aliases of a removed descriptor go
+ *  with it (removeIdentityControl), the same removal a live MCP's uninstall would run. */
+export function sweepStaleMcpKvRows(store: Store): { mcpProcesses: number; identityControls: number } {
+  const census = staleMcpKvCensus(store);
+  for (const k of census.mcpProcesses) store.db.prepare("DELETE FROM kv WHERE k=?").run(k);
+  for (const controlKey of census.identityControls) removeIdentityControl(store, controlKey);
+  if (census.mcpProcesses.length || census.identityControls.length)
+    store.audit("stale.kv-swept", { mcpProcesses: census.mcpProcesses.length, identityControls: census.identityControls.length, at: Date.now() });
+  return { mcpProcesses: census.mcpProcesses.length, identityControls: census.identityControls.length };
 }

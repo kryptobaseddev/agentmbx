@@ -11,7 +11,7 @@ import { opencodeService } from "./wake.ts";
 import { opencodeHostClassifier, type OpencodeHost } from "./opencode-provider.ts";
 import { kimiDesktop } from "./kimi-desktop.ts";
 import { version } from "./version.ts";
-import { GROK_NO_PUSH, MbxNode, RETRY_HOURS } from "./node.ts";
+import { GROK_NO_PUSH, MbxNode, RETRY_HOURS, staleMcpKvCensus } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
 import { claudePluginChecks } from "./claude-plugin.ts";
 import { detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConsent, mcpConfiguredCmd, mcpConfiguredTimeout, skillDest, skillStatus, statuslineConfiguredCommand, statuslineForms, statuslineState, wired, type CliId, type SetupCtx } from "./setup.ts";
@@ -19,7 +19,7 @@ import { mailboxLiveness } from "./receipts.ts";
 import { liveWatcher } from "./wake.ts";
 import { findIdentityControl, listIdentityControls } from "./identity-control.ts";
 import { pruneCandidates } from "./identity-cleanup.ts";
-import { inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
+import { deadHolderLeases, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
 import { providerLabel, sameLiveProvider } from "./identity-takeover.ts";
 
 export type Level = "ok" | "fail" | "warn" | "info";
@@ -59,6 +59,21 @@ export function identityClaimChurn(node: MbxNode, now = Date.now()): Check[] {
   return [...counts].filter(([, count]) => count > CLAIM_CHURN_LIMIT).map(([name, count]) => ({ level: "warn",
     label: `${name}: identity claim/release churn (${count} claims in 10 minutes; limit ${CLAIM_CHURN_LIMIT}); reconnecting or competing MCP connectors may be fighting the lease`,
     fix: "update AgentMBX and reconnect with the harness MCP controls; same-session connectors co-use the lease. Never kill MBX MCPs, hand-spawn agentmbx mcp, or force-takeover your own live session; use exact-session diagnostics and the mailbox CLI --as instead" }));
+}
+
+/** T507: rows whose recorded process is positively dead — force-killed MCP processes never run
+ *  their cleanup. The daemon sweeps them within 60 s, so a count that stays nonzero means the
+ *  daemon is down or the process table is unreadable. Read-only; shares the sweep's census, so
+ *  the numbers agree with what the next sweep clears. */
+export function staleRowCheck(node: MbxNode): Check {
+  const leases = deadHolderLeases(node.store);
+  const kv = staleMcpKvCensus(node.store);
+  const total = leases.leases.length + kv.mcpProcesses.length + kv.identityControls.length;
+  return {
+    level: total ? "warn" : "ok",
+    label: `stale rows of dead processes: ${leases.leases.length} unreleased lease(s), ${kv.mcpProcesses.length} mcp-process, ${kv.identityControls.length} identity-control`,
+    fix: total ? "the daemon sweeps these within 60s; a persistent count means the daemon is not running (agentmbx setup) or the process table is unreadable" : undefined,
+  };
 }
 
 export const VERSION = (() => {
@@ -536,6 +551,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     // T211: mailboxes nobody is holding, sessions waiting on a remembered identity, prune weight
     for (const c of strandedMail(node)) out.push(c);
     for (const c of pendingIdentities(node)) out.push(c);
+    out.push(staleRowCheck(node));
     for (const c of identityClaimChurn(node)) out.push(c);
     for (const c of foreignSessionProvider(node)) out.push(c);
     out.push(pruneSummary(node));
