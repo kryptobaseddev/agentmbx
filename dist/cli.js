@@ -1161,6 +1161,9 @@ If the codes differ, do not approve: someone is in the middle.`);
             setInterval(() => { void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node); void healStuckPeers(node, () => browse(3_000)).then(() => sendPresence(node, fetch, stuckHosts(node))).catch(() => { }); try {
                 node.pruneDeadSessions();
             }
+            catch { /* db busy: next minute */ } try {
+                node.sweepStaleRows();
+            }
             catch { /* db busy: next minute */ } }, 60_000);
             void refreshDirectory(node);
             void pullPolicies(node);

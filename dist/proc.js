@@ -173,11 +173,9 @@ export function claudeSessionId(pid) {
 const claudeSessionFile = (pid) => join(homedir(), ".claude/sessions", `${pid}.json`);
 const PS_LSTART_RE = /^[A-Z][a-z]{2} ([A-Z][a-z]{2})\s+(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/;
 const PS_MONTHS = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
-/** The process start as epoch ms, comparable with ISO timestamps (T337 review: reject a session row older than its process). */
-export function procStartEpochMs(pid) {
-    const start = procStart(pid);
-    if (!start)
-        return null;
+/** Epoch ms for any recorded start format: `linux:boot:ticks`, `ps-utc:` (UTC lstart), or procTable's
+ *  raw local-zone lstart. Null when the string is none of those — unparseable is never proof of reuse. */
+export function recordedStartEpochMs(start) {
     if (start.startsWith("linux:")) {
         const ticks = Number(start.split(":")[2]);
         try {
@@ -188,11 +186,26 @@ export function procStartEpochMs(pid) {
             return null;
         }
     }
-    const m = PS_LSTART_RE.exec(start.replace(/^ps-utc:/, ""));
+    const utc = start.startsWith("ps-utc:");
+    const m = PS_LSTART_RE.exec(utc ? start.slice("ps-utc:".length) : start);
     if (!m)
         return null;
-    // procTable's lstart is captured in the process's local zone (LC_ALL=C): build the epoch locally.
-    return new Date(Number(m[6]), PS_MONTHS[m[1]], Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5])).getTime();
+    return utc ? Date.UTC(Number(m[6]), PS_MONTHS[m[1]], Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5]))
+        : new Date(Number(m[6]), PS_MONTHS[m[1]], Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5])).getTime();
+}
+/** The same recorded process birth across formats: mcp-process rows record procStart's raw lstart (or
+ *  linux: ticks) while lease evidence is ps-utc. Returns false only when both starts parse and name
+ *  different moments (a reused pid); an unparseable start is not proof of reuse, so the row keeps. */
+export function recordedStartMatches(recorded, live) {
+    if (recorded === live)
+        return true;
+    const a = recordedStartEpochMs(recorded), b = recordedStartEpochMs(live);
+    return a === null || b === null ? true : a === b;
+}
+/** The process start as epoch ms, comparable with ISO timestamps (T337 review: reject a session row older than its process). */
+export function procStartEpochMs(pid) {
+    const start = procStart(pid);
+    return start ? recordedStartEpochMs(start) : null;
 }
 const grokSessionsFile = () => process.env.MBX_GROK_SESSIONS_FILE || join(process.env.GROK_HOME || join(homedir(), ".grok"), "active_sessions.json");
 /** The grok CLI tracks live sessions in active_sessions.json: [{session_id, pid, cwd, opened_at}].

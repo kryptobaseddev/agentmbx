@@ -3,7 +3,7 @@
 import { randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { NAME_RE } from "./envelope.ts";
-import { _resetPsEvidenceCache, procSeams, psEvidenceTable, readLinuxProcess, sleepSync } from "./proc.ts";
+import { _resetPsEvidenceCache, procSeams, psEvidenceTable, readLinuxProcess, recordedStartMatches, sleepSync } from "./proc.ts";
 import type { Store } from "./store.ts";
 
 // Only a synchronous, open write operation may attest which sender it currently holds.
@@ -135,6 +135,62 @@ export function inspectLeaseProcesses(pids: number[]): Map<number, ProcessEviden
 }
 
 export const _resetEvidenceCacheForTests = () => { evidenceCache.clear(); selfEvidenceCache = null; _resetPsEvidenceCache(); };
+
+// ---- T507: sweep rows of processes that died before running their cleanup ---------------------
+
+/** Positive-death verdict shared by the stale-row sweeps: ESRCH, or a live pid whose birth time
+ *  differs from the recorded one. Starts may be recorded in either format (mcp-process rows carry
+ *  procStart's raw lstart; lease evidence is ps-utc), so the comparison is epoch-based.
+ *  Unknown evidence and a live pid with no readable start keep the row: a live process's rows are
+ *  never swept (T507 AC2), and unknown never acts (T340). */
+export const processGone = (recordedStart: string | null, p: ProcessEvidence): boolean =>
+  p.alive === false || (p.alive === true && recordedStart !== null && p.start !== null && !recordedStartMatches(recordedStart, p.start));
+
+/** Batched evidence for a pid set: one inventory read, unless a test inspect override is given. */
+function evidenceFor(pids: number[], inspect?: (pid: number) => ProcessEvidence): (pid: number) => ProcessEvidence {
+  if (inspect) return (pid) => { try { return inspect(pid); } catch { return UNKNOWN_PROCESS; } };
+  const table = inspectLeaseProcesses(pids);
+  return (pid) => table.get(pid) ?? UNKNOWN_PROCESS;
+}
+
+export interface DeadHolderCensus { leases: IdentityLease[]; unknown: number }
+
+/** Walk every unreleased lease once, visiting those whose holder process is positively dead or
+ *  reborn, with one batched evidence read. Unknown evidence keeps the row and is counted. */
+function eachDeadHolder(store: Store, inspect: ((pid: number) => ProcessEvidence) | undefined,
+  visit: (row: IdentityLease, reason: "dead" | "pid-reused") => void): { unknown: number } {
+  const rows = store.db.prepare("SELECT * FROM identity_leases WHERE released_at IS NULL").all() as unknown as IdentityLease[];
+  const evidence = evidenceFor(rows.map((r) => r.holder_pid), inspect);
+  let unknown = 0;
+  for (const row of rows) {
+    const p = evidence(row.holder_pid);
+    if (p.alive === null) { unknown++; continue; } // unreadable evidence keeps the row
+    if (processGone(row.holder_start, p)) visit(row, p.alive === false ? "dead" : "pid-reused");
+  }
+  return { unknown };
+}
+
+/** Unreleased leases whose holder process is positively dead or reborn. Read-only; doctor's row and
+ *  the sweep share this census, so the count doctor reports is exactly what the sweep will clear. */
+export function deadHolderLeases(store: Store, options: { inspect?: (pid: number) => ProcessEvidence } = {}): DeadHolderCensus {
+  const leases: IdentityLease[] = [];
+  const { unknown } = eachDeadHolder(store, options.inspect, (row) => leases.push(row));
+  return { leases, unknown };
+}
+
+/** Release the leases deadHolderLeases counts (reason "dead" or "pid-reused"): the holder is gone
+ *  or its pid was reused, and a force-killed process never ran mbx_identity release. Rows are
+ *  marked released, never deleted, so history (hasHeldIdentity, recovery) survives. */
+export function sweepDeadHolderLeases(store: Store, options: { now?: number; inspect?: (pid: number) => ProcessEvidence } = {}): { name: string; reason: string }[] {
+  const now = options.now ?? Date.now();
+  const released: { name: string; reason: string }[] = [];
+  eachDeadHolder(store, options.inspect, (row, reason) => {
+    if (!store.db.prepare("UPDATE identity_leases SET released_at=?,release_reason=? WHERE name=? AND token=? AND released_at IS NULL").run(now, reason, row.name, row.token).changes) return;
+    store.audit("identity.expire", { name: row.name, holder: { pid: row.holder_pid, start: row.holder_start, keyFp: row.key_fp, cli: row.cli, sessionId: row.session_id }, reason, at: now });
+    released.push({ name: row.name, reason });
+  });
+  return released;
+}
 
 export class IdentityLeases {
   #prepared = new AsyncLocalStorage<EvidenceScope>();
