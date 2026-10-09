@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, copyFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, copyFileSync, chmodSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -15,6 +15,13 @@ import { INSTRUCTIONS } from "../src/mcp.ts";
 import { spawnSync } from "node:child_process";
 import { publishIdentityControl, type IdentityControlDescriptor } from "../src/identity-control.ts";
 import { holderProviderView } from "../src/identity-availability.ts";
+
+// macOS ps preserves the invoked symlink name while dyld resolves the original Node install.
+// Linux procfs resolves symlinks, so its executable-identity fixture must remain a real copy.
+const fakeExecutable = (path: string) => {
+  if (process.platform === "darwin") symlinkSync(process.execPath, path);
+  else { copyFileSync(process.execPath, path); chmodSync(path, 0o755); }
+};
 
 test("provider resolution crosses Node/Bun runtimes, stops at shells and unknown ancestry", () => {
   const table = new Map([[10, { ppid: 20 }], [20, { ppid: 30 }], [30, { ppid: 1 }]]);
@@ -46,11 +53,11 @@ test("OpenCode runtime reconnects co-use, shell-spawned MCPs refuse, other conve
     const fixture = mkdtempSync(join(tmpdir(), "mbx-t469-executable-"));
     t.after(() => rmSync(fixture, { recursive: true, force: true }));
     const executable = join(fixture, "opencode");
-    copyFileSync(process.execPath, executable); chmodSync(executable, 0o755);
+    fakeExecutable(executable);
     const env: NodeJS.ProcessEnv = { ...process.env, T469_HARNESS_FIXTURE: "1" };
     // A fresh test runner must not inherit the parent's internal worker context.
     delete env.NODE_TEST_CONTEXT;
-    const child = spawnSync(executable, ["--test", "--test-name-pattern=^OpenCode runtime", "--test-timeout=120000", "--test-force-exit", import.meta.filename], {
+    const child = spawnSync(executable, ["--test", "--test-isolation=none", "--test-name-pattern=^OpenCode runtime", "--test-timeout=120000", "--test-force-exit", import.meta.filename], {
       env, encoding: "utf8", timeout: 150000,
     });
     assert.equal(child.status, 0, `${child.error ?? ""}\n${child.stdout}\n${child.stderr}`);
@@ -62,7 +69,7 @@ test("OpenCode runtime reconnects co-use, shell-spawned MCPs refuse, other conve
   t.after(async () => { for (const c of clients.reverse()) await c.close().catch(() => {}); node.close(); rmSync(home, { recursive: true, force: true }); });
   // Real executable names work on both Linux procfs and macOS ps. Mutable titles do not.
   const runtime = join(home, "node"), shellRuntime = join(home, "zsh");
-  for (const executable of [runtime, shellRuntime]) { copyFileSync(process.execPath, executable); chmodSync(executable, 0o755); }
+  for (const executable of [runtime, shellRuntime]) fakeExecutable(executable);
   const wrapper = join(home, "runtime.mjs");
   writeFileSync(wrapper, `import { spawn } from 'node:child_process';
 const c = spawn(process.env.T469_NODE, process.argv.slice(2), { stdio: 'inherit' });
@@ -76,7 +83,7 @@ process.on('SIGTERM', () => c.kill('SIGTERM'));`);
     return c;
   };
   const call = (c: Client, name: string, args = {}, sid = "ses_t469") => c.callTool({ name, arguments: args, _meta: { sessionID: sid } });
-  const lease = () => node.store.db.prepare("SELECT token,holder_pid,released_at FROM identity_leases WHERE name='reconnect-reader'").get();
+  const lease = () => node.store.db.prepare("SELECT token,holder_pid,key_fp,released_at FROM identity_leases WHERE name='reconnect-reader'").get();
   const first = await connect();
   assert.notEqual((await call(first, "mbx_identity", { action: "register", name: "reconnect-reader", role: "test" })).isError, true);
   const held = lease();
@@ -101,13 +108,20 @@ process.on('SIGTERM', () => c.kill('SIGTERM'));`);
   assert.equal(stranger.agent, null); assert.deepEqual(lease(), held);
   assert.equal((await call(next, "mbx_read", { ids: [mail] }, "ses_stranger")).isError, true);
   assert.equal(((await call(next, "mbx_whoami")).structuredContent as { agent: string }).agent, "reconnect-reader");
+  const identitySibling = await connect();
+  assert.equal(((await call(identitySibling, "mbx_whoami")).structuredContent as { agent: string }).agent, "reconnect-reader");
+  // Existing sibling retains the old token; the respawned holder has a fresh MCP key/generation.
   await first.close();
-  const deadline = Date.now() + 10_000;
-  while (lease()!.token === held!.token || lease()!.released_at !== null) {
-    assert.ok(Date.now() < deadline, "EOF did not permit resume");
-    await call(next, "mbx_whoami"); await new Promise(r => setTimeout(r, 50));
-  }
+  const replacement = await connect();
+  assert.equal(((await call(replacement, "mbx_whoami")).structuredContent as { agent: string }).agent, "reconnect-reader");
+  const renewed = lease(); assert.notEqual(renewed!.token, held!.token);
+  assert.notEqual(renewed!.key_fp, held!.key_fp, "respawn mints a new MCP key");
+  assert.equal(((await call(identitySibling, "mbx_whoami")).structuredContent as { agent: string }).agent, "reconnect-reader");
+  // The FIRST mailbox call must refresh co-use, not return unbound until a later identity call.
   assert.notEqual((await call(next, "mbx_read", { ids: [mail] })).isError, true);
+  assert.equal(((await call(next, "mbx_whoami")).structuredContent as { agent: string }).agent, "reconnect-reader");
+  assert.deepEqual(lease(), renewed, "co-user does not replace the respawned holder");
+
 });
 
 test("force takeover refuses its own live session before owner signing and preserves the lease", t => {
