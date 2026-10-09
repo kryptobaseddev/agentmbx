@@ -41,3 +41,29 @@ test("opencode provider walk stops at a cross-directory node or bun parent", () 
   const compiled = new Map([[10, "/tmp/build/opencode"], [20, "/usr/bin/node"]]);
   assert.equal(walk(compiled, short), 10);
 });
+
+test("a bare node proxy still reaches opencode from a full-path generation", () => {
+  const table = new Map([[10, { ppid: 20 }], [20, { ppid: 30 }], [30, { ppid: 1 }]]);
+  const commands = new Map([
+    [10, "/Users/keaton/.local/share/mise/installs/node/24.21.0/bin/node"],
+    [20, "node"],
+    [30, "/Applications/OpenCode.app/Contents/MacOS/opencode"],
+  ]);
+  assert.equal(walk(commands, table), 30);
+});
+
+test("a provider walk reads each pid once", () => {
+  const table = new Map([[10, { ppid: 20 }], [20, { ppid: 30 }], [30, { ppid: 1 }]]);
+  const commands = new Map([
+    [10, "/opt/homebrew/bin/node"],
+    [20, "/opt/homebrew/bin/bun"],
+    [30, "/opt/homebrew/bin/opencode"],
+  ]);
+  const calls: number[] = [];
+  const found = opencodeProviderPid(10, table, p => {
+    calls.push(p);
+    return commands.get(p) ?? "";
+  });
+  assert.equal(found, 30);
+  assert.deepEqual(calls, [10, 20, 30]);
+});
