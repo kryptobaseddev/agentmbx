@@ -102,10 +102,11 @@ test("T391 doctor service check: silent unbound, ok reachable, warn with fix dow
     assert.equal(await opencodeServiceCheck(node, down), null);
     node.store.db.prepare("INSERT INTO sessions (agent, cli, session_id, channel, updated_at) VALUES (?, 'opencode', ?, 0, ?)")
       .run("agentmbx-opencode", "ses_test1", new Date().toISOString());
-    const ok = await opencodeServiceCheck(node, up);
+    const svcHost = () => "service" as const; // T524: these bindings are hosted by the shared service
+    const ok = await opencodeServiceCheck(node, up, svcHost);
     assert.equal(ok?.level, "ok");
     assert.match(ok?.label ?? "", /service reachable/);
-    const warn = await opencodeServiceCheck(node, down);
+    const warn = await opencodeServiceCheck(node, down, svcHost);
     assert.equal(warn?.level, "warn");
     assert.match(warn?.label ?? "", /cannot be woken/);
     assert.match(warn?.fix ?? "", /opencode/);
@@ -147,6 +148,7 @@ function stubSynthetic(posts: SyntheticPost[]) {
   const realFetch = globalThis.fetch;
   const realUrl = process.env.MBX_OPENCODE_URL;
   process.env.MBX_OPENCODE_URL = "http://127.0.0.1:9";
+  (globalThis as { __mbxArgv?: string[] }).__mbxArgv = ["opencode", "serve", "--service"]; // T524: plugin loaded by the shared service
   globalThis.fetch = (async (url: unknown, init?: { body?: unknown; headers?: unknown }) => {
     const body = JSON.parse(String(init?.body)) as SyntheticPost["body"];
     posts.push({ url: String(url), body, auth: String((init?.headers as Record<string, string> | undefined)?.authorization ?? "") });
@@ -155,6 +157,7 @@ function stubSynthetic(posts: SyntheticPost[]) {
   }) as typeof fetch;
   return () => {
     if (realUrl === undefined) delete process.env.MBX_OPENCODE_URL; else process.env.MBX_OPENCODE_URL = realUrl;
+    delete (globalThis as { __mbxArgv?: string[] }).__mbxArgv;
     globalThis.fetch = realFetch;
   };
 }

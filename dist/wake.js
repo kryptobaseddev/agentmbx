@@ -11,6 +11,7 @@ import { GROK_NO_PUSH, MbxNode, trustLabel } from "./node.js";
 import { captureWakeIdentity } from "./wake-identity.js";
 import { policyBrief } from "./policy.js";
 import { ulid } from "./crypto.js";
+import { opencodeHostOf } from "./opencode-provider.js";
 const run = promisify(execFile);
 const attemptId = () => ulid();
 const receipt = (strength, r = {}) => ({ strength, nativeId: null, sessionId: null, nativeStatus: null, providerVersion: null, ...r });
@@ -97,8 +98,19 @@ export async function opencodeService() {
         return null;
     }
 }
+/** T524: why a session that the shared service does not host is never pushed through it. */
+export const OPENCODE_STANDALONE_NO_PUSH = "session is hosted by a standalone OpenCode serve; the shared service would start a duplicate agent loop (next-prompt delivery only)";
+/** Push a wake into an OpenCode session through the shared service's synthetic endpoint — ONLY when
+ *  that service is the process hosting the session (`pid` is the binding's recorded provider pid).
+ *  T524: for a session hosted by a standalone/private serve (`opencode --standalone` spawns
+ *  `opencode serve --stdio`), resume:true makes the service start a second agent loop on the same
+ *  session, so that case — and an unknown host — is not_submitted/no-target with no service call. */
 export async function wakeOpencode(sessionId, text, o = {}) {
     const via = "opencode synthetic";
+    const host = (o.host ?? opencodeHostOf)(o.pid);
+    if (host !== "service")
+        return outcome(via, { kind: "not_submitted", reason: "no-target", detail: host === "standalone" ? OPENCODE_STANDALONE_NO_PUSH
+                : "the OpenCode process hosting this session is unknown; not pushing through the shared service, which could start a duplicate agent loop" });
     const svc = await (o.service ?? opencodeService)();
     if (!svc)
         return outcome(via, { kind: "not_submitted", reason: "unavailable" }, "opencode service not running");
@@ -470,7 +482,7 @@ export async function dispatchWakes(node, now = Date.now()) {
             if (s.cli === "codex")
                 result = await wakeCodex(s.session_id, text, { recheck });
             else if (s.cli === "opencode")
-                result = await wakeOpencode(s.session_id, text, { recheck });
+                result = await wakeOpencode(s.session_id, text, { recheck, pid: s.pid });
             else if (s.cli === "kimi")
                 result = kimiDesktop(s.pid) ? await wakeKimiDesktop(s, text, { recheck }) : await wakeKimi(s, text, { recheck });
             else if (s.cli === "grok")
