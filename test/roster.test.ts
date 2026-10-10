@@ -42,13 +42,13 @@ function world(t: { after: (fn: () => unknown) => void }) {
     leases.claim(name, { pid, start: `birth-${pid}`, cli: o.cli ?? "claude", sessionId: `s-${name}`, keyFp: "aaaa-bbbb-cccc-dddd" });
     if (o.registered !== false) registerIdentity(node.store, { name, role: o.role ?? "builder", description: o.description ?? null });
     node.registerAgent(name, { cli: o.cli ?? "claude", ...(o.role ? { role: o.role } : {}), ...(o.description ? { description: o.description } : {}) });
-    if (o.project) noteProject(node.store, name, o.project);
+    if (o.project) noteProject(node.store, name, o.project, true);
     return pid;
   };
   const member = (name: string, project: string, role = "builder") => {
     registerIdentity(node.store, { name, role });
     node.registerAgent(name, { role });
-    noteProject(node.store, name, project);
+    noteProject(node.store, name, project, true);
   };
   const designate = (agent: string, project: string, host = "alpha") => {
     const rec = makeLead({ project, agent, host, ownerPub: owner.publicKey });
@@ -150,7 +150,7 @@ test("AC4: retired and generated names are hidden unless live or idle; all:true 
   w.member("old-retired", A);
   w.node.store.set(retiredKey("old-retired"), "retired");
   w.node.registerAgent("agent-a1b2c3d4e5", { cli: "claude" });             // generated: never registered
-  noteProject(w.node.store, "agent-a1b2c3d4e5", A);
+  noteProject(w.node.store, "agent-a1b2c3d4e5", A, true);
   w.hold("agent-9f8e7d6c5b", { project: A, registered: false });           // generated name, but a live session holds it
 
   const r = w.roster({ project: A });
