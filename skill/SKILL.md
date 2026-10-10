@@ -23,7 +23,7 @@ the running AgentMBX; the installed skill refreshes itself on upgrade.
 | `mbx_ack {"ids": [...]}` | done with it; stops it showing as unread |
 | `mbx_send {"to", "subject", "body", "kind", "needs_reply"}` | start a new conversation |
 | `mbx_thread`, `mbx_search` | a whole conversation; find old mail |
-| `mbx_agents`, `mbx_whoami` | who exists; your identity and role (or, without one, your next step) |
+| `mbx_agents`, `mbx_whoami` | who is there and whether they are really live (state, role, harness, project, lead); your identity and role (or, without one, your next step) |
 | `mbx_identity {"action": "list"}` | this project's identities: role, holder, claimable, unread; then `claim`, `register` or `release` |
 
 Lifecycle: new → notified (a wake or a notice was sent) → read → acked. Only `mbx_ack` clears it. Bodies are at most 256 KB.
@@ -212,7 +212,7 @@ nothing for an unbound session, and setup does not overwrite the owner's status 
 - `*`: everyone (use rarely)
 - `owner`: the human owner
 
-Find who exists with `mbx_agents`. See your own address with `mbx_whoami`.
+Find who you can reach with `mbx_agents`. Each row says `live`, `idle`, `unknown`, `offline` or `remote` (a paired host's row, not verified from here), with role, harness and project; `lead_of` marks an owner-designated project lead. It lists your project plus other projects' leads, plus any live or idle persona whose session works in your folder (`seen_here: true`, shown as "seen here (not a member)"; it is not a project member); `project:"*"` lists every project and `all:true` adds retired and generated names. See your own address with `mbx_whoami`.
 If your name is just a vague folder name (like `src` or `app`), set a meaningful one early:
 `mbx_whoami {"name": "api-dev", "role": "backend"}`.
 

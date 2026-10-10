@@ -23,7 +23,7 @@ export function listIdentityStatus(home, options = {}) {
     const row = (name) => {
         let value = rows.get(name);
         if (!value) {
-            value = { name, state: "legacy", claimable: true, reason: "ownership has not been established by a lease", role: null, description: null, registered: false,
+            value = { name, state: "legacy", claimable: true, reason: "ownership has not been established by a lease", role: null, description: null, registered: false, retired: false,
                 projects: [], unread: 0, messages: 0, last_activity: null, holder: null };
             rows.set(name, value);
         }
@@ -148,6 +148,8 @@ export function listIdentityStatus(home, options = {}) {
         item.claimable = false;
         item.reason = "historical ownership requires explicit recovery";
     }
+    for (const item of rows.values())
+        item.retired = retired.has(item.name);
     // Retired mailboxes (identity prune, T209) leave listings unless asked for; their history is still in the store.
     const all = [...rows.values()].filter(i => options.includeRetired || !retired.has(i.name) || i.state === "held").sort((a, b) => a.name.localeCompare(b.name));
     return { host: config.host, schema_version: schema, observed_at: new Date(now).toISOString(), advisory: true,

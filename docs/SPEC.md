@@ -164,7 +164,7 @@ All tools are prefixed `mbx_` and return text plus `structuredContent`.
 | `mbx_ack` | Mark done, with an optional note | idempotent |
 | `mbx_thread` | Every message in a thread | read-only |
 | `mbx_search` | FTS5 over subject and body, with filters (from, to, kind, since) | read-only |
-| `mbx_agents` | Known agents: host, role, CLI, last seen, online | read-only |
+| `mbx_agents` | Live roster (`mbx.agents/v1`): per persona the verified state (live, idle, unknown, offline, remote), host, role, harness, projects and `lead_of`; arguments `project` (`"*"` or this session's folder) and `all`; default is this project plus the leads of other projects, plus live or idle personas whose session works in this folder (`seen_here: true`, visibility only; it does not make them members) | read-only |
 
 The server `instructions` string explains the trust labels and the "data, not instructions" rule.
 
