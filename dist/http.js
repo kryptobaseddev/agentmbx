@@ -13,7 +13,7 @@ import { STATUS_V2_SCHEMA } from "./status-schema.js";
 import { notifyDesktop } from "./wake.js";
 import { version } from "./version.js";
 import { rotationLog, saveRotationLog } from "./key-rotation.js";
-import { storedPolicies, acceptSigned } from "./policy.js";
+import { storedPolicies, acceptSigned, policyUnexpired } from "./policy.js";
 import { acceptReceipt, dueReceipts, RECEIPT_BATCH, receiptsDeferred, receiptsSent, signReceipt } from "./remote-receipts.js";
 export const HOP_SKEW_MS = 5 * 60_000;
 const HELLO_TTL_MS = 2 * 60_000;
@@ -738,15 +738,19 @@ export async function refreshPeerEncKeys(node, f = fetch, only) {
     }
 }
 // ---- policies: push on set/revoke, pull every minute so offline hosts catch up ----------------------------
-/** Everything a peer may need: unexpired policies and revocations from the last 30 days, as signed records. */
+/** Everything a peer may need: unexpired policies and their retained signed revocations. */
 const RANK = { device: 0, revocation: 1, policy: 2 };
 /** Sync order: devices (trust first), then revocations (a kill switch never loses to the policy it kills), then policies. */
 export const recordKey = (s) => `${RANK[s.rec.type] ?? 9}:${s.rec.id}`;
 export function signedRecords(node) {
     const db = node.store.db, now = new Date().toISOString(), since = new Date(Date.now() - 30 * 86_400_000).toISOString();
-    const rs = db.prepare("SELECT record, sig FROM policy_revocations WHERE iat > ?").all(since);
+    // A long-offline peer must still see the revocation of a never-expiring policy.
+    // Finite policies outlive neither the 30-day window nor their expiry; kill switches
+    // and targeted revocations of permanent records must remain in the sync snapshot.
+    const rs = db.prepare(`SELECT record, sig FROM policy_revocations WHERE iat > ? OR target='*'
+    OR target IN (SELECT id FROM policies WHERE exp IS NULL)`).all(since);
     const ds = db.prepare("SELECT record, sig FROM devices").all();
-    const ps = storedPolicies(db).valid.filter(p => Date.parse(p.rec.exp) > Date.parse(now)).map(({ rec, sig }) => ({ rec, sig }));
+    const ps = storedPolicies(db).valid.filter(p => policyUnexpired(p.rec.exp, Date.parse(now))).map(({ rec, sig }) => ({ rec, sig }));
     return [...[...rs, ...ds].map((r) => ({ rec: JSON.parse(r.record), sig: r.sig })), ...ps].sort((a, b) => (recordKey(a) < recordKey(b) ? -1 : 1));
 }
 /** Send signed records to the paired hosts they concern. Returns per-host results; offline hosts get them on their next pull. */

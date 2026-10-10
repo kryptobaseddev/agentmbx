@@ -75,7 +75,8 @@ export class MbxNode {
             privatePath(join(home, file), 0o600, true);
         const cfgPath = join(home, "config.json"), keyPath = join(home, "host.key"), encPath = join(home, "enc.key");
         if (!existsSync(cfgPath)) {
-            const c = { host: init.host ?? shortHost(), port: init.port ?? DEFAULT_PORT, bind: init.bind ?? "0.0.0.0" };
+            const c = { host: init.host ?? shortHost(), port: init.port ?? DEFAULT_PORT, bind: init.bind ?? "0.0.0.0",
+                ...(init.loop_detector ? { loop_detector: init.loop_detector } : {}) };
             if (!NAME_RE.test(c.host))
                 throw new Error(`invalid host name "${c.host}" (use a-z, 0-9, -)`);
             writeFileSync(cfgPath, JSON.stringify(c, null, 2) + "\n", { mode: 0o600 });
@@ -943,7 +944,7 @@ export class MbxNode {
     depthSuppressed(agent) {
         return this.inbox(agent).flatMap((m) => {
             const p = this.policyFor(m, agent);
-            return p.notes.some((n) => /^relay depth \d+ exceeds/.test(n)) ? [{ id: m.id, from: m.from_addr, hop: p.hop ?? 0 }] : [];
+            return p.depthSuppressed ? [{ id: m.id, from: m.from_addr, hop: p.hop ?? 0 }] : [];
         });
     }
     /** The owner policy that applies to `agent` acting on this message (computed now: expiry/revocation count). */

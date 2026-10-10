@@ -35,7 +35,9 @@ export const didWarning = (did: string | undefined) => did && did.length > DID_M
 export const WAKE_KINDS = new Set(["request", "task", "decision", "alert"]);
 export const WAKE_LIMITS = { perAgentSeconds: 30, perThreadHour: 6, perAgentDay: 60 };
 
-export interface Config { host: string; port: number; bind: string }
+export interface Config { host: string; port: number; bind: string;
+  /** Observational only; defaults to >50 automated messages in 10 minutes. */
+  loop_detector?: { message_threshold?: number; window_minutes?: number } }
 /** One resolved recipient of a send (T205): a local mailbox (`name`), a paired host (`host`, with `name` when addressed). */
 export interface RouteTarget { to: string; name?: string; host?: string; renamed_from?: string; unknown?: true }
 export interface Peer { host: string; pubkey: string; owner_pubkey: string | null; addr: string; state: string; code: string | null; approved_at: string | null; enc_pub?: string | null; prev_keys?: string | null }
@@ -82,7 +84,8 @@ export class MbxNode {
     for (const file of ["config.json", "host.key", "enc.key", "owner.key", "owner.json", "retired-keys.json", "rotations.json"]) privatePath(join(home, file), 0o600, true);
     const cfgPath = join(home, "config.json"), keyPath = join(home, "host.key"), encPath = join(home, "enc.key");
     if (!existsSync(cfgPath)) {
-      const c: Config = { host: init.host ?? shortHost(), port: init.port ?? DEFAULT_PORT, bind: init.bind ?? "0.0.0.0" };
+      const c: Config = { host: init.host ?? shortHost(), port: init.port ?? DEFAULT_PORT, bind: init.bind ?? "0.0.0.0",
+        ...(init.loop_detector ? { loop_detector: init.loop_detector } : {}) };
       if (!NAME_RE.test(c.host)) throw new Error(`invalid host name "${c.host}" (use a-z, 0-9, -)`);
       writeFileSync(cfgPath, JSON.stringify(c, null, 2) + "\n", { mode: 0o600 });
     }
@@ -837,7 +840,7 @@ export class MbxNode {
   depthSuppressed(agent: string): { id: string; from: string; hop: number }[] {
     return this.inbox(agent).flatMap((m) => {
       const p = this.policyFor(m, agent);
-      return p.notes.some((n) => /^relay depth \d+ exceeds/.test(n)) ? [{ id: m.id, from: m.from_addr, hop: p.hop ?? 0 }] : [];
+      return p.depthSuppressed ? [{ id: m.id, from: m.from_addr, hop: p.hop ?? 0 }] : [];
     });
   }
 
