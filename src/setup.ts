@@ -1099,13 +1099,79 @@ const inject = async (ctx: NoteCtx, sid: string, hook: string, text: string): Pr
   return false;
 };
 
+/** T519: the daemon's loopback queue is how a standalone serve receives a wake. null disables the
+ *  poll (unit tests set it so they never touch a daemon). A string is that port. Otherwise the
+ *  daemon port the sidebar already uses. */
+const wakePort = (): string | null => {
+  const seam = (globalThis as { __mbxWakePort?: string | null }).__mbxWakePort;
+  if (seam === null) return null;
+  if (typeof seam === "string" && seam.length > 0) return seam;
+  const env = process.env.MBX_PORT;
+  return env && env.length > 0 ? env : "7373";
+};
+/** The receipt is the id the host returned, not the id we offered. A direct id and a data.id both count. */
+const nativeMsgId = (result: unknown): string | null => {
+  if (!result || typeof result !== "object") return null;
+  const r = result as { id?: unknown; data?: { id?: unknown } };
+  const id = typeof r.id === "string" ? r.id : r.data && typeof r.data.id === "string" ? r.data.id : "";
+  return id.startsWith("msg_") ? id : null;
+};
+/** A queued wake is a different admission from a hook note. The host's id is what we report back. */
+const admitWake = async (ctx: NoteCtx, sid: string, text: string): Promise<string | null> => {
+  if (!sid || !text) return null;
+  const body = { sessionID: sid, id: noteId(sid, "wake", text), text, resume: false, delivery: "queue" };
+  const session = ctx?.session;
+  try {
+    if (typeof session?.synthetic === "function") return nativeMsgId(await session.synthetic(body));
+  } catch { /* this host has no synthetic: try prompt with the same admission */ }
+  try {
+    if (typeof session?.prompt === "function") return nativeMsgId(await session.prompt(body));
+  } catch { return null; }
+  return null;
+};
+const wakeWatching = new Set<string>();
+const pause = (ms: number) => new Promise<void>((r) => { const t = setTimeout(r, ms); t.unref(); });
+/** One long-poll per session, started once the session id is known, so both plugin generations share it.
+ *  The poll admits through the serve we are already inside. It never posts to the shared service. */
+const watchWake = (ctx: NoteCtx, sid: string): void => {
+  if (!sid || wakeWatching.has(sid) || wakePort() === null) return;
+  wakeWatching.add(sid);
+  void (async () => {
+    while (wakeWatching.has(sid)) {
+      const port = wakePort();
+      if (!port) { wakeWatching.delete(sid); return; }
+      const base = "http://127.0.0.1:" + port + "/v1/opencode-wake";
+      let text: string | null = null;
+      try {
+        const res = await fetch(base + "?session=" + encodeURIComponent(sid) + "&pid=" + String(process.pid));
+        if (res.status === 204) { await pause(200); continue; }
+        if (!res.ok) { await pause(1000); continue; }
+        const j = await res.json() as { text?: unknown };
+        text = typeof j.text === "string" && j.text ? j.text : null;
+      } catch {
+        if (wakePort() === null) { wakeWatching.delete(sid); return; }
+        await pause(1000);
+        continue;
+      }
+      if (!text) continue;
+      const id = await admitWake(ctx, sid, text);
+      if (!id) continue;
+      try {
+        await fetch(base, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionID: sid, id }) });
+      } catch { /* the receipt wait ends; nothing is sent to the shared service */ }
+    }
+  })();
+};
+
 /** One hook call: the JSON payload goes in on stdin; stdout is captured; a reason we recognize is
- *  admitted through the hosting serve's session API. A failure never surfaces. */
+ *  admitted through the hosting serve's session API. A failure never surfaces. The same call starts
+ *  the standalone wake poll once the session id is known. */
 const call = async (ctx: NoteCtx, bin: string[], event: string, payload: Record<string, unknown>): Promise<void> => {
   try {
+    const sid = typeof payload.session_id === "string" ? payload.session_id : null;
+    if (sid) watchWake(ctx, sid);
     const out = await new Promise<string>((resolve) => spawnCli(bin, ["hook", event, "--cli", "opencode"], JSON.stringify(payload), resolve));
     const reason = hookReason(out);
-    const sid = typeof payload.session_id === "string" ? payload.session_id : null;
     if (reason && sid) await inject(ctx, sid, event, reason);
   } catch { /* hook failures must never surface in the host TUI */ }
 };

@@ -119,6 +119,8 @@ test("T391 doctor service check: silent unbound, ok reachable, warn with fix dow
 
 /** Importable copy of the generated plugin source under test (Node 24 strips the erasable types). */
 async function loadPlugin() {
+  // T519 polls the daemon unless this seam is null. These cases must not touch port 7373.
+  (globalThis as { __mbxWakePort?: string | null }).__mbxWakePort = null;
   const dir = mkdtempSync(join(tmpdir(), "mbx-opencode-plugin-eval-"));
   const file = join(dir, "agentmbx.ts");
   writeFileSync(file, opencodePluginSource(CMD, version()));

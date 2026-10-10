@@ -50,6 +50,8 @@ test("plugin template admits in-process and never calls the shared service", () 
 });
 
 async function loadPlugin() {
+  // T519 polls the daemon unless this seam is null. These cases must not touch port 7373.
+  (globalThis as { __mbxWakePort?: string | null }).__mbxWakePort = null;
   const dir = mkdtempSync(join(tmpdir(), "mbx-t524-plugin-"));
   const file = join(dir, "agentmbx.ts");
   writeFileSync(file, opencodePluginSource(CMD, version()));
