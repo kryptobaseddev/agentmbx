@@ -12,6 +12,7 @@ import {
   PROBE_REPLY_MARKER, PROBE_SUBJECT_PREFIX, buildProbeReport, globMatch, planProbe, probeBody, probeSubject, runProbe,
   storeProbeIO, type ProbeIO, type SentProbe, type TargetObservation,
 } from "../src/probe.ts";
+import { noteProject } from "../src/registry.ts";
 import { bindWakeLease } from "./helpers/wake-lease.ts";
 
 const identity = (name: string, state: IdentityStatus["state"], holder: IdentityStatus["holder"] = null): IdentityStatus =>
@@ -470,8 +471,11 @@ test("storeProbeIO: historical membership but a live session elsewhere is not ta
   const n = new MbxNode(home, { host: "alpha" });
   t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   bindWakeLease(n, { agent: "local-worker", cli: "kimi", session_id: "term-local", pid: process.pid, cwd: "/proj" });
+  bindWakeLease(n, { agent: "cwd-only", cli: "codex", session_id: "term-cwd", pid: process.pid, cwd: "/proj" });
   bindWakeLease(n, { agent: "outsider", cli: "claude", session_id: "term-elsewhere", pid: process.pid, cwd: "/other" });
   bindWakeLease(n, { agent: "probe-runner", cli: "claude", session_id: "runner-1", pid: process.pid, cwd: "/proj" });
+  // A session cwd is not membership (T515). local-worker is a member because of the binding, and the live cwd still has to match (T445).
+  noteProject(n.store, "local-worker", "/proj");
   // outsider once worked in /proj — historical identity_projects membership only.
   n.store.db.prepare("INSERT INTO identity_projects (name,project,first_seen,last_seen) VALUES (?,?,?,?)")
     .run("outsider", "/proj", new Date().toISOString(), new Date().toISOString());

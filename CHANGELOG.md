@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **Project lead mail no longer sits silently in a mailbox with no live holder (T491):** mail to `lead`/`role:lead` whose resolved lead mailbox has no live holder now reports the recipient state `queued-no-holder` (plainly addressed unheld agents keep `offline`), with a sender-facing warning naming the lead recipient. The daemon's 60-second pass escalates urgent copies — kind `alert` or anything carrying `needs_reply` — in established mailboxes with no live holder: one desktop notice to the owner per copy, exactly once via a kv marker, and `agentmbx doctor`'s stranded row now names how many urgent messages were escalated per mailbox. Bare project names are unchanged (T493 covers those separately).
+- **A project member is an identity_projects binding, not a session folder (T515).** `projectIdentities` and `identity list --project` no longer treat `sessions.cwd` as membership, and opening the store no longer copies historical session folders into `identity_projects`. A shared host process whose cwd is this folder does not make that persona a member, and mail that belongs only through that persona stays out of the project ledger. A recorded binding still does. `agentmbx identity bindings` lists bindings older than another project for the same identity and removes them with `--apply` (dry run by default). One project is kept, and a tie for the newest `last_seen` is kept. `agentmbx doctor` names the count.
 
 ## 0.5.22 (2026-10-10)
 

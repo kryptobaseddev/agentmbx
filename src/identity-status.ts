@@ -82,7 +82,6 @@ export function listIdentityStatus(home: string, options: { now?: number; inspec
       row(r.name as string).projects.push(r.project as string);
       if (options.project && r.project === options.project) inProject.add(r.name as string);
     }
-    if (options.project) for (const r of db.prepare("SELECT DISTINCT agent FROM sessions WHERE cwd=?").all(options.project)) inProject.add(r.agent as string);
     if (schema >= 2) leases.push(...db.prepare("SELECT * FROM identity_leases").all() as unknown as IdentityLease[]);
     db.exec("COMMIT");
   } finally { db.close(); }
