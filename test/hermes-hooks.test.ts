@@ -505,7 +505,9 @@ test("hermes hooks: with no holder the first prompt learns how to get an identit
   assert.equal(run("session-start", "u1").stdout, "", "on_session_start output is dropped by Hermes");
   const first = run("prompt", "u1");
   assert.match((JSON.parse(first.stdout) as { context: string }).context, /no mailbox identity yet/);
-  assert.equal(run("prompt", "u1").stdout, "", "said once");
+  const again = JSON.parse(run("prompt", "u1").stdout) as { context: string };
+  assert.match(again.context, /mbx disconnected: reconnect/, "T503 keeps a missing connector visible on the next prompt");
+  assert.doesNotMatch(again.context, /no mailbox identity yet/, "identity guidance is said once");
 });
 
 // ---- AC3: the watcher wake is admitted for the real Hermes session --------------------------------------------------
@@ -531,4 +533,22 @@ test("hermes watcher receipt: a bound real session makes the watcher exit an adm
   const last = attempts().at(-1)!;
   assert.deepEqual([last.outcome, last.receipt, last.via, last.session, last.pid], ["admitted", "transport", "watcher", "hermes-sess-A", after.pid],
     "T460: once the hook bound the real session, the same watcher exit is recorded as admitted for that session");
+});
+
+// T527 AC3: pre_llm_call fires per LLM call, and it is the one Hermes hook that consumes stdout as
+// injected context — so mail that arrives mid-turn (between two calls of one tool loop) reaches the
+// session on the next pre_llm_call of the same turn. No new Hermes hook is wired for this.
+test("hermes hooks: mail arriving mid-turn is injected on the next pre_llm_call of the same turn (T527)", async t => {
+  const { n, hook, ctx, agent } = await hermesHolder(t);
+  hook("session-start", "hermes-sess-midturn", { platform: "tui" });
+  const before = hook("prompt", "hermes-sess-midturn", { user_message: "start the turn", is_first_turn: true, platform: "tui" });
+  assert.equal(before.status, 0, before.stderr);
+  assert.notEqual(before.stdout, "", "the first call answers (watcher instruction or mail hint)");
+  assert.doesNotMatch(ctx(before.stdout), /unread/, "no mail yet: the turn starts clean");
+  // Mail lands while the turn is running — between two LLM calls of one tool loop.
+  sendLeased(n, { from: "boss", to: [agent], subject: "mid-turn", body: "b", kind: "request" });
+  const mid = hook("prompt", "hermes-sess-midturn", { user_message: "tool result, keep going", platform: "tui" });
+  assert.equal(mid.status, 0, mid.stderr);
+  assert.match(ctx(mid.stdout), /\[mbx\] 1 unread for worker@alpha: mbx_inbox\./, "mid-turn mail surfaces on the next pre_llm_call, in the same turn");
+  assert.doesNotMatch(ctx(mid.stdout), /mid-turn/, "counts only, never mail content");
 });

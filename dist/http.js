@@ -12,7 +12,7 @@ import { resolveStatusIdentity } from "./status-identity.js";
 import { hudStatus, hudStatusV2 } from "./hud.js";
 import { STATUS_V2_SCHEMA } from "./status-schema.js";
 import { notifyDesktop } from "./wake.js";
-import { cancelOpencodeWake, completeOpencodeWake, waitForOpencodeWake } from "./opencode-wake-queue.js";
+import { cancelOpencodeWake, completeOpencodeWake, listOpencodeWakeWaiters, waitForOpencodeWake } from "./opencode-wake-queue.js";
 import { version } from "./version.js";
 import { rotationLog, saveRotationLog } from "./key-rotation.js";
 import { storedPolicies, acceptSigned, policyUnexpired } from "./policy.js";
@@ -416,6 +416,14 @@ export function startServer(node, port = node.config.port, bind = node.config.bi
             // T519: the plugin inside a standalone OpenCode serve long-polls this, then admits the text
             // in-process. It sits before verifyHop because that plugin has no hop key. Loopback only:
             // the body is a wake pointer for a session on this machine. A 20s hold fits requestTimeoutMs.
+            // T520: doctor reads the unoffered pollers on /waiters. Same loopback rule, no wake text.
+            if (url.pathname === "/v1/opencode-wake/waiters") {
+                if (!isLoopbackRemote(req.socket.remoteAddress ?? ""))
+                    return send(403, { error: "opencode wake queue is loopback only" });
+                if (req.method !== "GET")
+                    return send(405, { error: "method not allowed" });
+                return send(200, { waiters: listOpencodeWakeWaiters() });
+            }
             if (url.pathname === "/v1/opencode-wake") {
                 if (!isLoopbackRemote(req.socket.remoteAddress ?? ""))
                     return send(403, { error: "opencode wake queue is loopback only" });

@@ -2,6 +2,7 @@
 import { sha256, ulid } from "./crypto.js";
 import { checkShape, oneLine, verifyEnvelope } from "./envelope.js";
 import { notifyDesktop } from "./wake.js";
+import { armOpencodeDuplicateLoopAudit } from "./opencode-duplicate-loop.js";
 export const LOOP_DEFAULTS = { message_threshold: 50, window_minutes: 10 };
 const ADDRESS = /^[a-z0-9][a-z0-9-]{1,39}@[a-z0-9][a-z0-9-]{1,39}$/;
 /** Invalid settings are diagnosed, rather than silently disabling reports. */
@@ -114,6 +115,8 @@ export async function reportConversationLoops(node, deps = {}) {
 }
 /** Independent from daemon delivery/reconciliation; a slow notifier cannot overlap its own next tick. */
 export function armConversationLoopReports(node) {
+    // T522: the daemon already calls this arm. The duplicate-loop audit rides the same start.
+    armOpencodeDuplicateLoopAudit(node);
     let busy = false;
     const tick = () => {
         if (busy)

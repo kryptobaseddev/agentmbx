@@ -178,3 +178,15 @@ test("T368: a full doctor run surfaces the checks and the status line never fail
   assert.equal(warn!.fix, "agentmbx setup --only kimi");
   assert.ok(!stale.some((c) => c.level === "fail" && /status line/.test(c.label)));
 });
+
+test("T527: a detected Hermes gets an explicit status-line N/A note with the live evidence (and stays silent without Hermes)", (t) => {
+  const h = home();
+  t.after(() => rmSync(h, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  assert.deepEqual(checks(h, "hermes"), [], "no Hermes install: nothing to say");
+  put(h, ".hermes/config.yaml", "model:\n  default: fake\n");
+  const check = one(h, "hermes");
+  assert.equal(check.level, "info");
+  assert.match(check.label, /hermes: no status line feature in Hermes/);
+  assert.match(check.label, /agentmbx-hermes verified live/);
+  assert.equal(check.fix, undefined);
+});

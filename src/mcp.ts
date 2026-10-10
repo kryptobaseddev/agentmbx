@@ -783,7 +783,7 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
       const leaseToken = state.leaseToken ?? claimFor(state, agent, explicit);
       rememberProvider();
       node.registerAgent(agent, { cli: env.cli, role: process.env.MBX_ROLE, description: process.env.MBX_DESCRIPTION });
-      noteProject(node.store, agent, project);
+      noteProject(node.store, agent, project, explicit);
       publishControl({ ...state, agent, leaseToken });
       return { agent, leaseToken };
     });
@@ -1319,7 +1319,6 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
       prepareState(base, undefined, () => node.store.tx(() => {
         leases.renew(base.agent, base.leaseToken!);
         node.bindSession({ agent: base.agent, cli: env.cli, session_id: t.session_id, cwd: t.cwd, pid: env.ppid, session_key: base.key.publicKey, channel: false, mcp_pid: process.pid });
-        noteProject(node.store, base.agent, project);
         publishControl(base);
       }));
     } else if (!base.coUse) {
