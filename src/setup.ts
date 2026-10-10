@@ -633,8 +633,12 @@ export function mcpConfiguredTimeout(home: string, cli: CliId): number | null {
       const { target } = opencodeMcpContainer(parseJsonc(cur));
       const e = target && member(target, "mbx")?.value;
       if (e?.kind !== "object") return null;
-      const v = valueOf(cur, e) as { timeout?: unknown };
-      return typeof v?.timeout === "number" ? v.timeout / 1000 : null; // opencode's field is milliseconds
+      const timeout = (valueOf(cur, e) as { timeout?: unknown }).timeout;
+      // T541: OpenCode 2.0 rejects a numeric timeout and drops the whole server. Only the object
+      // form counts; a number reads as unset so doctor warns and the next setup run rewrites it.
+      if (!timeout || typeof timeout !== "object" || Array.isArray(timeout)) return null;
+      const startup = (timeout as { startup?: unknown }).startup;
+      return typeof startup === "number" ? startup / 1000 : null; // startup is milliseconds
     }
     if (cli === "grok") {
       const dir = (home === homedir() && process.env.GROK_HOME) || join(home, ".grok");
@@ -1408,13 +1412,25 @@ const opencodeMcpContainer = (root: JNode) => {
 };
 
 function opencodeServer(cmd: string[]) {
-  // T502: opencode's local-server "timeout" (ms) bounds fetching tools at startup — the measured
-  // ~2.2s connect sits close to the 5000ms default, so write 30000 explicitly.
-  const desired = { type: "local", command: [...cmd, "mcp"], timeout: MCP_STARTUP_TIMEOUT_SEC * 1000 };
-  const src = `{ "type": "local", "command": [${desired.command.map((s) => JSON.stringify(s)).join(", ")}], "timeout": ${desired.timeout} }`;
+  // T502 / T541: OpenCode 2.0's timeout is milliseconds in {startup, catalog}. A number (what T502
+  // wrote) makes 2.0 drop the whole mcp.servers.mbx entry. startup and catalog both get 30000:
+  // the measured ~2.2s connect used to sit against a 5000ms default.
+  const ms = MCP_STARTUP_TIMEOUT_SEC * 1000;
+  const timeoutSrc = `{ "startup": ${ms}, "catalog": ${ms} }`;
+  const desired = { type: "local", command: [...cmd, "mcp"], timeout: { startup: ms, catalog: ms } };
+  const src = `{ "type": "local", "command": [${desired.command.map((s) => JSON.stringify(s)).join(", ")}], "timeout": ${timeoutSrc} }`;
+  const timeoutCurrent = (timeout: unknown): boolean => {
+    if (!timeout || typeof timeout !== "object" || Array.isArray(timeout)) return false;
+    const t = timeout as { startup?: unknown; catalog?: unknown };
+    return typeof t.startup === "number" && t.startup >= ms && typeof t.catalog === "number" && t.catalog >= ms;
+  };
+  const commandCurrent = (command: unknown): boolean => Array.isArray(command) && (
+    JSON.stringify(command) === JSON.stringify(desired.command) ||
+    mcpNodeScriptCurrent({ command: command[0], args: command.slice(1) })
+  );
   return {
-    // T502 back-compat: an entry an older setup wrote (no timeout) is still wired; doctor warns and
-    // the next setup run repairs the field.
+    // T502 back-compat: an entry an older setup wrote (no timeout, or a numeric one) is still
+    // wired; doctor warns and the next setup run repairs the field.
     isWired: (cur: string | null) => {
       if (cur === null) return false;
       try {
@@ -1439,12 +1455,16 @@ function opencodeServer(cmd: string[]) {
       else if (!target) out = insertMember(text, mcp, "servers", `{ "mbx": ${src} }`);
       else {
         const m = member(target, "mbx");
-        if (m) {
-          const v = valueOf(text, m.value) as { command?: unknown };
-          // T533: wired by another shell's node + this install's entry: leave the bytes alone.
-          if (same(v, desired) || (Array.isArray(v?.command) && mcpNodeScriptCurrent({ command: v.command[0], args: v.command.slice(1) }))) return cur;
-        }
-        out = m ? replaceValue(text, m, src) : insertMember(text, target, "mbx", src);
+        if (m && m.value.kind === "object") {
+          const v = valueOf(text, m.value) as { command?: unknown; timeout?: unknown };
+          // T533: another shell's node + this install's entry stays. T541: only the timeout
+          // value is rewritten, so other mbx keys and other servers stay byte-identical.
+          if (commandCurrent(v?.command) && timeoutCurrent(v?.timeout)) return cur;
+          if (commandCurrent(v?.command)) {
+            const t = member(m.value, "timeout");
+            out = t ? replaceValue(text, t, timeoutSrc) : insertMember(text, m.value, "timeout", timeoutSrc);
+          } else out = replaceValue(text, m, src);
+        } else out = m ? replaceValue(text, m, src) : insertMember(text, target, "mbx", src);
       }
       parseJsonc(out); // never write something we cannot read back
       return out;
