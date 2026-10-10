@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **The limits-fuzz HTTP test no longer flakes with a client-side `terminated` under load (T528):** the server legitimately answers and closes while the client is still writing a large request body; the response body's read then dies with undici's `TypeError: terminated` (cause: write EPIPE). The test already tolerated that race on the request write — it now treats the identical race on the response body read the same way: counted as a race, never as a server failure, and only after a live `/v1/status` check proves the server still answers. The never-crash and no-5xx assertions, and the race-count bound, are unchanged. Verified with 20 consecutive runs of the file alongside a full `npm test` (20/20, suite exit 0).
+
 ## 0.5.21 (2026-10-09)
 
 Stale identity leases of dead MCP processes are swept by the daemon, and the release build is reliable again: the startup timing test keeps its strict local bound with a CI-safe bound on slow shared runners (v0.5.20's GitHub release build failed on the Intel macOS target for that reason; v0.5.20 itself was installable from its tag).
