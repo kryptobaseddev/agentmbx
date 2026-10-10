@@ -23,7 +23,7 @@ import { bumpPostToolMarkersForAgent, readPostToolMarker, writePostToolLast } fr
 import { resolveStatusIdentity } from "./status-identity.ts";
 import { runStatuslineSuggest } from "./statusline-suggest.ts";
 import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.ts";
-import { retirePhantoms, returnNeverClaimed } from "./stranded.ts";
+import { escalateUnheldMail, retirePhantoms, returnNeverClaimed } from "./stranded.ts";
 import { activeLead, leadSummary, makeLead, makeLeadRevocation, projectLeadLine, projectLeadView, revokeLead, storeLead } from "./project-ledger.ts";
 import { DEFAULT_PORT, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.ts";
 import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, parsePolicyTtl, policyUnexpired, policySummary,
@@ -38,7 +38,7 @@ import { kimiMultiHost } from "./kimi-web.ts";
 import { bindInstruction, issueBindTicket } from "./bind-ticket.ts";
 import { activityKey } from "./identity-availability.ts";
 import { identityLeaseStatus, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
-import { AUTO_NAME_RE, identityProjects, linkedKey, projectOf, recordSessionHint, registeredIdentity } from "./registry.ts";
+import { AUTO_NAME_RE, identityProjects, linkedKey, projectOf, recordSessionHint, registeredIdentity, removeStaleProjectBindings, staleProjectBindings } from "./registry.ts";
 import { applyForward, buildForward, pruneCandidates, retireMailbox } from "./identity-cleanup.ts";
 import { installDesktopPlugin, kimiDesktop, kimiDesktopDir, removeDesktopPlugin, writeDesktopPlugin } from "./kimi-desktop.ts";
 import { approveKimi, decidePermission, opencodePermissionPass, type Lookup } from "./permission.ts";
@@ -83,6 +83,7 @@ Messages
   agentmbx probe [--project <dir>] [--deadline 120s] [--require-idle-wake] [--only a,b] [--exclude glob] [--plan] [--json]   autonomy probe: every live leased identity must answer the [mbx-probe] request with no human prompt (T388 gate; T392, T445)
   agentmbx identity list [--project <dir>] [--all] [--json]   identities with role, holder, claimable and unread (read-only)
   agentmbx identity prune [--days 7] [--apply]   retire mailboxes older versions generated that nobody holds (dry run by default)
+  agentmbx identity bindings [--apply]           remove project bindings older than a newer project for the same identity (dry run by default)
   agentmbx identity forward <from> <to>          move a mailbox's unread mail to another, with your owner signature
   agentmbx identity claim [name] --cli <provider> --session <id> [--wait-ms 5000] [--json]
   agentmbx identity release --cli <provider> --session <id> [--wait-ms 5000] [--json]
@@ -424,6 +425,18 @@ async function run(argv: string[]) {
       } finally { node.close(); }
       return;
     }
+    if (pos[0] === "bindings" && pos.length === 1) {
+      // T515: a binding is stale when the same identity was seen later in another project. One project stays.
+      const node = new MbxNode();
+      try {
+        const stale = staleProjectBindings(node.store);
+        const removed = o.apply ? removeStaleProjectBindings(node.store, stale) : 0;
+        if (o.json) return console.log(JSON.stringify({ applied: !!o.apply, removed, stale }, null, 2));
+        console.log(`${o.apply ? "Removed" : "Would remove"} ${o.apply ? removed : stale.length} project binding(s) on ${node.host}${o.apply ? "" : " (dry run: add --apply)"}:`);
+        for (const r of stale) console.log(`  ${r.name}\t${r.project}\tlast ${r.last_seen}\tkept ${r.kept_project}`);
+      } finally { node.close(); }
+      return;
+    }
     if (pos[0] === "forward" && pos.length === 3) {
       // T209: move one mailbox's unread mail to another, with the owner's signature (Touch ID or passphrase).
       const node = new MbxNode();
@@ -470,7 +483,7 @@ async function run(argv: string[]) {
       } finally { node.close(); }
     }
     if ((pos[0] === "export" || pos[0] === "import") && pos.length === 2) return identityBackup(pos[0], pos[1], !!o.force);
-    die("identity list [--project <dir>] [--all] | prune [--days 7] [--apply] | forward <from> <to> | export <file> | import <file> | claim [name] --cli <provider> --session <id> | release --cli <provider> --session <id> | takeover <name> --force --cli <provider> --session <id> | result <request-id>");
+    die("identity list [--project <dir>] [--all] | prune [--days 7] [--apply] | bindings [--apply] | forward <from> <to> | export <file> | import <file> | claim [name] --cli <provider> --session <id> | release --cli <provider> --session <id> | takeover <name> --force --cli <provider> --session <id> | result <request-id>");
   }
   if (cmd === "statusline") {
     // T369: `statusline suggest` — a dry-run placement proposal (JSON + human text) for the MBX
@@ -951,7 +964,7 @@ If the codes differ, do not approve: someone is in the middle.`);
       let lastAddrs = addrSignature(node), lastBeacon = 0;
       const beacon = () => { const sig = addrSignature(node); if (sig !== lastAddrs || Date.now() - lastBeacon > 300_000) { lastAddrs = sig; lastBeacon = Date.now(); void sendPresence(node).catch(() => {}); } };
       setInterval(beacon, 10_000).unref(); setTimeout(() => { lastBeacon = 0; beacon(); }, 2_000).unref();
-      setInterval(() => { void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node); void healStuckPeers(node, () => browse(3_000)).then(() => sendPresence(node, fetch, stuckHosts(node))).catch(() => {}); try { node.pruneDeadSessions(); } catch { /* db busy: next minute */ } try { node.sweepStaleRows(); } catch { /* db busy: next minute */ } }, 60_000); void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node);
+      setInterval(() => { void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node); void healStuckPeers(node, () => browse(3_000)).then(() => sendPresence(node, fetch, stuckHosts(node))).catch(() => {}); try { node.pruneDeadSessions(); } catch { /* db busy: next minute */ } try { node.sweepStaleRows(); } catch { /* db busy: next minute */ } try { escalateUnheldMail(node, Date.now(), (subtitle, body) => void notifyDesktop({ subtitle, body })); } catch { /* db busy: next minute */ } }, 60_000); void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node);
       // a policy about to lapse: one desktop reminder, 48 h ahead, with the renew command (only where the owner key is)
       const remind = () => { try { if (!node.ownerPub) return; for (const p of dueReminders(node.store.db)) void notifyDesktop({ subtitle: "Policy expires soon",
         body: `${policySummary(p)} expires ${p.exp.slice(0, 16).replace("T", " ")}Z. Renew: agentmbx policy renew ${p.id.slice(-6)}` }); } catch { /* db busy */ } };

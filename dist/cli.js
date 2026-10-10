@@ -23,7 +23,7 @@ import { bumpPostToolMarkersForAgent, readPostToolMarker, writePostToolLast } fr
 import { resolveStatusIdentity } from "./status-identity.js";
 import { runStatuslineSuggest } from "./statusline-suggest.js";
 import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.js";
-import { retirePhantoms, returnNeverClaimed } from "./stranded.js";
+import { escalateUnheldMail, retirePhantoms, returnNeverClaimed } from "./stranded.js";
 import { activeLead, leadSummary, makeLead, makeLeadRevocation, projectLeadLine, projectLeadView, revokeLead, storeLead } from "./project-ledger.js";
 import { DEFAULT_PORT, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
 import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, parsePolicyTtl, policyUnexpired, policySummary } from "./policy.js";
@@ -37,7 +37,7 @@ import { kimiMultiHost } from "./kimi-web.js";
 import { bindInstruction, issueBindTicket } from "./bind-ticket.js";
 import { activityKey } from "./identity-availability.js";
 import { identityLeaseStatus, inspectLeaseProcess } from "./identity-leases.js";
-import { AUTO_NAME_RE, identityProjects, linkedKey, projectOf, recordSessionHint, registeredIdentity } from "./registry.js";
+import { AUTO_NAME_RE, identityProjects, linkedKey, projectOf, recordSessionHint, registeredIdentity, removeStaleProjectBindings, staleProjectBindings } from "./registry.js";
 import { applyForward, buildForward, pruneCandidates, retireMailbox } from "./identity-cleanup.js";
 import { installDesktopPlugin, kimiDesktop, kimiDesktopDir, removeDesktopPlugin, writeDesktopPlugin } from "./kimi-desktop.js";
 import { approveKimi, decidePermission, opencodePermissionPass } from "./permission.js";
@@ -81,6 +81,7 @@ Messages
   agentmbx probe [--project <dir>] [--deadline 120s] [--require-idle-wake] [--only a,b] [--exclude glob] [--plan] [--json]   autonomy probe: every live leased identity must answer the [mbx-probe] request with no human prompt (T388 gate; T392, T445)
   agentmbx identity list [--project <dir>] [--all] [--json]   identities with role, holder, claimable and unread (read-only)
   agentmbx identity prune [--days 7] [--apply]   retire mailboxes older versions generated that nobody holds (dry run by default)
+  agentmbx identity bindings [--apply]           remove project bindings older than a newer project for the same identity (dry run by default)
   agentmbx identity forward <from> <to>          move a mailbox's unread mail to another, with your owner signature
   agentmbx identity claim [name] --cli <provider> --session <id> [--wait-ms 5000] [--json]
   agentmbx identity release --cli <provider> --session <id> [--wait-ms 5000] [--json]
@@ -501,6 +502,23 @@ async function run(argv) {
             }
             return;
         }
+        if (pos[0] === "bindings" && pos.length === 1) {
+            // T515: a binding is stale when the same identity was seen later in another project. One project stays.
+            const node = new MbxNode();
+            try {
+                const stale = staleProjectBindings(node.store);
+                const removed = o.apply ? removeStaleProjectBindings(node.store, stale) : 0;
+                if (o.json)
+                    return console.log(JSON.stringify({ applied: !!o.apply, removed, stale }, null, 2));
+                console.log(`${o.apply ? "Removed" : "Would remove"} ${o.apply ? removed : stale.length} project binding(s) on ${node.host}${o.apply ? "" : " (dry run: add --apply)"}:`);
+                for (const r of stale)
+                    console.log(`  ${r.name}\t${r.project}\tlast ${r.last_seen}\tkept ${r.kept_project}`);
+            }
+            finally {
+                node.close();
+            }
+            return;
+        }
         if (pos[0] === "forward" && pos.length === 3) {
             // T209: move one mailbox's unread mail to another, with the owner's signature (Touch ID or passphrase).
             const node = new MbxNode();
@@ -561,7 +579,7 @@ async function run(argv) {
         }
         if ((pos[0] === "export" || pos[0] === "import") && pos.length === 2)
             return identityBackup(pos[0], pos[1], !!o.force);
-        die("identity list [--project <dir>] [--all] | prune [--days 7] [--apply] | forward <from> <to> | export <file> | import <file> | claim [name] --cli <provider> --session <id> | release --cli <provider> --session <id> | takeover <name> --force --cli <provider> --session <id> | result <request-id>");
+        die("identity list [--project <dir>] [--all] | prune [--days 7] [--apply] | bindings [--apply] | forward <from> <to> | export <file> | import <file> | claim [name] --cli <provider> --session <id> | release --cli <provider> --session <id> | takeover <name> --force --cli <provider> --session <id> | result <request-id>");
     }
     if (cmd === "statusline") {
         // T369: `statusline suggest` — a dry-run placement proposal (JSON + human text) for the MBX
@@ -1165,6 +1183,9 @@ If the codes differ, do not approve: someone is in the middle.`);
             }
             catch { /* db busy: next minute */ } try {
                 node.sweepStaleRows();
+            }
+            catch { /* db busy: next minute */ } try {
+                escalateUnheldMail(node, Date.now(), (subtitle, body) => void notifyDesktop({ subtitle, body }));
             }
             catch { /* db busy: next minute */ } }, 60_000);
             void refreshDirectory(node);

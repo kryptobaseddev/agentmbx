@@ -1,7 +1,7 @@
 // `agentmbx doctor`: one checklist that says what works, what doesn't, and the one command that fixes it.
 import { rotationLog } from "./key-rotation.ts";
 import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { phantomMailboxes, returnDays } from "./stranded.ts";
+import { escalatedCount, phantomMailboxes, returnDays } from "./stranded.ts";
 import { delimiter, dirname, join } from "node:path";
 import { fingerprint } from "./crypto.ts";
 import { signHop } from "./http.ts";
@@ -19,6 +19,7 @@ import { mailboxLiveness } from "./receipts.ts";
 import { liveWatcher } from "./wake.ts";
 import { findIdentityControl, listIdentityControls } from "./identity-control.ts";
 import { pruneCandidates } from "./identity-cleanup.ts";
+import { staleProjectBindings } from "./registry.ts";
 import { deadHolderLeases, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
 import { providerLabel, sameLiveProvider } from "./identity-takeover.ts";
 import { conversationLoopLabel, detectConversationLoops } from "./loop-detector.ts";
@@ -182,11 +183,14 @@ export function strandedMail(node: MbxNode): Check[] {
     .map((r) => ({ name: r.name, unread: r.unread, detail: r.liveness.detail }))
     .sort((a, b) => b.unread - a.unread || a.name.localeCompare(b.name));
   const days = returnDays(node);
-  const out: Check[] = stranded.slice(0, STRANDED_MAX).map((s) => { const p = phantoms.get(s.name); return p
-    ? { level: "warn" as Level, label: `${s.name}: phantom mailbox — ${s.unread} message(s) addressed to ${s.name}@${p.hosts.join(", ")}, which received them there; nobody holds ${s.name} here`,
+  const out: Check[] = stranded.slice(0, STRANDED_MAX).map((s) => { const p = phantoms.get(s.name);
+    const esc = escalatedCount(node, s.name);
+    const escLabel = esc ? `; ${esc} urgent message(s) (alert/needs-reply) escalated to the owner with a desktop notice` : "";
+    return p
+    ? { level: "warn" as Level, label: `${s.name}: phantom mailbox — ${s.unread} message(s) addressed to ${s.name}@${p.hosts.join(", ")}, which received them there; nobody holds ${s.name} here${escLabel}`,
       fix: "agentmbx doctor --fix   (marks these copies handled; nothing is deleted)" }
     : { level: "warn" as Level,
-    label: `${s.name}: ${s.unread} unread message(s) stranded — ${s.detail}`,
+    label: `${s.name}: ${s.unread} unread message(s) stranded — ${s.detail}${escLabel}`,
     fix: `the owning agent resumes it with mbx_identity {"action":"claim","name":"${s.name}"}, or the owner forwards the mail: agentmbx identity forward ${s.name} <to>`
       + (days && !node.establishedLocalName(s.name) ? `; ${s.name} is not an agent here, so new mail to it goes back to its sender after ${days} days` : "") }; });
   if (stranded.length > STRANDED_MAX) out.push({ level: "warn" as Level, label: `… ${stranded.length - STRANDED_MAX} more mailbox(es) with stranded unread mail` });
@@ -218,6 +222,14 @@ export function pruneSummary(node: MbxNode): Check {
   return retire.length
     ? { level: "warn", label: `${retire.length} generated mailbox(es) with no holder, no unread mail and no recent traffic would be retired`, fix: "review the list: agentmbx identity prune   (a dry run), then apply it: agentmbx identity prune --apply" }
     : { level: "info", label: "no generated mailboxes eligible for prune" };
+}
+
+/** How many project bindings are older than another project for the same identity (T515). Read-only. */
+export function staleBindingSummary(node: MbxNode): Check {
+  const stale = staleProjectBindings(node.store);
+  return stale.length
+    ? { level: "warn", label: `${stale.length} project binding(s) are older than another project for the same identity`, fix: "review the list: agentmbx identity bindings   (a dry run), then apply it: agentmbx identity bindings --apply" }
+    : { level: "info", label: "no project bindings older than another project for the same identity" };
 }
 
 /** OpenCode's LocationActivity drops an idle service about every 60 minutes, and the plugin then releases and claims again.
@@ -566,6 +578,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     for (const c of identityClaimChurn(node)) out.push(c);
     for (const c of foreignSessionProvider(node)) out.push(c);
     out.push(pruneSummary(node));
+    out.push(staleBindingSummary(node));
     const peers = node.peers();
     const approved = peers.filter((p) => p.state === "approved");
     if (!approved.length) add("info", "no paired hosts (optional: agentmbx pair <host>:7373)");

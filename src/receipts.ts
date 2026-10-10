@@ -14,7 +14,7 @@ import { remoteReceipts } from "./remote-receipts.ts";
 /** A holder renews its lease every minute; three missed beats mean its session is suspended or gone. */
 const STALE_HEARTBEAT_MS = 3 * 60_000;
 
-export type RecipientState = "live-wake" | "live-next-prompt" | "offline" | "forwarded" | "remote";
+export type RecipientState = "live-wake" | "live-next-prompt" | "offline" | "queued-no-holder" | "forwarded" | "remote";
 export interface RecipientReceipt { to: string; address: string; state: RecipientState; detail: string }
 
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -67,7 +67,14 @@ export function recipientReceipts(node: MbxNode, msgId: string, targets: RouteTa
     if (name === "owner") { out.push({ to: t.to, address, state: "live-next-prompt", detail: "the owner sees it in agentmbx inbox and as a desktop notification" }); continue; }
     const live = mailboxLiveness(node, name, now);
     let state: RecipientState, detail: string;
-    if (!live.live) { state = "offline"; detail = live.detail; }
+    if (t.lead && !live.live) {
+      // T491: `lead`/`role:lead` names the owner-designated lead. When its mailbox has no live holder the
+      // send is queued, not just "offline": the sender must hear that the project's lead will not see this
+      // until a session claims the mailbox or the owner acts, and urgent copies escalate to the owner.
+      state = "queued-no-holder";
+      detail = `addressed to the owner-designated lead; ${live.detail}; it waits here until a session claims ${name} or the owner forwards it, and the owner is notified`;
+    }
+    else if (!live.live) { state = "offline"; detail = live.detail; }
     else {
       const sessions = node.sessionsFor(name);
       const verified = sessions.filter(s => captureWakeIdentity(node, s));
@@ -101,8 +108,10 @@ export function recipientReceipts(node: MbxNode, msgId: string, targets: RouteTa
 
 /** Warning lines for recipients nobody will read soon. */
 export const offlineWarnings = (rs: RecipientReceipt[]): string[] =>
-  rs.filter((r) => r.state === "offline" || (r.state === "forwarded" && /offline: /.test(r.detail)))
-    .map((r) => `${r.address} is offline: ${r.detail.replace(/^.*offline: /, "")}. The message waits in its mailbox; tell your user if it is urgent.`);
+  rs.filter((r) => r.state === "offline" || r.state === "queued-no-holder" || (r.state === "forwarded" && /offline: /.test(r.detail)))
+    .map((r) => r.state === "queued-no-holder"
+      ? `${r.address} is the owner-designated lead but has no live holder: ${r.detail}. The message is queued here, not delivered; the owner is notified. Tell your user it needs the lead back or an owner forward.`
+      : `${r.address} is offline: ${r.detail.replace(/^.*offline: /, "")}. The message waits in its mailbox; tell your user if it is urgent.`);
 
 /** Levenshtein distance, capped (names are at most 40 characters). */
 function distance(a: string, b: string): number {
