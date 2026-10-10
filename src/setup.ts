@@ -1895,9 +1895,14 @@ function hermesApprovals(cmd: string[]) {
 }
 
 /** Are the hooks setup wrote approved to run? `auto` when hooks_auto_accept is on in config.yaml; HERMES_ACCEPT_HOOKS / --accept-hooks
- *  are per-process and cannot be seen from here. Read-only: doctor reports it, setup writes it. */
+ *  are per-process and cannot be seen from here. Read-only: doctor reports it, setup writes it.
+ *  T547: an allowlist entry matches by this install's entry script and the hook arguments, under any
+ *  node binary that still exists (hookNamesInstalledEntry, the same rule as mcpNodeScriptCurrent).
+ *  The node path inside ctx.cmd is not part of that match, so doctor run from a different node than
+ *  the one that wrote the allowlist still reports approved. An exact command match stays, for the
+ *  single-binary form that has no entry script. A foreign script does not match. */
 export function hermesConsent(ctx: SetupCtx): { state: "approved" | "auto" | "missing" | "unreadable"; missing: string[] } {
-  const wanted = HERMES_HOOK_EVENTS.map(([event, sub]) => ({ event, command: hookCommand(ctx.cmd, sub, "hermes") }));
+  const wanted = HERMES_HOOK_EVENTS.map(([event, sub]) => ({ event, sub, command: hookCommand(ctx.cmd, sub, "hermes") }));
   if (/^hooks_auto_accept:[ \t]*true[ \t]*(#.*)?\r?$/m.test(read(hermesConfigPath(ctx.home)) ?? "")) return { state: "auto", missing: [] };
   const text = read(hermesAllowlistPath(ctx.home));
   if (text === null) return { state: "missing", missing: wanted.map((w) => w.event) };
@@ -1909,7 +1914,13 @@ export function hermesConsent(ctx: SetupCtx): { state: "approved" | "auto" | "mi
     approvals = (parsed as { approvals?: unknown }).approvals ?? [];
   } catch { return { state: "unreadable", missing: wanted.map((w) => w.event) }; }
   if (!Array.isArray(approvals)) return { state: "unreadable", missing: wanted.map((w) => w.event) };
-  const missing = wanted.filter((w) => !approvals.some((e: unknown) => !!e && typeof e === "object" && (e as { event?: unknown }).event === w.event && (e as { command?: unknown }).command === w.command)).map((w) => w.event);
+  const matches = (entry: unknown, w: { event: string; sub: string; command: string }): boolean => {
+    if (!entry || typeof entry !== "object") return false;
+    const command = (entry as { command?: unknown }).command;
+    return (entry as { event?: unknown }).event === w.event && typeof command === "string"
+      && (command === w.command || hookNamesInstalledEntry(command, w.sub, "hermes"));
+  };
+  const missing = wanted.filter((w) => !approvals.some((entry) => matches(entry, w))).map((w) => w.event);
   return { state: missing.length ? "missing" : "approved", missing };
 }
 
