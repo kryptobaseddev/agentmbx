@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.25 (2026-10-10)
+
+A standalone OpenCode session that is woken now actually starts a turn, doctor classifies OpenCode bindings and flags duplicate agent loops, and Hermes reports its status surfaces honestly. Signed grants auto-approve reversible outward work (a non-default branch push or a draft PR) on harnesses with an approval channel, a session whose mbx MCP died is told to reconnect, and project membership is explicit only. Docs: the identity selector reference, the project-mailbox ADR and the OpenCode wake paths.
+
 - **A disconnected MCP is reported on the next prompt (T503).** Prompt and session-start hooks now say to reconnect mbx and name the conversation's remembered identity when its connector records are missing or its MCP process is positively dead. Live connectors and unreadable process evidence stay quiet; the hook never restarts a connector or changes ownership.
 - **A daemon wake of an idle standalone OpenCode session starts one turn (T544).** Hook notes stay `resume: false`. The wake is the same in-process `ctx.session.synthetic` call with `resume: true` and `delivery: "queue"`. On an idle `opencode --standalone` TUI, `resume: false` returned a `msg_` receipt and wrote no `session_message`, so the turn never started. `resume: true` wrote one synthetic row, one assistant row, then idle, with an empty pending queue and no call to the shared service.
 - **Doctor classifies each OpenCode binding (T520).** A binding is service-hosted, standalone with a live plugin consumer, or unwakeable. The consumer is a plugin polling `GET /v1/opencode-wake` for that session and pid; doctor reads those pollers from the daemon at `GET /v1/opencode-wake/waiters` (loopback, no wake text). A standalone binding with no consumer, or an unknown host, is a warning whose fix is `agentmbx setup --only opencode`. The shared service is still not called for those bindings.
