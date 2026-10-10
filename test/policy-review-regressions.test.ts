@@ -35,12 +35,12 @@ test('fresh PID reuse must not transfer a previous session identity', t => {
   assert.equal(n.bindSession({ agent: 'new-owner', cli: 'codex', session_id: 'new-thread', pid: process.pid }), 'new-owner');
 });
 
-test('permission hook rejects stale PID identity when the requesting session is unknown', t => {
+test('permission hook rejects stale PID identity when the requesting session is unknown', async t => {
   const { n, policy, grant } = fixture(t);
   grant(policy());
   n.bindSession({ agent: 'trusted', cli: 'codex', session_id: 'old-mcp', pid: process.pid, session_key: 'old-key' });
   n.store.db.prepare('UPDATE sessions SET updated_at=?').run('2000-01-01T00:00:00.000Z');
-  const d = decidePermission({ hook_event_name: 'PermissionRequest', session_id: 'unknown-thread', cwd: '/outside', tool_name: 'Bash', tool_input: { command: 'echo harmless' } },
+  const d = await decidePermission({ hook_event_name: 'PermissionRequest', session_id: 'unknown-thread', cwd: '/outside', tool_name: 'Bash', tool_input: { command: 'echo harmless' } },
     'codex', agent => hasClass(n.store.db, agent, n.host, 'permissions'), { node: n, pid: process.pid });
   assert.equal(d.allow, false);
 });

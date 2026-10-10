@@ -148,7 +148,7 @@ Agent integration
   agentmbx hook session-end --cli claude         release the exact session on terminal exit (keeps /clear and /resume bindings)
   agentmbx hook prompt --cli <…>                adds "N unread mbx messages" to the next turn when there is mail
   agentmbx hook post-tool --cli claude          surfaces new unread mail between tool calls (bundled sh fast path: zero node starts in steady state, T342)
-  agentmbx hook permission --cli <claude|codex|kimi>   YOLO: approves the prompt only under an active owner policy with the permissions class
+  agentmbx hook permission --cli <claude|codex|kimi>   untainted signed-policy approval for bounded outward-reversible work; permissions enables YOLO
   agentmbx import-v2 <MAILBOX/v2 dir>           import this caller's leased mailbox as unsigned 'legacy' messages
 
 Env: MBX_HOME (default ~/.local/share/agentmbx), MBX_AGENT (agent name for mcp/hooks), MBX_ADVERTISE (host:port others use),
@@ -941,7 +941,7 @@ If the codes differ, do not approve: someone is in the middle.`);
           const route = relay ? await relayRoute(node, relay).catch((e) => ({ mode: "skip" as const, why: (e as Error).message })) : null;
           const v2 = route?.mode === "v2" ? route.session : null;
           if (v2) { await relayPushOutbox(node, v2); await relayPushReceipts(node, v2); }
-          await flushOutbox(node); await flushReceipts(node); await dispatchWakes(node); await opencodePermissionPass(node, yoloLookup(node), opencodeService);
+          await flushOutbox(node); await flushReceipts(node); await dispatchWakes(node); await opencodePermissionPass(node, permissionLookup(node), opencodeService);
           if (v2) await relayReceive(node, v2);
           else if (relay && route?.mode === "v1") { await relayDrainOutbox(node, relay); await relayPull(node, relay); } // a relay that only speaks v1
           relaySettle(node); // the sender-side deadline runs whatever the relay's state
@@ -1299,8 +1299,8 @@ async function policy(node: MbxNode, pos: string[], str: (k: string) => string |
 }
 
 // ---- hooks -----------------------------------------------------------------------------------
-/** YOLO policy lookup (docs/POLICY.md §5): an active owner policy with the permissions class for that agent on this host. */
-const yoloLookup = (node: MbxNode): Lookup => (agent, ctx) => hasClass(node.store.db, agent, node.host, "permissions", { cwd: ctx?.cwd });
+/** One independently signed grant must cover the requested class and session project (POLICY.md §5). */
+const permissionLookup = (node: MbxNode): Lookup => (agent, ctx) => hasClass(node.store.db, agent, node.host, ctx?.class ?? "permissions", { cwd: ctx?.cwd });
 
 /** Exact command a Grok session runs as a tracked background task (T435). Its exit starts the next turn. */
 function grokWatchCommand(sid?: string): string {
@@ -1346,9 +1346,9 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
   }
   if (event === "permission") { // fail closed: any problem means no output and the CLI's normal prompt
     let parsed: unknown = null; try { parsed = JSON.parse(raw); } catch { /* malformed */ }
-    const d = decidePermission(parsed, cli, yoloLookup(node), { node, pid: process.ppid });
+    const d = await decidePermission(parsed, cli, permissionLookup(node), { node, pid: process.ppid });
     if (d.output) console.log(d.output);
-    if (d.kimi) await approveKimi(node, d, { recheck: () => yoloLookup(node)(d.agent!, { cwd: d.cwd }).ok });
+    if (d.kimi) await approveKimi(node, d, { recheck: () => permissionLookup(node)(d.agent!, { cwd: d.cwd, class: d.class }).ok });
     return;
   }
   if (!["session-start", "session-end", "prompt", "post-tool", "stop"].includes(event ?? "")) die("hook session-start | session-end | prompt | post-tool | stop | permission --cli <cli>");

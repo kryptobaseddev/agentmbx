@@ -1,10 +1,12 @@
-// YOLO (docs/POLICY.md §5): a CLI session auto-approves its own permission prompts while an owner policy grants its
-// agent the `permissions` class. Anything else (no policy, unknown agent, malformed input, any error) returns no
-// decision, so the CLI shows its normal prompt. Per-CLI mechanisms and evidence: docs/RESEARCH.md "Permission hooks per CLI".
+// POLICY.md §5: untainted sessions may use explicit YOLO or the bounded outward-reversible path.
+// Unknown authority, command or provider state returns no decision, preserving the normal prompt.
 import { kimiServer } from "./kimi-web.js";
 import { LIVE_AGENT_MS } from "./node.js";
 import { fingerprint } from "./crypto.js";
 import { IdentityLeases } from "./identity-leases.js";
+import { sessionUntainted } from "./session-taint.js";
+import { checkOutwardReversible, parseOutwardReversible } from "./outward-reversible.js";
+import { realpathSync } from "node:fs";
 export { kimiServer } from "./kimi-web.js";
 /** Tools that collect an answer from the user rather than ask for permission: never auto-approved. */
 const INTERACTIVE = new Set(["AskUserQuestion", "ExitPlanMode"]);
@@ -70,7 +72,7 @@ export function resolveAgent(node, cli, sessionId, _cwd, pid) {
     }
 }
 /** Hook-side decision for `agentmbx hook permission --cli <cli>`. `output` is what the hook prints on stdout. */
-export function decidePermission(input, cli, lookup, o) {
+export async function decidePermission(input, cli, lookup, o) {
     try {
         if (!input || typeof input !== "object" || Array.isArray(input))
             return NONE;
@@ -94,16 +96,40 @@ export function decidePermission(input, cli, lookup, o) {
         if ((cli === "codex" || cli === "kimi") && sessionId !== authority.binding.session_id)
             return NONE;
         const agent = authority.binding.agent;
+        const clean = () => sessionUntainted(o.node.store, authority.binding.cli, authority.binding.session_id);
+        let cls = "permissions", intent;
+        const yolo = withAuthority(o.node, authority, () => clean() && lookup(agent, { cwd, class: cls })?.ok);
+        if (!yolo) {
+            cls = "outward-reversible";
+            if (sessionId !== authority.binding.session_id)
+                return NONE;
+            if (!cwd || !authority.binding.cwd || realpathSync(cwd) !== realpathSync(authority.binding.cwd))
+                return NONE;
+            const covered = withAuthority(o.node, authority, () => clean() && lookup(agent, { cwd, class: cls })?.ok);
+            if (!covered)
+                return NONE;
+            const ti = i.tool_input;
+            if (!ti || typeof ti !== "object" || Array.isArray(ti))
+                return NONE;
+            const args = ti;
+            if (!((cli === "claude" || cli === "codex") && tool === "Bash" || cli === "kimi" && tool === "Shell")
+                || typeof args.command !== "string" || Object.keys(args).some(k => /^(?:env|cwd|workdir|shell|executable)$/.test(k)))
+                return NONE;
+            const parsed = parseOutwardReversible(args.command);
+            if (!parsed || !await (o.preflight ?? checkOutwardReversible)(parsed, cwd))
+                return NONE;
+            intent = parsed;
+        }
         return withAuthority(o.node, authority, () => {
-            const p = lookup(agent, { cwd });
-            if (!p?.ok)
+            const p = lookup(agent, { cwd, class: cls });
+            if (!clean() || !p?.ok)
                 return NONE;
             if (cli === "kimi") { // Kimi's hook can't decide; the approval goes through the kimi web API (approveKimi), which audits
                 const approval = s("id");
-                return sessionId && approval ? { allow: true, agent, tool, policy_id: p.policy_id, output: "", cwd, authority, kimi: { session_id: sessionId, approval_id: approval } } : NONE;
+                return sessionId && approval ? { allow: true, agent, tool, policy_id: p.policy_id, class: cls, intent, output: "", cwd, authority, kimi: { session_id: sessionId, approval_id: approval } } : NONE;
             }
-            o.node.store.audit("yolo_allow", { agent, cli, tool, policy_id: p.policy_id ?? null });
-            return { allow: true, agent, tool, policy_id: p.policy_id,
+            o.node.store.audit("yolo_allow", { agent, cli, tool, policy_id: p.policy_id ?? null, ...(intent ? { class: cls, action: intent.kind } : {}) });
+            return { allow: true, agent, tool, policy_id: p.policy_id, class: cls,
                 output: JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } }) };
         }) ?? NONE;
     }
@@ -118,7 +144,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * error or never lists it: give up, and the user answers the prompt as usual.
  */
 export async function approveKimi(node, d, o = {}) {
-    if (!d.allow || !d.kimi || !d.authority || !withAuthority(node, d.authority, () => true))
+    const clean = () => !!d.authority && sessionUntainted(node.store, d.authority.binding.cli, d.authority.binding.session_id);
+    if (!d.allow || !d.kimi || !d.authority || !withAuthority(node, d.authority, clean))
+        return false;
+    if (d.intent && !o.recheck)
         return false;
     const srv = o.server === undefined ? kimiServer() : o.server;
     if (!srv)
@@ -139,7 +168,9 @@ export async function approveKimi(node, d, o = {}) {
                 return false;
             await sleep(250);
         }
-        if (!withAuthority(node, d.authority, () => !o.recheck || o.recheck()))
+        if (d.intent && (!d.cwd || !await checkOutwardReversible(d.intent, d.cwd)))
+            return false;
+        if (!withAuthority(node, d.authority, () => clean() && (!o.recheck || o.recheck())))
             return false;
         // Provider APIs cannot consume a lease token: this is a fresh dispatch check, not revocation
         // of a request already in flight. Never hold a SQLite transaction across network I/O.
@@ -147,7 +178,7 @@ export async function approveKimi(node, d, o = {}) {
         const j = await res.json().catch(() => null);
         if (!res.ok || j?.code !== 0)
             return false;
-        node.store.audit("yolo_allow", { agent: d.agent, cli: "kimi", tool: d.tool, policy_id: d.policy_id ?? null, via: "kimi web" });
+        node.store.audit("yolo_allow", { agent: d.agent, cli: "kimi", tool: d.tool, policy_id: d.policy_id ?? null, via: "kimi web", ...(d.intent ? { class: d.class, action: d.intent.kind } : {}) });
         return true;
     }
     catch {
@@ -165,7 +196,7 @@ export async function opencodePermissionPass(node, lookup, svc, f = fetch) {
         .filter((r) => r.pid && node.sameSession(r.pid, r, { proof: true })); // only bindings proven to be a live OpenCode process
     const covered = rows.flatMap(r => {
         const authority = captureAuthority(node, r);
-        if (!authority || !r.session_id.startsWith("ses"))
+        if (!authority || !r.session_id.startsWith("ses") || !sessionUntainted(node.store, r.cli, r.session_id))
             return [];
         const p = safeLookup(lookup, r.agent, r.cwd);
         return p.ok ? [{ ...r, p, authority }] : [];
@@ -191,7 +222,7 @@ export async function opencodePermissionPass(node, lookup, svc, f = fetch) {
                 if (q.sessionID !== r.session_id)
                     continue;
                 done.add(q.id);
-                if (!withAuthority(node, r.authority, () => safeLookup(lookup, r.agent, r.cwd).ok))
+                if (!withAuthority(node, r.authority, () => sessionUntainted(node.store, r.cli, r.session_id) && safeLookup(lookup, r.agent, r.cwd).ok))
                     break;
                 const rep = await f(`${s.url}/api/session/${encodeURIComponent(q.sessionID)}/permission/${encodeURIComponent(q.id)}/reply`, { method: "POST", headers, body: JSON.stringify({ decision: "once" }), signal: AbortSignal.timeout(5000) });
                 if (!rep.ok)
@@ -205,7 +236,7 @@ export async function opencodePermissionPass(node, lookup, svc, f = fetch) {
     return n;
 }
 const safeLookup = (lookup, agent, cwd) => { try {
-    return lookup(agent, { cwd }) ?? { ok: false };
+    return lookup(agent, { cwd, class: "permissions" }) ?? { ok: false };
 }
 catch {
     return { ok: false };
