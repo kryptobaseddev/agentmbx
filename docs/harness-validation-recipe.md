@@ -49,6 +49,21 @@ against the same bound session so the numbers must agree across surfaces.
 | Claude mod (T401) | renders the v2 model band/pane | fixture render: `plugins/claude/fixtures/v2-*.json` + `test/claude-mod.test.ts` on `feat/t401-claude-mod`; live: screenshot of the band |
 | OpenCode sidebar (T409) | renders identity + counts from the v2 endpoint | fixture render: `test/opencode-sidebar.test.ts` (`formatStatusV2` against the v2 fixture); live: isolated-script run, rendered line + endpoint JSON |
 
+### Hermes evidence (T527, recorded 2026-10-10)
+
+agentmbx-hermes verified live in its terminal:
+
+- Hermes has **no status-line feature** — there is nothing in the TUI to render a segment, so the
+  statusline surface is N/A for Hermes and `agentmbx doctor` says so explicitly (the opencode
+  precedent). The daemon still writes `hud/hermes-<sid>.json`/`.v2.json`/`.line` for
+  `agentmbx status` and any future surface (automated in `test/status-surface.test.ts`).
+- Only `pre_llm_call` consumes hook stdout as injected context (`{"context": ...}`). Hermes also
+  runs `on_session_start` (an observer; its stdout is dropped) and supports `pre_tool_call` /
+  `post_tool_call`, but neither injects stdout — so there is no post-tool injection channel, and
+  none was wired. Mid-turn mail instead rides `pre_llm_call`, which fires per LLM call: mail that
+  arrives between two calls of one tool loop is injected on the next call of the same turn
+  (automated in `test/hermes-hooks.test.ts`).
+
 Rules that hold on every surface:
 
 - Numbers agree: `unread`/`needs_reply`/`from_owner` are identical on the statusline, both HUD

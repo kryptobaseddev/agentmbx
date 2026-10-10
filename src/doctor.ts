@@ -14,7 +14,7 @@ import { version } from "./version.ts";
 import { GROK_NO_PUSH, MbxNode, RETRY_HOURS, staleMcpKvCensus } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
 import { claudePluginChecks } from "./claude-plugin.ts";
-import { detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConsent, mcpConfiguredCmd, mcpConfiguredTimeout, skillDest, skillStatus, statuslineConfiguredCommand, statuslineCurrent, statuslineState, wired, type CliId, type SetupCtx } from "./setup.ts";
+import { detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConfigPath, hermesConsent, mcpConfiguredCmd, mcpConfiguredTimeout, skillDest, skillStatus, statuslineConfiguredCommand, statuslineCurrent, statuslineState, wired, type CliId, type SetupCtx } from "./setup.ts";
 import { mailboxLiveness } from "./receipts.ts";
 import { liveWatcher } from "./wake.ts";
 import { findIdentityControl, listIdentityControls } from "./identity-control.ts";
@@ -406,6 +406,12 @@ export function mcpCommandChecks(ctx: SetupCtx, cli: CliId): Check[] {
 export function statuslineChecks(ctx: SetupCtx, cli: string): Check[] {
   if (cli === "opencode")
     return [{ level: "info", label: "opencode: no custom status line feature (built-in segments only: anomalyco/opencode#30295); nothing to verify" }];
+  // T527: Hermes has no status-line feature at all (agentmbx-hermes verified live in its terminal,
+  // 2026-10-10). The daemon still writes hermes-<sid> HUD snapshots for `agentmbx status` and any
+  // future surface; there is just nothing in the TUI to render a segment. Silent when Hermes is
+  // not installed (the doctor loop only asks for detected CLIs; a direct call should stay quiet too).
+  if (cli === "hermes" && existsSync(hermesConfigPath(ctx.home)))
+    return [{ level: "info", label: "hermes: no status line feature in Hermes (agentmbx-hermes verified live, 2026-10-10); nothing to verify" }];
   if (cli !== "claude" && cli !== "kimi" && cli !== "grok") return [];
   const out: Check[] = [];
   const where = edits(ctx, cli).find((e) => e.kind === "statusline")?.path.replace(ctx.home, "~") ?? "-";

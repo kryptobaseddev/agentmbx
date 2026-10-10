@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Hermes status surfaces and mid-turn mail are pinned by tests and evidence (T527):** agentmbx-hermes verified live that Hermes has no status-line feature at all, so `agentmbx doctor` now reports an explicit info row documenting N/A (the opencode precedent) instead of leaving the surface silently absent. The daemon's generic HUD writer already covers bound Hermes sessions — `hud/hermes-<sid>.json`, `.v2.json` and `.line` snapshots are written, pruned when the binding dies, and now locked by a test in `test/status-surface.test.ts`. Mid-turn mail needs no new hook: only `pre_llm_call` consumes hook stdout as injected context, and it fires per LLM call, so mail arriving between two calls of one tool loop reaches the session on the next call of the same turn — a test in `test/hermes-hooks.test.ts` proves the second call injects the hint (counts only, never bodies). `docs/harness-validation-recipe.md` records the Hermes hook list as evidence: `on_session_start` (observer), `pre_llm_call` (injects), `pre_tool_call`/`post_tool_call` (exist, stdout not consumed — no post-tool channel, none wired).
 ## 0.5.24 (2026-10-10)
 
 Fixes from the v0.5.23 harness checks. The Claude plugin loads the version you installed and finds its session, Hermes binds its real session id past 64 KiB of history, OpenCode 2.0 keeps the mbx server, and a standalone OpenCode session is woken through the plugin inside its own serve. Signed collaboration grants now cover reversible outward work: a non-default branch push or a draft PR.
