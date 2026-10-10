@@ -146,7 +146,7 @@ Agent integration
   agentmbx hook session-end --cli claude         release the exact session on terminal exit (keeps /clear and /resume bindings)
   agentmbx hook prompt --cli <…>                adds "N unread mbx messages" to the next turn when there is mail
   agentmbx hook post-tool --cli claude          surfaces new unread mail between tool calls (bundled sh fast path: zero node starts in steady state, T342)
-  agentmbx hook permission --cli <claude|codex|kimi>   YOLO: approves the prompt only under an active owner policy with the permissions class
+  agentmbx hook permission --cli <claude|codex|kimi>   untainted signed-policy approval for bounded outward-reversible work; permissions enables YOLO
   agentmbx import-v2 <MAILBOX/v2 dir>           import this caller's leased mailbox as unsigned 'legacy' messages
 
 Env: MBX_HOME (default ~/.local/share/agentmbx), MBX_AGENT (agent name for mcp/hooks), MBX_ADVERTISE (host:port others use),
@@ -1134,7 +1134,7 @@ If the codes differ, do not approve: someone is in the middle.`);
                     await flushOutbox(node);
                     await flushReceipts(node);
                     await dispatchWakes(node);
-                    await opencodePermissionPass(node, yoloLookup(node), opencodeService);
+                    await opencodePermissionPass(node, permissionLookup(node), opencodeService);
                     if (v2)
                         await relayReceive(node, v2);
                     else if (relay && route?.mode === "v1") {
@@ -1600,8 +1600,8 @@ async function policy(node, pos, str, o) {
     die("policy set | list | renew <id> | revoke <id>|--all");
 }
 // ---- hooks -----------------------------------------------------------------------------------
-/** YOLO policy lookup (docs/POLICY.md §5): an active owner policy with the permissions class for that agent on this host. */
-const yoloLookup = (node) => (agent, ctx) => hasClass(node.store.db, agent, node.host, "permissions", { cwd: ctx?.cwd });
+/** One independently signed grant must cover the requested class and session project (POLICY.md §5). */
+const permissionLookup = (node) => (agent, ctx) => hasClass(node.store.db, agent, node.host, ctx?.class ?? "permissions", { cwd: ctx?.cwd });
 /** Exact command a Grok session runs as a tracked background task (T435). Its exit starts the next turn. */
 function grokWatchCommand(sid) {
     return sid ? `agentmbx watch --cli grok --session ${sid}` : "agentmbx watch --cli grok";
@@ -1659,11 +1659,11 @@ async function hook(node, event, cli) {
             parsed = JSON.parse(raw);
         }
         catch { /* malformed */ }
-        const d = decidePermission(parsed, cli, yoloLookup(node), { node, pid: process.ppid });
+        const d = await decidePermission(parsed, cli, permissionLookup(node), { node, pid: process.ppid });
         if (d.output)
             console.log(d.output);
         if (d.kimi)
-            await approveKimi(node, d, { recheck: () => yoloLookup(node)(d.agent, { cwd: d.cwd }).ok });
+            await approveKimi(node, d, { recheck: () => permissionLookup(node)(d.agent, { cwd: d.cwd, class: d.class }).ok });
         return;
     }
     if (!["session-start", "session-end", "prompt", "post-tool", "stop"].includes(event ?? ""))
