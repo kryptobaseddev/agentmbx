@@ -702,6 +702,14 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
       const recorded = parseProviderRecord(node.store.get(providerRecordKey(prior.holder_pid)));
       if (prior.cli === "opencode" && recorded?.harness && !env.harnessProvider)
         throw Object.assign(new Error("A standalone agentmbx mcp cannot use a live harness identity. Use agentmbx inbox/read/reply/ack/send --as <name> inside the provider session; reconnect with the harness MCP controls. Never kill or hand-spawn MBX MCP servers."), { code: "IDENTITY_IN_USE" });
+      // T516 (AC3): a lease held by THIS process is not a foreign holder when it is held for THIS SAME session
+      // (prior.session_id === state.sessionId) — a sibling context of the same conversation co-uses it (T439) instead of
+      // a lease refusal against our own process. A DIFFERENT session in this same process claiming that identity is still
+      // refused: identity-availability.ts gates its coUse answer on session_id equality, so the cross-session claim falls
+      // through below to the ordinary "held by live <session>" refusal. Same-process is not a license to hand one
+      // session's identity to another (T308 AC2).
+      if (prior.holder_pid === process.pid && prior.holder_start === holderStart() && prior.cli === env.cli && prior.session_id === state.sessionId)
+        throw Object.assign(new Error(`identity ${agent} is co-used: held by this process (pid ${process.pid}) for another context of this same session; a sibling MCP client of this session co-uses it`), { code: "IDENTITY_CO_USE", coUse: { agent, token: prior.token } });
       const recordedEvidence = recorded ? leases.processEvidence(recorded.pid) : null;
       const a = identityAvailability({ lease: prior, evidence: leases.processEvidence(prior.holder_pid), activity: parseActivity(node.store.get(activityKey(agent))),
         now: Date.now(), caller: { cli: env.cli, sessionId: state.sessionId, providerPid: env.ppid,
@@ -962,7 +970,19 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
       throw new Error("Conflicting OpenCode sessionID metadata");
     // Codex threadId is the resumable thread. Its sessionId is a distinct execution ID.
     const sid = env.cli === "codex" ? meta?.threadId : namespaced !== undefined ? namespaced : documented;
-    if (sid === undefined) return base; // non-session provider calls use the transport's own (launch-configured) identity
+    if (sid === undefined) {
+      // T516: a call without session metadata in an OpenCode MCP resolves to THIS process's single bound session
+      // state when exactly one exists (AC1), instead of the transport's own base identity — and when several are
+      // bound it is an explicit ambiguity that names the fix (AC2), never a lease refusal against its own process.
+      if (env.cli === "opencode") {
+        const boundSessions = [...states.values()].filter((s) => bound(s));
+        if (boundSessions.length === 1) return boundSessions[0];
+        if (boundSessions.length > 1)
+          throw Object.assign(new Error(`ambiguous OpenCode session: ${boundSessions.length} bound session states in this process and the call carries no session _meta. `
+            + 'Pass _meta {"sessionID":"<ses_id>"} (or {"ai.opencode/sessionID":"<ses_id>"}) so the call routes to its session.'), { code: "OPENCODE_SESSION_AMBIGUOUS" });
+      }
+      return base; // no session state (or none bound): non-session calls use the transport's own (launch-configured) identity
+    }
     const valid = env.cli === "codex" ? /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i : /^ses_[a-zA-Z0-9]{1,128}$/;
     if (typeof sid !== "string" || !valid.test(sid)) throw new Error(`Invalid ${env.cli} session identity metadata`);
     let state = states.get(sid);

@@ -51,6 +51,13 @@ for (const cli of ["codex", "opencode", "claude", "kimi"]) test(`${cli} initiali
   const before = await who(); assert.equal(before.agent, "scoped"); assert.deepEqual(before.policies, []);
   const ownPolicy = grant(before.agent, "collaborate");
   assert.deepEqual((await who()).policies.map(p => p.id), [ownPolicy]);
-  const base = (await c.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { policies: { id: string }[] };
-  assert.deepEqual(base.policies.map(p => p.id), [basePolicy]);
+  const base = (await c.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent: string; policies: { id: string }[] };
+  if (cli === "opencode") {
+    // T516 (AC1): with the single session bound, an OpenCode call without session _meta routes to that session's state
+    // (never the transport base) — the approved single-bound fallback.
+    assert.equal(base.agent, "scoped");
+    assert.deepEqual(base.policies.map(p => p.id), [ownPolicy]);
+  } else {
+    assert.deepEqual(base.policies.map(p => p.id), [basePolicy]);
+  }
 });
