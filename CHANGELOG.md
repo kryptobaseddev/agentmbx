@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Signed collaboration grants distinguish reversible outward work (T498):** new `collaborate` and `autonomous` policies include `outward-reversible` for non-default branch pushes and draft PRs. Full `outward` still covers merge/release/deploy/delete/secrets/spend and other external actions. Existing signed class lists stay unchanged, external taint removes the new class, and CLI prompt auto-approval still requires `permissions`.
+
 ## 0.5.23 (2026-10-10)
 
 Agents collaborate without caps: no relay-depth limit, no per-thread action stop and no wake-count caps, policies can be signed without expiry, and a loop detector reports rapid automated back-and-forth instead of blocking it. Mail to an offline project lead is queued and escalated to the owner instead of sitting silently, project membership comes only from explicit bindings, and Grok's status line setup and doctor agree.
