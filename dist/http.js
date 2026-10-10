@@ -1,6 +1,7 @@
 // Host-to-host HTTP: pairing, envelope exchange, agent directory. Every request except /v1/pair*, read-only
-// /v1/status and the loopback /v1/opencode-wake queue carries a signed hop (X-Mbx-Host / -Ts / -Sig over
-// method, path, ts, sha256(body)); freshness is checked on the hop only.
+// /v1/status, the loopback /v1/opencode-wake queue, and the loopback /v1/opencode-permission decision
+// carries a signed hop (X-Mbx-Host / -Ts / -Sig over method, path, ts, sha256(body)); freshness is
+// checked on the hop only.
 import { createServer } from "node:http";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
@@ -13,6 +14,7 @@ import { hudStatus, hudStatusV2 } from "./hud.js";
 import { STATUS_V2_SCHEMA } from "./status-schema.js";
 import { notifyDesktop } from "./wake.js";
 import { cancelOpencodeWake, completeOpencodeWake, listOpencodeWakeWaiters, waitForOpencodeWake } from "./opencode-wake-queue.js";
+import { opencodePermissionDecision } from "./opencode-permission.js";
 import { version } from "./version.js";
 import { rotationLog, saveRotationLog } from "./key-rotation.js";
 import { storedPolicies, acceptSigned, policyUnexpired } from "./policy.js";
@@ -458,6 +460,19 @@ export function startServer(node, port = node.config.port, bind = node.config.bi
                     return send(200, { ok: true });
                 }
                 return send(405, { error: "method not allowed" });
+            }
+            // T521: the plugin inside a standalone OpenCode serve asks whether it may set effect "allow"
+            // on the in-process evaluate hook. Before hop auth, loopback only, and never a wake slot.
+            if (url.pathname === "/v1/opencode-permission") {
+                if (!isLoopbackRemote(req.socket.remoteAddress ?? ""))
+                    return send(403, { error: "opencode permission route is loopback only" });
+                if (req.method !== "GET")
+                    return send(405, { error: "method not allowed" });
+                const sessionID = url.searchParams.get("session") ?? "";
+                const pidRaw = url.searchParams.get("pid") ?? "";
+                if (!sessionID || sessionID.length > 256 || !/^[1-9]\d{0,9}$/.test(pidRaw))
+                    return send(400, { error: "bad session or pid" });
+                return send(200, opencodePermissionDecision(node, sessionID, Number(pidRaw)));
             }
             if (url.pathname === "/v1/pair/hello" || url.pathname === "/v1/pair/join") {
                 tokenAttempts = tokenAttempts.filter((t) => Date.now() - t < 60_000);

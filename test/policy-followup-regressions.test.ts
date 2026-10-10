@@ -35,7 +35,7 @@ test('OpenCode approval rejects obsolete dead process binding',async t=>{
   if(opts?.method==='POST'){posts++;return Response.json({});}
   return Response.json({data:[{id:'per-one',sessionID:'ses-old',action:'Bash'}]});
  };
- await opencodePermissionPass(n,()=>({ok:true}),async()=>({url:'http://test.invalid',auth:''}),fake as typeof fetch);
+ await opencodePermissionPass(n,()=>({ok:true}),async()=>({url:'http://test.invalid',auth:''}),fake as typeof fetch,()=>'service');
  assert.equal(posts,0);
 });
 test('project containment fails closed for missing target behind outward symlink',t=>{

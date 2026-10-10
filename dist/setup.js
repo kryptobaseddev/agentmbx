@@ -1287,6 +1287,37 @@ const admitWake = async (ctx: NoteCtx, sid: string, text: string): Promise<strin
   } catch { return null; }
   return null;
 };
+/** A service-hosted plugin must not evaluate: that races the daemon's HTTP reply. Standalone is
+ *  --stdio, or any argv that is not the shared service. */
+const standaloneServe = (): boolean => {
+  const argv = process.argv;
+  const service = argv.some((a) => a === "--service" || String(a).startsWith("--service="));
+  const stdio = argv.includes("--stdio");
+  return stdio || !service;
+};
+const permissionWatching = { on: false };
+/** Ask this machine's daemon, then set effect on the in-process evaluate hook. A skip, a down
+ *  daemon, or a missing hook leaves the prompt. This never posts to the shared OpenCode service
+ *  and does not use the T519 wake queue. */
+const watchPermission = (ctx: NoteCtx & { permission?: { hook?: (name: string, fn: (req: { sessionID?: string; effect?: string }) => Promise<void> | void) => void } }): void => {
+  if (permissionWatching.on || !standaloneServe() || wakePort() === null) return;
+  const hook = ctx?.permission?.hook;
+  if (typeof hook !== "function") return;
+  permissionWatching.on = true;
+  try {
+    hook("evaluate", async (req) => {
+      const sid = req && typeof req.sessionID === "string" ? req.sessionID : "";
+      const port = wakePort();
+      if (!sid || !port) return;
+      try {
+        const res = await fetch("http://127.0.0.1:" + port + "/v1/opencode-permission?session=" + encodeURIComponent(sid) + "&pid=" + String(process.pid));
+        if (!res.ok) return;
+        const body = await res.json() as { decision?: unknown };
+        if (body && body.decision === "allow" && req && typeof req === "object") req.effect = "allow";
+      } catch { /* leave the prompt */ }
+    });
+  } catch { permissionWatching.on = false; }
+};
 const wakeWatching = new Set<string>();
 const pause = (ms: number) => new Promise<void>((r) => { const t = setTimeout(r, ms); t.unref(); });
 /** One long-poll per session, started once the session id is known, so both plugin generations share it.
@@ -1346,6 +1377,7 @@ const sidOf = (v: unknown): string | undefined => {
 /** OpenCode v1 generation: the loader calls this factory with { $, client, directory } and runs the
  *  returned hooks object (v1 names: session.created/session.idle/tool.execute.after). */
 export const AgentMBXHooks = async (ctx: NoteCtx & { $?: unknown; client?: unknown; directory?: string }) => {
+  watchPermission(ctx);
   const directory = ctx?.directory;
   const run = runFor(ctx, ${bin}, directory);
   return {
@@ -1374,7 +1406,9 @@ export default {
     location?: { directory?: string };
     event?: { subscribe?: (o?: unknown) => AsyncIterable<{ type?: string; location?: { directory?: string }; data?: unknown }> };
     tool?: { hook?: (name: "execute.after", fn: (input: unknown) => unknown) => unknown };
+    permission?: { hook?: (name: string, fn: (req: { sessionID?: string; effect?: string }) => Promise<void> | void) => void };
   }) {
+    watchPermission(ctx);
     const dir = ctx?.location?.directory;
     const run = runFor(ctx, ${bin}, dir);
     const here = (ev: { location?: { directory?: string } }) => !ev.location?.directory || !dir || ev.location.directory === dir;

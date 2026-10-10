@@ -177,9 +177,9 @@ test("T539 AC3/AC4: OpenCode retains YOLO only and checks taint after fetching",
     taint(n, "opencode", "ses_test"); return Response.json({ data: [{ id: "per_test", sessionID: "ses_test", action: "Bash" }] });
   }) as typeof fetch;
   const narrow: Lookup = (_agent, ctx) => ({ ok: ctx?.class === "outward-reversible" });
-  assert.equal(await opencodePermissionPass(n, narrow, async () => ({ url: "http://test.invalid", auth: "" }), fake), 0);
+  assert.equal(await opencodePermissionPass(n, narrow, async () => ({ url: "http://test.invalid", auth: "" }), fake, () => "service"), 0);
   assert.equal(calls, 0, "action-only requests cannot borrow narrow approval");
-  assert.equal(await opencodePermissionPass(n, yes, async () => ({ url: "http://test.invalid", auth: "" }), fake), 0);
+  assert.equal(await opencodePermissionPass(n, yes, async () => ({ url: "http://test.invalid", auth: "" }), fake, () => "service"), 0);
   assert.equal(posts, 0);
 });
 
@@ -286,9 +286,9 @@ test("opencode daemon pass: replies once for covered agents only, and makes no r
   }) as typeof fetch;
   let svcCalls = 0;
   const svc = async () => { svcCalls++; return { url: "http://oc", auth: "Basic x" }; };
-  assert.equal(await opencodePermissionPass(n, no, svc, fake), 0);
+  assert.equal(await opencodePermissionPass(n, no, svc, fake, () => "service"), 0);
   assert.equal(svcCalls, 0); assert.equal(calls.length, 0);
-  assert.equal(await opencodePermissionPass(n, (a) => (a === "yolo" ? yes(a) : no(a)), svc, fake), 1);
+  assert.equal(await opencodePermissionPass(n, (a) => (a === "yolo" ? yes(a) : no(a)), svc, fake, () => "service"), 1);
   assert.deepEqual(calls.map((c) => `${c.method} ${c.url}`), ["GET http://oc/api/session/ses_A/permission", "POST http://oc/api/session/ses_A/permission/per_1/reply"]);
   assert.deepEqual(JSON.parse(calls[1].body!), { decision: "once" });
   assert.deepEqual(audits(n), [{ agent: "yolo", cli: "opencode", tool: "bash", policy_id: "pol_1" }]);
@@ -308,7 +308,7 @@ test("opencode daemon pass: legacy MCP-only bindings cannot use folder-based app
     }
     posts.push(url); return new Response(null, { status: 204 });
   }) as typeof fetch;
-  assert.equal(await opencodePermissionPass(n, (a) => (a === "web" ? yes(a) : no(a)), async () => ({ url: "http://oc", auth: "" }), fake), 0);
+  assert.equal(await opencodePermissionPass(n, (a) => (a === "web" ? yes(a) : no(a)), async () => ({ url: "http://oc", auth: "" }), fake, () => "service"), 0);
   assert.equal(listUrl, "");
   assert.deepEqual(posts, []);
 });
