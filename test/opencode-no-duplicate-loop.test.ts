@@ -46,7 +46,9 @@ test("plugin template admits in-process and never calls the shared service", () 
   assert.ok(!src.includes("inService"), "no service-process gate");
   assert.ok(!src.includes('["service", "status"]') && !src.includes("opencode service status"), "no service discovery");
   assert.ok(!src.includes("/api/session"), "no session fetch");
-  assert.ok(src.includes("session?.synthetic") && src.includes("resume: false") && src.includes('delivery: "queue"'), "in-process admission");
+  assert.ok(src.includes("session?.synthetic") && src.includes('delivery: "queue"'), "in-process admission");
+  assert.ok(src.includes('id: noteId(sid, hook, text), text, resume: false'), "hook notes stay resume:false (T518)");
+  assert.ok(src.includes('id: noteId(sid, "wake", text), text, resume: true'), "a daemon wake resumes the idle turn (T544)");
 });
 
 async function loadPlugin() {
