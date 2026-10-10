@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS messages (
   authority TEXT,                -- JSON {caps, grant_id, session} when an owner grant verified, else NULL
   received_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS messages_thread ON messages(thread, ts);
+CREATE INDEX IF NOT EXISTS messages_received ON messages(received_at);
 CREATE INDEX IF NOT EXISTS messages_sender ON messages(from_addr, id);
 CREATE TRIGGER IF NOT EXISTS messages_writer_version BEFORE INSERT ON messages BEGIN
   SELECT CASE WHEN mbx_writer_schema_version()<3 THEN RAISE(ABORT,'AgentMBX writer schema is stale; restart this process') END; END;
@@ -122,7 +123,7 @@ CREATE TABLE IF NOT EXISTS wakes (agent TEXT NOT NULL, thread TEXT, at TEXT NOT 
 CREATE TABLE IF NOT EXISTS audit (at TEXT NOT NULL, event TEXT NOT NULL, detail TEXT);
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS policies (     -- owner-signed collaboration policies (src/policy.ts)
-  id TEXT PRIMARY KEY, record TEXT NOT NULL, sig TEXT NOT NULL, owner_fp TEXT NOT NULL, iat TEXT NOT NULL, exp TEXT NOT NULL,
+  id TEXT PRIMARY KEY, record TEXT NOT NULL, sig TEXT NOT NULL, owner_fp TEXT NOT NULL, iat TEXT NOT NULL, exp TEXT,
   revoked INTEGER NOT NULL DEFAULT 0, received_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS policy_revocations (id TEXT PRIMARY KEY, target TEXT NOT NULL, iat TEXT NOT NULL, record TEXT NOT NULL, sig TEXT NOT NULL, received_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, record TEXT NOT NULL, sig TEXT NOT NULL, received_at TEXT NOT NULL); -- owner-signed device records
@@ -225,12 +226,24 @@ export class Store {
         // A lost additive index/column still needs repair even when the definition marker survived.
         const objects = new Set(this.db.prepare("SELECT name FROM sqlite_master").all().map(row => row.name));
         definitionCurrent = SCHEMA_OBJECTS.every(name => objects.has(name)) && SCHEMA_COLUMNS.every(([table, column]) =>
-          this.db.prepare(`PRAGMA table_info(${table})`).all().some(row => row.name === column));
+          this.db.prepare(`PRAGMA table_info(${table})`).all().some(row => row.name === column))
+          && this.db.prepare("PRAGMA table_info(policies)").all().some(row => row.name === "exp" && row.notnull === 0);
       }
       if (!definitionCurrent) this.tx(() => {
         this.assertCurrent(); // another opener may have migrated while we waited for the write lock
         assertMigrationAllowed(); // an old opener may instead have initialized a previously empty database
         this.db.exec(SCHEMA);
+        // T537: exp:null is signed evidence of a policy with no expiry. Preserve every
+        // retained row byte-for-byte, including invalid/revoked evidence, in one transaction.
+        if (this.db.prepare("PRAGMA table_info(policies)").all().some(row => row.name === "exp" && row.notnull === 1)) {
+          this.db.exec(`CREATE TABLE policies_nullable (
+            id TEXT PRIMARY KEY, record TEXT NOT NULL, sig TEXT NOT NULL, owner_fp TEXT NOT NULL, iat TEXT NOT NULL, exp TEXT,
+            revoked INTEGER NOT NULL DEFAULT 0, received_at TEXT NOT NULL);
+            INSERT INTO policies_nullable (id,record,sig,owner_fp,iat,exp,revoked,received_at)
+              SELECT id,record,sig,owner_fp,iat,exp,revoked,received_at FROM policies;
+            DROP TABLE policies;
+            ALTER TABLE policies_nullable RENAME TO policies;`);
+        }
         if (this.schemaVersion() < 3) {
           // Legacy order is deterministic, not an assertion about historical receipt ordering.
           // Recipient visibility includes ACKed mail. Sender visibility matches MbxNode.canSee.

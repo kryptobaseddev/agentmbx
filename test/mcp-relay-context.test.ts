@@ -119,10 +119,10 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: maximum
     assert.equal(envelope.meta.hop, 1000);
     assert.equal(envelope.meta.origin, "external");
     const policy = n.policyFor(row, "receiver");
-    assert.equal(policy.level, "ask");
-    assert.match(policy.notes.join(" "), /relay depth 1000 exceeds 20 for collaborate/);
-    assert.ok((result.structuredContent as { warnings: string[] }).warnings.some(w => /relay depth 1000 exceeds 20: .*will not be woken.*autonomous and yolo have no depth limit/.test(w)),
-      "the sender learns the brake applies, instead of a silent missed wake (Fedora T151 report)");
+    assert.equal(policy.level, "collaborate");
+    assert.deepEqual(policy.classes, ["read"], "external content remains read-only at any depth");
+    assert.ok(!(result.structuredContent as { warnings: string[] }).warnings.some(w => /relay depth .*exceeds/.test(w)),
+      "an unlimited collaborate grant has no relay brake warning");
   }
   // answering the deep message's own sender is a conversation, not a relay: no depth, but external origin stays
   const answer = await c.callTool({ name: "mbx_reply", arguments: { id: parent.id, body: "data" } });

@@ -22,6 +22,18 @@ import { pruneCandidates } from "./identity-cleanup.js";
 import { staleProjectBindings } from "./registry.js";
 import { deadHolderLeases, inspectLeaseProcess } from "./identity-leases.js";
 import { providerLabel, sameLiveProvider } from "./identity-takeover.js";
+import { conversationLoopLabel, detectConversationLoops } from "./loop-detector.js";
+/** Observational only: doctor must never notify, mark deliveries or consume wake reservations. */
+export function conversationLoopChecks(node, now = Date.now()) {
+    try {
+        const loops = detectConversationLoops(node, now);
+        return loops.length ? loops.map(loop => ({ level: "warn", label: conversationLoopLabel(loop), fix: "review the thread with agentmbx thread; delivery and wakes remain enabled" }))
+            : [{ level: "ok", label: "no rapid automated conversation loops detected" }];
+    }
+    catch (error) {
+        return [{ level: "warn", label: `conversation loop reporting: ${error.message}` }];
+    }
+}
 export const CLAIM_CHURN_LIMIT = 5;
 /** T481: one session id leased by an MCP under a different OpenCode serve than the published control endpoint. */
 export function foreignSessionProvider(node) {
@@ -651,10 +663,11 @@ export async function doctor(ctx, mbxHome, opts = {}) {
             try {
                 const sup = node.depthSuppressed(a.name);
                 if (sup.length)
-                    add("warn", `${a.name}: ${sup.length} unread message(s) from ${[...new Set(sup.map((x) => x.from))].join(", ")} did not wake it (relay depth ${Math.max(...sup.map((x) => x.hop))} over the policy allowance)`, "the owner's next prompt in that session resets the depth; a collaborate policy allows 20, autonomous/yolo have no limit");
+                    add("warn", `${a.name}: ${sup.length} unread message(s) from ${[...new Set(sup.map((x) => x.from))].join(", ")} did not wake it (relay depth ${Math.max(...sup.map((x) => x.hop))} over the policy allowance)`, "the owner's next prompt in that session resets the depth; collaborate, autonomous and yolo have no relay limit");
             }
             catch { /* unreadable mailbox: other checks report it */ }
         }
+        out.push(...conversationLoopChecks(node));
         // T211: mailboxes nobody is holding, sessions waiting on a remembered identity, prune weight
         for (const c of strandedMail(node))
             out.push(c);

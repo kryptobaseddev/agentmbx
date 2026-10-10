@@ -9,7 +9,7 @@ import { IdentityLeases, type IdentityLease } from "./identity-leases.ts";
 export { kimiServer } from "./kimi-web.ts";
 
 /** Is the permissions class granted to `agent` for a session working in `ctx.cwd`? (see policy.ts hasClass) */
-export type Lookup = (agent: string, ctx?: { cwd?: string | null }) => { ok: boolean; policy_id?: string; exp?: string };
+export type Lookup = (agent: string, ctx?: { cwd?: string | null }) => { ok: boolean; policy_id?: string; exp?: string | null };
 interface PermissionBinding { agent: string; cli: string; session_id: string; pid: number | null; pid_start: string | null; session_key: string | null; updated_at: string; cwd: string | null }
 interface PermissionAuthority { binding: PermissionBinding; leaseToken: string }
 export interface Decision { allow: boolean; agent?: string; tool?: string; policy_id?: string; output: string; cwd?: string | null; authority?: PermissionAuthority; kimi?: { session_id: string; approval_id: string } }

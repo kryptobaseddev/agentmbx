@@ -29,7 +29,7 @@ export const DID_MAX = 200;
 export const didWarning = (did) => did && did.length > DID_MAX
     ? `did was ${did.length} characters; the audit log kept the first ${DID_MAX}, marked truncated. Lead with the action in one line; put detail in the thread reply or note.` : null;
 export const WAKE_KINDS = new Set(["request", "task", "decision", "alert"]);
-export const WAKE_LIMITS = { perAgentSeconds: 30, perThreadHour: 6, perAgentDay: 60 };
+export const WAKE_LIMITS = { perAgentSeconds: 30 };
 /** Session rows refresh every 60 s while the MCP server lives; older rows (or dead pids) are not trusted for identity. */
 export const SESSION_FRESH_MS = 3 * 60_000;
 export const LIVE_AGENT_MS = 24 * 3_600_000;
@@ -75,7 +75,8 @@ export class MbxNode {
             privatePath(join(home, file), 0o600, true);
         const cfgPath = join(home, "config.json"), keyPath = join(home, "host.key"), encPath = join(home, "enc.key");
         if (!existsSync(cfgPath)) {
-            const c = { host: init.host ?? shortHost(), port: init.port ?? DEFAULT_PORT, bind: init.bind ?? "0.0.0.0" };
+            const c = { host: init.host ?? shortHost(), port: init.port ?? DEFAULT_PORT, bind: init.bind ?? "0.0.0.0",
+                ...(init.loop_detector ? { loop_detector: init.loop_detector } : {}) };
             if (!NAME_RE.test(c.host))
                 throw new Error(`invalid host name "${c.host}" (use a-z, 0-9, -)`);
             writeFileSync(cfgPath, JSON.stringify(c, null, 2) + "\n", { mode: 0o600 });
@@ -368,13 +369,8 @@ export class MbxNode {
         }
         return n;
     }
-    /** Stop-hook continuation budget: the thread and daily wake caps also bound "keep going" turns. Records one when allowed. */
+    /** Record a Stop-hook continuation. Conversation loops are reported, never stopped by wake counts. */
     allowContinue(agent, thread, now = Date.now()) {
-        const q = (sql, ...a) => this.store.db.prepare(sql).get(...a).n;
-        if (thread && q("SELECT count(*) n FROM wakes WHERE agent=? AND thread=? AND at>?", agent, thread, new Date(now - 3_600_000).toISOString()) >= WAKE_LIMITS.perThreadHour)
-            return false;
-        if (q("SELECT count(*) n FROM wakes WHERE agent=? AND at>?", agent, new Date(now - 86_400_000).toISOString()) >= WAKE_LIMITS.perAgentDay)
-            return false;
         this.store.db.prepare("INSERT INTO wakes (agent,thread,at) VALUES (?,?,?)").run(agent, thread, new Date(now).toISOString());
         return true;
     }
@@ -955,7 +951,7 @@ export class MbxNode {
     depthSuppressed(agent) {
         return this.inbox(agent).flatMap((m) => {
             const p = this.policyFor(m, agent);
-            return p.notes.some((n) => /^relay depth \d+ exceeds/.test(n)) ? [{ id: m.id, from: m.from_addr, hop: p.hop ?? 0 }] : [];
+            return p.depthSuppressed ? [{ id: m.id, from: m.from_addr, hop: p.hop ?? 0 }] : [];
         });
     }
     /** The owner policy that applies to `agent` acting on this message (computed now: expiry/revocation count). */
@@ -1002,17 +998,13 @@ export class MbxNode {
     takeWake(agent, thread, now = Date.now()) {
         return this.reserveWake(agent, thread, now).brake;
     }
-    /** Reserve budget atomically; release only when the adapter proves no wake was submitted. */
+    /** Reserve the per-agent batching window atomically; release only when the adapter proves no wake was submitted. */
     reserveWake(agent, thread, now = Date.now()) {
         return this.store.tx(() => {
             const since = (ms) => new Date(now - ms).toISOString();
             const q = (sql, ...a) => this.store.db.prepare(sql).get(...a).n;
             if (q("SELECT count(*) n FROM wakes WHERE agent=? AND at>?", agent, since(WAKE_LIMITS.perAgentSeconds * 1000)))
                 return { brake: "batched (woke recently)" };
-            if (thread && q("SELECT count(*) n FROM wakes WHERE agent=? AND thread=? AND at>?", agent, thread, since(3_600_000)) >= WAKE_LIMITS.perThreadHour)
-                return { brake: "thread wake cap reached" };
-            if (q("SELECT count(*) n FROM wakes WHERE agent=? AND at>?", agent, since(86_400_000)) >= WAKE_LIMITS.perAgentDay)
-                return { brake: "daily wake cap reached" };
             const at = new Date(now).toISOString();
             const { lastInsertRowid } = this.store.db.prepare("INSERT INTO wakes (agent,thread,at) VALUES (?,?,?)").run(agent, thread, at);
             let released = false;

@@ -26,7 +26,7 @@ import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./rec
 import { escalateUnheldMail, retirePhantoms, returnNeverClaimed } from "./stranded.js";
 import { activeLead, leadSummary, makeLead, makeLeadRevocation, projectLeadLine, projectLeadView, revokeLead, storeLead } from "./project-ledger.js";
 import { DEFAULT_PORT, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
-import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary } from "./policy.js";
+import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, parsePolicyTtl, policyUnexpired, policySummary } from "./policy.js";
 import { authHelperPath, createKeychainOwner, createOwnerKey, defaultOwnerBackend, ownerInfo, ownerSignCanonical, readPassphraseFromTTY } from "./owner.js";
 import { periodicUpdateCheck, updateAvailable, updateCommand } from "./update.js";
 import { installKind, version } from "./version.js";
@@ -52,6 +52,7 @@ import { DEFAULT_LOGIN_BASE_URL, defaultLoginIO, parseLoginBase, runLogin } from
 import { buildIdentityTakeover } from "./identity-takeover.js";
 import { publishIdentityControl, findIdentityControl, identityControlReceipt, resolveIdentityControlReceipt, submitIdentityControl } from "./identity-control.js";
 import { armDaemonSync } from "./sync-daemon.js";
+import { armConversationLoopReports } from "./loop-detector.js";
 import { mcpStarting } from "./mcp-startup.js";
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
 
@@ -128,8 +129,8 @@ Owner (each signature needs you: a Touch ID / password prompt on macOS with Agen
   agentmbx owner send --to <agents> --subject "…" -m "…" [--kind task] [--needs-reply]   one message signed by you (OWNER)
 
 Policy (what agents may do for each other; each change needs you, like the owner commands)
-  agentmbx policy set <agent[,agent]|*> <${LEVELS.join("|")}> [--from local,<host>,principal:<fp>|*] [--host <host,…>|*] [--project <dir>]… [--classes ${CLASSES.join(",")}] [--ttl 8h]
-  agentmbx policy list [--json]      agentmbx policy renew <id> [--ttl 30d]      agentmbx policy revoke <id> | --all   (--all is the kill switch, sent to every paired host)
+  agentmbx policy set <agent[,agent]|*> <${LEVELS.join("|")}> [--from local,<host>,principal:<fp>|*] [--host <host,…>|*] [--project <dir>]… [--classes ${CLASSES.join(",")}] [--ttl 8h|never]
+  agentmbx policy list [--json]      agentmbx policy renew <id> [--ttl 30d|never]      agentmbx policy revoke <id> | --all   (--all is the kill switch, sent to every paired host)
   agentmbx lead set <agent> --project <dir> [--ttl 30d]     agentmbx lead revoke --project <dir>     agentmbx lead show [--project <dir>]
                   owner-signed project lead: reads every message of that project (mbx_project) and can forward them (mbx_forward)
   agentmbx audit [--since 24h] [--json]      what agents did on peer requests, YOLO approvals, policy and owner changes
@@ -992,8 +993,8 @@ version ${version()} (${installKind()})`);
             const stored = storedPolicies(node.store.db);
             if (stored.invalid.length)
                 console.error(`warning: ${stored.invalid.length} invalid stored policies ignored`);
-            const all = stored.valid.filter(p => p.currentOwner && !p.revoked && Date.parse(p.rec.exp) > Date.now()).map(p => p.rec);
-            console.log(all.length ? `policies ${all.length}: ${all.map((p) => `${p.level === "yolo" ? "YOLO" : p.level}(${p.to.agents.join(",")} until ${p.exp.slice(0, 16)}Z)`).join(" ")}` : "policies none (agents ask before acting on each other's requests)");
+            const all = stored.valid.filter(p => p.currentOwner && !p.revoked && policyUnexpired(p.rec.exp)).map(p => p.rec);
+            console.log(all.length ? `policies ${all.length}: ${all.map((p) => `${p.level === "yolo" ? "YOLO" : p.level}(${p.to.agents.join(",")} ${p.exp === null ? "never expires" : `until ${p.exp.slice(0, 16)}Z`})`).join(" ")}` : "policies none (agents ask before acting on each other's requests)");
             if (all.some((p) => p.level === "yolo"))
                 console.log("!!! YOLO is active: those agents approve their own permission prompts. Kill switch: agentmbx policy revoke --all");
             return;
@@ -1167,6 +1168,7 @@ If the codes differ, do not approve: someone is in the middle.`);
             }
             setInterval(tick, 2000);
             armDaemonSync(node);
+            armConversationLoopReports(node);
             // Presence (T201): announce this host's addresses on start, within ~10 s of an address change, and every 5 min.
             let lastAddrs = addrSignature(node), lastBeacon = 0;
             const beacon = () => { const sig = addrSignature(node); if (sig !== lastAddrs || Date.now() - lastBeacon > 300_000) {
@@ -1555,29 +1557,29 @@ async function policy(node, pos, str, o) {
             return die(`--project ${d}: no such directory`);
         } });
         const rec = makePolicy({ level, agents, hosts: str("host") ? list(str("host")) : [node.host], from: str("from") ? list(str("from")) : ["local"],
-            classes: str("classes") ? list(str("classes")) : undefined, projects, ttlMs: str("ttl") ? parseTtl(str("ttl")) : undefined, ownerPub: ownerPub() });
+            classes: str("classes") ? list(str("classes")) : undefined, projects, ttlMs: str("ttl") ? parsePolicyTtl(str("ttl")) : undefined, ownerPub: ownerPub() });
         if (rec.from.hosts.includes("*") && rec.classes.some((c) => c !== "read"))
             process.stderr.write("warning: --from '*' lets every paired machine's agents use this policy\n");
         const yolo = level === "yolo" ? "\n!!! YOLO: these agents will approve their own permission prompts. Anything that can message them can steer them. Kill switch: agentmbx policy revoke --all" : "";
         await publish(rec, yolo);
         if (!rec.to.hosts.includes("*") && !rec.to.hosts.includes(node.host))
             console.log(`(stored here for ${rec.to.hosts.join(", ")}; it doesn't apply to this host's agents)`);
-        console.log(`policy ${rec.id}: ${policySummary(rec)}\nexpires ${rec.exp}`);
+        console.log(`policy ${rec.id}: ${policySummary(rec)}\n${rec.exp === null ? "never expires" : `expires ${rec.exp}`}`);
         if (level === "yolo")
             await notifyDesktop({ subtitle: "YOLO policy active", body: `${policySummary(rec)}. Revoke: agentmbx policy revoke --all` });
         return;
     }
     if (sub === "renew") {
-        const id = pos[1] ?? die("policy renew <id> [--ttl 30d]");
+        const id = pos[1] ?? die("policy renew <id> [--ttl 30d|never]");
         const candidates = storedPolicies(node.store.db).valid.filter(p => p.currentOwner && !p.revoked && p.rec.id.endsWith(id));
         if (candidates.length !== 1)
             die(`expected one valid owner policy for ${id}, found ${candidates.length}`);
         const old = candidates[0].rec;
         const rec = makePolicy({ level: old.level, classes: old.classes, agents: old.to.agents, hosts: old.to.hosts, from: old.from.hosts, fromAgents: old.from.agents,
-            projects: old.projects, ttlMs: str("ttl") ? parseTtl(str("ttl")) : undefined, ownerPub: ownerPub() });
+            projects: old.projects, ttlMs: str("ttl") ? parsePolicyTtl(str("ttl")) : old.exp === null ? null : undefined, ownerPub: ownerPub() });
         await publish(rec);
         await publish(makeRevocation(old.id, ownerPub()));
-        return console.log(`renewed as ${rec.id}, expires ${rec.exp}`);
+        return console.log(`renewed as ${rec.id}, ${rec.exp === null ? "never expires" : `expires ${rec.exp}`}`);
     }
     if (sub === "revoke") {
         const target = o.all ? "*" : pos[1] ?? die("policy revoke <id> | --all");
@@ -1592,13 +1594,13 @@ async function policy(node, pos, str, o) {
         const stored = storedPolicies(node.store.db);
         for (const p of stored.invalid)
             console.error(`warning: invalid stored policy ${p.id}: ${p.reason}`);
-        const rows = stored.valid.filter(p => Date.parse(p.rec.exp) > Date.now() && (o.all || (p.currentOwner && !p.revoked)))
+        const rows = stored.valid.filter(p => policyUnexpired(p.rec.exp) && (o.all || (p.currentOwner && !p.revoked)))
             .map(p => ({ ...p.rec, revoked: p.revoked }));
         if (o.json)
             return console.log(JSON.stringify(rows, null, 2));
         if (!rows.length)
             return console.log("no active policies: agents answer each other but ask before acting (set one with: agentmbx policy set <agents> collaborate)");
-        return rows.forEach((p) => console.log(`${p.id}${p.revoked ? " (revoked)" : ""}  ${policySummary(p)}  expires ${p.exp.slice(0, 16)}Z`));
+        return rows.forEach((p) => console.log(`${p.id}${p.revoked ? " (revoked)" : ""}  ${policySummary(p)}  ${p.exp === null ? "never expires" : `expires ${p.exp.slice(0, 16)}Z`}`));
     }
     die("policy set | list | renew <id> | revoke <id>|--all");
 }
@@ -1816,12 +1818,12 @@ async function hook(node, event, cli) {
             }
             if (event === "stop") {
                 // Keep going instead of going idle when mail that wants this agent arrived during the turn, but only when the
-                // owner has delegated work or signed the request, only for mail newer than what was already surfaced, within the wake caps.
+                // owner has delegated work or signed the request, only for mail newer than what was already surfaced.
                 // T385: Grok continues the same turn on {"decision":"block","reason"} (user-guide 10-hooks.md,
                 // Stop Decision Control). A session-end Stop, reason other than end_turn, has no turn left to continue.
                 // T391: OpenCode Stop arrives from the plugin's session.idle (the turn just ended); the block
-                // reason is injected back into the session by the plugin's client, and the stopseen marker +
-                // allowContinue cap below bound the loop the injection could otherwise create.
+                // reason is injected back into the session by the plugin's client. The stopseen marker prevents
+                // repeating the same mail; the conversation loop detector reports repeated exchanges without blocking.
                 if (!["claude", "codex", "kimi", "grok", "opencode"].includes(cli))
                     return;
                 if (cli === "grok" && typeof input.reason === "string" && input.reason !== "end_turn")
@@ -1850,7 +1852,7 @@ async function hook(node, event, cli) {
                         return;
                     }
                     const w = kimiNagText();
-                    // No mail thread: the daily wake cap still applies. A refused nag leaves the marker unset.
+                    // No mail thread: record the continuation; kimiNagText retains the watcher's reminder interval.
                     if (w && node.allowContinue(agent, null)) {
                         node.store.set(kimiNagKey, new Date().toISOString());
                         process.stderr.write(`${w}\n`);
@@ -2326,7 +2328,7 @@ async function policyStep(level, yes) {
     try {
         if (!node.ownerPub)
             return;
-        const active = node.store.db.prepare("SELECT count(*) n FROM policies WHERE revoked=0 AND exp > ?").get(new Date().toISOString());
+        const active = node.store.db.prepare("SELECT count(*) n FROM policies WHERE revoked=0 AND (exp IS NULL OR exp > ?)").get(new Date().toISOString());
         if (active.n && !level)
             return console.log(`policy: ${active.n} active (agentmbx policy list)`);
         const keychain = ownerInfo(node.home)?.backend === "keychain";

@@ -241,7 +241,7 @@ function policyInputs(node, nowMs) {
     const { valid } = storedPolicies(node.store.db);
     return valid.map((row) => {
         const scope = policyScope(row.rec.projects);
-        const exp = Date.parse(row.rec.exp);
+        const exp = row.rec.exp === null ? Infinity : Date.parse(row.rec.exp);
         const state = row.revoked ? "revoked" : Number.isFinite(exp) && exp <= nowMs ? "expired" : "active";
         return {
             policy_id: row.rec.id,
