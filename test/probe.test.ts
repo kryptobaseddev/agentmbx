@@ -16,7 +16,7 @@ import { noteProject } from "../src/registry.ts";
 import { bindWakeLease } from "./helpers/wake-lease.ts";
 
 const identity = (name: string, state: IdentityStatus["state"], holder: IdentityStatus["holder"] = null): IdentityStatus =>
-  ({ name, state, claimable: false, reason: `${state} fixture`, role: null, description: null, registered: true,
+  ({ name, state, claimable: false, reason: `${state} fixture`, role: null, description: null, registered: true, retired: false,
     projects: [], unread: 0, messages: 0, last_activity: null, holder });
 
 test("planProbe addresses every live leased identity and excludes the sender", () => {
