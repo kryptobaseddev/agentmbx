@@ -370,10 +370,12 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
           if (!isLoopbackRemote(req.socket.remoteAddress ?? ""))
             return send(403, { error: "session-scoped status is loopback only" });
           const resolved = resolveStatusIdentity(node, cli, { sessionId: session });
+          res.setHeader("cache-control", "no-store");
           if (url.searchParams.get("schema") === STATUS_V2_SCHEMA)
             return send(200, hudStatusV2(node, {
               cli, sessionId: session, agent: resolved.name, state: resolved.state,
               resolvedBy: resolved.resolved_by ?? "none", candidates: resolved.candidates,
+              includeInbox: url.searchParams.get("include") === "inbox",
             }));
           return send(200, hudStatus(node, {
             agent: resolved.name, state: resolved.state,
