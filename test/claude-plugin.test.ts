@@ -8,6 +8,7 @@ import { doctor } from "../src/doctor.ts";
 import { MbxNode } from "../src/node.ts";
 import { parseJsonc } from "../src/jsonc.ts";
 import { runSetup, type SetupCtx } from "../src/setup.ts";
+import { version } from "../src/version.ts";
 
 function raw(text: string, path: string[], key: string): string {
   let node = parseJsonc(text);
@@ -88,7 +89,11 @@ function runner(home: string, failAt: string | null = null): { run: CliRunner; c
       write(join(home, ".claude/plugins/installed_plugins.json"), (cur) => {
         const plugins = cur.plugins as Record<string, { version: string }[]>;
         plugins["cloudflare@cloudflare"][0].version = "MUTATED";
-        plugins[CLAUDE_PLUGIN_ID] = [{ scope: "user", version: "0.5.13", installPath: pluginDir(root) } as unknown as { version: string }];
+        plugins[CLAUDE_PLUGIN_ID] = [{ scope: "user", version: version(), installPath: pluginDir(root) } as unknown as { version: string }];
+      });
+    } else if (args[1] === "update") {
+      write(join(home, ".claude/plugins/installed_plugins.json"), (cur) => {
+        (cur.plugins as Record<string, { version: string }[]>)[CLAUDE_PLUGIN_ID][0].version = version();
       });
     } else if (args[1] === "uninstall") {
       write(join(home, ".claude/settings.json"), (cur) => {
@@ -348,4 +353,43 @@ test("T416: an install without the plugin files skips instead of failing", (t) =
   cpSync(pluginDir(), pluginDir(bare), { recursive: true });
   assert.equal(shipsClaudePlugin(bare), true);
   assert.ok(existsSync(join(pluginDir(bare), "hooks/register.js")));
+});
+
+test("T542: a stale cached plugin is a doctor warning, and setup updates it to this version", () => {
+  const home = mkdtempSync(join(tmpdir(), "t542-stale-"));
+  try {
+    fixture(home);
+    claudePluginStep(home, "install", false, runner(home).run);
+    const path = join(home, ".claude/plugins/installed_plugins.json");
+    const cur = JSON.parse(readFileSync(path, "utf8")) as { plugins: Record<string, { version: string }[]> };
+    cur.plugins[CLAUDE_PLUGIN_ID][0].version = "0.5.19";
+    writeFileSync(path, JSON.stringify(cur));
+    const stale = claudePluginChecks(home, { useClis: true, which: () => "/bin/claude", runCli: runner(home).run });
+    assert.equal(stale[0]?.level, "warn");
+    assert.match(stale[0]?.label ?? "", new RegExp(`loaded plugin is 0\\.5\\.19, agentmbx is ${version().replace(/\./g, "\\.")}`));
+    assert.equal(claudePluginStep(home, "install", true, runner(home).run).action, "updated", "dry run reports the update");
+    const { run, calls } = runner(home);
+    const step = claudePluginStep(home, "install", false, run);
+    assert.equal(step.action, "updated");
+    assert.deepEqual(calls, [["plugin", "update", CLAUDE_PLUGIN_ID, "--scope", "user", "-y"]]);
+    assert.equal(claudePluginChecks(home, { useClis: true, which: () => "/bin/claude", runCli: runner(home).run })[0]?.level, "ok");
+    const again = runner(home);
+    assert.equal(claudePluginStep(home, "install", false, again.run).action, "unchanged");
+    assert.deepEqual(again.calls, [], "a current install runs nothing");
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test("T542: a failed update is an error naming the version still loaded", () => {
+  const home = mkdtempSync(join(tmpdir(), "t542-fail-"));
+  try {
+    fixture(home);
+    claudePluginStep(home, "install", false, runner(home).run);
+    const path = join(home, ".claude/plugins/installed_plugins.json");
+    const cur = JSON.parse(readFileSync(path, "utf8")) as { plugins: Record<string, { version: string }[]> };
+    cur.plugins[CLAUDE_PLUGIN_ID][0].version = "0.5.19";
+    writeFileSync(path, JSON.stringify(cur));
+    const step = claudePluginStep(home, "install", false, runner(home, "update").run);
+    assert.equal(step.action, "error");
+    assert.match(step.note ?? "", /left 0\.5\.19/);
+  } finally { rmSync(home, { recursive: true, force: true }); }
 });

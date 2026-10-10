@@ -20,6 +20,7 @@ export function statusText(
   },
 ): Promise<string>;
 export function loadStatus($: {
+  session?: { id: () => Promise<unknown> };
   env: { get: (name: string) => Promise<unknown> };
   clock: { now: () => Promise<number> };
   http: { fetch: (url: string) => Promise<{ ok?: boolean; status?: number; text?: unknown }> };
