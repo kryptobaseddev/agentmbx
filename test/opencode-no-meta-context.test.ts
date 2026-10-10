@@ -1,25 +1,44 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { MbxNode } from "../src/node.ts";
+import { opencodeHostOf, processArgsTable } from "../src/opencode-provider.ts";
 
 const bin = join(import.meta.dirname, "../bin/agentmbx.js");
 const textOf = (r: unknown) => ((r as { content: { text: string }[] }).content ?? []).map((c) => c.text).join("\n");
 
+// Real executable identity exercises the production host classifier, not an environment override.
+// This is a Node fixture named opencode, never a real OpenCode server or the owner's mailbox.
+function transportFor(home: string, host: "standalone" | "service" | "unknown"): StdioClientTransport {
+  const env = { ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local/share"), XDG_CACHE_HOME: join(home, ".cache"), OPENCODE_CONFIG_DIR: home, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "opencode", MBX_NO_DESKTOP: "1" } as Record<string, string>;
+  for (const key of Object.keys(env)) if (key.startsWith("MBX_MCP_") || ["MBX_AGENT", "MBX_ROLE", "MBX_CHANNEL"].includes(key)) delete env[key];
+  const executable = join(home, host === "unknown" ? "zsh" : "opencode");
+  if (process.platform === "darwin") symlinkSync(process.execPath, executable);
+  else { copyFileSync(process.execPath, executable); chmodSync(executable, 0o755); }
+  const wrapper = join(home, "provider.mjs");
+  writeFileSync(wrapper, `import { spawn } from 'node:child_process';
+const child = spawn(${JSON.stringify(process.execPath)}, [${JSON.stringify(bin)}, 'mcp'], { stdio: 'inherit' });
+child.on('exit', code => process.exit(code ?? 1));
+process.on('SIGTERM', () => child.kill('SIGTERM'));
+process.on('SIGINT', () => child.kill('SIGINT'));
+`);
+  return new StdioClientTransport({ command: executable, args: [wrapper, host === "service" ? "--service" : "--stdio"], env });
+}
+
 // T516: an OpenCode MCP call that carries no session `_meta` must route by THIS process's bound session state, never
 // refuse against its own process. One bound state -> use it; several -> an explicit ambiguity naming the fix.
-test("T516: no-_meta calls resolve to the single bound session, or fail explicitly when several are bound", async (t) => {
+test("T516: standalone no-_meta calls resolve to the single bound session, or fail explicitly when several are bound", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-oc-nometa-"));
   const n = new MbxNode(home, { host: "alpha" });
   n.registerAgent("receiver"); // T205: sends need an existing recipient
   const c = new Client({ name: "opencode", version: "test" });
   t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   // No MBX_AGENT: the transport's own base identity stays unbound, so only the session states decide the no-_meta answer.
-  await c.connect(new StdioClientTransport({ command: process.execPath, args: [bin, "mcp"], env: { ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local/share"), XDG_CACHE_HOME: join(home, ".cache"), AGENTMBX_DEV: "1", MBX_HOME: home, MBX_AGENT: "", MBX_CLI: "opencode", MBX_NO_DESKTOP: "1" } as Record<string,string> }));
+  await c.connect(transportFor(home, "standalone"));
   const call = (sid: string, name: string, args = {}) => c.callTool({ name, arguments: args, _meta: { sessionID: sid } });
 
   // AC4-1: with exactly one bound session state, a no-_meta call acts as that session (same identity and session key).
@@ -71,7 +90,7 @@ test("T516: a different session in one process cannot claim a sibling session's 
   n.registerAgent("receiver");
   const c = new Client({ name: "opencode", version: "test" });
   t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
-  await c.connect(new StdioClientTransport({ command: process.execPath, args: [bin, "mcp"], env: { ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local/share"), XDG_CACHE_HOME: join(home, ".cache"), AGENTMBX_DEV: "1", MBX_HOME: home, MBX_AGENT: "", MBX_CLI: "opencode", MBX_NO_DESKTOP: "1" } as Record<string,string> }));
+  await c.connect(transportFor(home, "standalone"));
   const call = (sid: string, name: string, args = {}) => c.callTool({ name, arguments: args, _meta: { sessionID: sid } });
   assert.notEqual((await call("ses_alpha", "mbx_identity", { action: "register", name: "alpha", role: "builder" })).isError, true);
   const pa = n.send({ from: "sender", to: ["alpha"], subject: "pa", body: "alpha private" }).envelope.id;
@@ -93,4 +112,28 @@ test("T516: a different session in one process cannot claim a sibling session's 
   assert.notEqual((await call("ses_alpha", "mbx_read", { ids: [pa] })).isError, true, "alpha's mail and lease are untouched");
   const lease = n.store.db.prepare("SELECT session_id FROM identity_leases WHERE name='alpha'").get() as { session_id: string };
   assert.equal(lease.session_id, "ses_alpha", "alpha's lease still names its own session");
+});
+
+for (const host of ["service", "unknown"] as const) test(`T516: ${host} host never lends its single bound session to a no-_meta caller`, async (t) => {
+  const home = mkdtempSync(join(tmpdir(), `mbx-oc-${host}-`));
+  const n = new MbxNode(home, { host: "scratch" });
+  const c = new Client({ name: "opencode", version: "test" });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  await c.connect(transportFor(home, host));
+  const meta = { "ai.opencode/sessionID": "ses_alpha" };
+  assert.notEqual((await c.callTool({ name: "mbx_identity", arguments: { action: "register", name: "alpha", role: "builder" }, _meta: meta })).isError, true);
+  const lease = n.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE name='alpha'").get() as { holder_pid: number };
+  const record = JSON.parse(n.store.get(`mcp-provider:${lease.holder_pid}`)!) as { providerPid: number };
+  assert.equal(opencodeHostOf(record.providerPid), host, JSON.stringify([...processArgsTable([record.providerPid])].filter(([pid]) => pid === record.providerPid)));
+  const mail = n.send({ from: "sender", to: ["alpha"], subject: "private alpha", body: "alpha only" }).envelope.id;
+  const who = await c.callTool({ name: "mbx_whoami", arguments: {} });
+  assert.notEqual(who.isError, true, textOf(who));
+  assert.equal((who.structuredContent as { agent: string | null }).agent, null, "a no-meta caller stays on the unbound transport base");
+  const read = await c.callTool({ name: "mbx_read", arguments: { ids: [mail] } });
+  assert.equal(read.isError, true, "an unidentified caller cannot read the bound session's mail");
+  const inbox = await c.callTool({ name: "mbx_inbox", arguments: {} });
+  assert.deepEqual((inbox.structuredContent as { messages: unknown[] }).messages, [], "no mailbox counts or subjects leak");
+  const alpha = await c.callTool({ name: "mbx_read", arguments: { ids: [mail] }, _meta: meta });
+  assert.notEqual(alpha.isError, true, textOf(alpha));
+  assert.match(textOf(alpha), /alpha only/);
 });

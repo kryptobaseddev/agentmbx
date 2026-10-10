@@ -22,7 +22,7 @@ import { activityKey, holderProviderView, identityAvailability, parseActivity, p
 import { reviveMailbox } from "./identity-cleanup.js";
 import { AUTO_NAME_RE, linkedKey, noteProject, projectKey, projectOf, registeredIdentity, registerIdentity, renameRegistration, ROLE_RE, sessionHint, UNSPECIFIED_ROLE } from "./registry.js";
 import { applyIdentityTakeover } from "./identity-takeover.js";
-import { opencodeProviderPid } from "./opencode-provider.js";
+import { opencodeHostOf, opencodeProviderPid } from "./opencode-provider.js";
 import { formatUnboundStart, listIdentityStatus } from "./identity-status.js";
 import { consumeIdentityControl, identityControlAliases, identityControlKey, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl } from "./identity-control.js";
 import { alive, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
@@ -1020,6 +1020,10 @@ async function configureMcp(server, node, startupClosed) {
         // serve many conversations and link by bind ticket; shared transports name sessions per call.
         if (state !== base || hosted)
             return null;
+        // A shared/unknown OpenCode host's sole recorded binding does not identify a no-meta caller.
+        // Otherwise returning base from contextFor could still borrow that session during retryResume.
+        if (env.cli === "opencode" && opencodeHostOf(env.harnessProvider) !== "standalone")
+            return null;
         const rows = node.store.db.prepare("SELECT session_id,pid_start,updated_at FROM sessions WHERE cli=? AND pid=? AND session_id NOT GLOB 'mcp-*'").all(env.cli, env.ppid).filter(r => node.sameSession(env.ppid, r, { proof: true }));
         const real = new Set(rows.map(r => r.session_id));
         const hint = real.size === 1 ? [...real][0] : real.size || env.cli === "codex" || env.cli === "opencode" ? null
@@ -1140,10 +1144,9 @@ async function configureMcp(server, node, startupClosed) {
         // Codex threadId is the resumable thread. Its sessionId is a distinct execution ID.
         const sid = env.cli === "codex" ? meta?.threadId : namespaced !== undefined ? namespaced : documented;
         if (sid === undefined) {
-            // T516: a call without session metadata in an OpenCode MCP resolves to THIS process's single bound session
-            // state when exactly one exists (AC1), instead of the transport's own base identity — and when several are
-            // bound it is an explicit ambiguity that names the fix (AC2), never a lease refusal against its own process.
-            if (env.cli === "opencode") {
+            // T516: only a standalone host may use its bound session without metadata. A shared service or unknown
+            // host cannot identify the caller this way: an unbound session could otherwise borrow another session's mail.
+            if (env.cli === "opencode" && opencodeHostOf(env.harnessProvider) === "standalone") {
                 const boundSessions = [...states.values()].filter((s) => bound(s));
                 if (boundSessions.length === 1)
                     return boundSessions[0];
