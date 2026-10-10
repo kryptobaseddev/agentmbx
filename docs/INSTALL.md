@@ -140,7 +140,7 @@ Setup also writes an explicit MCP startup timeout (at least 30 s) in every harne
 | CLI | Field | Value written |
 |---|---|---|
 | Codex | `startup_timeout_sec` (seconds) | `30` |
-| OpenCode | `"timeout"` (milliseconds) | `30000` |
+| OpenCode | `"timeout"` as `{ "startup", "catalog" }` (milliseconds) | `30000` each |
 | Hermes | `connect_timeout` (seconds) | `60` |
 | Grok | `startup_timeout_sec` (seconds) | `30` |
 | Claude, Kimi | none in their MCP config shape — nothing written | — |
@@ -182,10 +182,11 @@ In `~/.codex/hooks.json`, a SessionStart group running `agentmbx hook session-st
 ### OpenCode
 In `~/.config/opencode/opencode.jsonc` (or `opencode.json`), under `mcp.servers`. Setup inserts this one line and keeps your comments and formatting:
 ```jsonc
-"mbx": { "type": "local", "command": ["agentmbx", "mcp"], "timeout": 30000 }
+"mbx": { "type": "local", "command": ["<node>", "<agentmbx script>", "mcp"], "timeout": { "startup": 30000, "catalog": 30000 } }
 ```
+- OpenCode 2.0 rejects a plain numeric `timeout` and skips the whole `mbx` entry, so its MCP tools disappear. Setup therefore writes the object form above and rewrites a number an older setup wrote in place (T541); `agentmbx doctor` warns, with `agentmbx setup --only opencode`, while the field is still a number. `command` is the absolute node binary plus the absolute `agentmbx` script, as for every CLI (see above).
 - If `opencode service` is running, setup restarts it so it picks up the server.
-- OpenCode 2.x runs sessions two ways: a shared `opencode serve --service` process, or a private `opencode serve --stdio` that every `opencode --standalone` TUI spawns (both share one `opencode.db`). The daemon can only push notes and wakes into sessions the shared service hosts, through `POST /api/session/{id}/synthetic`; a standalone-hosted session receives its mail on the next prompt instead. See [OPENCODE.md](OPENCODE.md) for what to expect from each mode.
+- OpenCode 2.x runs sessions two ways: a shared `opencode serve --service` process, or a private `opencode serve --stdio` that every `opencode --standalone` TUI spawns (both share one `opencode.db`). Hook notes go into the session in-process in both modes. A wake reaches a service-hosted session through `POST /api/session/{id}/synthetic` on the shared service, and a standalone session through the plugin inside its own serve, which long-polls the daemon's loopback queue (`/v1/opencode-wake`) and admits the text in-process; AgentMBX never posts to the shared service for a standalone session. Whether a standalone wake starts a turn on an idle session is unproven (T544). See [OPENCODE.md](OPENCODE.md) for what to expect from each mode.
 - If OpenCode asks before each mbx tool call, allow `mbx_*` in its permission settings. See the e2e notes in `docs/TESTING.md`.
 
 **Hooks** are a plugin module, `~/.config/opencode/plugins/agentmbx.ts` (OpenCode has no settings-file hooks), translating OpenCode's `session.created`, `tool.execute.after` and session-idle events onto the shared `agentmbx hook` contract.
@@ -239,7 +240,7 @@ Restart Hermes to load it. Its tools then appear as `mcp_mbx_*`.
 ### YOLO: auto-approving permission prompts
 When an owner policy gives an agent the `permissions` class ([POLICY.md](POLICY.md) §5), that agent's sessions approve their own permission prompts until the policy expires. With no such policy nothing changes. Every approval is written to the audit log as `yolo_allow`. How each CLI does it (evidence in [RESEARCH.md](RESEARCH.md), "Permission hooks per CLI"):
 - **Claude Code** and **Codex**: the `PermissionRequest` hook above answers `allow`. Deny rules still win. Claude never auto-answers `AskUserQuestion` or `ExitPlanMode`, since those are questions for you. Codex asks you to trust the new hook once.
-- **OpenCode**: no hook; the daemon answers the service-hosted session's pending requests through the local `opencode service` (`once`). It needs the session bound (the mbx MCP server does that; its requests are matched by project folder) and the service running. A standalone-hosted session (`opencode --standalone`) is not answered remotely — see [OPENCODE.md](OPENCODE.md).
+- **OpenCode**: no hook; the daemon asks the local `opencode service` for the pending permission requests of each bound session and replies `once`. A session is covered when the mbx MCP server has bound it (an exact provider session id and a live process; a project folder never stands in for it), its agent holds an active `permissions` policy, and the service is running. The daemon does not check which kind of serve hosts the session, and whether the service can see a standalone serve's (`opencode --standalone`) pending requests has not been verified — see [OPENCODE.md](OPENCODE.md).
 - **Kimi Code**: Kimi's hooks can't approve. The `PermissionRequest` hook approves through the `kimi web` server, so it only works for sessions that server runs (`kimi web`, `kimi rc`, the Kimi desktop app). A plain `kimi` terminal session keeps prompting. For a hands-off Kimi agent there, start it with Kimi's own flag instead: `kimi --yolo` (routine edits and commands run; risky actions still ask) or `kimi --auto` (never asks). These flags ignore mbx policies, so use them only where you'd accept that.
 
 ### The skill
