@@ -4,8 +4,9 @@ import assert from "node:assert/strict";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
-import { doctor, failed, VERSION } from "../src/doctor.ts";
+import { doctor, failed, statuslineChecks, VERSION } from "../src/doctor.ts";
 import { parse as parseToml } from "smol-toml";
 import { insertMember, member, parseJsonc, removeMember, valueOf } from "../src/jsonc.ts";
 import { detectHost } from "../src/mcp.ts";
@@ -527,6 +528,30 @@ test("T337: grok session detection, MCP and statusline wiring, never overwrites"
   runSetup(ctx3, { mode: "install", stamp: "G6" });
   assert.match(rd(home3, ".grok/config.toml"), /~\/my-line\.sh; \/old\/agentmbx statusline grok/, "a composed command is foreign, never overwritten");
   rmSync(home3, { recursive: true, force: true });
+
+  // T536: a mise shim is ours but not current. setup rewrites it in place; doctor warns until then.
+  // any existing binary plus this install's entry is current for both, so neither rewrites nor warns.
+  {
+    const entry = realpathSync(fileURLToPath(new URL("../bin/agentmbx.js", import.meta.url)));
+    const node = process.execPath;
+    const h = fakeHome();
+    const c = ctxFor(h, [node, entry]);
+    mkdirSync(join(h, ".grok"), { recursive: true });
+    writeFileSync(join(h, ".grok/config.toml"), `[ui.status_line]\ntype = "command"\ncommand = "/Users/keatonhoskins/.local/share/mise/shims/agentmbx statusline grok"\nrefresh_interval = 15\n`);
+    assert.ok(statuslineChecks(c, "grok").some((x) => x.level === "warn" && /older AgentMBX form/.test(x.label)), "doctor warns on the shim form");
+    const rows536 = runSetup(c, { mode: "install", stamp: "G536" });
+    assert.equal(rows536.find((r) => r.cli === "grok" && r.item.includes("status_line"))?.action, "updated");
+    const cfg536 = rd(h, ".grok/config.toml");
+    assert.match(cfg536, /type = "command"\ncommand = /, "the rewrite keeps the newline before command");
+    assert.match(cfg536, new RegExp(JSON.stringify(`${node} ${entry} statusline grok`).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(cfg536, /refresh_interval = 15/, "the user's other key stays");
+    assert.ok(!statuslineChecks(c, "grok").some((x) => /older AgentMBX form/.test(x.label)), "doctor is quiet once the command is current");
+    writeFileSync(join(h, ".grok/config.toml"), `[ui.status_line]\ntype = "command"\ncommand = ${JSON.stringify(`/usr/bin/true ${entry} statusline grok`)}\n`);
+    const kept536 = runSetup(c, { mode: "install", stamp: "G536b" });
+    assert.equal(kept536.find((r) => r.cli === "grok" && r.item.includes("status_line"))?.action, "unchanged", "another existing binary plus this install's entry is current");
+    assert.ok(!statuslineChecks(c, "grok").some((x) => /older AgentMBX form/.test(x.label)));
+    rmSync(h, { recursive: true, force: true });
+  }
 
   // keep the user's other keys in our sections (review med 6)
   const home4 = fakeHome(); const ctx4 = ctxFor(home4);
