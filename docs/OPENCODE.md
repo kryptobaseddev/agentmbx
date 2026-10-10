@@ -60,8 +60,7 @@ its password from `~/.config/opencode/service.json`. It posts
 `POST /api/session/{id}/synthetic` with `{text, delivery: "queue", resume: true}`, which wakes an
 idle session. The wake is receipt-verified: the daemon checks that the service's answer names the
 exact session, the `synthetic` type, the `queue` delivery and the same text, and that it carries a
-`msg_` id and a creation time. The same service API also answers the session's pending permission
-requests under an owner YOLO policy. If the service is not running, the wake is `not_submitted`
+`msg_` id and a creation time. If the service is not running, the wake is `not_submitted`
 (`unavailable`) and doctor says how to start it.
 
 ### Wake: standalone session (T519)
@@ -85,6 +84,15 @@ If no plugin is polling for the session, nothing is submitted: the wake is `not_
 target, the shared service is not called, and the service starts no turn and takes no snapshot. If
 the plugin took the text but no `msg_` receipt arrived within 5 s, the outcome is `unknown`
 (`lost-response`) and the daemon does **not** post the same text to the service as a fallback.
+
+### Permission prompts under a YOLO policy
+
+Separate from wakes: the daemon also asks the shared service for the pending permission requests of
+each bound OpenCode session and replies `once`, writing `yolo_allow` to the audit log. A session is
+covered only when the mbx MCP server has bound it (an exact provider session id and a live process;
+a project folder never stands in for it), its agent holds an active `permissions` policy, and the
+service is running. The daemon does not check which kind of serve hosts the session, so whether the
+service can see the pending requests of a standalone serve is not verified.
 
 ### What the daemon records for a wake
 
@@ -141,3 +149,4 @@ that the model ran or handled it.
 | Loopback queue, receipt, 20 s hold, 5 s receipt wait | `src/opencode-wake-queue.ts`; the `/v1/opencode-wake` route in `src/http.ts` |
 | Hook notes, wake poll, plugin template | `opencodePluginSource` in `src/setup.ts` (`inject`, `admitWake`, `watchWake`) |
 | Doctor's OpenCode row | `opencodeServiceCheck` in `src/doctor.ts` |
+| Permission replies | `opencodePermissionPass` in `src/permission.ts`, called from the daemon loop in `src/cli.ts` |
