@@ -4,6 +4,7 @@
 // its sender after a while, so the sender can redirect it instead of believing it was delivered.
 import type { Envelope } from "./envelope.ts";
 import type { MbxNode } from "./node.ts";
+import { mailboxLiveness } from "./receipts.ts";
 
 export const DEFAULT_RETURN_DAYS = 7;
 const SINCE_KEY = "stranded-return-since";
@@ -89,4 +90,46 @@ export function returnNeverClaimed(node: MbxNode, now = Date.now(), days = retur
     out.push({ id: r.id, mailbox: r.mailbox, sender: r.sender });
   }
   return out;
+}
+
+// ---- T491: escalation of urgent mail in unheld mailboxes -----------------------------------------
+// Mail to `lead`/`role:lead` whose lead has no live holder is queued, not silently offline. Urgent copies
+// (kind `alert`, or anything carrying needs_reply) must not wait for a doctor visit: the daemon's 60-second
+// pass escalates each exactly once — a kv marker written before the owner notice — and doctor names the counts.
+
+export interface EscalatedCopy { id: string; mailbox: string; from: string; subject: string; urgent: "alert" | "needs-reply" }
+
+const escalatedKey = (id: string, mailbox: string) => `escalated:${id}:${mailbox}`;
+
+/** Escalate unacked urgent copies (T491) in established local mailboxes with no live holder: one desktop
+ *  notice to the owner per copy, exactly once (a kv marker written before the notice). `notify` is injected
+ *  so tests capture the notice and the daemon passes notifyDesktop; without it the marker and audit row
+ *  still record the escalation. Returns the copies escalated by this pass. */
+export function escalateUnheldMail(node: MbxNode, now = Date.now(), notify?: (subtitle: string, body: string) => void): EscalatedCopy[] {
+  const rows = node.store.db.prepare(`SELECT d.agent mailbox, m.id id, m.from_addr sender, m.subject subject, m.kind kind, m.envelope envelope
+    FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.state <> 'acked' AND d.agent <> 'owner' ORDER BY m.id`).all() as
+    { mailbox: string; id: string; sender: string; subject: string; kind: string; envelope: string }[];
+  const out: EscalatedCopy[] = [];
+  const live = new Map<string, boolean>();
+  for (const r of rows) {
+    if (!node.establishedLocalName(r.mailbox)) continue; // phantoms and never-claimed names have their own paths
+    if (!live.has(r.mailbox)) live.set(r.mailbox, mailboxLiveness(node, r.mailbox, now).live);
+    if (live.get(r.mailbox)) continue;
+    const urgent = r.kind === "alert" || (JSON.parse(r.envelope) as Envelope).needs_reply === true;
+    if (!urgent) continue;
+    if (node.store.get(escalatedKey(r.id, r.mailbox))) continue;
+    const why: EscalatedCopy["urgent"] = r.kind === "alert" ? "alert" : "needs-reply";
+    node.store.set(escalatedKey(r.id, r.mailbox), new Date(now).toISOString()); // before the notice: at most one per copy
+    notify?.("AgentMBX: urgent mail with no live holder",
+      `${r.subject} — ${r.mailbox}@${node.host} has no live holder, so an ${why} from ${r.sender} waits unread. `
+      + `The owner sees this notice once. Remedies: claim the mailbox (mbx_identity action=claim name=${r.mailbox}) or forward it (agentmbx identity forward ${r.mailbox} <to>).`);
+    node.store.audit("mailbox.escalated", { msg: r.id, mailbox: r.mailbox, from: r.sender, urgent: why });
+    out.push({ id: r.id, mailbox: r.mailbox, from: r.sender, subject: r.subject, urgent: why });
+  }
+  return out;
+}
+
+/** How many unacked copies of `mailbox` the T491 pass has escalated (doctor's stranded row names it). */
+export function escalatedCount(node: MbxNode, mailbox: string): number {
+  return (node.store.db.prepare("SELECT COUNT(*) c FROM kv WHERE k LIKE ?").get(`escalated:%:${mailbox}`) as { c: number }).c;
 }

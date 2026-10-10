@@ -23,7 +23,7 @@ import { bumpPostToolMarkersForAgent, readPostToolMarker, writePostToolLast } fr
 import { resolveStatusIdentity } from "./status-identity.js";
 import { runStatuslineSuggest } from "./statusline-suggest.js";
 import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.js";
-import { retirePhantoms, returnNeverClaimed } from "./stranded.js";
+import { escalateUnheldMail, retirePhantoms, returnNeverClaimed } from "./stranded.js";
 import { activeLead, leadSummary, makeLead, makeLeadRevocation, projectLeadLine, projectLeadView, revokeLead, storeLead } from "./project-ledger.js";
 import { DEFAULT_PORT, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
 import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary } from "./policy.js";
@@ -1181,6 +1181,9 @@ If the codes differ, do not approve: someone is in the middle.`);
             }
             catch { /* db busy: next minute */ } try {
                 node.sweepStaleRows();
+            }
+            catch { /* db busy: next minute */ } try {
+                escalateUnheldMail(node, Date.now(), (subtitle, body) => void notifyDesktop({ subtitle, body }));
             }
             catch { /* db busy: next minute */ } }, 60_000);
             void refreshDirectory(node);

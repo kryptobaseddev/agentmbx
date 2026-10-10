@@ -23,7 +23,7 @@ import { bumpPostToolMarkersForAgent, readPostToolMarker, writePostToolLast } fr
 import { resolveStatusIdentity } from "./status-identity.ts";
 import { runStatuslineSuggest } from "./statusline-suggest.ts";
 import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.ts";
-import { retirePhantoms, returnNeverClaimed } from "./stranded.ts";
+import { escalateUnheldMail, retirePhantoms, returnNeverClaimed } from "./stranded.ts";
 import { activeLead, leadSummary, makeLead, makeLeadRevocation, projectLeadLine, projectLeadView, revokeLead, storeLead } from "./project-ledger.ts";
 import { DEFAULT_PORT, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.ts";
 import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, policySummary,
@@ -962,7 +962,7 @@ If the codes differ, do not approve: someone is in the middle.`);
       let lastAddrs = addrSignature(node), lastBeacon = 0;
       const beacon = () => { const sig = addrSignature(node); if (sig !== lastAddrs || Date.now() - lastBeacon > 300_000) { lastAddrs = sig; lastBeacon = Date.now(); void sendPresence(node).catch(() => {}); } };
       setInterval(beacon, 10_000).unref(); setTimeout(() => { lastBeacon = 0; beacon(); }, 2_000).unref();
-      setInterval(() => { void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node); void healStuckPeers(node, () => browse(3_000)).then(() => sendPresence(node, fetch, stuckHosts(node))).catch(() => {}); try { node.pruneDeadSessions(); } catch { /* db busy: next minute */ } try { node.sweepStaleRows(); } catch { /* db busy: next minute */ } }, 60_000); void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node);
+      setInterval(() => { void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node); void healStuckPeers(node, () => browse(3_000)).then(() => sendPresence(node, fetch, stuckHosts(node))).catch(() => {}); try { node.pruneDeadSessions(); } catch { /* db busy: next minute */ } try { node.sweepStaleRows(); } catch { /* db busy: next minute */ } try { escalateUnheldMail(node, Date.now(), (subtitle, body) => void notifyDesktop({ subtitle, body })); } catch { /* db busy: next minute */ } }, 60_000); void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node);
       // a policy about to lapse: one desktop reminder, 48 h ahead, with the renew command (only where the owner key is)
       const remind = () => { try { if (!node.ownerPub) return; for (const p of dueReminders(node.store.db)) void notifyDesktop({ subtitle: "Policy expires soon",
         body: `${policySummary(p)} expires ${p.exp.slice(0, 16).replace("T", " ")}Z. Renew: agentmbx policy renew ${p.id.slice(-6)}` }); } catch { /* db busy */ } };
