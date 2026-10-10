@@ -1186,9 +1186,7 @@ export function opencodePluginSource(cmd, ver) {
 // Local edits make this file foreign: setup stops managing it and doctor reports it.
 // Uninstall with: agentmbx setup --uninstall --only opencode
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { createHash } from "node:crypto";
 
 /** Only text we produced ourselves is ever injected: a Stop {"decision":"block"} reason, or a
  *  run of [mbx]/probe-ok lines (a session-start note is several of our lines joined by newline).
@@ -1230,60 +1228,39 @@ const realSpawn: Spawn = (bin, args, input, cb) => {
 };
 const spawnCli: Spawn = (bin, args, input, cb) => ((globalThis as { __mbxSpawn?: Spawn }).__mbxSpawn ?? realSpawn)(bin, args, input, cb);
 
-/** T524: true only when THIS plugin is loaded by the shared OpenCode service process
- *  (\`opencode serve --service\`): its argv carries --service and not the private --stdio transport
- *  that every \`opencode --standalone\` TUI's own \`opencode serve --stdio --port 0\` uses. A synthetic
- *  POST with resume:true to the service for a session a standalone serve hosts makes the service
- *  start a SECOND agent loop on that session, so outside the service the plugin never calls it (and
- *  never spawns \`opencode service status\`). globalThis.__mbxArgv is the test seam. */
-const inService = (): boolean => {
-  const argv = (globalThis as { __mbxArgv?: string[] }).__mbxArgv ?? process.argv;
-  return argv.some((a) => a === "--service" || a.startsWith("--service=")) && !argv.includes("--stdio");
-};
-
-/** Inject a note as a queued synthetic user message through the OpenCode service — the same
- *  receipt-verified path the daemon's wake uses (src/wake.ts wakeOpencode: POST
- *  {svc}/api/session/:id/synthetic {text, delivery:"queue", resume:true}). Service URL from
- *  MBX_OPENCODE_URL or \`opencode service status\` (wake.ts opencodeService); Basic auth from
- *  ~/.config/opencode/service.json. B1c: no SDK client prompt API is cited for 2.0.23, so the
- *  plugin speaks the endpoint the daemon already proves on every wake. */
-const inject = async (sid: string, text: string): Promise<boolean> => {
-  if (!inService()) return false; // T524: a standalone serve hosts this session — the note waits for the next prompt
+/** T518: the plugin is already inside the serve that hosts this session, so a note is admitted
+ *  in-process. A POST to the shared service with resume:true made that service start a second
+ *  agent loop on a standalone session (T524). resume:false admits without a wake; delivery
+ *  "queue" waits for idle instead of steering the current turn. The id is a hash of session,
+ *  hook and text, so a retry is the same admission and a different note is a different one. */
+type NoteCtx = { session?: { synthetic?: (body: Record<string, unknown>) => Promise<unknown>; prompt?: (body: Record<string, unknown>) => Promise<unknown> } };
+const noteId = (sid: string, hook: string, text: string): string =>
+  "msg_" + createHash("sha256").update(sid + "\\0" + hook + "\\0" + text).digest("hex").slice(0, 32);
+const inject = async (ctx: NoteCtx, sid: string, hook: string, text: string): Promise<boolean> => {
+  if (!sid || !text) return false;
+  const body = { sessionID: sid, id: noteId(sid, hook, text), text, resume: false, delivery: "queue" };
+  const session = ctx?.session;
   try {
-    let status = process.env.MBX_OPENCODE_URL ?? "";
-    if (!status) {
-      status = await new Promise<string>((resolve) => spawnCli(["opencode"], ["service", "status"], "", (out) => resolve(out)));
-    }
-    const url = status.split(/\\s+/).find((w) => w.startsWith("http"))?.replace(/\\/$/, "");
-    if (!url) return false;
-    let auth = "";
-    try {
-      const cfg = JSON.parse(readFileSync(join(homedir(), ".config/opencode/service.json"), "utf8")) as { password?: string };
-      if (cfg.password) auth = "Basic " + Buffer.from(\`opencode:\${cfg.password}\`).toString("base64");
-    } catch { /* no service.json: a local service may run without a password */ }
-    const res = await fetch(\`\${url}/api/session/\${encodeURIComponent(sid)}/synthetic\`, {
-      method: "POST", headers: { "content-type": "application/json", ...(auth ? { authorization: auth } : {}) },
-      body: JSON.stringify({ text, delivery: "queue", resume: true }), signal: AbortSignal.timeout(10_000),
-    });
-    if (!res.ok) return false;
-    const j = await res.json().catch(() => null) as { data?: { id?: unknown; sessionID?: unknown; type?: unknown; delivery?: unknown; payload?: { text?: unknown } } } | null;
-    const r = j?.data;
-    return !!r && typeof r.id === "string" && r.id.startsWith("msg_") && r.sessionID === sid && r.type === "synthetic" && r.delivery === "queue" && r.payload?.text === text;
+    if (typeof session?.synthetic === "function") { await session.synthetic(body); return true; }
+  } catch { /* this host has no synthetic: try prompt with the same admission */ }
+  try {
+    if (typeof session?.prompt === "function") { await session.prompt(body); return true; }
   } catch { return false; }
+  return false;
 };
 
 /** One hook call: the JSON payload goes in on stdin; stdout is captured; a reason we recognize is
- *  injected into the session through the service's synthetic endpoint. A failure never surfaces. */
-const call = async (bin: string[], event: string, payload: Record<string, unknown>): Promise<void> => {
+ *  admitted through the hosting serve's session API. A failure never surfaces. */
+const call = async (ctx: NoteCtx, bin: string[], event: string, payload: Record<string, unknown>): Promise<void> => {
   try {
     const out = await new Promise<string>((resolve) => spawnCli(bin, ["hook", event, "--cli", "opencode"], JSON.stringify(payload), resolve));
     const reason = hookReason(out);
     const sid = typeof payload.session_id === "string" ? payload.session_id : null;
-    if (reason && sid) await inject(sid, reason);
+    if (reason && sid) await inject(ctx, sid, event, reason);
   } catch { /* hook failures must never surface in the host TUI */ }
 };
 
-const runFor = (bin: string[], cwd: string | undefined) => (event: string, payload: Record<string, unknown>) => call(bin, event, { cwd, ...payload });
+const runFor = (ctx: NoteCtx, bin: string[], cwd: string | undefined) => (event: string, payload: Record<string, unknown>) => call(ctx, bin, event, { cwd, ...payload });
 
 const sidOf = (v: unknown): string | undefined => {
   const o = v as { sessionID?: unknown; session_id?: unknown; id?: unknown; info?: unknown; session?: unknown; properties?: unknown } | undefined;
@@ -1294,8 +1271,9 @@ const sidOf = (v: unknown): string | undefined => {
 
 /** OpenCode v1 generation: the loader calls this factory with { $, client, directory } and runs the
  *  returned hooks object (v1 names: session.created/session.idle/tool.execute.after). */
-export const AgentMBXHooks = async ({ directory }: { $?: unknown; client?: unknown; directory?: string }) => {
-  const run = runFor(${bin}, directory);
+export const AgentMBXHooks = async (ctx: NoteCtx & { $?: unknown; client?: unknown; directory?: string }) => {
+  const directory = ctx?.directory;
+  const run = runFor(ctx, ${bin}, directory);
   return {
     event: async ({ event }: { event?: { type?: string; properties?: Record<string, unknown> } }) => {
       const sid = sidOf(event?.properties);
@@ -1318,13 +1296,13 @@ export const AgentMBXHooks = async ({ directory }: { $?: unknown; client?: unkno
 export default {
   id: "agentmbx-hooks",
   server: AgentMBXHooks,
-  async setup(ctx: {
+  async setup(ctx: NoteCtx & {
     location?: { directory?: string };
     event?: { subscribe?: (o?: unknown) => AsyncIterable<{ type?: string; location?: { directory?: string }; data?: unknown }> };
     tool?: { hook?: (name: "execute.after", fn: (input: unknown) => unknown) => unknown };
   }) {
     const dir = ctx?.location?.directory;
-    const run = runFor(${bin}, dir);
+    const run = runFor(ctx, ${bin}, dir);
     const here = (ev: { location?: { directory?: string } }) => !ev.location?.directory || !dir || ev.location.directory === dir;
     const ctl = new AbortController();
     void (async () => {
