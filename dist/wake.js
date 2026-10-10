@@ -12,6 +12,7 @@ import { captureWakeIdentity } from "./wake-identity.js";
 import { policyBrief } from "./policy.js";
 import { ulid } from "./crypto.js";
 import { opencodeHostOf } from "./opencode-provider.js";
+import { pushOpencodeWake } from "./opencode-wake-queue.js";
 const run = promisify(execFile);
 const attemptId = () => ulid();
 const receipt = (strength, r = {}) => ({ strength, nativeId: null, sessionId: null, nativeStatus: null, providerVersion: null, ...r });
@@ -100,17 +101,27 @@ export async function opencodeService() {
 }
 /** T524: why a session that the shared service does not host is never pushed through it. */
 export const OPENCODE_STANDALONE_NO_PUSH = "session is hosted by a standalone OpenCode serve; the shared service would start a duplicate agent loop (next-prompt delivery only)";
-/** Push a wake into an OpenCode session through the shared service's synthetic endpoint — ONLY when
- *  that service is the process hosting the session (`pid` is the binding's recorded provider pid).
- *  T524: for a session hosted by a standalone/private serve (`opencode --standalone` spawns
- *  `opencode serve --stdio`), resume:true makes the service start a second agent loop on the same
- *  session, so that case — and an unknown host — is not_submitted/no-target with no service call. */
+/** Push a wake into an OpenCode session. A service-hosted binding (its provider pid is
+ *  `opencode serve --service`) keeps the direct synthetic POST below. A standalone serve
+ *  (`opencode --standalone` → `opencode serve --stdio`) has no shared push channel: the plugin
+ *  in that serve polls a loopback queue and admits the text with `ctx.session.synthetic` (T519).
+ *  No waiting plugin is not_submitted/no-target and this function does not call the service, so
+ *  the service starts no turn and takes no snapshot (T524). An unknown host stays not_submitted. */
 export async function wakeOpencode(sessionId, text, o = {}) {
     const via = "opencode synthetic";
     const host = (o.host ?? opencodeHostOf)(o.pid);
+    if (host === "standalone") {
+        const pid = typeof o.pid === "number" && Number.isInteger(o.pid) && o.pid > 0 ? o.pid : 0;
+        const pushed = pid > 0 ? await pushOpencodeWake(sessionId, pid, text) : { ok: false, handedOff: false };
+        if (pushed.ok)
+            return outcome(via, { kind: "admitted", receipt: receipt("native", { nativeId: pushed.id, sessionId, nativeStatus: "queued" }) });
+        // The plugin already has the text. A missing msg_ id is not a reason to POST it to the service.
+        if (pushed.handedOff)
+            return outcome(via, { kind: "unknown", reason: "lost-response", detail: "standalone plugin took the wake and returned no msg_ receipt" });
+        return outcome(via, { kind: "not_submitted", reason: "no-target", detail: OPENCODE_STANDALONE_NO_PUSH });
+    }
     if (host !== "service")
-        return outcome(via, { kind: "not_submitted", reason: "no-target", detail: host === "standalone" ? OPENCODE_STANDALONE_NO_PUSH
-                : "the OpenCode process hosting this session is unknown; not pushing through the shared service, which could start a duplicate agent loop" });
+        return outcome(via, { kind: "not_submitted", reason: "no-target", detail: "the OpenCode process hosting this session is unknown; not pushing through the shared service, which could start a duplicate agent loop" });
     const svc = await (o.service ?? opencodeService)();
     if (!svc)
         return outcome(via, { kind: "not_submitted", reason: "unavailable" }, "opencode service not running");
