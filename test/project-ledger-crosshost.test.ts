@@ -45,7 +45,7 @@ test("a repository's mail from a paired host's own folder joins this host's proj
   assert.match(nas, /^h:[0-9a-f]{32}$/); assert.doesNotMatch(nas, /keaton|volume1|nas/);
   assert.equal(normalizeRemote("ssh://keaton@NAS.local/volume1/homes/keaton/git/foo"), nas, "same repository, same digest on every host");
 
-  registerIdentity(A.store, { name: "mac-lead", role: "lead" }); A.registerAgent("mac-lead"); noteProject(A.store, "mac-lead", mac);
+  registerIdentity(A.store, { name: "mac-lead", role: "lead" }); A.registerAgent("mac-lead"); noteProject(A.store, "mac-lead", mac, true);
   A.registerAgent("bystander"); // works elsewhere: only the project key ties this mail to the project
   const from = (project: string, subject: string) => signEnvelope(buildEnvelope({ from: "fedora-dev@beta", to: ["bystander@alpha"], subject, body: "b",
     project, project_key: projectKey(project) }), "beta", B.key.publicKey, B.key.privateKey);
