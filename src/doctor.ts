@@ -19,6 +19,7 @@ import { mailboxLiveness } from "./receipts.ts";
 import { liveWatcher } from "./wake.ts";
 import { findIdentityControl, listIdentityControls } from "./identity-control.ts";
 import { pruneCandidates } from "./identity-cleanup.ts";
+import { staleProjectBindings } from "./registry.ts";
 import { deadHolderLeases, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
 import { providerLabel, sameLiveProvider } from "./identity-takeover.ts";
 
@@ -208,6 +209,14 @@ export function pruneSummary(node: MbxNode): Check {
   return retire.length
     ? { level: "warn", label: `${retire.length} generated mailbox(es) with no holder, no unread mail and no recent traffic would be retired`, fix: "review the list: agentmbx identity prune   (a dry run), then apply it: agentmbx identity prune --apply" }
     : { level: "info", label: "no generated mailboxes eligible for prune" };
+}
+
+/** How many project bindings are older than another project for the same identity (T515). Read-only. */
+export function staleBindingSummary(node: MbxNode): Check {
+  const stale = staleProjectBindings(node.store);
+  return stale.length
+    ? { level: "warn", label: `${stale.length} project binding(s) are older than another project for the same identity`, fix: "review the list: agentmbx identity bindings   (a dry run), then apply it: agentmbx identity bindings --apply" }
+    : { level: "info", label: "no project bindings older than another project for the same identity" };
 }
 
 /** OpenCode's LocationActivity drops an idle service about every 60 minutes, and the plugin then releases and claims again.
@@ -555,6 +564,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     for (const c of identityClaimChurn(node)) out.push(c);
     for (const c of foreignSessionProvider(node)) out.push(c);
     out.push(pruneSummary(node));
+    out.push(staleBindingSummary(node));
     const peers = node.peers();
     const approved = peers.filter((p) => p.state === "approved");
     if (!approved.length) add("info", "no paired hosts (optional: agentmbx pair <host>:7373)");
