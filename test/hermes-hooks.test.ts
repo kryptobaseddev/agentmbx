@@ -505,7 +505,9 @@ test("hermes hooks: with no holder the first prompt learns how to get an identit
   assert.equal(run("session-start", "u1").stdout, "", "on_session_start output is dropped by Hermes");
   const first = run("prompt", "u1");
   assert.match((JSON.parse(first.stdout) as { context: string }).context, /no mailbox identity yet/);
-  assert.equal(run("prompt", "u1").stdout, "", "said once");
+  const again = JSON.parse(run("prompt", "u1").stdout) as { context: string };
+  assert.match(again.context, /mbx disconnected: reconnect/, "T503 keeps a missing connector visible on the next prompt");
+  assert.doesNotMatch(again.context, /no mailbox identity yet/, "identity guidance is said once");
 });
 
 // ---- AC3: the watcher wake is admitted for the real Hermes session --------------------------------------------------
