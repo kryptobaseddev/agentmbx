@@ -87,6 +87,18 @@ test("GET/POST /v1/opencode-wake holds on loopback and completes only a msg_ rec
     assert.deepEqual(await pushed, { ok: true, id: "msg_http" });
     assert.equal((await fetch(`http://127.0.0.1:${port}/v1/status`)).status, 200, "the public status route is unchanged");
     assert.equal((await fetch(`http://127.0.0.1:${port}/v1/agents`)).status, 401, "the queue does not authorize a signed route");
+    const waitersUrl = `${base}/waiters`;
+    assert.equal((await fetch(waitersUrl, { method: "POST" })).status, 405);
+    assert.deepEqual(await (await fetch(waitersUrl)).json(), { waiters: [] });
+    const held = fetch(`${base}?session=${encodeURIComponent("ses_w")}&pid=77`);
+    assert.equal(await until(() => opencodeWakeWaiting("ses_w", 77)), true);
+    const listed = await (await fetch(waitersUrl)).json() as { waiters: { sessionID: string; pid: number }[] };
+    assert.deepEqual(listed.waiters, [{ sessionID: "ses_w", pid: 77 }]);
+    const release = pushOpencodeWake("ses_w", 77, "release", 2_000);
+    assert.equal((await held).status, 200);
+    await fetch(base, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionID: "ses_w", id: "msg_listed" }) });
+    await release;
+    assert.deepEqual(await (await fetch(waitersUrl)).json(), { waiters: [] });
   } finally {
     await closeServer(server);
     node.close();
@@ -131,8 +143,10 @@ test("wakeOpencode: the plugin in the matching serve admits, and the receipt is 
     assert.equal(admitted.outcome?.kind === "admitted" && admitted.outcome.receipt.nativeId, "msg_fromhost");
     const wake = notes.find((n) => n.text === "[mbx] from daemon");
     assert.ok(wake, "the wake was admitted in-process");
-    assert.equal(wake?.resume, false);
+    assert.equal(wake?.resume, true, "T544: resume:true is what starts the idle turn");
     assert.equal(wake?.delivery, "queue");
+    const hookNotes = notes.filter((n) => n.text !== "[mbx] from daemon" && n.text !== "[mbx] direct");
+    assert.ok(hookNotes.length >= 1 && hookNotes.every((n) => n.resume === false), "hook notes stay resume:false");
     assert.notEqual(wake?.id, "msg_fromhost", "the receipt is the id the host returned");
 
     await event({ event: { type: "session.idle", properties: { info: { id: "ses_direct" } } } });

@@ -71,9 +71,10 @@ export function opencodeProviderPid(pid: number, table: Map<number, { ppid: numb
 // `opencode serve --service` and the private `opencode serve --stdio --port 0` every
 // `opencode --standalone` TUI spawns. A synthetic POST with resume:true to the SERVICE for a session
 // that a standalone serve hosts makes the service start a second agent loop on that session (duplicate
-// assistant chains, double compactions, interleaved git snapshots). Only a service-hosted session may
-// be pushed through the service; everything else gets next-prompt delivery until in-process delivery
-// lands (T518/T519).
+// assistant chains, double compactions, interleaved git snapshots). So only a service-hosted session is
+// pushed through the service. A standalone session is woken by the plugin inside its own serve, over
+// the loopback queue in opencode-wake-queue.ts (T519); with no plugin polling, nothing is submitted and
+// it gets mail with its next prompt. An unknown host is never pushed.
 
 export type OpencodeHost = "service" | "standalone" | "unknown";
 

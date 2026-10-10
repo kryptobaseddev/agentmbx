@@ -93,7 +93,7 @@ test("a send without a project field uses the sender's newest project", (t) => {
   n.registerAgent("agentmbx-lead");
   n.registerAgent("worker");
   lead("agentmbx-lead", projA);
-  noteProject(n.store, "worker", projA);
+  noteProject(n.store, "worker", projA, true);
   const sent = n.send({ from: "worker", to: ["role:lead"], subject: "remembered", body: "b" });
   assert.deepEqual(sent.envelope.to, ["agentmbx-lead"]);
   assert.equal(sent.envelope.meta.project, undefined, "the fallback does not invent a project stamp");

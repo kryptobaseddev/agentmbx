@@ -82,3 +82,33 @@ Read from the bundled JS in `~/.kimi-code/bin/kimi` (`strings`):
 - Live `GET /openapi.json` on the running service ("opencode HttpApi"): `GET /api/permission/request`, `GET /api/session/{sessionID}/permission` → `{data:[Permission.Request]}` with `Permission.Request = {id:"per…", sessionID:"ses…", action, resources[], save?, metadata?, source?, message?}`, and `POST /api/session/{sessionID}/permission/{requestID}/reply` with `{"decision":"once"|"always"|"reject","message"?}` → 204. The body is `additionalProperties:false`; the older `{"reply":"once"}` in `scripts/e2e/wake-opencode.py` doesn't match 2.0.15's schema.
 - The SSE stream `GET /api/event` sends `data: {"id","type","data"}` frames; the binary defines `permission.asked` (data = `Permission.Request`) and `permission.replied`.
 - The binary also has a plugin hook: `c.trigger("permission","evaluate",{sessionID, agent, action, resources, metadata, source, effect})`, and a plugin can set `effect` (seen as `e.permission.hook("evaluate", f => { … f.effect = "deny" })`). That runs inside OpenCode and would need a JS plugin shipped into `~/.config/opencode/plugins`. We use the daemon instead, per POLICY.md: every 2 s it polls the pending requests of bound OpenCode sessions whose agent has an active policy, and replies `once`. Agents without a policy cost no request. The MCP server binds OpenCode as `mcp-<pid>`, not a `ses_…` id, so for those bindings the daemon reads `GET /api/permission/request?location[directory]=<cwd>` (checked live: it answers `{"location":{"directory":"/tmp"},"data":[]}`) and skips requests from sessions bound to another agent.
+
+## Question
+
+T539: which existing provider channels can apply an operation-specific outward-reversible decision without switching permission modes?
+
+## Findings
+
+The current implementation reuses the exact binding/lease guard and signed policy lookup, validates persisted taint, classifies a bounded literal shell command, performs read-only Git preflight outside SQLite, then rechecks authority before output or dispatch. Claude/Codex use the established PermissionRequest allow JSON; hosted Kimi uses the exact approval ID through its existing server API. These adapters are tested with isolated session fixtures and mocked provider requests, not live approval side effects.
+
+N/A evidence, as coordinated by the lead for T539:
+
+| Harness/surface | Evidence | Narrow-path result |
+|---|---|---|
+| Grok | src/setup.ts GROK_HOOK_EVENTS excludes PermissionRequest; test/grok-hooks.test.ts asserts its absence | N/A; no guessed hook installed |
+| Hermes | AgentMBX wires on_session_start/pre_llm_call only. Installed agent/shell_hooks.py _parse_pre_tool_call maps action approve to human escalation; tools/human_input_hooks.py ignores observer returns | N/A; no fabricated allow output or global mode change |
+| OpenCode | src/permission.ts models id/sessionID/action only, without command content | N/A for narrow authority; existing explicit permissions approval remains separate and gains taint checks |
+| Kimi TUI | PermissionRequest is fire-and-forget; approveKimi requires the hosted server's matching pending approval | N/A in plain TUI; empty stdout and no successful hosted approval leave the prompt |
+
+Unknown or malformed command payloads also keep prompting, even on a supported provider. No setup/provider adapter files or owner configuration were changed. The CLI wiring is coordinated after the T525 merge.
+
+The classifier deliberately accepts one literal invocation, one branch destination with a proven actual-remote default, or an explicit-head draft PR. It rejects shell composition, force/delete/default pushes, multiple targets, custom Git execution/side effects and unassessed gh flags. Persisted live or unassessable taint blocks both narrow approval and YOLO. Provider dispatch and remote/configuration changes remain non-atomic race boundaries; no in-flight revocation claim is made.
+
+## Sources
+
+- src/outward-reversible.ts, src/permission.ts and src/session-taint.ts, with their targeted tests (T539).
+- Canonical POLICY section 5 and the versioned T051 source observations above.
+- Installed Hermes primary source under /Users/keatonhoskins/.hermes/hermes-agent: agent/shell_hooks.py, tools/human_input_hooks.py and tools/approval.py.
+- Lead task message 01M4KCZZT3M68Q88C5DSMVQFZ2: implement real channels and record the listed N/A surfaces with evidence.
+- https://cli.github.com/manual/gh_pr_create: explicit head skips implicit fork/push.
+- https://git-scm.com/docs/git-push and https://git-scm.com/docs/git-ls-remote: destination refspec, push URLs, implicit effects and remote HEAD symref.
