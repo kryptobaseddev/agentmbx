@@ -23,6 +23,7 @@ import { staleProjectBindings } from "./registry.ts";
 import { deadHolderLeases, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
 import { providerLabel, sameLiveProvider } from "./identity-takeover.ts";
 import { conversationLoopLabel, detectConversationLoops } from "./loop-detector.ts";
+import { opencodeDuplicateLoopChecks } from "./opencode-duplicate-loop.ts";
 
 export type Level = "ok" | "fail" | "warn" | "info";
 export interface Check { level: Level; label: string; fix?: string }
@@ -301,24 +302,57 @@ function hourlyOpencodeEviction(events: LeaseEvent[]): boolean {
  *  and grok are replace-only — `command` replaces the footer and never renders alongside the user's
  *  other keys. opencode has no custom status line feature at all (built-in segments only), so the
  *  honest result is an explicit skip note, not a check against an invented config path. */
-/** T391/T524: the shared OpenCode service is the push-wake path only for sessions it hosts itself.
- *  Sessions hosted by a standalone serve (`opencode --standalone` → `opencode serve --stdio`) are
- *  never pushed through the service (it would start a duplicate agent loop): they get mail on their
- *  next prompt. Doctor counts both and proves the service answers when a service-hosted session is
- *  bound. A warn never fails doctor (the T435 rule). Unbound hosts stay silent. */
+/** T391/T524/T519/T520: each OpenCode binding is service-hosted, standalone with a live plugin
+ *  consumer, or unwakeable. The shared service is the push path only for sessions it hosts. A
+ *  standalone serve is woken by the plugin already polling its wake queue for that session and pid.
+ *  No poller, or an unknown host, is unwakeable: the shared service is not called. A warn never
+ *  fails doctor (the T435 rule). Unbound hosts stay silent. */
+const UNWAKEABLE_FIX = "agentmbx setup --only opencode installs the plugin; a standalone session is woken only while that plugin is polling inside its serve";
+
+/** Pollers live in the daemon. A missing daemon means no consumer, not a crash. */
+async function pluginConsumers(port: number): Promise<(sessionID: string, pid: number) => boolean> {
+  const none = (): boolean => false;
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/v1/opencode-wake/waiters`, { signal: AbortSignal.timeout(300) });
+    if (!res.ok) return none;
+    const body = await res.json() as { waiters?: { sessionID?: unknown; pid?: unknown }[] };
+    const keys = new Set<string>();
+    for (const w of body.waiters ?? []) {
+      if (typeof w.sessionID === "string" && typeof w.pid === "number") keys.add(`${w.sessionID}\0${w.pid}`);
+    }
+    return (sessionID, pid) => keys.has(`${sessionID}\0${pid}`);
+  } catch { return none; }
+}
+
 export async function opencodeServiceCheck(node: MbxNode, service: () => Promise<{ url: string; auth: string } | null> = opencodeService,
-  host: (pid: number | null) => OpencodeHost = opencodeHostClassifier()): Promise<Check | null> {
-  const bound = node.store.db.prepare("SELECT agent, pid FROM sessions WHERE cli='opencode' AND session_id NOT LIKE 'mcp-%'").all() as { agent: string; pid: number | null }[];
+  host: (pid: number | null) => OpencodeHost = opencodeHostClassifier(),
+  waiting?: (sessionID: string, pid: number) => boolean): Promise<Check | null> {
+  const bound = node.store.db.prepare("SELECT session_id, pid FROM sessions WHERE cli='opencode' AND session_id NOT LIKE 'mcp-%'").all() as { session_id: string; pid: number | null }[];
   if (!bound.length) return null;
-  const hosted = bound.filter((b) => host(b.pid) === "service").length, standalone = bound.length - hosted;
-  const rest = standalone ? `${standalone} binding(s) in a standalone OpenCode serve (or unknown host): no push wake yet, next-prompt delivery only` : "";
-  if (!hosted) return { level: "info", label: `opencode: ${rest}` };
+  const consumers = waiting ?? (bound.some((b) => host(b.pid) === "standalone") ? await pluginConsumers(node.config.port) : () => false);
+  let hosted = 0, plugin = 0, unwakeable = 0;
+  for (const b of bound) {
+    const kind = host(b.pid);
+    if (kind === "service") { hosted++; continue; }
+    if (kind === "standalone" && b.pid !== null && consumers(b.session_id, b.pid)) { plugin++; continue; }
+    unwakeable++;
+  }
+  const parts = [
+    hosted ? `${hosted} service-hosted` : "",
+    plugin ? `${plugin} standalone binding(s) with a live plugin consumer` : "",
+    unwakeable ? `${unwakeable} unwakeable binding(s): standalone with no plugin consumer, or an unknown host` : "",
+  ].filter(Boolean);
+  const detail = parts.join("; ");
+  if (!hosted && !unwakeable) return { level: "ok", label: `opencode: ${detail}` };
+  if (!hosted) return { level: "warn", label: `opencode: ${detail}`, fix: UNWAKEABLE_FIX };
   const svc = await service().catch(() => null);
-  if (svc) return { level: "ok", label: `opencode: service reachable (${svc.url}) — wake path for ${hosted} service-hosted mailbox binding(s)${rest ? `; ${rest}` : ""}` };
+  const extra = [plugin ? `${plugin} standalone binding(s) with a live plugin consumer` : "", unwakeable ? `${unwakeable} unwakeable binding(s): standalone with no plugin consumer, or an unknown host` : ""].filter(Boolean).join("; ");
+  if (svc && !unwakeable) return { level: "ok", label: `opencode: service reachable (${svc.url}) — wake path for ${hosted} service-hosted mailbox binding(s)${extra ? `; ${extra}` : ""}` };
+  if (svc) return { level: "warn", label: `opencode: service reachable (${svc.url}) — wake path for ${hosted} service-hosted mailbox binding(s); ${extra}`, fix: UNWAKEABLE_FIX };
   return {
     level: "warn",
-    label: `opencode: service not reachable, so ${hosted} service-hosted OpenCode binding(s) cannot be woken${rest ? `; ${rest}` : ""}`,
-    fix: "run any opencode command (or `opencode service start`) so the service API comes up; config: ~/.config/opencode/service.json",
+    label: `opencode: service not reachable, so ${hosted} service-hosted OpenCode binding(s) cannot be woken${extra ? `; ${extra}` : ""}`,
+    fix: unwakeable ? `run any opencode command (or \`opencode service start\`) so the service API comes up; config: ~/.config/opencode/service.json. ${UNWAKEABLE_FIX}` : "run any opencode command (or `opencode service start`) so the service API comes up; config: ~/.config/opencode/service.json",
   };
 }
 
@@ -521,6 +555,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     // collision — see the T435 note above) and runs only when an opencode mailbox is bound.
     if (d.cli === "opencode" && node) { const c = await opencodeServiceCheck(node); if (c) out.push(c); }
     if (d.cli === "opencode" && node) { const c = opencodeEvictionCheck(node.store.db); if (c) out.push(c); }
+    if (d.cli === "opencode" && node) for (const c of opencodeDuplicateLoopChecks(node)) out.push(c);
     // T460: its own function too (the T435 rule): a refused hooks layout and the not-approved state are Hermes facts.
     if (d.cli === "hermes") for (const c of hermesHooksChecks(ctx)) out.push(c);
     // T502/T504: the explicit MCP startup timeout and the resolved command path are checked for

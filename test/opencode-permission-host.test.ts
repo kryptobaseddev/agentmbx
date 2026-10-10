@@ -1,5 +1,5 @@
-// T521: a standalone OpenCode plugin answers a permission in its own serve. The daemon host gate
-// that stops opencodePermissionPass from calling the shared service is not in this change.
+// T521: a standalone OpenCode plugin answers a permission in its own serve. The daemon pass
+// calls the shared service only for a service-hosted binding.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -10,7 +10,9 @@ import { join } from "node:path";
 import { canonical, signData } from "../src/crypto.ts";
 import { startServer } from "../src/http.ts";
 import { MbxNode } from "../src/node.ts";
+import type { OpencodeHost } from "../src/opencode-provider.ts";
 import { createOwnerKey, unlockOwnerKey } from "../src/owner.ts";
+import { opencodePermissionPass } from "../src/permission.ts";
 import { acceptSigned, makePolicy } from "../src/policy.ts";
 import { opencodePluginSource } from "../src/setup.ts";
 import { version } from "../src/version.ts";
@@ -69,6 +71,39 @@ test("GET /v1/opencode-permission allows a live yolo binding and skips everythin
     await closeServer(server);
     node.close();
     rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+test("opencodePermissionPass calls the shared service only for a service host", async () => {
+  for (const kind of ["service", "standalone", "unknown"] as const) {
+    const home = mkdtempSync(join(tmpdir(), "mbx-t521-pass-"));
+    const node = new MbxNode(home, { host: "alpha" });
+    bindWakeLease(node, { cli: "opencode", pid: process.pid, agent: "mbx-yolo", session_id: "ses_allow" });
+    let svcCalls = 0;
+    let fetches = 0;
+    const fake = (async (_url: string, init: RequestInit = {}) => {
+      fetches++;
+      if ((init.method ?? "GET") === "POST") return new Response(null, { status: 204 });
+      return Response.json({ data: [{ id: "per_1", sessionID: "ses_allow", action: "bash" }] });
+    }) as typeof fetch;
+    try {
+      const n = await opencodePermissionPass(node, () => ({ ok: true, policy_id: "pol_1" }), async () => {
+        svcCalls++;
+        return { url: "http://oc", auth: "" };
+      }, fake, () => kind satisfies OpencodeHost);
+      if (kind === "service") {
+        assert.equal(n, 1);
+        assert.equal(svcCalls, 1);
+        assert.equal(fetches, 2);
+      } else {
+        assert.equal(n, 0);
+        assert.equal(svcCalls, 0, `${kind} must not call svc()`);
+        assert.equal(fetches, 0, `${kind} must not fetch`);
+      }
+    } finally {
+      node.close();
+      rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
   }
 });
 

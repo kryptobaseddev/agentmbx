@@ -178,7 +178,8 @@ test("T384 AC2: an unbound grok session gets the register prompt on every PostTo
     assert.match(JSON.parse(again.stdout).hookSpecificOutput.additionalContext, /no mailbox identity yet/, "every unbound post-tool, not once");
     const prompt = hook(home, "prompt", sid);
     assert.equal(prompt.status, 0, prompt.stderr);
-    assert.equal(prompt.stdout, "", "grok prompt guidance stays empty");
+    assert.match(prompt.stdout, /mbx disconnected: reconnect/, "T503 reconnect guidance reaches a disconnected prompt");
+    assert.doesNotMatch(prompt.stdout, /no mailbox identity yet/, "registration guidance stays on PostToolUse");
     const stop = hook(home, "stop", sid);
     assert.equal(stop.status, 0, stop.stderr);
     assert.equal(stop.stdout, "", "grok stop stays off this change");

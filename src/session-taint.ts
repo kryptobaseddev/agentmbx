@@ -73,6 +73,20 @@ export function readSessionTaint(store: Store, cli: string, sessionId: string, n
   try { return normalize(JSON.parse(raw), cli, sessionId, now); } catch { return null; }
 }
 
+/** Approval must distinguish absent/valid expired state from corrupt or unreadable taint. */
+export function sessionUntainted(store: Store, cli: string, sessionId: string, now = Date.now()): boolean {
+  try {
+    const raw = store.get(taintKey(cli, sessionId));
+    if (raw === undefined) return true;
+    const value: unknown = JSON.parse(raw);
+    if (!value || typeof value !== "object") return false;
+    const root = (value as { root?: unknown }).root;
+    if (typeof root !== "number" || !Number.isSafeInteger(root) || root > now) return false;
+    // Validate the expired record at its root instead of treating every malformed record as expired.
+    return now - root >= EXTERNAL_TAINT_MS && normalize(value, cli, sessionId, root) !== null;
+  } catch { return false; }
+}
+
 /** Write a live record. An expired root deletes the key. Anything else that is not live throws and leaves the old value. */
 export function writeSessionTaint(store: Store, record: SessionTaint, now = Date.now()): void {
   const key = taintKey(record.cli, record.session_id);

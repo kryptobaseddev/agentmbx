@@ -20,37 +20,37 @@ function fixture(t: TestContext, cli: string, sessionId = "s1") {
   return { node, leases, lease, holder, input };
 }
 
-test("permission process checks run before the approval transaction locks SQLite", t => {
+test("permission process checks run before the approval transaction locks SQLite", async t => {
   const { node, input } = fixture(t, "claude"), checks: boolean[] = [];
   const sameSession = node.sameSession.bind(node), kill = process.kill;
   node.sameSession = (...args) => { checks.push(node.store.db.isTransaction); return sameSession(...args); };
   process.kill = ((...args: Parameters<typeof process.kill>) => { checks.push(node.store.db.isTransaction); return kill(...args); }) as typeof process.kill;
   try {
-    const result = decidePermission(input, "claude", () => { assert.equal(node.store.db.isTransaction, true); return yes(); }, { node, pid: process.pid });
+    const result = await decidePermission(input, "claude", () => { assert.equal(node.store.db.isTransaction, true); return yes(); }, { node, pid: process.pid });
     assert.equal(result.allow, true); assert.ok(checks.length > 0); assert.ok(checks.every(locked => !locked));
   } finally { process.kill = kill; node.sameSession = sameSession; }
 });
 
-for (const cli of ["claude", "codex", "kimi"]) test(`${cli} permission decision requires the live lease and matching session key`, t => {
+for (const cli of ["claude", "codex", "kimi"]) test(`${cli} permission decision requires the live lease and matching session key`, async t => {
   const { node, leases, lease, holder, input } = fixture(t, cli);
   const decide = () => decidePermission(input, cli, yes, { node, pid: process.pid });
-  assert.equal(decide().allow, true);
+  assert.equal((await decide()).allow, true);
   node.store.db.prepare("UPDATE identity_leases SET heartbeat_at=0 WHERE name='worker'").run();
-  assert.equal(decide().allow, false, "expired lease cannot authorize despite a live parent process and policy");
+  assert.equal((await decide()).allow, false, "expired lease cannot authorize despite a live parent process and policy");
   const other = generateKeyPair();
   leases.claim("worker", { ...holder, keyFp: fingerprint(other.publicKey) });
-  assert.equal(decide().allow, false, "replacement generation belongs to a different key");
+  assert.equal((await decide()).allow, false, "replacement generation belongs to a different key");
   assert.equal(leases.release("worker", lease.token), false);
 });
 
-for (const cli of ["codex", "kimi"]) test(`${cli} unknown thread cannot inherit the sole leased mailbox on a shared process`, t => {
+for (const cli of ["codex", "kimi"]) test(`${cli} unknown thread cannot inherit the sole leased mailbox on a shared process`, async t => {
   const { node, input } = fixture(t, cli);
-  assert.equal(decidePermission({ ...input, session_id: "unbound-other-thread" }, cli, yes, { node, pid: process.pid }).allow, false);
+  assert.equal((await decidePermission({ ...input, session_id: "unbound-other-thread" }, cli, yes, { node, pid: process.pid })).allow, false);
 });
 
 for (const mutation of ["release", "replace", "rebind"]) test(`Kimi permission rechecks captured authority after polling: ${mutation}`, async t => {
   const { node, leases, lease, holder, input } = fixture(t, "kimi");
-  const decision = decidePermission(input, "kimi", yes, { node, pid: process.pid });
+  const decision = await decidePermission(input, "kimi", yes, { node, pid: process.pid });
   assert.equal(decision.allow, true);
   let posts = 0;
   const fake = (async (_url: unknown, init?: RequestInit) => {
@@ -78,7 +78,7 @@ for (const mutation of ["none", "release", "replace", "rebind"]) test(`OpenCode 
     }
     return Response.json({ data: [{ id: "per_test", sessionID: "ses_test", action: "Bash" }] });
   }) as typeof fetch;
-  const result = await opencodePermissionPass(node, yes, async () => ({ url: "http://test.invalid", auth: "" }), fake);
+  const result = await opencodePermissionPass(node, yes, async () => ({ url: "http://test.invalid", auth: "" }), fake, () => "service");
   assert.equal(result, mutation === "none" ? 1 : 0);
   assert.equal(posts, mutation === "none" ? 1 : 0);
 });
@@ -87,7 +87,7 @@ test("leased OpenCode provisional mailbox cannot approve an unbound same-folder 
   const { node } = fixture(t, "opencode", "mcp-test");
   let calls = 0;
   const fake = (async () => { calls++; return Response.json({ data: [{ id: "per_test", sessionID: "ses_unknown", action: "Bash" }] }); }) as typeof fetch;
-  assert.equal(await opencodePermissionPass(node, yes, async () => ({ url: "http://test.invalid", auth: "" }), fake), 0);
+  assert.equal(await opencodePermissionPass(node, yes, async () => ({ url: "http://test.invalid", auth: "" }), fake, () => "service"), 0);
   assert.equal(calls, 0);
 });
 
@@ -99,8 +99,8 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} legacy b
   const lookup = () => { lookups++; return yes(); };
   if (cli === "opencode") {
     const fake = (async () => { requests++; return Response.json({ data: [{ id: "per_test", sessionID: "ses_test", action: "Bash" }] }); }) as typeof fetch;
-    assert.equal(await opencodePermissionPass(node, lookup, async () => ({ url: "http://test.invalid", auth: "" }), fake), 0);
-  } else assert.equal(decidePermission(input, cli, lookup, { node, pid: process.pid }).allow, false);
+    assert.equal(await opencodePermissionPass(node, lookup, async () => ({ url: "http://test.invalid", auth: "" }), fake, () => "service"), 0);
+  } else assert.equal((await decidePermission(input, cli, lookup, { node, pid: process.pid })).allow, false);
   assert.equal(lookups, 0);
   assert.equal(requests, 0);
   assert.equal(node.store.db.prepare("SELECT count(*) AS n FROM audit WHERE event='yolo_allow'").get()!.n, 0);

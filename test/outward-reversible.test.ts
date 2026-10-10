@@ -1,7 +1,9 @@
 // T498: signed delegation only. Operation-specific provider-hook approvals belong to T539.
 import { test } from "node:test";
+import { execFileSync } from "node:child_process";
+import { checkOutwardReversible, parseOutwardReversible } from "../src/outward-reversible.ts";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -15,6 +17,11 @@ import { declaredOriginWarning, taintSendWarning, type SessionTaint } from "../s
 import { sendLeased } from "./helpers/leased-send.ts";
 
 process.env.MBX_NO_DESKTOP = "1";
+// Git fixtures must not inherit the owner's helpers or harness-injected config.
+process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+process.env.GIT_CONFIG_NOSYSTEM = "1";
+delete process.env.GIT_CONFIG_COUNT;
+delete process.env.GIT_CONFIG_PARAMETERS;
 const DEFAULT = ["read", "edit", "outward-reversible"];
 function owner(t: { after: (fn: () => void | Promise<void>) => void }, clients: Client[] = []) {
   const home = mkdtempSync(join(tmpdir(), "mbx-outward-"));
@@ -144,7 +151,109 @@ test("T498 AC5 (policy documentation): published POLICY.md and emitted delegatio
   assert.match(doc, /`autonomous` \| read, edit, outward-reversible/);
   assert.match(doc, /session tainted by external content cannot use `outward-reversible`/);
   assert.match(doc, /full `outward`/);
-  assert.match(delegationNote(n.store.db, "worker", "alpha")!, /permission prompts still apply unless the class list includes permissions/);
+  assert.match(delegationNote(n.store.db, "worker", "alpha")!, /permission prompts may be auto-approved for bounded outward-reversible operations on supported harnesses; other prompts still require permissions/);
 });
 
 test.todo("T498 AC5 tool-description text pending mcp.ts handoff from T516");
+
+test("T539 AC1: literal branch pushes and explicit-head draft PRs classify", () => {
+  for (const command of ["git push origin feature", "git push -u origin HEAD:refs/heads/feature", "git push --no-follow-tags --recurse-submodules=no origin refs/heads/feature:feature",
+    "gh pr create --draft --head feature", "gh pr create -d -H feature --title 'Fix; keep literal $text' --body ''",
+    'gh pr create --draft --head=worker:feature --title="Fix it" --body-file=body.md']) {
+    assert.ok(parseOutwardReversible(command), command);
+  }
+});
+
+test("T539 AC2: ambiguous or additional shell operations never classify", () => {
+  for (const command of ["git push", "git push origin", "git push origin HEAD", "git push origin +feature:feature", "git push origin :feature",
+    "git push --force origin feature", "git push --force-with-lease origin feature", "git push -f origin feature", "git push --delete origin feature",
+    "git push --mirror origin feature", "git push --all origin feature", "git push --tags origin feature", "git push --follow-tags origin feature",
+    "git push origin feature other", "git push origin refs/tags/v1", "git push origin feature:refs/tags/v1", "git -C /other push origin feature",
+    "git push https://example.invalid/repo feature", "git push origin 'feature:*'", "git push origin feature && gh release create v1",
+    "git push origin feature; rm -rf .", "git push origin feature | cat", "git push origin feature >out", "git push origin feature\ngh pr merge",
+    "env git push origin feature", "sh -c 'git push origin feature'", "git push origin $(echo feature)", "git push origin `echo feature`",
+    "gh pr create --head feature", "gh pr create --draft", "gh pr create --draft=false --head feature", "gh pr create --draft --draft --head feature",
+    "gh pr create --draft --head feature --repo other/repo", "gh pr create --draft --head feature --web", "gh pr create --draft --head feature --attach secret",
+    "gh pr create --draft --head feature --body-file -", "gh pr create --draft --head feature --body x --body-file file",
+    "gh pr create --draft --head feature --title \"$(cat secret)\"", "gh pr merge", "gh release create v1", "gh pr create --draft --head feature && git push origin main"]) {
+    assert.equal(parseOutwardReversible(command), null, command);
+  }
+});
+
+test("T539 AC1/AC2: preflight checks the actual push repository's default destination and implicit effects", async t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-outward-")), cwd = join(home, "work"), remote = join(home, "remote.git");
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  mkdirSync(cwd);
+  const git = (...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  git("init", "-b", "unusual-default");
+  git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "fixture");
+  git("branch", "feature"); git("clone", "--bare", cwd, remote); git("remote", "add", "origin", remote);
+  const check = (command: string) => checkOutwardReversible(parseOutwardReversible(command)!, cwd);
+  assert.equal(await check("git push origin feature"), true);
+  assert.equal(await check("git push origin HEAD:refs/heads/feature"), true);
+  assert.equal(await check("git push origin feature:unusual-default"), false);
+  assert.equal(await check("git push origin HEAD:refs/heads/unusual-default"), false);
+  assert.equal(await check("git push origin missing"), false);
+  git("config", "push.followTags", "true");
+  assert.equal(await check("git push origin feature"), false);
+  assert.equal(await check("git push --no-follow-tags origin feature"), true);
+  git("config", "--unset", "push.followTags");
+  git("config", "push.recurseSubmodules", "on-demand");
+  assert.equal(await check("git push origin feature"), false);
+  assert.equal(await check("git push --recurse-submodules=no origin feature"), true);
+  git("config", "--unset", "push.recurseSubmodules");
+  git("config", "remote.origin.mirror", "true");
+  assert.equal(await check("git push origin feature"), false);
+  git("config", "--unset", "remote.origin.mirror");
+  git("config", "core.sshCommand", "custom-command");
+  assert.equal(await check("git push origin feature"), false);
+  git("config", "--unset", "core.sshCommand");
+  git("config", "credential.helper", "!custom-command");
+  assert.equal(await check("git push origin feature"), false);
+  git("config", "--unset", "credential.helper");
+  git("config", "remote.origin.receivepack", "custom-command");
+  assert.equal(await check("git push origin feature"), false);
+  git("config", "--unset", "remote.origin.receivepack");
+  git("config", `url.${remote}.insteadOf`, "rewrite:");
+  assert.equal(await check("git push origin feature"), false);
+  git("config", "--unset", `url.${remote}.insteadOf`);
+  writeFileSync(join(cwd, ".git/hooks/pre-push"), "custom command");
+  assert.equal(await check("git push origin feature"), false);
+  rmSync(join(cwd, ".git/hooks/pre-push"));
+  git("config", "--add", "remote.origin.pushurl", remote); git("config", "--add", "remote.origin.pushurl", remote);
+  assert.equal(await check("git push origin feature"), false);
+  git("config", "--unset-all", "remote.origin.pushurl");
+  git("config", "remote.origin.pushurl", join(home, "missing.git"));
+  assert.equal(await check("git push origin feature"), false, "fetch URL cannot stand in for the push URL");
+  git("config", "--unset", "remote.origin.pushurl");
+  execFileSync("git", ["--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/feature"]);
+  assert.equal(await check("git push origin feature"), false, "fresh remote HEAD overrides any stale local default hint");
+  execFileSync("git", ["--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/unknown"]);
+  assert.equal(await check("git push origin feature"), false, "unknown remote HEAD keeps prompting");
+});
+
+test("T539 AC2: draft body files stay inside the repository, including symlinks", async t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-pr-body-")), cwd = join(home, "work");
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  mkdirSync(cwd); execFileSync("git", ["init", cwd], { stdio: "ignore" });
+  writeFileSync(join(cwd, "body.md"), "draft body"); writeFileSync(join(home, "outside.md"), "outside");
+  symlinkSync(join(home, "outside.md"), join(cwd, "escape.md"));
+  for (const [file, expected] of [["body.md", true], ["../outside.md", false], ["escape.md", false], ["missing.md", false]] as const) {
+    assert.equal(await checkOutwardReversible(parseOutwardReversible(`gh pr create --draft --head feature --body-file ${file}`)!, cwd), expected);
+  }
+});
+
+test("T539 AC2: repository and transport environment overrides keep prompting", async t => {
+  const cwd = mkdtempSync(join(tmpdir(), "mbx-git-env-"));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  execFileSync("git", ["init", cwd], { stdio: "ignore" });
+  const intent = parseOutwardReversible("gh pr create --draft --head feature")!;
+  assert.equal(await checkOutwardReversible(intent, cwd), true);
+  for (const [key, value] of Object.entries({ GIT_DIR: join(cwd, ".git"), GIT_WORK_TREE: cwd, GIT_NAMESPACE: "fixture", GIT_CONFIG_COUNT: "0",
+    GIT_CONFIG_PARAMETERS: "", GIT_SSH: "git", GIT_SSH_COMMAND: "ssh", GIT_EXEC_PATH: cwd, GH_REPO: "owner/repo", GH_HOST: "github.com" })) {
+    const old = process.env[key];
+    try { process.env[key] = value; assert.equal(await checkOutwardReversible(intent, cwd), false, key); }
+    finally { if (old === undefined) delete process.env[key]; else process.env[key] = old; }
+  }
+  assert.equal(await checkOutwardReversible(intent, cwd), true);
+});

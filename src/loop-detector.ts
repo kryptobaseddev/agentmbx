@@ -3,6 +3,7 @@ import { sha256, ulid } from "./crypto.ts";
 import { checkShape, oneLine, verifyEnvelope, type Envelope } from "./envelope.ts";
 import type { MbxNode } from "./node.ts";
 import { notifyDesktop } from "./wake.ts";
+import { armOpencodeDuplicateLoopAudit } from "./opencode-duplicate-loop.ts";
 
 export interface LoopDetectorConfig { message_threshold: number; window_minutes: number }
 export const LOOP_DEFAULTS: Readonly<LoopDetectorConfig> = { message_threshold: 50, window_minutes: 10 };
@@ -102,6 +103,8 @@ export async function reportConversationLoops(node: MbxNode, deps: { now?: numbe
 
 /** Independent from daemon delivery/reconciliation; a slow notifier cannot overlap its own next tick. */
 export function armConversationLoopReports(node: MbxNode): void {
+  // T522: the daemon already calls this arm. The duplicate-loop audit rides the same start.
+  armOpencodeDuplicateLoopAudit(node);
   let busy = false;
   const tick = () => {
     if (busy) return;

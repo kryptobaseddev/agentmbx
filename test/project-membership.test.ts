@@ -10,7 +10,7 @@ import { staleBindingSummary } from "../src/doctor.ts";
 import { listIdentityStatus } from "../src/identity-status.ts";
 import { MbxNode } from "../src/node.ts";
 import { inLedger } from "../src/project-ledger.ts";
-import { backfillRegistry, noteProject, projectIdentities, removeStaleProjectBindings, staleProjectBindings } from "../src/registry.ts";
+import { backfillRegistry, identityProjects, noteProject, projectIdentities, registerIdentity, removeStaleProjectBindings, staleProjectBindings } from "../src/registry.ts";
 
 const HERE = "/tmp/mbx-t515-agentmbx";
 const STUDIO = "/tmp/mbx-t515-studio";
@@ -39,7 +39,7 @@ test("a shared host cwd is not membership, and a recorded binding still is", (t)
   n.registerAgent("home-grok");
   n.registerAgent("persona-x");
   n.registerAgent("host-shared");
-  noteProject(n.store, "home-grok", HERE);
+  noteProject(n.store, "home-grok", HERE, true);
   // One host process (pid 4242) recorded two personas in this folder. Neither has a binding.
   session(n, "persona-x", HERE, "shared-x");
   session(n, "host-shared", HERE, "shared-host");
@@ -57,7 +57,7 @@ test("a shared host cwd is not membership, and a recorded binding still is", (t)
   assert.equal(bound(n, "persona-x", HERE), false, "store open does not copy a session cwd into identity_projects");
   assert.equal(bound(n, "host-shared", HERE), false);
 
-  noteProject(n.store, "persona-x", HERE);
+  noteProject(n.store, "persona-x", HERE, true);
   assert.ok(projectIdentities(n.store, HERE).has("persona-x"));
   assert.equal(inLedger(n, HERE, foreign.envelope.id), true, "a noteProject binding brings that persona's mail into the ledger");
   assert.deepEqual(
@@ -100,7 +100,7 @@ test("identity bindings is a dry run until --apply, and doctor names the count",
 
   // A row refreshed after the list was built no longer matches, so apply leaves it.
   const snapshot = staleProjectBindings(n.store);
-  noteProject(n.store, "axiom-lab-dev", HERE, new Date("2030-01-01T00:00:00.000Z"));
+  noteProject(n.store, "axiom-lab-dev", HERE, true, new Date("2030-01-01T00:00:00.000Z"));
   assert.equal(removeStaleProjectBindings(n.store, snapshot.filter((r) => r.name === "axiom-lab-dev")), 0);
   assert.equal(bound(n, "axiom-lab-dev", HERE), true);
   assert.equal(bound(n, "axiom-lab-dev", STUDIO), true);
@@ -147,4 +147,20 @@ test("identity bindings is a dry run until --apply, and doctor names the count",
   assert.match(clear.label, /no project bindings older/);
   assert.equal(staleProjectBindings(after.store).length, 0);
   assert.ok(after.store.db.prepare("SELECT 1 FROM audit WHERE event='project.binding.removed'").get());
+});
+
+// T538: membership is explicit only. A persona bound in project A whose session starts with a cwd in
+// project B never becomes a member of B — the old every-bind cwd upsert re-added foreign personas as
+// fast as T515's prune removed them.
+test("T538: a cwd observation never binds a persona to a project; an explicit claim does", (t) => {
+  const { n } = homeNode(t, "t538");
+  registerIdentity(n.store, { name: "persona-a", role: "builder" });
+  noteProject(n.store, "persona-a", "/proj/B", false);
+  assert.deepEqual(identityProjects(n.store, "persona-a"), [], "cwd in B alone writes no binding");
+  noteProject(n.store, "persona-a", "/proj/A", true);
+  assert.deepEqual(identityProjects(n.store, "persona-a"), ["/proj/A"], "an explicit claim for A binds A");
+  noteProject(n.store, "persona-a", "/proj/B", false);
+  assert.deepEqual(identityProjects(n.store, "persona-a"), ["/proj/A"], "a later cwd in B neither adds B nor refreshes A");
+  assert.ok(!projectIdentities(n.store, "/proj/B").has("persona-a"), "B's members surface stays clean");
+  assert.ok(projectIdentities(n.store, "/proj/A").has("persona-a"), "A keeps its member");
 });
