@@ -15,7 +15,7 @@ import { STATUS_V2_SCHEMA } from "./status-schema.ts";
 import { notifyDesktop } from "./wake.ts";
 import { version } from "./version.ts";
 import { rotationLog, saveRotationLog, type SignedRotation } from "./key-rotation.ts";
-import { storedPolicies, acceptSigned, type AnyRecord, type Signed } from "./policy.ts";
+import { storedPolicies, acceptSigned, policyUnexpired, type AnyRecord, type Signed } from "./policy.ts";
 import { acceptReceipt, dueReceipts, RECEIPT_BATCH, receiptsDeferred, receiptsSent, signReceipt } from "./remote-receipts.ts";
 
 export const HOP_SKEW_MS = 5 * 60_000;
@@ -645,16 +645,20 @@ export async function refreshPeerEncKeys(node: MbxNode, f: typeof fetch = fetch,
 }
 
 // ---- policies: push on set/revoke, pull every minute so offline hosts catch up ----------------------------
-/** Everything a peer may need: unexpired policies and revocations from the last 30 days, as signed records. */
+/** Everything a peer may need: unexpired policies and their retained signed revocations. */
 const RANK: Record<string, number> = { device: 0, revocation: 1, policy: 2 };
 /** Sync order: devices (trust first), then revocations (a kill switch never loses to the policy it kills), then policies. */
 export const recordKey = (s: Signed<AnyRecord>) => `${RANK[s.rec.type] ?? 9}:${s.rec.id}`;
 
 export function signedRecords(node: MbxNode): Signed<AnyRecord>[] {
   const db = node.store.db, now = new Date().toISOString(), since = new Date(Date.now() - 30 * 86_400_000).toISOString();
-  const rs = db.prepare("SELECT record, sig FROM policy_revocations WHERE iat > ?").all(since) as { record: string; sig: string }[];
+  // A long-offline peer must still see the revocation of a never-expiring policy.
+  // Finite policies outlive neither the 30-day window nor their expiry; kill switches
+  // and targeted revocations of permanent records must remain in the sync snapshot.
+  const rs = db.prepare(`SELECT record, sig FROM policy_revocations WHERE iat > ? OR target='*'
+    OR target IN (SELECT id FROM policies WHERE exp IS NULL)`).all(since) as { record: string; sig: string }[];
   const ds = db.prepare("SELECT record, sig FROM devices").all() as { record: string; sig: string }[];
-  const ps = storedPolicies(db).valid.filter(p => Date.parse(p.rec.exp) > Date.parse(now)).map(({ rec, sig }) => ({ rec, sig }));
+  const ps = storedPolicies(db).valid.filter(p => policyUnexpired(p.rec.exp, Date.parse(now))).map(({ rec, sig }) => ({ rec, sig }));
   return [...[...rs, ...ds].map((r) => ({ rec: JSON.parse(r.record) as AnyRecord, sig: r.sig })), ...ps].sort((a, b) => (recordKey(a) < recordKey(b) ? -1 : 1));
 }
 

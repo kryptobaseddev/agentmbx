@@ -33,9 +33,11 @@ export const DID_MAX = 200;
 export const didWarning = (did: string | undefined) => did && did.length > DID_MAX
   ? `did was ${did.length} characters; the audit log kept the first ${DID_MAX}, marked truncated. Lead with the action in one line; put detail in the thread reply or note.` : null;
 export const WAKE_KINDS = new Set(["request", "task", "decision", "alert"]);
-export const WAKE_LIMITS = { perAgentSeconds: 30, perThreadHour: 6, perAgentDay: 60 };
+export const WAKE_LIMITS = { perAgentSeconds: 30 };
 
-export interface Config { host: string; port: number; bind: string }
+export interface Config { host: string; port: number; bind: string;
+  /** Observational only; defaults to >50 automated messages in 10 minutes. */
+  loop_detector?: { message_threshold?: number; window_minutes?: number } }
 /** One resolved recipient of a send (T205): a local mailbox (`name`), a paired host (`host`, with `name` when addressed).
  *  `lead` marks a target the `lead`/`role:lead` tokens resolved to (T491), so send-time receipts can queue it
  *  instead of reporting it like any plainly addressed mailbox. */
@@ -84,7 +86,8 @@ export class MbxNode {
     for (const file of ["config.json", "host.key", "enc.key", "owner.key", "owner.json", "retired-keys.json", "rotations.json"]) privatePath(join(home, file), 0o600, true);
     const cfgPath = join(home, "config.json"), keyPath = join(home, "host.key"), encPath = join(home, "enc.key");
     if (!existsSync(cfgPath)) {
-      const c: Config = { host: init.host ?? shortHost(), port: init.port ?? DEFAULT_PORT, bind: init.bind ?? "0.0.0.0" };
+      const c: Config = { host: init.host ?? shortHost(), port: init.port ?? DEFAULT_PORT, bind: init.bind ?? "0.0.0.0",
+        ...(init.loop_detector ? { loop_detector: init.loop_detector } : {}) };
       if (!NAME_RE.test(c.host)) throw new Error(`invalid host name "${c.host}" (use a-z, 0-9, -)`);
       writeFileSync(cfgPath, JSON.stringify(c, null, 2) + "\n", { mode: 0o600 });
     }
@@ -347,11 +350,8 @@ export class MbxNode {
     return n;
   }
 
-  /** Stop-hook continuation budget: the thread and daily wake caps also bound "keep going" turns. Records one when allowed. */
+  /** Record a Stop-hook continuation. Conversation loops are reported, never stopped by wake counts. */
   allowContinue(agent: string, thread: string | null, now = Date.now()): boolean {
-    const q = (sql: string, ...a: (string | null)[]) => (this.store.db.prepare(sql).get(...a) as { n: number }).n;
-    if (thread && q("SELECT count(*) n FROM wakes WHERE agent=? AND thread=? AND at>?", agent, thread, new Date(now - 3_600_000).toISOString()) >= WAKE_LIMITS.perThreadHour) return false;
-    if (q("SELECT count(*) n FROM wakes WHERE agent=? AND at>?", agent, new Date(now - 86_400_000).toISOString()) >= WAKE_LIMITS.perAgentDay) return false;
     this.store.db.prepare("INSERT INTO wakes (agent,thread,at) VALUES (?,?,?)").run(agent, thread, new Date(now).toISOString());
     return true;
   }
@@ -848,7 +848,7 @@ export class MbxNode {
   depthSuppressed(agent: string): { id: string; from: string; hop: number }[] {
     return this.inbox(agent).flatMap((m) => {
       const p = this.policyFor(m, agent);
-      return p.notes.some((n) => /^relay depth \d+ exceeds/.test(n)) ? [{ id: m.id, from: m.from_addr, hop: p.hop ?? 0 }] : [];
+      return p.depthSuppressed ? [{ id: m.id, from: m.from_addr, hop: p.hop ?? 0 }] : [];
     });
   }
 
@@ -899,14 +899,12 @@ export class MbxNode {
     return this.reserveWake(agent, thread, now).brake;
   }
 
-  /** Reserve budget atomically; release only when the adapter proves no wake was submitted. */
+  /** Reserve the per-agent batching window atomically; release only when the adapter proves no wake was submitted. */
   reserveWake(agent: string, thread: string | null, now = Date.now()): { brake: string; release?: never } | { brake: null; release: () => void } {
     return this.store.tx(() => {
       const since = (ms: number) => new Date(now - ms).toISOString();
       const q = (sql: string, ...a: (string | null)[]) => (this.store.db.prepare(sql).get(...a) as { n: number }).n;
       if (q("SELECT count(*) n FROM wakes WHERE agent=? AND at>?", agent, since(WAKE_LIMITS.perAgentSeconds * 1000))) return { brake: "batched (woke recently)" };
-      if (thread && q("SELECT count(*) n FROM wakes WHERE agent=? AND thread=? AND at>?", agent, thread, since(3_600_000)) >= WAKE_LIMITS.perThreadHour) return { brake: "thread wake cap reached" };
-      if (q("SELECT count(*) n FROM wakes WHERE agent=? AND at>?", agent, since(86_400_000)) >= WAKE_LIMITS.perAgentDay) return { brake: "daily wake cap reached" };
       const at = new Date(now).toISOString();
       const { lastInsertRowid } = this.store.db.prepare("INSERT INTO wakes (agent,thread,at) VALUES (?,?,?)").run(agent, thread, at);
       let released = false;

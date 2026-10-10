@@ -176,7 +176,12 @@ func summarizeRaw(_ o: [String: Any]) throws -> String {
     if let principals = from["principals"], !strs(principals).isEmpty { fromText += " (people: \(list(principals)))" }
     let fromAgents = strs(from["agents"])
     if !fromAgents.isEmpty && fromAgents != ["*"] { fromText = "\(list(from["agents"])) on \(fromText)" }
-    var text = "Allow \(clean(level, 20)) (\(list(o["classes"], "no classes"))) for \(list(to["agents"])) on \(list(to["hosts"])) from \(fromText) for \(try duration(o))"
+    let lifetime: String
+    if o["exp"] is NSNull {
+      guard parseDate(o["iat"] as? String) != nil else { throw Refusal(reason: "missing iat") }
+      lifetime = "with no expiry"
+    } else { lifetime = "for \(try duration(o))" }
+    var text = "Allow \(clean(level, 20)) (\(list(o["classes"], "no classes"))) for \(list(to["agents"])) on \(list(to["hosts"])) from \(fromText) \(lifetime)"
     if !strs(o["projects"]).isEmpty { text += " in \(list(o["projects"]))" }
     let yolo = level == "YOLO" || strs(o["classes"]).contains("permissions")
     if yolo {

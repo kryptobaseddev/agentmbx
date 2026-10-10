@@ -1,5 +1,5 @@
 // Relay depth counts relays, not conversation turns (T104): two agents answering each other stay at depth 0 however
-// long they talk, while passing content on to a third agent still adds a hop, so chains are limited exactly as before.
+// long they talk, while passing content on to a third agent still adds a hop for provenance.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -79,11 +79,11 @@ test("a chain still adds one hop per relay, also when it loops back to its start
   const ca = await w.send("cyd", ["ada"]); assert.equal(ca.meta.hop, 2, "c read from b, not a: the loop back to a is still a relay");
 });
 
-test("whoami says when relay depth kept mail from waking this session", async (t) => {
+test("whoami does not report a depth suppression for an unlimited collaborate grant", async (t) => {
   const w = await world(t, ["ada"], "collaborate");
   sendLeased(w.n, { from: "far", to: ["ada"], subject: "deep", body: "data", hop: 21, kind: "request", needs_reply: true });
   const me = await w.call("ada", "mbx_whoami", {});
-  assert.match(String(me.wakes_suppressed), /1 unread message\(s\) from far@alpha did not wake this session: relay depth 21/);
+  assert.equal(me.wakes_suppressed, undefined);
   sendLeased(w.n, { from: "near", to: ["ada"], subject: "fine", body: "data", hop: 3, kind: "request" });
-  assert.match(String((await w.call("ada", "mbx_whoami", {})).wakes_suppressed), /^1 unread/, "within the allowance: not listed");
+  assert.equal((await w.call("ada", "mbx_whoami", {})).wakes_suppressed, undefined);
 });

@@ -284,6 +284,8 @@ test("real helper: prompt text for each payload type", { skip }, () => {
   const policy = { v: 1, type: "policy", id: "01J", level: "collaborate", classes: ["read", "edit"], to: { agents: ["api-dev", "*"], hosts: ["macbook"] },
     from: { hosts: ["local", "desktop"], agents: ["*"] }, iat, exp: hours(24 * 7), owner_fp: "b81a-0000-0000-0000" };
   assert.equal(ok(policy), "Allow COLLABORATE (read, edit) for ALL (*) [also named: api-dev] on macbook from local, desktop for 7 days");
+  assert.equal(ok({ ...policy, exp: null }), "Allow COLLABORATE (read, edit) for ALL (*) [also named: api-dev] on macbook from local, desktop with no expiry");
+  assert.equal(summary(canonical({ ...policy, iat: "invalid", exp: null })).code, 5);
   assert.equal(ok({ ...policy, projects: ["/Users/k/projects/agentmbx"], exp: hours(36) }),
     "Allow COLLABORATE (read, edit) for ALL (*) [also named: api-dev] on macbook from local, desktop for 36 hours in /Users/k/projects/agentmbx");
   const yolo = ok({ ...policy, level: "yolo", classes: ["read", "edit", "outward", "permissions"], to: { agents: ["codex", "claude"], hosts: ["macbook"] }, exp: hours(8) });

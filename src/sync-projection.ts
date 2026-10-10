@@ -77,7 +77,7 @@ export interface PolicyInput {
   project_keys: string[];
   has_local_scope: boolean;
   issued_at: string;
-  expires_at: string;
+  expires_at: string | null;
   owner_fp: string;
   source: "cli" | "touch_id" | "console";
   command_id: string | null;

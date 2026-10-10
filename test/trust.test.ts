@@ -133,16 +133,24 @@ test("local delivery, labels, inbox/read/ack, threads and search", () => {
   assert.equal(a.wantsWake("helper", inbox[0]), true);
 });
 
-test("wake brake: batching, thread cap, and status messages do not wake", () => {
+test("wake brake: batching stays, thread/hour and agent/day counts do not block, and status does not wake", () => {
   const { a } = twoHosts();
   let t = Date.now();
   assert.equal(a.takeWake("helper", "th1", t), null);
   assert.match(a.takeWake("helper", "th1", t + 5_000)!, /batched/);
-  for (let i = 1; i < 6; i++) assert.equal(a.takeWake("helper", "th1", t + i * 31_000), null);
-  assert.match(a.takeWake("helper", "th1", t + 7 * 31_000)!, /thread wake cap/);
-  assert.equal(a.takeWake("helper", "th2", t + 8 * 31_000), null);
+  for (let i = 1; i < 70; i++) assert.equal(a.takeWake("helper", "th1", t + i * 31_000), null, `wake ${i + 1} is admitted`);
+  assert.match(a.takeWake("helper", "th2", t + 69 * 31_000 + 5_000)!, /batched/, "batching is per agent across threads");
+  assert.equal(a.takeWake("helper", "th2", t + 70 * 31_000), null);
   const { envelope } = a.send({ from: "master", to: ["helper"], subject: "fyi", body: "status only", kind: "status" });
   assert.equal(a.wantsWake("helper", a.message(envelope.id)!), false);
+});
+
+test("Stop continuation records every turn without thread/hour or agent/day count limits", () => {
+  const { a } = twoHosts(), now = Date.now();
+  for (let i = 0; i < 70; i++) assert.equal(a.allowContinue("helper", "th1", now), true, `continuation ${i + 1} is admitted`);
+  assert.equal(a.allowContinue("helper", null, now), true, "a continuation without a thread still passes above 60/day");
+  const count = a.store.db.prepare("SELECT count(*) n FROM wakes WHERE agent=?").get("helper") as { n: number };
+  assert.equal(count.n, 71, "continuations retain wake history for batching and diagnostics");
 });
 
 test("owner key: wrong passphrase fails, file is not plaintext", () => {
