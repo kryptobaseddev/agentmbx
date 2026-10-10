@@ -55,6 +55,7 @@ import { publishIdentityControl, findIdentityControl, identityControlReceipt, re
 import { armDaemonSync } from "./sync-daemon.js";
 import { armConversationLoopReports } from "./loop-detector.js";
 import { mcpStarting } from "./mcp-startup.js";
+import { hookDisconnectedNote } from "./hook-connection.js";
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
 
 Start here
@@ -1909,6 +1910,7 @@ async function hook(node, event, cli) {
         const grokUnboundPost = cli === "grok" && event === "post-tool";
         if (!sid || (event !== "session-start" && event !== "prompt" && !grokUnboundPost))
             return;
+        const disconnected = grokUnboundPost ? null : hookDisconnectedNote(node, cli, sid, process.ppid);
         const multi = cli === "kimi" && kimiMultiHost(process.ppid);
         // A conversation in a multi-conversation Kimi host can't be matched to its mbx server from here: hand it a bind
         // ticket, once; after it linked, it only needs the identity guidance.
@@ -1933,14 +1935,14 @@ async function hook(node, event, cli) {
         if (event === "session-start") {
             if (cli !== "hermes") {
                 node.store.set(guided, new Date().toISOString());
-                emit(cli, "SessionStart", link ? `${unbound}\n${link}` : unbound);
+                emit(cli, "SessionStart", [disconnected, unbound, link].filter(Boolean).join("\n"));
             }
         }
         else if (grokUnboundPost)
             emit(cli, "PostToolUse", link ? `${unbound}\n${link}` : unbound);
-        else if (link || first) {
+        else if (disconnected || link || first) {
             node.store.set(guided, new Date().toISOString());
-            emit(cli, "UserPromptSubmit", first ? (link ? `${unbound}\n${link}` : unbound) : link);
+            emit(cli, "UserPromptSubmit", [disconnected, first ? unbound : null, link].filter(Boolean).join("\n"));
         }
     }
 }
