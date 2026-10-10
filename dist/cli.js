@@ -2309,7 +2309,8 @@ async function kimiDesktopStep(cmd, o) {
 /**
  * Onboarding: how much may this machine's agents do for each other? One owner-signed policy for every local agent
  * (`*`, from this machine only). The default is `collaborate` (POLICY.md, ratified 2026-09-26): read, test and reversible
- * edits in the project; outward actions still ask. --policy <level> answers up front, `--policy ask` signs nothing. The
+ * edits in the project, non-default branch pushes and draft PRs; full outward actions still ask. --policy <level>
+ * answers up front, `--policy ask` signs nothing. The
  * human always approves the exact text in the Touch ID / passphrase prompt, so an agent running setup can't widen it.
  */
 /**
@@ -2337,7 +2338,7 @@ async function policyStep(level, yes) {
             const rl = createInterface({ input: process.stdin, output: process.stdout });
             const a = (await rl.question(`\nHow much may the agents on this machine do for each other?
   1) ask          they answer each other; anything else waits for you
-  2) collaborate  read, test and make reversible edits in their project; push/deploy/delete still ask you   [default]
+  2) collaborate  read, test, edit, push a non-default branch and open a draft PR in their project; merge/release/deploy/delete/secrets/spend still ask you   [default]
   3) autonomous   same classes, no check-ins until done
   4) yolo         everything, including approving their own permission prompts (8 hours)
 Choose 1-4 [2]: `)).trim();
