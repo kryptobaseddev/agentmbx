@@ -20,7 +20,7 @@ const CLIS = new Set(["claude", "codex", "kimi", "opencode", "hermes", "cli", "u
 const KINDS = ["message", "request", "reply", "status", "decision", "alert", "task"];
 const STATES = ["queued", "handed-over", "delivered", "notified", "read", "acked", "forwarded", "returned"];
 const LEVELS = new Set(["ask", "collaborate", "autonomous", "yolo"]);
-const CLASSES = new Set(["read", "edit", "outward", "permissions"]);
+const CLASSES = new Set(["read", "edit", "outward-reversible", "outward", "permissions"]);
 const TRUSTS = new Set(["local", "verified", "unverified"]);
 export function receiptKey(r) {
     return `${r.message_id}\n${r.to}\n${r.state}\n${r.at}`;
