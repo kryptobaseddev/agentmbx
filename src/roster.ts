@@ -2,7 +2,9 @@
 //   - state comes from verified holder process evidence, the same function a claim uses (listIdentityStatus ->
 //     identityAvailability), never from last_seen;
 //   - each row says its role, the harness that holds it, its projects and which projects it leads;
-//   - the default view is the session's project plus the leads of other projects; project "*" lists every project;
+//   - the default view is the session's project plus the leads of other projects, plus any live or idle persona whose
+//     verified session works in this folder (`seen_here`: visibility only, never a membership write, T538);
+//     project "*" lists every project;
 //   - retired and generated names are left out unless a session holds them (or all:true).
 // Rows are built from an explicit field list. IdentityStatus carries unread and message counts; they never reach a
 // roster row (T308 AC2). A row from a paired host is `remote` and unverified: its liveness is that host's to say.
@@ -11,6 +13,7 @@ import type { MbxNode } from "./node.ts";
 import { listIdentityStatus, type IdentityStatus } from "./identity-status.ts";
 import type { ProcessEvidence } from "./identity-leases.ts";
 import { activeLeads, projectLeadView, type LeadRecord } from "./lead-record.ts";
+import { cwdInProject } from "./probe.ts";
 import { AGENTS_V1_SCHEMA, type AgentsV1, type AgentsV1Row, type AgentState } from "./status-schema.ts";
 
 export interface RosterOptions {
@@ -51,9 +54,19 @@ export function buildRoster(node: MbxNode, o: RosterOptions = {}): AgentsV1 {
   const here = new Map(directory.filter((a) => a.host === node.host).map((a) => [a.name, a]));
   const leads = activeLeads(node, new Date(now));
   const ledBy = (name: string, host: string): string[] => leads.filter((l) => l.agent === name && l.host === host).map((l) => l.project).sort();
+  // The cwd of a holder's live session binding row, the same evidence `agentmbx probe` uses for "works in this project" (T445).
+  const sessionCwd = (h: { cli: string; session_id: string }): string | null => {
+    const r = node.store.db.prepare("SELECT cwd FROM sessions WHERE cli=? AND session_id=? ORDER BY updated_at DESC LIMIT 1")
+      .get(h.cli, h.session_id) as { cwd: string | null } | undefined;
+    return r?.cwd ?? null;
+  };
 
   const rows: AgentsV1Row[] = status.identities.map((i) => {
     const a = here.get(i.name), held = i.state === "held" || i.state === "idle";
+    // Visibility only (T538 stands): a live or idle holder whose verified session binding works in this folder is shown even
+    // though it is not a member. Nothing is written to identity_projects, and an offline persona that once ran here is not shown.
+    const seenHere = !!o.project && held && !!i.holder && !(!!o.self && o.self === i.name) && !i.projects.includes(o.project)
+      && cwdInProject(sessionCwd(i.holder), o.project);
     return {
       name: i.name, host: node.host, address: `${i.name}@${node.host}`,
       state: stateOf(i.state), reason: i.reason,
@@ -61,14 +74,14 @@ export function buildRoster(node: MbxNode, o: RosterOptions = {}): AgentsV1 {
       registered: i.registered, retired: i.retired,
       harness: held && i.holder ? i.holder.cli : null, cli: a?.cli ?? null,
       projects: [...i.projects].sort(), lead_of: ledBy(i.name, node.host),
-      self: !!o.self && o.self === i.name, last_seen: a?.last_seen ?? i.last_activity,
+      self: !!o.self && o.self === i.name, seen_here: seenHere, last_seen: a?.last_seen ?? i.last_activity,
     };
   });
   const remoteRow = (name: string, host: string, a?: { role: string | null; cli: string | null; description: string | null; last_seen: string | null }): AgentsV1Row => ({
     name, host, address: `${name}@${host}`, state: "remote",
     reason: `listed by paired host ${host}; this host cannot verify whether it is running`,
     role: a?.role ?? null, description: a?.description ?? null, registered: null, retired: null,
-    harness: null, cli: a?.cli ?? null, projects: [], lead_of: ledBy(name, host), self: false, last_seen: a?.last_seen ?? null,
+    harness: null, cli: a?.cli ?? null, projects: [], lead_of: ledBy(name, host), self: false, seen_here: false, last_seen: a?.last_seen ?? null,
   });
   for (const a of directory) if (a.host !== node.host) rows.push(remoteRow(a.name, a.host, a));
   // A designated lead is always listed, even when its mailbox has no row yet or lives on a host we only know by its record.
@@ -77,11 +90,12 @@ export function buildRoster(node: MbxNode, o: RosterOptions = {}): AgentsV1 {
     if (l.host !== node.host) { rows.push(remoteRow(l.agent, l.host)); continue; }
     rows.push({ name: l.agent, host: node.host, address: `${l.agent}@${node.host}`, state: "offline",
       reason: "designated lead; no mailbox activity recorded on this host", role: null, description: null, registered: false, retired: false,
-      harness: null, cli: null, projects: [], lead_of: ledBy(l.agent, node.host), self: !!o.self && o.self === l.agent, last_seen: null });
+      harness: null, cli: null, projects: [], lead_of: ledBy(l.agent, node.host), self: !!o.self && o.self === l.agent, seen_here: false, last_seen: null });
   }
 
   const local = (r: AgentsV1Row) => r.host === node.host;
-  const inScope = (r: AgentsV1Row) => everyProject || r.self || r.lead_of.length > 0 || (local(r) && !!o.project && r.projects.includes(o.project));
+  const inScope = (r: AgentsV1Row) => everyProject || r.self || r.lead_of.length > 0
+    || (local(r) && !!o.project && (r.projects.includes(o.project) || r.seen_here));
   // Retired and generated names stay out unless something holds them or they are a designated lead or the caller.
   // `unknown` counts as held: a holder exists and may be live.
   const hiddenByDefault = (r: AgentsV1Row) => local(r) && (r.retired === true || r.registered === false)
@@ -108,7 +122,7 @@ export function rosterText(r: AgentsV1): string {
   const lines = r.agents.map((a) => {
     const led = a.lead_of.length ? `  LEAD of ${a.lead_of.map((p) => basename(p) || p).join(", ")}` : "";
     const cli = a.harness ?? a.cli;
-    return `${a.address}  ${a.state}${led}${a.self ? "  (you)" : ""}${a.role ? `  role:${a.role}` : ""}${cli ? `  (${cli})` : ""}`
+    return `${a.address}  ${a.state}${led}${a.self ? "  (you)" : ""}${a.seen_here ? "  seen here (not a member)" : ""}${a.role ? `  role:${a.role}` : ""}${cli ? `  (${cli})` : ""}`
       + `  last seen ${a.last_seen ?? "never"}${a.description ? `  — ${oneLine(a.description)}` : ""}`;
   });
   const leadLine = !r.scope.project ? "lead: no project" : r.lead ? `lead: ${r.lead.address} until ${r.lead.exp}` : "lead: none";

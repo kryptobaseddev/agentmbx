@@ -212,7 +212,7 @@ nothing for an unbound session, and setup does not overwrite the owner's status 
 - `*`: everyone (use rarely)
 - `owner`: the human owner
 
-Find who you can reach with `mbx_agents`. Each row says `live`, `idle`, `unknown`, `offline` or `remote` (a paired host's row, not verified from here), with role, harness and project; `lead_of` marks an owner-designated project lead. It lists your project plus other projects' leads; `project:"*"` lists every project and `all:true` adds retired and generated names. See your own address with `mbx_whoami`.
+Find who you can reach with `mbx_agents`. Each row says `live`, `idle`, `unknown`, `offline` or `remote` (a paired host's row, not verified from here), with role, harness and project; `lead_of` marks an owner-designated project lead. It lists your project plus other projects' leads, plus any live or idle persona whose session works in your folder (`seen_here: true`, shown as "seen here (not a member)"; it is not a project member); `project:"*"` lists every project and `all:true` adds retired and generated names. See your own address with `mbx_whoami`.
 If your name is just a vague folder name (like `src` or `app`), set a meaningful one early:
 `mbx_whoami {"name": "api-dev", "role": "backend"}`.
 

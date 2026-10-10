@@ -37,12 +37,14 @@ function world(t: { after: (fn: () => unknown) => void }) {
   const leases = new IdentityLeases(node.store, { clock: () => NOW, idleTtlMs: 3_600_000, inspect });
   let nextPid = 1000;
   /** A persona with a lease held by a process: registered (unless told otherwise), bound to a project, in the directory. */
-  const hold = (name: string, o: { cli?: string; role?: string; project?: string; registered?: boolean; pid?: number; description?: string } = {}) => {
+  const hold = (name: string, o: { cli?: string; role?: string; project?: string; registered?: boolean; pid?: number; description?: string; cwd?: string } = {}) => {
     const pid = o.pid ?? nextPid++;
     leases.claim(name, { pid, start: `birth-${pid}`, cli: o.cli ?? "claude", sessionId: `s-${name}`, keyFp: "aaaa-bbbb-cccc-dddd" });
     if (o.registered !== false) registerIdentity(node.store, { name, role: o.role ?? "builder", description: o.description ?? null });
     node.registerAgent(name, { cli: o.cli ?? "claude", ...(o.role ? { role: o.role } : {}), ...(o.description ? { description: o.description } : {}) });
     if (o.project) noteProject(node.store, name, o.project, true);
+    // The holder's session binding row carries the folder it works in (what `agentmbx probe` reads, T445).
+    if (o.cwd) node.bindSession({ agent: name, cli: o.cli ?? "claude", session_id: `s-${name}`, pid, cwd: o.cwd });
     return pid;
   };
   const member = (name: string, project: string, role = "builder") => {
@@ -192,12 +194,51 @@ test("AC5: the output validates against the mbx.agents/v1 schema and fixture", (
   const mutate = (f: (c: AgentsV1) => void) => { const c = structuredClone(FIXTURE); f(c); return validateAgentsV1(c); };
   assert.match(mutate((c) => { delete (c.agents[0] as Partial<typeof c.agents[0]>).lead_of; }).join(), /lead_of/);
   assert.match(mutate((c) => { (c.agents[0] as unknown as Record<string, unknown>).self = "yes"; }).join(), /self/);
+  assert.match(mutate((c) => { delete (c.agents[0] as Partial<typeof c.agents[0]>).seen_here; }).join(), /seen_here/);
   assert.match(mutate((c) => { (c.agents[0] as unknown as Record<string, unknown>).state = "online"; }).join(), /state/);
   assert.match(mutate((c) => { c.agents[4].harness = "claude"; }).join(), /harness/);
   assert.match(mutate((c) => { (c as unknown as Record<string, unknown>).schema = "mbx.agents/v2"; }).join(), /schema/);
   assert.match(mutate((c) => { c.scope.hidden = -1; }).join(), /hidden/);
   assert.deepEqual(validateAgentsV1(null), ["not an object"]);
   assert.deepEqual(mutate((c) => { (c as unknown as Record<string, unknown>).extra = 1; (c.agents[0] as unknown as Record<string, unknown>).extra = 1; }), [], "additive fields are allowed");
+});
+
+test("seen_here (lead decision): a live or idle holder working in this folder is listed and flagged, never made a member; an offline persona that once ran here is not", (t) => {
+  const w = world(t);
+  w.hold("a-dev", { project: A });
+  w.hold("visitor", { project: B, cwd: `${A}/sub` });                          // live, a member of B, its session works inside A
+  w.hold("idle-visitor", { project: B, cwd: A, cli: "opencode" });             // an idle shared-process conversation working in A
+  w.node.store.set(activityKey("idle-visitor"), JSON.stringify({ at: w.NOW - 11 * 60_000, shared: true }));
+  w.hold("elsewhere", { project: B, cwd: C });                                 // live, but its session works in another folder
+  w.hold("no-cwd", { project: B });                                            // live, no session binding row to prove a folder
+  w.hold("sibling", { project: B, cwd: `${A}-extra` });                        // a folder that only shares A's prefix
+  const gone = w.hold("once-here", { project: B, cwd: A });                    // ran here, now dead
+  w.evidence.set(gone, { alive: false, start: null });
+  w.hold("me", { project: B, cwd: A });                                        // the caller: not a member, works here
+  w.member("sleeper", A);                                                      // a member with no holder
+  const members = () => w.node.store.db.prepare("SELECT name,project,first_seen,last_seen FROM identity_projects ORDER BY name,project").all();
+  const before = members();
+
+  const r = w.roster({ project: A, self: "a-dev" });
+  assert.deepEqual(names(r).sort(), ["a-dev", "idle-visitor", "me", "sleeper", "visitor"], "members plus the live or idle holders working here (me is one of them unless it is the caller)");
+  assert.equal(row(r, "me").seen_here, true);
+  assert.deepEqual([row(r, "visitor").state, row(r, "visitor").seen_here, row(r, "visitor").projects], ["live", true, [B]], "flagged, and still only a member of B");
+  assert.deepEqual([row(r, "idle-visitor").state, row(r, "idle-visitor").seen_here], ["idle", true]);
+  assert.equal(row(r, "a-dev").seen_here, false, "a member is not flagged");
+  assert.equal(row(r, "sleeper").seen_here, false);
+  assert.deepEqual(members(), before, "nothing was written to identity_projects (T538 stands)");
+  assert.match(rosterText(r).split("\n").find((l) => l.startsWith("visitor@alpha"))!, /seen here \(not a member\)/);
+  assert.doesNotMatch(rosterText(r).split("\n").find((l) => l.startsWith("a-dev@alpha"))!, /seen here/);
+
+  assert.deepEqual(validateAgentsV1(r), [], "still conforms to mbx.agents/v1");
+  const mine = w.roster({ project: A, self: "me" });
+  assert.deepEqual([row(mine, "me").self, row(mine, "me").seen_here], [true, false], "the same persona as the caller is (you), not flagged");
+  const all = w.roster({ project: A, ask: "*" });
+  assert.equal(row(all, "visitor").seen_here, true, "the flag does not depend on the view");
+  assert.equal(row(all, "once-here").seen_here, false);
+  assert.equal(row(all, "elsewhere").seen_here, false);
+  assert.ok(w.roster({}).agents.every((a) => !a.seen_here), "a session with no project flags nothing");
+  assert.deepEqual(members(), before, "still unchanged after every view");
 });
 
 test("activeLeads lists each project's current lead and drops expired or revoked records", (t) => {

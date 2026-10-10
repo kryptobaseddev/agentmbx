@@ -28,6 +28,7 @@
       "projects": ["/work/fixture"],
       "lead_of": ["/work/fixture"],
       "self": false,
+      "seen_here": false,
       "last_seen": "2026-10-10T17:59:00.000Z"
     },
     {
@@ -45,6 +46,25 @@
       "projects": ["/work/fixture"],
       "lead_of": [],
       "self": true,
+      "seen_here": false,
+      "last_seen": "2026-10-10T17:59:30.000Z"
+    },
+    {
+      "name": "fixture-visitor",
+      "host": "fixture-host",
+      "address": "fixture-visitor@fixture-host",
+      "state": "live",
+      "reason": "held by a verified session working in this folder",
+      "role": "builder",
+      "description": null,
+      "registered": true,
+      "retired": false,
+      "harness": "kimi",
+      "cli": "kimi",
+      "projects": ["/work/elsewhere"],
+      "lead_of": [],
+      "self": false,
+      "seen_here": true,
       "last_seen": "2026-10-10T17:59:30.000Z"
     },
     {
@@ -62,6 +82,7 @@
       "projects": ["/work/fixture"],
       "lead_of": [],
       "self": false,
+      "seen_here": false,
       "last_seen": "2026-10-10T17:45:00.000Z"
     },
     {
@@ -79,6 +100,7 @@
       "projects": ["/work/fixture"],
       "lead_of": [],
       "self": false,
+      "seen_here": false,
       "last_seen": "2026-10-10T17:58:00.000Z"
     },
     {
@@ -96,6 +118,7 @@
       "projects": ["/work/fixture"],
       "lead_of": [],
       "self": false,
+      "seen_here": false,
       "last_seen": "2026-10-09T09:00:00.000Z"
     },
     {
@@ -113,6 +136,7 @@
       "projects": [],
       "lead_of": ["/work/other"],
       "self": false,
+      "seen_here": false,
       "last_seen": null
     }
   ]

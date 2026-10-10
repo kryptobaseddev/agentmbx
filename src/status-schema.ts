@@ -92,6 +92,10 @@ export interface AgentsV1Row {
   lead_of: string[];
   /** This is the calling session's own persona. */
   self: boolean;
+  /** Listed because its live or idle session works in the calling session's folder while it is NOT a member of that
+   *  project. Visibility only: nothing is written to identity_projects (T538). False for members, for the caller, and when
+   *  the session has no project. */
+  seen_here: boolean;
   last_seen: string | null;
 }
 
@@ -146,6 +150,7 @@ export function validateAgentsV1(x: unknown): string[] {
     for (const k of ["registered", "retired"] as const) if (!boolOrNull(r[k]) || r[k] === undefined) bad.push(`${at}.${k} is not a boolean or null`);
     for (const k of ["projects", "lead_of"] as const) if (!strList(r[k])) bad.push(`${at}.${k} is not a list of strings`);
     if (typeof r.self !== "boolean") bad.push(`${at}.self is not a boolean`);
+    if (typeof r.seen_here !== "boolean") bad.push(`${at}.seen_here is not a boolean`);
     if (r.harness !== null && r.state !== "live" && r.state !== "idle") bad.push(`${at}.harness is set but the persona is not live or idle`);
   });
   return bad;

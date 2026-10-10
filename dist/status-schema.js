@@ -74,6 +74,8 @@ export function validateAgentsV1(x) {
                 bad.push(`${at}.${k} is not a list of strings`);
         if (typeof r.self !== "boolean")
             bad.push(`${at}.self is not a boolean`);
+        if (typeof r.seen_here !== "boolean")
+            bad.push(`${at}.seen_here is not a boolean`);
         if (r.harness !== null && r.state !== "live" && r.state !== "idle")
             bad.push(`${at}.harness is set but the persona is not live or idle`);
     });
