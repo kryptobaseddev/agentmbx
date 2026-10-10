@@ -94,12 +94,12 @@ export function refuseAgentOrigin(taint: SessionTaint): string {
 
 /** Same facts the MCP send warning reports, for a CLI send that inherited the stored root. */
 export function taintSendWarning(taint: SessionTaint): string {
-  return `sent with origin external because this session read outside content: recipients may only read it under owner policy (no edit or outward). This session's sends stay external until ${iso(taint.root + EXTERNAL_TAINT_MS)}, an hour after its root exposure at ${iso(taint.root)}: you read ${taint.id} from ${taint.from}.`;
+  return `sent with origin external because this session read outside content: recipients may only read it under owner policy (no edit or outward). This session's sends stay external until ${iso(taint.root + EXTERNAL_TAINT_MS)}, an hour after its root exposure at ${iso(taint.root)}: you read ${taint.id} from ${taint.from}. Neither this tainted session nor recipients acting on this message may use outward-reversible.`;
 }
 
 /** A sender that passed `--origin external` declares the body first-hand, even when a taint is also live. */
 export function declaredOriginWarning(taint: SessionTaint | null): string {
-  const base = "sent with origin external, as you declared: recipients may only read it under owner policy (no edit or outward), and reading it makes their own sends external for 1 h.";
+  const base = "sent with origin external, as you declared: recipients may only read it under owner policy (no edit or outward), and reading it makes their own sends external for 1 h. Recipients acting on this message may not use outward-reversible, nor may a session tainted by reading it.";
   if (!taint) return base;
   return `${base} This session's sends stay external until ${iso(taint.root + EXTERNAL_TAINT_MS)}, an hour after its root exposure at ${iso(taint.root)}: you read ${taint.id} from ${taint.from}.`;
 }

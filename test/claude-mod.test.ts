@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import {
-  bandText, currentSnapshot, readStatus, register, renderSections, renderStatus, resetStatusCache, resetStatusState, resolveSessionId,
+  bandText, currentSnapshot, loadStatus, readStatus, register, renderSections, renderStatus, resetStatusCache, resetStatusState, resolveSessionId,
   statusLineText, statusRequestUrl, statusText,
 } from "../plugins/claude/hooks/register.js";
 
@@ -359,4 +359,20 @@ test("T415/T308 AC2: a stale snapshot never survives a session change or a faile
   await readStatus({ sessionId: null, fetchImpl: async () => ({ ok: true, status: 200, text: JSON.stringify(SHARED_V2) }) });
   assert.equal(currentSnapshot("sess-c"), null);
   resetStatusState();
+});
+
+test("T542: the session id comes from $.session.id(), with the env vars only as fallback", async () => {
+  const fetched: string[] = [];
+  const base = {
+    clock: { now: async () => 5_000_000 },
+    http: { fetch: async (url: string) => { fetched.push(new URL(url).searchParams.get("session") ?? ""); return { ok: true, status: 200, text: JSON.stringify(SHARED_V2) }; } },
+  };
+  resetStatusState();
+  const viaSession = await loadStatus({ ...base, session: { id: async () => "sess-engine" }, env: { get: async () => undefined } });
+  assert.notEqual(viaSession.band, "unbound", "an empty env no longer means unbound");
+  assert.deepEqual(fetched, ["sess-engine"]);
+  resetStatusState();
+  const fallback = await loadStatus({ ...base, session: { id: async () => { throw new Error("no session noun"); } }, env: { get: async (n: string) => (n === "CLAUDE_CODE_SESSION_ID" ? "sess-env" : undefined) } });
+  assert.notEqual(fallback.band, "unbound");
+  assert.equal(fetched.at(-1), "sess-env");
 });

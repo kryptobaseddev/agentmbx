@@ -116,7 +116,7 @@ for (const level of ["collaborate", "autonomous"] as const) test(`${level}: 500-
   }
   const row = n.message(sendLeased(n, { from: "builder", to: ["worker"], subject: "deep work", body: "data", kind: "request", hop: 500 }).envelope.id)!;
   for (let i = 0; i < 500; i++) n.store.audit("peer_action", { thread: row.thread });
-  assert.equal(n.policyFor(row, "worker").level, level); assert.deepEqual(n.policyFor(row, "worker").classes, ["read", "edit"]);
+  assert.equal(n.policyFor(row, "worker").level, level); assert.deepEqual(n.policyFor(row, "worker").classes, ["read", "edit", "outward-reversible"]);
   assert.equal(hasWakeAuthority(n, "worker", row), true); assert.equal(n.depthSuppressed("worker").length, 0);
   const result = await dispatchWakes(n);
   assert.ok(readFileSync(wakeLog, "utf8").includes(row.id)); assert.equal(result[0].result.ok, true); assert.equal(n.unreadCount("worker"), 1);

@@ -106,7 +106,7 @@ test("setup wires every CLI, backs files up, leaves other hook groups alone, and
   // OpenCode: comments survive, mbx sits under mcp.servers
   const oc = rd(home, ".config/opencode/opencode.jsonc");
   for (const c of ["// my MCP servers", "// trailing comment", "/* block comment */"]) assert.ok(oc.includes(c), c);
-  assert.ok(oc.includes(`"mbx": { "type": "local", "command": ["/opt/bin/agentmbx", "mcp"], "timeout": 30000 },`));
+  assert.ok(oc.includes(`"mbx": { "type": "local", "command": ["/opt/bin/agentmbx", "mcp"], "timeout": { "startup": 30000, "catalog": 30000 } },`));
   assert.ok(member(member(member(parseJsonc(oc), "mcp")!.value, "servers")!.value, "mbx"));
 
   // Kimi: mcp.json created, hooks appended after Orca's block
@@ -206,11 +206,10 @@ test("T502: setup writes an explicit MCP startup timeout for codex, opencode and
   assert.match(codex, /\[mcp_servers\.mbx\]\ncommand = "\/opt\/bin\/agentmbx"\nargs = \["mcp"\]\ndefault_tools_approval_mode = "approve"\nstartup_timeout_sec = 30\n/);
   assert.equal(mcpConfiguredTimeout(home, "codex"), 30);
 
-  // opencode: "timeout" in milliseconds — it bounds fetching tools at startup (the measured ~2.2s
-  // connect sits close to the 5000ms default).
+  // opencode: timeout is {startup, catalog} in milliseconds (T541). A number is what 2.0 drops.
   const oc = rd(home, ".config/opencode/opencode.jsonc");
   const mbx = member(member(member(parseJsonc(oc), "mcp")!.value, "servers")!.value, "mbx")!.value;
-  assert.equal((valueOf(oc, mbx) as { timeout: number }).timeout, 30_000);
+  assert.deepEqual((valueOf(oc, mbx) as { timeout: unknown }).timeout, { startup: 30_000, catalog: 30_000 });
   assert.equal(mcpConfiguredTimeout(home, "opencode"), 30);
 
   // hermes: connect_timeout (seconds) — the initial-connection/startup knob.
@@ -252,6 +251,45 @@ test("T502: setup writes an explicit MCP startup timeout for codex, opencode and
   assert.ok(checks.some((c) => c.level === "warn" && c.label === "codex: MCP startup timeout is 5s (< 30s)"), JSON.stringify(checks));
   runSetup(ctxFor(home), { mode: "install", only: ["codex"], stamp: "T502c" });
   assert.equal(mcpConfiguredTimeout(home, "codex"), 30);
+});
+
+// T541: OpenCode 2.0 drops mcp.servers.mbx when timeout is a number. Setup writes {startup, catalog},
+// rewrites a numeric timeout in place, and a second run leaves the file alone. Doctor reads the
+// object (startup seconds) and warns on a number with the setup fix command.
+test("T541: OpenCode timeout is {startup,catalog}; a number is rewritten in place and a re-run is unchanged", async () => {
+  const home = fakeHome();
+  const ctx = ctxFor(home);
+  const other = `"other": { "type": "remote", "url": "https://example.invalid/mcp", "timeout": 5000 }`;
+  const before = `{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      ${other},
+      "mbx": { "type": "local", "command": ["/opt/bin/agentmbx", "mcp"], "enabled": true, "timeout": 30000 }
+    }
+  }
+}
+`;
+  writeFileSync(join(home, ".config/opencode/opencode.jsonc"), before);
+  const mbxHome = join(home, ".local/share/agentmbx");
+  new MbxNode(mbxHome, { host: "alpha", port: 1 }).close();
+  assert.equal(mcpConfiguredTimeout(home, "opencode"), null, "a numeric timeout is not the v2 form");
+  let checks = await doctor(ctx, mbxHome);
+  assert.ok(checks.some((c) => c.level === "ok" && /^opencode: MCP server wired/.test(c.label)), "a numeric timeout is still wired");
+  assert.ok(checks.some((c) => c.level === "warn" && c.label === "opencode: MCP startup timeout is not set" && c.fix === "agentmbx setup --only opencode"), JSON.stringify(checks));
+
+  const rows = runSetup(ctx, { mode: "install", only: ["opencode"], stamp: "T541" });
+  assert.ok(rows.some((r) => r.cli === "opencode" && r.item === "mcp.servers.mbx" && r.action === "updated"), JSON.stringify(rows));
+  const after = rd(home, ".config/opencode/opencode.jsonc");
+  assert.ok(after.includes(other), "the other server, including its own numeric timeout, stays byte-identical");
+  assert.ok(after.includes(`"mbx": { "type": "local", "command": ["/opt/bin/agentmbx", "mcp"], "enabled": true, "timeout": { "startup": 30000, "catalog": 30000 } }`));
+  assert.equal(mcpConfiguredTimeout(home, "opencode"), 30);
+  checks = await doctor(ctx, mbxHome);
+  assert.ok(!checks.some((c) => /^opencode: MCP startup timeout/.test(c.label)), JSON.stringify(checks));
+
+  const again = runSetup(ctx, { mode: "install", only: ["opencode"], stamp: "T541b" });
+  assert.ok(again.some((r) => r.cli === "opencode" && r.item === "mcp.servers.mbx" && r.action === "unchanged"), JSON.stringify(again));
+  assert.equal(rd(home, ".config/opencode/opencode.jsonc"), after);
 });
 
 // T504: the MCP command setup registers is the absolute node binary plus the absolute, symlink-resolved
@@ -921,7 +959,7 @@ test("T533: codex/kimi/opencode MCP and codex/hermes hooks wired by another node
   // kimi mcp.json in the other-node form
   writeFileSync(join(home, ".kimi-code/mcp.json"), JSON.stringify({ mcpServers: { mbx: { command: otherNode, args: [entry, "mcp"] } } }));
   // opencode jsonc in the other-node form
-  writeFileSync(join(home, ".config/opencode/opencode.jsonc"), `{\n  "mcp": { "servers": { "mbx": { "type": "local", "command": [${JSON.stringify(otherNode)}, ${JSON.stringify(entry)}, "mcp"], "timeout": 30000 } } }\n}\n`);
+  writeFileSync(join(home, ".config/opencode/opencode.jsonc"), `{\n  "mcp": { "servers": { "mbx": { "type": "local", "command": [${JSON.stringify(otherNode)}, ${JSON.stringify(entry)}, "mcp"], "timeout": { "startup": 30000, "catalog": 30000 } } } }\n}\n`);
 
   const ctx = ctxFor(home, ["/nonexistent/other-node", "/opt/app/bin/agentmbx.js"]);
   const snapshot = { codex: rd(home, ".codex/config.toml"), hooks: rd(home, ".codex/hooks.json"), kimi: rd(home, ".kimi-code/mcp.json"), oc: rd(home, ".config/opencode/opencode.jsonc") };

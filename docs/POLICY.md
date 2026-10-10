@@ -1,6 +1,6 @@
 # Collaboration policy, YOLO mode, and owner identity
 
-Status: design for v0.3, built under CLEO epic T040 (tasks T048, T051–T054). This design merges:
+Status: implemented under CLEO epic T040 (tasks T048, T051–T054), with uncapped acting grants and optional permanent expiry (T537) and the signed outward class split (T498). The original design merged:
 - Keaton's request: agents should collaborate across sessions and machines without per-message approval, including an opt-in "true YOLO" mode;
 - the reviews from master-dev-setup and codex (2026-09-26): use action classes, default to `ask`, require human presence that an agent can't fake, record provenance, and add a kill switch.
 
@@ -20,7 +20,8 @@ Status: design for v0.3, built under CLEO epic T040 (tasks T048, T051–T054). T
 |---|---|
 | `read` | inspect files, run read-only and verification commands (tests, builds, git status/log/diff), answer with results |
 | `edit` | reversible writes inside the policy's project roots: edit files, create branches, make local commits, write temp files |
-| `outward` | anything that leaves the machine or is hard to undo: push, open or merge PRs, deploy, call external services, delete, spend money, touch secrets |
+| `outward-reversible` | push a non-default branch or open a draft PR within the granting policy's project scope |
+| `outward` | full outward authority: the two actions above plus default-branch pushes, opening non-draft PRs, merge, release, deploy, delete, touch secrets, spend money, and other external service calls |
 | `permissions` | approve the receiving CLI's own permission prompts and raise its permission mode. **Only the `yolo` level grants this.** |
 
 Replying, reading and acking mail need no class. They're always allowed, even under `ask`.
@@ -30,11 +31,13 @@ Replying, reading and acking mail need no class. They're always allowed, even un
 | Level | Classes | Check-ins | Typical use |
 |---|---|---|---|
 | `ask` (default) | none | human approves each peer-requested action | untrusted or unknown peers |
-| `collaborate` | read, edit | report at milestones; stop and ask before anything `outward` | agents on one project on this machine |
-| `autonomous` | read, edit | none until done; `outward` goes to the owner as a `decision` and dependent work pauses | long unattended runs |
-| `yolo` | read, edit, outward, permissions | none | "get out of the way": the owner accepts all the risk |
+| `collaborate` | read, edit, outward-reversible | report at milestones; stop and ask before actions requiring full `outward` | agents on one project on this machine |
+| `autonomous` | read, edit, outward-reversible | none until done; full `outward` goes to the owner as a `decision` and dependent work pauses | long unattended runs |
+| `yolo` | read, edit, outward-reversible, outward, permissions | none | "get out of the way": the owner accepts all the risk |
 
-An owner can also set classes directly: `--classes read,edit,outward`.
+These presets apply when signing a new policy. Existing signed policies keep their exact class lists, scopes and expiry; a previously signed `read,edit` policy does not gain `outward-reversible`. Full `outward` remains broader authority and covers branch pushes and draft PRs even when that older signed record does not name the new class. Clients must upgrade to understand policies containing the new class; older clients reject unknown classes.
+
+An owner can also set classes directly: `--classes read,edit,outward-reversible`. Other branch pushes, non-draft PRs, merge, release, deploy, delete, secrets and spend still need full `outward`. The new class grants signed delegation only; it does not approve the CLI's permission prompts. Provider-hook approval for these two operations is tracked separately in T539.
 
 ## 3. The policy record
 
@@ -42,7 +45,7 @@ Owner-signed canonical JSON, verified by every receiving daemon:
 
 ```json
 { "v": 1, "type": "policy", "id": "<ulid>",
-  "level": "collaborate", "classes": ["read", "edit"],
+  "level": "collaborate", "classes": ["read", "edit", "outward-reversible"],
   "to":   { "agents": ["api-dev", "*"], "hosts": ["macbook"] },
   "from": { "hosts": ["local", "desktop"], "agents": ["*"] },
   "projects": ["/Users/k/projects/agentmbx"],
@@ -52,10 +55,11 @@ It is stored with `owner_sig`.
 
 - `to`: who receives this policy. Agents are named on the receiving host. Hosts are receiving host names.
 - `from`: which senders it covers. `local` means this host. A remote host must be named explicitly unless the owner passes `--from '*'`.
-- `projects`: optional canonical absolute roots (realpath). `edit` only applies inside them. When `projects` is omitted, the receiving session's own working directory applies.
-- Expiry is required:
-  - `ask`, `collaborate` and `autonomous` default to 7 days, 30 days at most.
-  - `yolo` defaults to 8 hours, 7 days at most.
+- `projects`: optional canonical absolute roots (realpath). Both `edit` and `outward-reversible` only apply inside them. When `projects` is omitted, the receiving session's own working directory applies.
+- An explicit expiry field is required:
+  - Finite `ask`, `collaborate` and `autonomous` policies default to 7 days, 30 days at most.
+  - Finite `yolo` policies default to 8 hours, 7 days at most.
+  - `--ttl never` signs `exp: null`, valid until revoked, for any level. It never means an omitted, empty or malformed expiry.
   - An expired or unverifiable policy fails closed to `ask`.
 - **Resolution.** For a message from `S@H` to agent `A` on this host, take every unrevoked, unexpired policy that matches `A` and `S@H`. Each policy's classes apply only within that policy's own projects, so scopes never mix across policies. The header lists each grant separately.
 - **Owner on other machines.** A machine takes policies only from its own owner key, or from the owner key that signed a *device record* for it. You create that record on your owner machine with `agentmbx owner add-device <host>`, which needs one Touch ID / passphrase approval.
@@ -69,10 +73,12 @@ It is stored with `owner_sig`.
 
 | Condition | Effect |
 |---|---|
-| `meta.origin = "external"`: the sender marked the content as coming from a web page, an issue, a PR comment or an email, or its session read such content in the last hour | only `read` applies, and the header says so (declared by the sender, or inherited from a root exposure, and when that clears) |
-| the thread already had 20 requests or tasks acted on under policy, or the message's `meta.hop` is over 6 | `ask`; the owner gets an `alert` |
+| `meta.origin = "external"`: the sender marked the content as coming from a web page, an issue, a PR comment or an email, or its session read such content in the last hour | only `read` applies: `outward-reversible`, `edit`, `outward` and `permissions` are removed. A session tainted by external content cannot use `outward-reversible`; the header states the root exposure and when it clears |
+| relay depth under an acting grant (`collaborate`, `autonomous`, `yolo`) | no limit; no per-thread action-count stop. `ask` retains depth bookkeeping up to 6 |
 | the message body contains text that looks like a `policy:` or `authority:` line | the header warns that the body claims a policy and the claim is ignored |
 | the sender's host was unpaired or its policy revoked | fails closed immediately |
+
+Rapid automated loops are reported separately, without removing acting grants or suppressing ordinary delivery: the default detector reports more than 50 request/task messages in 10 minutes across at least two directions. Owner loop settings can change that observational threshold. Wake batching, mute and backoff still apply, but there are no per-hour or daily wake-count caps.
 
 `meta.origin` and `meta.hop` are signed envelope fields:
 - `mbx_send` gets `origin` (`agent` by default, or `external`).
@@ -104,9 +110,9 @@ Agents are told why at each step:
 The daemon, not the sender, writes one extra header line on every delivered message:
 
 ```
-policy: collaborate [read, edit] · owner-signed 01J… · expires 2026-10-03 · projects: ~/projects/agentmbx
+policy: collaborate [read, edit, outward-reversible] · owner-signed 01J… · expires 2026-10-03 · projects: ~/projects/agentmbx
 policy: ask (no owner policy covers this sender)
-policy: yolo [read, edit, outward, permissions] · owner-signed · expires 20:00
+policy: yolo [read, edit, outward-reversible, outward, permissions] · owner-signed · expires 20:00
 ```
 
 The MCP instructions and the skill tell agents three things:
@@ -129,6 +135,8 @@ The mail rules alone can't make a CLI skip its permission prompts. YOLO adds a p
 | Codex | the same `PermissionRequest` hook (verified in 0.157.1) |
 | Kimi | terminal sessions: **unsupported** (its PermissionRequest hook is observation-only); `kimi web`-hosted sessions: approvals API |
 | OpenCode | the daemon answers permission requests through the service API |
+
+`outward-reversible` does not include `permissions`: a collaborate or autonomous policy authorizes the delegated branch push or draft PR while the CLI's normal permission prompt still applies. T539 owns operation-specific provider-hook approval; this class split does not enable it.
 
 Rules for the `permissions` class:
 - A permission prompt isn't tied to one sender, so only a policy that covers every local sender (`from` = any agent on this machine) grants it.
