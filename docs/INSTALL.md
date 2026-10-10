@@ -140,7 +140,7 @@ Setup also writes an explicit MCP startup timeout (at least 30 s) in every harne
 | CLI | Field | Value written |
 |---|---|---|
 | Codex | `startup_timeout_sec` (seconds) | `30` |
-| OpenCode | `"timeout"` (milliseconds) | `30000` |
+| OpenCode | `"timeout"` as `{ "startup", "catalog" }` (milliseconds) | `30000` each |
 | Hermes | `connect_timeout` (seconds) | `60` |
 | Grok | `startup_timeout_sec` (seconds) | `30` |
 | Claude, Kimi | none in their MCP config shape — nothing written | — |
@@ -182,8 +182,9 @@ In `~/.codex/hooks.json`, a SessionStart group running `agentmbx hook session-st
 ### OpenCode
 In `~/.config/opencode/opencode.jsonc` (or `opencode.json`), under `mcp.servers`. Setup inserts this one line and keeps your comments and formatting:
 ```jsonc
-"mbx": { "type": "local", "command": ["agentmbx", "mcp"], "timeout": 30000 }
+"mbx": { "type": "local", "command": ["<node>", "<agentmbx script>", "mcp"], "timeout": { "startup": 30000, "catalog": 30000 } }
 ```
+- OpenCode 2.0 rejects a plain numeric `timeout` and skips the whole `mbx` entry, so its MCP tools disappear. Setup therefore writes the object form above and rewrites a number an older setup wrote in place (T541); `agentmbx doctor` warns, with `agentmbx setup --only opencode`, while the field is still a number. `command` is the absolute node binary plus the absolute `agentmbx` script, as for every CLI (see above).
 - If `opencode service` is running, setup restarts it so it picks up the server.
 - OpenCode 2.x runs sessions two ways: a shared `opencode serve --service` process, or a private `opencode serve --stdio` that every `opencode --standalone` TUI spawns (both share one `opencode.db`). Hook notes go into the session in-process in both modes. A wake reaches a service-hosted session through `POST /api/session/{id}/synthetic` on the shared service, and a standalone session through the plugin inside its own serve, which long-polls the daemon's loopback queue (`/v1/opencode-wake`) and admits the text in-process; AgentMBX never posts to the shared service for a standalone session. Whether a standalone wake starts a turn on an idle session is unproven (T544). See [OPENCODE.md](OPENCODE.md) for what to expect from each mode.
 - If OpenCode asks before each mbx tool call, allow `mbx_*` in its permission settings. See the e2e notes in `docs/TESTING.md`.
