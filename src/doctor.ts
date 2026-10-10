@@ -24,6 +24,7 @@ import { deadHolderLeases, inspectLeaseProcess, type IdentityLease } from "./ide
 import { providerLabel, sameLiveProvider } from "./identity-takeover.ts";
 import { conversationLoopLabel, detectConversationLoops } from "./loop-detector.ts";
 import { opencodeDuplicateLoopChecks } from "./opencode-duplicate-loop.ts";
+import { mcpOrphanCheck } from "./mcp-lifecycle.ts";
 
 export type Level = "ok" | "fail" | "warn" | "info";
 export interface Check { level: Level; label: string; fix?: string }
@@ -522,6 +523,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
   const out: Check[] = [];
   const add = (level: Level, label: string, fix?: string) => out.push({ level, label, fix });
   add("info", `agentmbx ${VERSION} (node ${process.versions.node})`);
+  out.push(mcpOrphanCheck(mbxHome));
   if (Number(process.versions.node.split(".")[0]) < 24) add("fail", `Node ${process.versions.node} is too old`, "install Node 24 or later");
 
   // T314: stay out of the grok block. OpenCode's own doctor function must not collide with this.
