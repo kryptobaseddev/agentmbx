@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { _resetEvidenceCacheForTests, inspectLeaseProcess, type ProcessEvidence } from "../src/identity-leases.ts";
 import { mcpOrphanCensus, mcpOrphanCheck } from "../src/mcp-lifecycle.ts";
 import { procSeams, procTable, recordedStartMatches } from "../src/proc.ts";
+import { doctor } from "../src/doctor.ts";
 
 const moduleUrl = pathToFileURL(fileURLToPath(new URL("../src/mcp-lifecycle.ts", import.meta.url))).href;
 const fixture = `import { startMcpLifecycle, recordMcpGeneration } from ${JSON.stringify(moduleUrl)};
@@ -254,4 +255,12 @@ test("empty or malformed inventory is unavailable; malformed lifecycle records s
   procSeams.ps = () => "900001 1024 agentmbx mcp\n";
   assert.equal(mcpOrphanCensus(w.home, inspect).unknown, 1);
   assert.equal(mcpOrphanCensus(w.home, inspect).orphans, 0);
+});
+
+test("doctor includes the read-only orphan census without a configured harness or initialized host", async t => {
+  const w = censusWorld(t), body = w.record(900001, 990000);
+  procSeams.ps = () => { throw new Error("inventory unavailable"); };
+  const checks = await doctor({ home: w.home, cmd: ["agentmbx"], which: () => null, useClis: false }, w.home);
+  assert.equal(checks.filter(c => /MCP orphan census unavailable/.test(c.label)).length, 1);
+  assert.equal(readFileSync(join(w.home, "mcp-lifecycle", "900001.json"), "utf8"), body);
 });
