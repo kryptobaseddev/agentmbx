@@ -133,16 +133,21 @@ test("random bodies to every HTTP endpoint never crash the server or produce a 5
       const body = method === "GET" && r() < 0.7 ? "" : raw.toString("utf8");
       const headers = r() < 0.8 ? signHop(A.n, method, path, body) : { "content-type": pick(r, ["application/json", "text/plain"]) };
       if (r() < 0.1) headers["x-mbx-ts"] = str(r).replace(/[^\x20-\x7e]/g, "");
-      // A socket the server closes while a pooled request is still writing surfaces as EPIPE/ECONNRESET on the client.
-      // That is not a server failure, provided the server answers straight away; count such races and keep them rare.
+      // A socket the server closes while a pooled request is still writing surfaces as EPIPE/ECONNRESET on the client,
+      // and the same race surfaces on the RESPONSE body read as undici's TypeError: terminated once headers arrived.
+      // Neither is a server failure, provided the server answers straight away; count such races and keep them rare.
+      const race = (e: unknown) => /EPIPE|ECONNRESET|UND_ERR_SOCKET|terminated/.test(String((e as { cause?: { code?: string } })?.cause?.code ?? (e as { cause?: unknown })?.cause ?? e));
+      const alive = async () => assert.equal((await fetch(`${base}/v1/status`)).status, 200, `server answers after a dropped socket (case ${i})`);
       const res = await fetch(`${base}${path}${r() < 0.2 ? "?after=" + encodeURIComponent(str(r).toWellFormed()) + "&limit=" + str(r).replace(/[^\x20-\x7e]/g, "") : ""}`,
-        { method, headers, ...(method === "GET" ? {} : { body }) }).catch(async (e: Error & { cause?: { code?: string } }) => {
-        if (!/EPIPE|ECONNRESET|UND_ERR_SOCKET/.test(String(e.cause?.code ?? e.cause ?? e))) throw e;
-        assert.equal((await fetch(`${base}/v1/status`)).status, 200, `server answers after a dropped socket (case ${i})`);
+        { method, headers, ...(method === "GET" ? {} : { body }) }).catch(async (e: unknown) => {
+        if (!race(e)) throw e;
+        await alive();
         races++; return null;
       });
       if (!res) continue;
-      await res.arrayBuffer();
+      // T528: the server may answer (and close) while the client is still writing the request body —
+      // the response body read then dies with "terminated". That is the same client-side race, not a crash.
+      try { await res.arrayBuffer(); } catch (e) { if (!race(e)) throw e; await alive(); races++; continue; }
       statuses[res.status] = (statuses[res.status] ?? 0) + 1;
       assert.ok(res.status < 500, `${method} ${path} case ${i} gave ${res.status}`);
     }
