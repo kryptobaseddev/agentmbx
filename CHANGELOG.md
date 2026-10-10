@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.21 (2026-10-09)
+
+Stale identity leases of dead MCP processes are swept by the daemon, and the release build is reliable again: the startup timing test keeps its strict local bound with a CI-safe bound on slow shared runners (v0.5.20's GitHub release build failed on the Intel macOS target for that reason; v0.5.20 itself was installable from its tag).
+
 ## 0.5.20 (2026-10-09)
 
 OpenCode stops running duplicate agent loops and MCP connections get sturdier: AgentMBX pushes notes and wakes through the shared OpenCode service only for sessions that service hosts (standalone sessions get mail on their next prompt), the MCP answers initialize before any store or identity work so a busy database can no longer kill it at startup, setup writes explicit startup timeouts and an absolute node + script command instead of the mise shim, and the OpenCode standalone model is documented.
