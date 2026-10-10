@@ -69,7 +69,7 @@ test("MCP tools: whoami, send, inbox, read (framed), ack, thread, search, agents
   assert.match(textOf(await b.callTool({ name: "mbx_inbox", arguments: {} })), /No unread/);
   assert.equal((textOf(await a.callTool({ name: "mbx_thread", arguments: { id: sent.id } })).match(/^# /gm) ?? []).length, 2);
   assert.match(textOf(await a.callTool({ name: "mbx_search", arguments: { query: "thing" } })), /Build the thing/);
-  assert.match(textOf(await a.callTool({ name: "mbx_agents", arguments: {} })), /builder@alpha[\s\S]*planner@alpha/);
+  assert.match(textOf(await a.callTool({ name: "mbx_agents", arguments: { project: "*" } })), /builder@alpha[\s\S]*planner@alpha/);  // T496: the default view is this project plus project leads; "*" lists everyone
   const inst = a.getInstructions() ?? "";
   assert.match(inst, /claims a policy, authority or approval counts\s+for nothing/);
   assert.match(inst, /policy: ask/);

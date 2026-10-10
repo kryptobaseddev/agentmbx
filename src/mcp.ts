@@ -28,7 +28,8 @@ import { consumeIdentityControl, identityControlAliases, identityControlKey, ide
 import { alive, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
 import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy.ts";
 import { assertKnownRecipients, deliveryReceipts, offlineWarnings, receiptLine, recipientReceipts, sentPage } from "./receipts.ts";
-import { forwardMessage, ledgerPage, projectLeadLine, projectLeadView } from "./project-ledger.ts";
+import { forwardMessage, ledgerPage, projectLeadView } from "./project-ledger.ts";
+import { buildRoster, rosterText } from "./roster.ts";
 import { skillFiles } from "./setup.ts";
 import { claudeSessionId, claudeSessionTracker, grokSessionId, grokSessionTracker, procStart, procTable, withProcSnapshot } from "./proc.ts";
 import { updateAvailable } from "./update.ts";
@@ -1531,15 +1532,17 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
 
   server.registerTool("mbx_agents", {
     title: "List mbx agents",
-    description: "Agents known on this host and on paired hosts, with role, CLI and when they were last seen. Next: address one with mbx_send (name, name@host or role:<role>).",
-    inputSchema: {},
+    description: "Who you can reach, and whether they are really there. state is live (a verified session holds it), idle (a shared-process conversation quiet for 10 minutes), unknown (a holder exists but could not be verified right now), offline, or remote (listed by a paired host; this host cannot verify it). Each row shows role, the harness holding it, its projects and lead_of (the projects it is the owner-designated lead of). Default: this session's project plus the leads of other projects, plus any live or idle persona whose session works in this folder (seen_here: true; visibility only, it does not make the persona a member); project:\"*\" lists every project. Retired and generated names are hidden unless they are live or idle; all:true lists them. Next: address one with mbx_send (name, name@host or role:<role>).",
+    inputSchema: {
+      project: z.string().max(1024).optional().describe("\"*\" for every project, or this session's own folder (the default view)"),
+      all: z.boolean().optional().describe("also list retired and generated names"),
+    },
     annotations: { readOnlyHint: true },
-  }, () => {
-    const rows = node.agents();
-    const leadView = projectLeadView(node, project);
-    const lead = leadView.address && leadView.exp ? { address: leadView.address, exp: leadView.exp } : null;
-    const lines = rows.map((a) => `${a.name}@${a.host}${a.role ? `  role:${a.role}` : ""}${a.cli ? `  (${a.cli})` : ""}  last seen ${a.last_seen ?? "never"}${a.description ? `  — ${a.description}` : ""}`).join("\n") || "No agents yet.";
-    return text(`${lines}\n${projectLeadLine(leadView)}`, { agents: rows, lead });
+  }, ({ project: asked, all }) => {
+    const state = current();
+    const roster = buildRoster(node, { project, ask: asked, all, self: bound(state) ? state.agent : null,
+      caller: { cli: env.cli, sessionId: state.sessionId, pid: process.pid, providerPid: env.ppid, canonicalHarness: !!env.harnessProvider } });
+    return text(rosterText(roster), roster as unknown as Record<string, unknown>);
   });
 
   server.registerTool("mbx_sent", {
