@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Paired hosts publish a signed agent directory (T546).** `GET /v1/agents` adds `state` (`live`, `idle`, `unknown`, or `offline`), `harness` (the holder cli when live or idle, otherwise null), and `project_keys` (normalized git origins, not folder paths). The body is signed with the host key, the same way `/v1/enc-key` is. `refreshDirectory` stores those columns only when the signature matches the pinned peer key. An older unsigned directory still updates the five original fields and clears any previously verified columns. A bad signature is audited and not applied. A name that leaves a signed directory keeps its row and loses the verified columns. The schema version stays 3.
+
 ## 0.5.25 (2026-10-10)
 
 A standalone OpenCode session that is woken now actually starts a turn, doctor classifies OpenCode bindings and flags duplicate agent loops, and Hermes reports its status surfaces honestly. Signed grants auto-approve reversible outward work (a non-default branch push or a draft PR) on harnesses with an approval channel, a session whose mbx MCP died is told to reconnect, and project membership is explicit only. Docs: the identity selector reference, the project-mailbox ADR and the OpenCode wake paths.
