@@ -162,3 +162,29 @@ test("/v1/status POST is still 405", async () => {
     assert.equal(res.status, 405);
   } finally { s.close(); n.store.db.close?.(); }
 });
+
+test("T410: opt-in inbox summaries are bounded, session-scoped, body-free and read-only", async () => {
+  const n = newNode();
+  bindSession(n, "opencode", "ses_sidebar", "mine");
+  bindSession(n, "opencode", "ses_other", "other");
+  for (let i = 0; i < 5; i++) n.send({ from: "peer", to: ["mine"], subject: `own-${i}`, body: "NEVER EXPOSE BODY", needs_reply: i === 4 });
+  n.send({ from: "peer", to: ["other"], subject: "NOT YOUR SUBJECT", body: "OTHER PRIVATE" });
+  const s = await startServer(n, 0, "127.0.0.1");
+  try {
+    const { port } = s.address() as AddressInfo;
+    const url = (sid: string) => `http://127.0.0.1:${port}/v1/status?cli=opencode&session=${sid}&schema=mbx.status%2Fv2`;
+    const normal = await (await fetch(url("ses_sidebar"))).json() as { inbox: Record<string, unknown> };
+    assert.equal(normal.inbox.recent, undefined, "existing v2 clients keep the same shape");
+    const response = await fetch(url("ses_sidebar") + "&include=inbox");
+    const detailed = await response.json() as { inbox: { unread: number; recent: { subject: string; sender: string; kind: string; ts: string; needs_reply: boolean }[] } };
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    assert.equal(detailed.inbox.recent.length, 3);
+    assert.ok(detailed.inbox.recent.every(m => m.subject.startsWith("own-") && m.sender.startsWith("peer@") && m.kind && m.ts));
+    assert.ok(detailed.inbox.recent.some(m => m.needs_reply));
+    assert.doesNotMatch(JSON.stringify(detailed), /NEVER EXPOSE BODY|NOT YOUR SUBJECT|OTHER PRIVATE/);
+    assert.equal(detailed.inbox.unread, 5, "rendering never marks mail read or acknowledged");
+    const unknown = await (await fetch(url("ses_missing") + "&include=inbox")).json() as { inbox: { unread: number; recent: unknown[] } };
+    assert.equal(unknown.inbox.unread, 0);
+    assert.deepEqual(unknown.inbox.recent, []);
+  } finally { s.close(); n.close(); }
+});

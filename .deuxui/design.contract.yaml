@@ -1,0 +1,19 @@
+surface: OpenCode native terminal sidebar
+mode: preserve
+identity: Native monospace text, inherited OpenCode theme, flat grouped sections; no replacement of surrounding sidebar or session UI.
+layout:
+  width: host-owned
+  sections: [identity, registration, inbox, recent-mail, harness, cloud, devices, project]
+  recent_mail_limit: 3
+  default: collapsed
+  disclosure: mouse or command palette
+  full_details: native session panel via group click or /mbx
+states: [loading, bound, unbound, ambiguous, disconnected]
+privacy:
+  exact_session_only: true
+  clear_on_session_switch: true
+  no_mailbox_data_when_unbound_or_ambiguous: true
+motion: none
+colors: inherited semantic OpenCode theme tokens
+typography: inherited terminal monospace
+runtime_verification: real OpenCode screenshot required; HTML preview is not native verification
