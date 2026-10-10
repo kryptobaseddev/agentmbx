@@ -1271,10 +1271,13 @@ const nativeMsgId = (result: unknown): string | null => {
   const id = typeof r.id === "string" ? r.id : r.data && typeof r.data.id === "string" ? r.data.id : "";
   return id.startsWith("msg_") ? id : null;
 };
-/** A queued wake is a different admission from a hook note. The host's id is what we report back. */
+/** T544: hook notes stay resume:false (T518). A daemon wake is the same in-process call with
+ *  resume:true. Live on an idle standalone TUI, resume:false returned a msg_ receipt and wrote
+ *  no session_message, so the turn never started; resume:true wrote one synthetic row, one
+ *  assistant row, and then idle. This still does not POST to the shared service (T524). */
 const admitWake = async (ctx: NoteCtx, sid: string, text: string): Promise<string | null> => {
   if (!sid || !text) return null;
-  const body = { sessionID: sid, id: noteId(sid, "wake", text), text, resume: false, delivery: "queue" };
+  const body = { sessionID: sid, id: noteId(sid, "wake", text), text, resume: true, delivery: "queue" };
   const session = ctx?.session;
   try {
     if (typeof session?.synthetic === "function") return nativeMsgId(await session.synthetic(body));

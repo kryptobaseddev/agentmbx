@@ -131,8 +131,10 @@ test("wakeOpencode: the plugin in the matching serve admits, and the receipt is 
     assert.equal(admitted.outcome?.kind === "admitted" && admitted.outcome.receipt.nativeId, "msg_fromhost");
     const wake = notes.find((n) => n.text === "[mbx] from daemon");
     assert.ok(wake, "the wake was admitted in-process");
-    assert.equal(wake?.resume, false);
+    assert.equal(wake?.resume, true, "T544: resume:true is what starts the idle turn");
     assert.equal(wake?.delivery, "queue");
+    const hookNotes = notes.filter((n) => n.text !== "[mbx] from daemon" && n.text !== "[mbx] direct");
+    assert.ok(hookNotes.length >= 1 && hookNotes.every((n) => n.resume === false), "hook notes stay resume:false");
     assert.notEqual(wake?.id, "msg_fromhost", "the receipt is the id the host returned");
 
     await event({ event: { type: "session.idle", properties: { info: { id: "ses_direct" } } } });
