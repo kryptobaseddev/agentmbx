@@ -1,5 +1,6 @@
-// Host-to-host HTTP: pairing, envelope exchange, agent directory. Every request except /v1/pair* and read-only /v1/status carries a
-// signed hop (X-Mbx-Host / -Ts / -Sig over method, path, ts, sha256(body)); freshness is checked on the hop only.
+// Host-to-host HTTP: pairing, envelope exchange, agent directory. Every request except /v1/pair*, read-only
+// /v1/status and the loopback /v1/opencode-wake queue carries a signed hop (X-Mbx-Host / -Ts / -Sig over
+// method, path, ts, sha256(body)); freshness is checked on the hop only.
 import { createServer } from "node:http";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
@@ -11,6 +12,7 @@ import { resolveStatusIdentity } from "./status-identity.js";
 import { hudStatus, hudStatusV2 } from "./hud.js";
 import { STATUS_V2_SCHEMA } from "./status-schema.js";
 import { notifyDesktop } from "./wake.js";
+import { cancelOpencodeWake, completeOpencodeWake, waitForOpencodeWake } from "./opencode-wake-queue.js";
 import { version } from "./version.js";
 import { rotationLog, saveRotationLog } from "./key-rotation.js";
 import { storedPolicies, acceptSigned, policyUnexpired } from "./policy.js";
@@ -410,6 +412,44 @@ export function startServer(node, port = node.config.port, bind = node.config.bi
                 if (!isStr(challenge, 64))
                     return send(400, { error: "bad challenge" });
                 return send(200, signedStatus(node, challenge)); // proves this host's key and its own addresses (T151)
+            }
+            // T519: the plugin inside a standalone OpenCode serve long-polls this, then admits the text
+            // in-process. It sits before verifyHop because that plugin has no hop key. Loopback only:
+            // the body is a wake pointer for a session on this machine. A 20s hold fits requestTimeoutMs.
+            if (url.pathname === "/v1/opencode-wake") {
+                if (!isLoopbackRemote(req.socket.remoteAddress ?? ""))
+                    return send(403, { error: "opencode wake queue is loopback only" });
+                if (req.method === "GET") {
+                    const sessionID = url.searchParams.get("session") ?? "";
+                    const pidRaw = url.searchParams.get("pid") ?? "";
+                    if (!sessionID || sessionID.length > 256 || !/^[1-9]\d{0,9}$/.test(pidRaw))
+                        return send(400, { error: "bad session or pid" });
+                    const pid = Number(pidRaw);
+                    let gone = false;
+                    const onClose = () => { if (!res.writableEnded) {
+                        gone = true;
+                        cancelOpencodeWake(sessionID, pid);
+                    } };
+                    req.on("close", onClose);
+                    const text = await waitForOpencodeWake(sessionID, pid);
+                    req.off("close", onClose);
+                    if (gone || res.writableEnded)
+                        return;
+                    if (!text) {
+                        res.writeHead(204);
+                        return res.end();
+                    }
+                    return send(200, { text });
+                }
+                if (req.method === "POST") {
+                    const j = JSON.parse(body || "{}");
+                    if (typeof j.sessionID !== "string" || typeof j.id !== "string" || !j.sessionID || j.sessionID.length > 256)
+                        return send(400, { error: "bad receipt" });
+                    if (!completeOpencodeWake(j.sessionID, j.id))
+                        return send(409, { error: "no wake is waiting for that receipt" });
+                    return send(200, { ok: true });
+                }
+                return send(405, { error: "method not allowed" });
             }
             if (url.pathname === "/v1/pair/hello" || url.pathname === "/v1/pair/join") {
                 tokenAttempts = tokenAttempts.filter((t) => Date.now() - t < 60_000);
