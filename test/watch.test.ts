@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { MbxNode, WAKE_LIMITS } from "../src/node.ts";
+import { MbxNode } from "../src/node.ts";
 import { IdentityLeases } from "../src/identity-leases.ts";
 import { dispatchWakes, liveWatcher } from "../src/wake.ts";
 import { selfWatchInstruction, WATCHER_INSTRUCTION } from "../src/mcp.ts";
@@ -182,7 +182,7 @@ test("T435: three Kimi Stops with the watcher down produce exactly one exit 2", 
   assert.equal(live.stdout, "");
 });
 
-test("T435: a Kimi Stop nag stays inside the daily continue cap", async (t) => {
+test("T537: a Kimi Stop nag re-arms a down watcher even after 60 wakes today", async (t) => {
   const { spawnSync } = await import("node:child_process");
   const home = mkdtempSync(join(tmpdir(), "mbx-watch-kimi-cap-"));
   const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "watch-kimi-cap", version: "1" });
@@ -193,12 +193,13 @@ test("T435: a Kimi Stop nag stays inside the daily continue cap", async (t) => {
     { input: JSON.stringify({ session_id: "kimi-term-1", cwd: process.cwd(), prompt: "hi" }), encoding: "utf8", env });
   assert.equal(prompt.status, 0, prompt.stderr);
   const insert = n.store.db.prepare("INSERT INTO wakes (agent,thread,at) VALUES (?,?,?)");
-  for (let i = 0; i < WAKE_LIMITS.perAgentDay; i++) insert.run("worker", null, new Date().toISOString());
-  const capped = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", "stop", "--cli", "kimi"],
+  for (let i = 0; i < 60; i++) insert.run("worker", null, new Date().toISOString());
+  const continued = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", "stop", "--cli", "kimi"],
     { input: JSON.stringify({ session_id: "kimi-term-1", cwd: process.cwd() }), encoding: "utf8", env });
-  assert.equal(capped.status, 0, capped.stderr);
-  assert.equal(capped.stderr, "");
-  assert.equal(n.store.get("stopnag:kimi:kimi-term-1") ?? null, null, "a refused nag does not start the 10 minute window");
+  assert.equal(continued.status, 2, continued.stderr);
+  assert.match(continued.stderr, /agentmbx watch/);
+  assert.ok(n.store.get("stopnag:kimi:kimi-term-1"), "the admitted nag starts the existing 10 minute window");
+  assert.equal((n.store.db.prepare("SELECT count(*) n FROM wakes WHERE agent='worker'").get() as { n: number }).n, 61);
 });
 
 test("agentmbx watch outside any session lease stops with a reason", async (t) => {
