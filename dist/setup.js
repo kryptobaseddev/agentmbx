@@ -36,6 +36,110 @@ const __filename_or_url = () => (typeof __filename !== "undefined" ? __filename 
 const shq = (s) => /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
 export const shJoin = (argv) => argv.map(shq).join(" ");
 export const hookCommand = (cmd, event, cli) => `${shJoin(cmd)} hook ${event} --cli ${cli}`;
+// ---- T526/T532/T533: recognize our own entries by meaning, not by exact bytes ----------------
+/** Split a shell command's leading binary part into tokens, resolving '…' and "…" quoting.
+ *  Null when quoting is unbalanced — not parseable confidently, so never "ours". */
+export function shellTokens(s) {
+    const out = [];
+    let cur = "", quote = null;
+    const push = () => { if (cur) {
+        out.push(cur);
+        cur = "";
+    } };
+    for (let i = 0; i < s.length; i++) {
+        const c = s[i];
+        if (quote === "'") {
+            if (c === "'") {
+                if (s[i + 1] === "'") {
+                    cur += "'";
+                    i++;
+                }
+                else
+                    quote = null;
+            }
+            else
+                cur += c;
+            continue;
+        }
+        if (quote === '"') {
+            if (c === '"')
+                quote = null;
+            else
+                cur += c;
+            continue;
+        }
+        if (c === "'" || c === '"') {
+            quote = c;
+            continue;
+        }
+        if (/\s/.test(c)) {
+            push();
+            continue;
+        }
+        cur += c;
+    }
+    if (quote)
+        return null;
+    push();
+    return out;
+}
+/** T533: this install's entry script (realpath), or null when there is none on disk (the SEA
+ *  single binary has no script; the [node, script] form can never be "current" there). */
+export function installedEntry() {
+    try {
+        return realpathSync(fileURLToPath(new URL("../bin/agentmbx.js", import.meta.url)));
+    }
+    catch {
+        return null;
+    }
+}
+/** T533: an [anyNode, script] MCP/hook pair wired by ANOTHER shell's node still names this install
+ *  when the script realpaths to the installed entry. Whether it stays "current" additionally
+ *  depends on the node existing (see callers); the script alone decides what it names. */
+export function namesInstalledEntry(script) {
+    const entry = installedEntry();
+    if (!entry)
+        return false;
+    try {
+        return realpathSync(script) === entry;
+    }
+    catch {
+        return false;
+    }
+}
+/** T526/T532/T533: does `bin` run agentmbx? One token ending in agentmbx (bare, mise/asdf shim,
+ *  SEA binary); or two tokens — a node-like runtime plus the agentmbx entry script (T504's
+ *  node + script form), in any path spelling. A command composed with anything else is someone
+ *  else's and is left alone. */
+export function runsAgentmbx(bin) {
+    const t = shellTokens(bin);
+    if (!t)
+        return false;
+    if (t.length === 1)
+        return /(^|\/)agentmbx(\.exe)?$/.test(t[0]);
+    return t.length === 2 && /(^|\/)(node|nodejs|bun|deno)[\w.]*(\.exe)?$/.test(t[0]) && /(^|\/)agentmbx\.js$/.test(t[1]);
+}
+/** T533: a configured [node, script, "mcp"] entry wired by ANOTHER shell's node names this install
+ *  (script realpaths to the installed entry) and its node binary still exists — wired-and-current
+ *  from any node, so neither doctor nor setup rewrites it. A missing node or a script that
+ *  resolves elsewhere stays "ours but stale" and is rewritten in place by the writers. */
+export function mcpNodeScriptCurrent(entry) {
+    if (typeof entry.command !== "string" || !Array.isArray(entry.args))
+        return false;
+    const [script, ...rest] = entry.args;
+    return rest.length === 1 && rest[0] === "mcp" && typeof script === "string" && existsSync(entry.command) && namesInstalledEntry(script);
+}
+/** T533: the hooks twin of mcpNodeScriptCurrent — one of OUR hook commands naming [another
+ *  existing node, this install's entry] is current; setup leaves the bytes alone instead of
+ *  rewriting them to this shell's node path. A missing node or a script that resolves elsewhere
+ *  is rewritten (the stale-entry rules of each writer). */
+export function hookNamesInstalledEntry(command, sub, cli) {
+    const tail = ` hook ${sub} --cli ${cli}`;
+    if (!command.endsWith(tail))
+        return false;
+    const t = shellTokens(command.slice(0, -tail.length));
+    return !!t && t.length === 2 && existsSync(t[0]) && namesInstalledEntry(t[1]);
+}
 // T347: setup wires one status line per CLI — never overwrites a user's existing one. A foreign
 // status line is left alone and reported (runSetup adds a manual row with the snippet); uninstall
 // removes only what setup wrote. "Ours" is an EXACT match against a command setup itself writes
@@ -114,13 +218,14 @@ const kimiStatus = (cur) => {
     return { form: "section", body, commandLine };
 };
 /** A TOML basic-string value for `command = "…"`, unescaped (re-review: a path containing `"` must
- *  round-trip as ours, not read as foreign). */
+ *  round-trip as ours, not read as foreign). T532: a line-ending backslash may fold the string onto
+ *  the next line — the fold is unescaped before the value is used, so a folded entry still matches. */
 const tomlStringValue = (body, key) => {
-    const m = new RegExp(`(?:^|\\r?\\n)[ \\t]*${key}[ \\t]*=[ \\t]*"((?:[^"\\\\]|\\\\.)*)"`).exec(body);
+    const m = new RegExp(`(?:^|\\r?\\n)[ \\t]*${key}[ \\t]*=[ \\t]*"((?:[^"\\\\]|\\\\[\\s\\S])*)"`).exec(body);
     if (!m)
         return null;
     try {
-        return JSON.parse(`"${m[1]}"`);
+        return JSON.parse(`"${m[1].replace(/\\\r?\n[ \t]*/g, "")}"`);
     }
     catch {
         return null;
@@ -377,7 +482,38 @@ function grokMcp(cmd) {
     // setup writes and repairs it itself. It goes after `enabled`, the shape `grok mcp add` verifies.
     const timeoutLine = `startup_timeout_sec = ${MCP_STARTUP_TIMEOUT_SEC}\n`;
     const sectionText = () => `[mcp_servers.mbx]\n${lineText("command", wantCommand)}args = ${argsText}\nenabled = true\n${timeoutLine}`;
+    const sectionArgs = (body) => {
+        const a = /^[ \t]*args[ \t]*=[ \t]*(\[[^\n]*\])/m.exec(body)?.[1];
+        if (!a)
+            return null;
+        try {
+            return JSON.parse(a);
+        }
+        catch {
+            return null;
+        }
+    };
+    // T533: grok keeps command and args in separate fields; [another node, this install's entry] in
+    // those fields is ours. `current` additionally requires the node binary to exist.
+    const entryNamesInstall = (body) => {
+        const args = sectionArgs(body);
+        return Array.isArray(args) && typeof args[0] === "string" && args[1] === "mcp" && namesInstalledEntry(args[0]);
+    };
+    const entryCurrent = (body) => {
+        const command = grokCommandValue(body);
+        return command !== null && existsSync(command) && entryNamesInstall(body);
+    };
     const ours = (body) => grokCommandValue(body) === wantCommand && body.includes(`args = ${wantArgs}`); // exact match (review med 5)
+    // T532: ours in any older form too — a single-binary command (mise shim, bare, absolute) running
+    // `agentmbx mcp`, or [any node, this install's entry] (T533). Uninstall removes those as well;
+    // only another tool's mbx (agentmbx-fork, a foreign server) stays.
+    const oursAnyForm = (body) => {
+        if (ours(body) || entryNamesInstall(body))
+            return true;
+        const command = grokCommandValue(body);
+        const args = sectionArgs(body);
+        return command !== null && /(^|\/)agentmbx$/.test(command) && Array.isArray(args) && args.length === 1 && args[0] === "mcp";
+    };
     /** The section body with an adequate startup timeout: append ours when absent, raise a too-short one. */
     const withTimeout = (body) => {
         const m = /(^|\r?\n)([ \t]*startup_timeout_sec[ \t]*=[ \t]*)(\d+)/.exec(body);
@@ -392,7 +528,7 @@ function grokMcp(cmd) {
             if (cur === null)
                 return false;
             const st = grokMcpState(cur);
-            return st.form === "section" && ours(st.body);
+            return st.form === "section" && (ours(st.body) || entryCurrent(st.body));
         },
         install: (cur) => {
             const st = cur === null ? { form: "absent" } : grokMcpState(cur);
@@ -400,11 +536,13 @@ function grokMcp(cmd) {
                 return cur;
             if (st.form === "section") {
                 let body = st.body;
-                if (!ours(body)) {
+                if (!ours(body) && !entryCurrent(body)) {
                     const command = grokCommandValue(body);
-                    // normalize only a stale path of the SAME binary (…/agentmbx); anything else is another
-                    // tool's mbx — never overwritten (review med 5: agentmbx-fork is not ours)
-                    if (command !== null && !/(^|\/)agentmbx$/.test(command))
+                    // Ours in any older form (shim/bare single binary, or [node, this install's entry] with a
+                    // missing node — T533): replace in place. Anything else is another tool's mbx — never
+                    // overwritten (review med 5: agentmbx-fork is not ours).
+                    const oursOlder = command !== null && (/(^|\/)agentmbx$/.test(command) || entryNamesInstall(body));
+                    if (!oursOlder)
                         return cur;
                     // rewrite ONLY our command/args lines — the user's other keys in the section stay
                     body = body
@@ -423,7 +561,7 @@ function grokMcp(cmd) {
             if (cur === null)
                 return cur;
             const st = grokMcpState(cur);
-            if (st.form !== "section" || !ours(st.body))
+            if (st.form !== "section" || !oursAnyForm(st.body))
                 return cur;
             // the whole section goes; exactly one separator \n install added before it goes too
             const start = (cur ?? "").indexOf(st.body);
@@ -593,41 +731,57 @@ export function mcpConfiguredTimeout(home, cli) {
  *  Stop continues a turn that is ending (T385, user-guide 10-hooks.md). PermissionRequest stays out. */
 const GROK_HOOK_EVENTS = [["SessionStart", "session-start"], ["UserPromptSubmit", "prompt"], ["PostToolUse", "post-tool"], ["Stop", "stop"]];
 const grokHookSub = (event) => GROK_HOOK_EVENTS.find((e) => e[0] === event)?.[1] ?? null;
-/** Ours is exactly `…/agentmbx hook <sub> --cli grok` (bare or quoted path). A composed command
+/** Ours is exactly `…/agentmbx hook <sub> --cli <cli>` (bare or quoted path). A composed command
  *  is someone else's hook and is left alone. */
 function isOurGrokHookCommand(command, sub) {
     const tail = ` hook ${sub} --cli grok`;
     if (!command.endsWith(tail))
         return false;
-    let bin = command.slice(0, -tail.length);
-    if (bin.startsWith("'") && bin.endsWith("'"))
-        bin = bin.slice(1, -1).replace(/'\\''/g, "'");
-    else if (/\s/.test(bin))
-        return false;
-    return /(^|\/)agentmbx$/.test(bin);
+    return runsAgentmbx(command.slice(0, -tail.length));
 }
 function inlineHookCommand(body) {
-    const m = /command[ \t]*=[ \t]*"((?:[^"\\]|\\.)*)"/.exec(body);
+    // T532: `\\[\s\S]` so a line-ending-backslash fold does not truncate the value; the fold unescapes to nothing.
+    const m = /command[ \t]*=[ \t]*"((?:[^"\\]|\\[\s\S])*)"/.exec(body);
     if (!m)
         return null;
     try {
-        return JSON.parse(`"${m[1]}"`);
+        return JSON.parse(`"${m[1].replace(/\\\r?\n[ \t]*/g, "")}"`);
     }
     catch {
         return null;
     }
 }
 /** One `[[hooks.<Event>]]` table, including the newline that ends its last line. Contiguous
- *  tables meet exactly (end === next start), so a block uninstall removes only the bytes it added. */
+ *  tables meet exactly (end === next start), so a block uninstall removes only the bytes it added.
+ *  T532: grok's own `grok hooks add` writes the hook as a nested `[[hooks.<Event>.hooks]]` table
+ *  under the (often empty) event header — those nested headers continue the span; only a header
+ *  that is not our nested table ends it. Without this the nested form's `command =` line sits
+ *  outside the span, the entry is not recognised as ours, and setup appends a duplicate. */
 function grokHookSpans(cur) {
     const re = /[ \t]*\[\[[ \t]*hooks[ \t]*\.[ \t]*([A-Za-z]+)[ \t]*\]\][ \t]*(?:#[^\r\n]*)?\r?\n/g;
     const spans = [];
     for (const m of cur.matchAll(re)) {
-        const start = m.index ?? 0;
-        const after = start + m[0].length;
-        const next = /\r?\n[ \t]*\[/.exec(cur.slice(after));
-        const end = next ? after + next.index + (/^\r?\n/.exec(next[0])?.[0].length ?? 1) : cur.length;
-        spans.push({ start, end, event: m[1], command: inlineHookCommand(cur.slice(start, end)) });
+        const start = m.index ?? 0, event = m[1];
+        let after = start + m[0].length, end = cur.length;
+        for (;;) {
+            const next = /\r?\n[ \t]*\[/.exec(cur.slice(after));
+            if (!next)
+                break;
+            const at = after + next.index + next[0].length - 1; // the '[' itself
+            const head = /^(\[\[[^\]\r\n]*\]\]|\[[^\]\r\n]*\])/.exec(cur.slice(at))?.[1] ?? "";
+            const nested = new RegExp(`^\\[\\[[ \\t]*hooks[ \\t]*\\.[ \\t]*${event}[ \\t]*\\.[ \\t]*hooks[ \\t]*\\]\\]$`).test(head);
+            if (!nested) {
+                end = at;
+                break;
+            }
+            after = at + head.length;
+        }
+        const text = cur.slice(start, end);
+        const command = inlineHookCommand(text);
+        // T526 review rule: something that looks like ours but cannot be parsed confidently is
+        // reported (a `manual` row), never duplicated and never rewritten.
+        const suspect = command === null && /agentmbx|hook[ \t]+[a-z-]+[ \t]+--cli/.test(text);
+        spans.push({ start, end, event, command, suspect });
     }
     return spans;
 }
@@ -642,6 +796,14 @@ function grokHooks(cmd) {
     const oursIn = (cur, event, sub) => grokHookSpans(cur)
         .filter((s) => s.event === event && s.command !== null && isOurGrokHookCommand(s.command, sub));
     return {
+        // T526 review rule: a hook entry that looks like ours but cannot be parsed confidently blocks
+        // the edit — setup reports a `manual` row and touches nothing, never appends next to it.
+        blocked: (cur) => {
+            if (cur === null)
+                return null;
+            const suspect = grokHookSpans(cur).find((s) => s.suspect);
+            return suspect ? `hooks.${suspect.event} mentions agentmbx but its command is not a plain TOML string; edit it by hand` : null;
+        },
         install: (cur) => {
             if (cur !== null && (tryParseToml(cur) === null || grokPlainHooksTable(cur)))
                 return cur;
@@ -654,9 +816,11 @@ function grokHooks(cmd) {
                     missing.push(tableText(event, want));
                     continue;
                 }
-                if (ours[0].command !== want) {
+                if (ours[0].command !== want && ours[0].command !== null && !hookNamesInstalledEntry(ours[0].command, sub, "grok")) {
+                    // T532: `\\[\s\S]` so a line-ending-backslash-folded command is replaced whole — the
+                    // canonical single line in, the folded continuation bytes gone.
                     const body = next.slice(ours[0].start, ours[0].end)
-                        .replace(/(command[ \t]*=[ \t]*)"(?:[^"\\]|\\.)*"/, `$1${JSON.stringify(want)}`);
+                        .replace(/(command[ \t]*=[ \t]*)"(?:[^"\\]|\\[\s\S])*"/, `$1${JSON.stringify(want)}`);
                     next = next.slice(0, ours[0].start) + body + next.slice(ours[0].end);
                 }
                 const extra = oursIn(next, event, sub).slice(1);
@@ -789,7 +953,8 @@ function jsonHooks(events, cli, cmd, commandFor) {
                 changed = true;
                 continue;
             }
-            if (ours[0].command !== want) {
+            // T533: [another existing node, this install's entry] is current — never rewritten to this shell's node path.
+            if (ours[0].command !== want && !hookNamesInstalledEntry(ours[0].command ?? "", sub, cli)) {
                 ours[0].command = want;
                 changed = true;
             }
@@ -908,13 +1073,18 @@ function codexServer(cmd) {
             if (!t)
                 return false;
             const e = t.mcp_servers?.mbx;
-            return !!e && e.command === cmd[0] && JSON.stringify(e.args ?? []) === JSON.stringify(mcpArgs);
+            return !!e && (e.command === cmd[0] && JSON.stringify(e.args ?? []) === JSON.stringify(mcpArgs) || mcpNodeScriptCurrent(e));
         },
         install: (cur) => {
             const lines = (cur ?? "").split("\n");
             const r = tomlTable(lines, "mcp_servers.mbx");
             if (!r)
                 return appendBlock(cur, block.join("\n"));
+            // T533: wired by another shell's node + this install's entry, node still there: leave the bytes alone.
+            const t = tryParseToml(cur ?? "");
+            const e = t ? t.mcp_servers?.mbx : undefined;
+            if (e && mcpNodeScriptCurrent(e))
+                return cur;
             // main table body only (sub-tables such as [mcp_servers.mbx.env] are kept)
             let mainEnd = r[0] + 1;
             while (mainEnd < r[1] && !lines[mainEnd].trim().startsWith("["))
@@ -1364,7 +1534,12 @@ function opencodeServer(cmd) {
                 if (e?.kind !== "object")
                     return false;
                 const v = valueOf(cur, e);
-                return !!v && typeof v === "object" && v.type === "local" && JSON.stringify(v.command ?? null) === JSON.stringify(desired.command);
+                if (!v || typeof v !== "object")
+                    return false;
+                if (v.type === "local" && JSON.stringify(v.command ?? null) === JSON.stringify(desired.command))
+                    return true;
+                // T533: [another node, this install's entry, "mcp"] under any spelling of the node path.
+                return Array.isArray(v.command) && mcpNodeScriptCurrent({ command: v.command[0], args: v.command.slice(1) });
             }
             catch {
                 return false;
@@ -1385,8 +1560,12 @@ function opencodeServer(cmd) {
                 out = insertMember(text, mcp, "servers", `{ "mbx": ${src} }`);
             else {
                 const m = member(target, "mbx");
-                if (m && same(valueOf(text, m.value), desired))
-                    return cur;
+                if (m) {
+                    const v = valueOf(text, m.value);
+                    // T533: wired by another shell's node + this install's entry: leave the bytes alone.
+                    if (same(v, desired) || (Array.isArray(v?.command) && mcpNodeScriptCurrent({ command: v.command[0], args: v.command.slice(1) })))
+                        return cur;
+                }
                 out = m ? replaceValue(text, m, src) : insertMember(text, target, "mbx", src);
             }
             parseJsonc(out); // never write something we cannot read back
@@ -1471,7 +1650,7 @@ function hermesServer(cmd) {
             if (cur === null)
                 return false;
             const e = hermesMcpParse(cur);
-            return !!e && e.command === cmd[0] && JSON.stringify(e.args ?? []) === JSON.stringify(mcpArgs);
+            return !!e && (e.command === cmd[0] && JSON.stringify(e.args ?? []) === JSON.stringify(mcpArgs) || mcpNodeScriptCurrent({ command: e.command, args: e.args }));
         },
         install: (cur) => {
             if (cur === null)
@@ -1480,6 +1659,12 @@ function hermesServer(cmd) {
             const r = hermesMcpLocate(lines);
             if (!r)
                 return appendBlock(cur, ["mcp_servers:", ...body("  ")].join("\n"));
+            // T533: wired by another shell's node + this install's entry, node still there: leave the bytes alone.
+            if (r.mbx >= 0) {
+                const e = hermesMcpParse(cur);
+                if (e && mcpNodeScriptCurrent({ command: e.command, args: e.args }))
+                    return cur;
+            }
             const want = body(r.ind);
             if (r.mbx >= 0) {
                 if (same(lines.slice(r.mbx, r.mbxEnd), want))
@@ -1514,22 +1699,21 @@ function hermesServer(cmd) {
 // The file is hand-edited YAML, so this is a minimal line edit like hermesServer: only lines of ours are added or removed and every
 // other byte stays. A layout that cannot be edited with certainty (flow style, duplicate keys, tabs, anchors, mixed line endings)
 // is refused and reported, never rewritten. Hermes runs a new (event, command) pair only after it was approved: see hermesApprovals.
+// T526: Hermes itself rewrites this file and folds long scalars onto continuation lines — a folded `command:` is reconstructed
+// semantically (and repaired to the canonical single line); a `command:` that visibly looks like ours but cannot be parsed is
+// reported for a manual fix, never appended next to.
 export const HERMES_HOOK_EVENTS = [["on_session_start", "session-start"], ["pre_llm_call", "prompt"]];
 const HERMES_MARK = "# managed by agentmbx setup";
 /** Ours is `…/agentmbx hook <sub> --cli <cli>` (bare or quoted path), or exactly the command this setup would write. A command
- *  composed with anything else is someone else's hook and is left alone. */
+ *  composed with anything else is someone else's hook and is left alone. The agentmbx part may be any form of ours — shim, bare,
+ *  SEA binary, or the node + entry-script pair (T504) under any node path (T533) — see runsAgentmbx. */
 function isOurHookCommand(command, sub, cli, exact) {
     if (exact !== undefined && command === exact)
         return true;
     const tail = ` hook ${sub} --cli ${cli}`;
     if (!command.endsWith(tail))
         return false;
-    let bin = command.slice(0, -tail.length);
-    if (bin.startsWith("'") && bin.endsWith("'"))
-        bin = bin.slice(1, -1).replace(/'\\''/g, "'");
-    else if (/\s/.test(bin))
-        return false;
-    return /(^|\/)agentmbx$/.test(bin);
+    return runsAgentmbx(command.slice(0, -tail.length));
 }
 /** The string a YAML scalar spells, for the forms a hand-written `command:` takes; null for anything else (block scalar, anchor, flow). */
 function yamlString(raw) {
@@ -1553,6 +1737,104 @@ function yamlString(raw) {
         return null;
     return t.replace(/[ \t]+#.*$/, "");
 }
+// T526: Hermes rewrites ~/.hermes/config.yaml itself and folds long scalars onto indented continuation
+// lines, so a `command:` value may span lines. A plain scalar consumes the item's following lines that
+// are indented deeper than the key column (a sibling key like `timeout:` sits AT the key column and
+// terminates the scalar); each segment gets yamlString's trailing-comment handling. A quoted scalar
+// accepts its closing quote on a continuation line (double-quoted with JSON escapes, single-quoted with
+// '' doubling), the folded break spelling one space. Block scalars (| >, with chomping/indent indicators)
+// read their deeper-indented content lines (> folds to one space, | keeps line breaks). A plain segment
+// ending in `\` is Hermes's line-continuation fold: the backslash drops out and the join takes no extra
+// space. Anchors, aliases and flow stay null — the conservative posture yamlString already had — and are
+// reported (never appended next to) when their visible text looks like one of ours: see hermesHooks.blocked.
+function yamlCommandScalar(lines, line, keyCol, stop, raw) {
+    const t = raw.trim();
+    if (t.startsWith("\"") || t.startsWith("'")) {
+        const quote = t[0];
+        let body = "", endLine = line, src = t.slice(1);
+        for (;;) {
+            for (let i = 0; i < src.length; i++) {
+                const c = src[i];
+                if (quote === "\"" && c === "\\") {
+                    body += src.slice(i, i + 2);
+                    i++;
+                    continue;
+                }
+                if (quote === "'" && c === "'" && src[i + 1] === "'") {
+                    body += "''";
+                    i++;
+                    continue;
+                }
+                if (c === quote) {
+                    if (quote === "\"") {
+                        try {
+                            return { value: JSON.parse(`"${body}"`), endLine };
+                        }
+                        catch {
+                            return { value: null, endLine: line };
+                        }
+                    }
+                    return { value: body.replace(/''/g, "'"), endLine };
+                }
+                body += c;
+            }
+            endLine++;
+            if (endLine >= stop || endLine >= lines.length)
+                return { value: null, endLine: line };
+            const l = lines[endLine].replace(/\r$/, "");
+            if (yamlBlank(l) || yamlIndent(l) <= keyCol || l.trimStart().startsWith("#"))
+                return { value: null, endLine: line };
+            body += " "; // one folded line break is one space
+            src = l.trim();
+        }
+    }
+    const block = /^([|>])([+-]?)([1-9]?)[ \t]*(?:#.*)?$/.exec(t);
+    if (block) {
+        // Block scalar: content lines sit deeper than the key column; folded (>) joins with one
+        // space, literal (|) with line breaks (trailing breaks chomped for the command comparison).
+        const segs = [];
+        let endLine = line;
+        while (endLine + 1 < stop && endLine + 1 < lines.length) {
+            const l = lines[endLine + 1].replace(/\r$/, "");
+            if (yamlBlank(l) || yamlIndent(l) <= keyCol || l.trimStart().startsWith("#"))
+                break;
+            endLine++;
+            segs.push(l.trim());
+        }
+        if (!segs.length)
+            return { value: null, endLine: line };
+        const value = (block[1] === ">" ? segs.join(" ") : segs.join("\n")).replace(/\n+$/, "");
+        return { value: value === "" ? null : value, endLine };
+    }
+    if (t === "" || /^[>&*!\[{#]/.test(t))
+        return { value: null, endLine: line };
+    const segs = [t.replace(/[ \t]+#.*$/, "").trim()];
+    let endLine = line;
+    while (endLine + 1 < stop && endLine + 1 < lines.length) {
+        const l = lines[endLine + 1].replace(/\r$/, "");
+        if (yamlBlank(l) || yamlIndent(l) <= keyCol || l.trimStart().startsWith("#"))
+            break;
+        endLine++;
+        segs.push(l.trim().replace(/[ \t]+#.*$/, "").trim());
+    }
+    // Fold the segments: a plain break is one space; a segment ending in `\` is a line-continuation
+    // marker (Hermes's fold) — the backslash drops out and the join takes no extra space.
+    let value = "";
+    for (const seg of segs.filter((s) => s !== "")) {
+        if (seg.endsWith("\\"))
+            value += seg.slice(0, -1);
+        else
+            value += (value && !value.endsWith(" ") ? " " : "") + seg;
+    }
+    return { value: value === "" ? null : value, endLine };
+}
+/** T526: the visible (unparsed) start of a `command:` value that cannot be reconstructed confidently
+ *  but plausibly IS one of ours — `agentmbx` with ` hook ` in it, or ending at the agentmbx binary.
+ *  Setup never appends next to a possible copy of its own entry: it refuses the file and reports. */
+const looksLikeOursHook = (raw) => {
+    const v = raw.trim();
+    return (/ hook /.test(v) && /agentmbx/.test(v)) || /agentmbx$/.test(v);
+};
 const yamlBlank = (l) => /^\s*(#.*)?$/.test(l);
 const yamlIndent = (l) => /^ */.exec(l)[0].length;
 function hermesLayout(lines) {
@@ -1635,17 +1917,23 @@ function hermesEvent(lines, lay, event) {
         const mine = body.filter((i) => i >= start && i < stop);
         const first = /^( *)-( *)(.*)$/.exec(lines[start].replace(/\r$/, ""));
         const keyCol = first[3] ? first[1].length + 1 + first[2].length : yamlIndent(lines[mine[1]] ?? "");
-        let command = null, commandLine = -1;
+        let command = null, commandLine = -1, commandEndLine = -1, suspect = false;
         for (const i of mine) {
             const text = (i === start ? first[3] : lines[i].replace(/\r$/, "").slice(keyCol)), col = i === start ? keyCol : yamlIndent(lines[i]);
             const m = col === keyCol ? /^command:[ \t]*(.*)$/.exec(text) : null;
-            if (m) {
-                command = yamlString(m[1]);
-                commandLine = i;
-                break;
-            }
+            if (!m)
+                continue;
+            commandLine = i;
+            // T526: the value may be folded onto deeper-indented continuation lines (Hermes rewrites this
+            // file); reconstruct the semantic scalar and remember the whole span a rewrite must replace.
+            const rec = yamlCommandScalar(lines, i, keyCol, stop, m[1]);
+            command = rec.value;
+            commandEndLine = rec.endLine;
+            if (command === null && looksLikeOursHook(m[1]))
+                suspect = true;
+            break;
         }
-        return { start, end: mine[mine.length - 1] + 1, command, commandLine };
+        return { start, end: mine[mine.length - 1] + 1, command, commandLine, commandEndLine, ...(suspect ? { suspect } : {}) };
     });
     return { key: k.key, last: k.last, itemInd, items };
 }
@@ -1671,6 +1959,10 @@ function hermesHooks(cmd) {
                 const e = hermesEvent(lines, lay, event);
                 if (e && "reason" in e)
                     return e.reason;
+                // T526 amendment: a `command:` scalar that cannot be reconstructed confidently but visibly looks
+                // like one of ours is never appended next to — the file is left untouched for a human fix.
+                if (e && e.items.some((it) => it.suspect))
+                    return `hooks.${event}: agentmbx hook entry could not be parsed; fix by hand`;
             }
         return null;
     };
@@ -1712,9 +2004,15 @@ function hermesHooks(cmd) {
                     out.splice(e.items.length ? e.last + 1 : e.key + 1, 0, ...nl(item(e.items.length ? e.itemInd : l.ind + 2, wanted)));
                     continue;
                 }
-                // a function replacer: a path containing $& or $' must not be read as a replacement pattern
-                if (mine[0].command !== wanted)
-                    out[mine[0].commandLine] = out[mine[0].commandLine].replace(/(command:[ \t]*).*/, (_m, p1) => p1 + JSON.stringify(wanted));
+                // a function replacer: a path containing $& or $' must not be read as a replacement pattern.
+                // T526: a folded scalar is replaced across its whole line span — the canonical single line in,
+                // the continuation lines gone — never leaving a truncated sibling of ours.
+                // T533: [another existing node, this install's entry] is current — never rewritten to this shell's node path.
+                if (mine[0].command !== wanted && !hookNamesInstalledEntry(mine[0].command, sub, "hermes")) {
+                    const it = mine[0];
+                    const line = out[it.commandLine].replace(/(command:[ \t]*).*/, (_m, p1) => p1 + JSON.stringify(wanted));
+                    out.splice(it.commandLine, it.commandEndLine - it.commandLine + 1, line);
+                }
                 for (const extra of mine.slice(1).reverse())
                     out.splice(extra.start, extra.end - extra.start);
             }
@@ -1851,7 +2149,7 @@ export function edits(ctx, cli) {
     switch (cli) {
         case "claude": {
             const entry = { type: "stdio", command: cmd[0], args: mcpArgs, env: {} };
-            const srv = jsonServer("mcpServers", entry, (e) => e.command === cmd[0] && same(e.args ?? [], mcpArgs));
+            const srv = jsonServer("mcpServers", entry, (e) => (e.command === cmd[0] && same(e.args ?? [], mcpArgs)) || mcpNodeScriptCurrent(e));
             return [
                 { cli, kind: "mcp", item: "MCP server mbx (user scope)", path: join(home, ".claude.json"), ...srv,
                     viaCli: (c, mode, cur) => {
@@ -1923,7 +2221,7 @@ export function edits(ctx, cli) {
             ];
         case "kimi": {
             const kimi = (home === homedir() && process.env.KIMI_CODE_HOME) || join(home, ".kimi-code");
-            const srv = jsonServer("mcpServers", { command: cmd[0], args: mcpArgs }, (e) => e.command === cmd[0] && same(e.args ?? [], mcpArgs), true);
+            const srv = jsonServer("mcpServers", { command: cmd[0], args: mcpArgs }, (e) => (e.command === cmd[0] && same(e.args ?? [], mcpArgs)) || mcpNodeScriptCurrent(e), true);
             return [
                 { cli, kind: "mcp", item: "mcpServers.mbx", path: join(kimi, "mcp.json"), ...srv },
                 { cli, kind: "hooks", item: "[[hooks]] SessionStart + UserPromptSubmit + PermissionRequest + Stop", path: join(kimi, "config.toml"), ...kimiHooks(cmd) },
@@ -2158,7 +2456,7 @@ export function runSetup(ctx, o) {
                 if (why && (o.mode === "install" || (cur !== null && cur.includes(`--cli ${e.cli}`)))) {
                     refused.add(`${e.cli}:${e.kind}`);
                     const what = e.kind === "consent" ? "approve the agentmbx hooks yourself (hermes hooks list, or hooks_auto_accept: true)"
-                        : o.mode === "install" ? `add the agentmbx hooks by hand: ${HERMES_HOOK_EVENTS.map(([ev, sub]) => `${ev} -> ${hookCommand(ctx.cmd, sub, e.cli)}`).join("; ")}`
+                        : o.mode === "install" ? `add the agentmbx hooks by hand: ${(e.cli === "grok" ? GROK_HOOK_EVENTS : HERMES_HOOK_EVENTS).map(([ev, sub]) => `${ev} -> ${hookCommand(ctx.cmd, sub, e.cli)}`).join("; ")}`
                             : "remove the agentmbx hooks by hand";
                     rows.push({ ...row, action: "manual", note: `${why}; left untouched. ${what}` });
                     continue;

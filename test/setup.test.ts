@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { doctor, failed, VERSION } from "../src/doctor.ts";
+import { parse as parseToml } from "smol-toml";
 import { insertMember, member, parseJsonc, removeMember, valueOf } from "../src/jsonc.ts";
 import { detectHost } from "../src/mcp.ts";
 import { MbxNode } from "../src/node.ts";
@@ -635,4 +636,290 @@ test("T337: install+uninstall of both sections round-trips LF and CRLF files byt
     assert.equal(rd(h, ".grok/config.toml"), before, `${name}: byte-identical after removing both sections`);
     rmSync(h, { recursive: true, force: true });
   }
+});
+
+// T526: Hermes rewrites ~/.hermes/config.yaml itself and folds long scalars onto indented
+// continuation lines. Setup must recognise its own folded entries semantically, repair them to the
+// canonical single line in place (never append a duplicate), and stay idempotent; a foreign hook in
+// the same event list is never touched. A `command:` that visibly looks like ours but cannot be
+// parsed is reported as a manual row — never appended next to.
+test("T526: Hermes folded hook scalars are recognised and repaired in place; unparseable ours is a manual row", () => {
+  const home = fakeHome(); const ctx = ctxFor(home);
+  const before = `model:
+  default: fake
+hooks:
+  on_session_start:
+    - command: /opt/very/long/path/that/hermes/folds/because/it/is/far/too/long/for/one/line/agentmbx hook
+        session-start --cli hermes
+      timeout: 10
+    - command: /usr/bin/foreign-hook --watch
+      timeout: 5
+  pre_llm_call:
+    - command: "/opt/very/long/path/that/hermes/folds/because/it/is/far/too/long/for/one/line/agentmbx hook
+        prompt --cli hermes"
+      timeout: 10
+`;
+  writeFileSync(join(home, ".hermes/config.yaml"), before);
+  const rows = runSetup(ctx, { mode: "install", only: ["hermes"], stamp: "T526a" });
+  assert.ok(rows.some((r) => r.cli === "hermes" && r.item.startsWith("hooks") && (r.action === "updated" || r.action === "unchanged")), JSON.stringify(rows));
+  const hy = rd(home, ".hermes/config.yaml");
+  // each agentmbx hook exactly once, in the canonical single-line form; the folded lines are gone
+  assert.equal((hy.match(/agentmbx hook /g) ?? []).length, 2, "each agentmbx hook exactly once");
+  assert.match(hy, /- command: "\/opt\/bin\/agentmbx hook session-start --cli hermes"\n      timeout: 10\n/);
+  assert.match(hy, /- command: "\/opt\/bin\/agentmbx hook prompt --cli hermes"\n      timeout: 10\n/);
+  assert.doesNotMatch(hy, /^\s+session-start --cli hermes/m, "no folded continuation lines left");
+  assert.doesNotMatch(hy, /^\s+prompt --cli hermes/m, "no folded continuation lines left");
+  // the foreign hook keeps its bytes
+  assert.match(hy, /- command: \/usr\/bin\/foreign-hook --watch\n      timeout: 5\n/, "foreign hook untouched");
+  assert.match(hy, /^model:\n  default: fake\n/, "everything above hooks: is byte-preserved");
+  // AC1/AC3: a second run reports unchanged and nothing moves
+  const snapshot = rd(home, ".hermes/config.yaml");
+  const again = runSetup(ctx, { mode: "install", only: ["hermes"], stamp: "T526b" });
+  assert.ok(again.every((r) => r.action === "unchanged" || r.action === "skipped"), JSON.stringify(again));
+  assert.equal(rd(home, ".hermes/config.yaml"), snapshot);
+
+  // the amendment: an unparseable `command:` that looks like ours -> manual row, hooks untouched
+  const home2 = fakeHome(); const ctx2 = ctxFor(home2);
+  const hooks2 = `hooks:
+  on_session_start:
+    - command: "/opt/bin/agentmbx hook session-start
+      timeout: 10
+`;
+  writeFileSync(join(home2, ".hermes/config.yaml"), hooks2);
+  const rows2 = runSetup(ctx2, { mode: "install", only: ["hermes"], stamp: "T526c" });
+  const manual = rows2.find((r) => r.cli === "hermes" && r.item.startsWith("hooks"));
+  assert.equal(manual?.action, "manual", JSON.stringify(rows2));
+  assert.ok(manual?.note?.includes("agentmbx hook entry could not be parsed; fix by hand"), manual?.note);
+  assert.ok(rd(home2, ".hermes/config.yaml").startsWith(hooks2), "the hooks block is not touched");
+});
+
+// T532: grok configs hold older agentmbx entries in several shapes — the mise-shim binary in grok's
+// own nested [[hooks.<Event>.hooks]] form (the incident), a bare `agentmbx` in setup's inline form,
+// and the current node+script form. All are recognised by meaning and replaced in place; setup never
+// appends next to its own older entry, foreign hooks stay, and the result parses as TOML.
+test("T532: grok shim/bare/current forms are replaced in place, never duplicated", () => {
+  const shim = "/Users/dev/.local/share/mise/shims/agentmbx";
+  const nodeCmd = ["/opt/bin/node", "/opt/app/bin/agentmbx.js"];
+  // the incident shape: nested form with shim commands, a line-folded command, a foreign nested
+  // hook in its own [[hooks.SessionStart]] element, and a shim MCP section.
+  const home = fakeHome(); const ctx = ctxFor(home, nodeCmd);
+  mkdirSync(join(home, ".grok"), { recursive: true });
+  writeFileSync(join(home, ".grok/config.toml"), `[mcp_servers.mbx]
+command = "${shim}"
+args = ["mcp"]
+enabled = true
+
+[[hooks.SessionStart]]
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "${shim} hook session-start --cli grok"
+timeout = 10
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "${shim} hook prompt --cli grok"
+timeout = 10
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "${shim} hook stop --cli grok"
+timeout = 10
+
+[[hooks.SessionStart]]
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "my-own.sh --watch"
+timeout = 30
+`);
+  const rows = runSetup(ctx, { mode: "install", only: ["grok"], stamp: "T532a" });
+  assert.ok(!rows.some((r) => r.cli === "grok" && r.action === "error"), JSON.stringify(rows));
+  let out = rd(home, ".grok/config.toml");
+  assert.doesNotThrow(() => parseToml(out), "the result parses as TOML");
+  // exactly one of each hook, ours in the node+script form; the shim commands are gone
+  for (const [event, sub] of [["SessionStart", "session-start"], ["UserPromptSubmit", "prompt"], ["Stop", "stop"], ["PostToolUse", "post-tool"]] as const) {
+    const want = `${nodeCmd.join(" ")} hook ${sub} --cli grok`;
+    assert.equal((out.match(new RegExp(`command = ${JSON.stringify(want)}`, "g")) ?? []).length, 1, `exactly one ${event} hook of ours`);
+  }
+  assert.equal((out.match(/mise\/shims\/agentmbx/g) ?? []).length, 0, "no shim command is left next to a new one");
+  assert.match(out, /command = "my-own\.sh --watch"\n/, "the foreign hook keeps its bytes");
+  assert.equal((out.match(/\[mcp_servers\.mbx\]/g) ?? []).length, 1, "exactly one MCP section");
+  assert.match(out, /\[mcp_servers\.mbx\]\ncommand = "\/opt\/bin\/node"\nargs = \["\/opt\/app\/bin\/agentmbx\.js", "mcp"\]\n/, "the shim MCP entry is replaced in place");
+  // AC2: a second run reports unchanged
+  const snapshot = out;
+  const again = runSetup(ctx, { mode: "install", only: ["grok"], stamp: "T532b" });
+  assert.ok(again.every((r) => r.action === "unchanged" || r.action === "skipped"), JSON.stringify(again));
+  assert.equal(rd(home, ".grok/config.toml"), snapshot);
+  // uninstall removes our entries in every recognised form and keeps the foreign one
+  const removed = runSetup(ctx, { mode: "uninstall", only: ["grok"], stamp: "T532c" });
+  assert.ok(removed.some((r) => r.cli === "grok" && r.item.startsWith("hooks") && r.action === "removed"), JSON.stringify(removed));
+  out = rd(home, ".grok/config.toml");
+  assert.doesNotThrow(() => parseToml(out));
+  assert.doesNotMatch(out, /agentmbx|mcp_servers/, "our shim MCP and hook entries are removed");
+  assert.match(out, /my-own\.sh --watch/, "the foreign hook survives uninstall");
+
+  // bare form: setup's inline table spelling with a bare `agentmbx` binary
+  const home2 = fakeHome(); const ctx2 = ctxFor(home2, nodeCmd);
+  mkdirSync(join(home2, ".grok"), { recursive: true });
+  writeFileSync(join(home2, ".grok/config.toml"), `[mcp_servers.mbx]
+command = "agentmbx"
+args = ["mcp"]
+enabled = true
+
+[[hooks.SessionStart]]
+hooks = [{ type = "command", command = "agentmbx hook session-start --cli grok", timeout = 10 }]
+`);
+  runSetup(ctx2, { mode: "install", only: ["grok"], stamp: "T532d" });
+  out = rd(home2, ".grok/config.toml");
+  assert.doesNotThrow(() => parseToml(out));
+  assert.equal((out.match(/command = "\/opt\/bin\/node \/opt\/app\/bin\/agentmbx\.js hook session-start --cli grok"/g) ?? []).length, 1,
+    "the bare hook is replaced in place (exactly one SessionStart command line)");
+  assert.doesNotMatch(out, /command = "agentmbx/, "no bare command is left next to the new one");
+  assert.match(out, /hooks = \[{ type = "command", command = "\/opt\/bin\/node \/opt\/app\/bin\/agentmbx\.js hook session-start --cli grok", timeout = 10 }\]/);
+  assert.match(out, /\[mcp_servers\.mbx\]\ncommand = "\/opt\/bin\/node"\nargs = \["\/opt\/app\/bin\/agentmbx\.js", "mcp"\]\n/, "the bare MCP entry is replaced in place");
+  const again2 = runSetup(ctx2, { mode: "install", only: ["grok"], stamp: "T532e" });
+  assert.ok(again2.every((r) => r.action === "unchanged" || r.action === "skipped"), JSON.stringify(again2));
+
+  // current form: written by this very cmd, a second run is byte-identical
+  const home3 = fakeHome(); const ctx3 = ctxFor(home3, nodeCmd);
+  mkdirSync(join(home3, ".grok"), { recursive: true });
+  runSetup(ctx3, { mode: "install", only: ["grok"], stamp: "T532f" });
+  const current = rd(home3, ".grok/config.toml");
+  const again3 = runSetup(ctx3, { mode: "install", only: ["grok"], stamp: "T532g" });
+  assert.ok(again3.every((r) => r.action === "unchanged" || r.action === "skipped"), JSON.stringify(again3));
+  assert.equal(rd(home3, ".grok/config.toml"), current);
+
+  // a line-folded command makes the file unparseable for smol-toml (its parse guard): the file is
+  // conservatively left untouched — reported, never written into and never appended next to.
+  const home4 = fakeHome(); const ctx4 = ctxFor(home4, nodeCmd);
+  mkdirSync(join(home4, ".grok"), { recursive: true });
+  const folded = `[[hooks.SessionStart]]\n\n[[hooks.SessionStart.hooks]]\ntype = "command"\ncommand = "${shim} hook session-start \\\n  --cli grok"\ntimeout = 10\n`;
+  writeFileSync(join(home4, ".grok/config.toml"), folded);
+  const rows4 = runSetup(ctx4, { mode: "install", only: ["grok"], stamp: "T532h" });
+  assert.equal(rd(home4, ".grok/config.toml"), folded, "a folded (unparseable) config is left byte-alone — no duplicate appended");
+});
+
+// T533: doctor and setup compared the exact node path, so a shell whose shim resolves another node
+// reported every harness "not wired" and setup rewrote every config. [any existing node, this
+// install's entry script] is wired-and-current from any node: setup leaves the bytes alone, and a
+// configured node that no longer exists is still rewritten to this shell's command.
+test("T533: a config wired by another shell's node + this install's entry stays put; a dead node is rewritten", async () => {
+  const entry = realpathSync(join(import.meta.dirname, "../bin/agentmbx.js"));
+  const otherNode = process.execPath; // stands in for e.g. Homebrew node while ctx asks for another
+  const mbxHome = (home: string) => { const d = join(home, ".local/share/agentmbx"); new MbxNode(d, { host: "alpha", port: 1 }).close(); return d; };
+
+  // grok (TOML command+args fields)
+  const home = fakeHome();
+  mkdirSync(join(home, ".grok"), { recursive: true });
+  writeFileSync(join(home, ".grok/config.toml"), `[mcp_servers.mbx]\ncommand = ${JSON.stringify(otherNode)}\nargs = ${JSON.stringify([entry, "mcp"])}\nenabled = true\nstartup_timeout_sec = 30\n`);
+  const ctx = ctxFor(home, ["/nonexistent/other-node", "/opt/app/bin/agentmbx.js"]);
+  const rows = runSetup(ctx, { mode: "install", only: ["grok"], stamp: "T533g" });
+  assert.ok(rows.some((r) => r.cli === "grok" && r.item.startsWith("[mcp_servers") && r.action === "unchanged"), JSON.stringify(rows));
+  assert.ok(rd(home, ".grok/config.toml").includes(JSON.stringify(otherNode)), "the other node's bytes stay");
+  let checks = await doctor(ctx, mbxHome(home));
+  assert.ok(checks.some((c) => c.level === "ok" && /^grok: MCP server wired/.test(c.label)), JSON.stringify(checks));
+  // the same entry under a node that no longer exists is ours-but-stale: rewritten in place
+  writeFileSync(join(home, ".grok/config.toml"), `[mcp_servers.mbx]\ncommand = "/nonexistent/node-gone"\nargs = ${JSON.stringify([entry, "mcp"])}\nenabled = true\nstartup_timeout_sec = 30\n`);
+  const rows2 = runSetup(ctx, { mode: "install", only: ["grok"], stamp: "T533h" });
+  assert.ok(rows2.some((r) => r.cli === "grok" && r.item.startsWith("[mcp_servers") && r.action === "updated"), JSON.stringify(rows2));
+  assert.match(rd(home, ".grok/config.toml"), /command = "\/nonexistent\/other-node"\nargs = \["\/opt\/app\/bin\/agentmbx\.js", "mcp"\]/);
+
+  // claude (JSON object)
+  const homeC = fakeHome();
+  const claudeJson = JSON.parse(rd(homeC, ".claude.json")) as { mcpServers: Record<string, unknown> };
+  claudeJson.mcpServers.mbx = { type: "stdio", command: otherNode, args: [entry, "mcp"], env: {} };
+  writeFileSync(join(homeC, ".claude.json"), JSON.stringify(claudeJson, null, 2));
+  const ctxC = ctxFor(homeC, ["/nonexistent/other-node", "/opt/app/bin/agentmbx.js"]);
+  const rowsC = runSetup(ctxC, { mode: "install", only: ["claude"], stamp: "T533c" });
+  assert.ok(rowsC.some((r) => r.cli === "claude" && r.item.startsWith("MCP server") && r.action === "unchanged"), JSON.stringify(rowsC));
+  checks = await doctor(ctxC, mbxHome(homeC));
+  assert.ok(checks.some((c) => c.level === "ok" && /^claude: MCP server wired/.test(c.label)), JSON.stringify(checks));
+
+  // hermes (YAML command+args)
+  const homeH = fakeHome();
+  writeFileSync(join(homeH, ".hermes/config.yaml"), `model:\n  default: fake\nmcp_servers:\n  mbx:\n    command: ${JSON.stringify(otherNode)}\n    args: ${JSON.stringify([entry, "mcp"])}\n    connect_timeout: 60\n`);
+  const ctxH = ctxFor(homeH, ["/nonexistent/other-node", "/opt/app/bin/agentmbx.js"]);
+  const rowsH = runSetup(ctxH, { mode: "install", only: ["hermes"], stamp: "T533m" });
+  assert.ok(rowsH.some((r) => r.cli === "hermes" && r.item.toLowerCase().startsWith("mcp") && r.action === "unchanged"), JSON.stringify(rowsH));
+  assert.ok(rd(homeH, ".hermes/config.yaml").includes(JSON.stringify(otherNode)), "the other node's bytes stay");
+  checks = await doctor(ctxH, mbxHome(homeH));
+  assert.ok(checks.some((c) => c.level === "ok" && /^hermes: MCP server wired/.test(c.label)), JSON.stringify(checks));
+});
+
+// T526 addendum: block scalars (| and >), including Hermes's backslash line-continuation fold,
+// are our own entries too — repaired to the canonical single line in place, never duplicated.
+test("T526: Hermes block scalars and backslash folds are repaired in place, idempotently", () => {
+  const home = fakeHome(); const ctx = ctxFor(home);
+  const before = `hooks:
+  on_session_start:
+    - command: /opt/very/long/path/that/hermes/folds/because/it/exceeds/the/width/agentmbx hook \\
+        session-start --cli hermes
+      timeout: 10
+  pre_llm_call:
+    - command: |
+        /opt/x/agentmbx hook prompt --cli hermes
+      timeout: 10
+`;
+  writeFileSync(join(home, ".hermes/config.yaml"), before);
+  const rows = runSetup(ctx, { mode: "install", only: ["hermes"], stamp: "T526d" });
+  assert.ok(rows.some((r) => r.cli === "hermes" && r.item.startsWith("hooks") && r.action === "updated"), JSON.stringify(rows));
+  const hy = rd(home, ".hermes/config.yaml");
+  assert.equal((hy.match(/agentmbx hook /g) ?? []).length, 2, "each agentmbx hook exactly once");
+  assert.match(hy, /- command: "\/opt\/bin\/agentmbx hook session-start --cli hermes"\n      timeout: 10\n/);
+  assert.match(hy, /- command: "\/opt\/bin\/agentmbx hook prompt --cli hermes"\n      timeout: 10\n/);
+  assert.doesNotMatch(hy, /[|>][+-]?\s*$/, "no block scalar header left on a command line");
+  const again = runSetup(ctx, { mode: "install", only: ["hermes"], stamp: "T526e" });
+  assert.ok(again.every((r) => r.action === "unchanged" || r.action === "skipped"), JSON.stringify(again));
+  assert.equal(rd(home, ".hermes/config.yaml"), hy);
+});
+
+// T533 addendum: codex (TOML), kimi (JSON) and opencode (JSONC) MCP entries, and hook commands of
+// codex/hermes naming [another existing node, this install's entry], are wired-and-current from
+// any node — setup leaves the bytes alone, doctor passes.
+test("T533: codex/kimi/opencode MCP and codex/hermes hooks wired by another node stay put", async () => {
+  const entry = realpathSync(join(import.meta.dirname, "../bin/agentmbx.js"));
+  const otherNode = process.execPath; // stands in for e.g. Homebrew node while ctx asks for another
+  const mbxHome = (home: string) => { const d = join(home, ".local/share/agentmbx"); new MbxNode(d, { host: "alpha", port: 1 }).close(); return d; };
+
+  const home = fakeHome();
+  // codex: MCP table + all four hook groups in the other-node node+script form, after Orca's
+  writeFileSync(join(home, ".codex/config.toml"), `model = "fake-model"\n\n[mcp_servers.mbx]\ncommand = ${JSON.stringify(otherNode)}\nargs = ${JSON.stringify([entry, "mcp"])}\ndefault_tools_approval_mode = "approve"\nstartup_timeout_sec = 30\n`);
+  const codexHooks = JSON.parse(rd(home, ".codex/hooks.json")) as { hooks: Record<string, { hooks: { type: string; command: string; timeout: number }[] }[]> };
+  for (const ev of ["SessionStart", "UserPromptSubmit", "PermissionRequest", "Stop"])
+    codexHooks.hooks[ev] = [...(codexHooks.hooks[ev] ?? []), { hooks: [{ type: "command", command: `${otherNode} ${entry} hook ${ev === "SessionStart" ? "session-start" : ev === "UserPromptSubmit" ? "prompt" : ev === "PermissionRequest" ? "permission" : "stop"} --cli codex`, timeout: 10 }] }];
+  writeFileSync(join(home, ".codex/hooks.json"), JSON.stringify(codexHooks, null, 2));
+  // kimi mcp.json in the other-node form
+  writeFileSync(join(home, ".kimi-code/mcp.json"), JSON.stringify({ mcpServers: { mbx: { command: otherNode, args: [entry, "mcp"] } } }));
+  // opencode jsonc in the other-node form
+  writeFileSync(join(home, ".config/opencode/opencode.jsonc"), `{\n  "mcp": { "servers": { "mbx": { "type": "local", "command": [${JSON.stringify(otherNode)}, ${JSON.stringify(entry)}, "mcp"], "timeout": 30000 } } }\n}\n`);
+
+  const ctx = ctxFor(home, ["/nonexistent/other-node", "/opt/app/bin/agentmbx.js"]);
+  const snapshot = { codex: rd(home, ".codex/config.toml"), hooks: rd(home, ".codex/hooks.json"), kimi: rd(home, ".kimi-code/mcp.json"), oc: rd(home, ".config/opencode/opencode.jsonc") };
+  const rows = runSetup(ctx, { mode: "install", only: ["codex", "kimi", "opencode"], stamp: "T533x" });
+  for (const [cli, item] of [["codex", "[mcp_servers.mbx]"], ["kimi", "mcpServers.mbx"], ["opencode", "mcp.servers.mbx"]] as const)
+    assert.ok(rows.some((r) => r.cli === cli && r.item === item && r.action === "unchanged"), `${cli}: ${JSON.stringify(rows)}`);
+  assert.ok(rows.some((r) => r.cli === "codex" && r.item.startsWith("hooks") && r.action === "unchanged"), JSON.stringify(rows));
+  assert.equal(rd(home, ".codex/config.toml"), snapshot.codex, "codex config bytes stay");
+  assert.equal(rd(home, ".codex/hooks.json"), snapshot.hooks, "codex hooks bytes stay");
+  assert.equal(rd(home, ".kimi-code/mcp.json"), snapshot.kimi, "kimi mcp.json bytes stay");
+  assert.equal(rd(home, ".config/opencode/opencode.jsonc"), snapshot.oc, "opencode jsonc bytes stay");
+  const checks = await doctor(ctx, mbxHome(home));
+  for (const cli of ["codex", "kimi", "opencode"])
+    assert.ok(checks.some((c) => c.level === "ok" && new RegExp(`^${cli}: MCP server wired`).test(c.label)), `${cli}: ${JSON.stringify(checks)}`);
+  assert.ok(checks.some((c) => c.level === "ok" && /^codex: hooks wired/.test(c.label)), JSON.stringify(checks));
+
+  // hermes hook commands in the other-node form: wired, bytes untouched
+  const homeH = fakeHome();
+  writeFileSync(join(homeH, ".hermes/config.yaml"), `hooks:\n  on_session_start:\n    - command: ${JSON.stringify(`${otherNode} ${entry} hook session-start --cli hermes`)}\n      timeout: 10\n  pre_llm_call:\n    - command: ${JSON.stringify(`${otherNode} ${entry} hook prompt --cli hermes`)}\n      timeout: 10\nmcp_servers:\n  mbx:\n    command: ${JSON.stringify(otherNode)}\n    args: ${JSON.stringify([entry, "mcp"])}\n    connect_timeout: 60\n`);
+  const ctxH = ctxFor(homeH, ["/nonexistent/other-node", "/opt/app/bin/agentmbx.js"]);
+  const rowsH = runSetup(ctxH, { mode: "install", only: ["hermes"], stamp: "T533y" });
+  assert.ok(rowsH.some((r) => r.cli === "hermes" && r.item.startsWith("hooks") && r.action === "unchanged"), JSON.stringify(rowsH));
+  assert.ok(rd(homeH, ".hermes/config.yaml").includes(otherNode), "hermes hook keeps the other node's bytes");
+  const checksH = await doctor(ctxH, mbxHome(homeH));
+  assert.ok(checksH.some((c) => c.level === "ok" && /^hermes: hooks wired/.test(c.label)), JSON.stringify(checksH));
 });
