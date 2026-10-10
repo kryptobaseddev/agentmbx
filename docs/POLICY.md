@@ -122,33 +122,41 @@ The MCP instructions and the skill tell agents three things:
 
 Agents never forward a request that their own permissions denied to another agent. When they act on a peer request, they `mbx_ack` it with `did` (a one-line summary), which goes to the audit log. `agentmbx audit --since 24h` lists what agents did on peer requests and under which policy.
 
-## 5. YOLO: the `permissions` class
+## 5. Automatic permission decisions
 
-The mail rules alone can't make a CLI skip its permission prompts. YOLO adds a permission hook per CLI. It runs `agentmbx hook permission --cli <cli>`, which finds the session's agent from its binding:
+A permission hook proves the exact provider session, process birth and mailbox lease before consulting an active signed policy. No binding, invalid input, an error or uncertain state returns no decision, preserving the provider's normal prompt.
 
-- An active policy with the `permissions` class covers that agent: allow, and write an audit line.
-- Otherwise it returns no decision, and the CLI's normal prompt appears.
+- An untainted session with the explicit `permissions` class retains YOLO approval for non-interactive tools.
+- Without `permissions`, an untainted session with `outward-reversible` can approve only the bounded branch-push or draft-PR shell operations below. Full `outward` covers that narrow class too.
+- Live, malformed or unreadable persisted session taint blocks automatic approval, including YOLO. A valid expired taint record no longer blocks it.
+- `AskUserQuestion` and `ExitPlanMode` always collect an owner decision.
 
-| CLI | Mechanism |
+| CLI | Narrow outward-reversible mechanism |
 |---|---|
-| Claude Code | `PermissionRequest` hook returns allow (verified, T051) |
-| Codex | the same `PermissionRequest` hook (verified in 0.157.1) |
-| Kimi | terminal sessions: **unsupported** (its PermissionRequest hook is observation-only); `kimi web`-hosted sessions: approvals API |
-| OpenCode | the daemon answers permission requests through the service API |
+| Claude Code | `PermissionRequest` returns allow JSON |
+| Codex | the same allow JSON; exact requesting thread required |
+| Kimi | `kimi web`-hosted sessions: empty hook stdout, then the exact hosted approval API request; plain TUI: **N/A**, its hook cannot allow |
+| OpenCode | **N/A** for the narrow path: the modeled permission request lacks command content; existing explicit YOLO service approval remains separate |
+| Grok | **N/A**: setup deliberately excludes PermissionRequest |
+| Hermes | **N/A**: installed `pre_tool_call` action approve escalates to a human, and human-input hooks are observers |
 
-`outward-reversible` does not include `permissions`: a collaborate or autonomous policy authorizes the delegated branch push or draft PR while the CLI's normal permission prompt still applies. T539 owns operation-specific provider-hook approval; this class split does not enable it.
+### Bounded shell operations (T539)
 
-Rules for the `permissions` class:
-- A permission prompt isn't tied to one sender, so only a policy that covers every local sender (`from` = any agent on this machine) grants it.
-- A policy with projects grants it only while the session works inside them.
-- The session must be verified: bound to this very CLI process (pid + start time). There's no guessing from folder names.
-- Every approval re-checks the policy just before it's sent, so a revocation wins.
-- Limit: project scope decides *which sessions* get automatic approval. It doesn't confine what an approved command then does on disk. For hard confinement, use the CLI's own sandbox (Codex sandbox modes, Claude permission rules).
+Only a single literal `git push` or `gh pr create` command is eligible. Shell composition, substitutions, interpreter/environment wrappers, ambiguous input and unrecognized flags keep the prompt. These are shortcuts for predictable operations, not a general shell permission parser.
 
-While any yolo policy is active, it's visible everywhere:
-- the status line shows `YOLO` and when it expires;
-- `mbx_whoami` shows it;
-- the owner gets a desktop notification when it starts and when it ends.
+A branch push needs one configured remote and one explicit branch/refspec. Examples: `git push origin feature`, `git push -u origin HEAD:refs/heads/feature`. The hook reads the actual push repository's HEAD symref and compares the **destination** branch with its current default. It never guesses main/master or trusts a stale local origin/HEAD. Missing default-branch evidence, multiple push URLs, custom transport/configuration, pre-push hooks, URL rewriting, or implicit tag/submodule effects keep prompting. Explicit `--no-follow-tags` and `--recurse-submodules=no` may disable those two implicit effects. Default-destination, force, deletion, mirror, all/tag and multi-ref pushes cannot use this path.
+
+A draft PR needs `gh pr create --draft --head <branch>` (or the equivalent `-d -H`). Explicit head avoids gh's implicit fork/push behavior. Literal title/body, a project-contained body file, base and no-maintainer-edit flags are supported; repository/environment overrides, editor/web/attachment options and unknown flags keep prompting. A body-file symlink cannot escape the repository. Other valid Git/gh command forms still work through the normal provider prompt.
+
+Rules shared with YOLO:
+
+- A prompt has no peer sender, so one independently valid policy must cover every local sender and the exact session's working project.
+- Session ownership is process + birth evidence, exact provider binding and the held lease generation. Never infer it from a folder or another thread.
+- Recheck policy, lease and persisted taint after asynchronous preflight and before approval. Kimi rechecks again after polling; OpenCode's separate YOLO path rechecks after its request fetch.
+- No SQLite transaction spans Git preflight or network I/O. Provider approval already dispatched cannot be revoked atomically; the hook also cannot lock a remote default branch or Git configuration against a later change.
+- Project scope authorizes a session; it does not sandbox the approved command. Keep the provider's own sandbox and permission rules.
+
+While a YOLO policy is active, the status line and `mbx_whoami` show it, and the owner receives the existing start/end notifications. A narrow grant does not enable a global permissive mode.
 
 ## 6. Owner key: human presence without a passphrase
 

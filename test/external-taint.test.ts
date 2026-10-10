@@ -13,10 +13,35 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { buildEnvelope, checkShape, EXTERNAL_TAINT_MS, externalExposure, signEnvelope, type Envelope } from "../src/envelope.ts";
 import { externalLine, MbxNode } from "../src/node.ts";
-import { readSessionTaint } from "../src/session-taint.ts";
+import { readSessionTaint, sessionUntainted, taintKey } from "../src/session-taint.ts";
 import { humanPromptKey } from "../src/wake.ts";
 
 const MIN = 60_000;
+
+test("T539 AC3: approval distinguishes absent/valid expired taint from corrupt or unreadable state", t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-approval-taint-")), n = new MbxNode(home, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  const now = Date.now(), key = taintKey("codex", "thread");
+  const record = { v: 1, cli: "codex", session_id: "thread", root: now, from: "outside", id: "message_test", how: "declared", relay_depth: [] };
+  assert.equal(sessionUntainted(n.store, "codex", "thread", now), true);
+  n.store.set(key, JSON.stringify(record));
+  assert.equal(sessionUntainted(n.store, "codex", "thread", now), false);
+  assert.equal(sessionUntainted(n.store, "codex", "sibling", now), true);
+  assert.equal(sessionUntainted(n.store, "codex", "thread", now + EXTERNAL_TAINT_MS), true);
+  for (const raw of ["{bad", "null", "[]", JSON.stringify({ ...record, v: 2 }), JSON.stringify({ ...record, session_id: "sibling" }),
+    JSON.stringify({ ...record, relay_depth: [null] })]) {
+    n.store.set(key, raw);
+    assert.equal(sessionUntainted(n.store, "codex", "thread", now), false, raw);
+    assert.equal(sessionUntainted(n.store, "codex", "thread", now + EXTERNAL_TAINT_MS * 2), false, raw);
+  }
+  n.store.set(key, JSON.stringify({ ...record, root: now + 1 }));
+  assert.equal(sessionUntainted(n.store, "codex", "thread", now), false);
+  const get = n.store.get;
+  n.store.get = () => { throw new Error("read failed"); };
+  try { assert.equal(sessionUntainted(n.store, "codex", "thread", now), false); }
+  finally { n.store.get = get; }
+  assert.equal(sessionUntainted(n.store, "codex", "bad\nthread", now), false);
+});
 const iso = (t: number) => new Date(t).toISOString();
 const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 type Env = Envelope & { meta: Envelope["meta"] & { external_since?: string; external_source?: string } };
