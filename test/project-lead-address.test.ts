@@ -9,8 +9,9 @@ import { canonical, generateKeyPair, signData } from "../src/crypto.ts";
 import { MbxNode } from "../src/node.ts";
 import { createOwnerKey, unlockOwnerKey } from "../src/owner.ts";
 import { makeLead, projectLeadLine, projectLeadView, storeLead } from "../src/project-ledger.ts";
-import { assertKnownRecipients } from "../src/receipts.ts";
+import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "../src/receipts.ts";
 import { noteProject, registerIdentity } from "../src/registry.ts";
+import { escalateUnheldMail } from "../src/stranded.ts";
 
 function ownerNode(t: { after: (fn: () => void) => void }) {
   const root = mkdtempSync(join(tmpdir(), "mbx-lead-addr-"));
@@ -115,6 +116,40 @@ test("a remote lead is a paired address, and an unpaired one is refused", (t) =>
   assert.deepEqual(sent.envelope.to, ["agentmbx-lead@fedora"]);
   assert.deepEqual(sent.remote, ["fedora"]);
   assert.deepEqual(sent.local, []);
+});
+
+test("T491: lead mail with no live holder queues as queued-no-holder, warns the sender, and escalates urgent mail to the owner", (t) => {
+  const { n, lead, projA } = ownerNode(t);
+  n.registerAgent("agentmbx-lead");
+  n.registerAgent("worker");
+  lead("agentmbx-lead", projA);
+  // The lead's session has ended: the mailbox is established but no session holds it.
+  const alert = n.send({ from: "worker", to: ["lead"], kind: "alert", subject: "deploy failed", body: "now", project: projA });
+  const byRole = n.send({ from: "worker", to: ["role:lead"], kind: "request", needs_reply: true, subject: "pick one", body: "a or b", project: projA });
+  const plain = n.send({ from: "worker", to: ["agentmbx-lead"], subject: "fyi", body: "no lead token" });
+
+  const stateOf = (r: ReturnType<MbxNode["send"]>) =>
+    recipientReceipts(n, r.envelope.id, r.targets).find((x) => x.address === "agentmbx-lead@alpha")!.state;
+  assert.equal(stateOf(alert), "queued-no-holder", "lead mail to an unheld lead mailbox is queued-no-holder");
+  assert.equal(stateOf(byRole), "queued-no-holder", "role:lead mail to an unheld lead mailbox is queued-no-holder");
+  assert.equal(stateOf(plain), "offline", "a plainly addressed unheld agent keeps the offline state");
+
+  const warnings = offlineWarnings(recipientReceipts(n, alert.envelope.id, alert.targets));
+  assert.ok(warnings.some((w) => w.includes("agentmbx-lead@alpha")), "the sender-facing warning names the lead recipient");
+
+  const notes: string[] = [];
+  const notify = (subtitle: string, body: string) => notes.push(`${subtitle} — ${body}`);
+  const escalated = escalateUnheldMail(n, Date.now(), notify);
+  assert.deepEqual(escalated.map((e) => `${e.mailbox}:${e.id}`).sort(),
+    [`agentmbx-lead:${alert.envelope.id}`, `agentmbx-lead:${byRole.envelope.id}`].sort(),
+    "alert and needs_reply copies to the unheld lead mailbox are escalated");
+  assert.ok(n.store.get(`escalated:${alert.envelope.id}:agentmbx-lead`), "an exactly-once kv marker is written");
+  assert.equal(n.store.get(`escalated:${plain.envelope.id}:agentmbx-lead`), undefined, "mail with no urgency is not escalated");
+  assert.equal(notes.length, 2, "the owner gets one desktop notice per escalated copy");
+  assert.ok(notes.every((x) => x.includes("agentmbx-lead")), "each notice names the unheld mailbox");
+
+  assert.deepEqual(escalateUnheldMail(n, Date.now(), notify), [], "a second pass escalates nothing new");
+  assert.equal(notes.length, 2, "exactly one notice per copy");
 });
 
 test("projectLeadView and agentmbx status show none, no project, and the address until exp", (t) => {
