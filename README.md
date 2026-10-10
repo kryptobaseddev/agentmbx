@@ -114,7 +114,7 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
   | CLI | Wake path | Status |
   |---|---|---|
   | Codex | `codex queue --thread <id>` | tested live |
-  | OpenCode | the local service's session API (`/synthetic`) | tested live |
+  | OpenCode | service-hosted session: the local service's session API (`/synthetic`). `--standalone` session: the plugin inside that session's own serve, over a loopback queue (see [OPENCODE.md](docs/OPENCODE.md)) | service path tested live; standalone wakes are admitted in-process, whether one starts a turn on an idle session is unproven (T544) |
   | Claude Code | pushed by the session's own mbx MCP server through Claude Code's per-session inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`), so a plainly started `claude` wakes on mail with no flag, setting or cron; `agentmbx claude [args]` adds the research-preview mbx channel instead | tested live (macOS and Fedora) |
   | Kimi | desktop app: its local control socket (setup installs an AgentMBX plugin into the app). `kimi web`: the local server's prompts API. Terminal: a background `agentmbx watch` task the session keeps running (Kimi starts a turn when it exits) | tested live (terminal, desktop, web) |
   | Hermes | cron now; plugin planned | not tested live |

@@ -46,7 +46,9 @@ test("plugin template admits in-process and never calls the shared service", () 
   assert.ok(!src.includes("inService"), "no service-process gate");
   assert.ok(!src.includes('["service", "status"]') && !src.includes("opencode service status"), "no service discovery");
   assert.ok(!src.includes("/api/session"), "no session fetch");
-  assert.ok(src.includes("session?.synthetic") && src.includes("resume: false") && src.includes('delivery: "queue"'), "in-process admission");
+  assert.ok(src.includes("session?.synthetic") && src.includes('delivery: "queue"'), "in-process admission");
+  assert.ok(src.includes('id: noteId(sid, hook, text), text, resume: false'), "hook notes stay resume:false (T518)");
+  assert.ok(src.includes('id: noteId(sid, "wake", text), text, resume: true'), "a daemon wake resumes the idle turn (T544)");
 });
 
 async function loadPlugin() {
@@ -191,27 +193,66 @@ test("wakeOpencode: a service-hosted session still posts exactly once with a val
   assert.equal(posts, 1);
 });
 
-test("doctor: standalone-hosted bindings get no push-wake claim", async () => {
-  const home = mkdtempSync(join(tmpdir(), "mbx-t524-doctor-"));
+test("T520: a service-hosted OpenCode binding is classified service-hosted", async () => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-t520-service-"));
+  const node = new MbxNode(home, { host: "alpha" });
+  try {
+    node.store.db.prepare("INSERT INTO sessions (agent, cli, session_id, pid, channel, updated_at) VALUES (?, 'opencode', ?, ?, 0, ?)")
+      .run("agent-svc", "ses_svc", 100, new Date().toISOString());
+    let asked = 0;
+    const up = async () => { asked++; return { url: "http://127.0.0.1:49374", auth: "" }; };
+    const row = await opencodeServiceCheck(node, up, () => "service", () => false);
+    assert.equal(row?.level, "ok");
+    assert.match(row?.label ?? "", /wake path for 1 service-hosted/);
+    assert.doesNotMatch(row?.label ?? "", /unwakeable|plugin consumer/);
+    assert.equal(row?.fix, undefined);
+    assert.equal(asked, 1);
+  } finally { node.close(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test("T520: a standalone binding with a live plugin consumer is classified as wakeable", async () => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-t520-plugin-"));
+  const node = new MbxNode(home, { host: "alpha" });
+  try {
+    node.store.db.prepare("INSERT INTO sessions (agent, cli, session_id, pid, channel, updated_at) VALUES (?, 'opencode', ?, ?, 0, ?)")
+      .run("agent-live", "ses_live", 200, new Date().toISOString());
+    let asked = 0;
+    const up = async () => { asked++; return { url: "http://127.0.0.1:49374", auth: "" }; };
+    const row = await opencodeServiceCheck(node, up, () => "standalone", (sid, pid) => sid === "ses_live" && pid === 200);
+    assert.equal(row?.level, "ok");
+    assert.match(row?.label ?? "", /1 standalone binding\(s\) with a live plugin consumer/);
+    assert.doesNotMatch(row?.label ?? "", /unwakeable|wake path for/);
+    assert.equal(row?.fix, undefined);
+    assert.equal(asked, 0, "a plugin consumer does not probe the shared service");
+  } finally { node.close(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test("T520: a standalone binding with no plugin consumer is an unwakeable warning", async () => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-t520-unwakeable-"));
   const node = new MbxNode(home, { host: "alpha" });
   try {
     const add = (sid: string, pid: number) => node.store.db.prepare("INSERT INTO sessions (agent, cli, session_id, pid, channel, updated_at) VALUES (?, 'opencode', ?, ?, 0, ?)")
       .run(`agent-${sid}`, sid, pid, new Date().toISOString());
-    add("ses_a", 200);
-    let asked = 0;
-    const up = async () => { asked++; return { url: "http://127.0.0.1:49374", auth: "" }; };
-    const host = (pid: number | null) => (pid === 100 ? "service" as const : "standalone" as const);
-    const only = await opencodeServiceCheck(node, up, host);
-    assert.equal(only?.level, "info");
-    assert.match(only?.label ?? "", /1 binding\(s\) in a standalone OpenCode serve/);
-    assert.match(only?.label ?? "", /no push wake yet/);
-    assert.match(only?.label ?? "", /next-prompt delivery only/);
-    assert.doesNotMatch(only?.label ?? "", /wake path for/);
-    assert.equal(asked, 0, "no service probe when nothing is service-hosted");
-    add("ses_b", 100);
-    const mixed = await opencodeServiceCheck(node, up, host);
-    assert.equal(mixed?.level, "ok");
-    assert.match(mixed?.label ?? "", /wake path for 1 service-hosted/);
-    assert.match(mixed?.label ?? "", /1 binding\(s\) in a standalone OpenCode serve .*no push wake yet/);
+    add("ses_alone", 200);
+    add("ses_unknown", 201);
+    const host = (pid: number | null) => (pid === 200 ? "standalone" as const : "unknown" as const);
+    const row = await opencodeServiceCheck(node, async () => { throw new Error("service must not be probed"); }, host, () => false);
+    assert.equal(row?.level, "warn");
+    assert.match(row?.label ?? "", /2 unwakeable binding\(s\): standalone with no plugin consumer, or an unknown host/);
+    assert.match(row?.fix ?? "", /agentmbx setup --only opencode/);
+    assert.doesNotMatch(`${row?.label ?? ""} ${row?.fix ?? ""}`, /no push wake yet/);
+  } finally { node.close(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test("T520: a missing daemon waiter read fails closed as unwakeable and does not probe the service", async () => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-t520-deaf-"));
+  const node = new MbxNode(home, { host: "alpha", port: 1 });
+  try {
+    node.store.db.prepare("INSERT INTO sessions (agent, cli, session_id, pid, channel, updated_at) VALUES (?, 'opencode', ?, ?, 0, ?)")
+      .run("agent-deaf", "ses_deaf", 300, new Date().toISOString());
+    const row = await opencodeServiceCheck(node, async () => { throw new Error("service must not be probed"); }, () => "standalone");
+    assert.equal(row?.level, "warn");
+    assert.match(row?.label ?? "", /1 unwakeable binding\(s\): standalone with no plugin consumer, or an unknown host/);
+    assert.match(row?.fix ?? "", /agentmbx setup --only opencode/);
   } finally { node.close(); rmSync(home, { recursive: true, force: true }); }
 });
