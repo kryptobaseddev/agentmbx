@@ -21,6 +21,7 @@ import { HERMES_NAG_MS, hermesHookInput, hermesHookOutput } from "./hermes-hook.
 import { ancestors, processEvidenceSpawns, withProcSnapshot } from "./proc.js";
 import { bumpPostToolMarkersForAgent, readPostToolMarker, writePostToolLast } from "./posttool.js";
 import { resolveStatusIdentity } from "./status-identity.js";
+import { readStdin, stdinIsTTY } from "./stdin.js";
 import { runStatuslineSuggest } from "./statusline-suggest.js";
 import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.js";
 import { escalateUnheldMail, retirePhantoms, returnNeverClaimed } from "./stranded.js";
@@ -151,12 +152,6 @@ Agent integration
 Env: MBX_HOME (default ~/.local/share/agentmbx), MBX_AGENT (agent name for mcp/hooks), MBX_ADVERTISE (host:port others use),
      MBX_UPDATE_URL (release download base), MBX_NO_UPDATE_CHECK (daemon skips its daily update check)`;
 const die = (msg) => { throw Object.assign(new Error(msg), { code: "USAGE_ERROR" }); };
-const readStdin = () => { try {
-    return readFileSync(0, "utf8");
-}
-catch {
-    return "";
-} };
 const EXIT = { USAGE: 2, NOT_FOUND: 3, AMBIGUOUS: 4 };
 // T313: every CLI with a statusline adapter. Session files are namespaced by these names, so a
 // statusline can never read another CLI's snapshot.
@@ -595,7 +590,7 @@ async function run(argv) {
         if (!STATUSLINE_CLIS.includes(which))
             die(`statusline <${STATUSLINE_CLIS.join("|")}>`);
         let info = {};
-        if (!process.stdin.isTTY) {
+        if (!stdinIsTTY()) {
             try {
                 info = JSON.parse(readStdin() || "{}");
             }
@@ -856,7 +851,7 @@ async function run(argv) {
             if (originArg !== undefined && originArg !== "agent" && originArg !== "external")
                 die("--origin must be agent or external");
             // Read external input before acquiring the lease's database lock.
-            const body = str("m") ?? (str("body-file") ? readFileSync(str("body-file"), "utf8") : process.stdin.isTTY ? "" : readStdin());
+            const body = str("m") ?? (str("body-file") ? readFileSync(str("body-file"), "utf8") : stdinIsTTY() ? "" : readStdin());
             // T205: never create a mailbox by typo; --new-mailbox deliberately leaves mail for an agent that has not started yet
             if (!str("reply-to") && !o["new-mailbox"])
                 assertKnownRecipients(node, (str("to") ?? "").split(",").map(s => s.trim()).filter(Boolean));
@@ -1639,7 +1634,14 @@ function grokWatchArmed(input, sid) {
     });
 }
 async function hook(node, event, cli) {
-    const raw = process.stdin.isTTY ? "{}" : readStdin();
+    const piped = !stdinIsTTY(), raw = piped ? readStdin() : "{}";
+    // T525: Hermes fails open and only logs a hook that exits non-zero, so an unreadable payload (it was once read as "" above
+    // 64 KiB) must not look like a successful no-op. Other providers keep treating a missing payload as an empty object.
+    if (cli === "hermes" && piped && !raw.trim()) {
+        process.stderr.write("[mbx] hook: empty stdin\n");
+        process.exitCode = 1;
+        return;
+    }
     let input = {};
     try {
         input = JSON.parse(raw || "{}");
@@ -2309,7 +2311,8 @@ async function kimiDesktopStep(cmd, o) {
 /**
  * Onboarding: how much may this machine's agents do for each other? One owner-signed policy for every local agent
  * (`*`, from this machine only). The default is `collaborate` (POLICY.md, ratified 2026-09-26): read, test and reversible
- * edits in the project; outward actions still ask. --policy <level> answers up front, `--policy ask` signs nothing. The
+ * edits in the project, non-default branch pushes and draft PRs; full outward actions still ask. --policy <level>
+ * answers up front, `--policy ask` signs nothing. The
  * human always approves the exact text in the Touch ID / passphrase prompt, so an agent running setup can't widen it.
  */
 /**
@@ -2337,7 +2340,7 @@ async function policyStep(level, yes) {
             const rl = createInterface({ input: process.stdin, output: process.stdout });
             const a = (await rl.question(`\nHow much may the agents on this machine do for each other?
   1) ask          they answer each other; anything else waits for you
-  2) collaborate  read, test and make reversible edits in their project; push/deploy/delete still ask you   [default]
+  2) collaborate  read, test, edit, push a non-default branch and open a draft PR in their project; merge/release/deploy/delete/secrets/spend still ask you   [default]
   3) autonomous   same classes, no check-ins until done
   4) yolo         everything, including approving their own permission prompts (8 hours)
 Choose 1-4 [2]: `)).trim();

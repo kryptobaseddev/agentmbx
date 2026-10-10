@@ -22,7 +22,7 @@ const CLIS = new Set(["claude", "codex", "kimi", "opencode", "hermes", "cli", "u
 const KINDS = ["message", "request", "reply", "status", "decision", "alert", "task"] as const;
 const STATES = ["queued", "handed-over", "delivered", "notified", "read", "acked", "forwarded", "returned"] as const;
 const LEVELS = new Set(["ask", "collaborate", "autonomous", "yolo"]);
-const CLASSES = new Set(["read", "edit", "outward", "permissions"]);
+const CLASSES = new Set(["read", "edit", "outward-reversible", "outward", "permissions"]);
 const TRUSTS = new Set(["local", "verified", "unverified"]);
 
 export interface DoctorFinding { code: string; severity: "info" | "warn" | "error" }

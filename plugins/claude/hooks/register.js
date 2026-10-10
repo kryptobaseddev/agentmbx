@@ -4,7 +4,8 @@
  *
  * Session id: `session.start` is only `{ cwd }`. The binary sets
  * `CLAUDE_CODE_SESSION_ID` on the process and on child env, and substitutes
- * `${CLAUDE_SESSION_ID}`. Those two names are read with `$.env.get` (a string
+ * `${CLAUDE_SESSION_ID}`. T542: `$.session.id()` is read first; those two names are the
+ * fallback, read with `$.env.get` (a string
  * literal, which `claude plugin validate` can see). If both are missing or
  * blank, the band says "unbound" and does not call status.
  *
@@ -352,16 +353,28 @@ function envString(value) {
 }
 
 /**
+ * T542: the engine's own `$.session.id()` is the session id, and it follows /clear and resume.
+ * The env vars are a fallback for a host without it: after /reload-plugins on 2.1.296 they read empty.
+ * @param {any} $
+ * @returns {Promise<Record<string, string>>}
+ */
+async function sessionEnv($) {
+  let sid = "";
+  try { sid = envString(await $.session.id()); } catch { /* no session noun: env below */ }
+  return {
+    CLAUDE_CODE_SESSION_ID: sid || envString(await $.env.get("CLAUDE_CODE_SESSION_ID")),
+    CLAUDE_SESSION_ID: envString(await $.env.get("CLAUDE_SESSION_ID")),
+  };
+}
+
+/**
  * Production read. `$` stays on this top-level function so `claude plugin validate`
  * sees `$.env.get`, `$.clock.now`, and `$.http.fetch`.
  * @param {{ env: { get: (name: string) => Promise<unknown> }, clock: { now: () => Promise<number> }, http: { fetch: (url: string) => Promise<{ ok?: boolean, text?: unknown }> } }} $
  * @returns {Promise<{ band: string, sections: string[], snapshot: unknown }>}
  */
 export async function loadStatus($) {
-  const env = {
-    CLAUDE_CODE_SESSION_ID: envString(await $.env.get("CLAUDE_CODE_SESSION_ID")),
-    CLAUDE_SESSION_ID: envString(await $.env.get("CLAUDE_SESSION_ID")),
-  };
+  const env = await sessionEnv($);
   const sessionId = resolveSessionId(env);
   const now = await $.clock.now();
   const band = await statusText(env, {
@@ -426,10 +439,7 @@ export function register(on) {
     try {
       if (e?.props?.hasSurvey) return next(e);
       const { Text } = $.ui.resolve(e);
-      const env = {
-        CLAUDE_CODE_SESSION_ID: envString(await $.env.get("CLAUDE_CODE_SESSION_ID")),
-        CLAUDE_SESSION_ID: envString(await $.env.get("CLAUDE_SESSION_ID")),
-      };
+      const env = await sessionEnv($);
       const now = await $.clock.now();
       await statusText(env, {
         now: typeof now === "number" ? now : 0,
@@ -448,10 +458,7 @@ export function register(on) {
       const { Box, Text } = $.ui.resolve(e);
       // The pane must never show another session's snapshot either: resolve the current
       // session id and read only the snapshot stored under it (T308 AC2).
-      const env = {
-        CLAUDE_CODE_SESSION_ID: envString(await $.env.get("CLAUDE_CODE_SESSION_ID")),
-        CLAUDE_SESSION_ID: envString(await $.env.get("CLAUDE_SESSION_ID")),
-      };
+      const env = await sessionEnv($);
       const sid = resolveSessionId(env);
       const sections = renderSections(currentSnapshot(sid)) ?? ["mbx: unavailable"];
       return Box({

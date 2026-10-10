@@ -190,3 +190,20 @@ test("a policy keeps project keys and drops nothing the loader already removed",
   assert.equal(rows[0].has_local_scope, true);
   assert.equal(got.body.includes(HOME), false);
 });
+
+test("T498: sync preserves outward-reversible without expanding an older signed class list", () => {
+  const policy: PolicyInput = {
+    policy_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV", level: "collaborate", classes: ["read", "edit", "outward-reversible"],
+    to: { agents: ["worker"], hosts: ["alpha"] }, from: { agents: ["*"], hosts: ["local"] },
+    project_keys: [KEY], has_local_scope: true, issued_at: "2026-10-05T00:00:00.000Z", expires_at: null,
+    owner_fp: "abcd-ef01-2345-6789", source: "cli", command_id: null, state: "active", provisional: false,
+  };
+  for (const classes of [policy.classes, ["read", "edit"]]) {
+    const got = projectSync(snap({ policies: [{ ...policy, classes }] }));
+    assert.equal(got.ok, true);
+    if (!got.ok) continue;
+    const rows = (got.batch.policies as { upsert: { classes: string[]; expires_at: string | null }[] }).upsert;
+    assert.deepEqual(rows[0].classes, classes);
+    assert.equal(rows[0].expires_at, null);
+  }
+});

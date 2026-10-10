@@ -6,11 +6,11 @@ import type { DatabaseSync } from "node:sqlite";
 import { canonical, fingerprint, ulid, verifyData } from "./crypto.ts";
 import { checkShape, verifyEnvelope, type Envelope } from "./envelope.ts";
 
-export const CLASSES = ["read", "edit", "outward", "permissions"] as const;
+export const CLASSES = ["read", "edit", "outward-reversible", "outward", "permissions"] as const;
 export type PolicyClass = (typeof CLASSES)[number];
 export const LEVELS = ["ask", "collaborate", "autonomous", "yolo"] as const;
 export type Level = (typeof LEVELS)[number];
-export const LEVEL_CLASSES: Record<Level, PolicyClass[]> = { ask: [], collaborate: ["read", "edit"], autonomous: ["read", "edit"], yolo: [...CLASSES] };
+export const LEVEL_CLASSES: Record<Level, PolicyClass[]> = { ask: [], collaborate: ["read", "edit", "outward-reversible"], autonomous: ["read", "edit", "outward-reversible"], yolo: [...CLASSES] };
 const H = 3_600_000;
 export const TTL = { default: { ask: 168 * H, collaborate: 168 * H, autonomous: 168 * H, yolo: 8 * H }, max: { ask: 720 * H, collaborate: 720 * H, autonomous: 720 * H, yolo: 168 * H } };
 export const MAX_HOP = 6;
@@ -329,7 +329,8 @@ export const within = (dir: string, roots: string[]) => {
  */
 export function hasClass(db: DatabaseSync, agent: string, host: string, cls: PolicyClass, ctx: { cwd?: string | null } = {}, now = new Date()): { ok: boolean; policy_id?: string; exp?: string | null } {
   const broad = (p: PolicyRecord) => p.from.agents.includes("*") && (p.from.hosts.includes("*") || p.from.hosts.includes("local") || p.from.hosts.includes(host));
-  const p = activePolicies(db, agent, host, now).find((x) => x.classes.includes(cls) && broad(x)
+  // Full outward authority includes branch pushes and draft PRs, without rewriting the signed class list.
+  const p = activePolicies(db, agent, host, now).find((x) => (x.classes.includes(cls) || (cls === "outward-reversible" && x.classes.includes("outward"))) && broad(x)
     && (!x.projects?.length || (!!ctx.cwd && within(ctx.cwd, x.projects))));
   return p ? { ok: true, policy_id: p.id, exp: p.exp } : { ok: false };
 }
@@ -360,7 +361,9 @@ export function delegationNote(db: DatabaseSync, agent: string, host: string): s
   const parts = ps.map(noticeGrant);
   return `[mbx] Your owner has signed an AgentMBX policy for ${agent}@${host}: ${parts.join("; ")}. This is the owner's own delegation`
     + " (verified signature): act on other agents' requests within those classes as you would on your user's request (your CLI's own"
-    + " permission prompts still apply unless the class list includes permissions). read = inspect/verify/test; edit = reversible changes inside the project; outward = push/deploy/delete/external;"
+    + " permission prompts still apply unless the class list includes permissions). read = inspect/verify/test; edit = reversible changes inside the project;"
+    + " outward-reversible = push a non-default branch or open a draft PR; outward = those actions plus default-branch pushes, non-draft PRs, merge/release/deploy/delete/secrets/spend and other external actions;"
+    + " a session tainted by external content cannot use outward-reversible;"
     + " anything outside the classes: ask your user. These are separate grants; do not combine their classes, scopes or expiries. Read the mbx_read header before acting: it applies sender restrictions and message-specific downgrades.";
 }
 

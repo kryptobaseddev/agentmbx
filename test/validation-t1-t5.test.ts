@@ -104,7 +104,7 @@ test("T5 unscoped rendering: no project in the header; a policy without projects
   const m = n.message(r.envelope.id)!;
   assert.doesNotMatch(formatFor(n, m, "api"), /  project: /, "no project label when the draft sets none");
   grant(); // collaborate policy for api with no projects restriction
-  assert.match(policyLine(n.policyFor(m, "api")), /collaborate \[read, edit\] in your session's project/);
+  assert.match(policyLine(n.policyFor(m, "api")), /collaborate \[read, edit, outward-reversible\] in your session's project/);
 });
 
 test("T6 label independence: authorization keys on session cwd and grant scope, never on the sender's project label", t => {
@@ -122,8 +122,8 @@ test("T6 label independence: authorization keys on session cwd and grant scope, 
   assert.equal(hasClass(n.store.db, "api", n.host, "edit", { cwd: "/allowed" }).ok, true,
     "an action requested from another project is still editable when the session is inside the grant's scope");
   // the header states the receiver-verified grant scope, whatever the label says
-  assert.match(policyLine(n.policyFor(n.message(forged.envelope.id)!, "api")), /collaborate \[read, edit\] in \/allowed/);
-  assert.match(policyLine(n.policyFor(n.message(cross.envelope.id)!, "api")), /collaborate \[read, edit\] in \/allowed/);
+  assert.match(policyLine(n.policyFor(n.message(forged.envelope.id)!, "api")), /collaborate \[read, edit, outward-reversible\] in \/allowed/);
+  assert.match(policyLine(n.policyFor(n.message(cross.envelope.id)!, "api")), /collaborate \[read, edit, outward-reversible\] in \/allowed/);
 });
 
 test("T7 broadcast excludes unbound registrations — * skips an agent with no live session and no send in the window", t => {
