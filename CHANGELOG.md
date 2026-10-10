@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Doctor and the daemon notice two OpenCode processes on one bound session (T522).** Overlapping assistant turns in that session's `session_message` rows are the signal (each turn also carries a git snapshot). The daemon writes one `opencode.duplicate_loop` audit row when that set changes. `agentmbx doctor` warns, and a warning does not fail the run. The plugin still spawns only `agentmbx hook`, never an `opencode` child, on each hook.
+
 ## 0.5.24 (2026-10-10)
 
 Fixes from the v0.5.23 harness checks. The Claude plugin loads the version you installed and finds its session, Hermes binds its real session id past 64 KiB of history, OpenCode 2.0 keeps the mbx server, and a standalone OpenCode session is woken through the plugin inside its own serve. Signed collaboration grants now cover reversible outward work: a non-default branch push or a draft PR.
