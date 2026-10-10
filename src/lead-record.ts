@@ -104,11 +104,17 @@ export function projectLeadLine(view: ProjectLeadView): string {
 
 const leadToken = (to: string): boolean => to === "lead" || to === "role:lead";
 
+/** The expanded `to` plus the address `lead`/`role:lead` resolved to (null when no lead token was
+ *  present), so the caller can mark exactly the targets the tokens produced (T491). */
+export interface LeadResolution { to: string[]; leadAddress: string | null }
+
 /** Expand `lead` and `role:lead` to the owner-designated lead before the envelope is signed.
  *  Any other role stays a fan-out. Both tokens are one address and are de-duplicated. A prebuilt
- *  envelope is not passed here: its signature already commits to `to`. */
-export function resolveLeadRecipients(node: MbxNode, fromName: string, to: string[], project?: string): string[] {
-  if (!to.some(leadToken)) return to;
+ *  envelope is not passed here: its signature already commits to `to`. Holder liveness is NOT
+ *  consulted here (that graph belongs to receipts); the returned leadAddress lets the caller mark
+ *  the resolved targets for the send-time receipt check. */
+export function resolveLeadRecipients(node: MbxNode, fromName: string, to: string[], project?: string): LeadResolution {
+  if (!to.some(leadToken)) return { to, leadAddress: null };
   const folder = project || identityProjects(node.store, fromName)[0];
   if (!folder) fail("NO_PROJECT", "no project for this sender: lead and role:lead need the sender's project");
   const lead = activeLead(node, folder) ?? fail("NO_LEAD", "no owner-designated lead is set for this sender's project");
@@ -122,5 +128,5 @@ export function resolveLeadRecipients(node: MbxNode, fromName: string, to: strin
     const next = leadToken(token) ? address : token;
     if (!out.includes(next)) out.push(next);
   }
-  return out;
+  return { to: out, leadAddress: address };
 }

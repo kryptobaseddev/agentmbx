@@ -75,7 +75,14 @@ export function recipientReceipts(node, msgId, targets, now = Date.now()) {
         }
         const live = mailboxLiveness(node, name, now);
         let state, detail;
-        if (!live.live) {
+        if (t.lead && !live.live) {
+            // T491: `lead`/`role:lead` names the owner-designated lead. When its mailbox has no live holder the
+            // send is queued, not just "offline": the sender must hear that the project's lead will not see this
+            // until a session claims the mailbox or the owner acts, and urgent copies escalate to the owner.
+            state = "queued-no-holder";
+            detail = `addressed to the owner-designated lead; ${live.detail}; it waits here until a session claims ${name} or the owner forwards it, and the owner is notified`;
+        }
+        else if (!live.live) {
             state = "offline";
             detail = live.detail;
         }
@@ -113,8 +120,10 @@ export function recipientReceipts(node, msgId, targets, now = Date.now()) {
     return out;
 }
 /** Warning lines for recipients nobody will read soon. */
-export const offlineWarnings = (rs) => rs.filter((r) => r.state === "offline" || (r.state === "forwarded" && /offline: /.test(r.detail)))
-    .map((r) => `${r.address} is offline: ${r.detail.replace(/^.*offline: /, "")}. The message waits in its mailbox; tell your user if it is urgent.`);
+export const offlineWarnings = (rs) => rs.filter((r) => r.state === "offline" || r.state === "queued-no-holder" || (r.state === "forwarded" && /offline: /.test(r.detail)))
+    .map((r) => r.state === "queued-no-holder"
+    ? `${r.address} is the owner-designated lead but has no live holder: ${r.detail}. The message is queued here, not delivered; the owner is notified. Tell your user it needs the lead back or an owner forward.`
+    : `${r.address} is offline: ${r.detail.replace(/^.*offline: /, "")}. The message waits in its mailbox; tell your user if it is urgent.`);
 /** Levenshtein distance, capped (names are at most 40 characters). */
 function distance(a, b) {
     const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);

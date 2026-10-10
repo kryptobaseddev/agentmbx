@@ -109,10 +109,12 @@ export function projectLeadLine(view) {
 const leadToken = (to) => to === "lead" || to === "role:lead";
 /** Expand `lead` and `role:lead` to the owner-designated lead before the envelope is signed.
  *  Any other role stays a fan-out. Both tokens are one address and are de-duplicated. A prebuilt
- *  envelope is not passed here: its signature already commits to `to`. */
+ *  envelope is not passed here: its signature already commits to `to`. Holder liveness is NOT
+ *  consulted here (that graph belongs to receipts); the returned leadAddress lets the caller mark
+ *  the resolved targets for the send-time receipt check. */
 export function resolveLeadRecipients(node, fromName, to, project) {
     if (!to.some(leadToken))
-        return to;
+        return { to, leadAddress: null };
     const folder = project || identityProjects(node.store, fromName)[0];
     if (!folder)
         fail("NO_PROJECT", "no project for this sender: lead and role:lead need the sender's project");
@@ -129,5 +131,5 @@ export function resolveLeadRecipients(node, fromName, to, project) {
         if (!out.includes(next))
             out.push(next);
     }
-    return out;
+    return { to: out, leadAddress: address };
 }

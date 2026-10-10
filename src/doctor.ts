@@ -1,7 +1,7 @@
 // `agentmbx doctor`: one checklist that says what works, what doesn't, and the one command that fixes it.
 import { rotationLog } from "./key-rotation.ts";
 import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { phantomMailboxes, returnDays } from "./stranded.ts";
+import { escalatedCount, phantomMailboxes, returnDays } from "./stranded.ts";
 import { delimiter, dirname, join } from "node:path";
 import { fingerprint } from "./crypto.ts";
 import { signHop } from "./http.ts";
@@ -172,11 +172,14 @@ export function strandedMail(node: MbxNode): Check[] {
     .map((r) => ({ name: r.name, unread: r.unread, detail: r.liveness.detail }))
     .sort((a, b) => b.unread - a.unread || a.name.localeCompare(b.name));
   const days = returnDays(node);
-  const out: Check[] = stranded.slice(0, STRANDED_MAX).map((s) => { const p = phantoms.get(s.name); return p
-    ? { level: "warn" as Level, label: `${s.name}: phantom mailbox — ${s.unread} message(s) addressed to ${s.name}@${p.hosts.join(", ")}, which received them there; nobody holds ${s.name} here`,
+  const out: Check[] = stranded.slice(0, STRANDED_MAX).map((s) => { const p = phantoms.get(s.name);
+    const esc = escalatedCount(node, s.name);
+    const escLabel = esc ? `; ${esc} urgent message(s) (alert/needs-reply) escalated to the owner with a desktop notice` : "";
+    return p
+    ? { level: "warn" as Level, label: `${s.name}: phantom mailbox — ${s.unread} message(s) addressed to ${s.name}@${p.hosts.join(", ")}, which received them there; nobody holds ${s.name} here${escLabel}`,
       fix: "agentmbx doctor --fix   (marks these copies handled; nothing is deleted)" }
     : { level: "warn" as Level,
-    label: `${s.name}: ${s.unread} unread message(s) stranded — ${s.detail}`,
+    label: `${s.name}: ${s.unread} unread message(s) stranded — ${s.detail}${escLabel}`,
     fix: `the owning agent resumes it with mbx_identity {"action":"claim","name":"${s.name}"}, or the owner forwards the mail: agentmbx identity forward ${s.name} <to>`
       + (days && !node.establishedLocalName(s.name) ? `; ${s.name} is not an agent here, so new mail to it goes back to its sender after ${days} days` : "") }; });
   if (stranded.length > STRANDED_MAX) out.push({ level: "warn" as Level, label: `… ${stranded.length - STRANDED_MAX} more mailbox(es) with stranded unread mail` });

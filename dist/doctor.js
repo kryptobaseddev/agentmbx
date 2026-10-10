@@ -1,7 +1,7 @@
 // `agentmbx doctor`: one checklist that says what works, what doesn't, and the one command that fixes it.
 import { rotationLog } from "./key-rotation.js";
 import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { phantomMailboxes, returnDays } from "./stranded.js";
+import { escalatedCount, phantomMailboxes, returnDays } from "./stranded.js";
 import { delimiter, dirname, join } from "node:path";
 import { fingerprint } from "./crypto.js";
 import { signHop } from "./http.js";
@@ -207,11 +207,13 @@ export function strandedMail(node) {
     const days = returnDays(node);
     const out = stranded.slice(0, STRANDED_MAX).map((s) => {
         const p = phantoms.get(s.name);
+        const esc = escalatedCount(node, s.name);
+        const escLabel = esc ? `; ${esc} urgent message(s) (alert/needs-reply) escalated to the owner with a desktop notice` : "";
         return p
-            ? { level: "warn", label: `${s.name}: phantom mailbox — ${s.unread} message(s) addressed to ${s.name}@${p.hosts.join(", ")}, which received them there; nobody holds ${s.name} here`,
+            ? { level: "warn", label: `${s.name}: phantom mailbox — ${s.unread} message(s) addressed to ${s.name}@${p.hosts.join(", ")}, which received them there; nobody holds ${s.name} here${escLabel}`,
                 fix: "agentmbx doctor --fix   (marks these copies handled; nothing is deleted)" }
             : { level: "warn",
-                label: `${s.name}: ${s.unread} unread message(s) stranded — ${s.detail}`,
+                label: `${s.name}: ${s.unread} unread message(s) stranded — ${s.detail}${escLabel}`,
                 fix: `the owning agent resumes it with mbx_identity {"action":"claim","name":"${s.name}"}, or the owner forwards the mail: agentmbx identity forward ${s.name} <to>`
                     + (days && !node.establishedLocalName(s.name) ? `; ${s.name} is not an agent here, so new mail to it goes back to its sender after ${days} days` : "") };
     });

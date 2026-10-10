@@ -746,7 +746,7 @@ export class MbxNode {
         const pub = this.ownerPub;
         if (!pub)
             throw new Error("no owner key on this machine: run 'agentmbx owner init'");
-        const to = resolveLeadRecipients(this, "owner", d.to, d.project);
+        const { to } = resolveLeadRecipients(this, "owner", d.to, d.project);
         const req = ownerSignRequest(buildEnvelope({ ...d, to, from: `owner@${this.host}` }), pub);
         return this.send({ ...d, to, from: "owner" }, undefined, undefined, withOwnerSig(req.envelope, (await sign(req.payload)).sig));
     }
@@ -756,7 +756,8 @@ export class MbxNode {
             throw new Error(`invalid sender name "${fromName}"`);
         // A prebuilt envelope is already signed, so its `to` stays. Callers that build one (sendAsOwner)
         // resolve lead tokens before that signature.
-        const to = prebuilt ? d.to : resolveLeadRecipients(this, fromName, d.to, d.project);
+        const lead = prebuilt ? { to: d.to, leadAddress: null } : resolveLeadRecipients(this, fromName, d.to, d.project);
+        const to = lead.to;
         let e = prebuilt ?? buildEnvelope({ ...d, to, from: `${fromName}@${this.host}` });
         // Positive host attestation comes from the current lease operation, never a draft flag.
         // A prebuilt owner-signed envelope is immutable: changing metadata would invalidate its approval.
@@ -765,6 +766,17 @@ export class MbxNode {
         if (!prebuilt)
             e.meta.sender_verification = !d.unverifiedSender && hasHeldIdentity(this.store, fromName) ? "leased" : "unverified";
         const r = this.route(e.to);
+        // T491: mark exactly the targets the lead tokens resolved to (a fan-out or broadcast that happens to
+        // include the lead agent is not lead mail). Remote leads are the paired host's liveness question.
+        if (lead.leadAddress) {
+            const at = lead.leadAddress.indexOf("@"); // a local lead resolves to a bare name; a remote one to name@host
+            const leadName = at === -1 ? lead.leadAddress : lead.leadAddress.slice(0, at);
+            const leadHost = at === -1 ? this.host : lead.leadAddress.slice(at + 1);
+            if (leadHost === this.host)
+                for (const t of r.targets)
+                    if (!t.host && t.name === leadName && t.to === lead.leadAddress)
+                        t.lead = true;
+        }
         // Name the bare recipients this host delivered to its own agents, inside the signed envelope, so a paired host that
         // also has an agent of that name skips its copy exactly (no reliance on its possibly stale directory of this host).
         const localBare = [...new Set(r.targets.filter((t) => !t.host && t.name && t.name !== "owner" && !t.to.includes("@") && !t.to.startsWith("role:") && t.to !== "*").map((t) => t.to))];

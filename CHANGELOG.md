@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Project lead mail no longer sits silently in a mailbox with no live holder (T491):** mail to `lead`/`role:lead` whose resolved lead mailbox has no live holder now reports the recipient state `queued-no-holder` (plainly addressed unheld agents keep `offline`), with a sender-facing warning naming the lead recipient. The daemon's 60-second pass escalates urgent copies — kind `alert` or anything carrying `needs_reply` — in established mailboxes with no live holder: one desktop notice to the owner per copy, exactly once via a kv marker, and `agentmbx doctor`'s stranded row now names how many urgent messages were escalated per mailbox. Bare project names are unchanged (T493 covers those separately).
+
 ## 0.5.22 (2026-10-10)
 
 Setup recognises its own entries in every form and stops duplicating hooks: Hermes folded YAML, Grok's sub-table hooks and older shim or bare commands are matched by meaning and replaced in place; setup and doctor accept any existing node running the installed agentmbx script, so they agree across shells; an entry setup cannot parse is reported for a manual fix instead of duplicated. The limits-fuzz test no longer flakes under load.
