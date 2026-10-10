@@ -19,6 +19,7 @@ import { mailboxLiveness } from "./receipts.js";
 import { liveWatcher } from "./wake.js";
 import { findIdentityControl, listIdentityControls } from "./identity-control.js";
 import { pruneCandidates } from "./identity-cleanup.js";
+import { staleProjectBindings } from "./registry.js";
 import { deadHolderLeases, inspectLeaseProcess } from "./identity-leases.js";
 import { providerLabel, sameLiveProvider } from "./identity-takeover.js";
 export const CLAIM_CHURN_LIMIT = 5;
@@ -247,6 +248,13 @@ export function pruneSummary(node) {
     return retire.length
         ? { level: "warn", label: `${retire.length} generated mailbox(es) with no holder, no unread mail and no recent traffic would be retired`, fix: "review the list: agentmbx identity prune   (a dry run), then apply it: agentmbx identity prune --apply" }
         : { level: "info", label: "no generated mailboxes eligible for prune" };
+}
+/** How many project bindings are older than another project for the same identity (T515). Read-only. */
+export function staleBindingSummary(node) {
+    const stale = staleProjectBindings(node.store);
+    return stale.length
+        ? { level: "warn", label: `${stale.length} project binding(s) are older than another project for the same identity`, fix: "review the list: agentmbx identity bindings   (a dry run), then apply it: agentmbx identity bindings --apply" }
+        : { level: "info", label: "no project bindings older than another project for the same identity" };
 }
 /** OpenCode's LocationActivity drops an idle service about every 60 minutes, and the plugin then releases and claims again.
  *  A claim within ~65 minutes of its release, with those pairs about 61 minutes apart, is that eviction. One restart is not.
@@ -656,6 +664,7 @@ export async function doctor(ctx, mbxHome, opts = {}) {
         for (const c of foreignSessionProvider(node))
             out.push(c);
         out.push(pruneSummary(node));
+        out.push(staleBindingSummary(node));
         const peers = node.peers();
         const approved = peers.filter((p) => p.state === "approved");
         if (!approved.length)

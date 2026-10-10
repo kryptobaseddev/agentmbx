@@ -113,14 +113,52 @@ export function noteProject(store, name, project, now = new Date()) {
     store.db.prepare(`INSERT INTO identity_projects (name,project,first_seen,last_seen) VALUES (?,?,?,?)
     ON CONFLICT(name,project) DO UPDATE SET last_seen=excluded.last_seen`).run(name, project, at, at);
 }
-/** Identities associated with a project: recorded binds, plus legacy session rows in that folder. */
+/** Identities recorded in identity_projects for this folder. A session cwd is not a binding:
+ *  a shared host process records its own folder for every persona it serves (T515). */
 export function projectIdentities(store, project) {
     const out = new Set();
     for (const r of store.db.prepare("SELECT name FROM identity_projects WHERE project=?").all(project))
         out.add(r.name);
-    for (const r of store.db.prepare("SELECT DISTINCT agent FROM sessions WHERE cwd=?").all(project))
-        out.add(r.agent);
     return out;
+}
+/** Bindings older than another project for the same identity. One project stays. A tie for the
+ *  newest last_seen stays. Read-only: the dry run of `agentmbx identity bindings`. */
+export function staleProjectBindings(store) {
+    const rows = store.db.prepare("SELECT name, project, last_seen FROM identity_projects ORDER BY name, last_seen DESC, project").all();
+    const out = [];
+    let i = 0;
+    while (i < rows.length) {
+        let j = i + 1;
+        while (j < rows.length && rows[j].name === rows[i].name)
+            j++;
+        const group = rows.slice(i, j);
+        const newest = group[0].last_seen;
+        const keeper = group.find((r) => r.last_seen === newest);
+        for (const r of group) {
+            if (r.last_seen < newest)
+                out.push({
+                    name: r.name, project: r.project, last_seen: r.last_seen,
+                    kept_project: keeper.project, kept_last_seen: keeper.last_seen,
+                });
+        }
+        i = j;
+    }
+    return out;
+}
+/** Delete bindings from a dry-run list. A row whose last_seen changed after the list was built is left. */
+export function removeStaleProjectBindings(store, rows) {
+    return store.tx(() => {
+        const del = store.db.prepare("DELETE FROM identity_projects WHERE name=? AND project=? AND last_seen=?");
+        let n = 0;
+        for (const r of rows)
+            n += Number(del.run(r.name, r.project, r.last_seen).changes);
+        if (n)
+            store.audit("project.binding.removed", {
+                removed: n,
+                bindings: rows.slice(0, 50).map((r) => ({ name: r.name, project: r.project, kept: r.kept_project })),
+            });
+        return n;
+    });
 }
 export function identityProjects(store, name) {
     return store.db.prepare("SELECT project FROM identity_projects WHERE name=? ORDER BY last_seen DESC").all(name).map(r => r.project);
@@ -145,8 +183,8 @@ export function backfillRegistry(store, host) {
             continue;
         store.db.prepare("INSERT OR IGNORE INTO identities (name,role,description,registered_at,registered_by) VALUES (?,?,NULL,?,'backfill')").run(to, UNSPECIFIED_ROLE, at);
     }
-    for (const r of store.db.prepare("SELECT DISTINCT agent, cwd FROM sessions WHERE cwd IS NOT NULL").all())
-        store.db.prepare("INSERT OR IGNORE INTO identity_projects (name,project,first_seen,last_seen) VALUES (?,?,?,?)").run(r.agent, r.cwd, at, at);
+    // Session cwd is not copied (T515). Doing so made a shared host process's folder a permanent
+    // membership for every persona that process had served.
 }
 /**
  * A provider's hooks know their session id; an MCP server started with a provisional id (terminal Kimi, a Claude session
