@@ -23,6 +23,7 @@ import { staleProjectBindings } from "./registry.js";
 import { deadHolderLeases, inspectLeaseProcess } from "./identity-leases.js";
 import { providerLabel, sameLiveProvider } from "./identity-takeover.js";
 import { conversationLoopLabel, detectConversationLoops } from "./loop-detector.js";
+import { opencodeDuplicateLoopChecks } from "./opencode-duplicate-loop.js";
 /** Observational only: doctor must never notify, mark deliveries or consume wake reservations. */
 export function conversationLoopChecks(node, now = Date.now()) {
     try {
@@ -656,6 +657,9 @@ export async function doctor(ctx, mbxHome, opts = {}) {
             if (c)
                 out.push(c);
         }
+        if (d.cli === "opencode" && node)
+            for (const c of opencodeDuplicateLoopChecks(node))
+                out.push(c);
         // T460: its own function too (the T435 rule): a refused hooks layout and the not-approved state are Hermes facts.
         if (d.cli === "hermes")
             for (const c of hermesHooksChecks(ctx))

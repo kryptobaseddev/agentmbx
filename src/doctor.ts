@@ -23,6 +23,7 @@ import { staleProjectBindings } from "./registry.ts";
 import { deadHolderLeases, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
 import { providerLabel, sameLiveProvider } from "./identity-takeover.ts";
 import { conversationLoopLabel, detectConversationLoops } from "./loop-detector.ts";
+import { opencodeDuplicateLoopChecks } from "./opencode-duplicate-loop.ts";
 
 export type Level = "ok" | "fail" | "warn" | "info";
 export interface Check { level: Level; label: string; fix?: string }
@@ -554,6 +555,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     // collision — see the T435 note above) and runs only when an opencode mailbox is bound.
     if (d.cli === "opencode" && node) { const c = await opencodeServiceCheck(node); if (c) out.push(c); }
     if (d.cli === "opencode" && node) { const c = opencodeEvictionCheck(node.store.db); if (c) out.push(c); }
+    if (d.cli === "opencode" && node) for (const c of opencodeDuplicateLoopChecks(node)) out.push(c);
     // T460: its own function too (the T435 rule): a refused hooks layout and the not-approved state are Hermes facts.
     if (d.cli === "hermes") for (const c of hermesHooksChecks(ctx)) out.push(c);
     // T502/T504: the explicit MCP startup timeout and the resolved command path are checked for
