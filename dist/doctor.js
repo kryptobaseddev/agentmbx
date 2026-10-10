@@ -14,7 +14,7 @@ import { version } from "./version.js";
 import { GROK_NO_PUSH, MbxNode, RETRY_HOURS, staleMcpKvCensus } from "./node.js";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.js";
 import { claudePluginChecks } from "./claude-plugin.js";
-import { detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConsent, mcpConfiguredCmd, mcpConfiguredTimeout, skillDest, skillStatus, statuslineConfiguredCommand, statuslineForms, statuslineState, wired } from "./setup.js";
+import { detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConsent, mcpConfiguredCmd, mcpConfiguredTimeout, skillDest, skillStatus, statuslineConfiguredCommand, statuslineCurrent, statuslineState, wired } from "./setup.js";
 import { mailboxLiveness } from "./receipts.js";
 import { liveWatcher } from "./wake.js";
 import { findIdentityControl, listIdentityControls } from "./identity-control.js";
@@ -482,7 +482,7 @@ export function statuslineChecks(ctx, cli) {
     if (state === "ours") {
         if (scriptPath && !existsSync(scriptPath))
             out.push({ level: "warn", label: `${cli}: status line points at a missing script (${scriptPath})`, fix: "agentmbx setup --only skill" });
-        else if (configured !== null && !statuslineForms(ctx.home, cli, ctx.cmd).has(configured))
+        else if (configured !== null && !statuslineCurrent(ctx.home, cli, ctx.cmd, configured))
             out.push({ level: "warn", label: `${cli}: status line uses an older AgentMBX form (${configured})`, fix });
         else
             out.push({ level: "ok", label: `${cli}: status line wired (${where})${cli === "claude"

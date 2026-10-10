@@ -163,6 +163,16 @@ export const statuslineForms = (home: string, cli: "claude" | "kimi" | "grok", c
   `sh ${shJoin([join(skillDest(home), "scripts", `${cli}-statusline.sh`)])}`,
   `${shJoin(cmd)} statusline ${cli}`,
 ]);
+/** T536: a status line is current when setup would write it, or when it is any existing node
+ *  plus this install's entry (the T533 matcher). A mise shim or bare `agentmbx` is ours but not
+ *  current, so setup rewrites it and doctor warns — the two never disagree. */
+export function statuslineCurrent(home: string, cli: "claude" | "kimi" | "grok", cmd: string[], command: string): boolean {
+  if (statuslineForms(home, cli, cmd).has(command)) return true;
+  const tail = ` statusline ${cli}`;
+  if (!command.endsWith(tail)) return false;
+  const tokens = shellTokens(command.slice(0, -tail.length));
+  return !!tokens && tokens.length === 2 && existsSync(tokens[0]) && namesInstalledEntry(tokens[1]);
+}
 const isOurStatusline = (home: string, cli: "claude" | "kimi" | "grok", cmd: string[], command: string | undefined): boolean =>
   !!command && (statuslineForms(home, cli, cmd).has(command)
     // Re-review minor: also recognise the exact forms older setups wrote — the bare command and any
@@ -373,7 +383,7 @@ const grokStatus = (cur: string): GrokStatus => {
   if (ui && /^[ \t]*status_line[ \t]*[=.]/m.test(ui)) return { form: "foreign" }; // embedded in [ui]
   const body = tomlSectionAt(cur, "ui.status_line");
   if (body === null) return { form: "absent" };
-  const commandLine = /(?:^|\r?\n)[ \t]*command[ \t]*=[^\n]*\r?\n/.exec(body)?.[0] ?? null;
+  const commandLine = /(?:^|\r?\n)([ \t]*command[ \t]*=[^\n]*\r?\n)/.exec(body)?.[1] ?? null; // capture excludes the leading newline, so a rewrite never eats it
   return { form: "section", body, commandLine };
 };
 const grokCommandValue = (body: string): string | null => tomlStringValue(body, "command");
@@ -393,7 +403,7 @@ function grokStatusLine(home: string, cmd: string[]) {
         // Re-review medium B: a user section without exactly our command is foreign — a
         // `[ui.status_line] type = "builtin"` or no command at all is never edited, only reported.
         if (command === null || !isOurStatusline(home, "grok", cmd, command)) return cur;
-        if (command === w && /(?:^|\r?\n)[ \t]*type[ \t]*=[ \t]*"command"/.test(st.body)) return cur;
+        if (statuslineCurrent(home, "grok", cmd, command) && /(?:^|\r?\n)[ \t]*type[ \t]*=[ \t]*"command"/.test(st.body)) return cur;
         const eolOfFile = (cur ?? "").includes("\r\n") ? "\r\n" : "\n"; // minor: match the file's line ending
         return guarded(cur, (cur ?? "").replace(st.commandLine!, () => `command = ${JSON.stringify(w)}${eolOfFile}`)); // rewrite ONLY our line — type, refresh_interval, padding stay
       }
