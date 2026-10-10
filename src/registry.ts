@@ -90,9 +90,14 @@ export function renameRegistration(store: Store, from: string, to: string) {
   store.db.prepare("DELETE FROM identity_projects WHERE name=?").run(from);
 }
 
-/** Remember that `name` works in `project` (every bind, so a restarted agent finds its mailbox from its folder). */
-export function noteProject(store: Store, name: string, project: string | undefined, now = new Date()) {
-  if (!project) return;
+/** Remember that `name` is a member of `project` — but ONLY on an explicit claim or registration in
+ *  that project (T538). A session's cwd is not a binding: a persona served by a shared host process,
+ *  or an agent that happens to start in another project's folder, must not become a member merely by
+ *  where its process ran — that cwd upsert re-added foreign personas to the members surface as fast
+ *  as T515's prune removed them. Callers pass explicit=true only from the mbx_identity claim/register
+ *  path; every other call is a cwd observation and writes nothing. */
+export function noteProject(store: Store, name: string, project: string | undefined, explicit: boolean, now = new Date()) {
+  if (!project || !explicit) return;
   const at = now.toISOString();
   store.db.prepare(`INSERT INTO identity_projects (name,project,first_seen,last_seen) VALUES (?,?,?,?)
     ON CONFLICT(name,project) DO UPDATE SET last_seen=excluded.last_seen`).run(name, project, at, at);

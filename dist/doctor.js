@@ -14,7 +14,7 @@ import { version } from "./version.js";
 import { GROK_NO_PUSH, MbxNode, RETRY_HOURS, staleMcpKvCensus } from "./node.js";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.js";
 import { claudePluginChecks } from "./claude-plugin.js";
-import { detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConsent, mcpConfiguredCmd, mcpConfiguredTimeout, skillDest, skillStatus, statuslineConfiguredCommand, statuslineCurrent, statuslineState, wired } from "./setup.js";
+import { detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConfigPath, hermesConsent, mcpConfiguredCmd, mcpConfiguredTimeout, skillDest, skillStatus, statuslineConfiguredCommand, statuslineCurrent, statuslineState, wired } from "./setup.js";
 import { mailboxLiveness } from "./receipts.js";
 import { liveWatcher } from "./wake.js";
 import { findIdentityControl, listIdentityControls } from "./identity-control.js";
@@ -469,6 +469,12 @@ export function mcpCommandChecks(ctx, cli) {
 export function statuslineChecks(ctx, cli) {
     if (cli === "opencode")
         return [{ level: "info", label: "opencode: no custom status line feature (built-in segments only: anomalyco/opencode#30295); nothing to verify" }];
+    // T527: Hermes has no status-line feature at all (agentmbx-hermes verified live in its terminal,
+    // 2026-10-10). The daemon still writes hermes-<sid> HUD snapshots for `agentmbx status` and any
+    // future surface; there is just nothing in the TUI to render a segment. Silent when Hermes is
+    // not installed (the doctor loop only asks for detected CLIs; a direct call should stay quiet too).
+    if (cli === "hermes" && existsSync(hermesConfigPath(ctx.home)))
+        return [{ level: "info", label: "hermes: no status line feature in Hermes (agentmbx-hermes verified live, 2026-10-10); nothing to verify" }];
     if (cli !== "claude" && cli !== "kimi" && cli !== "grok")
         return [];
     const out = [];

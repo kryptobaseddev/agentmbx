@@ -166,6 +166,14 @@ function installedSlot(text: string | null, root: string, home: string): Slot {
   return owned ? "ours" : "foreign";
 }
 
+/** The version Claude Code actually loads: its cached install, not the package's plugin.json (T542). */
+export function installedClaudePluginVersion(home: string): string | null {
+  const all = jsonValue(readText(join(home, ".claude", "plugins", "installed_plugins.json")), ["plugins"]) as Record<string, unknown> | undefined;
+  const rows = all && typeof all === "object" ? all[CLAUDE_PLUGIN_ID] : undefined;
+  const row = (Array.isArray(rows) ? rows : [rows]).find((r) => r && typeof r === "object" && (r as { scope?: unknown }).scope === "user") as { version?: unknown } | undefined;
+  return typeof row?.version === "string" ? row.version : null;
+}
+
 export function classifyClaudePlugin(home: string, root = packageRoot()): Classified {
   const market = marketplaceSlot(readText(join(home, ".claude", "plugins", "known_marketplaces.json")), root);
   const enabled = enabledSlot(readText(join(home, ".claude", "settings.json")));
@@ -199,7 +207,19 @@ export function claudePluginStep(home: string, mode: "install" | "uninstall", dr
   const path = join(home, ".claude", "settings.json");
   const state = classifyClaudePlugin(home, root);
   if (state.kind === "foreign") return { action: "manual", path, note: state.note };
-  if (mode === "install" && state.kind === "ours") return { action: "unchanged", path, note: `${CLAUDE_PLUGIN_ID} already installed` };
+  if (mode === "install" && state.kind === "ours") {
+    const have = installedClaudePluginVersion(home);
+    if (have === version()) return { action: "unchanged", path, note: `${CLAUDE_PLUGIN_ID} already installed` };
+    // T542: an npm upgrade refreshes the marketplace source, never Claude's cached copy.
+    if (dryRun) return { action: "updated", path, note: `dry run: ${have ?? "unknown"} -> ${version()}` };
+    const result = run(runner, root, home, ["plugin", "update", CLAUDE_PLUGIN_ID, "--scope", "user", "-y"]);
+    const now = installedClaudePluginVersion(home);
+    if (result.status !== 0 || now !== version()) {
+      const detail = (result.stderr || result.stdout).trim().slice(0, 200);
+      return { action: "error", path, note: `claude plugin update left ${now ?? "unknown"}, want ${version()}${detail ? `: ${detail}` : ""}` };
+    }
+    return { action: "updated", path, note: `${CLAUDE_PLUGIN_ID} ${have ?? "unknown"} -> ${version()} (restart Claude Code to load it)` };
+  }
   if (mode === "install" && !shipsClaudePlugin(root)) return { action: "skipped", path, note: NOT_SHIPPED };
   if (mode === "uninstall" && state.kind === "absent") return { action: "unchanged", path, note: "Claude plugin not installed" };
   if (dryRun) return { action: mode === "install" ? "added" : "removed", path, note: "dry run" };
@@ -257,6 +277,9 @@ export function claudePluginChecks(home: string, opts: { useClis: boolean; runCl
     validated = true;
     validateOk = result.status === 0;
   }
+  const installed = installedClaudePluginVersion(home);
+  if (installed !== version())
+    return [{ level: "warn", label: `claude: loaded plugin is ${installed ?? "unknown"}, agentmbx is ${version()}`, fix }];
   if (!hooks || !versionOk || (validated && !validateOk))
     return [{ level: "warn", label: "claude: plugin installed but it does not load", fix }];
   return [{ level: "ok", label: validated ? "claude: plugin installed and loads (agentmbx@agentmbx)" : "claude: plugin installed (agentmbx@agentmbx)" }];

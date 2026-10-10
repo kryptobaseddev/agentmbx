@@ -69,3 +69,30 @@ test("statusline check: kimi is alert-only — nothing to show means an empty li
   assert.match(alert.stdout, /^mbx quiet-staff/);
   assert.ok(alert.stdout.includes("1↑"));
 });
+
+// T527 AC1: the daemon's generic HUD writer covers bound Hermes sessions — hermes-<sid> v1, v2 and
+// .line snapshots exist for `agentmbx status` and any future surface (Hermes itself has no status
+// line to render one; doctor documents that separately).
+test("hud check: a bound hermes session gets hermes-<sid> v1, v2 and line snapshots (T527)", (t) => {
+  const h = mkdtempSync(join(tmpdir(), "mbx-status-surface-hermes-")), n = new MbxNode(h, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(h, { recursive: true, force: true }); });
+  n.bindSession({ agent: "hermes-staff", cli: "hermes", session_id: "hermes-ses_hud", pid: process.pid, session_key: "k" });
+  new IdentityLeases(n.store).claim("hermes-staff", { pid: process.pid, start: inspectLeaseProcess(process.pid).start!, keyFp: "aaaa-bbbb-cccc-dddd", cli: "hermes", sessionId: "hermes-ses_hud" });
+  n.send({ from: "boss", to: ["hermes-staff"], subject: "one", body: "b" });
+  writeHud(n);
+  const v1 = JSON.parse(readFileSync(join(h, "hud", "hermes-hermes-ses_hud.json"), "utf8"));
+  assert.equal(v1.identity.name, "hermes-staff");
+  assert.equal(v1.identity.state, "bound");
+  assert.equal(v1.unread, 1);
+  const v2 = JSON.parse(readFileSync(join(h, "hud", "hermes-hermes-ses_hud.v2.json"), "utf8"));
+  assert.equal(v2.schema, "mbx.status/v2");
+  assert.equal(v2.harness.cli, "hermes");
+  assert.equal(v2.identity.name, "hermes-staff");
+  const line = readFileSync(join(h, "hud", "hermes-hermes-ses_hud.line"), "utf8");
+  assert.match(line, /^mbx hermes-staff/);
+  assert.ok(line.includes("1↑"));
+  // the binding dies (pid reused by a fake start): the snapshot prunes on the next pass
+  n.store.db.prepare("UPDATE sessions SET pid_start=? WHERE cli='hermes' AND session_id=?").run("2000-01-01T00:00:00Z", "hermes-ses_hud");
+  writeHud(n);
+  assert.throws(() => readFileSync(join(h, "hud", "hermes-hermes-ses_hud.json"), "utf8"), "a stale hermes snapshot prunes once its process is proven reused");
+});
