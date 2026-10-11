@@ -61,6 +61,15 @@ for (const failMode of ["error", "throw"]) test(`handover spawn failure (${failM
   assert.equal(lease.released_at, null, "a failed handover must not release the lease");
   assert.ok(listIdentityControls(node.store).some(d => d.agent === name), "the identity control endpoint survives");
   assert.notEqual((await client.callTool({ name: "mbx_inbox", arguments: {} })).isError, true, "tools keep working after the failed handover");
+  const schema = node.store.schemaVersion();
+  node.store.db.exec(`PRAGMA user_version=${schema + 1}`);
+  appendFileSync(entry, "\n// deployed schema build\n");
+  assert.equal((await whoami(client)).isError, true, "the stale schema is refused while the replacement fails");
+  assert.equal((await whoami(client)).isError, true, "a failed schema handover resumes the original reader");
+  assert.equal(node.store.db.prepare("SELECT released_at FROM identity_leases WHERE name=?").get(name)!.released_at, null,
+    "failed schema handover leaves the lease held");
+  node.store.db.exec(`PRAGMA user_version=${schema}`);
+  assert.notEqual((await whoami(client)).isError, true, "the original mailbox remains open after schema handover failure");
 });
 
 test("a child that exits right after spawning mirrors its exit (clean exit, not a half-retired server)", async t => {
