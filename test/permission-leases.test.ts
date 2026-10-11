@@ -78,7 +78,7 @@ for (const mutation of ["none", "release", "replace", "rebind"]) test(`OpenCode 
     }
     return Response.json({ data: [{ id: "per_test", sessionID: "ses_test", action: "Bash" }] });
   }) as typeof fetch;
-  const result = await opencodePermissionPass(node, yes, async () => ({ url: "http://test.invalid", auth: "" }), fake);
+  const result = await opencodePermissionPass(node, yes, async () => ({ url: "http://test.invalid", auth: "" }), fake, () => "service");
   assert.equal(result, mutation === "none" ? 1 : 0);
   assert.equal(posts, mutation === "none" ? 1 : 0);
 });
@@ -87,7 +87,7 @@ test("leased OpenCode provisional mailbox cannot approve an unbound same-folder 
   const { node } = fixture(t, "opencode", "mcp-test");
   let calls = 0;
   const fake = (async () => { calls++; return Response.json({ data: [{ id: "per_test", sessionID: "ses_unknown", action: "Bash" }] }); }) as typeof fetch;
-  assert.equal(await opencodePermissionPass(node, yes, async () => ({ url: "http://test.invalid", auth: "" }), fake), 0);
+  assert.equal(await opencodePermissionPass(node, yes, async () => ({ url: "http://test.invalid", auth: "" }), fake, () => "service"), 0);
   assert.equal(calls, 0);
 });
 
@@ -99,7 +99,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} legacy b
   const lookup = () => { lookups++; return yes(); };
   if (cli === "opencode") {
     const fake = (async () => { requests++; return Response.json({ data: [{ id: "per_test", sessionID: "ses_test", action: "Bash" }] }); }) as typeof fetch;
-    assert.equal(await opencodePermissionPass(node, lookup, async () => ({ url: "http://test.invalid", auth: "" }), fake), 0);
+    assert.equal(await opencodePermissionPass(node, lookup, async () => ({ url: "http://test.invalid", auth: "" }), fake, () => "service"), 0);
   } else assert.equal((await decidePermission(input, cli, lookup, { node, pid: process.pid })).allow, false);
   assert.equal(lookups, 0);
   assert.equal(requests, 0);
