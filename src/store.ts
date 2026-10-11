@@ -72,6 +72,12 @@ CREATE TABLE IF NOT EXISTS project_leads (  -- owner-signed project lead records
   id TEXT PRIMARY KEY, project TEXT NOT NULL, agent TEXT NOT NULL, record TEXT NOT NULL, sig TEXT NOT NULL,
   revocation TEXT, revocation_sig TEXT, received_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS project_leads_project ON project_leads(project);
+-- Project mailboxes (src/project-mailbox.ts, T493): one row per project, keyed by resolveProject(folder).key (the CLEO project id, else
+-- the folder). The slot is the reserved name its deliveries carry in the deliveries table; it is never an agent, identity or lease.
+-- home_host is the host of the first lead set and never changes. Additive: older runtimes ignore the table (no schema version change).
+CREATE TABLE IF NOT EXISTS project_mailboxes (
+  key TEXT PRIMARY KEY, slot TEXT NOT NULL UNIQUE, alias TEXT UNIQUE, home_host TEXT NOT NULL,
+  source TEXT NOT NULL, folder TEXT, created_at TEXT NOT NULL);
 -- Cross-host delivery receipts (src/remote-receipts.ts, T218). Every delivery state change of a message from a paired host
 -- is queued for that host by these triggers, so every path that moves a delivery (old runtimes included) is covered; the
 -- daemon signs and pushes them. Additive: older runtimes ignore the tables (no schema version change).

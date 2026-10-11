@@ -13,6 +13,7 @@ import { policyBrief } from "./policy.js";
 import { ulid } from "./crypto.js";
 import { opencodeHostOf } from "./opencode-provider.js";
 import { pushOpencodeWake } from "./opencode-wake-queue.js";
+import { notSlot } from "./project-slot.js";
 const run = promisify(execFile);
 const attemptId = () => ulid();
 const receipt = (strength, r = {}) => ({ strength, nativeId: null, sessionId: null, nativeStatus: null, providerVersion: null, ...r });
@@ -419,7 +420,8 @@ function noticeAllowed(node, agent, now) {
 /** One pass of the wake dispatcher: every delivered-but-not-notified message is either woken, batched or skipped. */
 export async function dispatchWakes(node, now = Date.now()) {
     reconcileWakes(node, now);
-    const pending = node.store.db.prepare(`SELECT d.agent, m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.state='delivered' ORDER BY m.ts`).all();
+    // T493: a project mailbox slot has no session of its own; waking its lead is a separate path, so the dispatcher leaves slot rows alone.
+    const pending = node.store.db.prepare(`SELECT d.agent, m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.state='delivered' AND ${notSlot("d.agent")} ORDER BY m.ts`).all();
     const byAgent = new Map();
     for (const r of pending)
         byAgent.set(r.agent, [...(byAgent.get(r.agent) ?? []), r]);

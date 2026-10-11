@@ -4,6 +4,7 @@
 // its sender after a while, so the sender can redirect it instead of believing it was delivered.
 import type { Envelope } from "./envelope.ts";
 import type { MbxNode } from "./node.ts";
+import { projectLabel, projectMailboxBySlot } from "./project-mailbox.ts";
 import { mailboxLiveness } from "./receipts.ts";
 
 export const DEFAULT_RETURN_DAYS = 7;
@@ -120,9 +121,13 @@ export function escalateUnheldMail(node: MbxNode, now = Date.now(), notify?: (su
     if (node.store.get(escalatedKey(r.id, r.mailbox))) continue;
     const why: EscalatedCopy["urgent"] = r.kind === "alert" ? "alert" : "needs-reply";
     node.store.set(escalatedKey(r.id, r.mailbox), new Date(now).toISOString()); // before the notice: at most one per copy
-    notify?.("AgentMBX: urgent mail with no live holder",
-      `${r.subject} — ${r.mailbox}@${node.host} has no live holder, so an ${why} from ${r.sender} waits unread. `
-      + `The owner sees this notice once. Remedies: claim the mailbox (mbx_identity action=claim name=${r.mailbox}) or forward it (agentmbx identity forward ${r.mailbox} <to>).`);
+    // T493: a project mailbox has no holder to claim; its reader is the project's lead, so the remedy is the lead's, not "claim pm-...".
+    const project = projectMailboxBySlot(node.store, r.mailbox);
+    notify?.("AgentMBX: urgent mail with no live holder", project
+      ? `${r.subject} — the project mailbox ${projectLabel(project)}@${node.host} has no live reader, so an ${why} from ${r.sender} waits unread. `
+        + `The owner sees this notice once. Remedy: reconnect the project's lead, or designate one (agentmbx lead set <agent> --project <dir>).`
+      : `${r.subject} — ${r.mailbox}@${node.host} has no live holder, so an ${why} from ${r.sender} waits unread. `
+        + `The owner sees this notice once. Remedies: claim the mailbox (mbx_identity action=claim name=${r.mailbox}) or forward it (agentmbx identity forward ${r.mailbox} <to>).`);
     node.store.audit("mailbox.escalated", { msg: r.id, mailbox: r.mailbox, from: r.sender, urgent: why });
     out.push({ id: r.id, mailbox: r.mailbox, from: r.sender, subject: r.subject, urgent: why });
   }

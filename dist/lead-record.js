@@ -67,7 +67,7 @@ export function revokeLead(node, rev, sig) {
 export function activeLead(node, project, now = new Date()) {
     return leadFor(node, project, resolveProject(project).key, now);
 }
-function leadFor(node, project, key, now) {
+export function leadFor(node, project, key, now) {
     const rows = node.store.db.prepare("SELECT record,sig,revocation,revocation_sig,project_key FROM project_leads WHERE project=? OR project_key=? ORDER BY id DESC").all(project, key);
     for (const row of rows) {
         let rec;

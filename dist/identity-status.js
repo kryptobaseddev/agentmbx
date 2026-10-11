@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { inspectLeaseProcess } from "./identity-leases.js";
 import { activityKey, holderProviderView, identityAvailability, parseActivity, parseProviderRecord } from "./identity-availability.js";
 import { procTable } from "./proc.js";
+import { notSlot } from "./project-slot.js";
 import { SCHEMA_VERSION } from "./store.js";
 export function listIdentityStatus(home, options = {}) {
     const path = join(home, "mbx.db"), now = options.now ?? Date.now();
@@ -41,7 +42,7 @@ export function listIdentityStatus(home, options = {}) {
             throw Object.assign(new Error(`mailbox schema ${schema} is newer than this runtime; update AgentMBX`), { code: "STALE_SERVER" });
         for (const r of db.prepare("SELECT name,last_seen FROM agents WHERE host=?").all(config.host))
             activity(row(r.name), r.last_seen);
-        for (const r of db.prepare("SELECT agent,COUNT(*) total,SUM(state<>'acked') unread,MAX(updated_at) activity FROM deliveries GROUP BY agent").all()) {
+        for (const r of db.prepare(`SELECT agent,COUNT(*) total,SUM(state<>'acked') unread,MAX(updated_at) activity FROM deliveries WHERE ${notSlot("agent")} GROUP BY agent`).all()) {
             const item = row(r.agent);
             item.messages = Number(r.total);
             item.unread = Number(r.unread);

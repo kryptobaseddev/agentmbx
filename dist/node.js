@@ -18,6 +18,7 @@ import { bumpPostToolMarker, bumpPostToolMarkersForAgent } from "./posttool.js";
 import { privatePath } from "./private-files.js";
 import { backfillProjectKeys, backfillRegistry } from "./registry.js";
 import { resolveLeadRecipients } from "./lead-record.js";
+import { rewriteProjectAliases } from "./project-mailbox.js";
 import { Store } from "./store.js";
 export const DEFAULT_PORT = 7373;
 export const RETRY_HOURS = 72;
@@ -748,7 +749,8 @@ export class MbxNode {
     establishedLocalName(name) {
         const q = (sql, ...args) => !!this.store.db.prepare(sql).get(...args);
         return name === "owner" || q("SELECT 1 FROM agents WHERE name=? AND host=?", name, this.host) || q("SELECT 1 FROM identity_leases WHERE name=?", name)
-            || q("SELECT 1 FROM identities WHERE name=?", name) || this.store.get(`alias:${name}`) !== undefined;
+            || q("SELECT 1 FROM identities WHERE name=?", name) || this.store.get(`alias:${name}`) !== undefined
+            || q("SELECT 1 FROM project_mailboxes WHERE slot=?", name); // T493: an allocated project mailbox is deliberately created
     }
     /** Has `name` ever existed on this host: an agents row, a delivery, a lease or a rename alias (T205)? */
     knownLocalName(name) {
@@ -756,7 +758,8 @@ export class MbxNode {
         if (this.store.get(`retired:${name}`) !== undefined)
             return false; // retired by identity prune (T209)
         return name === "owner" || q("SELECT 1 FROM agents WHERE name=? AND host=?", name, this.host) || q("SELECT 1 FROM deliveries WHERE agent=? LIMIT 1", name)
-            || q("SELECT 1 FROM identity_leases WHERE name=?", name) || this.store.get(`alias:${name}`) !== undefined;
+            || q("SELECT 1 FROM identity_leases WHERE name=?", name) || this.store.get(`alias:${name}`) !== undefined
+            || q("SELECT 1 FROM project_mailboxes WHERE slot=?", name);
     }
     // ---- send / receive ----------------------------------------------------------------------
     revoked() { return new Set(this.store.db.prepare("SELECT id FROM grants WHERE revoked=1").all().map((r) => r.id)); }
@@ -765,7 +768,7 @@ export class MbxNode {
         const pub = this.ownerPub;
         if (!pub)
             throw new Error("no owner key on this machine: run 'agentmbx owner init'");
-        const { to } = resolveLeadRecipients(this, "owner", d.to, d.project);
+        const to = rewriteProjectAliases(this, resolveLeadRecipients(this, "owner", d.to, d.project).to).to; // before the owner signs, like the lead tokens
         const req = ownerSignRequest(buildEnvelope({ ...d, to, from: `owner@${this.host}` }), pub);
         return this.send({ ...d, to, from: "owner" }, undefined, undefined, withOwnerSig(req.envelope, (await sign(req.payload)).sig));
     }
@@ -776,7 +779,9 @@ export class MbxNode {
         // A prebuilt envelope is already signed, so its `to` stays. Callers that build one (sendAsOwner)
         // resolve lead tokens before that signature.
         const lead = prebuilt ? { to: d.to, leadAddress: null } : resolveLeadRecipients(this, fromName, d.to, d.project);
-        const to = lead.to;
+        // T493: a bare project name becomes the project mailbox's slot here, before the envelope is signed (a prebuilt one already is).
+        const project = prebuilt ? { to: lead.to, notes: [] } : rewriteProjectAliases(this, lead.to);
+        const to = project.to;
         let e = prebuilt ?? buildEnvelope({ ...d, to, from: `${fromName}@${this.host}` });
         // Positive host attestation comes from the current lease operation, never a draft flag.
         // A prebuilt owner-signed envelope is immutable: changing metadata would invalidate its approval.
@@ -785,6 +790,7 @@ export class MbxNode {
         if (!prebuilt)
             e.meta.sender_verification = !d.unverifiedSender && hasHeldIdentity(this.store, fromName) ? "leased" : "unverified";
         const r = this.route(e.to);
+        r.warnings.push(...project.notes);
         // T491: mark exactly the targets the lead tokens resolved to (a fan-out or broadcast that happens to
         // include the lead agent is not lead mail). Remote leads are the paired host's liveness question.
         if (lead.leadAddress) {

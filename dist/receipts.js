@@ -8,12 +8,25 @@ import { captureWakeIdentity } from "./wake-identity.js";
 import { procTable } from "./proc.js";
 import { activityKey, parseActivity, SHARED_IDLE_MS } from "./identity-availability.js";
 import { remoteReceipts } from "./remote-receipts.js";
+import { isSlotName } from "./project-slot.js";
+import { projectLabel, projectReader } from "./project-mailbox.js";
 /** A holder renews its lease every minute; three missed beats mean its session is suspended or gone. */
 const STALE_HEARTBEAT_MS = 3 * 60_000;
 const iso = (ms) => new Date(ms).toISOString();
 /** Is a session holding `name` right now? Unknown process evidence with a fresh heartbeat counts as live (it is the
  *  lease's own rule for "unknown"); everything else says since when and who held it last. */
 export function mailboxLiveness(node, name, now = Date.now()) {
+    if (isSlotName(name)) {
+        // T493: a project mailbox has no holder of its own. Its reader is the project's current lead, so it is live exactly when that lead is.
+        const reader = projectReader(node, name, new Date(now));
+        if (!reader)
+            return { live: false, detail: "this project mailbox is not allocated on this host" };
+        const label = `project mailbox ${projectLabel(reader.mailbox)}`;
+        if (!reader.lead)
+            return { live: false, detail: `${label}: no owner-designated lead on ${node.host} to read it` };
+        const lead = mailboxLiveness(node, reader.lead.agent, now);
+        return { live: lead.live, detail: `${label}, read by its lead ${reader.lead.agent}: ${lead.detail}` };
+    }
     const row = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(name);
     if (!row)
         return { live: false, detail: "no session has ever held this mailbox; it is read when an agent claims it" };
