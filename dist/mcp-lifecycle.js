@@ -1,9 +1,11 @@
 // Process lifetime is independent of mailbox retirement: a reload proxy still owns the client transport.
-import { mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { z } from "zod";
-import { inspectLeaseProcesses, processGone } from "./identity-leases.js";
-import { procSeams, recordedStartMatches } from "./proc.js";
+import { inspectLeaseProcess, inspectLeaseProcesses, processGone } from "./identity-leases.js";
+import { procSeams, recordedStartMatches, stdioEndpoint } from "./proc.js";
 const pid = z.number().int().min(2).max(2 ** 31 - 1);
 const birth = z.string().min(1).max(300).nullable();
 const recordSchema = z.object({
@@ -15,6 +17,88 @@ const unknown = { alive: null, start: null };
 const recordPath = (home, processPid) => join(home, "mcp-lifecycle", `${processPid}.json`);
 const clientSchema = recordSchema.shape.client.unwrap();
 const generationPath = (home, originalPid) => join(home, "mcp-generation", String(originalPid));
+/** Publish the complete owner atomically; never infer a connection from its provider PID or session id. */
+export function claimMcpConnection(home) {
+    const endpoint = stdioEndpoint();
+    if (!endpoint || process.pid <= 1)
+        return { state: "unknown" };
+    const start = inspectLeaseProcess(process.pid).start;
+    if (!start)
+        return { state: "unknown" };
+    const dir = join(home, "mcp-connections"), path = join(dir, createHash("sha256").update(endpoint).digest("hex"));
+    const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`, body = JSON.stringify({ pid: process.pid, start });
+    const read = () => {
+        try {
+            if (statSync(path).size > 4096)
+                return null;
+            const r = clientSchema.safeParse(JSON.parse(readFileSync(path, "utf8")));
+            return r.success ? r.data : null;
+        }
+        catch {
+            return null;
+        }
+    };
+    const held = () => ({ state: "held", release() {
+            const owner = read();
+            if (owner?.pid === process.pid && owner.start === start)
+                try {
+                    unlinkSync(path);
+                }
+                catch { /* Already released. */ }
+        } });
+    let guard;
+    let temporary = false;
+    try {
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
+        writeFileSync(tmp, body, { mode: 0o600, flag: "wx" });
+        temporary = true;
+        try {
+            linkSync(tmp, path);
+            return held();
+        }
+        catch (error) {
+            if (error.code !== "EEXIST")
+                throw error;
+        }
+        const owner = read();
+        if (!owner?.start)
+            return { state: "unknown" };
+        const live = inspectLeaseProcess(owner.pid);
+        if (live.alive === true && live.start && owner.start === live.start)
+            return owner.pid === process.pid ? held() : { state: "duplicate", pid: owner.pid };
+        if (!processGone(owner.start, live))
+            return { state: "unknown" };
+        // Only stale recovery needs a short OS lock. Normal startup performs no SQLite work before initialize.
+        guard = new DatabaseSync(`${path}.reap`);
+        guard.exec("PRAGMA busy_timeout=0; BEGIN EXCLUSIVE");
+        const current = read();
+        if (!current || current.pid !== owner.pid || current.start !== owner.start)
+            return { state: "retry" };
+        if (!processGone(current.start, inspectLeaseProcess(current.pid)))
+            return { state: "unknown" };
+        unlinkSync(path);
+        try {
+            linkSync(tmp, path);
+            return held();
+        }
+        catch (error) {
+            if (error.code === "EEXIST")
+                return { state: "retry" };
+            throw error;
+        }
+    }
+    catch (error) {
+        return /locked|busy/i.test(error.message) ? { state: "retry" } : { state: "unknown" };
+    }
+    finally {
+        guard?.close();
+        if (temporary)
+            try {
+                unlinkSync(tmp);
+            }
+            catch { /* No pending publication. */ }
+    }
+}
 function readGeneration(home, originalPid) {
     try {
         const path = generationPath(home, originalPid);
@@ -61,6 +145,7 @@ export function startMcpLifecycle(home) {
     let start = null, stopped = false, saved = "";
     let seenGeneration = null;
     let cleanup;
+    let releaseConnection = () => { };
     const path = recordPath(home, process.pid);
     const save = () => {
         const body = JSON.stringify({ v: 1, pid: process.pid, start, client, role });
@@ -75,6 +160,7 @@ export function startMcpLifecycle(home) {
         catch { /* Diagnostic records are advisory; failure cannot keep a disconnected MCP alive. */ }
     };
     const dispose = () => {
+        releaseConnection();
         clearInterval(poll);
         process.stdin.off("end", eof);
         process.stdin.off("close", eof);
@@ -156,6 +242,9 @@ export function startMcpLifecycle(home) {
     }, 2_000);
     return {
         home,
+        claimConnection() { const result = claimMcpConnection(home); if (result.state === "held")
+            releaseConnection = result.release; return result; },
+        releaseConnection() { releaseConnection(); releaseConnection = () => { }; },
         /** Capture detectHost's actual provider, never an intermediate reload parent or PID 1. */
         watchClient(next) { client = clientSchema.parse(next); },
         /** The caller must bound synchronous database cleanup (busy_timeout=0); timers cannot interrupt a SQLite wait. */
@@ -165,59 +254,69 @@ export function startMcpLifecycle(home) {
         dispose,
     };
 }
-/** Read-only: PID 1, missing records and unavailable evidence never prove an orphan. RSS from ps is KiB. */
-export function mcpOrphanCensus(home, inspect = inspectLeaseProcesses) {
-    const out = { total: 0, orphans: 0, orphanRssBytes: 0, unknown: 0, unknownMemory: 0, unavailable: false };
+/** Read-only inventory: legacy/watch processes without a recorded client retain unknown liveness. */
+export function mbxProcessInventory(home, inspect = inspectLeaseProcesses) {
     let listing;
     try {
-        listing = procSeams.ps(["-A", "-o", "pid=,rss=,args="], {
+        listing = procSeams.ps(["-A", "-o", "pid=,ppid=,rss=,args="], {
             timeout: 1000, stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, LC_ALL: "C", LANG: "C" },
         });
     }
     catch {
-        return { ...out, unavailable: true };
+        return { processes: [], unavailable: true };
     }
     if (!listing.trim())
-        return { ...out, unavailable: true };
+        return { processes: [], unavailable: true };
     const processes = new Map();
     let readableRows = 0;
     for (const line of listing.split("\n")) {
-        const match = /^\s*(\d+)\s+(\S+)\s+(.+)$/.exec(line);
+        const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/.exec(line);
         if (!match)
             continue;
         readableRows++;
         // shortcut: standard Node/SEA entrypoints only; extend argv inspection when custom launchers are supported.
-        if (!/^(?:(?:\S*\/)?node(?:\s+--\S*)*\s+)?(?:\S*\/)?agentmbx(?:\.js)?\s+mcp(?:\s|$)/.test(match[3]))
+        const command = /^(?:(?:\S*\/)?node(?:\s+--\S*)*\s+)?(?:\S*\/)?agentmbx(?:\.js)?\s+(mcp|watch)(?:\s|$)/.exec(match[4]);
+        if (!command)
             continue;
-        const processPid = Number(match[1]), rss = Number(match[2]);
-        if (!Number.isSafeInteger(processPid) || processPid <= 1)
+        const processPid = Number(match[1]), ppid = Number(match[2]), rss = Number(match[3]);
+        if (!Number.isSafeInteger(processPid) || processPid <= 0 || !Number.isSafeInteger(ppid) || ppid < 0)
             continue;
-        processes.set(processPid, { rss: Number.isSafeInteger(rss * 1024) && rss >= 0 ? rss * 1024 : null, record: readRecord(home, processPid) });
+        processes.set(processPid, { kind: command[1], ppid,
+            rss: Number.isSafeInteger(rss * 1024) && rss >= 0 ? rss * 1024 : null, record: readRecord(home, processPid) });
     }
     if (!readableRows)
-        return { ...out, unavailable: true };
-    out.total = processes.size;
+        return { processes: [], unavailable: true };
     const evidence = inspect([...processes.keys(), ...[...processes.values()].flatMap(p => p.record?.client ? [p.record.client.pid] : [])]);
-    for (const [processPid, item] of processes) {
-        const self = evidence.get(processPid) ?? unknown;
-        // Do not attribute a reused PID to a stale lifecycle record, or count a process that already exited.
-        if (self.alive === false) {
-            out.total--;
+    return { unavailable: false, processes: [...processes].map(([processPid, item]) => {
+            const self = evidence.get(processPid) ?? unknown;
+            let client = "unknown", clientPid = null;
+            if (item.record?.start && self.alive === true && self.start && recordedStartMatches(item.record.start, self.start) && item.record.client) {
+                clientPid = item.record.client.pid;
+                const current = evidence.get(clientPid) ?? unknown;
+                if (processGone(item.record.client.start, current))
+                    client = current.alive === false ? "dead" : "reused";
+                else if (current.alive === true && current.start && item.record.client.start)
+                    client = "live";
+            }
+            return { kind: item.kind, pid: processPid, ppid: item.ppid, start: self.start, alive: self.alive, clientPid, client, rssBytes: item.rss };
+        }) };
+}
+/** Read-only: PID 1, missing records and unavailable evidence never prove an orphan. RSS from ps is KiB. */
+export function mcpOrphanCensus(home, inspect = inspectLeaseProcesses) {
+    const inventory = mbxProcessInventory(home, inspect);
+    const out = { total: 0, orphans: 0, orphanRssBytes: 0, unknown: 0, unknownMemory: 0, unavailable: inventory.unavailable };
+    for (const item of inventory.processes) {
+        if (item.kind !== "mcp" || item.alive === false)
             continue;
-        }
-        if (!item.record?.start || self.alive !== true || !self.start || !recordedStartMatches(item.record.start, self.start) || !item.record.client) {
-            out.unknown++;
-            continue;
-        }
-        const current = evidence.get(item.record.client.pid) ?? unknown;
-        if (processGone(item.record.client.start, current)) {
+        out.total++;
+        if (item.client === "dead" || item.client === "reused") {
             out.orphans++;
-            if (item.rss === null)
+            if (item.rssBytes === null)
                 out.unknownMemory++;
             else
-                out.orphanRssBytes += item.rss;
+                out.orphanRssBytes += item.rssBytes;
         }
-        else if (current.alive !== true || !current.start || !item.record.client.start)
+        else if (item.client === "unknown")
             out.unknown++;
     }
     return out;

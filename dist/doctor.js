@@ -25,7 +25,16 @@ import { deadHolderLeases, inspectLeaseProcess } from "./identity-leases.js";
 import { providerLabel, sameLiveProvider } from "./identity-takeover.js";
 import { conversationLoopLabel, detectConversationLoops } from "./loop-detector.js";
 import { opencodeDuplicateLoopChecks } from "./opencode-duplicate-loop.js";
-import { mcpOrphanCheck } from "./mcp-lifecycle.js";
+import { mbxProcessInventory, mcpOrphanCheck } from "./mcp-lifecycle.js";
+/** --processes observes only the process inventory; it never initializes or repairs the host. */
+export function processChecks(home) {
+    const inventory = mbxProcessInventory(home);
+    if (inventory.unavailable)
+        return [{ level: "warn", label: "MCP/watch process inventory unavailable; nothing changed" }];
+    return [{ level: "info", label: `${inventory.processes.length} agentmbx MCP/watch process(es); read-only` },
+        ...inventory.processes.map(p => ({ level: "info",
+            label: `${p.kind} pid=${p.pid} ppid=${p.ppid} start=${p.start ?? "unknown"} client=${p.client}${p.clientPid ? ` (pid=${p.clientPid})` : ""} RSS=${p.rssBytes === null ? "unknown" : `${(p.rssBytes / 1024 ** 2).toFixed(1)} MiB`}` }))];
+}
 /** Observational only: doctor must never notify, mark deliveries or consume wake reservations. */
 export function conversationLoopChecks(node, now = Date.now()) {
     try {

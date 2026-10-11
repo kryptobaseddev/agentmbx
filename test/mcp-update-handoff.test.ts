@@ -57,7 +57,7 @@ for (const cli of ["claude", "codex", "opencode"]) test(`${cli} build handover f
     pending.push(node.send({ from: "sender", to: [name], subject: "preserved", body: "history" }).envelope.id);
   }
   for (let generation = 1; generation <= 2; generation++) {
-    const old = node.store.db.prepare("SELECT holder_pid,token FROM identity_leases WHERE name=?").get(names[0])!;
+    const old = names.map(name => node.store.db.prepare("SELECT holder_pid,token FROM identity_leases WHERE name=?").get(name)!);
     const messages = node.store.db.prepare("SELECT * FROM messages ORDER BY id").all();
     if (generation === 1) writeFileSync(mcpPath, currentMcp);
     appendFileSync(join(install, "dist/cli.js"), "\n// deployed build\n");
@@ -83,8 +83,9 @@ for (const cli of ["claude", "codex", "opencode"]) test(`${cli} build handover f
       assert.equal((who.structuredContent as { switching?: string }).switching, undefined, "the replacement reports no pending switch");
       assert.equal((who.structuredContent as { agent: string }).agent, names[i]);
       const lease = node.store.db.prepare("SELECT holder_pid,token,released_at FROM identity_leases WHERE name=?").get(names[i])!;
-      assert.notEqual(lease.holder_pid, old.holder_pid);
-      assert.notEqual(lease.token, old.token);
+      if (typeof process.execve === "function") assert.equal(lease.holder_pid, old[i].holder_pid, "exec preserves the PID");
+      else assert.notEqual(lease.holder_pid, old[i].holder_pid, "legacy spawn replaces the holder");
+      assert.notEqual(lease.token, old[i].token, "every hosted session gets a fresh lease generation");
       assert.equal(lease.released_at, null);
       assert.equal(node.inbox(names[i])[0].id, pending[i]);
       const replay = await call(sid, "mbx_replay", { limit: 1 });
@@ -97,15 +98,22 @@ for (const cli of ["claude", "codex", "opencode"]) test(`${cli} build handover f
     assert.deepEqual(node.store.db.prepare("SELECT * FROM messages ORDER BY id").all(), messages);
   }
   const held = node.store.db.prepare("SELECT holder_pid,token FROM identity_leases WHERE name=?").get(names[0])!;
+  const heldControl = listIdentityControls(node.store).find(d => d.agent === names[0])!;
+  assert.ok(heldControl, "held identity has a control endpoint");
   assert.notEqual((await call(ids[0], "mbx_identity", { action: "release" })).isError, true);
   appendFileSync(join(install, "dist/cli.js"), "\n// deployed after explicit handoff\n");
   assert.notEqual((await call(ids[0], "mbx_identity", { action: "list" })).isError, true);
   const deadline = Date.now() + 10_000;
-  while (!listIdentityControls(node.store).some(d => d.agent === names[0] && d.mcp_pid !== held.holder_pid)) {
+  const restoredControl = () => listIdentityControls(node.store).find(d => d.agent === names[0] && d.control_key !== heldControl.control_key);
+  while (!restoredControl()) {
     assert.ok(Date.now() < deadline, "detached control endpoint was not restored by the new process");
     assert.notEqual((await call(ids[0], "mbx_identity", { action: "list" })).isError, true);
     await new Promise(resolve => setTimeout(resolve, 25));
   }
+  const control = restoredControl()!;
+  assert.equal(control.generation, null, "the restored detached control holds no lease");
+  if (typeof process.execve === "function") assert.equal(control.mcp_pid, held.holder_pid, "detached exec preserves the PID");
+  else assert.notEqual(control.mcp_pid, held.holder_pid, "legacy spawn restores the control in its replacement");
   const detached = node.store.db.prepare("SELECT token,released_at FROM identity_leases WHERE name=?").get(names[0])!;
   assert.equal(detached.token, held.token, "reload must not mint a lease for a detached identity");
   assert.notEqual(detached.released_at, null);
