@@ -1483,7 +1483,7 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
 
   server.registerTool("mbx_inbox", {
     title: "Read my mbx inbox",
-    description: "Start here: list messages for this agent that are not acked yet (or all with all=true), newest last, with trust labels. Needs an identity: a session without one gets {agent: null, unbound: true, messages: [], next} (not an error); follow `next` (mbx_whoami, then mbx_identity claim or register) first. Next: mbx_read the ids for full content, then mbx_reply and mbx_ack.",
+    description: "Start here: list messages for this agent that are not acked yet (or all with all=true), newest last, with trust labels. A line's policy classes mean: outward-reversible = push a non-default branch or open a draft PR; outward = merge, release, deploy, delete, secrets, spend. Needs an identity: a session without one gets {agent: null, unbound: true, messages: [], next} (not an error); follow `next` (mbx_whoami, then mbx_identity claim or register) first. Next: mbx_read the ids for full content, then mbx_reply and mbx_ack.",
     inputSchema: { all: z.boolean().default(false), limit: z.number().int().min(1).max(200).default(30) },
     annotations: { readOnlyHint: true },
   }, ({ all, limit }) => {
@@ -1502,7 +1502,7 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
 
   server.registerTool("mbx_read", {
     title: "Read mbx messages",
-    description: "Full content of one or more messages (ids or unique id prefixes), framed with sender verification. It marks your own copy read, so the sender's receipt (mbx_sent) shows it; nothing else changes. Next: answer with mbx_reply if it needs one, then mbx_ack once you have dealt with it.",
+    description: "Full content of one or more messages (ids or unique id prefixes), framed with sender verification. Its policy line means: outward-reversible = push a non-default branch or open a draft PR; outward = merge, release, deploy, delete, secrets, spend. It marks your own copy read, so the sender's receipt (mbx_sent) shows it; nothing else changes. Next: answer with mbx_reply if it needs one, then mbx_ack once you have dealt with it.",
     inputSchema: { ids: z.array(z.string().min(6)).min(1).max(20) },
     annotations: { readOnlyHint: true },
   }, ({ ids }) => { const { agent } = current(); const rows = ids.map((id) => node.read(id, agent)); noteRead(rows); markRead(rows, agent); return text(rows.map((m) => formatFor(node, m, agent)).join("\n\n")); });
