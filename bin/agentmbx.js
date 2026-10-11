@@ -13,5 +13,26 @@ const src = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
 // src/ too, and Node refuses to strip types under node_modules (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING).
 const installed = fileURLToPath(import.meta.url).split(sep).includes("node_modules");
 const devSrc = !!process.env.AGENTMBX_DEV && !installed && existsSync(src);
-const { main } = await import(existsSync(dist) && !devSrc ? "../dist/cli.js" : "../src/cli.ts");
-await main();
+const useDist = existsSync(dist) && !devSrc;
+const command = process.argv[2];
+if (command === "daemon" && !["install", "uninstall"].includes(process.argv[3]) && !process.argv.includes("--help") && !process.argv.includes("-h")) {
+  try {
+    const { timestampDaemonOutput } = await import(useDist ? "../dist/logs.js" : "../src/logs.ts");
+    timestampDaemonOutput();
+  } catch { /* Advisory logging cannot block the entrypoint. */ }
+}
+try {
+  const { main } = await import(useDist ? "../dist/cli.js" : "../src/cli.ts");
+  await main();
+} catch (error) {
+  if (command === "mcp") {
+    try {
+      const { recordMcpStartupError } = await import(useDist ? "../dist/logs.js" : "../src/logs.ts");
+      const { homedir } = await import("node:os");
+      const { join } = await import("node:path");
+      recordMcpStartupError(process.env.MBX_HOME || join(homedir(), ".local/share/agentmbx"), process.env.MBX_CLI || "unknown", error);
+    } catch { /* Preserve the original entry failure. */ }
+  }
+  console.error(error);
+  process.exitCode = 1;
+}
