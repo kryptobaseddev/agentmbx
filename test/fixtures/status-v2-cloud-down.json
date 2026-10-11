@@ -1,0 +1,12 @@
+{
+  "schema": "mbx.status/v2",
+  "mbx_version": "0.5.26",
+  "identity": { "name": "agentmbx-fixture", "role": "builder", "state": "bound" },
+  "registration": { "registered": true, "lease": { "holder_cli": "opencode", "holder_session": "ses_fixture", "verified": true } },
+  "inbox": { "unread": 2, "needs_reply": 1, "from_owner": 0, "outbox_unsent": 3 },
+  "harness": { "cli": "opencode", "session_id": "ses_fixture", "wake_path": "api", "policy": ["autonomous"] },
+  "cloud": { "relay": { "url": "https://relay.example", "state": "unreachable", "last_ack": null }, "key_ad_expiry": null, "account": null },
+  "devices": [],
+  "project": { "directory": "/work/fixture", "lead": "agentmbx-lead", "members": ["agentmbx-fixture"] },
+  "resolved_by": "session_id"
+}
