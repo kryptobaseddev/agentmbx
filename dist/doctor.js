@@ -28,6 +28,7 @@ import { conversationLoopLabel, detectConversationLoops } from "./loop-detector.
 import { opencodeDuplicateLoopChecks } from "./opencode-duplicate-loop.js";
 import { mbxProcessInventory, mcpOrphanCheck } from "./mcp-lifecycle.js";
 import { HUD_ALIVE_MAX_MS, hudAlivePath, hudSessionV2Path } from "./hud.js";
+import { recentMcpStartupErrors } from "./logs.js";
 /** --processes observes only the process inventory; it never initializes or repairs the host. */
 export function processChecks(home) {
     const inventory = mbxProcessInventory(home);
@@ -776,6 +777,13 @@ export async function doctor(ctx, mbxHome, opts = {}) {
     const add = (level, label, fix) => out.push({ level, label, fix });
     add("info", `agentmbx ${VERSION} (node ${process.versions.node})`);
     out.push(mcpOrphanCheck(mbxHome));
+    try {
+        const errors = recentMcpStartupErrors(mbxHome);
+        add(errors.length ? "warn" : "info", `MCP startup errors in the last 24h (${errors.length} shown):${errors.length ? `\n${errors.join("\n")}` : " none"}`);
+    }
+    catch (error) {
+        add("warn", `MCP startup error log unavailable: ${error.message}`);
+    }
     if (Number(process.versions.node.split(".")[0]) < 24)
         add("fail", `Node ${process.versions.node} is too old`, "install Node 24 or later");
     // T314: stay out of the grok block. OpenCode's own doctor function must not collide with this.

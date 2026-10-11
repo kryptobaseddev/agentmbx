@@ -9,7 +9,9 @@ import { storedPolicies } from "./policy.js";
 import { activeLead } from "./lead-record.js";
 import { projectKey } from "./registry.js";
 import { relayFor } from "./relay-client.js";
+import { relayState } from "./relay-v2.js";
 import { newSyncNonce, syncOnce } from "./sync-client.js";
+import { allowStatus } from "./status-sync.js";
 import { CAPS, PATH_FLAG_PREFIX, PROJECT_KEY_RE } from "./sync-projection.js";
 import { notSlot } from "./project-slot.js";
 import { version } from "./version.js";
@@ -163,14 +165,54 @@ export function loadSyncSnapshot(node, ctx, projectKeyOf = projectKey) {
         seenLead.add(key);
         leads.push({ project_key: key, agent: rec.agent, host: rec.host, exp: rec.exp, id: rec.id });
     }
+    const policies = policyInputs(node, nowMs);
+    const enrolled = relayEnrolled(node);
+    const relayUrl = relayFor(node);
+    const relay = relayUrl ? relayState(node, relayUrl) : null;
+    const keyAdExpiry = typeof relay?.enc_ad_exp === "string" ? relay.enc_ad_exp : null;
+    const approved = node.peers().filter((peer) => peer.state === "approved");
+    const outbox = db.prepare("SELECT COUNT(*) AS n FROM outbox").get();
+    const membersByKey = new Map();
+    for (const agent of agents) {
+        for (const key of agent.project_keys) {
+            const list = membersByKey.get(key) ?? [];
+            if (!list.includes(agent.name))
+                list.push(agent.name);
+            membersByKey.set(key, list);
+        }
+    }
+    const status = allowStatus({
+        schema: "mbx.status/v2",
+        mbx_version: version(),
+        identities: agents.map((agent) => {
+            const policy = policies.find((row) => row.to.agents.length === 0 || row.to.agents.includes(agent.name));
+            return {
+                name: agent.name, role: agent.role,
+                state: agent.state,
+                registered: identities.some((row) => row.name === agent.name),
+                lease: agent.holder ? { holder_cli: agent.holder.cli, verified: agent.state === "live" } : null,
+                unread: agent.unread, harness_cli: agent.cli,
+                policy: policy ? { level: policy.level, classes: policy.classes } : { level: "ask", classes: [] },
+            };
+        }),
+        outbox_unsent: outbox.n,
+        cloud: { relay_enrolled: enrolled, last_ack: ctx.lastAck ?? null, key_ad_expiry: keyAdExpiry, account: null },
+        devices: approved.map((peer) => ({ host: peer.host, reachability: "unknown", last_presence: null })),
+        projects: [...membersByKey.entries()].map(([key, members]) => {
+            const lead = leads.find((row) => row.project_key === key);
+            const cli = lead ? agents.find((agent) => agent.name === lead.agent)?.cli : undefined;
+            return { lead: lead && cli ? { name: lead.agent, cli } : null, members };
+        }),
+        resolved_by: agents.some((agent) => agent.state === "live") ? "lease" : "manual",
+    });
     return {
         host: {
             daemon_version: version(),
             os: osOf(process.platform),
             owner_fp: node.ownerPub ? fingerprint(node.ownerPub) : null,
             authority_owner: node.ownerPub != null,
-            relay_enrolled: relayEnrolled(node),
-            peers: node.peers().filter((peer) => peer.state === "approved").flatMap((peer) => {
+            relay_enrolled: enrolled,
+            peers: approved.flatMap((peer) => {
                 const host_key_fp = peerFp(peer.pubkey);
                 return host_key_fp ? [{ host_name: peer.host, host_key_fp, last_seen_at: null }] : [];
             }),
@@ -179,10 +221,11 @@ export function loadSyncSnapshot(node, ctx, projectKeyOf = projectKey) {
         agents,
         threads: [...threads.values()],
         receipts,
-        policies: policyInputs(node, nowMs),
+        policies,
         approvals: [],
         paths,
         leads,
+        ...(status ? { status } : {}),
     };
 }
 function syncSigner(home, nowMs) {

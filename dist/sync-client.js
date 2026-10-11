@@ -125,7 +125,7 @@ export async function syncOnce(o) {
         const allowsPaths = contract >= PROJECT_PATHS_SINCE && link.project_paths === true;
         const allowsLeads = contract >= PROJECT_LEADS_SINCE && link.project_leads === true;
         const sentAt = new Date(o.now).toISOString();
-        const snap = o.source({ now: sentAt, seq, full: true, contract, contractAllowsProjectPaths: allowsPaths, contractAllowsProjectLeads: allowsLeads, sentReceipts: state.sent_receipts });
+        const snap = o.source({ now: sentAt, seq, full: true, contract, contractAllowsProjectPaths: allowsPaths, contractAllowsProjectLeads: allowsLeads, sentReceipts: state.sent_receipts, lastAck: state.acked_at ?? null });
         const common = { ...snap, now: sentAt, seq, contract, contractAllowsProjectPaths: allowsPaths, contractAllowsProjectLeads: allowsLeads, sentReceipts: state.sent_receipts };
         const fullTry = projectSync({ ...common, full: true });
         if (!fullTry.ok) {
@@ -148,6 +148,18 @@ export async function syncOnce(o) {
         writeState(o.kv, state);
     }
     return send(o, link, state, pending);
+}
+function withoutStatus(body) {
+    try {
+        const parsed = JSON.parse(body);
+        if (!parsed.host || !Object.prototype.hasOwnProperty.call(parsed.host, "status"))
+            return null;
+        delete parsed.host.status;
+        return JSON.stringify(parsed);
+    }
+    catch {
+        return null;
+    }
 }
 async function send(o, link, state, pending) {
     const signer = o.signer;
@@ -180,6 +192,15 @@ async function send(o, link, state, pending) {
         return recover(o, state, pending, res);
     }
     if (res.status < 200 || res.status >= 300) {
+        if (res.status === 400) {
+            const stripped = withoutStatus(pending.body);
+            if (stripped) {
+                pending.body = stripped;
+                state.pending = pending;
+                writeState(o.kv, state);
+                return send(o, link, state, pending);
+            }
+        }
         state.attempt += 1;
         state.next_at = o.now + backoffMs(state.attempt, state.floor_seconds);
         writeState(o.kv, state);
@@ -202,6 +223,7 @@ async function send(o, link, state, pending) {
     }
     const wait = clampSeconds(ack.next_sync_seconds, 15);
     state.ack_seq = pending.seq;
+    state.acked_at = new Date(Number(timestamp) * 1000).toISOString();
     state.pending = undefined;
     state.attempt = 0;
     state.floor_seconds = wait;
