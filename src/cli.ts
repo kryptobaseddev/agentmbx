@@ -13,7 +13,7 @@ import { parseRelayFingerprint, relayPin, relayPushOutbox, relayPushReceipts, re
 import { DEFAULT_QUOTA, parseRelayKey, RelayCore, startRelayServer } from "./relay.ts";
 import { SqliteRelayStore } from "./relay-store.ts";
 import { backupStore, readOps, restoredFrom, restoreStore, rotateEpochOp, STORE_DB, waitForLock } from "./relay-ops.ts";
-import { daemonReadiness, doctor, failed, formatChecks } from "./doctor.ts";
+import { daemonReadiness, doctor, failed, formatChecks, processChecks } from "./doctor.ts";
 import { HUD_ALIVE_MAX_MS, HUD_SCHEMA, hudAlivePath, hudDir, hudPidLinePath, hudPidPath, hudSessionLinePath, hudSessionPath, hudStatus, hudStatusV2, writeHud, type HudStatus } from "./hud.ts";
 import { STATUS_V2_SCHEMA } from "./status-schema.ts";
 import { detectHost, HERMES_WATCHER_INSTRUCTION, HERMES_WATCHER_REMINDER, MCP_HEARTBEAT_MS, noPush, runMcp, selfWatchInstruction } from "./mcp.ts";
@@ -51,6 +51,7 @@ import { formatUnboundStart, listIdentityStatus } from "./identity-status.ts";
 import { REBINDING_CLIS, withCliIdentity, withHookIdentity, type CliIdentitySelection } from "./cli-identity.ts";
 import { declaredOriginWarning, readSessionTaint, refuseAgentOrigin, taintSendWarning, type SessionTaint } from "./session-taint.ts";
 import { runProbe, storeProbeIO } from "./probe.ts";
+import { resolveProject } from "./project-key.ts";
 import { DEFAULT_LOGIN_BASE_URL, defaultLoginIO, parseLoginBase, runLogin } from "./login.ts";
 import { buildIdentityTakeover, type IdentityTakeoverApproval } from "./identity-takeover.ts";
 import { publishIdentityControl, findIdentityControl, identityControlReceipt, resolveIdentityControlReceipt, submitIdentityControl, type IdentityControlReceipt } from "./identity-control.ts";
@@ -64,7 +65,7 @@ const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, 
 Start here
   agentmbx setup [--yes] [--dry-run] [--only claude,codex,opencode,kimi,hermes,skill,owner] [--host <name>] [--no-owner] [--policy ask|collaborate|autonomous|yolo] [--uninstall]
                   init this host, install the daemon, wire every detected agent CLI (MCP + hooks + skill), create the owner key
-  agentmbx doctor [--fix]   checklist: host, daemon, each CLI's wiring, skill, peers, pending pairings, stranded mail (--fix retires phantom mailboxes)
+  agentmbx doctor [--fix] [--processes]   checklist; --processes lists MCP/watch pid, ppid, birth, client liveness and RSS (read-only; excludes --fix)
   agentmbx claude [claude args…]   start Claude Code with the mbx channel, so the idle session wakes when mail arrives
 
 Messages
@@ -335,7 +336,7 @@ async function run(argv: string[]) {
     compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" },
     backend: { type: "string" }, "no-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
     project: { type: "string", multiple: true }, since: { type: "string" }, policy: { type: "string" }, "wait-ms": { type: "string" }, "store-dir": { type: "string" }, "trust-proxy": { type: "boolean" },
-    "older-than": { type: "string" }, minutes: { type: "string" }, apply: { type: "boolean" }, days: { type: "string" }, fix: { type: "boolean" }, key: { type: "string" },
+    "older-than": { type: "string" }, minutes: { type: "string" }, apply: { type: "boolean" }, days: { type: "string" }, fix: { type: "boolean" }, processes: { type: "boolean" }, key: { type: "string" },
     deadline: { type: "string" }, "require-idle-wake": { type: "boolean" }, "exclude": { type: "string" }, plan: { type: "boolean" },
     "base-url": { type: "string" }, "no-browser": { type: "boolean" } } });
   if (o.help) return console.log(commandHelp(cmd));
@@ -350,6 +351,10 @@ async function run(argv: string[]) {
   if (cmd === "update") { process.exitCode = await updateCommand({ check: !!o.check, yes: !!o.yes }); return; }
   if (cmd === "setup") return setup(o, str);
   if (cmd === "doctor") {
+    if (o.processes) {
+      if (o.fix) return die("doctor --processes is read-only; omit --fix");
+      return console.log(formatChecks(processChecks(defaultHome())));
+    }
     if (o.fix) { // S2: retire phantom mailboxes (the only automatic repair doctor offers; it deletes nothing)
       const fixNode = new MbxNode();
       try {
@@ -1147,9 +1152,15 @@ async function lead(node: MbxNode, pos: string[], str: (k: string) => string | u
   const dir = str("project") ?? (Array.isArray(o.project) ? (o.project as string[])[0] : undefined); // --project is a multiple option
   const project = dir ? (projectOf(resolve(dir)) ?? die(`${dir} is the home folder or /, not a project`)) : undefined;
   if (sub === "show") {
-    const rows = node.store.db.prepare("SELECT DISTINCT project FROM project_leads" + (project ? " WHERE project=?" : "")).all(...(project ? [project] : [])) as { project: string }[];
+    // A record covers its folder and every other checkout of the same CLEO project (T543): show the key and those folders.
+    const key = project ? resolveProject(project).key : undefined;
+    const rows = node.store.db.prepare("SELECT project, MAX(project_key) AS project_key FROM project_leads" + (project ? " WHERE project=? OR project_key=?" : "") + " GROUP BY project").all(...(project ? [project, key!] : [])) as { project: string; project_key: string | null }[];
     if (!rows.length) return console.log(project ? `no lead for ${project}` : "no project leads");
-    for (const r of rows) { const l = activeLead(node, r.project); console.log(`${r.project}\t${l ? `${l.agent}@${l.host} until ${l.exp} (id ${l.id})` : "none (expired or revoked)"}`); }
+    for (const r of rows) {
+      const l = activeLead(node, r.project);
+      const also = r.project_key ? (node.store.db.prepare("SELECT DISTINCT project FROM identity_projects WHERE project_key=? AND project<>?").all(r.project_key, r.project) as { project: string }[]).map((x) => x.project) : [];
+      console.log(`${r.project}\t${l ? `${l.agent}@${l.host} until ${l.exp} (id ${l.id})` : "none (expired or revoked)"}\tkey ${r.project_key ? `${r.project_key} (CLEO project id)` : "folder path"}${also.length ? `\talso covers ${also.join(", ")}` : ""}`);
+    }
     return;
   }
   if (!project) die(`lead ${sub ?? "set"} needs --project <dir>`);

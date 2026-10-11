@@ -1,23 +1,25 @@
 import { activeLead, isLead } from "./lead-record.js";
 import { bumpPostToolMarkersForAgent } from "./posttool.js";
 import { deliveryReceipts } from "./receipts.js";
-import { projectIdentities, projectKey, registeredIdentity } from "./registry.js";
+import { resolveProject } from "./project-key.js";
+import { projectIdentities, registeredIdentity } from "./registry.js";
 export { LEAD_DEFAULT_TTL_MS, LEAD_MAX_TTL_MS, leadSummary, makeLead, makeLeadRevocation, storeLead, revokeLead, activeLead, isLead, projectLeadView, projectLeadLine, resolveLeadRecipients, } from "./lead-record.js";
 const fail = (code, message) => { throw Object.assign(new Error(message), { code }); };
 const roleOf = (node, address) => {
     const [name, host] = address.split("@");
     return host === node.host ? registeredIdentity(node.store, name)?.role ?? null : null;
 };
-/** SQL condition (and parameters) for "a message of this project": stamped with meta.project, stamped with the same git
- *  origin from a paired host's own folder of this repository (T219), or sent by / delivered to an identity associated
- *  with the project. */
+/** SQL condition (and parameters) for "a message of this project": stamped with meta.project, stamped with this project's
+ *  key (its CLEO id, T543, or the git origin that mail written before that was stamped with, T219) from another checkout or a
+ *  paired host's own folder, or sent by / delivered to an identity associated with the project. */
 function ledgerWhere(node, project) {
     const members = [...projectIdentities(node.store, project)];
     const addrs = members.map((n) => `${n}@${node.host}`);
     const inList = (xs) => (xs.length ? xs.map(() => "?").join(",") : "NULL");
-    const key = projectKey(project);
-    return { sql: `(json_extract(envelope,'$.meta.project')=?${key ? " OR json_extract(envelope,'$.meta.project_key')=?" : ""} OR from_addr IN (${inList(addrs)})
-      OR id IN (SELECT msg_id FROM deliveries WHERE agent IN (${inList(members)})))`, args: [project, ...(key ? [key] : []), ...addrs, ...members] };
+    const id = resolveProject(project);
+    const keys = [...new Set([id.cleoId, id.gitKey].filter((k) => !!k))];
+    return { sql: `(json_extract(envelope,'$.meta.project')=?${keys.length ? ` OR json_extract(envelope,'$.meta.project_key') IN (${inList(keys)})` : ""} OR from_addr IN (${inList(addrs)})
+      OR id IN (SELECT msg_id FROM deliveries WHERE agent IN (${inList(members)})))`, args: [project, ...keys, ...addrs, ...members] };
 }
 function ledgerIds(node, project, after, upTo, limit) {
     const w = ledgerWhere(node, project);

@@ -19,15 +19,25 @@ import { mailboxLiveness } from "./receipts.ts";
 import { liveWatcher } from "./wake.ts";
 import { findIdentityControl, listIdentityControls } from "./identity-control.ts";
 import { pruneCandidates } from "./identity-cleanup.ts";
-import { staleProjectBindings } from "./registry.ts";
+import { projectOf, staleProjectBindings } from "./registry.ts";
+import { resolveProject } from "./project-key.ts";
 import { deadHolderLeases, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
 import { providerLabel, sameLiveProvider } from "./identity-takeover.ts";
 import { conversationLoopLabel, detectConversationLoops } from "./loop-detector.ts";
 import { opencodeDuplicateLoopChecks } from "./opencode-duplicate-loop.ts";
-import { mcpOrphanCheck } from "./mcp-lifecycle.ts";
+import { mbxProcessInventory, mcpOrphanCheck } from "./mcp-lifecycle.ts";
 
 export type Level = "ok" | "fail" | "warn" | "info";
 export interface Check { level: Level; label: string; fix?: string }
+
+/** --processes observes only the process inventory; it never initializes or repairs the host. */
+export function processChecks(home: string): Check[] {
+  const inventory = mbxProcessInventory(home);
+  if (inventory.unavailable) return [{ level: "warn", label: "MCP/watch process inventory unavailable; nothing changed" }];
+  return [{ level: "info", label: `${inventory.processes.length} agentmbx MCP/watch process(es); read-only` },
+    ...inventory.processes.map(p => ({ level: "info" as const,
+      label: `${p.kind} pid=${p.pid} ppid=${p.ppid} start=${p.start ?? "unknown"} client=${p.client}${p.clientPid ? ` (pid=${p.clientPid})` : ""} RSS=${p.rssBytes === null ? "unknown" : `${(p.rssBytes / 1024 ** 2).toFixed(1)} MiB`}` }))];
+}
 
 /** Observational only: doctor must never notify, mark deliveries or consume wake reservations. */
 export function conversationLoopChecks(node: MbxNode, now = Date.now()): Check[] {
@@ -232,6 +242,34 @@ export function staleBindingSummary(node: MbxNode): Check {
   return stale.length
     ? { level: "warn", label: `${stale.length} project binding(s) are older than another project for the same identity`, fix: "review the list: agentmbx identity bindings   (a dry run), then apply it: agentmbx identity bindings --apply" }
     : { level: "info", label: "no project bindings older than another project for the same identity" };
+}
+
+/**
+ * Which key names this folder's project, and where it came from (T543). A CLEO id from `.cleo/project-id` is shared by every
+ * checkout and host; without one the folder path is the key and nothing else matches it. A key that this host has seen on
+ * folders with different git origins means a `.cleo` directory was copied, which would merge two unrelated projects.
+ */
+export function projectKeyChecks(node: MbxNode, cwd = process.cwd()): Check[] {
+  const folder = projectOf(cwd);
+  if (!folder) return [];
+  const id = resolveProject(folder);
+  const out: Check[] = [];
+  if (!id.cleoId) {
+    out.push({ level: "info",
+      label: `project key is the folder path ${folder} (no .cleo/project-id): other checkouts of this project are not recognised${id.gitKey ? `; cross-host key ${id.gitKey} (git origin)` : "; no git origin either, so nothing matches it on another host"}`,
+      fix: "cleo init, then commit .cleo/project-id" });
+    return out;
+  }
+  const file = id.source === "cleo-project-id" ? ".cleo/project-id" : ".cleo/project.json";
+  out.push({ level: "ok", label: `project key ${id.cleoId} (source ${file} in ${id.cleoRoot}): the same on every checkout and host${id.gitKey ? `; the cloud keeps the git origin ${id.gitKey}` : ""}` });
+  const folders = (node.store.db.prepare("SELECT project FROM identity_projects WHERE project_key=? UNION SELECT project FROM project_leads WHERE project_key=?")
+    .all(id.cleoId, id.cleoId) as { project: string }[]).map((r) => r.project);
+  const origins = new Map<string, string[]>();
+  for (const f of new Set([...folders, folder])) { const g = resolveProject(f).gitKey; if (g) origins.set(g, [...(origins.get(g) ?? []), f]); }
+  if (origins.size > 1) out.push({ level: "warn",
+    label: `project key ${id.cleoId} is used by folders with different git origins (${[...origins.keys()].join(", ")}): a copied .cleo directory merges unrelated projects' members, leads and ledgers`,
+    fix: "give the copy its own id: remove the copied .cleo/project-id there and run cleo init" });
+  return out;
 }
 
 /** OpenCode's LocationActivity drops an idle service about every 60 minutes, and the plugin then releases and claims again.
@@ -622,6 +660,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     for (const c of foreignSessionProvider(node)) out.push(c);
     out.push(pruneSummary(node));
     out.push(staleBindingSummary(node));
+    for (const c of projectKeyChecks(node)) out.push(c);
     const peers = node.peers();
     const approved = peers.filter((p) => p.state === "approved");
     if (!approved.length) add("info", "no paired hosts (optional: agentmbx pair <host>:7373)");

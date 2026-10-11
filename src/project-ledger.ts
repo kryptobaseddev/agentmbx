@@ -7,7 +7,8 @@ import { activeLead, isLead } from "./lead-record.ts";
 import type { MbxNode } from "./node.ts";
 import { bumpPostToolMarkersForAgent } from "./posttool.ts";
 import { deliveryReceipts, type DeliveryReceipt } from "./receipts.ts";
-import { projectIdentities, projectKey, registeredIdentity } from "./registry.ts";
+import { resolveProject } from "./project-key.ts";
+import { projectIdentities, registeredIdentity } from "./registry.ts";
 import type { MessageRow } from "./store.ts";
 
 export {
@@ -23,7 +24,7 @@ const fail = (code: string, message: string): never => { throw Object.assign(new
 export interface LedgerRecipient extends DeliveryReceipt { role: string | null }
 export interface LedgerItem {
   id: string; ts: string; from: string; to: string[]; kind: string; subject: string; thread: string; project: string | null;
-  /** the sender's repository (normalized git origin): how mail from a paired host's own folder joins this ledger (T219) */
+  /** the project key the sender stamped (its CLEO id, else its normalized git origin): how mail from another checkout or a paired host's own folder joins this ledger (T219, T543) */
   project_key: string | null;
   body: string | null; body_withheld?: string; recipients: LedgerRecipient[]; forwarded_by?: string[];
 }
@@ -35,16 +36,17 @@ const roleOf = (node: MbxNode, address: string) => {
   return host === node.host ? registeredIdentity(node.store, name)?.role ?? null : null;
 };
 
-/** SQL condition (and parameters) for "a message of this project": stamped with meta.project, stamped with the same git
- *  origin from a paired host's own folder of this repository (T219), or sent by / delivered to an identity associated
- *  with the project. */
+/** SQL condition (and parameters) for "a message of this project": stamped with meta.project, stamped with this project's
+ *  key (its CLEO id, T543, or the git origin that mail written before that was stamped with, T219) from another checkout or a
+ *  paired host's own folder, or sent by / delivered to an identity associated with the project. */
 function ledgerWhere(node: MbxNode, project: string): { sql: string; args: string[] } {
   const members = [...projectIdentities(node.store, project)];
   const addrs = members.map((n) => `${n}@${node.host}`);
   const inList = (xs: string[]) => (xs.length ? xs.map(() => "?").join(",") : "NULL");
-  const key = projectKey(project);
-  return { sql: `(json_extract(envelope,'$.meta.project')=?${key ? " OR json_extract(envelope,'$.meta.project_key')=?" : ""} OR from_addr IN (${inList(addrs)})
-      OR id IN (SELECT msg_id FROM deliveries WHERE agent IN (${inList(members)})))`, args: [project, ...(key ? [key] : []), ...addrs, ...members] };
+  const id = resolveProject(project);
+  const keys = [...new Set([id.cleoId, id.gitKey].filter((k): k is string => !!k))];
+  return { sql: `(json_extract(envelope,'$.meta.project')=?${keys.length ? ` OR json_extract(envelope,'$.meta.project_key') IN (${inList(keys)})` : ""} OR from_addr IN (${inList(addrs)})
+      OR id IN (SELECT msg_id FROM deliveries WHERE agent IN (${inList(members)})))`, args: [project, ...keys, ...addrs, ...members] };
 }
 function ledgerIds(node: MbxNode, project: string, after: string, upTo: string, limit: number): string[] {
   const w = ledgerWhere(node, project);

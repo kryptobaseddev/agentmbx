@@ -242,8 +242,8 @@ test("build handover with an unbound base (agent \"\") does not crash the server
   assert.notEqual((await call("mbx_whoami")).isError, true, "the final call finishes under the old build");
   const deadline = Date.now() + 10_000;
   for (;;) {
-    const lease = node.store.db.prepare("SELECT holder_pid,released_at FROM identity_leases WHERE name='handover-reader'").get() as Lease;
-    if (lease.holder_pid !== old.holder_pid && lease.released_at === null) break;
+    const lease = node.store.db.prepare("SELECT holder_pid,token,released_at FROM identity_leases WHERE name='handover-reader'").get() as Lease;
+    if (lease.token !== old.token && lease.released_at === null) break;
     assert.ok(Date.now() < deadline, "the replacement did not take over the session");
     assert.equal(closed, false, "Transport closed: the handover crashed the server");
     await new Promise(r => setTimeout(r, 50));

@@ -138,9 +138,12 @@ CREATE TABLE IF NOT EXISTS pair_tokens (  -- one-time pairing tokens (agentmbx p
  */
 export const SCHEMA_VERSION = 3;
 // Additive columns on version 3. A missing one is added on open; user_version stays 3.
+// An older reader ignores the columns, and a version bump would make that reader refuse the store.
 // sessions.task and sessions.lane are the live session's CLEO task and phase (T497).
-// agents.state, agents.harness and agents.project_keys are the signed directory (T546).
-const SCHEMA_COLUMNS = [["sessions", "pid_start"], ["sessions", "task"], ["sessions", "lane"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"], ["agents", "state"], ["agents", "harness"], ["agents", "project_keys"]];
+// agents.state/harness/project_keys are the signed directory (T546).
+const SCHEMA_COLUMNS = [["sessions", "pid_start"], ["sessions", "task"], ["sessions", "lane"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"], ["agents", "state"], ["agents", "harness"], ["agents", "project_keys"],
+    // T543: the CLEO-id key of the folder, derived locally and never signed; NULL when the folder has no id (then the folder is the key).
+    ["identity_projects", "project_key"], ["project_leads", "project_key"]];
 const SCHEMA_OBJECTS = [...SCHEMA.matchAll(/CREATE\s+(?:VIRTUAL\s+)?(?:TABLE|INDEX|TRIGGER)\s+IF NOT EXISTS\s+(\w+)/g)].map(match => match[1]);
 const SCHEMA_DEFINITION = createHash("sha256").update(SCHEMA).update(JSON.stringify(SCHEMA_COLUMNS)).digest("hex");
 const opening = new AsyncLocalStorage();

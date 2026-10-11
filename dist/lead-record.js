@@ -4,6 +4,7 @@
 import { z } from "zod";
 import { canonical, fingerprint, ulid, verifyData } from "./crypto.js";
 import { ownerKeys } from "./policy.js";
+import { resolveProject } from "./project-key.js";
 import { identityProjects } from "./registry.js";
 export const LEAD_DEFAULT_TTL_MS = 30 * 86_400_000;
 export const LEAD_MAX_TTL_MS = 180 * 86_400_000;
@@ -41,8 +42,9 @@ export function storeLead(node, rec, sig) {
         fail("LEAD_INVALID", `invalid lead record: ${r.error.issues[0]?.message ?? "shape"}`);
     if (!signedBy(node, r.data, sig, r.data.owner_fp))
         fail("LEAD_SIGNATURE", "lead record is not signed by an owner key this host trusts");
-    node.store.db.prepare("INSERT OR IGNORE INTO project_leads (id,project,agent,record,sig,received_at) VALUES (?,?,?,?,?,?)")
-        .run(r.data.id, r.data.project, r.data.agent, JSON.stringify(r.data), sig, new Date().toISOString());
+    // project_key is derived here from the signed folder and is never part of what the owner signed (T543); NULL without a CLEO id.
+    node.store.db.prepare("INSERT OR IGNORE INTO project_leads (id,project,agent,record,sig,received_at,project_key) VALUES (?,?,?,?,?,?,?)")
+        .run(r.data.id, r.data.project, r.data.agent, JSON.stringify(r.data), sig, new Date().toISOString(), resolveProject(r.data.project).cleoId);
     node.store.audit("lead.set", { id: r.data.id, project: r.data.project, agent: `${r.data.agent}@${r.data.host}`, exp: r.data.exp });
     return r.data;
 }
@@ -59,9 +61,14 @@ export function revokeLead(node, rev, sig) {
     node.store.audit("lead.revoke", { id: r.data.target, revocation: r.data.id });
     return r.data;
 }
-/** The current lead of `project`, re-verified now: newest valid, unexpired, unrevoked record wins. */
+/** The current lead of `project`, re-verified now: newest valid, unexpired, unrevoked record wins. A record belongs to the
+ *  folder it was signed for, or to any other checkout of the same CLEO project (T543: the stored key matches). The owner's
+ *  signature is checked exactly as before; the key only decides which signed records are candidates for this project. */
 export function activeLead(node, project, now = new Date()) {
-    const rows = node.store.db.prepare("SELECT record,sig,revocation,revocation_sig FROM project_leads WHERE project=? ORDER BY id DESC").all(project);
+    return leadFor(node, project, resolveProject(project).key, now);
+}
+function leadFor(node, project, key, now) {
+    const rows = node.store.db.prepare("SELECT record,sig,revocation,revocation_sig,project_key FROM project_leads WHERE project=? OR project_key=? ORDER BY id DESC").all(project, key);
     for (const row of rows) {
         let rec;
         try {
@@ -73,7 +80,7 @@ export function activeLead(node, project, now = new Date()) {
         catch {
             continue;
         }
-        if (rec.project !== project || !signedBy(node, rec, row.sig, rec.owner_fp))
+        if ((rec.project !== project && !(row.project_key !== null && row.project_key === key)) || !signedBy(node, rec, row.sig, rec.owner_fp))
             continue;
         if (row.revocation && row.revocation_sig) {
             try {
@@ -90,11 +97,12 @@ export function activeLead(node, project, now = new Date()) {
     return null;
 }
 /** Every project's current lead, each re-verified now like `activeLead` (T496). A project whose records are all
- *  expired, revoked or not signed by a trusted owner key has no entry. Ordered by project folder. */
+ *  expired, revoked or not signed by a trusted owner key has no entry. One entry per project, however many checkouts have
+ *  records (T543). Ordered by project folder. */
 export function activeLeads(node, now = new Date()) {
     const out = [];
-    for (const { project } of node.store.db.prepare("SELECT DISTINCT project FROM project_leads ORDER BY project").all()) {
-        const lead = activeLead(node, project, now);
+    for (const g of node.store.db.prepare("SELECT COALESCE(project_key, project) AS k, MIN(project) AS project FROM project_leads GROUP BY COALESCE(project_key, project) ORDER BY MIN(project)").all()) {
+        const lead = leadFor(node, g.project, g.k, now);
         if (lead)
             out.push(lead);
     }
