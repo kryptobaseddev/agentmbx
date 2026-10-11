@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Sync carries an allowlisted status snapshot (T423).** The daemon adds `mbx.status/v2` counts, enums, names and timestamps to the contract-1 host report. Subjects, bodies, paths, session ids, relay URLs, keys and tokens stay off the wire. `needs_reply` and `from_owner` stay off because those counts are read from message bodies. Contract 2 remains reserved for the lead record.
+
 - **OpenCode plugin diagnostics distinguish wiring from runtime proof (T412).** Doctor reports managed, missing, outdated and foreign plugin wiring, then checks up to 20 exact session bindings using one bounded loopback waiter request and private HUD files. A matching session/pid waiter proves only a server wake poll; producer freshness uses the daemon heartbeat, never an unchanged snapshot's mtime. Missing or mismatched evidence remains explicit, and TUI loading, reading and render cost are unobserved. Checks expose no message subjects or counts, change no state, and point to `agentmbx setup --only opencode` without restarting sessions or overwriting foreign plugins.
 
 - **A new mailbox is a role persona, never the folder or a harness (T492).** `agentName` returns a name only when `MBX_AGENT` is set. Register, claim, and a whoami rename refuse a name that does not already exist when it equals the project folder or ends in a harness id (`claude`, `codex`, `opencode`, `kimi`, `hermes`, `grok`). An existing mailbox under either shape stays readable and claimable. The same persona claimed from one harness and then another keeps its mail and its role.

@@ -6,6 +6,8 @@
 // key, agent, host, expiry and record id — never the checkout path — and is
 // attached only when the spoken contract lists project_leads (T393).
 
+import { allowStatus } from "./status-sync.ts";
+
 export const CONTRACT_VERSION = 1;
 export const PROJECT_PATHS_SINCE = 2;
 export const PROJECT_LEADS_SINCE = 2;
@@ -110,6 +112,8 @@ export interface SyncSnapshot {
   approvals: { approval_id: string }[];
   paths: PathInput[];
   leads: LeadInput[];
+  /** Allowlisted mbx.status/v2 snapshot. Absent when the caller has not built one. */
+  status?: unknown;
   /** Receipt dedup keys already accepted. Those receipts are not appended again. */
   sentReceipts: string[];
 }
@@ -234,6 +238,7 @@ export function projectSync(input: SyncSnapshot): Projection {
   const findings = input.host.findings.filter((f) => /^[a-z0-9_.-]{1,64}$/.test(f.code)).slice(0, 50);
   const project_paths = projectPaths(input, findings);
   const project_leads = projectLeads(input);
+  const status = allowStatus(input.status);
   const host: Record<string, unknown> = {
     daemon_version: input.host.daemon_version,
     os: input.host.os,
@@ -254,6 +259,7 @@ export function projectSync(input: SyncSnapshot): Projection {
       host_name: p.host_name, host_key_fp: p.host_key_fp, last_seen_at: p.last_seen_at,
     })),
     doctor: { checked_at: input.now, findings: findings.slice(0, 50) },
+    ...(status ? { status } : {}),
   };
   if (project_paths) host.project_paths = project_paths;
   if (project_leads) host.project_leads = project_leads;

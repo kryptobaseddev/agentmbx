@@ -11,6 +11,7 @@ import { activeLead } from "./lead-record.ts";
 import { projectKey } from "./registry.ts";
 import { relayFor } from "./relay-client.ts";
 import { newSyncNonce, syncOnce, type SyncDeps, type SyncResult, type SyncSigner } from "./sync-client.ts";
+import { allowStatus } from "./status-sync.ts";
 import { CAPS, PATH_FLAG_PREFIX, PROJECT_KEY_RE, type AgentInput, type HostInput, type LeadInput, type PathInput, type PolicyInput, type ReceiptInput, type SyncSnapshot, type ThreadInput } from "./sync-projection.ts";
 import type { Store } from "./store.ts";
 import { version } from "./version.ts";
@@ -155,14 +156,50 @@ export function loadSyncSnapshot(node: MbxNode, ctx: { contractAllowsProjectPath
     leads.push({ project_key: key, agent: rec.agent, host: rec.host, exp: rec.exp, id: rec.id });
   }
 
+  const policies = policyInputs(node, nowMs);
+  const enrolled = relayEnrolled(node);
+  const approved = node.peers().filter((peer) => peer.state === "approved");
+  const outbox = db.prepare("SELECT COUNT(*) AS n FROM outbox").get() as { n: number };
+  const membersByKey = new Map<string, string[]>();
+  for (const agent of agents) {
+    for (const key of agent.project_keys) {
+      const list = membersByKey.get(key) ?? [];
+      if (!list.includes(agent.name)) list.push(agent.name);
+      membersByKey.set(key, list);
+    }
+  }
+  const status = allowStatus({
+    schema: "mbx.status/v2",
+    mbx_version: version(),
+    identities: agents.map((agent) => {
+      const policy = policies.find((row) => row.to.agents.length === 0 || row.to.agents.includes(agent.name));
+      return {
+        name: agent.name, role: agent.role,
+        state: agent.state,
+        registered: identities.some((row) => row.name === agent.name),
+        lease: agent.holder ? { holder_cli: agent.holder.cli, verified: agent.state === "live" } : null,
+        unread: agent.unread, harness_cli: agent.cli,
+        policy: policy ? { level: policy.level, classes: policy.classes } : { level: "ask", classes: [] },
+      };
+    }),
+    outbox_unsent: outbox.n,
+    cloud: { relay_enrolled: enrolled, last_ack: null, key_ad_expiry: null, account: null },
+    devices: approved.map((peer) => ({ host: peer.host, reachability: "unknown", last_presence: null })),
+    projects: [...membersByKey.entries()].map(([key, members]) => {
+      const lead = leads.find((row) => row.project_key === key);
+      const cli = lead ? agents.find((agent) => agent.name === lead.agent)?.cli : undefined;
+      return { lead: lead && cli ? { name: lead.agent, cli } : null, members };
+    }),
+    resolved_by: agents.some((agent) => agent.state === "live") ? "lease" : "manual",
+  });
   return {
     host: {
       daemon_version: version(),
       os: osOf(process.platform),
       owner_fp: node.ownerPub ? fingerprint(node.ownerPub) : null,
       authority_owner: node.ownerPub != null,
-      relay_enrolled: relayEnrolled(node),
-      peers: node.peers().filter((peer) => peer.state === "approved").flatMap((peer) => {
+      relay_enrolled: enrolled,
+      peers: approved.flatMap((peer) => {
         const host_key_fp = peerFp(peer.pubkey);
         return host_key_fp ? [{ host_name: peer.host, host_key_fp, last_seen_at: null }] : [];
       }),
@@ -171,10 +208,11 @@ export function loadSyncSnapshot(node: MbxNode, ctx: { contractAllowsProjectPath
     agents,
     threads: [...threads.values()],
     receipts,
-    policies: policyInputs(node, nowMs),
+    policies,
     approvals: [],
     paths,
     leads,
+    ...(status ? { status } : {}),
   };
 }
 

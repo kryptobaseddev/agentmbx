@@ -207,3 +207,40 @@ test("T498: sync preserves outward-reversible without expanding an older signed 
     assert.equal(rows[0].expires_at, null);
   }
 });
+
+test("status keeps counts and names and drops bodies, paths, sessions and tokens (T423)", () => {
+  const got = projectSync(snap({
+    status: {
+      schema: "mbx.status/v2",
+      mbx_version: "0.5.26",
+      identities: [{
+        name: "worker", role: "builder", state: "live", registered: true,
+        lease: { holder_cli: "claude", verified: true, holder_session: "secret-session" },
+        unread: 2, harness_cli: "claude", session_id: "secret-session", wake_path: `${HOME}/wake`,
+        policy: { level: "collaborate", classes: ["read", "edit"] },
+        body: "message body", subject: "hello",
+      }],
+      outbox_unsent: 1,
+      cloud: { relay_enrolled: true, last_ack: null, key_ad_expiry: null, account: "acct_other", url: "https://relay.example/token" },
+      devices: [{ host: "fedora", reachability: "reachable", last_presence: null, address: `${HOME}/sock` }],
+      projects: [{ lead: { name: "worker", cli: "claude" }, members: ["worker"], directory: `${HOME}/projects/widget` }],
+      resolved_by: "lease",
+    },
+  }));
+  assert.equal(got.ok, true);
+  if (!got.ok) return;
+  const body = got.body;
+  assert.equal(body.includes("mbx.status/v2"), true);
+  assert.equal(body.includes("\"unread\":2"), true);
+  assert.equal(body.includes(HOME), false);
+  assert.equal(body.includes("message body"), false);
+  assert.equal(body.includes("secret-session"), false);
+  assert.equal(body.includes("acct_other"), false);
+  assert.equal(body.includes("relay.example"), false);
+  assert.equal(body.includes("\"body\""), false);
+  assert.equal(body.includes("\"subject\""), false);
+  assert.equal(body.includes("\"session_id\""), false);
+  assert.equal(body.includes("\"directory\""), false);
+  const status = (got.batch.host as { status?: { cloud: { account: null } } }).status;
+  assert.equal(status?.cloud.account, null);
+});
