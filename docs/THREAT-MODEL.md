@@ -303,6 +303,18 @@ and pair again with a token. Documented here and to be added to the rotation hel
   that is re-verified on every read; a tampered row or a forged revocation changes nothing. Forwarding never adds
   authority: the recipient's policy still comes from the original sender. Other project members see metadata (senders,
   recipients, roles, states) but no bodies they were not sent.
+- **R10, lead-carried grants (T499).** An owner can sign grants onto the lead record so named members get the narrow
+  `outward-reversible` approvals (a literal branch push or draft PR) without the owner. The authority is the owner's
+  signature, bounded to that one class, named personas, the lead record's life and 30 days, and it is suspended whenever
+  the lead is not live or any conversation the store knows for the lead holds external-origin content, and ended by
+  `lead revoke`, a newer lead record or `policy revoke --all`. Residual risks: a prompt-injected lead is limited to
+  those two operations by members the owner named, for the grant's life; taint only follows content that arrived
+  through mbx, so a lead that read a hostile page with its own tools is **not** suspended. The lead's liveness is
+  database evidence (a fresh heartbeat), not process proof, so a killed lead keeps its grants until the heartbeat
+  ages out, unlike the persona side, which checks the process. A lead on another host never grants here, because its
+  taint is not visible. A taint recorded only under a provisional `mcp-*` session id the store does not list for the
+  lead is not seen, the same limit the persona side has. A grant to `*` covers every explicit member, and a session
+  becomes a member by registering itself, so the owner is shown the `*` in the text they sign.
 - **R8, wake storms.** Per-agent brakes, batching, busy backoff, unknown holds and mute bound wakes for any one agent
   (D1). F6 remains open across many names. A woken session spends model turns even when it decides to do nothing.
 
