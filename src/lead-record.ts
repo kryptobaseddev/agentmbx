@@ -38,7 +38,7 @@ export const leadSummary = (r: LeadRecord) => `Make ${r.agent}@${r.host} the lea
 
 /** Owner keys this host trusts: its own, plus adopted owners (paired-device principals). */
 const trustedOwners = (node: MbxNode) => [...new Set([...(node.ownerPub ? [node.ownerPub] : []), ...ownerKeys(node.store.db)])];
-function signedBy(node: MbxNode, rec: unknown, sig: string, owner_fp: string): boolean {
+export function signedBy(node: MbxNode, rec: unknown, sig: string, owner_fp: string): boolean {
   const pub = trustedOwners(node).find((k) => fingerprint(k) === owner_fp);
   return !!pub && verifyData(pub, canonical(rec), sig);
 }
@@ -72,7 +72,7 @@ export function revokeLead(node: MbxNode, rev: unknown, sig: string): LeadRevoca
 export function activeLead(node: MbxNode, project: string, now = new Date()): LeadRecord | null {
   return leadFor(node, project, resolveProject(project).key, now);
 }
-function leadFor(node: MbxNode, project: string, key: string, now: Date): LeadRecord | null {
+export function leadFor(node: MbxNode, project: string, key: string, now: Date): LeadRecord | null {
   const rows = node.store.db.prepare("SELECT record,sig,revocation,revocation_sig,project_key FROM project_leads WHERE project=? OR project_key=? ORDER BY id DESC").all(project, key) as
     { record: string; sig: string; revocation: string | null; revocation_sig: string | null; project_key: string | null }[];
   for (const row of rows) {
