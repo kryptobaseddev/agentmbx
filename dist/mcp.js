@@ -7,7 +7,6 @@ import { EventEmitter } from "node:events";
 import { execFileSync, spawn } from "node:child_process";
 import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -27,11 +26,12 @@ import { formatUnboundStart, listIdentityStatus } from "./identity-status.js";
 import { consumeIdentityControl, identityControlAliases, identityControlKey, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl } from "./identity-control.js";
 import { alive, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
 import { auditLeadGrantUse, leadGrantCovering } from "./lead-grants.js";
+import { setSessionPresence } from "./presence.js";
 import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy.js";
 import { assertKnownRecipients, deliveryReceipts, offlineWarnings, receiptLine, recipientReceipts, sentPage } from "./receipts.js";
 import { forwardMessage, ledgerPage, projectLeadView } from "./project-ledger.js";
 import { buildRoster, rosterText } from "./roster.js";
-import { skillFiles } from "./setup.js";
+import { CLIS, skillFiles } from "./setup.js";
 import { claudeSessionId, claudeSessionTracker, grokSessionId, grokSessionTracker, procStart, procTable, withProcSnapshot } from "./proc.js";
 import { updateAvailable } from "./update.js";
 import { installKind, version } from "./version.js";
@@ -42,6 +42,7 @@ import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wa
 import { isStoreBusy, withStoreBusyTimeout } from "./store.js";
 import { markMcpStarting } from "./mcp-startup.js";
 import { recordMcpGeneration, startMcpLifecycle } from "./mcp-lifecycle.js";
+import { projectLabel } from "./project-mailbox.js";
 let lifecycle;
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
 It is shared by AI coding agents on this machine and on paired machines. Your user set it up so agents can coordinate;
@@ -415,17 +416,22 @@ export function socketPush(text, env = process.env) {
         });
     });
 }
-/** Default agent name: $MBX_AGENT when the owner set one, otherwise the project folder. The home folder and `/` are
- *  not projects, so they do not invent a name from the harness or from the account. An existing mailbox the owner
- *  names with MBX_AGENT, including one already named after a harness, is kept. */
-export function agentName(cwd = process.cwd()) {
-    const explicit = process.env.MBX_AGENT;
-    const inHome = resolve(cwd) === resolve(homedir()) || resolve(cwd) === "/";
-    const raw = explicit || (inHome ? "" : basename(cwd));
-    if (!raw)
+/** A name only when the owner set MBX_AGENT (T492). A folder, the home directory and `/` do not invent one.
+ *  An existing mailbox the owner names with MBX_AGENT, including one already named after a harness, is kept. */
+export function agentName(_cwd = process.cwd()) {
+    const explicit = process.env.MBX_AGENT?.trim();
+    if (!explicit)
         return null;
-    const n = raw.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
-    return NAME_RE.test(n) ? n : "agent";
+    const n = explicit.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+    return NAME_RE.test(n) ? n : null;
+}
+/** A mailbox that does not exist yet may not be the project folder or end in a harness id (T492). */
+export function reservedNewName(name, cwd) {
+    // TODO(T493): also refuse when reservedByProjectMailbox(store, name) is true.
+    const bare = basename(resolve(cwd));
+    if (name === bare || name === bare.toLowerCase())
+        return true;
+    return CLIS.some((cli) => name.endsWith(`-${cli}`));
 }
 const text = (s, structured) => ({ content: [{ type: "text", text: s }], ...(structured ? { structuredContent: structured } : {}) });
 /** A status that looks like it wants attention will not get it: say so to the sender (owner decision 2026-09-30). */
@@ -1217,8 +1223,7 @@ async function configureMcp(server, node, startupClosed) {
         return { draft, warnings: externalWarning(origin, taint) };
     };
     /** Opening mail marks the reader's own copies read (delivered/notified → read; never past acked), for sender receipts (T207). */
-    const markRead = (rows, agent) => { for (const r of rows)
-        node.setDelivery(r.id, agent, "read"); };
+    const markRead = (rows, agent) => node.markRead(rows, agent); // its own copy, else a project copy it may read (T493)
     // Identity and policy notes belong to the ready caller, never the transport's provisional mailbox.
     const sessionNotes = (state) => {
         if (!bound(state))
@@ -1402,7 +1407,7 @@ async function configureMcp(server, node, startupClosed) {
         missed: missedCount(node.store, agent).missed,
         open_threads: Number(node.store.db.prepare("SELECT COUNT(DISTINCT m.thread) n FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state<>'acked'").get(agent).n),
         recent_notes: node.store.db.prepare("SELECT msg_id,note,updated_at FROM deliveries WHERE agent=? AND note IS NOT NULL ORDER BY updated_at DESC LIMIT 3").all(agent) });
-    const identityOperation = ({ action, name, role, description, all, approval, target: controlTarget }) => {
+    const identityOperation = ({ action, name, role, description, task, lane, all, approval, target: controlTarget }) => {
         const state = current();
         if (action === "takeover") {
             if (!name || !approval || approval.payload.name !== name || !controlTarget)
@@ -1414,8 +1419,8 @@ async function configureMcp(server, node, startupClosed) {
                 throw new Error("takeover destination process evidence is unavailable");
             return applyIdentityTakeover(node, leases, approval, descriptor, () => identityOperation({ action: "claim", name }));
         }
-        if (action !== "claim" && action !== "register" && (name || role || description))
-            throw new Error("name, role and description are only valid for claim and register");
+        if (action !== "claim" && action !== "register" && (name || role || description || task || lane))
+            throw new Error("name, role, description, task and lane are only valid for claim and register");
         if (action === "list") {
             const result = listIdentityStatus(node.home, { project: all ? undefined : project, caller: { cli: env.cli, sessionId: state.sessionId, pid: process.pid, providerPid: env.ppid, canonicalHarness: !!env.harnessProvider } });
             const out = { ...result, you: bound(state) ? { agent: state.agent, address: `${state.agent}@${node.host}`, ...(state.coUse ? { co_use: CO_USE_NOTE } : {}) }
@@ -1466,6 +1471,8 @@ async function configureMcp(server, node, startupClosed) {
             // still be claimed without one, to read their mail.
             if (AUTO_NAME_RE.test(target))
                 throw Object.assign(new Error(`"${target}" looks auto-generated; register a readable name such as <project>-<role>`), { code: "IDENTITY_NAME_UNREADABLE" });
+            if (!node.knownLocalName(target) && reservedNewName(target, process.cwd()))
+                throw Object.assign(new Error(`${target} is reserved. Register a role persona such as <project>-<role>, not the project folder or a harness suffix.`), { code: "IDENTITY_NAME_UNREADABLE" });
             // A mailbox that already exists here (it had mail, a lease, an agents row or an alias) is resumed by name, keeping
             // the role it was known by, so the list's "claimable" and the claim agree (T315). A new name still needs a role.
             if (!role && !(action === "claim" && node.knownLocalName(target)))
@@ -1480,6 +1487,8 @@ async function configureMcp(server, node, startupClosed) {
                         throw Object.assign(new Error("release your current identity before claiming another; use mbx_whoami to rename it"), { code: "IDENTITY_RELEASE_REQUIRED" });
                     if (role || description)
                         registerIdentity(node.store, { name: target, role: role ?? registration?.role ?? UNSPECIFIED_ROLE, description, by: `${env.cli}:${state.sessionId}` });
+                    if (task || lane)
+                        setSessionPresence(node, { cli: env.cli, sessionId: state.sessionId, ...(task ? { task } : {}), ...(lane ? { lane } : {}) });
                     const result = handoff(state.agent);
                     return text(JSON.stringify(result, null, 2), result);
                 });
@@ -1499,6 +1508,8 @@ async function configureMcp(server, node, startupClosed) {
                 if (role || description || inheritedRole)
                     registerIdentity(node.store, { name: target, role: role ?? registration?.role ?? inheritedRole ?? UNSPECIFIED_ROLE, description, by: `${env.cli}:${next.sessionId}` });
                 node.registerAgent(target, { cli: env.cli, ...(role ? { role } : {}), ...(description ? { description } : {}) });
+                if (task || lane)
+                    setSessionPresence(node, { cli: env.cli, sessionId: next.sessionId, ...(task ? { task } : {}), ...(lane ? { lane } : {}) });
                 return handoff(next.agent);
             }));
         }
@@ -1523,6 +1534,8 @@ async function configureMcp(server, node, startupClosed) {
             name: z.string().regex(NAME_RE).optional().describe("identity to claim or register, e.g. agentmbx-reviewer"),
             role: z.string().regex(ROLE_RE).optional().describe("short role label, e.g. lead, reviewer, builder (required to register)"),
             description: z.string().max(200).optional().describe("what this agent does, at most 200 characters"),
+            task: z.string().regex(/^T\d+$/).optional().describe("CLEO task this session is on, e.g. T497"),
+            lane: z.string().regex(ROLE_RE).optional().describe("swim lane, a short label such as the CLEO phase"),
             all: z.boolean().optional().describe("list: every identity on this host instead of this project's") },
         annotations: { destructiveHint: false },
     }, identityOperation);
@@ -1593,6 +1606,8 @@ async function configureMcp(server, node, startupClosed) {
                 throw Object.assign(new Error(`${to} is a registered identity (role ${taken.role}); to take it over, release yours and claim it with mbx_identity`), { code: "NAME_IN_USE" });
             if (AUTO_NAME_RE.test(to))
                 throw Object.assign(new Error(`"${to}" looks auto-generated; choose a readable name such as <project>-<role>`), { code: "IDENTITY_NAME_UNREADABLE" });
+            if (!node.knownLocalName(to) && reservedNewName(to, process.cwd()))
+                throw Object.assign(new Error(`${to} is reserved. Register a role persona such as <project>-<role>, not the project folder or a harness suffix.`), { code: "IDENTITY_NAME_UNREADABLE" });
             checkLegacy(to, state, node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions WHERE agent=?`).all(to));
             const lease = leases.rename(agent, state.leaseToken, to);
             node.addAlias(agent, to, env.ppid);
@@ -1622,6 +1637,8 @@ async function configureMcp(server, node, startupClosed) {
             auditLeadGrantUse(node.store, { grant: { lead: covered.lead, record: covered.record, grants: covered.grant, exp: covered.exp }, agent, cli: env.cli, via: "whoami" });
         const out = { agent, host: node.host, address: `${agent}@${node.host}`, role: reg?.role ?? me?.role ?? null, description: reg?.description ?? me?.description ?? null,
             registered: !!reg, project: project ?? null, lead: leadView.address && leadView.exp ? { address: leadView.address, exp: leadView.exp } : null,
+            // T493: the project mailboxes this session reads as the project's lead, with their unread counts. Absent for everyone else.
+            ...((ps) => ps.length ? { project_mailboxes: ps } : {})(node.projectInboxes(agent, { limit: 1 }).map((s) => ({ project: projectLabel(s.project), key: s.project.key, unread: s.unread }))),
             // T548: `session` keeps its historical meaning (the lease key fingerprint) for old clients; the id the
             // statusline/HUD key on is the sessions-table session id, reported as `harness_session`; `lease_key` labels it.
             cli: env.cli, session: fingerprint(key.publicKey), harness_session: state.sessionId, lease_key: fingerprint(key.publicKey),
@@ -1676,7 +1693,7 @@ async function configureMcp(server, node, startupClosed) {
     });
     server.registerTool("mbx_send", {
         title: "Send an mbx message",
-        description: "Start a new conversation with other agents (to answer a message, use mbx_reply instead). `to` accepts agent names (vida-dev), agent@host (vida-dev@fedora), role:<role>, lead and role:lead (the owner-designated lead of this session's project; refused when that project has none), * (everyone), or owner; find names with mbx_agents. Kind decides waking: request/task/decision/alert wake an idle recipient; message/reply wake only with needs_reply=true or an @mention; status NEVER wakes (it waits for the recipient's next prompt). Use kind=request/task with needs_reply=true when you need an answer. A successful send is acceptance, not recipient delivery, reply or task completion; queued transport retry is not a draft API. Avoid manually resending an uncertain send. The result's recipients[] says per recipient: live-wake (eligible for wake; dispatcher admission pending), live-next-prompt (seen on its next prompt), offline (no live session; it waits), forwarded (renamed mailbox) or remote (queued for a paired host). A name that never existed on this host is refused with suggestions. Next: check mbx_inbox for answers.",
+        description: "Start a new conversation with other agents (to answer a message, use mbx_reply instead). `to` accepts agent names (vida-dev), agent@host (vida-dev@fedora), role:<role>, task:T123 (every live persona on that CLEO task), lead and role:lead (the owner-designated lead of this session's project; refused when that project has none), * (everyone), or owner; find names with mbx_agents. Kind decides waking: request/task/decision/alert wake an idle recipient; message/reply wake only with needs_reply=true or an @mention; status NEVER wakes (it waits for the recipient's next prompt). Use kind=request/task with needs_reply=true when you need an answer. A successful send is acceptance, not recipient delivery, reply or task completion; queued transport retry is not a draft API. Avoid manually resending an uncertain send. The result's recipients[] says per recipient: live-wake (eligible for wake; dispatcher admission pending), live-next-prompt (seen on its next prompt), offline (no live session; it waits), forwarded (renamed mailbox) or remote (queued for a paired host). A name that never existed on this host is refused with suggestions. Next: check mbx_inbox for answers.",
         inputSchema: {
             to: z.array(z.string().min(1)).min(1).max(20), subject: z.string().min(1).max(200), body: z.string().max(256 * 1024),
             kind: z.enum(KINDS).default("message").describe("request/task/decision/alert wake the recipient; message/reply wake only with needs_reply or an @mention; status never wakes"),
@@ -1741,10 +1758,16 @@ async function configureMcp(server, node, startupClosed) {
     }, ({ all, limit }) => {
         const { agent } = current();
         const rows = node.inbox(agent, { all, limit });
-        if (!rows.length)
-            return text(`No ${all ? "" : "unread "}messages for ${agent}@${node.host}.`, { messages: [] });
-        const lines = rows.map((m) => { const p = node.policyFor(m, agent); return `${summaryLine(m)}\n    trust: ${trustLabel(m)} · policy: ${p.level === "yolo" ? "YOLO" : p.level}${p.classes.length ? ` [${p.classes.join(", ")}]` : ""}`; });
-        return text(`${rows.length} message(s) for ${agent}@${node.host}:\n${lines.join("\n")}\n\nRead one with mbx_read {"ids": ["<id>"]}.`, { messages: rows.map((m) => ({ id: m.id, from: m.from_addr, subject: m.subject, kind: m.kind, ts: m.ts, state: m.state, trust: trustLabel(m) })) });
+        // T493: the project mailboxes this session leads, as labelled sections. Empty for everyone else, and outside the holder's own lease.
+        const sections = node.projectInboxes(agent, { all, limit });
+        const describe = (m) => { const p = node.policyFor(m, agent); return `${summaryLine(m)}\n    trust: ${trustLabel(m)} · policy: ${p.level === "yolo" ? "YOLO" : p.level}${p.classes.length ? ` [${p.classes.join(", ")}]` : ""}`; };
+        const brief = (m) => ({ id: m.id, from: m.from_addr, subject: m.subject, kind: m.kind, ts: m.ts, state: m.state, trust: trustLabel(m) });
+        const projectOut = sections.length ? { project_inboxes: sections.map((s) => ({ project: projectLabel(s.project), key: s.project.key, unread: s.unread, messages: s.messages.map(brief) })) } : {};
+        const projectText = sections.map((s) => `Project mailbox ${projectLabel(s.project)} (${s.unread} unread; stored once for the project, you read it as its lead):${s.messages.length ? `\n${s.messages.map((m) => describe(m).replace(s.project.slot, `project:${projectLabel(s.project)}`)).join("\n")}` : "\n(nothing)"}`);
+        if (!rows.length && !sections.some((s) => s.messages.length))
+            return text(`No ${all ? "" : "unread "}messages for ${agent}@${node.host}.${projectText.length ? `\n${projectText.join("\n")}` : ""}`, { messages: [], ...projectOut });
+        const personal = rows.length ? `${rows.length} message(s) for ${agent}@${node.host}:\n${rows.map(describe).join("\n")}` : `No ${all ? "" : "unread "}personal messages for ${agent}@${node.host}.`;
+        return text(`${[personal, ...projectText].join("\n\n")}\n\nRead one with mbx_read {"ids": ["<id>"]}.`, { messages: rows.map(brief), ...projectOut });
     });
     server.registerTool("mbx_read", {
         title: "Read mbx messages",
@@ -1780,10 +1803,11 @@ async function configureMcp(server, node, startupClosed) {
         description: "Mark messages as dealt with (optionally with a short note). Acked messages leave the unread inbox. Ack after you reply or act; no need to send a separate \"acknowledged\" message. Keep `did` to one line of at most 200 characters, action first; put detail in your thread reply. Next: mbx_inbox for anything else.",
         inputSchema: { ids: z.array(z.string().min(6)).min(1).max(50), note: z.string().max(500).optional(),
             // No schema max: an over-long line must never fail the acks themselves; node.ack keeps it bounded and marked.
-            did: z.string().max(10_000).optional().describe("if you acted on the request: one line, at most 200 characters, saying what you did, action first (owner's audit log; longer text is cut and marked truncated)") },
+            did: z.string().max(10_000).optional().describe("if you acted on the request: one line, at most 200 characters, saying what you did, action first (owner's audit log; longer text is cut and marked truncated)"),
+            project: z.string().min(1).max(200).optional().describe("the project mailbox (its bare name) whose copy to acknowledge, when you lead the project and the message also reached you personally; otherwise your own copy is acknowledged first") },
         annotations: { idempotentHint: true },
-    }, ({ ids, note, did }) => {
-        const acked = ids.map((i) => node.ack(i, current().agent, note ?? null, did)), warning = didWarning(did);
+    }, ({ ids, note, did, project }) => {
+        const acked = ids.map((i) => node.ack(i, current().agent, note ?? null, did, project === undefined ? {} : { project })), warning = didWarning(did);
         return text(`Acked: ${acked.join(", ")}${warning ? `\nwarning: ${warning}` : ""}`);
     });
     server.registerTool("mbx_thread", {
@@ -1812,7 +1836,7 @@ async function configureMcp(server, node, startupClosed) {
     });
     server.registerTool("mbx_agents", {
         title: "List mbx agents",
-        description: "Who you can reach, and whether they are really there. state is live (a verified session holds it), idle (a shared-process conversation quiet for 10 minutes), unknown (a holder exists but could not be verified right now), offline, or remote (listed by a paired host; this host cannot verify it). Each row shows role, the harness holding it, its projects and lead_of (the projects it is the owner-designated lead of). Default: this session's project plus the leads of other projects, plus any live or idle persona whose session works in this folder (seen_here: true; visibility only, it does not make the persona a member); project:\"*\" lists every project. Retired and generated names are hidden unless they are live or idle; all:true lists them. Next: address one with mbx_send (name, name@host or role:<role>).",
+        description: "Who you can reach, and whether they are really there. state is live (a verified session holds it), idle (a shared-process conversation quiet for 10 minutes), unknown (a holder exists but could not be verified right now), offline, or remote (listed by a paired host; this host cannot verify it). Each row shows role, task and lane when this host's live session recorded them, the harness holding it, its projects and lead_of (the projects it is the owner-designated lead of). Default: this session's project plus the leads of other projects, plus any live or idle persona whose session works in this folder (seen_here: true; visibility only, it does not make the persona a member); project:\"*\" lists every project. Retired and generated names are hidden unless they are live or idle; all:true lists them. Next: address one with mbx_send (name, name@host, role:<role> or task:<id>).",
         inputSchema: {
             project: z.string().max(1024).optional().describe("\"*\" for every project, or this session's own folder (the default view)"),
             all: z.boolean().optional().describe("also list retired and generated names"),

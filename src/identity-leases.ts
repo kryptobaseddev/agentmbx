@@ -15,6 +15,18 @@ export function hasHeldIdentity(store: Store, name: string): boolean {
   return row?.token === scope.token && row.released_at === null;
 }
 
+/**
+ * Is the current synchronous operation running inside `name`'s own held lease (read or write), with that lease still the current,
+ * unreleased one? This is the proof that a caller may READ what only `name` may read (a project mailbox, T493). Unlike
+ * hasHeldIdentity it accepts a read-only scope; it never attests a sender, which stays write-only.
+ */
+export function hasHeldScope(store: Store, name: string): boolean {
+  const scope = heldOperation.getStore();
+  if (!scope?.active || scope.store !== store || scope.name !== name) return false;
+  const row = store.db.prepare("SELECT token,released_at FROM identity_leases WHERE name=?").get(name);
+  return row?.token === scope.token && row.released_at === null;
+}
+
 export const DEFAULT_IDENTITY_IDLE_TTL_MS = 30 * 60_000;
 export interface LeaseHolder { pid: number; start: string; keyFp: string; cli: string; sessionId: string }
 export interface IdentityLease {

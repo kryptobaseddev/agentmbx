@@ -76,6 +76,9 @@ export function validateAgentsV1(x) {
             bad.push(`${at}.self is not a boolean`);
         if (typeof r.seen_here !== "boolean")
             bad.push(`${at}.seen_here is not a boolean`);
+        for (const k of ["task", "lane"])
+            if (r[k] !== undefined && !strOrNull(r[k]))
+                bad.push(`${at}.${k} is not a string or null`);
         if (r.project_keys !== undefined && !strList(r.project_keys))
             bad.push(`${at}.project_keys is not a list of strings`);
         if (r.harness !== null && r.state !== "live" && r.state !== "idle")

@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { inspectLeaseProcess, type IdentityLease, type ProcessEvidence } from "./identity-leases.ts";
 import { activityKey, holderProviderView, identityAvailability, parseActivity, parseProviderRecord, type LeaseActivity, type RecordedProvider } from "./identity-availability.ts";
 import { procTable } from "./proc.ts";
+import { notSlot } from "./project-slot.ts";
 import { SCHEMA_VERSION } from "./store.ts";
 
 export interface IdentityStatus {
@@ -56,7 +57,7 @@ export function listIdentityStatus(home: string, options: { now?: number; inspec
     schema = db.prepare("PRAGMA user_version").get()!.user_version as number;
     if (schema > SCHEMA_VERSION) throw Object.assign(new Error(`mailbox schema ${schema} is newer than this runtime; update AgentMBX`), { code: "STALE_SERVER" });
     for (const r of db.prepare("SELECT name,last_seen FROM agents WHERE host=?").all(config.host)) activity(row(r.name as string), r.last_seen);
-    for (const r of db.prepare("SELECT agent,COUNT(*) total,SUM(state<>'acked') unread,MAX(updated_at) activity FROM deliveries GROUP BY agent").all()) {
+    for (const r of db.prepare(`SELECT agent,COUNT(*) total,SUM(state<>'acked') unread,MAX(updated_at) activity FROM deliveries WHERE ${notSlot("agent")} GROUP BY agent`).all()) {
       const item = row(r.agent as string); item.messages = Number(r.total); item.unread = Number(r.unread); activity(item, r.activity);
     }
     for (const r of db.prepare("SELECT agent,MAX(updated_at) activity FROM sessions GROUP BY agent").all()) activity(row(r.agent as string), r.activity);

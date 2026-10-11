@@ -72,6 +72,12 @@ CREATE TABLE IF NOT EXISTS project_leads (  -- owner-signed project lead records
   id TEXT PRIMARY KEY, project TEXT NOT NULL, agent TEXT NOT NULL, record TEXT NOT NULL, sig TEXT NOT NULL,
   revocation TEXT, revocation_sig TEXT, received_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS project_leads_project ON project_leads(project);
+-- Project mailboxes (src/project-mailbox.ts, T493): one row per project, keyed by resolveProject(folder).key (the CLEO project id, else
+-- the folder). The slot is the reserved name its deliveries carry in the deliveries table; it is never an agent, identity or lease.
+-- home_host is the host of the first lead set and never changes. Additive: older runtimes ignore the table (no schema version change).
+CREATE TABLE IF NOT EXISTS project_mailboxes (
+  key TEXT PRIMARY KEY, slot TEXT NOT NULL UNIQUE, alias TEXT UNIQUE, home_host TEXT NOT NULL,
+  source TEXT NOT NULL, folder TEXT, created_at TEXT NOT NULL);
 -- Cross-host delivery receipts (src/remote-receipts.ts, T218). Every delivery state change of a message from a paired host
 -- is queued for that host by these triggers, so every path that moves a delivery (old runtimes included) is covered; the
 -- daemon signs and pushes them. Additive: older runtimes ignore the tables (no schema version change).
@@ -143,9 +149,11 @@ CREATE TABLE IF NOT EXISTS pair_tokens (  -- one-time pairing tokens (agentmbx p
  */
 export const SCHEMA_VERSION = 3;
 
-// agents.state/harness/project_keys are additive (T546). They stay on schema version 3, same as peers.enc_pub:
-// an older reader ignores the columns, and a version bump would make that reader refuse the store.
-const SCHEMA_COLUMNS = [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"], ["agents", "state"], ["agents", "harness"], ["agents", "project_keys"],
+// Additive columns on version 3. A missing one is added on open; user_version stays 3.
+// An older reader ignores the columns, and a version bump would make that reader refuse the store.
+// sessions.task and sessions.lane are the live session's CLEO task and phase (T497).
+// agents.state/harness/project_keys are the signed directory (T546).
+const SCHEMA_COLUMNS = [["sessions", "pid_start"], ["sessions", "task"], ["sessions", "lane"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"], ["agents", "state"], ["agents", "harness"], ["agents", "project_keys"],
   // T543: the CLEO-id key of the folder, derived locally and never signed; NULL when the folder has no id (then the folder is the key).
   ["identity_projects", "project_key"], ["project_leads", "project_key"],
   // T499: the owner-signed grants blob and its signature, on the lead's row. The signed lead record itself is untouched, so an older reader

@@ -15,6 +15,7 @@ import { opencodeHostOf, type OpencodeHost } from "./opencode-provider.ts";
 import { pushOpencodeWake } from "./opencode-wake-queue.ts";
 import type { WakeOutcome, WakeReceipt } from "./wake-contract.ts";
 import type { MessageRow } from "./store.ts";
+import { notSlot } from "./project-slot.ts";
 
 const run = promisify(execFile);
 /** `ok` is true only for an admitted wake or a shown notice. Provider adapters also report the typed `outcome` (T178,
@@ -385,7 +386,8 @@ function noticeAllowed(node: MbxNode, agent: string, now: number): boolean {
 /** One pass of the wake dispatcher: every delivered-but-not-notified message is either woken, batched or skipped. */
 export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ agent: string; result: WakeResult | { ok: false; via: "brake"; error: string } }[]> {
   reconcileWakes(node, now);
-  const pending = node.store.db.prepare(`SELECT d.agent, m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.state='delivered' ORDER BY m.ts`).all() as unknown as (MessageRow & { agent: string })[];
+  // T493: a project mailbox slot has no session of its own; waking its lead is a separate path, so the dispatcher leaves slot rows alone.
+  const pending = node.store.db.prepare(`SELECT d.agent, m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.state='delivered' AND ${notSlot("d.agent")} ORDER BY m.ts`).all() as unknown as (MessageRow & { agent: string })[];
   const byAgent = new Map<string, (MessageRow & { agent: string })[]>();
   for (const r of pending) byAgent.set(r.agent, [...(byAgent.get(r.agent) ?? []), r]);
   const out: { agent: string; result: WakeResult | { ok: false; via: "brake"; error: string } }[] = [];
