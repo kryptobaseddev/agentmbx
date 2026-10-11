@@ -141,7 +141,10 @@ export const SCHEMA_VERSION = 3;
 // an older reader ignores the columns, and a version bump would make that reader refuse the store.
 const SCHEMA_COLUMNS = [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"], ["agents", "state"], ["agents", "harness"], ["agents", "project_keys"],
     // T543: the CLEO-id key of the folder, derived locally and never signed; NULL when the folder has no id (then the folder is the key).
-    ["identity_projects", "project_key"], ["project_leads", "project_key"]];
+    ["identity_projects", "project_key"], ["project_leads", "project_key"],
+    // T499: the owner-signed grants blob and its signature, on the lead's row. The signed lead record itself is untouched, so an older reader
+    // (whose strict LeadRecord parser would drop a record with an extra key) keeps the lead and simply never sees the grants.
+    ["project_leads", "grants"], ["project_leads", "grants_sig"]];
 const SCHEMA_OBJECTS = [...SCHEMA.matchAll(/CREATE\s+(?:VIRTUAL\s+)?(?:TABLE|INDEX|TRIGGER)\s+IF NOT EXISTS\s+(\w+)/g)].map(match => match[1]);
 const SCHEMA_DEFINITION = createHash("sha256").update(SCHEMA).update(JSON.stringify(SCHEMA_COLUMNS)).digest("hex");
 const opening = new AsyncLocalStorage();

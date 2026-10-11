@@ -6,6 +6,7 @@ import { fingerprint } from "./crypto.ts";
 import { IdentityLeases, type IdentityLease } from "./identity-leases.ts";
 import { opencodeHostOf, type OpencodeHost } from "./opencode-provider.ts";
 import { sessionUntainted } from "./session-taint.ts";
+import { auditLeadGrantUse, type LeadGrantUse } from "./lead-grants.ts";
 import { checkOutwardReversible, parseOutwardReversible, type OutwardReversible } from "./outward-reversible.ts";
 import { realpathSync } from "node:fs";
 
@@ -13,10 +14,10 @@ export { kimiServer } from "./kimi-web.ts";
 
 /** Check one requested class under the session's project scope (policy.ts hasClass). */
 export type PermissionClass = "permissions" | "outward-reversible";
-export type Lookup = (agent: string, ctx?: { cwd?: string | null; class?: PermissionClass }) => { ok: boolean; policy_id?: string; exp?: string | null };
+export type Lookup = (agent: string, ctx?: { cwd?: string | null; class?: PermissionClass }) => { ok: boolean; policy_id?: string; exp?: string | null; grant?: LeadGrantUse };
 interface PermissionBinding { agent: string; cli: string; session_id: string; pid: number | null; pid_start: string | null; session_key: string | null; updated_at: string; cwd: string | null }
 interface PermissionAuthority { binding: PermissionBinding; leaseToken: string }
-export interface Decision { allow: boolean; agent?: string; tool?: string; policy_id?: string; class?: PermissionClass; intent?: OutwardReversible; output: string; cwd?: string | null; authority?: PermissionAuthority; kimi?: { session_id: string; approval_id: string } }
+export interface Decision { allow: boolean; agent?: string; tool?: string; policy_id?: string; grant?: LeadGrantUse; class?: PermissionClass; intent?: OutwardReversible; output: string; cwd?: string | null; authority?: PermissionAuthority; kimi?: { session_id: string; approval_id: string } }
 
 /** Tools that collect an answer from the user rather than ask for permission: never auto-approved. */
 const INTERACTIVE = new Set(["AskUserQuestion", "ExitPlanMode"]);
@@ -115,10 +116,11 @@ export async function decidePermission(input: unknown, cli: string, lookup: Look
       if (!clean() || !p?.ok) return NONE;
       if (cli === "kimi") { // Kimi's hook can't decide; the approval goes through the kimi web API (approveKimi), which audits
         const approval = s("id");
-        return sessionId && approval ? { allow: true, agent, tool, policy_id: p.policy_id, class: cls, intent, output: "", cwd, authority, kimi: { session_id: sessionId, approval_id: approval } } : NONE;
+        return sessionId && approval ? { allow: true, agent, tool, policy_id: p.policy_id, grant: p.grant, class: cls, intent, output: "", cwd, authority, kimi: { session_id: sessionId, approval_id: approval } } : NONE;
       }
       o.node.store.audit("yolo_allow", { agent, cli, tool, policy_id: p.policy_id ?? null, ...(intent ? { class: cls, action: intent.kind } : {}) });
-      return { allow: true, agent, tool, policy_id: p.policy_id, class: cls,
+      auditLeadGrantUse(o.node.store, { grant: p.grant, agent, cli, session_id: authority.binding.session_id, tool, class: cls, action: intent?.kind, cwd });
+      return { allow: true, agent, tool, policy_id: p.policy_id, grant: p.grant, class: cls,
         output: JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } }) };
     }) ?? NONE;
   } catch { return NONE; }
@@ -160,6 +162,7 @@ export async function approveKimi(node: MbxNode, d: Decision, o: { server?: { ur
     const j = await res.json().catch(() => null) as { code?: number } | null;
     if (!res.ok || j?.code !== 0) return false;
     node.store.audit("yolo_allow", { agent: d.agent, cli: "kimi", tool: d.tool, policy_id: d.policy_id ?? null, via: "kimi web", ...(d.intent ? { class: d.class, action: d.intent.kind } : {}) });
+    auditLeadGrantUse(node.store, { grant: d.grant, agent: d.agent, cli: "kimi", session_id, tool: d.tool, class: d.class, action: d.intent?.kind, cwd: d.cwd, via: "kimi web" });
     return true;
   } catch { return false; }
 }
