@@ -42,7 +42,7 @@ import { activityKey } from "./identity-availability.ts";
 import { fillCleoPresence } from "./cleo-presence.ts";
 import { identityLeaseStatus, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
 import { AUTO_NAME_RE, identityProjects, linkedKey, projectOf, recordSessionHint, registeredIdentity, removeStaleProjectBindings, staleProjectBindings } from "./registry.ts";
-import { applyForward, buildForward, pruneCandidates, retireMailbox } from "./identity-cleanup.ts";
+import { applyForward, applyPrune, buildForward, leadForward, pruneCandidates, type LeadForward } from "./identity-cleanup.ts";
 import { installDesktopPlugin, kimiDesktop, kimiDesktopDir, removeDesktopPlugin, writeDesktopPlugin } from "./kimi-desktop.ts";
 import { approveKimi, decidePermission, opencodePermissionPass, type Lookup } from "./permission.ts";
 import { diagnosticSnapshot, type RuntimeObservation } from "./diagnostics.ts";
@@ -422,16 +422,17 @@ async function run(argv: string[]) {
       return;
     }
     if (pos[0] === "prune" && pos.length === 1) {
-      // T209: retire mailboxes older versions generated that nobody holds, with no unread mail and no recent traffic.
+      // T209: retire mailboxes older versions generated that nobody holds, with no recent traffic. T495: unread mail goes to the
+      // mailbox's own project mailbox when it has one, so it no longer keeps a dead mailbox alive.
       const days = Number(str("days") ?? 7);
       if (!Number.isFinite(days) || days < 1) die("--days must be at least 1");
       const node = new MbxNode();
       try {
         const { retire, kept } = pruneCandidates(node, { days });
-        if (o.apply) for (const r of retire) retireMailbox(node, r.name, "agentmbx identity prune");
-        if (o.json) return console.log(JSON.stringify({ applied: !!o.apply, retire, kept: kept.filter(k => AUTO_NAME_RE.test(k.name)) }, null, 2));
+        const applied = o.apply ? applyPrune(node, retire, "agentmbx identity prune") : undefined;
+        if (o.json) return console.log(JSON.stringify({ applied: !!o.apply, ...(applied ? { forwarded: applied.forwarded } : {}), retire, kept: kept.filter(k => AUTO_NAME_RE.test(k.name)) }, null, 2));
         console.log(`${o.apply ? "Retired" : "Would retire"} ${retire.length} generated mailbox(es) on ${node.host}${o.apply ? "" : " (dry run: add --apply)"}:`);
-        for (const r of retire) console.log(`  ${r.name}\t${r.messages} message(s)\tlast ${r.last_activity ?? "never"}`);
+        for (const r of retire) console.log(`  ${r.name}\t${r.messages} message(s)\tlast ${r.last_activity ?? "never"}${r.forward ? `\t${o.apply ? "forwarded" : "would forward"} ${r.forward.unread} unread to the project mailbox ${r.forward.label}` : ""}`);
         const held = kept.filter(k => AUTO_NAME_RE.test(k.name));
         if (held.length) { console.log(`Kept ${held.length} generated mailbox(es):`); for (const k of held) console.log(`  ${k.name}\t${k.reason}`); }
         console.log("Messages are never deleted; claiming a retired name brings it back.");
@@ -452,8 +453,26 @@ async function run(argv: string[]) {
     }
     if (pos[0] === "forward" && pos.length === 3) {
       // T209: move one mailbox's unread mail to another, with the owner's signature (Touch ID or passphrase).
+      // T495: the project's current lead moves mail between mailboxes of its OWN project without it, on the strength of its verified
+      // lead record and the lease of the session running this command. Anything that check does not cover asks for the signature.
       const node = new MbxNode();
       try {
+        const outcome: { lead?: LeadForward; failure?: unknown; caller?: string } = {};
+        try {
+          withCliIdentity(node, { as: str("as") ?? (process.env.MBX_AGENT || undefined), cli: str("cli"), session: str("session") }, (caller) => {
+            outcome.caller = caller;
+            try { outcome.lead = leadForward(node, caller, pos[1]!, pos[2]!); } catch (e) { outcome.failure = e; throw e; }
+          });
+        } catch (e) {
+          if (outcome.failure) throw outcome.failure; // a failure of the move itself is never swallowed into the owner path
+          // No session identity proves who is calling (a plain shell): only the owner's signature is left.
+        }
+        if (outcome.lead?.ok) {
+          const m = outcome.lead;
+          if (o.json) return console.log(JSON.stringify({ from: pos[1], to: pos[2], moved: m.moved, authority: "lead", project: m.project, ids: m.ids }));
+          return console.log(`Moved ${m.moved} unread message(s) from ${pos[1]} to ${pos[2]} as ${outcome.caller}, the lead of project ${m.label}; no owner signature needed.`);
+        }
+        if (outcome.lead) console.error(`Not forwarded as a project lead: ${outcome.lead.reason}. Asking for the owner's signature instead.`);
         const payload = buildForward(node, pos[1], pos[2]);
         const summary = `Forward ${payload.unread} unread message(s) from ${payload.from}@${payload.host} to ${payload.to}@${payload.host}; ${payload.from} routes to ${payload.to} from now on. Approval expires ${new Date(payload.expires_at).toISOString()}.`;
         const { sig } = await ownerSignCanonical(node.home, canonical(payload), summary);

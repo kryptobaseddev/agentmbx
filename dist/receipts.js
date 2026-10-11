@@ -97,9 +97,11 @@ export function recipientReceipts(node, msgId, targets, now = Date.now()) {
             // T493: the recipient is the project, not a session. With no live lead it is queued exactly like mail to `lead` with no holder
             // (T491); with one, the lead sees it in its project inbox section on its next prompt (waking it is the wake path's, not claimed here).
             const box = projectMailboxBySlot(node.store, name), label = box ? projectLabel(box) : name;
-            out.push(live.live
-                ? { to: t.to, address, state: "live-next-prompt", detail: `addressed to the project mailbox ${label}; ${live.detail}; it sees this in its project inbox on its next prompt` }
-                : { to: t.to, address, state: "queued-no-holder", detail: `addressed to the project mailbox ${label}; ${live.detail}; it waits here until the project's lead reconnects or the owner designates one, and urgent mail is reported to the owner` });
+            const here = live.live
+                ? { state: "live-next-prompt", detail: `addressed to the project mailbox ${label}; ${live.detail}; it sees this in its project inbox on its next prompt` }
+                : { state: "queued-no-holder", detail: `addressed to the project mailbox ${label}; ${live.detail}; it waits here until the project's lead reconnects or the owner designates one, and urgent mail is reported to the owner` };
+            // T495: a retired generated name whose unread mail went to the project mailbox still routes there; the sender is told.
+            out.push(t.renamed_from ? { to: t.to, address, state: "forwarded", detail: `${t.renamed_from} was renamed to the project mailbox ${label}; ${here.state}: ${here.detail}` } : { to: t.to, address, ...here });
             continue;
         }
         let state, detail;
