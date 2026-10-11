@@ -48,6 +48,20 @@ test("launcher import failure records one error and preserves stderr and a nonze
   assert.equal(unwritable.status, 1); assert.match(unwritable.stderr, /forced CLI import failure/);
 });
 
+for (const source of [true, false]) for (const logger of ["missing", "broken"]) for (const command of ["mcp", "daemon"])
+  test(`${command} ${source ? "source" : "dist"} launcher preserves the original error with a ${logger} logger`, t => {
+    const f = fixture(t), install = join(f.root, "install"), entry = join(install, source ? "src" : "dist");
+    mkdirSync(join(install, "bin"), { recursive: true }); mkdirSync(entry);
+    writeFileSync(join(install, "package.json"), '{"type":"module"}');
+    copyFileSync(join(ROOT, "bin/agentmbx.js"), join(install, "bin/agentmbx.js"));
+    writeFileSync(join(entry, source ? "cli.ts" : "cli.js"), "throw new Error('original entry failure');");
+    if (logger === "broken") writeFileSync(join(entry, source ? "logs.ts" : "logs.js"), "throw new Error('bootstrap logger failure');");
+    const child = spawnSync(process.execPath, [join(install, "bin/agentmbx.js"), command], { env: f.env, encoding: "utf8", timeout: 10_000 });
+    assert.equal(child.status, 1); assert.match(child.stderr, /original entry failure/);
+    assert.doesNotMatch(child.stderr, /bootstrap logger failure|ERR_MODULE_NOT_FOUND/);
+    assert.equal(child.stdout, ""); assert.equal(existsSync(f.log), false);
+  });
+
 test("daemon bootstrap import failure timestamps every stderr line", t => {
   const f = fixture(t), install = join(f.root, "install");
   mkdirSync(join(install, "bin"), { recursive: true }); mkdirSync(join(install, "src"));
