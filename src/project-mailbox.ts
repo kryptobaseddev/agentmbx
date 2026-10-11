@@ -6,7 +6,8 @@ import { NAME_RE } from "./envelope.ts";
 import { leadFor, type LeadRecord } from "./lead-record.ts";
 import type { MbxNode } from "./node.ts";
 import { resolveProject } from "./project-key.ts";
-import { isSlotName, slotFor } from "./project-slot.ts";
+import { assertSingleHome, resolveRemoteProject } from "./project-directory.ts";
+import { isSlotName, RESERVED_ALIASES, slotFor } from "./project-slot.ts";
 import type { Store } from "./store.ts";
 
 export { isSlotName, slotFor } from "./project-slot.ts";
@@ -24,9 +25,6 @@ export interface ProjectMailbox {
   folder: string | null;
   created_at: string;
 }
-
-/** Names a project must never claim as its bare name: they already mean something to send(). */
-const RESERVED_ALIASES = new Set(["owner", "lead"]);
 
 const fail = (code: string, message: string): never => { throw Object.assign(new Error(message), { code }); };
 
@@ -96,19 +94,33 @@ export interface RewrittenRecipients { to: string[]; notes: string[] }
  * divert project mail into a personal inbox. Anything that is not an allocated alias passes through untouched; a prebuilt,
  * already-signed envelope is never passed here. Two spellings of one project collapse to one recipient.
  */
-export function rewriteProjectAliases(node: MbxNode, to: string[]): RewrittenRecipients {
-  const rows = node.store.db.prepare("SELECT alias,slot FROM project_mailboxes WHERE alias IS NOT NULL").all() as { alias: string; slot: string }[];
-  if (!rows.length) return { to, notes: [] };
-  const bySlot = new Map(rows.map((r) => [r.alias, r.slot]));
+export function rewriteProjectAliases(node: MbxNode, to: string[], project?: string): RewrittenRecipients {
+  const rows = node.store.db.prepare("SELECT alias,slot,key,source FROM project_mailboxes WHERE alias IS NOT NULL").all() as { alias: string; slot: string; key: string; source: string }[];
+  const anyPeer = !!node.store.db.prepare("SELECT 1 FROM peer_project_mailboxes LIMIT 1").get();
+  const remoteSlots = to.some((t) => { const at = t.indexOf("@"); return at > 0 && isSlotName(t.slice(0, at)) && t.slice(at + 1) !== node.host; });
+  if (!rows.length && !anyPeer && !remoteSlots) return { to, notes: [] };
+  const bySlot = new Map(rows.map((r) => [r.alias, r]));
   const out: string[] = [], notes: string[] = [];
+  let ownKey: string | null | undefined;
+  const own = () => ownKey === undefined ? (ownKey = project ? resolveProject(project).cleoId : null) : ownKey; // only read when two projects answer to one name
   for (const t of to) {
     const at = t.indexOf("@");
     const raw = at === -1 ? t : t.slice(0, at), host = at === -1 ? undefined : t.slice(at + 1);
-    const slot = !t.includes(":") && t !== "*" && (host === undefined || host === node.host) ? bySlot.get(raw) : undefined;
-    if (slot === undefined) { if (!out.includes(t)) out.push(t); continue; }
-    if (!out.includes(slot)) out.push(slot);
-    const held = node.store.db.prepare("SELECT 1 FROM identity_leases WHERE name=? AND released_at IS NULL").get(raw);
-    notes.push(`${raw} is the project mailbox${held ? ` (a live mailbox of the same name exists; it does not receive this)` : ""}: delivered once to the project, read by its lead`);
+    const plain = !t.includes(":") && t !== "*" && t !== "owner";
+    const local = plain && (host === undefined || host === node.host) ? bySlot.get(raw) : undefined;
+    if (local !== undefined) {
+      if (local.source === "cleo") assertSingleHome(node, local.key, raw); // two hosts that both allocated this project: no guess
+      if (!out.includes(local.slot)) out.push(local.slot);
+      const held = node.store.db.prepare("SELECT 1 FROM identity_leases WHERE name=? AND released_at IS NULL").get(raw);
+      notes.push(`${raw} is the project mailbox${held ? ` (a live mailbox of the same name exists; it does not receive this)` : ""}: delivered once to the project, read by its lead`);
+      continue;
+    }
+    // T493 S3: a project mailbox that lives on a paired host. Its slot comes from that host's signed directory, never from the sender.
+    const remote = plain && (host === undefined || host !== node.host) && (anyPeer || (host !== undefined && isSlotName(raw)))
+      ? resolveRemoteProject(node, raw, host, own) : null;
+    const dest = remote?.to ?? t;
+    if (remote) notes.push(remote.note);
+    if (!out.includes(dest)) out.push(dest);
   }
   return { to: out, notes };
 }

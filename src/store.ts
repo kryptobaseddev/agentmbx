@@ -78,6 +78,11 @@ CREATE INDEX IF NOT EXISTS project_leads_project ON project_leads(project);
 CREATE TABLE IF NOT EXISTS project_mailboxes (
   key TEXT PRIMARY KEY, slot TEXT NOT NULL UNIQUE, alias TEXT UNIQUE, home_host TEXT NOT NULL,
   source TEXT NOT NULL, folder TEXT, created_at TEXT NOT NULL);
+-- The project mailboxes a paired host advertises (src/project-directory.ts, T493 slice 3): verified under that host's pinned key,
+-- replaced whole on each refresh. Additive: older runtimes ignore the table (no schema version change).
+CREATE TABLE IF NOT EXISTS peer_project_mailboxes (
+  host TEXT NOT NULL, slot TEXT NOT NULL, key TEXT, alias TEXT, source TEXT NOT NULL, seen_at TEXT NOT NULL, PRIMARY KEY (host, slot));
+CREATE INDEX IF NOT EXISTS peer_project_mailboxes_alias ON peer_project_mailboxes(alias);
 -- Cross-host delivery receipts (src/remote-receipts.ts, T218). Every delivery state change of a message from a paired host
 -- is queued for that host by these triggers, so every path that moves a delivery (old runtimes included) is covered; the
 -- daemon signs and pushes them. Additive: older runtimes ignore the tables (no schema version change).
