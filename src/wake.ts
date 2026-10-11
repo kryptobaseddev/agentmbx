@@ -53,7 +53,7 @@ const HERMES_WATCH_WRAPPER = /^\s*\[IMPORTANT: (?:Background process \S+ |\d+ ba
 export const isHumanPrompt = (prompt: unknown): boolean => typeof prompt === "string" && !!prompt.trim() && !/^\s*\[mbx(-watch)?\]/.test(prompt)
   && !HERMES_WATCH_WRAPPER.test(prompt);
 
-export function wakeText(agent: string, msgs: MessageRow[]): string {
+export function wakeText(agent: string, msgs: MessageRow[], project?: string): string {
   const senders = [...new Set(msgs.map((m) => `${m.from_addr} [${trustLabel(m).split(" · ")[0].split(" (")[0]}]`))].join(", ");
   const owner = msgs.some(m => (JSON.parse(m.envelope) as { authority?: unknown }).authority) ? " Includes an owner-authority claim; verify its current mbx_read header." : "";
   // A hint can be queued while the session is busy and shown after the mail was handled: name the ids so it is checkable (T195).
@@ -62,7 +62,8 @@ export function wakeText(agent: string, msgs: MessageRow[]): string {
   // mbx_read header; repeating them in each wake only spent context. Content is never in a wake, only ids.
   // T442: the stale-hint note is conditional. An unconditional "Already handled: no action needed" was obeyed
   // literally and made agents skip unread mail.
-  return `[mbx] ${msgs.length} new message(s) for ${agent} from ${senders} (ids ${ids}).${owner} mbx_inbox or mbx_read, reply, ack. If you already handled these ids, no action is needed.`;
+  const where = project ? ` in the project mailbox ${project}` : ""; // T493: mail to the project, read by its lead
+  return `[mbx] ${msgs.length} new message(s) for ${agent}${where} from ${senders} (ids ${ids}).${owner} mbx_inbox or mbx_read, reply, ack. If you already handled these ids, no action is needed.`;
 }
 
 export const which = (bin: string) => { try { return execFileSync("/usr/bin/which", [bin], { encoding: "utf8" }).trim() || null; } catch { return null; } };

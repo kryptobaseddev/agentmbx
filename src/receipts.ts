@@ -12,6 +12,7 @@ import { activityKey, parseActivity, SHARED_IDLE_MS } from "./identity-availabil
 import { remoteReceipts } from "./remote-receipts.ts";
 import { isSlotName } from "./project-slot.ts";
 import { projectLabel, projectMailboxBySlot, projectReader } from "./project-mailbox.ts";
+import { peerProjectBySlot } from "./project-directory.ts";
 
 /** A holder renews its lease every minute; three missed beats mean its session is suspended or gone. */
 const STALE_HEARTBEAT_MS = 3 * 60_000;
@@ -63,6 +64,12 @@ export function mailboxLiveness(node: MbxNode, name: string, now = Date.now()): 
   return { live: false, detail: `no live session since ${iso(since)} (last holder ${holder}, ${why})` };
 }
 
+/** "addressed to the project mailbox X; " when `name` is a project slot that `host` advertises, else nothing (T493). */
+const projectBoxNote = (node: MbxNode, name: string | undefined, host: string): string => {
+  const box = name && isSlotName(name) ? peerProjectBySlot(node, host, name) : undefined;
+  return box ? `addressed to the project mailbox ${box.alias ?? box.slot} on ${host}, read by its lead there; ` : "";
+};
+
 /** One receipt per resolved target of a stored message. */
 export function recipientReceipts(node: MbxNode, msgId: string, targets: RouteTarget[], now = Date.now()): RecipientReceipt[] {
   const m = node.message(msgId);
@@ -70,7 +77,7 @@ export function recipientReceipts(node: MbxNode, msgId: string, targets: RouteTa
   for (const t of targets) {
     if (t.host) {
       const p = node.peer(t.host);
-      out.push({ to: t.to, address: `${t.name ?? "*"}@${t.host}`, state: "remote", detail: `queued for paired host ${t.host}${p ? ` at ${p.addr}` : ""}; its daemon decides wake and liveness` });
+      out.push({ to: t.to, address: `${t.name ?? "*"}@${t.host}`, state: "remote", detail: `${projectBoxNote(node, t.name, t.host)}queued for paired host ${t.host}${p ? ` at ${p.addr}` : ""}; its daemon decides wake and liveness` });
       continue;
     }
     const name = t.name!;
@@ -198,7 +205,7 @@ export function deliveryReceipts(node: MbxNode, m: MessageRow, now = Date.now())
     const got = signed.filter((r) => r.recipient.endsWith(`@${h}`));
     const pending = names.filter((n) => !got.some((r) => r.recipient === n));
     return [
-      ...got.map((r): DeliveryReceipt => ({ address: r.recipient, state: r.state, updated_at: r.at, note: r.note, did: r.did, liveness: `on paired host ${h} (signed receipt)` })),
+      ...got.map((r): DeliveryReceipt => ({ address: r.recipient, state: r.state, updated_at: r.at, note: r.note, did: r.did, liveness: `${projectBoxNote(node, r.recipient.split("@")[0], h)}on paired host ${h} (signed receipt)` })),
       ...(got.length && !pending.length ? [] : [{ address: (got.length ? pending : names).join(",") || `*@${h}`, state: o ? "queued" : "handed-over", updated_at: null, note: null, did: null,
         liveness: o ? `paired host ${h}: not accepted yet` : `accepted by paired host ${h}; no receipt from it yet`,
         ...(o ? { outbox: { attempts: o.attempts, last_error: o.last_error, next_at: o.next_at } } : {}) }]),

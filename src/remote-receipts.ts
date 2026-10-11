@@ -7,6 +7,7 @@ import { z } from "zod";
 import { canonical, signData, verifyData } from "./crypto.ts";
 import { NAME_RE } from "./envelope.ts";
 import { DID_MAX, RETRY_HOURS, type MbxNode } from "./node.ts";
+import { isSlotName } from "./project-slot.ts";
 
 export const RECEIPT_STATES = ["delivered", "notified", "read", "acked"] as const;
 export type ReceiptState = typeof RECEIPT_STATES[number];
@@ -97,6 +98,8 @@ export function acceptReceipt(node: MbxNode, item: unknown, hop: string | null):
   // resolved there. A paired host can't claim receipts for mail sent only to another host (review on #65).
   const to = (JSON.parse(m.envelope) as { to: string[] }).to;
   if (!to.some((t) => t.endsWith(`@${host}`) || (!t.includes("@") && t !== "owner"))) return `rejected:message was not sent to ${host}`;
+  // T493: a host reports on a project mailbox only if the signed envelope addressed that exact slot there (the other bounds are unchanged).
+  if (isSlotName(rec.recipient.split("@")[0]) && !to.includes(rec.recipient)) return `rejected:${rec.recipient} was not addressed by this message`;
   return node.store.tx((): AcceptResult => {
     const old = node.store.db.prepare("SELECT state,seq FROM remote_receipts WHERE msg_id=? AND recipient=?").get(rec.msg, rec.recipient) as { state: string; seq: number } | undefined;
     if (old) {

@@ -59,6 +59,8 @@ import { armDaemonSync } from "./sync-daemon.ts";
 import { armConversationLoopReports } from "./loop-detector.ts";
 import { mcpStarting } from "./mcp-startup.ts";
 import { hookDisconnectedNote } from "./hook-connection.ts";
+import { projectLabel, projectMailboxBySlot, projectsLedBy } from "./project-mailbox.ts";
+import { isSlotName } from "./project-slot.ts";
 
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
 
@@ -1717,8 +1719,10 @@ async function watch(node: MbxNode, selection: CliIdentitySelection) {
       } else deadUntilMono = 0;
       node.store.set(watcherKey(agent), JSON.stringify({ pid: process.pid, at: Date.now(), token: pinned.token })); // #97: liveWatcher checks the token
       const lines: string[] = [];
-      for (const mailbox of [agent, ...node.linkedNames(agent)]) {
-        if (wakeMutedUntil(node, mailbox)) continue; // muted: the mail stays delivered and unread
+      // T493: the project mailboxes this agent leads are watched too. Their rows are the slot's; policy, mute and the batching window are the lead's.
+      for (const mailbox of [agent, ...node.linkedNames(agent), ...projectsLedBy(node, agent).map((p) => p.slot)]) {
+        const box = isSlotName(mailbox) ? projectMailboxBySlot(node.store, mailbox) : undefined, subject = box ? agent : mailbox;
+        if (wakeMutedUntil(node, subject)) continue; // muted: the mail stays delivered and unread
         // T435: also pick up unread wanted mail the dispatcher already marked notified/desktop.
         // State `read` stays out of this query. setDelivery cannot clear a note on an
         // already-notified row (COALESCE keeps it, and notified is not an earlier rank).
@@ -1727,12 +1731,13 @@ async function watch(node: MbxNode, selection: CliIdentitySelection) {
           `SELECT m.*, d.note AS delivery_note FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND (d.state='delivered' OR (d.state='notified' AND d.note='desktop')) ORDER BY m.ts`
         ).all(mailbox) as unknown as WatchRow[];
         if (!rows.length) continue;
-        const wanted = rows.filter(r => node.wantsWake(mailbox, r) && hasWakeAuthority(node, mailbox, r));
+        const wanted = rows.filter(r => node.wantsWake(subject, r) && hasWakeAuthority(node, subject, r));
         if (wanted.length) {
-          const reservation = node.reserveWake(mailbox, wanted[0].thread);
+          const reservation = node.reserveWake(subject, wanted[0].thread);
           if (reservation.brake?.startsWith("batched")) continue; // leave the desktop note so the next tick can still see it
-          const linked = mailbox === agent ? "" : ` This is your linked mailbox: use agentmbx inbox --as ${mailbox} and agentmbx ack --as ${mailbox} <id>.`;
-          if (!reservation.brake) lines.push(wakeText(mailbox, wanted) + linked);
+          const linked = box ? ` Read it in mbx_inbox (project section) and acknowledge with mbx_ack project=${box.alias ?? box.slot}.`
+            : mailbox === agent ? "" : ` This is your linked mailbox: use agentmbx inbox --as ${mailbox} and agentmbx ack --as ${mailbox} <id>.`;
+          if (!reservation.brake) lines.push(wakeText(subject, wanted, box ? projectLabel(box) : undefined) + linked);
         }
         for (const r of rows) {
           node.setDelivery(r.id, mailbox, "notified");
@@ -1746,7 +1751,7 @@ async function watch(node: MbxNode, selection: CliIdentitySelection) {
           const observed = watcherObservingSession(node, agent, selection);
           const session = observed?.session ?? (selection.session && !selection.session.startsWith("mcp-") ? selection.session : undefined);
           node.store.audit("wake.attempt", {
-            agent: mailbox, outcome: observed ? "admitted" : "not_submitted", receipt: observed ? "transport" : "none",
+            agent: subject, outcome: observed ? "admitted" : "not_submitted", receipt: observed ? "transport" : "none",
             via: "watcher", pid: process.pid, ...(session ? { session } : {}),
           });
         }

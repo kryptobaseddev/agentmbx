@@ -12,6 +12,9 @@ export const SLOT_RE = /^pm-[0-9a-f]{32}$/;
 /** The same shape as a SQLite GLOB, so a query can exclude slots without reading the registry (a read-only opener may not have the table). */
 export const SLOT_GLOB = `${SLOT_PREFIX}${"[0-9a-f]".repeat(32)}`;
 
+/** Names a project must never claim as its bare name: they already mean something to send(). Shared by allocation and by what a peer may advertise. */
+export const RESERVED_ALIASES: ReadonlySet<string> = new Set(["owner", "lead"]);
+
 export const isSlotName = (name: string): boolean => SLOT_RE.test(name);
 
 export function slotFor(key: string): string {

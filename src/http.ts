@@ -23,6 +23,7 @@ import { storedPolicies, acceptSigned, policyUnexpired, type AnyRecord, type Sig
 import { acceptReceipt, dueReceipts, RECEIPT_BATCH, receiptsDeferred, receiptsSent, signReceipt } from "./remote-receipts.ts";
 import { listIdentityStatus, type IdentityStatus } from "./identity-status.ts";
 import { projectKey } from "./registry.ts";
+import { acceptPeerProjects, signedProjects } from "./project-directory.ts";
 
 export const HOP_SKEW_MS = 5 * 60_000;
 const HELLO_TTL_MS = 2 * 60_000;
@@ -698,9 +699,10 @@ function directoryAgents(node: MbxNode): DirectoryAgent[] {
 }
 
 /** The directory body a peer verifies: `canonical` of this object, not of the object that also carries `sig`. */
-export function signedDirectory(node: MbxNode): { v: 1; host: string; agents: DirectoryAgent[]; sig: string } {
+export function signedDirectory(node: MbxNode): { v: 1; host: string; agents: DirectoryAgent[]; sig: string } & ReturnType<typeof signedProjects> {
   const body = { v: 1 as const, host: node.host, agents: directoryAgents(node) };
-  return { ...body, sig: signData(node.key.privateKey, canonical(body)) };
+  // T493: the project mailboxes sit beside `agents` under their own signature, so a peer that predates them still verifies `sig`.
+  return { ...body, sig: signData(node.key.privateKey, canonical(body)), ...signedProjects(node) };
 }
 
 const textOrNull = (v: unknown): string | null => typeof v === "string" ? v : null;
@@ -755,7 +757,7 @@ export async function refreshDirectory(node: MbxNode, f: typeof fetch = fetch): 
       const path = "/v1/agents";
       const res = await f(`http://${p.addr}${path}`, { headers: signHop(node, "GET", path, ""), signal: AbortSignal.timeout(5_000) });
       if (!res.ok) continue;
-      const j = await res.json() as { v?: unknown; host?: unknown; agents?: unknown; sig?: unknown };
+      const j = await res.json() as { v?: unknown; host?: unknown; agents?: unknown; sig?: unknown; projects?: unknown; projects_sig?: unknown };
       if (typeof j?.sig === "string") {
         if (j.v !== 1 || j.host !== p.host || !Array.isArray(j.agents)) {
           node.store.audit("directory.rejected", { host: p.host, reason: "signed directory does not match this peer" });
@@ -768,8 +770,10 @@ export async function refreshDirectory(node: MbxNode, f: typeof fetch = fetch): 
           continue;
         }
         storeDirectory(node, p.host, j.agents, true);
+        acceptPeerProjects(node, p, j); // T493: the project mailboxes it hosts, checked under the same pinned key
       } else if (Array.isArray(j?.agents)) {
         storeDirectory(node, p.host, j.agents, false);
+        acceptPeerProjects(node, p, {}); // an unsigned directory is an older peer: no project mailboxes, said so
       }
     } catch { /* peer offline; try next time */ }
   }

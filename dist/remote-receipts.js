@@ -7,6 +7,7 @@ import { z } from "zod";
 import { canonical, signData, verifyData } from "./crypto.js";
 import { NAME_RE } from "./envelope.js";
 import { DID_MAX, RETRY_HOURS } from "./node.js";
+import { isSlotName } from "./project-slot.js";
 export const RECEIPT_STATES = ["delivered", "notified", "read", "acked"];
 const rank = (s) => RECEIPT_STATES.indexOf(s);
 /** One message can't fan out into more receipt rows than this per host (a paired host can't grow our table at will). */
@@ -89,6 +90,9 @@ export function acceptReceipt(node, item, hop) {
     const to = JSON.parse(m.envelope).to;
     if (!to.some((t) => t.endsWith(`@${host}`) || (!t.includes("@") && t !== "owner")))
         return `rejected:message was not sent to ${host}`;
+    // T493: a host reports on a project mailbox only if the signed envelope addressed that exact slot there (the other bounds are unchanged).
+    if (isSlotName(rec.recipient.split("@")[0]) && !to.includes(rec.recipient))
+        return `rejected:${rec.recipient} was not addressed by this message`;
     return node.store.tx(() => {
         const old = node.store.db.prepare("SELECT state,seq FROM remote_receipts WHERE msg_id=? AND recipient=?").get(rec.msg, rec.recipient);
         if (old) {

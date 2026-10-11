@@ -41,7 +41,8 @@ import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wa
 import { isStoreBusy, withStoreBusyTimeout } from "./store.js";
 import { markMcpStarting } from "./mcp-startup.js";
 import { recordMcpGeneration, startMcpLifecycle } from "./mcp-lifecycle.js";
-import { projectLabel } from "./project-mailbox.js";
+import { projectLabel, projectMailboxBySlot } from "./project-mailbox.js";
+import { isSlotName } from "./project-slot.js";
 let lifecycle;
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
 It is shared by AI coding agents on this machine and on paired machines. Your user set it up so agents can coordinate;
@@ -1956,13 +1957,17 @@ async function configureMcp(server, node, startupClosed) {
                     return; // the holder pushes its own session's wakes (T439)
                 const agent = base.agent;
                 leases.withHeld(agent, base.leaseToken, () => undefined);
-                for (const mailbox of [agent, ...node.linkedNames(agent)]) {
-                    if (wakeMutedUntil(node, mailbox))
+                // T493: the project mailboxes this session may read right now (inside its own lease) are pushed too. Their rows are the slot's;
+                // policy, mute and the batching window are the lead's.
+                const slots = leases.withHeld(agent, base.leaseToken, () => node.readableSlots(agent));
+                for (const mailbox of [agent, ...node.linkedNames(agent), ...slots]) {
+                    const box = isSlotName(mailbox) ? projectMailboxBySlot(node.store, mailbox) : undefined, subject = box ? agent : mailbox;
+                    if (wakeMutedUntil(node, subject))
                         continue; // muted (T179): mail stays delivered and unread, no channel hint
                     const { rows, wanted, reservation } = leases.withHeld(agent, base.leaseToken, () => {
                         const rows = node.store.db.prepare(`SELECT m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state='delivered' ORDER BY m.ts`).all(mailbox);
-                        const wanted = rows.filter(r => node.wantsWake(mailbox, r) && hasWakeAuthority(node, mailbox, r));
-                        const reservation = wanted.length ? node.reserveWake(mailbox, wanted[0].thread) : null;
+                        const wanted = rows.filter(r => node.wantsWake(subject, r) && hasWakeAuthority(node, subject, r));
+                        const reservation = wanted.length ? node.reserveWake(subject, wanted[0].thread) : null;
                         return { rows, wanted, reservation };
                     });
                     if (!rows.length)
@@ -1970,18 +1975,19 @@ async function configureMcp(server, node, startupClosed) {
                     if (wanted.length) {
                         if (reservation?.brake?.startsWith("batched"))
                             continue;
-                        const linked = mailbox === agent ? "" : ` This is your linked mailbox: use agentmbx inbox --as ${mailbox} and agentmbx ack --as ${mailbox} <id>.`;
+                        const linked = box ? ` Read it in mbx_inbox (project section) and acknowledge with mbx_ack project=${box.alias ?? box.slot}.`
+                            : mailbox === agent ? "" : ` This is your linked mailbox: use agentmbx inbox --as ${mailbox} and agentmbx ack --as ${mailbox} <id>.`;
                         // a push that fails never reached the session: refund it and keep the mail delivered for the next tick
                         if (!reservation?.brake)
                             try {
                                 if (env.channel)
                                     await server.server.notification({ method: "notifications/claude/channel", params: {
-                                            content: wakeText(mailbox, wanted) + linked,
-                                            meta: { count: String(wanted.length), agent, mailbox },
+                                            content: wakeText(subject, wanted, box ? projectLabel(box) : undefined) + linked,
+                                            meta: { count: String(wanted.length), agent, mailbox: box ? subject : mailbox, ...(box ? { project: projectLabel(box) } : {}) },
                                         } });
                                 else
-                                    await socketPush(wakeText(mailbox, wanted) + linked);
-                                node.store.audit("wake.attempt", { agent: mailbox, session: `claude:${env.sessionId}`, outcome: "admitted", receipt: "transport", via: env.channel ? "claude channel" : "session socket" });
+                                    await socketPush(wakeText(subject, wanted, box ? projectLabel(box) : undefined) + linked);
+                                node.store.audit("wake.attempt", { agent: subject, session: `claude:${env.sessionId}`, outcome: "admitted", receipt: "transport", via: env.channel ? "claude channel" : "session socket" });
                             }
                             catch (e) {
                                 reservation?.release?.();

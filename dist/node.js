@@ -18,6 +18,7 @@ import { bumpPostToolMarker, bumpPostToolMarkersForAgent } from "./posttool.js";
 import { privatePath } from "./private-files.js";
 import { backfillProjectKeys, backfillRegistry } from "./registry.js";
 import { resolveLeadRecipients } from "./lead-record.js";
+import { isSlotName } from "./project-slot.js";
 import { projectLabel, projectMailboxBySlot, projectsLedBy, resolveProjectMailbox, rewriteProjectAliases } from "./project-mailbox.js";
 import { Store } from "./store.js";
 export const DEFAULT_PORT = 7373;
@@ -768,7 +769,7 @@ export class MbxNode {
         const pub = this.ownerPub;
         if (!pub)
             throw new Error("no owner key on this machine: run 'agentmbx owner init'");
-        const to = rewriteProjectAliases(this, resolveLeadRecipients(this, "owner", d.to, d.project).to).to; // before the owner signs, like the lead tokens
+        const to = rewriteProjectAliases(this, resolveLeadRecipients(this, "owner", d.to, d.project).to, d.project).to; // before the owner signs, like the lead tokens
         const req = ownerSignRequest(buildEnvelope({ ...d, to, from: `owner@${this.host}` }), pub);
         return this.send({ ...d, to, from: "owner" }, undefined, undefined, withOwnerSig(req.envelope, (await sign(req.payload)).sig));
     }
@@ -780,7 +781,7 @@ export class MbxNode {
         // resolve lead tokens before that signature.
         const lead = prebuilt ? { to: d.to, leadAddress: null } : resolveLeadRecipients(this, fromName, d.to, d.project);
         // T493: a bare project name becomes the project mailbox's slot here, before the envelope is signed (a prebuilt one already is).
-        const project = prebuilt ? { to: lead.to, notes: [] } : rewriteProjectAliases(this, lead.to);
+        const project = prebuilt ? { to: lead.to, notes: [] } : rewriteProjectAliases(this, lead.to, d.project);
         const to = project.to;
         let e = prebuilt ?? buildEnvelope({ ...d, to, from: `${fromName}@${this.host}` });
         // Positive host attestation comes from the current lease operation, never a draft flag.
@@ -867,6 +868,13 @@ export class MbxNode {
             return "duplicate";
         const auth = storedEnv.authority ? checkAuthority(storedEnv, peer.owner_pubkey, this.revoked()) : null;
         const r = this.route(e.to, true, new Set(e.meta.local_names ?? []));
+        // T493: a peer reaches a project mailbox only by its allocated slot. Any other slot-shaped name is not a mailbox here, and delivering
+        // to it would only mint a phantom delivery nobody can read.
+        for (const a of [...r.local])
+            if (isSlotName(a) && !projectMailboxBySlot(this.store, a)) {
+                r.local.delete(a);
+                r.warnings.push(`${a}: not a project mailbox on ${this.host}; not delivered here`);
+            }
         const skipped = r.warnings.filter((w) => w.includes("not delivered here"));
         if (skipped.length)
             this.store.audit("receive.skipped", { msg: e.id, from: e.from, notes: skipped.slice(0, 10) });
