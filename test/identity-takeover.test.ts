@@ -100,13 +100,18 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI owne
   new IdentityLeases(node.store).release("occupied", fixtureToken);
   await displaced.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "occupied", MBX_CLI: cli, AGENTMBX_DEV: "1" } as Record<string,string> }));
-  assert.equal((await displaced.callTool({ name: "mbx_whoami", arguments: {} })).isError, undefined);
-  const old = node.store.db.prepare("SELECT token FROM identity_leases WHERE name='occupied'").get()!.token;
-  const displacedKey = node.store.db.prepare("SELECT session_key FROM sessions WHERE agent='occupied'").get()!.session_key;
+  const displacedMeta = cli === "opencode" ? { "ai.opencode/sessionID": "ses_displaced" } : undefined;
+  if (displacedMeta) assert.notEqual((await displaced.callTool({ name: "mbx_identity", arguments: { action: "claim", name: "occupied" }, _meta: displacedMeta })).isError, true);
+  assert.equal((await displaced.callTool({ name: "mbx_whoami", arguments: {}, _meta: displacedMeta })).isError, undefined);
+  const displacedLease = node.store.db.prepare("SELECT token,session_id,key_fp FROM identity_leases WHERE name='occupied'").get()!;
+  const old = displacedLease.token;
+  // Metadata binds a native context distinct from the transport's provisional row: inspect the actual lease holder.
+  const displacedKey = node.store.db.prepare("SELECT session_key FROM sessions WHERE agent='occupied' AND session_id=?").get(displacedLease.session_id)!.session_key as string;
+  assert.equal(fingerprint(displacedKey), displacedLease.key_fp);
   const transport = new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "destination", MBX_CLI: cli, AGENTMBX_DEV: "1" } as Record<string,string> });
   await client.connect(transport);
-  const meta = cli === "codex" ? { threadId: "44444444-4444-4444-8444-444444444444" } : cli === "opencode" ? { sessionID: "ses_takeover" } : undefined;
+  const meta = cli === "codex" ? { threadId: "44444444-4444-4444-8444-444444444444" } : cli === "opencode" ? { "ai.opencode/sessionID": "ses_takeover" } : undefined;
   const call = (name: string, args: Record<string,unknown> = {}) => client.callTool({ name, arguments: args, ...(meta ? { _meta: meta } : {}) });
   // A shared transport's session starts unbound and registers its own identity (T204); MBX_AGENT names only the transport.
   if (meta) assert.notEqual((await call("mbx_identity", { action: "register", name: "session-destination", role: "destination" })).isError, true);
@@ -149,9 +154,9 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} CLI owne
   assert.equal(JSON.parse(result.stdout).result.agent, "occupied");
   assert.ok(!result.stdout.includes(old as string));
   assert.equal(((await call("mbx_whoami")).structuredContent as { agent: string }).agent, "occupied");
-  assert.equal((await displaced.callTool({ name: "mbx_inbox", arguments: {} })).isError, true, "displaced live MCP holder is fenced");
-  assert.notEqual((await displaced.callTool({ name: "mbx_identity", arguments: { action: "list" } })).isError, true, "recovery controls stay available");
-  assert.equal((await displaced.callTool({ name: "mbx_identity", arguments: { action: "claim", name: "occupied" } })).isError, true, "old holder cannot reclaim the occupied successor generation");
+  assert.equal((await displaced.callTool({ name: "mbx_inbox", arguments: {}, _meta: displacedMeta })).isError, true, "displaced live MCP holder is fenced");
+  assert.notEqual((await displaced.callTool({ name: "mbx_identity", arguments: { action: "list" }, _meta: displacedMeta })).isError, true, "recovery controls stay available");
+  assert.equal((await displaced.callTool({ name: "mbx_identity", arguments: { action: "claim", name: "occupied" }, _meta: displacedMeta })).isError, true, "old holder cannot reclaim the occupied successor generation");
   assert.deepEqual(node.store.db.prepare("SELECT * FROM sessions WHERE session_key=?").all(displacedKey), []);
   assert.equal(node.inbox("occupied")[0].id, history);
   assert.equal(node.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE name='occupied'").get()!.holder_pid, transport.pid);

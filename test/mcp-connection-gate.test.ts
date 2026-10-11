@@ -23,12 +23,14 @@ for (const cli of ["codex", "opencode"]) test(`${cli}: two readers of one live p
   const transport = new StdioClientTransport({ command: process.execPath, args: ["--input-type=module", "-e", manager], env: env as Record<string, string>, stderr: "pipe" });
   await client.connect(transport);
   let stderr = ""; transport.stderr?.on("data", data => { stderr += data; });
-  const who = await client.callTool({ name: "mbx_whoami", arguments: {} });
+  const meta = cli === "opencode" ? { "ai.opencode/sessionID": "ses_pipeReader" } : undefined;
+  if (meta) assert.notEqual((await client.callTool({ name: "mbx_identity", arguments: { action: "claim", name: "pipe-reader" }, _meta: meta })).isError, true);
+  const who = await client.callTool({ name: "mbx_whoami", arguments: {}, _meta: meta });
   assert.equal((who.structuredContent as { agent: string }).agent, "pipe-reader");
   const deadline = Date.now() + 5000;
   while (!/"code":1/.test(stderr) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
   assert.match(stderr, /duplicate MCP client connection already served by pid \d+; refusing this reader/);
   assert.match(stderr, /"code":1/);
   assert.equal(node.store.db.prepare("SELECT COUNT(*) AS n FROM identity_leases WHERE released_at IS NULL").get()?.n, 1);
-  assert.notEqual((await client.callTool({ name: "mbx_inbox", arguments: {} })).isError, true, "the retained reader still serves the same pipe");
+  assert.notEqual((await client.callTool({ name: "mbx_inbox", arguments: {}, _meta: meta })).isError, true, "the retained reader still serves the same pipe");
 });
