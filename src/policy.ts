@@ -261,6 +261,24 @@ export function activePolicies(db: DatabaseSync, agent: string, host: string, no
     .map(p => ({ ...p.rec, sig: p.sig }));
 }
 
+/**
+ * True when a signed kill switch (`policy revoke --all`, target "*") from `ownerFp` was issued at or after `iat` (T499). A lead-carried
+ * grant is not a policy record, so it asks this instead of the policies table; the rule is storedPolicies': the revocation must verify
+ * against an owner key this host knows, and it takes authority only from its own signer.
+ */
+export function killSwitchSince(db: DatabaseSync, iat: string, ownerFp: string): boolean {
+  const keys = (db.prepare("SELECT pub FROM principals").all() as { pub: string }[]).map((k) => k.pub);
+  for (const row of db.prepare("SELECT record,sig FROM policy_revocations WHERE target='*'").all() as { record: string; sig: string }[]) {
+    try {
+      const rec = JSON.parse(row.record) as Revocation;
+      if (!validRevocation(rec) || rec.target !== "*" || rec.owner_fp !== ownerFp || !(Date.parse(rec.iat) >= Date.parse(iat))) continue;
+      const key = keys.find((k) => fingerprint(k) === rec.owner_fp);
+      if (key && verifySigned({ rec, sig: row.sig }, key)) return true;
+    } catch { /* malformed retained evidence cannot establish a revocation */ }
+  }
+  return false;
+}
+
 /** One policy's grant: its classes only apply within its own projects (no mixing scopes across policies). */
 export interface Grant { id: string; level: Level; classes: PolicyClass[]; projects: string[]; exp: string | null }
 export interface Effective { level: Level; classes: PolicyClass[]; ids: string[]; exp: string | null; projects: string[]; grants: Grant[]; notes: string[]; hop?: number; depthSuppressed?: boolean }
