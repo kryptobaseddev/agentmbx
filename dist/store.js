@@ -137,9 +137,11 @@ CREATE TABLE IF NOT EXISTS pair_tokens (  -- one-time pairing tokens (agentmbx p
  * (an old MCP server still running after an upgrade) refuses to write instead of failing with raw SQL errors.
  */
 export const SCHEMA_VERSION = 3;
-// agents.state/harness/project_keys are additive (T546). They stay on schema version 3, same as peers.enc_pub:
-// an older reader ignores the columns, and a version bump would make that reader refuse the store.
-const SCHEMA_COLUMNS = [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"], ["agents", "state"], ["agents", "harness"], ["agents", "project_keys"],
+// Additive columns on version 3. A missing one is added on open; user_version stays 3.
+// An older reader ignores the columns, and a version bump would make that reader refuse the store.
+// sessions.task and sessions.lane are the live session's CLEO task and phase (T497).
+// agents.state/harness/project_keys are the signed directory (T546).
+const SCHEMA_COLUMNS = [["sessions", "pid_start"], ["sessions", "task"], ["sessions", "lane"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"], ["agents", "state"], ["agents", "harness"], ["agents", "project_keys"],
     // T543: the CLEO-id key of the folder, derived locally and never signed; NULL when the folder has no id (then the folder is the key).
     ["identity_projects", "project_key"], ["project_leads", "project_key"],
     // T499: the owner-signed grants blob and its signature, on the lead's row. The signed lead record itself is untouched, so an older reader
