@@ -34,8 +34,8 @@ export function claimMcpConnection(home) {
             const r = clientSchema.safeParse(JSON.parse(readFileSync(path, "utf8")));
             return r.success ? r.data : null;
         }
-        catch {
-            return null;
+        catch (error) {
+            return error.code === "ENOENT" ? undefined : null;
         }
     };
     const held = () => ({ state: "held", release() {
@@ -61,6 +61,8 @@ export function claimMcpConnection(home) {
                 throw error;
         }
         const owner = read();
+        if (owner === undefined)
+            return { state: "retry" }; // A concurrent stale-owner reap can remove it after EEXIST.
         if (!owner?.start)
             return { state: "unknown" };
         const live = inspectLeaseProcess(owner.pid);

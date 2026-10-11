@@ -37,5 +37,26 @@ for (const seed of ["none", "dead", "unknown"] as const) test(`shared-connection
   const { reports, unchanged, alive } = JSON.parse(result.stdout);
   assert.equal(alive, true, "all contenders retain the pipe until the contention result is captured");
   if (seed === "unknown") { assert.equal(unchanged, true); assert.ok(reports.every((r: { state: string }) => r.state === "unknown")); }
-  else { assert.equal(reports.filter((r: { state: string }) => r.state === "held").length, 1); assert.equal(reports.filter((r: { state: string }) => r.state === "duplicate").length, 7); }
+  else { assert.equal(reports.filter((r: { state: string }) => r.state === "held").length, 1, JSON.stringify(reports)); assert.equal(reports.filter((r: { state: string }) => r.state === "duplicate").length, 7, JSON.stringify(reports)); }
+});
+
+test("connection claim retries when a stale owner disappears before it is read", { skip: !supported }, t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-connection-reap-")); t.after(() => rmSync(home, { recursive: true, force: true }));
+  const worker = `import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+    import {createHash} from 'node:crypto'; import {stdioEndpoint} from ${JSON.stringify(procUrl)};
+    import {claimMcpConnection} from ${JSON.stringify(lifecycleUrl)};
+    const dir=${JSON.stringify(join(home, "mcp-connections"))};fs.mkdirSync(dir,{recursive:true});
+    const path=dir+'/'+createHash('sha256').update(stdioEndpoint()).digest('hex');
+    fs.writeFileSync(path,JSON.stringify({pid:2000000000,start:'unparseable birth'}));
+    const link=fs.linkSync;
+    fs.linkSync=(from,to)=>{try{return link(from,to)}catch(error){
+      if(error.code==='EEXIST'&&to===path)fs.unlinkSync(path);throw error;
+    }};
+    syncBuiltinESMExports();
+    const first=claimMcpConnection(${JSON.stringify(home)}), second=claimMcpConnection(${JSON.stringify(home)});
+    if(second.state==='held')second.release();
+    console.log(JSON.stringify({first:first.state,second:second.state}));`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", worker], { encoding: "utf8", timeout: 10_000 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { first: "retry", second: "held" });
 });

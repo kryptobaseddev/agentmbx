@@ -32,7 +32,7 @@ export function claimMcpConnection(home: string): ConnectionClaim {
   const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`, body = JSON.stringify({ pid: process.pid, start });
   const read = () => {
     try { if (statSync(path).size > 4096) return null; const r = clientSchema.safeParse(JSON.parse(readFileSync(path, "utf8"))); return r.success ? r.data : null; }
-    catch { return null; }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? undefined : null; }
   };
   const held = (): ConnectionClaim => ({ state: "held", release() {
     const owner = read();
@@ -46,6 +46,7 @@ export function claimMcpConnection(home: string): ConnectionClaim {
     try { linkSync(tmp, path); return held(); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
     const owner = read();
+    if (owner === undefined) return { state: "retry" }; // A concurrent stale-owner reap can remove it after EEXIST.
     if (!owner?.start) return { state: "unknown" };
     const live = inspectLeaseProcess(owner.pid);
     if (live.alive === true && live.start && owner.start === live.start)
