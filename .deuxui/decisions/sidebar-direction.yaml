@@ -1,0 +1,12 @@
+owner: Keaton Hoskins
+source: provider question response in this session
+decision: compact disclosure with grouped summaries and a native dashboard
+reason: The owner reviewed both working variants and requested a hybrid that occupies less sidebar space, expands on click, and opens full dashboard details from a group or command.
+preserve: native OpenCode terminal typography and theme
+implementation:
+  default: collapsed
+  grouped_details: on expansion
+  dashboard: group click or /mbx
+verification:
+  preview: working HTML prototype
+  native_runtime: pending live OpenCode validation

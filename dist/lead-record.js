@@ -89,6 +89,17 @@ export function activeLead(node, project, now = new Date()) {
     }
     return null;
 }
+/** Every project's current lead, each re-verified now like `activeLead` (T496). A project whose records are all
+ *  expired, revoked or not signed by a trusted owner key has no entry. Ordered by project folder. */
+export function activeLeads(node, now = new Date()) {
+    const out = [];
+    for (const { project } of node.store.db.prepare("SELECT DISTINCT project FROM project_leads ORDER BY project").all()) {
+        const lead = activeLead(node, project, now);
+        if (lead)
+            out.push(lead);
+    }
+    return out;
+}
 export const isLead = (node, agent, project) => !!project && ((l) => !!l && l.agent === agent && l.host === node.host)(activeLead(node, project));
 /** What `agentmbx status` and `agentmbx whoami` show for the owner-designated lead. */
 export function projectLeadView(node, project, now = new Date()) {

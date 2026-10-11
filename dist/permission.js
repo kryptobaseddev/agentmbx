@@ -4,6 +4,7 @@ import { kimiServer } from "./kimi-web.js";
 import { LIVE_AGENT_MS } from "./node.js";
 import { fingerprint } from "./crypto.js";
 import { IdentityLeases } from "./identity-leases.js";
+import { opencodeHostOf } from "./opencode-provider.js";
 import { sessionUntainted } from "./session-taint.js";
 import { checkOutwardReversible, parseOutwardReversible } from "./outward-reversible.js";
 import { realpathSync } from "node:fs";
@@ -186,11 +187,12 @@ export async function approveKimi(node, d, o = {}) {
     }
 }
 /**
- * One daemon pass: for each OpenCode session bound to an agent whose policy is active, reply "once" to its pending
- * permission requests. Only a current lease and an exact provider session binding may authorize a request.
- * Provisional or legacy bindings never infer ownership from a project directory.
+ * One daemon pass: for each service-hosted OpenCode session bound to an agent whose policy is active, reply "once"
+ * to its pending permission requests. A standalone session is answered by the plugin in that serve (T521). An
+ * unknown host is skipped. Neither calls the shared service. Only a current lease and an exact provider session
+ * binding may authorize a request. Provisional or legacy bindings never infer ownership from a project directory.
  */
-export async function opencodePermissionPass(node, lookup, svc, f = fetch) {
+export async function opencodePermissionPass(node, lookup, svc, f = fetch, host = opencodeHostOf) {
     const db = node.store.db;
     const rows = db.prepare("SELECT * FROM sessions WHERE cli='opencode' ORDER BY updated_at DESC LIMIT 50").all()
         .filter((r) => r.pid && node.sameSession(r.pid, r, { proof: true })); // only bindings proven to be a live OpenCode process
@@ -200,7 +202,7 @@ export async function opencodePermissionPass(node, lookup, svc, f = fetch) {
             return [];
         const p = safeLookup(lookup, r.agent, r.cwd);
         return p.ok ? [{ ...r, p, authority }] : [];
-    });
+    }).filter((r) => host(r.pid) === "service");
     if (!covered.length)
         return 0;
     const s = await svc();
