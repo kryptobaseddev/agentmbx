@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **Inbox and read name the outward split (T498).** `mbx_inbox` and `mbx_read` say `outward-reversible` is a non-default branch push or a draft PR, and `outward` is merge, release, deploy, delete, secrets and spend. `mbx_ack` does not show a policy line, so its description stays as it is. The session instructions use the same class list.
+- **Inbox and read name the outward split (T498).** `mbx_inbox` and `mbx_read` say `outward-reversible` is a non-default branch push or a draft PR, and `outward` is merge, release, deploy, delete, secrets and spend. `mbx_ack` does not show a policy line, so its description stays as it is. The session instructions and the skill policy table use the same class list.
 
 - **The owner can let a project lead stand behind branch pushes and draft PRs (T499).** `agentmbx lead grant <agent[,agent]|*> --project <dir>` (or `lead set … --classes outward-reversible --to …`) signs a second owner record onto the lead's row, with one Touch ID tap and the plain-English text shown first. The permission hook asks the owner's own policies first; for `outward-reversible` only, it then accepts the grant when the persona is a named explicit member in the lead's project, the lead is live and every conversation the store knows for it is untainted, the lead record and grants are unexpired and unrevoked, and no `policy revoke --all` came after. It is a separate blob (`project_leads.grants`, `grants_sig`, additive) rather than a key in the strict lead record, so an older running reader keeps the lead. `outward`, `permissions`, `read` and `edit` are refused. `lead show` prints each grant and its state; `lead.grants_set` and `lead.grant_used` are audited. `docs/POLICY.md`, `docs/THREAT-MODEL.md` R10.
 ## 0.5.26 (2026-10-11)

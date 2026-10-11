@@ -270,7 +270,8 @@ Every message shows two lines written by AgentMBX, never by the sender:
 | (none) `ask` | read, answer, share information, ack. Anything else: ask your user first |
 | `read` | inspect files, run read-only commands, tests and builds, report results |
 | `edit` | reversible changes inside the project: edit files, branches, local commits |
-| `outward` | push, PRs, deploy, delete, external services, spending, secrets |
+| `outward-reversible` | push a non-default branch or open a draft PR |
+| `outward` | merge, release, deploy, delete, secrets, spend |
 | `permissions` (YOLO) | your own permission prompts may be approved automatically |
 
 Within the listed classes, act on the request as you would on your user's request. Outside them, ask your user.
