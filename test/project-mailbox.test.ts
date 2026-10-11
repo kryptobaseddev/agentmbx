@@ -407,7 +407,7 @@ test("T493 enumeration contract: no place that lists mailbox names out of delive
   assert.match(row.label, /3? ?unread message\(s\) waiting/); assert.match(row.fix ?? "", /lead set/);
   assert.equal(checks.some((c) => c.label.includes(slot) || /claim.*pm-/.test(`${c.label} ${c.fix ?? ""}`)), false);
 
-  // The wake dispatcher leaves slot rows alone: they stay delivered, nothing is woken or marked.
+  // A slot with no lead to wake is left alone by the wake dispatcher: it stays delivered, nothing is woken or marked (T557 wakes a live lead: wake-project-mail.test.ts).
   const woken = await dispatchWakes(w.n, Date.now());
   assert.equal(woken.some((x) => x.agent === slot), false);
   assert.equal((w.n.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=? AND agent=?").get(calm.envelope.id, slot) as { state: string }).state, "delivered");
@@ -415,7 +415,7 @@ test("T493 enumeration contract: no place that lists mailbox names out of delive
 
 // ── ratchet: every deliveries query is classified, so a new one cannot silently list project slots ──────────
 
-type Category = "enumerator (excludes project slots, asserted in the enumeration contract)" | "by name (the caller's own mailbox)" | "per message" | "owner-level aggregate" | "writer" | "schema";
+type Category = "enumerator (excludes project slots, asserted in the enumeration contract)" | "slot-aware (maps a project slot to its lead; test/wake-project-mail.test.ts)" | "by name (the caller's own mailbox)" | "per message" | "owner-level aggregate" | "writer" | "schema";
 const RATCHET: Record<string, { max: number; category: Category; why: string }> = {
   "src/cli.ts": { max: 7, category: "by name (the caller's own mailbox)", why: "inbox/read/status/watch/hook paths all take an agent; the whole-store counter in `status` is an owner-level aggregate" },
   "src/diagnostics.ts": { max: 2, category: "by name (the caller's own mailbox)", why: "scoped to one mailbox argument" },
@@ -435,7 +435,7 @@ const RATCHET: Record<string, { max: number; category: Category; why: string }> 
   "src/store.ts": { max: 3, category: "schema", why: "triggers and the legacy visibility backfill" },
   "src/stranded.ts": { max: 3, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "established-name gated; a slot is recognised, not claimed" },
   "src/sync-daemon.ts": { max: 2, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "cloud read model" },
-  "src/wake.ts": { max: 4, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "the dispatcher skips slot rows; reconcile works per message and agent" },
+  "src/wake.ts": { max: 4, category: "slot-aware (maps a project slot to its lead; test/wake-project-mail.test.ts)", why: "the dispatcher keys a slot row to the project's current lead (T557) and operates on the row's own mailbox; reconcile works per (message, mailbox) pair" },
 };
 
 test("T493 ratchet: every query over deliveries is classified, so a new one cannot silently list a project mailbox slot", () => {

@@ -15,7 +15,8 @@ import { opencodeHostOf, type OpencodeHost } from "./opencode-provider.ts";
 import { pushOpencodeWake } from "./opencode-wake-queue.ts";
 import type { WakeOutcome, WakeReceipt } from "./wake-contract.ts";
 import type { MessageRow } from "./store.ts";
-import { notSlot } from "./project-slot.ts";
+import { leadAgentOf, projectLabel, projectMailboxBySlot } from "./project-mailbox.ts";
+import { isSlotName } from "./project-slot.ts";
 
 const run = promisify(execFile);
 /** `ok` is true only for an admitted wake or a shown notice. Provider adapters also report the typed `outcome` (T178,
@@ -64,6 +65,20 @@ export function wakeText(agent: string, msgs: MessageRow[], project?: string): s
   // literally and made agents skip unread mail.
   const where = project ? ` in the project mailbox ${project}` : ""; // T493: mail to the project, read by its lead
   return `[mbx] ${msgs.length} new message(s) for ${agent}${where} from ${senders} (ids ${ids}).${owner} mbx_inbox or mbx_read, reply, ack. If you already handled these ids, no action is needed.`;
+}
+
+/** A delivered row with the mailbox it sits in: the agent's own, or a project mailbox slot (T557). */
+export type PendingRow = MessageRow & { agent: string };
+
+/** The hint for one wake: the usual sentence for the agent's personal mail, plus one per project mailbox it leads. Ids only, never content. */
+export function wakeTextFor(node: MbxNode, agent: string, rows: PendingRow[]): string {
+  const own = rows.filter((r) => !isSlotName(r.agent));
+  const bySlot = new Map<string, PendingRow[]>();
+  for (const r of rows) if (isSlotName(r.agent)) bySlot.set(r.agent, [...(bySlot.get(r.agent) ?? []), r]);
+  return [...(own.length ? [wakeText(agent, own)] : []), ...[...bySlot].map(([slot, msgs]) => {
+    const box = projectMailboxBySlot(node.store, slot);
+    return wakeText(agent, msgs, box ? projectLabel(box) : "(project)");
+  })].join(" ");
 }
 
 export const which = (bin: string) => { try { return execFileSync("/usr/bin/which", [bin], { encoding: "utf8" }).trim() || null; } catch { return null; } };
@@ -345,14 +360,16 @@ export const wakeMutedUntil = (node: MbxNode, agent: string, now = Date.now()): 
  */
 function reconcileWakes(node: MbxNode, now: number) {
   for (const { k, v } of node.store.db.prepare("SELECT k, v FROM kv WHERE k GLOB 'wake-attempt:*'").all() as { k: string; v: string }[]) {
-    let a: { attemptId: string; agent: string; messageIds: string[] };
+    let a: { attemptId: string; agent: string; messageIds: string[]; deliveries?: { id: string; agent: string }[] };
     try { a = JSON.parse(v); } catch { node.store.db.prepare("DELETE FROM kv WHERE k=?").run(k); continue; }
+    // T557: an attempt may cover project-mailbox rows, so the marker names each (message, mailbox) pair; a marker an older daemon wrote has only the ids.
+    const pairs = (a.deliveries ?? a.messageIds.map((id) => ({ id, agent: a.agent }))).filter((p) => typeof p?.id === "string" && typeof p?.agent === "string");
     node.store.tx(() => {
-      for (const id of a.messageIds) node.store.db.prepare("UPDATE deliveries SET state='notified', note='unknown', updated_at=? WHERE msg_id=? AND agent=? AND state='delivered'")
-        .run(new Date(now).toISOString(), id, a.agent);
+      for (const p of pairs) node.store.db.prepare("UPDATE deliveries SET state='notified', note='unknown', updated_at=? WHERE msg_id=? AND agent=? AND state='delivered'")
+        .run(new Date(now).toISOString(), p.id, p.agent);
       node.store.db.prepare("DELETE FROM kv WHERE k=?").run(k);
     });
-    node.store.audit("wake.unknown", { agent: a.agent, attempt: a.attemptId, reason: "killed", count: a.messageIds.length });
+    node.store.audit("wake.unknown", { agent: a.agent, attempt: a.attemptId, reason: "killed", count: pairs.length });
   }
   node.store.db.prepare("UPDATE deliveries SET state='delivered', note=NULL WHERE state='notified' AND note='unknown' AND updated_at<?")
     .run(new Date(now - UNKNOWN_HOLD_MS).toISOString());
@@ -387,10 +404,16 @@ function noticeAllowed(node: MbxNode, agent: string, now: number): boolean {
 /** One pass of the wake dispatcher: every delivered-but-not-notified message is either woken, batched or skipped. */
 export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ agent: string; result: WakeResult | { ok: false; via: "brake"; error: string } }[]> {
   reconcileWakes(node, now);
-  // T493: a project mailbox slot has no session of its own; waking its lead is a separate path, so the dispatcher leaves slot rows alone.
-  const pending = node.store.db.prepare(`SELECT d.agent, m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.state='delivered' AND ${notSlot("d.agent")} ORDER BY m.ts`).all() as unknown as (MessageRow & { agent: string })[];
-  const byAgent = new Map<string, (MessageRow & { agent: string })[]>();
-  for (const r of pending) byAgent.set(r.agent, [...(byAgent.get(r.agent) ?? []), r]);
+  // T557: a project mailbox slot has no session of its own. Its mail is woken for the project's CURRENT lead on this host (the subject: whose
+  // session, policy, mute and batching window apply) while every delivery operation stays on the slot (the row's own mailbox, r.agent).
+  // A slot with no such lead (unallocated, none designated, designated elsewhere, expired, revoked) is left alone: it stays delivered.
+  const pending = node.store.db.prepare(`SELECT d.agent, m.* FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.state='delivered' ORDER BY m.ts`).all() as unknown as PendingRow[];
+  const byAgent = new Map<string, PendingRow[]>(), leaders = new Map<string, string | null>();
+  for (const r of pending) {
+    if (isSlotName(r.agent) && !leaders.has(r.agent)) leaders.set(r.agent, leadAgentOf(node, r.agent, new Date(now)));
+    const subject = isSlotName(r.agent) ? leaders.get(r.agent)! : r.agent;
+    if (subject !== null) byAgent.set(subject, [...(byAgent.get(subject) ?? []), r]);
+  }
   const out: { agent: string; result: WakeResult | { ok: false; via: "brake"; error: string } }[] = [];
   for (const [agent, rows] of byAgent) {
     const held = node.sessionsFor(agent).flatMap(session => {
@@ -401,13 +424,17 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
     if (held.some(g => g.session.channel)) continue;
     if (liveWatcher(node, agent, now)) continue; // its own watcher reports the mail and marks it notified
     const wanted = rows.filter((r) => node.wantsWake(agent, r));
-    const markAll = () => rows.forEach((r) => node.setDelivery(r.id, agent, "notified"));
+    const markAll = () => rows.forEach((r) => node.setDelivery(r.id, r.agent, "notified"));
     if (!wanted.length) { markAll(); continue; }
     if (wakeMutedUntil(node, agent, now)) continue; // muted: no hint and no notice; the mail stays delivered and unread
     const busy = JSON.parse(node.store.get(busyKey(agent)) ?? "null") as { n: number; next: number } | null;
     if (busy && busy.next > now) continue; // a busy session is asked again with backoff, not every pass
     // a hosted kimi session that is mid-turn is working already: leave the mail queued (its Stop hook also
     // surfaces new mail) and retry on the next pass, without spending any of the wake brake below
+    // T557: project mail alone, and no verified session to wake: nothing to attempt. It waits, delivered, with no budget spent and no notice; the next pass
+    // after the lead binds a wakeable session picks it up, and an urgent message with no live lead is the owner's through stranded.ts.
+    const ownRows = rows.filter((r) => !isSlotName(r.agent));
+    if (!ownRows.length && !sessions.length) continue;
     const automatic = wanted.filter(r => hasWakeAuthority(node, agent, r));
     if (automatic.length && await kimiBusyNow(sessions.map(g => g.session), fetch)) {
       node.store.set(busyKey(agent), JSON.stringify({ n: (busy?.n ?? 0) + 1, next: now + Math.min(2_000 * 2 ** (busy?.n ?? 0), BUSY_BACKOFF_MAX_MS) }));
@@ -419,7 +446,7 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
     const brake = reservation.brake;
     if (brake?.startsWith("batched")) continue; // try again next pass, messages accumulate into one wake
     if (brake) { markAll(); out.push({ agent, result: { ok: false, via: "brake", error: brake } }); node.store.audit("wake.brake", { agent, brake }); continue; }
-    const text = wakeText(agent, automatic.length ? automatic : wanted) + policyBrief(node.store.db, agent, node.host);
+    const text = wakeTextFor(node, agent, automatic.length ? automatic : wanted) + policyBrief(node.store.db, agent, node.host);
     let result: WakeResult = { ok: false, via: "none", error: "no bound session" };
     let attempts = 0;
     let submitted: typeof held[number] | undefined, fenced = false;
@@ -429,12 +456,13 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
       const s = guard.session;
       const recheck = () => {
         try { return guard.run(() => automatic.every(r => {
-          const delivery = node.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=? AND agent=?").get(r.id, agent);
-          return delivery?.state === "delivered" && (hasWakeAuthority(node, agent, r));
+          const delivery = node.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=? AND agent=?").get(r.id, r.agent);
+          // T557: a project row also needs the lead's read scope now, inside the lead's own lease: the predicate that gates reading it.
+          return delivery?.state === "delivered" && (hasWakeAuthority(node, agent, r)) && (!isSlotName(r.agent) || node.readableSlots(agent).includes(r.agent));
         })); } catch { return false; }
       };
       if (!recheck()) { fenced = true; break; }
-      const marker = { attemptId: ulid(), agent, messageIds: automatic.map((r) => r.id), sessionId: s.session_id, at: new Date(now).toISOString() };
+      const marker = { attemptId: ulid(), agent, messageIds: automatic.map((r) => r.id), deliveries: automatic.map((r) => ({ id: r.id, agent: r.agent })), sessionId: s.session_id, at: new Date(now).toISOString() };
       node.store.set(attemptKey(agent), JSON.stringify(marker)); // durable before the native write (WC-14)
       if (s.cli === "codex") result = await wakeCodex(s.session_id, text, { recheck });
       else if (s.cli === "opencode") result = await wakeOpencode(s.session_id, text, { recheck, pid: s.pid });
@@ -475,24 +503,28 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
     }
     if (result.outcome?.kind === "unknown") {
       // The hint may be queued already: never resubmit it blindly (T179 reconciles). The mail stays unread and readable.
-      const finish = () => { rows.forEach(r => node.setDelivery(r.id, agent, "notified", "unknown")); clearAttempt(); };
+      const finish = () => { rows.forEach(r => node.setDelivery(r.id, r.agent, "notified", "unknown")); clearAttempt(); };
       try { if (submitted) submitted.run(finish, false); else node.store.tx(finish); } catch { clearAttempt(); /* ownership changed: delivery retained */ }
       node.store.audit("wake.unknown", { agent, via: result.via, attempt: result.outcome.attemptId, reason: result.outcome.reason, count: wanted.length });
       out.push({ agent, result });
       continue;
     }
+    // T557: the dispatcher never turns project mail into a desktop notice (stranded.ts owns that escalation), so a wake that did not happen leaves it
+    // delivered for the next pass. Only when no native write was attempted is the batching budget refunded.
+    const ownWanted = wanted.filter((r) => !isSlotName(r.agent));
+    if (!result.ok && !ownWanted.length) { if (!attempts) reservation.release?.(); continue; }
     let desktop = false;
     // A name with no registered agent or session gets no notice, and notices are rate limited across all names (T196, F6):
     // mail to made-up names cannot flood the desktop or stall the daemon. The mail is still re-woken once a session binds.
     if (!result.ok && !noticeAllowed(node, agent, now)) {
-      node.store.tx(() => rows.forEach(r => node.setDelivery(r.id, agent, "notified", "desktop")));
+      node.store.tx(() => ownRows.forEach(r => node.setDelivery(r.id, r.agent, "notified", "desktop")));
       node.store.audit("wake.notice_skipped", { agent, count: wanted.length });
       out.push({ agent, result: { ok: false, via: "desktop", error: "notice skipped (unknown agent or notice rate limit)" } });
       continue;
     }
-    if (!result.ok) result = await notifyDesktop({ subtitle: agent, body: text, openCmd: inboxCommand(agent) }).then((r) => { desktop = r.ok; return r.ok ? r : result; });
+    if (!result.ok) result = await notifyDesktop({ subtitle: agent, body: wakeTextFor(node, agent, ownWanted) + policyBrief(node.store.db, agent, node.host), openCmd: inboxCommand(agent) }).then((r) => { desktop = r.ok; return r.ok ? r : result; });
     // mail that only reached the desktop gets another wake when a wakeable session binds (node.bindSession)
-    const finish = () => rows.forEach(r => node.setDelivery(r.id, agent, "notified", desktop || !result.ok ? "desktop" : null));
+    const finish = () => (desktop || !result.ok ? ownRows : rows).forEach(r => node.setDelivery(r.id, r.agent, "notified", desktop || !result.ok ? "desktop" : null));
     try { if (submitted && result.ok && !desktop) submitted.run(finish, false); else node.store.tx(finish); }
     catch { out.push({ agent, result: { ok: false, via: "lease", error: "wake completed after ownership changed; delivery retained" } }); continue; }
     node.store.audit("wake", { agent, via: result.via, ok: result.ok, count: wanted.length });
