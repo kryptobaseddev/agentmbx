@@ -9,11 +9,13 @@ import { pathToFileURL } from "node:url";
 const lifecycleUrl = pathToFileURL(resolve("src/mcp-lifecycle.ts")).href;
 const procUrl = pathToFileURL(resolve("src/proc.ts")).href;
 const supported = process.platform === "darwin" || process.platform === "linux";
+// Retry budget includes scheduling delays; each enclosing process gets time to collect and clean up.
+const claimTimeout = 10_000;
 
-for (const seed of ["none", "dead", "unknown"] as const) test(`shared-connection exclusion is atomic (${seed} owner)`, { skip: !supported, timeout: 12000 }, t => {
+for (const seed of ["none", "dead", "unknown"] as const) test(`shared-connection exclusion is atomic (${seed} owner)`, { skip: !supported, timeout: claimTimeout + 15_000 }, t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-connection-")); t.after(() => rmSync(home, { recursive: true, force: true }));
   const worker = `import {claimMcpConnection,startMcpLifecycle} from ${JSON.stringify(lifecycleUrl)};
-    const life=startMcpLifecycle(${JSON.stringify(home)}); const end=Date.now()+1500; let claim;
+    const life=startMcpLifecycle(${JSON.stringify(home)}); const end=Date.now()+${claimTimeout}; let claim;
     do {claim=life.claimConnection(); if(claim.state==='retry')await new Promise(r=>setTimeout(r,10));}while(claim.state==='retry'&&Date.now()<end);
     process.stderr.write(JSON.stringify({pid:process.pid,state:claim.state})+'\\n');`;
   const manager = `import {spawn} from 'node:child_process'; import {mkdirSync,writeFileSync,readFileSync} from 'node:fs';
@@ -26,11 +28,11 @@ for (const seed of ["none", "dead", "unknown"] as const) test(`shared-connection
     for(let i=0;i<8;i++){const c=spawn(process.execPath,['--input-type=module','-e',${JSON.stringify(worker)}],{stdio:['inherit','inherit','pipe']});children.push(c);
       let buf='';c.stderr.on('data',data=>{buf+=data;const lines=buf.split('\\n');buf=lines.pop();for(const line of lines)if(line.startsWith('{'))reports.push(JSON.parse(line));
         if(reports.length===8){console.log(JSON.stringify({reports,alive:children.every(p=>p.exitCode===null),unchanged:seed==='unknown'?readFileSync(path,'utf8')===body:null}));for(const p of children)p.kill('SIGTERM');}});}
-    const timer=setTimeout(()=>{for(const c of children)c.kill('SIGKILL');process.exit(2)},7000);
+    const timer=setTimeout(()=>{for(const c of children)c.kill('SIGKILL');process.exit(2)},${claimTimeout + 5_000});
     let exited=0;for(const c of children)c.on('exit',()=>{if(++exited===8){clearTimeout(timer);process.exit(0)}});`;
   const env = { ...process.env };
   for (const key of Object.keys(env)) if (/^(?:MBX_MCP_|CLAUDE_|CODEX_|CLEO_|ORCA_)/.test(key)) delete env[key];
-  const result = spawnSync(process.execPath, ["--input-type=module", "-e", manager], { env, encoding: "utf8", timeout: 10000 });
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", manager], { env, encoding: "utf8", timeout: claimTimeout + 10_000 });
   assert.equal(result.status, 0, result.stderr);
   const { reports, unchanged, alive } = JSON.parse(result.stdout);
   assert.equal(alive, true, "all contenders retain the pipe until the contention result is captured");

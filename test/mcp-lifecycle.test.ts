@@ -74,6 +74,8 @@ for (const forceLegacy of [false, true]) test(`after ${RELOADS} reloads ${forceL
       if (row && row.token !== holderTokens[holderTokens.length - 1] && row.released_at === null) break;
       await new Promise(r => setTimeout(r, 25));
     }
+    // A fresh lease precedes boot fingerprint capture; wait for tools before deploying again.
+    assert.ok((await client.listTools()).tools.some(t => t.name === "mbx_replay"), "replacement must finish startup");
     pushHolderPid();
 
     // The original proxy (generation 1) stays on its transport; every re-exec generation in between
@@ -123,7 +125,10 @@ test("closing stdin stops every MCP process after 2 reloads", async t => {
   const root = mkdtempSync(join(tmpdir(), "mbx-lifecycle-eof-")), install = join(root, "install"), home = join(root, "mail");
   mkdirSync(install);
   for (const path of ["bin", "dist", "package.json"]) cpSync(resolve(path), join(install, path), { recursive: true });
-  const mcpPath = join(install, "dist/mcp.js"), currentMcp = readFileSync(mcpPath, "utf8");
+  const mcpPath = join(install, "dist/mcp.js"), source = readFileSync(mcpPath, "utf8");
+  assert.ok(source.includes("const boot = codeFingerprint();"), "fixture must delay boot fingerprint capture");
+  // Reproduce a replacement descheduled between lease publication and fingerprint capture.
+  const currentMcp = source.replace("const boot = codeFingerprint();", "await new Promise(resolve => setTimeout(resolve, 250)); const boot = codeFingerprint();");
   const start = currentMcp.indexOf('server.registerTool("mbx_replay",');
   const end = currentMcp.indexOf('server.registerTool("mbx_ack",', start);
   assert.ok(start >= 0 && end > start, "fixture must remove exactly the replay registration");
@@ -161,6 +166,7 @@ test("closing stdin stops every MCP process after 2 reloads", async t => {
       if (row && row.token !== holderTokens[holderTokens.length - 1] && row.released_at === null) break;
       await new Promise(r => setTimeout(r, 25));
     }
+    assert.ok((await client.listTools()).tools.some(t => t.name === "mbx_replay"), "replacement must finish startup");
     pushHolderPid();
   }
 
@@ -222,6 +228,7 @@ test("a crashed current generation closes the provider transport", async t => {
     if (row && row.token !== holderTokens[holderTokens.length - 1] && row.released_at === null) break;
     await new Promise(r => setTimeout(r, 25));
   }
+  assert.ok((await client.listTools()).tools.some(t => t.name === "mbx_replay"), "replacement must finish startup");
   pushHolderPid();
 
   // Crash the current generation (SIGKILL, never the graceful path).
