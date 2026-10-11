@@ -24,9 +24,10 @@ test("T329 home and root do not invent a harness name", () => {
   });
 });
 
-test("T329 a project folder is the project name", () => {
+test("T492 a project folder does not invent a name", () => {
   withAgent(undefined, () => {
-    assert.equal(agentName("/tmp/agentmbx-proj"), "agentmbx-proj");
+    assert.equal(agentName("/tmp/agentmbx-proj"), null);
+    assert.equal(agentName("/tmp/My Project"), null);
   });
 });
 
