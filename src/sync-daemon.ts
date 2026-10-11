@@ -12,6 +12,7 @@ import { projectKey } from "./registry.ts";
 import { relayFor } from "./relay-client.ts";
 import { newSyncNonce, syncOnce, type SyncDeps, type SyncResult, type SyncSigner } from "./sync-client.ts";
 import { CAPS, PATH_FLAG_PREFIX, PROJECT_KEY_RE, type AgentInput, type HostInput, type LeadInput, type PathInput, type PolicyInput, type ReceiptInput, type SyncSnapshot, type ThreadInput } from "./sync-projection.ts";
+import { notSlot } from "./project-slot.ts";
 import type { Store } from "./store.ts";
 import { version } from "./version.ts";
 
@@ -45,9 +46,10 @@ export function loadSyncSnapshot(node: MbxNode, ctx: { contractAllowsProjectPath
   const localAgents = db.prepare("SELECT name, role, cli, last_seen FROM agents WHERE host=?").all(hostName) as AgentRow[];
   const leases = db.prepare("SELECT name, cli, claimed_at, heartbeat_at, released_at FROM identity_leases").all() as LeaseRow[];
   const projects = db.prepare("SELECT name, project, last_seen FROM identity_projects ORDER BY last_seen ASC").all() as { name: string; project: string; last_seen: string }[];
-  const unreadRows = db.prepare("SELECT agent, COUNT(*) AS n FROM deliveries WHERE state <> 'acked' GROUP BY agent").all() as { agent: string; n: number }[];
+  // T493: a project mailbox slot is not an agent; its counts and delivery rows stay out of the read model.
+  const unreadRows = db.prepare(`SELECT agent, COUNT(*) AS n FROM deliveries WHERE state <> 'acked' AND ${notSlot("agent")} GROUP BY agent`).all() as { agent: string; n: number }[];
   const messages = db.prepare("SELECT id, thread, kind, from_addr, trust, ts, origin, json_extract(envelope, '$.meta.hop') AS hop FROM messages").all() as MsgRow[];
-  const deliveries = db.prepare("SELECT msg_id, agent, state, updated_at FROM deliveries").all() as DelRow[];
+  const deliveries = db.prepare(`SELECT msg_id, agent, state, updated_at FROM deliveries WHERE ${notSlot("agent")}`).all() as DelRow[];
 
   const byName = new Map<string, AgentRow>();
   for (const row of localAgents) byName.set(row.name, row);

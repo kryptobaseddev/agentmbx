@@ -1,6 +1,7 @@
 // `agentmbx doctor`: one checklist that says what works, what doesn't, and the one command that fixes it.
 import { rotationLog } from "./key-rotation.ts";
 import { accessSync, closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
+import { projectLabel, projectMailboxBySlot } from "./project-mailbox.ts";
 import { escalatedCount, phantomMailboxes, returnDays } from "./stranded.ts";
 import { delimiter, dirname, join } from "node:path";
 import { fingerprint } from "./crypto.ts";
@@ -199,6 +200,10 @@ export function strandedMail(node: MbxNode): Check[] {
   const out: Check[] = stranded.slice(0, STRANDED_MAX).map((s) => { const p = phantoms.get(s.name);
     const esc = escalatedCount(node, s.name);
     const escLabel = esc ? `; ${esc} urgent message(s) (alert/needs-reply) escalated to the owner with a desktop notice` : "";
+    // T493: a project mailbox waits for its lead, not for a session to claim it.
+    const project = projectMailboxBySlot(node.store, s.name);
+    if (project) return { level: "warn" as Level, label: `project mailbox ${projectLabel(project)}: ${s.unread} unread message(s) waiting — ${s.detail}${escLabel}`,
+      fix: "the project's lead reconnects (it reads this as a labelled section of its inbox), or the owner designates one: agentmbx lead set <agent> --project <dir>" };
     return p
     ? { level: "warn" as Level, label: `${s.name}: phantom mailbox — ${s.unread} message(s) addressed to ${s.name}@${p.hosts.join(", ")}, which received them there; nobody holds ${s.name} here${escLabel}`,
       fix: "agentmbx doctor --fix   (marks these copies handled; nothing is deleted)" }

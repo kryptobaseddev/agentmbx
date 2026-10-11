@@ -1,4 +1,4 @@
-import { deadHolderLeases, hasHeldIdentity, IdentityLeases, inspectLeaseProcesses, processGone, sweepDeadHolderLeases, UNKNOWN_PROCESS } from "./identity-leases.ts";
+import { deadHolderLeases, hasHeldIdentity, hasHeldScope, IdentityLeases, inspectLeaseProcesses, processGone, sweepDeadHolderLeases, UNKNOWN_PROCESS } from "./identity-leases.ts";
 import { listIdentityControls, removeIdentityControl } from "./identity-control.ts";
 import { initializeReplay, replayQuery, type ReplayOptions, type ReplayPage } from "./replay.ts";
 import { kimiHostedCheck } from "./wake-check.ts";
@@ -22,6 +22,7 @@ import { privatePath } from "./private-files.ts";
 import { TASK_RE } from "./presence.ts";
 import { backfillProjectKeys, backfillRegistry } from "./registry.ts";
 import { resolveLeadRecipients } from "./lead-record.ts";
+import { projectLabel, projectMailboxBySlot, projectsLedBy, resolveProjectMailbox, rewriteProjectAliases, type ProjectMailbox } from "./project-mailbox.ts";
 import { Store, type DeliveryState, type MessageRow } from "./store.ts";
 
 export const DEFAULT_PORT = 7373;
@@ -702,7 +703,8 @@ export class MbxNode {
   establishedLocalName(name: string): boolean {
     const q = (sql: string, ...args: string[]) => !!this.store.db.prepare(sql).get(...args);
     return name === "owner" || q("SELECT 1 FROM agents WHERE name=? AND host=?", name, this.host) || q("SELECT 1 FROM identity_leases WHERE name=?", name)
-      || q("SELECT 1 FROM identities WHERE name=?", name) || this.store.get(`alias:${name}`) !== undefined;
+      || q("SELECT 1 FROM identities WHERE name=?", name) || this.store.get(`alias:${name}`) !== undefined
+      || q("SELECT 1 FROM project_mailboxes WHERE slot=?", name); // T493: an allocated project mailbox is deliberately created
   }
 
   /** Has `name` ever existed on this host: an agents row, a delivery, a lease or a rename alias (T205)? */
@@ -710,7 +712,8 @@ export class MbxNode {
     const q = (sql: string, ...args: string[]) => !!this.store.db.prepare(sql).get(...args);
     if (this.store.get(`retired:${name}`) !== undefined) return false; // retired by identity prune (T209)
     return name === "owner" || q("SELECT 1 FROM agents WHERE name=? AND host=?", name, this.host) || q("SELECT 1 FROM deliveries WHERE agent=? LIMIT 1", name)
-      || q("SELECT 1 FROM identity_leases WHERE name=?", name) || this.store.get(`alias:${name}`) !== undefined;
+      || q("SELECT 1 FROM identity_leases WHERE name=?", name) || this.store.get(`alias:${name}`) !== undefined
+      || q("SELECT 1 FROM project_mailboxes WHERE slot=?", name);
   }
 
   // ---- send / receive ----------------------------------------------------------------------
@@ -720,7 +723,7 @@ export class MbxNode {
   async sendAsOwner(d: Draft, sign: (canonicalJson: string) => Promise<{ sig: string }>): Promise<ReturnType<MbxNode["send"]>> {
     const pub = this.ownerPub;
     if (!pub) throw new Error("no owner key on this machine: run 'agentmbx owner init'");
-    const { to } = resolveLeadRecipients(this, "owner", d.to, d.project);
+    const to = rewriteProjectAliases(this, resolveLeadRecipients(this, "owner", d.to, d.project).to).to; // before the owner signs, like the lead tokens
     const req = ownerSignRequest(buildEnvelope({ ...d, to, from: `owner@${this.host}` }), pub);
     return this.send({ ...d, to, from: "owner" }, undefined, undefined, withOwnerSig(req.envelope, (await sign(req.payload)).sig));
   }
@@ -731,7 +734,9 @@ export class MbxNode {
     // A prebuilt envelope is already signed, so its `to` stays. Callers that build one (sendAsOwner)
     // resolve lead tokens before that signature.
     const lead = prebuilt ? { to: d.to, leadAddress: null } : resolveLeadRecipients(this, fromName, d.to, d.project);
-    const to = lead.to;
+    // T493: a bare project name becomes the project mailbox's slot here, before the envelope is signed (a prebuilt one already is).
+    const project = prebuilt ? { to: lead.to, notes: [] as string[] } : rewriteProjectAliases(this, lead.to);
+    const to = project.to;
     let e = prebuilt ?? buildEnvelope({ ...d, to, from: `${fromName}@${this.host}` });
     // Positive host attestation comes from the current lease operation, never a draft flag.
     // A prebuilt owner-signed envelope is immutable: changing metadata would invalidate its approval.
@@ -739,6 +744,7 @@ export class MbxNode {
       throw new Error("prebuilt sender attestation requires the current identity lease");
     if (!prebuilt) e.meta.sender_verification = !d.unverifiedSender && hasHeldIdentity(this.store, fromName) ? "leased" : "unverified";
     const r = this.route(e.to);
+    r.warnings.push(...project.notes);
     // T491: mark exactly the targets the lead tokens resolved to (a fan-out or broadcast that happens to
     // include the lead agent is not lead mail). Remote leads are the paired host's liveness question.
     if (lead.leadAddress) {
@@ -836,6 +842,35 @@ export class MbxNode {
       WHERE d.agent=? ${opts.all ? "" : "AND d.state <> 'acked'"} ORDER BY m.ts LIMIT ?`).all(agent, opts.limit ?? 50) as unknown as MessageRow[]).map(m => this.currentAuthority(m));
   }
 
+  /**
+   * The project mailbox slots `agent` may read right now (T493): none unless this call runs inside `agent`'s own held lease, and only
+   * for projects whose current owner-signed lead, designated on this host, is `agent`. Re-derived on every call from the signed lead
+   * record and the lease, so a replaced or revoked lead, a released or taken-over lease, a role label or a folder grants nothing.
+   */
+  readableSlots(agent: string): string[] {
+    return hasHeldScope(this.store, agent) ? projectsLedBy(this, agent).map((m) => m.slot) : [];
+  }
+
+  /** The labelled project sections of `agent`'s inbox, one per project it currently leads. Empty outside its own lease scope. */
+  projectInboxes(agent: string, opts: { all?: boolean; limit?: number } = {}): { project: ProjectMailbox; unread: number; messages: MessageRow[] }[] {
+    if (!hasHeldScope(this.store, agent)) return [];
+    return projectsLedBy(this, agent).map((project) => ({
+      project,
+      unread: (this.store.db.prepare("SELECT count(*) n FROM deliveries WHERE agent=? AND state <> 'acked'").get(project.slot) as { n: number }).n,
+      messages: (this.store.db.prepare(`SELECT m.*, d.state FROM deliveries d JOIN messages m ON m.id=d.msg_id
+        WHERE d.agent=? ${opts.all ? "" : "AND d.state <> 'acked'"} ORDER BY m.ts LIMIT ?`).all(project.slot, opts.limit ?? 50) as unknown as MessageRow[]).map((m) => this.currentAuthority(m)),
+    }));
+  }
+
+  /** Mark the reader's copy of each message read: its own when it has one, else a project copy it may read (T493). */
+  markRead(rows: { id: string }[], agent: string) {
+    const slots = this.readableSlots(agent);
+    for (const r of rows) {
+      if (this.store.db.prepare("SELECT 1 FROM deliveries WHERE msg_id=? AND agent=?").get(r.id, agent)) { this.setDelivery(r.id, agent, "read"); continue; }
+      for (const slot of slots) this.setDelivery(r.id, slot, "read");
+    }
+  }
+
   unreadCount(agent: string): number {
     return (this.store.db.prepare("SELECT count(*) n FROM deliveries WHERE agent=? AND state <> 'acked'").get(agent) as { n: number }).n;
   }
@@ -847,7 +882,7 @@ export class MbxNode {
       ((m.origin='local' OR substr(m.from_addr,instr(m.from_addr,'@')+1)=?)
         AND substr(m.from_addr,1,instr(m.from_addr,'@')-1)=names.value)
       OR EXISTS (SELECT 1 FROM deliveries d WHERE d.msg_id=m.id AND d.agent=names.value))` : "";
-    const scope = agent ? [JSON.stringify([agent, ...this.linkedNames(agent)]), this.host] : [];
+    const scope = agent ? [JSON.stringify([agent, ...this.linkedNames(agent), ...this.readableSlots(agent)]), this.host] : [];
     const rows = this.store.db.prepare(`SELECT m.* FROM messages m WHERE m.id LIKE ? ${visibility} LIMIT 6`).all(`${id}%`, ...scope) as unknown as MessageRow[];
     if (rows.length > 1) throw Object.assign(new Error(`id prefix ${id} matches ${rows.length === 6 ? "6+" : rows.length} messages (${rows.slice(0, 3).map((r) => r.id).join(", ")}…); use more characters`), { code: "AMBIGUOUS" });
     return rows[0] ? this.currentAuthority(rows[0]) : undefined;
@@ -858,7 +893,7 @@ export class MbxNode {
    * that takes a message id for an agent checks this and answers "not found" otherwise, so ids leak nothing.
    */
   canSee(m: MessageRow, agent: string): boolean {
-    const names = [agent, ...this.linkedNames(agent)];
+    const names = [agent, ...this.linkedNames(agent), ...this.readableSlots(agent)];
     const [fa, fh] = m.from_addr.split("@");
     if ((m.origin === "local" || fh === this.host) && names.includes(fa)) return true;
     return names.some((n) => this.store.db.prepare("SELECT 1 FROM deliveries WHERE msg_id=? AND agent=?").get(m.id, n));
@@ -872,14 +907,22 @@ export class MbxNode {
   }
 
   /** `did`: what the agent did on this message's request; recorded in the audit log with the policy that allowed it. */
-  ack(id: string, agent: string, note: string | null = null, did?: string) {
+  ack(id: string, agent: string, note: string | null = null, did?: string, opts: { project?: string } = {}) {
     return this.store.tx(() => {
       const m = this.message(id, agent);
       if (!m || !this.canSee(m, agent)) throw Object.assign(new Error(`no message ${id}`), { code: "NOT_FOUND" });
       const delivered = (name: string) => !!this.store.db.prepare("SELECT 1 FROM deliveries WHERE msg_id=? AND agent=?").get(m.id, name);
       // Reading a sent message is allowed, but acknowledging requires a recipient delivery.
       // Prefer the caller's own copy; never drain additional linked copies on an idempotent retry.
-      const recipients = delivered(agent) ? [agent] : this.linkedNames(agent).filter(delivered);
+      // T493: with no personal copy, a project copy the agent may read (its own lead mailbox) is the one acknowledged; `project` names one
+      // explicitly, which is the only way to drain a project copy of a message that also reached the agent personally.
+      const slots = this.readableSlots(agent);
+      let recipients: string[];
+      if (opts.project !== undefined) {
+        const wanted = resolveProjectMailbox(this.store, opts.project)?.slot;
+        if (!wanted || !slots.includes(wanted)) throw Object.assign(new Error(`no message ${id}`), { code: "NOT_FOUND" });
+        recipients = delivered(wanted) ? [wanted] : [];
+      } else recipients = delivered(agent) ? [agent] : [...this.linkedNames(agent), ...slots].filter(delivered);
       if (!recipients.length) throw Object.assign(new Error(`message ${m.id} was not delivered to ${agent}; there is no recipient acknowledgement to record`), { code: "NOT_RECIPIENT" });
       if (recipients.length > 1) throw Object.assign(new Error(`message ${m.id} has multiple linked recipients (${recipients.join(", ")}); choose one with agentmbx ack --as <recipient> ${m.id}`), { code: "AMBIGUOUS_RECIPIENT" });
       const recipient = recipients[0];
@@ -927,7 +970,7 @@ export class MbxNode {
       ((m.origin='local' OR substr(m.from_addr,instr(m.from_addr,'@')+1)=?)
         AND substr(m.from_addr,1,instr(m.from_addr,'@')-1)=names.value)
       OR EXISTS (SELECT 1 FROM deliveries d WHERE d.msg_id=m.id AND d.agent=names.value))` : "";
-    const scope = agent ? [JSON.stringify([agent, ...this.linkedNames(agent)]), this.host] : [];
+    const scope = agent ? [JSON.stringify([agent, ...this.linkedNames(agent), ...this.readableSlots(agent)]), this.host] : [];
     return (this.store.db.prepare(`SELECT m.* FROM messages_fts f JOIN messages m ON m.rowid=f.rowid WHERE messages_fts MATCH ?
       ${visibility} ORDER BY rank LIMIT ?`).all(fts, ...scope, limit) as unknown as MessageRow[]).map(m => this.currentAuthority(m));
   }
@@ -976,7 +1019,10 @@ export function formatFor(node: MbxNode, m: MessageRow, agent: string): string {
     : policyLine(node.policyFor(m, agent));
   // T208: a project lead re-delivered this message to `agent`; the policy above still comes from the original sender
   const lead = node.store.get(`forwarded:${m.id}:${agent}`);
-  return formatMessage(row, lead ? `${policy}\nforwarded by lead ${lead} (project ledger; this adds no authority)` : policy);
+  // T493: say which project mailbox a message was addressed to, in words, instead of its reserved slot name.
+  const boxes = (JSON.parse(m.envelope) as Envelope).to.flatMap((t) => { const b = projectMailboxBySlot(node.store, t); return b ? [projectLabel(b)] : []; });
+  const where = boxes.length ? `\naddressed to the project mailbox ${boxes.join(", ")} (stored once for the project; its lead reads it)` : "";
+  return formatMessage(row, (lead ? `${policy}\nforwarded by lead ${lead} (project ledger; this adds no authority)` : policy) + where);
 }
 
 /** Structural guard for legacy cached authority; this does not revalidate key revocation or expiry. */

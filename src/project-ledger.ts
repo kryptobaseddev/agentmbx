@@ -8,6 +8,7 @@ import type { MbxNode } from "./node.ts";
 import { bumpPostToolMarkersForAgent } from "./posttool.ts";
 import { deliveryReceipts, type DeliveryReceipt } from "./receipts.ts";
 import { resolveProject } from "./project-key.ts";
+import { SLOT_GLOB } from "./project-slot.ts";
 import { projectIdentities, registeredIdentity } from "./registry.ts";
 import type { MessageRow } from "./store.ts";
 
@@ -48,10 +49,16 @@ function ledgerWhere(node: MbxNode, project: string): { sql: string; args: strin
   return { sql: `(json_extract(envelope,'$.meta.project')=?${keys.length ? ` OR json_extract(envelope,'$.meta.project_key') IN (${inList(keys)})` : ""} OR from_addr IN (${inList(addrs)})
       OR id IN (SELECT msg_id FROM deliveries WHERE agent IN (${inList(members)})))`, args: [project, ...keys, ...addrs, ...members] };
 }
-function ledgerIds(node: MbxNode, project: string, after: string, upTo: string, limit: number): string[] {
+function ledgerIds(node: MbxNode, project: string, after: string, upTo: string, limit: number, caller: string): string[] {
   const w = ledgerWhere(node, project);
-  return (node.store.db.prepare(`SELECT id FROM messages WHERE id>? AND id<=? AND ${w.sql} ORDER BY id LIMIT ?`)
-    .all(after, upTo, ...w.args, limit) as { id: string }[]).map((r) => r.id);
+  // T493: mail that was delivered to a project mailbox is private to that mailbox's lead and to whoever sent it. Its subject, sender,
+  // recipients and kind are not ledger metadata for the other members, so it is left out HERE, before LIMIT and the cursor are worked out,
+  // not blanked afterwards (a body-only blank would still show that it exists, and who it was for).
+  const mine = node.readableSlots(caller);
+  const hidden = `AND (NOT EXISTS (SELECT 1 FROM deliveries x WHERE x.msg_id=messages.id AND x.agent GLOB '${SLOT_GLOB}')
+    OR from_addr=? OR EXISTS (SELECT 1 FROM deliveries x WHERE x.msg_id=messages.id AND x.agent IN (${mine.length ? mine.map(() => "?").join(",") : "NULL"})))`;
+  return (node.store.db.prepare(`SELECT id FROM messages WHERE id>? AND id<=? AND ${w.sql} ${hidden} ORDER BY id LIMIT ?`)
+    .all(after, upTo, ...w.args, `${caller}@${node.host}`, ...mine, limit) as { id: string }[]).map((r) => r.id);
 }
 /** Is `id` a message of `project`'s ledger? */
 export function inLedger(node: MbxNode, project: string, id: string): boolean {
@@ -83,7 +90,7 @@ export function ledgerPage(node: MbxNode, caller: string, project: string, o: { 
   }
   const lead = activeLead(node, project);
   const callerIsLead = !!lead && lead.agent === caller && lead.host === node.host;
-  const ids = ledgerIds(node, project, frame.position, frame.end, limit + 1);
+  const ids = ledgerIds(node, project, frame.position, frame.end, limit + 1, caller);
   const page = ids.slice(0, limit);
   const messages = page.map((id): LedgerItem => {
     const m = node.message(id) as MessageRow;

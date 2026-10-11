@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { canonical, fingerprint, verifyData } from "./crypto.ts";
 import { NAME_RE } from "./envelope.ts";
+import { isSlotName, notSlot } from "./project-slot.ts";
 import { identityAvailability, activityKey, parseActivity } from "./identity-availability.ts";
 import { inspectLeaseProcess, type IdentityLease, type ProcessEvidence } from "./identity-leases.ts";
 import { bumpPostToolMarkersForAgent } from "./posttool.ts";
@@ -25,7 +26,8 @@ export function pruneCandidates(node: MbxNode, o: { days?: number; now?: number;
   const db = node.store.db;
   const names = new Set<string>([
     ...(db.prepare("SELECT name FROM agents WHERE host=?").all(node.host) as { name: string }[]).map(r => r.name),
-    ...(db.prepare("SELECT DISTINCT agent name FROM deliveries").all() as { name: string }[]).map(r => r.name),
+    // T493: a project mailbox slot is never a prune candidate; forwarding into or out of one is T495's, not this path's.
+    ...(db.prepare(`SELECT DISTINCT agent name FROM deliveries WHERE ${notSlot("agent")}`).all() as { name: string }[]).map(r => r.name),
     ...(db.prepare("SELECT name FROM identity_leases").all() as { name: string }[]).map(r => r.name),
   ]);
   const retire: PruneRow[] = [], kept: PruneRow[] = [];
@@ -84,6 +86,7 @@ export function buildForward(node: MbxNode, from: string, to: string, now = Date
   const owner = node.ownerPub;
   if (!owner) throw new Error("identity forward requires a local owner key (agentmbx owner init)");
   if (from === to) throw new Error("forward needs two different mailboxes");
+  if (isSlotName(from) || isSlotName(to)) throw new Error("a project mailbox cannot be a forward source or target here: project mail is handled by the project lead (T495)");
   const held = (name: string) => {
     const lease = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(name) as unknown as IdentityLease | undefined;
     return lease && lease.released_at === null ? identityAvailability({ lease, evidence: inspectLeaseProcess(lease.holder_pid), activity: null, now }) : null;
@@ -99,6 +102,7 @@ export function buildForward(node: MbxNode, from: string, to: string, now = Date
 /** Apply an owner-signed forward: unread mail moves (acked history stays), and `from` routes to `to` from now on. */
 export function applyForward(node: MbxNode, approval: { payload: ForwardPayload; sig: string }, now = Date.now()): { moved: number } {
   const payload = forwardSchema.parse(approval.payload), owner = node.ownerPub;
+  if (isSlotName(payload.from) || isSlotName(payload.to)) throw new Error("a project mailbox cannot be a forward source or target here: project mail is handled by the project lead (T495)");
   if (!owner || fingerprint(owner) !== payload.owner_fp || !verifyData(owner, canonical(payload), approval.sig)) throw new Error("invalid owner forward signature");
   if (payload.host !== node.host || payload.host_fp !== fingerprint(node.key.publicKey)) throw new Error("owner forward approval names another host");
   if (payload.issued_at > now || payload.expires_at <= now) throw new Error("owner forward approval expired");

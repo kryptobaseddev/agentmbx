@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { canonical, fingerprint, verifyData } from "./crypto.js";
 import { NAME_RE } from "./envelope.js";
+import { isSlotName, notSlot } from "./project-slot.js";
 import { identityAvailability, activityKey, parseActivity } from "./identity-availability.js";
 import { inspectLeaseProcess } from "./identity-leases.js";
 import { bumpPostToolMarkersForAgent } from "./posttool.js";
@@ -20,7 +21,8 @@ export function pruneCandidates(node, o = {}) {
     const db = node.store.db;
     const names = new Set([
         ...db.prepare("SELECT name FROM agents WHERE host=?").all(node.host).map(r => r.name),
-        ...db.prepare("SELECT DISTINCT agent name FROM deliveries").all().map(r => r.name),
+        // T493: a project mailbox slot is never a prune candidate; forwarding into or out of one is T495's, not this path's.
+        ...db.prepare(`SELECT DISTINCT agent name FROM deliveries WHERE ${notSlot("agent")}`).all().map(r => r.name),
         ...db.prepare("SELECT name FROM identity_leases").all().map(r => r.name),
     ]);
     const retire = [], kept = [];
@@ -93,6 +95,8 @@ export function buildForward(node, from, to, now = Date.now()) {
         throw new Error("identity forward requires a local owner key (agentmbx owner init)");
     if (from === to)
         throw new Error("forward needs two different mailboxes");
+    if (isSlotName(from) || isSlotName(to))
+        throw new Error("a project mailbox cannot be a forward source or target here: project mail is handled by the project lead (T495)");
     const held = (name) => {
         const lease = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(name);
         return lease && lease.released_at === null ? identityAvailability({ lease, evidence: inspectLeaseProcess(lease.holder_pid), activity: null, now }) : null;
@@ -109,6 +113,8 @@ export function buildForward(node, from, to, now = Date.now()) {
 /** Apply an owner-signed forward: unread mail moves (acked history stays), and `from` routes to `to` from now on. */
 export function applyForward(node, approval, now = Date.now()) {
     const payload = forwardSchema.parse(approval.payload), owner = node.ownerPub;
+    if (isSlotName(payload.from) || isSlotName(payload.to))
+        throw new Error("a project mailbox cannot be a forward source or target here: project mail is handled by the project lead (T495)");
     if (!owner || fingerprint(owner) !== payload.owner_fp || !verifyData(owner, canonical(payload), approval.sig))
         throw new Error("invalid owner forward signature");
     if (payload.host !== node.host || payload.host_fp !== fingerprint(node.key.publicKey))

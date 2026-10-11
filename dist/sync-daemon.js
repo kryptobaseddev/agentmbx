@@ -11,6 +11,7 @@ import { projectKey } from "./registry.js";
 import { relayFor } from "./relay-client.js";
 import { newSyncNonce, syncOnce } from "./sync-client.js";
 import { CAPS, PATH_FLAG_PREFIX, PROJECT_KEY_RE } from "./sync-projection.js";
+import { notSlot } from "./project-slot.js";
 import { version } from "./version.js";
 export const SYNC_INTERVAL_MS = 15_000;
 const LIVE_MS = 60_000;
@@ -26,9 +27,10 @@ export function loadSyncSnapshot(node, ctx, projectKeyOf = projectKey) {
     const localAgents = db.prepare("SELECT name, role, cli, last_seen FROM agents WHERE host=?").all(hostName);
     const leases = db.prepare("SELECT name, cli, claimed_at, heartbeat_at, released_at FROM identity_leases").all();
     const projects = db.prepare("SELECT name, project, last_seen FROM identity_projects ORDER BY last_seen ASC").all();
-    const unreadRows = db.prepare("SELECT agent, COUNT(*) AS n FROM deliveries WHERE state <> 'acked' GROUP BY agent").all();
+    // T493: a project mailbox slot is not an agent; its counts and delivery rows stay out of the read model.
+    const unreadRows = db.prepare(`SELECT agent, COUNT(*) AS n FROM deliveries WHERE state <> 'acked' AND ${notSlot("agent")} GROUP BY agent`).all();
     const messages = db.prepare("SELECT id, thread, kind, from_addr, trust, ts, origin, json_extract(envelope, '$.meta.hop') AS hop FROM messages").all();
-    const deliveries = db.prepare("SELECT msg_id, agent, state, updated_at FROM deliveries").all();
+    const deliveries = db.prepare(`SELECT msg_id, agent, state, updated_at FROM deliveries WHERE ${notSlot("agent")}`).all();
     const byName = new Map();
     for (const row of localAgents)
         byName.set(row.name, row);
