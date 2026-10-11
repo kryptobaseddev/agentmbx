@@ -369,6 +369,7 @@ export function agentName(_cwd = process.cwd()): string | null {
 
 /** A mailbox that does not exist yet may not be the project folder or end in a harness id (T492). */
 export function reservedNewName(name: string, cwd: string): boolean {
+  // TODO(T493): also refuse when reservedByProjectMailbox(store, name) is true.
   const bare = basename(resolve(cwd));
   if (name === bare || name === bare.toLowerCase()) return true;
   return CLIS.some((cli) => name.endsWith(`-${cli}`));
