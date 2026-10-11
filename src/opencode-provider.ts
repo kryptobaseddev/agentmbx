@@ -66,6 +66,32 @@ export function opencodeProviderPid(pid: number, table: Map<number, { ppid: numb
   return null;
 }
 
+/** Test seam: production never reassigns it. */
+export const opencodeServeSeams: { exe: (pid: number) => string } = { exe: invokedExecutable };
+
+/**
+ * The TOPMOST opencode executable among `pid`'s ancestors (including `pid` itself), or null when there
+ * is none or the ancestry chain breaks before the walk finishes. Unlike `opencodeProviderPid` — which
+ * starts from a runtime and fails closed on any other executable — this walk skips arbitrary
+ * intermediates (tool shells, session hosts), because the caller proof compares the root computed from
+ * two ends of one session's process tree (T550): the descriptor's recorded parent_pid can sit anywhere
+ * in the MCP's branch — a raw intermediate when the runtime resolve found nothing, or the first
+ * opencode executable on that branch — so only the topmost opencode executable is stable on both sides.
+ * Bounded at 64 hops; a chain that never reaches pid 1 is treated as broken (fail closed).
+ */
+export function opencodeServeRoot(pid: number, table: Map<number, { ppid: number }> = procTable(),
+  exeOf: (pid: number) => string = opencodeServeSeams.exe): number | null {
+  let topmost: number | null = null;
+  for (let current = pid, n = 0; ; current = table.get(current)!.ppid, n++) {
+    if (current <= 1) return topmost; // launchd: the walk is complete
+    if (n >= 64) return null; // bounded; a chain this deep is not proof
+    const row = table.get(current);
+    if (!row) return null; // broken chain: fail closed
+    const name = basename(exeOf(current));
+    if (name === "opencode" || name === "opencode.exe") topmost = current;
+  }
+}
+
 // ---- service vs standalone host (T524) ---------------------------------------------------------
 // OpenCode 2.x runs sessions in two kinds of server process that share one opencode.db: the shared
 // `opencode serve --service` and the private `opencode serve --stdio --port 0` every
