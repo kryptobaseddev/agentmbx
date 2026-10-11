@@ -6,7 +6,6 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { MbxNode } from "../src/node.ts";
-import { opencodeHostOf } from "../src/opencode-provider.ts";
 
 const bin = join(import.meta.dirname, "../bin/agentmbx.js");
 test("OpenCode metadata isolates sessions, binds wake IDs, and scopes cleanup", async (t) => {
@@ -57,15 +56,9 @@ test("OpenCode metadata isolates sessions, binds wake IDs, and scopes cleanup", 
   assert.deepEqual(n.store.db.prepare("SELECT token FROM identity_leases WHERE name=?").get(bb.agent), prior);
   assert.equal(((await call("ses_beta", "mbx_whoami")).structuredContent as {agent:string;session:string}).session, bb.session);
   const invalid = await call("../bad", "mbx_whoami"); assert.equal(invalid.isError,true);
-  const holder = n.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE name=?").get(bb.agent) as { holder_pid: number };
-  const provider = JSON.parse(n.store.get(`mcp-provider:${holder.holder_pid}`)!) as { providerPid: number };
   const noMeta = await c.callTool({name:"mbx_whoami",arguments:{}});
-  if (opencodeHostOf(provider.providerPid) === "standalone") {
-    assert.equal(noMeta.isError, true, "several bound sessions in a standalone fixture are ambiguous");
-    assert.match(JSON.stringify(noMeta.content), /ambiguous OpenCode session/);
-  } else {
-    assert.equal((noMeta.structuredContent as { agent: string }).agent, "oc-test", "shared or unknown hosts retain their transport identity");
-  }
+  assert.equal(noMeta.isError, true, "metadata-free calls cannot use the transport's launch identity either");
+  assert.match(JSON.stringify(noMeta.content), /session metadata is required/);
   await c.close();
   const rows = n.store.db.prepare("SELECT session_id,session_key FROM sessions WHERE session_id LIKE 'ses_%'").all();
   assert.deepEqual(rows.map(r => r.session_id).sort(), ["ses_alpha", "ses_beta"], "the unbound conflicting session never bound"); assert.ok(rows.every(r=>r.session_key===null));

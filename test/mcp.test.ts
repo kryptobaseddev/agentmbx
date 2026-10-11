@@ -215,11 +215,12 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) for (const crash of [
     const home = mkdtempSync(join(tmpdir(), "mbx-resume-name-"));
     const n = new MbxNode(home, { host: "alpha" });
     const first = await client(home, "initial", { MBX_CLI: cli });
+    const meta = cli === "opencode" ? { "ai.opencode/sessionID": "ses_renamed" } : undefined;
     try {
       const providerPid = cli === "opencode" ? opencodeProviderPid(process.pid)! : process.pid;
       if (cli === "opencode") assert.equal(opencodeHostOf(providerPid), "standalone");
       n.bindSession({ agent: "initial", cli, session_id: cli === "opencode" ? "ses_renamed" : "real-thread", pid: providerPid, cwd: process.cwd() });
-      await first.c.callTool({ name: "mbx_whoami", arguments: { name: "chosen" } });
+      await first.c.callTool({ name: "mbx_whoami", arguments: { name: "chosen" }, _meta: meta });
       const id = n.send({ from: "sender", to: ["chosen"], subject: "mail before reconnect", body: "preserved" }).envelope.id;
       if (crash) {
         const closed = new Promise<void>((resolve) => { first.c.onclose = resolve; });
@@ -229,10 +230,10 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) for (const crash of [
       // No explicit MBX_AGENT override on restart: resume the verified session's chosen name.
       const next = await client(home, "", { MBX_CLI: cli });
       try {
-        const who = (await next.c.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent: string };
+        const who = (await next.c.callTool({ name: "mbx_whoami", arguments: {}, _meta: meta })).structuredContent as { agent: string };
         assert.equal(who.agent, "chosen");
-        assert.match(textOf(await next.c.callTool({ name: "mbx_inbox", arguments: {} })), /mail before reconnect/);
-        assert.equal((await next.c.callTool({ name: "mbx_ack", arguments: { ids: [id] } })).isError, undefined);
+        assert.match(textOf(await next.c.callTool({ name: "mbx_inbox", arguments: {}, _meta: meta })), /mail before reconnect/);
+        assert.equal((await next.c.callTool({ name: "mbx_ack", arguments: { ids: [id] }, _meta: meta })).isError, undefined);
         assert.equal(n.unreadCount("chosen"), 0);
         assert.equal(n.sessionsFor("chosen").length, 1);
       } finally { await next.c.close(); }
@@ -251,8 +252,9 @@ test("opencode: unknown host cannot resume a sole recorded mailbox without metad
     await first.c.close();
     const next = await client(home, "", { MBX_CLI: "opencode" });
     try {
-      const who = (await next.c.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent: string | null };
-      assert.equal(who.agent, null, "a generic provider cannot infer its caller from one recorded conversation");
+      const who = await next.c.callTool({ name: "mbx_whoami", arguments: {} });
+      assert.equal(who.isError, true, "a generic provider cannot infer its caller from one recorded conversation");
+      assert.match(textOf(who), /session metadata is required/);
       assert.equal((await next.c.callTool({ name: "mbx_read", arguments: { ids: [id] } })).isError, true);
       assert.equal(n.unreadCount("chosen"), 1, "refused reconnect never consumes another conversation's mail");
     } finally { await next.c.close(); }

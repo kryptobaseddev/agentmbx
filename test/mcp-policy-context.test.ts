@@ -8,7 +8,6 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { MbxNode } from "../src/node.ts";
 import { canonical, generateKeyPair, signData } from "../src/crypto.ts";
 import { acceptSigned, delegationNote, makePolicy } from "../src/policy.ts";
-import { opencodeHostOf } from "../src/opencode-provider.ts";
 
 const resultText = (r: unknown) => (r as { content: { type: string; text?: string }[] }).content.map(c => c.text ?? "").join("\n");
 
@@ -52,9 +51,10 @@ for (const cli of ["codex", "opencode", "claude", "kimi"]) test(`${cli} initiali
   const before = await who(); assert.equal(before.agent, "scoped"); assert.deepEqual(before.policies, []);
   const ownPolicy = grant(before.agent, "collaborate");
   assert.deepEqual((await who()).policies.map(p => p.id), [ownPolicy]);
-  const base = (await c.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { policies: { id: string }[] };
-  const holder = n.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE name='scoped'").get() as { holder_pid: number };
-  const provider = JSON.parse(n.store.get(`mcp-provider:${holder.holder_pid}`)!) as { providerPid: number };
-  const standalone = cli === "opencode" && opencodeHostOf(provider.providerPid) === "standalone";
-  assert.deepEqual(base.policies.map(p => p.id), [standalone ? ownPolicy : basePolicy]);
+  const result = await c.callTool({ name: "mbx_whoami", arguments: {} });
+  if (cli === "opencode") {
+    assert.equal(result.isError, true);
+    assert.match(resultText(result), /session metadata is required/);
+    assert.ok(!resultText(result).includes(basePolicy.slice(-6)) && !resultText(result).includes(ownPolicy.slice(-6)), "an unattributed caller sees no policy banner");
+  } else assert.deepEqual((result.structuredContent as { policies: { id: string }[] }).policies.map(p => p.id), [basePolicy]);
 });

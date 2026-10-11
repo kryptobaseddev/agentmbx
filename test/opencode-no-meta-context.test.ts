@@ -29,9 +29,8 @@ process.on('SIGINT', () => child.kill('SIGINT'));
   return new StdioClientTransport({ command: executable, args: [wrapper, host === "service" ? "--service" : "--stdio"], env });
 }
 
-// T516: an OpenCode MCP call that carries no session `_meta` must route by THIS process's bound session state, never
-// refuse against its own process. One bound state -> use it; several -> an explicit ambiguity naming the fix.
-test("T516: standalone no-_meta calls resolve to the single bound session, or fail explicitly when several are bound", async (t) => {
+// T516: a standalone host can have an unbound second tab even when only one session has called MBX.
+test("T516: standalone no-_meta calls never borrow one or several bound sessions", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-oc-nometa-"));
   const n = new MbxNode(home, { host: "alpha" });
   n.registerAgent("receiver"); // T205: sends need an existing recipient
@@ -41,27 +40,33 @@ test("T516: standalone no-_meta calls resolve to the single bound session, or fa
   await c.connect(transportFor(home, "standalone"));
   const call = (sid: string, name: string, args = {}) => c.callTool({ name, arguments: args, _meta: { sessionID: sid } });
 
-  // AC4-1: with exactly one bound session state, a no-_meta call acts as that session (same identity and session key).
+  const refused = async (name: string, args = {}) => {
+    const result = await c.callTool({ name, arguments: args });
+    assert.equal(result.isError, true, "no-meta calls have no proven session");
+    assert.match(textOf(result), /session metadata is required/);
+    assert.match(textOf(result), /_meta.*sessionID/);
+    assert.match(textOf(result), /codemode=false/);
+    assert.equal(result.structuredContent, undefined);
+  };
+  await refused("mbx_identity", { action: "register", name: "anonymous", role: "builder" });
+  assert.equal(n.store.db.prepare("SELECT name FROM agents WHERE name='anonymous'").get(), undefined);
   assert.notEqual((await call("ses_alpha", "mbx_identity", { action: "register", name: "alpha", role: "builder" })).isError, true);
   const viaMeta = await call("ses_alpha", "mbx_whoami");
   const aa = viaMeta.structuredContent as { agent: string; session: string };
   assert.equal(aa.agent, "alpha");
-  const noMetaWho = await c.callTool({ name: "mbx_whoami", arguments: {} });
-  assert.notEqual(noMetaWho.isError, true, textOf(noMetaWho));
-  const nmWho = noMetaWho.structuredContent as { agent: string; session: string };
-  assert.deepEqual([nmWho.agent, nmWho.session], [aa.agent, aa.session], "a no-_meta call in a single-session server acts as that session");
+  await refused("mbx_whoami");
   const id = n.send({ from: "sender", to: [aa.agent], subject: "single", body: "only bound session" }).envelope.id;
-  const noMetaRead = await c.callTool({ name: "mbx_read", arguments: { ids: [id] } });
-  assert.notEqual(noMetaRead.isError, true, textOf(noMetaRead));
+  const prior = n.store.db.prepare("SELECT token,heartbeat_at FROM identity_leases WHERE name='alpha'").get();
+  await refused("mbx_read", { ids: [id] });
+  await refused("mbx_ack", { ids: [id] });
+  await refused("mbx_inbox");
+  assert.deepEqual(n.store.db.prepare("SELECT token,heartbeat_at FROM identity_leases WHERE name='alpha'").get(), prior, "an unattributed call never touches the bound lease");
+  assert.equal(n.unreadCount("alpha"), 1, "no-meta read/ack leaves private mail untouched");
 
-  // AC4-2: with several bound sessions, a no-_meta call is an explicit ambiguity naming the fix, never a lease refusal.
+  // Binding a second session does not change the metadata requirement.
   assert.notEqual((await call("ses_beta", "mbx_identity", { action: "register", name: "beta", role: "builder" })).isError, true);
   assert.equal(((await call("ses_beta", "mbx_whoami")).structuredContent as { agent: string }).agent, "beta");
-  const ambiguous = await c.callTool({ name: "mbx_whoami", arguments: {} });
-  assert.equal(ambiguous.isError, true, "a no-_meta call with two bound sessions is an explicit ambiguity");
-  assert.match(textOf(ambiguous), /ambiguous OpenCode session/i);
-  assert.match(textOf(ambiguous), /Pass _meta.*sessionID/, "the ambiguity error names the _meta fix");
-  assert.doesNotMatch(textOf(ambiguous), /held by|lease refusal/i, "ambiguity never goes through a lease refusal");
+  await refused("mbx_whoami");
 
   // AC4-3: the ambiguity must not corrupt either session — every _meta call still sees only its own identity and mail.
   const a2 = (await call("ses_alpha", "mbx_whoami")).structuredContent as { agent: string };
@@ -127,12 +132,14 @@ for (const host of ["service", "unknown"] as const) test(`T516: ${host} host nev
   assert.equal(opencodeHostOf(record.providerPid), host, JSON.stringify([...processArgsTable([record.providerPid])].filter(([pid]) => pid === record.providerPid)));
   const mail = n.send({ from: "sender", to: ["alpha"], subject: "private alpha", body: "alpha only" }).envelope.id;
   const who = await c.callTool({ name: "mbx_whoami", arguments: {} });
-  assert.notEqual(who.isError, true, textOf(who));
-  assert.equal((who.structuredContent as { agent: string | null }).agent, null, "a no-meta caller stays on the unbound transport base");
+  assert.equal(who.isError, true);
+  assert.match(textOf(who), /session metadata is required/);
+  assert.equal(who.structuredContent, undefined, "no identity or counts leak");
   const read = await c.callTool({ name: "mbx_read", arguments: { ids: [mail] } });
   assert.equal(read.isError, true, "an unidentified caller cannot read the bound session's mail");
   const inbox = await c.callTool({ name: "mbx_inbox", arguments: {} });
-  assert.deepEqual((inbox.structuredContent as { messages: unknown[] }).messages, [], "no mailbox counts or subjects leak");
+  assert.equal(inbox.isError, true);
+  assert.equal(inbox.structuredContent, undefined, "no mailbox counts or subjects leak");
   const alpha = await c.callTool({ name: "mbx_read", arguments: { ids: [mail] }, _meta: meta });
   assert.notEqual(alpha.isError, true, textOf(alpha));
   assert.match(textOf(alpha), /alpha only/);

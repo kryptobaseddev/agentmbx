@@ -22,7 +22,7 @@ import { activityKey, holderProviderView, identityAvailability, parseActivity, p
 import { reviveMailbox } from "./identity-cleanup.ts";
 import { AUTO_NAME_RE, crossHostKey, linkedKey, noteProject, projectOf, registeredIdentity, registerIdentity, renameRegistration, ROLE_RE, sessionHint, UNSPECIFIED_ROLE } from "./registry.ts";
 import { applyIdentityTakeover, type IdentityTakeoverApproval } from "./identity-takeover.ts";
-import { opencodeHostOf, opencodeProviderPid } from "./opencode-provider.ts";
+import { opencodeProviderPid } from "./opencode-provider.ts";
 import { formatUnboundStart, listIdentityStatus } from "./identity-status.ts";
 import { consumeIdentityControl, identityControlAliases, identityControlKey, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl, type IdentityControlDescriptor } from "./identity-control.ts";
 import { alive, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
@@ -844,9 +844,8 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
     // session of this parent process, from a verified hook binding (exactly one) or a session hint. Hosted processes
     // serve many conversations and link by bind ticket; shared transports name sessions per call.
     if (state !== base || hosted) return null;
-    // A shared/unknown OpenCode host's sole recorded binding does not identify a no-meta caller.
-    // Otherwise returning base from contextFor could still borrow that session during retryResume.
-    if (env.cli === "opencode" && opencodeHostOf(env.harnessProvider) !== "standalone") return null;
+    // Standalone tabs share a transport too; a sole recorded binding is not caller attribution.
+    if (env.cli === "opencode") return null;
     const rows = (node.store.db.prepare("SELECT session_id,pid_start,updated_at FROM sessions WHERE cli=? AND pid=? AND session_id NOT GLOB 'mcp-*'").all(env.cli, env.ppid) as
       { session_id: string; pid_start: string | null; updated_at: string }[]).filter(r => node.sameSession(env.ppid, r, { proof: true }));
     const real = new Set(rows.map(r => r.session_id));
@@ -940,16 +939,11 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
     // Codex threadId is the resumable thread. Its sessionId is a distinct execution ID.
     const sid = env.cli === "codex" ? meta?.threadId : namespaced !== undefined ? namespaced : documented;
     if (sid === undefined) {
-      // T516: only a standalone host may use its bound session without metadata. A shared service or unknown
-      // host cannot identify the caller this way: an unbound session could otherwise borrow another session's mail.
-      if (env.cli === "opencode" && opencodeHostOf(env.harnessProvider) === "standalone") {
-        const boundSessions = [...states.values()].filter((s) => bound(s));
-        if (boundSessions.length === 1) return boundSessions[0];
-        if (boundSessions.length > 1)
-          throw Object.assign(new Error(`ambiguous OpenCode session: ${boundSessions.length} bound session states in this process and the call carries no session _meta. `
-            + 'Pass _meta {"sessionID":"<ses_id>"} (or {"ai.opencode/sessionID":"<ses_id>"}) so the call routes to its session.'), { code: "OPENCODE_SESSION_AMBIGUOUS" });
-      }
-      return base; // no session state (or none bound): non-session calls use the transport's own (launch-configured) identity
+      if (env.cli === "opencode")
+        throw Object.assign(new Error('OpenCode session metadata is required; this transport may serve multiple conversations. '
+          + 'Pass _meta {"ai.opencode/sessionID":"<ses_id>"} (or {"sessionID":"<ses_id>"}). '
+          + 'If Code Mode omits it, use native tools (mcp.servers.mbx.codemode=false) or upgrade OpenCode to 2.0.26 or newer.'), { code: "OPENCODE_SESSION_REQUIRED" });
+      return base;
     }
     const valid = env.cli === "codex" ? /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i : /^ses_[a-zA-Z0-9]{1,128}$/;
     if (typeof sid !== "string" || !valid.test(sid)) throw new Error(`Invalid ${env.cli} session identity metadata`);
