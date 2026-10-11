@@ -26,6 +26,7 @@ import { opencodeProviderPid } from "./opencode-provider.js";
 import { formatUnboundStart, listIdentityStatus } from "./identity-status.js";
 import { consumeIdentityControl, identityControlAliases, identityControlKey, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl } from "./identity-control.js";
 import { alive, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
+import { setSessionPresence } from "./presence.js";
 import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy.js";
 import { assertKnownRecipients, deliveryReceipts, offlineWarnings, receiptLine, recipientReceipts, sentPage } from "./receipts.js";
 import { forwardMessage, ledgerPage, projectLeadView } from "./project-ledger.js";
@@ -1362,7 +1363,7 @@ async function configureMcp(server, node, startupClosed) {
         missed: missedCount(node.store, agent).missed,
         open_threads: Number(node.store.db.prepare("SELECT COUNT(DISTINCT m.thread) n FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state<>'acked'").get(agent).n),
         recent_notes: node.store.db.prepare("SELECT msg_id,note,updated_at FROM deliveries WHERE agent=? AND note IS NOT NULL ORDER BY updated_at DESC LIMIT 3").all(agent) });
-    const identityOperation = ({ action, name, role, description, all, approval, target: controlTarget }) => {
+    const identityOperation = ({ action, name, role, description, task, lane, all, approval, target: controlTarget }) => {
         const state = current();
         if (action === "takeover") {
             if (!name || !approval || approval.payload.name !== name || !controlTarget)
@@ -1374,8 +1375,8 @@ async function configureMcp(server, node, startupClosed) {
                 throw new Error("takeover destination process evidence is unavailable");
             return applyIdentityTakeover(node, leases, approval, descriptor, () => identityOperation({ action: "claim", name }));
         }
-        if (action !== "claim" && action !== "register" && (name || role || description))
-            throw new Error("name, role and description are only valid for claim and register");
+        if (action !== "claim" && action !== "register" && (name || role || description || task || lane))
+            throw new Error("name, role, description, task and lane are only valid for claim and register");
         if (action === "list") {
             const result = listIdentityStatus(node.home, { project: all ? undefined : project, caller: { cli: env.cli, sessionId: state.sessionId, pid: process.pid, providerPid: env.ppid, canonicalHarness: !!env.harnessProvider } });
             const out = { ...result, you: bound(state) ? { agent: state.agent, address: `${state.agent}@${node.host}`, ...(state.coUse ? { co_use: CO_USE_NOTE } : {}) }
@@ -1440,6 +1441,8 @@ async function configureMcp(server, node, startupClosed) {
                         throw Object.assign(new Error("release your current identity before claiming another; use mbx_whoami to rename it"), { code: "IDENTITY_RELEASE_REQUIRED" });
                     if (role || description)
                         registerIdentity(node.store, { name: target, role: role ?? registration?.role ?? UNSPECIFIED_ROLE, description, by: `${env.cli}:${state.sessionId}` });
+                    if (task || lane)
+                        setSessionPresence(node, { cli: env.cli, sessionId: state.sessionId, ...(task ? { task } : {}), ...(lane ? { lane } : {}) });
                     const result = handoff(state.agent);
                     return text(JSON.stringify(result, null, 2), result);
                 });
@@ -1459,6 +1462,8 @@ async function configureMcp(server, node, startupClosed) {
                 if (role || description || inheritedRole)
                     registerIdentity(node.store, { name: target, role: role ?? registration?.role ?? inheritedRole ?? UNSPECIFIED_ROLE, description, by: `${env.cli}:${next.sessionId}` });
                 node.registerAgent(target, { cli: env.cli, ...(role ? { role } : {}), ...(description ? { description } : {}) });
+                if (task || lane)
+                    setSessionPresence(node, { cli: env.cli, sessionId: next.sessionId, ...(task ? { task } : {}), ...(lane ? { lane } : {}) });
                 return handoff(next.agent);
             }));
         }
@@ -1483,6 +1488,8 @@ async function configureMcp(server, node, startupClosed) {
             name: z.string().regex(NAME_RE).optional().describe("identity to claim or register, e.g. agentmbx-reviewer"),
             role: z.string().regex(ROLE_RE).optional().describe("short role label, e.g. lead, reviewer, builder (required to register)"),
             description: z.string().max(200).optional().describe("what this agent does, at most 200 characters"),
+            task: z.string().regex(/^T\d+$/).optional().describe("CLEO task this session is on, e.g. T497"),
+            lane: z.string().regex(ROLE_RE).optional().describe("swim lane, a short label such as the CLEO phase"),
             all: z.boolean().optional().describe("list: every identity on this host instead of this project's") },
         annotations: { destructiveHint: false },
     }, identityOperation);
@@ -1629,7 +1636,7 @@ async function configureMcp(server, node, startupClosed) {
     });
     server.registerTool("mbx_send", {
         title: "Send an mbx message",
-        description: "Start a new conversation with other agents (to answer a message, use mbx_reply instead). `to` accepts agent names (vida-dev), agent@host (vida-dev@fedora), role:<role>, lead and role:lead (the owner-designated lead of this session's project; refused when that project has none), * (everyone), or owner; find names with mbx_agents. Kind decides waking: request/task/decision/alert wake an idle recipient; message/reply wake only with needs_reply=true or an @mention; status NEVER wakes (it waits for the recipient's next prompt). Use kind=request/task with needs_reply=true when you need an answer. A successful send is acceptance, not recipient delivery, reply or task completion; queued transport retry is not a draft API. Avoid manually resending an uncertain send. The result's recipients[] says per recipient: live-wake (eligible for wake; dispatcher admission pending), live-next-prompt (seen on its next prompt), offline (no live session; it waits), forwarded (renamed mailbox) or remote (queued for a paired host). A name that never existed on this host is refused with suggestions. Next: check mbx_inbox for answers.",
+        description: "Start a new conversation with other agents (to answer a message, use mbx_reply instead). `to` accepts agent names (vida-dev), agent@host (vida-dev@fedora), role:<role>, task:T123 (every live persona on that CLEO task), lead and role:lead (the owner-designated lead of this session's project; refused when that project has none), * (everyone), or owner; find names with mbx_agents. Kind decides waking: request/task/decision/alert wake an idle recipient; message/reply wake only with needs_reply=true or an @mention; status NEVER wakes (it waits for the recipient's next prompt). Use kind=request/task with needs_reply=true when you need an answer. A successful send is acceptance, not recipient delivery, reply or task completion; queued transport retry is not a draft API. Avoid manually resending an uncertain send. The result's recipients[] says per recipient: live-wake (eligible for wake; dispatcher admission pending), live-next-prompt (seen on its next prompt), offline (no live session; it waits), forwarded (renamed mailbox) or remote (queued for a paired host). A name that never existed on this host is refused with suggestions. Next: check mbx_inbox for answers.",
         inputSchema: {
             to: z.array(z.string().min(1)).min(1).max(20), subject: z.string().min(1).max(200), body: z.string().max(256 * 1024),
             kind: z.enum(KINDS).default("message").describe("request/task/decision/alert wake the recipient; message/reply wake only with needs_reply or an @mention; status never wakes"),
@@ -1765,7 +1772,7 @@ async function configureMcp(server, node, startupClosed) {
     });
     server.registerTool("mbx_agents", {
         title: "List mbx agents",
-        description: "Who you can reach, and whether they are really there. state is live (a verified session holds it), idle (a shared-process conversation quiet for 10 minutes), unknown (a holder exists but could not be verified right now), offline, or remote (listed by a paired host; this host cannot verify it). Each row shows role, the harness holding it, its projects and lead_of (the projects it is the owner-designated lead of). Default: this session's project plus the leads of other projects, plus any live or idle persona whose session works in this folder (seen_here: true; visibility only, it does not make the persona a member); project:\"*\" lists every project. Retired and generated names are hidden unless they are live or idle; all:true lists them. Next: address one with mbx_send (name, name@host or role:<role>).",
+        description: "Who you can reach, and whether they are really there. state is live (a verified session holds it), idle (a shared-process conversation quiet for 10 minutes), unknown (a holder exists but could not be verified right now), offline, or remote (listed by a paired host; this host cannot verify it). Each row shows role, task and lane when this host's live session recorded them, the harness holding it, its projects and lead_of (the projects it is the owner-designated lead of). Default: this session's project plus the leads of other projects, plus any live or idle persona whose session works in this folder (seen_here: true; visibility only, it does not make the persona a member); project:\"*\" lists every project. Retired and generated names are hidden unless they are live or idle; all:true lists them. Next: address one with mbx_send (name, name@host, role:<role> or task:<id>).",
         inputSchema: {
             project: z.string().max(1024).optional().describe("\"*\" for every project, or this session's own folder (the default view)"),
             all: z.boolean().optional().describe("also list retired and generated names"),

@@ -38,6 +38,7 @@ import { dispatchWakes, hasWakeAuthority, humanPromptKey, inboxCommand, isHumanP
 import { kimiMultiHost } from "./kimi-web.ts";
 import { bindInstruction, issueBindTicket } from "./bind-ticket.ts";
 import { activityKey } from "./identity-availability.ts";
+import { fillCleoPresence } from "./cleo-presence.ts";
 import { identityLeaseStatus, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
 import { AUTO_NAME_RE, identityProjects, linkedKey, projectOf, recordSessionHint, registeredIdentity, removeStaleProjectBindings, staleProjectBindings } from "./registry.ts";
 import { applyForward, buildForward, pruneCandidates, retireMailbox } from "./identity-cleanup.ts";
@@ -1399,6 +1400,7 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
         const row = node.store.db.prepare("SELECT agent,session_key FROM sessions WHERE cli=? AND session_id=?").get(cli, sid);
         if (bound !== agent || !row?.session_key || fingerprint(row.session_key as string) !== descriptor.control_key)
           throw new Error("hook binding does not match the current lease");
+        if (event === "session-start") fillCleoPresence(node, { cli, sessionId: sid, cwd });
         if (source) node.store.db.prepare("DELETE FROM sessions WHERE cli=? AND pid=? AND session_key=? AND session_id<>?")
           .run(cli, process.ppid, source.session_key!, sid);
         publishIdentityControl(node.store, { ...descriptor, session_id: sid });

@@ -249,7 +249,7 @@ export function capsNeeded(e: Envelope): string[] {
   else if (e.kind === "decision") need.push("decision");
   else if (e.kind === "alert") need.push("alert");
   else need.push(`kind:${e.kind}`); // status/message/reply never carry owner authority
-  if (e.to.some((t) => t === "*" || t.startsWith("role:"))) need.push("broadcast");
+  if (e.to.some((t) => t === "*" || t.startsWith("role:") || t.startsWith("task:"))) need.push("broadcast");
   return need;
 }
 

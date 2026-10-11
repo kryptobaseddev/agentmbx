@@ -1,0 +1,62 @@
+// Session start fills task and lane from CLEO when it is present (T497). A session without CLEO is left unchanged,
+// and a failure here never fails the hook.
+import { execFileSync, spawnSync } from "node:child_process";
+import { setSessionPresence, TASK_RE } from "./presence.js";
+import { ROLE_RE } from "./registry.js";
+const CLEO_BUDGET_MS = 1500;
+/** The task id inside `cleo current`'s `data.currentTask`, a string or `{id}`. */
+export function taskIdOf(value) {
+    if (typeof value === "string" && TASK_RE.test(value))
+        return value;
+    if (value && typeof value === "object" && "id" in value) {
+        const id = value.id;
+        if (typeof id === "string" && TASK_RE.test(id))
+            return id;
+    }
+    return undefined;
+}
+function defaultWhich(bin) {
+    try {
+        const found = execFileSync("/usr/bin/which", [bin], { encoding: "utf8" }).trim();
+        return found || null;
+    }
+    catch {
+        return null;
+    }
+}
+function readCleo(bin, cwd, env) {
+    try {
+        const r = spawnSync(bin, ["current"], { cwd, env, encoding: "utf8", timeout: CLEO_BUDGET_MS });
+        if (r.status !== 0 || !r.stdout)
+            return null;
+        const parsed = JSON.parse(r.stdout);
+        return parsed.data ?? null;
+    }
+    catch {
+        return null;
+    }
+}
+/** Write this session's task and lane. `CLEO_TASK_ID` wins and does not spawn cleo. Otherwise `cleo current`. */
+export function fillCleoPresence(node, s) {
+    try {
+        const env = s.env ?? process.env;
+        const fromEnv = env.CLEO_TASK_ID;
+        if (typeof fromEnv === "string" && TASK_RE.test(fromEnv)) {
+            setSessionPresence(node, { cli: s.cli, sessionId: s.sessionId, task: fromEnv });
+            return;
+        }
+        const which = s.which ?? defaultWhich;
+        if (!which("cleo"))
+            return;
+        const data = (s.current ?? ((cwd, e) => { const bin = which("cleo"); return bin ? readCleo(bin, cwd, e) : null; }))(s.cwd, env);
+        if (!data)
+            return;
+        const task = taskIdOf(data.currentTask);
+        const phase = typeof data.currentPhase === "string" ? data.currentPhase : "";
+        const lane = phase && ROLE_RE.test(phase) ? phase : undefined;
+        if (!task && !lane)
+            return;
+        setSessionPresence(node, { cli: s.cli, sessionId: s.sessionId, ...(task ? { task } : {}), ...(lane ? { lane } : {}) });
+    }
+    catch { /* CLEO is optional */ }
+}

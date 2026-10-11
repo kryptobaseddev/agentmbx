@@ -37,6 +37,7 @@ import { dispatchWakes, hasWakeAuthority, humanPromptKey, inboxCommand, isHumanP
 import { kimiMultiHost } from "./kimi-web.js";
 import { bindInstruction, issueBindTicket } from "./bind-ticket.js";
 import { activityKey } from "./identity-availability.js";
+import { fillCleoPresence } from "./cleo-presence.js";
 import { identityLeaseStatus, inspectLeaseProcess } from "./identity-leases.js";
 import { AUTO_NAME_RE, identityProjects, linkedKey, projectOf, recordSessionHint, registeredIdentity, removeStaleProjectBindings, staleProjectBindings } from "./registry.js";
 import { applyForward, buildForward, pruneCandidates, retireMailbox } from "./identity-cleanup.js";
@@ -1720,6 +1721,8 @@ async function hook(node, event, cli) {
                 const row = node.store.db.prepare("SELECT agent,session_key FROM sessions WHERE cli=? AND session_id=?").get(cli, sid);
                 if (bound !== agent || !row?.session_key || fingerprint(row.session_key) !== descriptor.control_key)
                     throw new Error("hook binding does not match the current lease");
+                if (event === "session-start")
+                    fillCleoPresence(node, { cli, sessionId: sid, cwd });
                 if (source)
                     node.store.db.prepare("DELETE FROM sessions WHERE cli=? AND pid=? AND session_key=? AND session_id<>?")
                         .run(cli, process.ppid, source.session_key, sid);

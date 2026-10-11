@@ -137,9 +137,10 @@ CREATE TABLE IF NOT EXISTS pair_tokens (  -- one-time pairing tokens (agentmbx p
  * (an old MCP server still running after an upgrade) refuses to write instead of failing with raw SQL errors.
  */
 export const SCHEMA_VERSION = 3;
-// agents.state/harness/project_keys are additive (T546). They stay on schema version 3, same as peers.enc_pub:
-// an older reader ignores the columns, and a version bump would make that reader refuse the store.
-const SCHEMA_COLUMNS = [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"], ["agents", "state"], ["agents", "harness"], ["agents", "project_keys"]];
+// Additive columns on version 3. A missing one is added on open; user_version stays 3.
+// sessions.task and sessions.lane are the live session's CLEO task and phase (T497).
+// agents.state, agents.harness and agents.project_keys are the signed directory (T546).
+const SCHEMA_COLUMNS = [["sessions", "pid_start"], ["sessions", "task"], ["sessions", "lane"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"], ["agents", "state"], ["agents", "harness"], ["agents", "project_keys"]];
 const SCHEMA_OBJECTS = [...SCHEMA.matchAll(/CREATE\s+(?:VIRTUAL\s+)?(?:TABLE|INDEX|TRIGGER)\s+IF NOT EXISTS\s+(\w+)/g)].map(match => match[1]);
 const SCHEMA_DEFINITION = createHash("sha256").update(SCHEMA).update(JSON.stringify(SCHEMA_COLUMNS)).digest("hex");
 const opening = new AsyncLocalStorage();
