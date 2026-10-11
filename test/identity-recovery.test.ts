@@ -138,7 +138,12 @@ test("stale recovery cannot take over or release a successor, or erase its sessi
   t.after(async () => { await client.close(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, MBX_HOME: home, MBX_AGENT: "reader", MBX_CLI: "claude", AGENTMBX_DEV: "1" } as Record<string, string> }));
-  node.store.db.prepare("UPDATE identity_leases SET heartbeat_at=0 WHERE name='reader'").run();
+  // connect returns before the spawned MCP has written the reader lease. Wait for that write, then stale it.
+  const started = await client.callTool({ name: "mbx_whoami", arguments: {} });
+  assert.notEqual(started.isError, true, JSON.stringify(started));
+  assert.equal((started.structuredContent as { agent?: string }).agent, "reader");
+  const zeroed = node.store.db.prepare("UPDATE identity_leases SET heartbeat_at=0 WHERE name='reader'").run();
+  assert.equal(zeroed.changes, 1);
   const next = new IdentityLeases(node.store).claim("reader", { pid: process.pid, start: inspectLeaseProcess(process.pid).start!, keyFp: "aaaa-bbbb-cccc-dddd", cli: "claude", sessionId: "successor" });
   node.bindSession({ agent: "reader", cli: "claude", session_id: "successor", pid: process.pid, session_key: "successor-key" });
   const result = await client.callTool({ name: "mbx_identity", arguments: { action: "claim", name: "reader" } });
