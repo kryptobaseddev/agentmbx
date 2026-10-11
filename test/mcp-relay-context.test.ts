@@ -51,11 +51,13 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: unrelat
   writeFileSync(preload, `import {readFileSync} from 'node:fs'; Date.now = () => Number(readFileSync(${JSON.stringify(clock)}, 'utf8'));`);
   await c.connect(new StdioClientTransport({ command: process.execPath, args: ["--import", preload, join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, AGENTMBX_DEV: "1", MBX_IDENTITY_IDLE_TTL_MS: "10800000", MBX_HOME: home, MBX_CLI: cli, MBX_AGENT: "reader", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
+  const meta = cli === "opencode" ? { "ai.opencode/sessionID": "ses_relayDepth" } : undefined;
+  if (meta) assert.notEqual((await c.callTool({ name: "mbx_identity", arguments: { action: "claim", name: "reader" }, _meta: meta })).isError, true);
   const old = n.send({ from: "sender", to: ["reader"], subject: "old context", body: "data", hop: 65, origin: "external" }).envelope;
   const fresh = n.send({ from: "sender", to: ["reader"], subject: "unrelated", body: "data" }).envelope;
-  const read = async (id: string) => assert.notEqual((await c.callTool({ name: "mbx_read", arguments: { ids: [id] } })).isError, true);
+  const read = async (id: string) => assert.notEqual((await c.callTool({ name: "mbx_read", arguments: { ids: [id] }, _meta: meta })).isError, true);
   const send = async (to: string[]) => {
-    const result = await c.callTool({ name: "mbx_send", arguments: { to, subject: "new work", body: "direct message" } });
+    const result = await c.callTool({ name: "mbx_send", arguments: { to, subject: "new work", body: "direct message" }, _meta: meta });
     assert.notEqual(result.isError, true);
     return JSON.parse(n.message((result.structuredContent as { id: string }).id)!.envelope);
   };
@@ -79,12 +81,12 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: unrelat
   }
   // Explicit replies re-read their parent; expiry must not erase actual reply provenance. Forwarding the old thread to
   // someone else keeps its depth; answering its own sender does not relay it (T104), but external origin stays.
-  const fwd = await c.callTool({ name: "mbx_send", arguments: { to: ["one"], subject: "fwd", body: "fwd", reply_to: old.id } });
+  const fwd = await c.callTool({ name: "mbx_send", arguments: { to: ["one"], subject: "fwd", body: "fwd", reply_to: old.id }, _meta: meta });
   assert.notEqual(fwd.isError, true);
   const forwarded = JSON.parse(n.message((fwd.structuredContent as { id: string }).id)!.envelope);
   assert.equal(forwarded.meta.hop, 66);
   assert.equal(forwarded.meta.origin, "external");
-  const reply = await c.callTool({ name: "mbx_reply", arguments: { id: old.id, body: "reply" } });
+  const reply = await c.callTool({ name: "mbx_reply", arguments: { id: old.id, body: "reply" }, _meta: meta });
   assert.notEqual(reply.isError, true);
   const replied = JSON.parse(n.message((reply.structuredContent as { id: string }).id)!.envelope);
   assert.equal(replied.meta.hop ?? 0, 0);
@@ -104,14 +106,16 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: maximum
   t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await c.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: cli, MBX_AGENT: "reader", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
+  const meta = cli === "opencode" ? { "ai.opencode/sessionID": "ses_relayCap" } : undefined;
+  if (meta) assert.notEqual((await c.callTool({ name: "mbx_identity", arguments: { action: "claim", name: "reader" }, _meta: meta })).isError, true);
   const parent = n.send({ from: "sender", to: ["reader"], subject: "max depth", body: "data", hop: 1000, origin: "external" }).envelope;
   assert.equal(checkShape(parent), null);
-  assert.notEqual((await c.callTool({ name: "mbx_read", arguments: { ids: [parent.id] } })).isError, true);
+  assert.notEqual((await c.callTool({ name: "mbx_read", arguments: { ids: [parent.id] }, _meta: meta })).isError, true);
   for (const request of [
     { name: "mbx_send", arguments: { to: ["receiver"], subject: "new thread", body: "data" } },
     { name: "mbx_send", arguments: { to: ["receiver"], subject: "reply", body: "data", reply_to: parent.id } },
   ]) {
-    const result = await c.callTool(request);
+    const result = await c.callTool({ ...request, _meta: meta });
     assert.notEqual(result.isError, true);
     const row = n.message((result.structuredContent as { id: string }).id)!;
     const envelope = JSON.parse(row.envelope);
@@ -125,7 +129,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: maximum
       "an unlimited collaborate grant has no relay brake warning");
   }
   // answering the deep message's own sender is a conversation, not a relay: no depth, but external origin stays
-  const answer = await c.callTool({ name: "mbx_reply", arguments: { id: parent.id, body: "data" } });
+  const answer = await c.callTool({ name: "mbx_reply", arguments: { id: parent.id, body: "data" }, _meta: meta });
   const answered = JSON.parse(n.message((answer.structuredContent as { id: string }).id)!.envelope);
   assert.equal(answered.meta.hop ?? 0, 0); assert.equal(answered.meta.origin, "external");
 });

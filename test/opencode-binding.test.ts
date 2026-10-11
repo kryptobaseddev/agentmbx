@@ -56,8 +56,9 @@ test("OpenCode metadata isolates sessions, binds wake IDs, and scopes cleanup", 
   assert.deepEqual(n.store.db.prepare("SELECT token FROM identity_leases WHERE name=?").get(bb.agent), prior);
   assert.equal(((await call("ses_beta", "mbx_whoami")).structuredContent as {agent:string;session:string}).session, bb.session);
   const invalid = await call("../bad", "mbx_whoami"); assert.equal(invalid.isError,true);
-  const fallback = (await c.callTool({name:"mbx_whoami",arguments:{}})).structuredContent as {agent:string};
-  assert.equal(fallback.agent, "oc-test", "calls without session metadata use the transport's launch identity");
+  const noMeta = await c.callTool({name:"mbx_whoami",arguments:{}});
+  assert.equal(noMeta.isError, true, "metadata-free calls cannot use the transport's launch identity either");
+  assert.match(JSON.stringify(noMeta.content), /session metadata is required/);
   await c.close();
   const rows = n.store.db.prepare("SELECT session_id,session_key FROM sessions WHERE session_id LIKE 'ses_%'").all();
   assert.deepEqual(rows.map(r => r.session_id).sort(), ["ses_alpha", "ses_beta"], "the unbound conflicting session never bound"); assert.ok(rows.every(r=>r.session_key===null));

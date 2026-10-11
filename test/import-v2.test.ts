@@ -26,10 +26,12 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} v2 impor
     const client = new Client({ name: "import-test", version: "1" }); clients.push(client);
     await client.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
       env: { ...process.env, MBX_HOME: home, MBX_AGENT: name, MBX_CLI: cli, AGENTMBX_DEV: "1" } as Record<string,string> }));
-    const me = (await client.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent: string };
+    const meta = cli === "opencode" ? { sessionID: "ses_import" + name } : undefined;
+    if (meta) assert.notEqual((await client.callTool({ name: "mbx_identity", arguments: { action: "claim", name }, _meta: meta })).isError, true);
+    const me = (await client.callTool({ name: "mbx_whoami", arguments: {}, _meta: meta })).structuredContent as { agent: string };
     assert.equal(me.agent, name);
-    const sid = n.sessionsFor(name)[0].session_id;
-    return { client, selected: ["--cli", cli, "--session", sid, "--as", name] };
+    const sid = meta?.sessionID ?? n.sessionsFor(name)[0].session_id;
+    return { client, meta, selected: ["--cli", cli, "--session", sid, "--as", name] };
   };
   const reader = await holder("reader"), other = await holder("other");
   assert.equal(run().status, 1, "shared parent cannot select an importer implicitly");
@@ -50,6 +52,6 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} v2 impor
   const conflict = run(...reader.selected); assert.equal(conflict.status, 1); assert.match(conflict.stderr, /conflicts with stored content/);
   assert.equal(n.message("v2-00"), undefined, "earlier inserts roll back with a later conflict");
   assert.equal(n.message("v2-b")?.subject, "b");
-  assert.notEqual((await reader.client.callTool({ name: "mbx_identity", arguments: { action: "release" } })).isError, true);
+  assert.notEqual((await reader.client.callTool({ name: "mbx_identity", arguments: { action: "release" }, _meta: reader.meta })).isError, true);
   assert.equal(run(...reader.selected).status, 1); assert.equal(n.message("v2-00"), undefined);
 });

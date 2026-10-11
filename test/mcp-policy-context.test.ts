@@ -51,6 +51,10 @@ for (const cli of ["codex", "opencode", "claude", "kimi"]) test(`${cli} initiali
   const before = await who(); assert.equal(before.agent, "scoped"); assert.deepEqual(before.policies, []);
   const ownPolicy = grant(before.agent, "collaborate");
   assert.deepEqual((await who()).policies.map(p => p.id), [ownPolicy]);
-  const base = (await c.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { policies: { id: string }[] };
-  assert.deepEqual(base.policies.map(p => p.id), [basePolicy]);
+  const result = await c.callTool({ name: "mbx_whoami", arguments: {} });
+  if (cli === "opencode") {
+    assert.equal(result.isError, true);
+    assert.match(resultText(result), /session metadata is required/);
+    assert.ok(!resultText(result).includes(basePolicy.slice(-6)) && !resultText(result).includes(ownPolicy.slice(-6)), "an unattributed caller sees no policy banner");
+  } else assert.deepEqual((result.structuredContent as { policies: { id: string }[] }).policies.map(p => p.id), [basePolicy]);
 });
