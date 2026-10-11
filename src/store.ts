@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS outbox (       -- envelopes waiting to reach a paired
   last_error TEXT, created_at TEXT NOT NULL, PRIMARY KEY (msg_id, host));
 CREATE TABLE IF NOT EXISTS agents (       -- agents known on this host and on paired hosts
   name TEXT NOT NULL, host TEXT NOT NULL, role TEXT, cli TEXT, description TEXT, last_seen TEXT,
+  state TEXT, harness TEXT, project_keys TEXT, -- verified directory cache (T546); null means unverified
   PRIMARY KEY (name, host));
 CREATE TABLE IF NOT EXISTS sessions (     -- live CLI sessions bound to local agents (for wake-up)
   agent TEXT NOT NULL, cli TEXT NOT NULL, session_id TEXT NOT NULL, cwd TEXT, pid INTEGER,
@@ -142,7 +143,11 @@ CREATE TABLE IF NOT EXISTS pair_tokens (  -- one-time pairing tokens (agentmbx p
  */
 export const SCHEMA_VERSION = 3;
 
-const SCHEMA_COLUMNS = [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"]] as const;
+// agents.state/harness/project_keys are additive (T546). They stay on schema version 3, same as peers.enc_pub:
+// an older reader ignores the columns, and a version bump would make that reader refuse the store.
+const SCHEMA_COLUMNS = [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"], ["agents", "state"], ["agents", "harness"], ["agents", "project_keys"],
+  // T543: the CLEO-id key of the folder, derived locally and never signed; NULL when the folder has no id (then the folder is the key).
+  ["identity_projects", "project_key"], ["project_leads", "project_key"]] as const;
 const SCHEMA_OBJECTS = [...SCHEMA.matchAll(/CREATE\s+(?:VIRTUAL\s+)?(?:TABLE|INDEX|TRIGGER)\s+IF NOT EXISTS\s+(\w+)/g)].map(match => match[1]);
 const SCHEMA_DEFINITION = createHash("sha256").update(SCHEMA).update(JSON.stringify(SCHEMA_COLUMNS)).digest("hex");
 const opening = new AsyncLocalStorage<{ busyTimeoutMs: number; stores: Store[] }>();
