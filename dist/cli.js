@@ -49,6 +49,7 @@ import { formatUnboundStart, listIdentityStatus } from "./identity-status.js";
 import { REBINDING_CLIS, withCliIdentity, withHookIdentity } from "./cli-identity.js";
 import { declaredOriginWarning, readSessionTaint, refuseAgentOrigin, taintSendWarning } from "./session-taint.js";
 import { runProbe, storeProbeIO } from "./probe.js";
+import { resolveProject } from "./project-key.js";
 import { DEFAULT_LOGIN_BASE_URL, defaultLoginIO, parseLoginBase, runLogin } from "./login.js";
 import { buildIdentityTakeover } from "./identity-takeover.js";
 import { publishIdentityControl, findIdentityControl, identityControlReceipt, resolveIdentityControlReceipt, submitIdentityControl } from "./identity-control.js";
@@ -1418,12 +1419,15 @@ async function lead(node, pos, str, o) {
     const dir = str("project") ?? (Array.isArray(o.project) ? o.project[0] : undefined); // --project is a multiple option
     const project = dir ? (projectOf(resolve(dir)) ?? die(`${dir} is the home folder or /, not a project`)) : undefined;
     if (sub === "show") {
-        const rows = node.store.db.prepare("SELECT DISTINCT project FROM project_leads" + (project ? " WHERE project=?" : "")).all(...(project ? [project] : []));
+        // A record covers its folder and every other checkout of the same CLEO project (T543): show the key and those folders.
+        const key = project ? resolveProject(project).key : undefined;
+        const rows = node.store.db.prepare("SELECT project, MAX(project_key) AS project_key FROM project_leads" + (project ? " WHERE project=? OR project_key=?" : "") + " GROUP BY project").all(...(project ? [project, key] : []));
         if (!rows.length)
             return console.log(project ? `no lead for ${project}` : "no project leads");
         for (const r of rows) {
             const l = activeLead(node, r.project);
-            console.log(`${r.project}\t${l ? `${l.agent}@${l.host} until ${l.exp} (id ${l.id})` : "none (expired or revoked)"}`);
+            const also = r.project_key ? node.store.db.prepare("SELECT DISTINCT project FROM identity_projects WHERE project_key=? AND project<>?").all(r.project_key, r.project).map((x) => x.project) : [];
+            console.log(`${r.project}\t${l ? `${l.agent}@${l.host} until ${l.exp} (id ${l.id})` : "none (expired or revoked)"}\tkey ${r.project_key ? `${r.project_key} (CLEO project id)` : "folder path"}${also.length ? `\talso covers ${also.join(", ")}` : ""}`);
         }
         return;
     }
