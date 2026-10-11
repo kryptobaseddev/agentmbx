@@ -1,6 +1,6 @@
 // `agentmbx doctor`: one checklist that says what works, what doesn't, and the one command that fixes it.
 import { rotationLog } from "./key-rotation.js";
-import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { escalatedCount, phantomMailboxes, returnDays } from "./stranded.js";
 import { delimiter, dirname, join } from "node:path";
 import { fingerprint } from "./crypto.js";
@@ -26,6 +26,7 @@ import { providerLabel, sameLiveProvider } from "./identity-takeover.js";
 import { conversationLoopLabel, detectConversationLoops } from "./loop-detector.js";
 import { opencodeDuplicateLoopChecks } from "./opencode-duplicate-loop.js";
 import { mbxProcessInventory, mcpOrphanCheck } from "./mcp-lifecycle.js";
+import { HUD_ALIVE_MAX_MS, hudAlivePath, hudSessionV2Path } from "./hud.js";
 /** --processes observes only the process inventory; it never initializes or repairs the host. */
 export function processChecks(home) {
     const inventory = mbxProcessInventory(home);
@@ -458,6 +459,121 @@ export async function opencodeServiceCheck(node, service = opencodeService, host
         fix: unwakeable ? `run any opencode command (or \`opencode service start\`) so the service API comes up; config: ~/.config/opencode/service.json. ${UNWAKEABLE_FIX}` : "run any opencode command (or `opencode service start`) so the service API comes up; config: ~/.config/opencode/service.json",
     };
 }
+/** Bounded diagnostic reads; unreadable, nonregular and oversized files are unknown, never evidence. */
+function pluginDiagnosticFile(path, maxBytes = 262_144) {
+    let fd;
+    try {
+        fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+        const stat = fstatSync(fd);
+        if (!stat.isFile() || stat.size > maxBytes)
+            return null;
+        const buffer = Buffer.alloc(maxBytes + 1);
+        const size = readSync(fd, buffer, 0, buffer.length, null);
+        return size > maxBytes ? null : buffer.toString("utf8", 0, size);
+    }
+    catch {
+        return null;
+    }
+    finally {
+        if (fd !== undefined)
+            try {
+                closeSync(fd);
+            }
+            catch { /* read failure remains unknown */ }
+    }
+}
+/** Observes wiring, server polls and producer freshness; these do not prove a TUI read or render. */
+export async function opencodePluginChecks(ctx, node, options = {}) {
+    const fix = "agentmbx setup --only opencode";
+    const wiring = edits(ctx, "opencode").filter(e => e.kind === "hooks" || e.kind === "sidebar").map(e => {
+        const cur = pluginDiagnosticFile(e.path);
+        try {
+            const state = !existsSync(e.path) ? "missing" : cur === null ? "unknown (unreadable or oversized)"
+                : e.blocked?.(cur) ? "foreign or malformed (preserved)"
+                    : e.isWired?.(cur) || e.install(cur) === cur ? "present/current" : "outdated managed wiring";
+            return { item: e.item, state };
+        }
+        catch {
+            return { item: e.item, state: "unknown (malformed)" };
+        }
+    });
+    const current = wiring.every(w => w.state === "present/current");
+    const foreign = wiring.some(w => w.state.startsWith("foreign"));
+    const repair = foreign ? `Back up your local plugin edits, then run ${fix}; setup preserves foreign files.` : fix;
+    const checks = [{ level: current ? "ok" : "warn", label: `opencode: plugin wiring — ${wiring.map(w => `${w.item}: ${w.state}`).join("; ")}`, ...(current ? {} : { fix: repair }) }];
+    const rows = node.store.db.prepare("SELECT session_id, pid, agent FROM sessions WHERE cli='opencode' AND session_id NOT LIKE 'mcp-%' ORDER BY session_id LIMIT 21").all();
+    if (!rows.length)
+        return [...checks, { level: "info", label: "opencode: plugin runtime unobserved — no session bindings; TUI load/read/render budget unobserved" }];
+    const waiting = new Set();
+    let pollState = "unavailable";
+    try {
+        const response = await (options.fetch ?? fetch)(`http://127.0.0.1:${node.config.port}/v1/opencode-wake/waiters`, { signal: AbortSignal.timeout(300), redirect: "error" });
+        if (response.ok) {
+            const reader = response.body?.getReader();
+            let text = "", bytes = 0;
+            const decoder = new TextDecoder();
+            if (reader)
+                try {
+                    for (;;) {
+                        const part = await reader.read();
+                        if (part.done)
+                            break;
+                        bytes += part.value.byteLength;
+                        if (bytes > 262_144)
+                            throw new Error("oversized waiters response");
+                        text += decoder.decode(part.value, { stream: true });
+                    }
+                    text += decoder.decode();
+                }
+                finally {
+                    await reader.cancel();
+                }
+            const body = JSON.parse(text);
+            if (body && typeof body === "object" && "waiters" in body && Array.isArray(body.waiters) && body.waiters.length <= 1000) {
+                pollState = "observed";
+                for (const w of body.waiters)
+                    if (w && typeof w === "object" && "sessionID" in w && typeof w.sessionID === "string" && "pid" in w && typeof w.pid === "number" && Number.isSafeInteger(w.pid) && w.pid > 0)
+                        waiting.add(`${w.sessionID}\0${w.pid}`);
+            }
+        }
+    }
+    catch { /* unobserved is not proof of an unloaded plugin */ }
+    const now = options.now ?? Date.now();
+    const alive = pluginDiagnosticFile(hudAlivePath(node.home), 32)?.trim();
+    const stamp = alive && /^\d+$/.test(alive) ? Number(alive) : NaN;
+    const age = now - stamp;
+    const heartbeat = !Number.isSafeInteger(stamp) || age < 0 ? "unknown" : age <= HUD_ALIVE_MAX_MS ? "fresh" : "stale";
+    for (const row of rows.slice(0, 20)) {
+        if (typeof row.session_id !== "string" || !/^ses_[a-zA-Z0-9]{1,124}$/.test(row.session_id)) {
+            checks.push({ level: "warn", label: "opencode: plugin session has an invalid identity — snapshot not read", fix });
+            continue;
+        }
+        let snapshot = "missing or unreadable";
+        try {
+            const raw = pluginDiagnosticFile(hudSessionV2Path(node.home, "opencode", row.session_id));
+            if (raw !== null) {
+                const value = JSON.parse(raw);
+                snapshot = "invalid or mismatched";
+                if (value && typeof value === "object" && "schema" in value && value.schema === "mbx.status/v2" && "harness" in value && value.harness && typeof value.harness === "object"
+                    && "cli" in value.harness && value.harness.cli === "opencode" && "session_id" in value.harness && value.harness.session_id === row.session_id
+                    && "identity" in value && value.identity && typeof value.identity === "object" && "state" in value.identity && value.identity.state === "bound" && "name" in value.identity && value.identity.name === row.agent)
+                    snapshot = "exact snapshot available";
+            }
+        }
+        catch {
+            snapshot = "invalid or mismatched";
+        }
+        const poll = waiting.has(`${row.session_id}\0${row.pid}`) ? "server poll observed" : `server poll unobserved (${pollState === "observed" ? "no matching waiter; service hosts need no standalone waiter" : "waiters endpoint unavailable"})`;
+        const healthy = current && heartbeat === "fresh" && snapshot === "exact snapshot available";
+        checks.push({ level: healthy ? "info" : "warn", label: `opencode: plugin session ${row.session_id} — wiring ${current ? "present/current" : "incomplete"}; ${poll}; producer heartbeat ${heartbeat}; ${snapshot}; TUI load/read/render budget unobserved`,
+            fix: foreign ? repair : `${fix}; reopen only the affected OpenCode TUI when the owner permits it.` });
+    }
+    if (rows.length > 20) {
+        const total = Number(node.store.db.prepare("SELECT COUNT(*) n FROM sessions WHERE cli='opencode' AND session_id NOT LIKE 'mcp-%'").get()?.n ?? rows.length);
+        checks.push({ level: "info", label: `opencode: plugin diagnostics bounded to 20 sessions; ${total - 20} additional bindings not assessed` });
+    }
+    return checks;
+}
 /** T460: Hermes runs a shell hook only after its (event, command) pair was approved, and in the TUI (no tty) it silently skips an
  *  unapproved one: hooks that are wired but not approved look installed and do nothing. Reads the same state setup writes. A warn
  *  never fails doctor. Silent until the hooks are wired, because the generic hooks row already says so then. */
@@ -705,6 +821,8 @@ export async function doctor(ctx, mbxHome, opts = {}) {
         if (d.cli === "opencode" && node)
             for (const c of opencodeDuplicateLoopChecks(node))
                 out.push(c);
+        if (d.cli === "opencode" && node)
+            out.push(...await opencodePluginChecks(ctx, node));
         // T460: its own function too (the T435 rule): a refused hooks layout and the not-approved state are Hermes facts.
         if (d.cli === "hermes")
             for (const c of hermesHooksChecks(ctx))

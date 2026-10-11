@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **OpenCode plugin diagnostics distinguish wiring from runtime proof (T412).** Doctor reports managed, missing, outdated and foreign plugin wiring, then checks up to 20 exact session bindings using one bounded loopback waiter request and private HUD files. A matching session/pid waiter proves only a server wake poll; producer freshness uses the daemon heartbeat, never an unchanged snapshot's mtime. Missing or mismatched evidence remains explicit, and TUI loading, reading and render cost are unobserved. Checks expose no message subjects or counts, change no state, and point to `agentmbx setup --only opencode` without restarting sessions or overwriting foreign plugins.
+
 ## 0.5.26 (2026-10-11)
 
 The OpenCode sidebar becomes a full dashboard, mbx_agents is a live roster with verified state across hosts from a signed directory, and the project key is the CLEO project id. An agentmbx mcp exits when its client goes away and a reload keeps one process per connection, which cuts the orphaned MCP processes that piled up on busy hosts. OpenCode permissions stay inside the serve that hosts the session, and mbx_whoami names the session id the status line uses.
