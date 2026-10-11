@@ -7,7 +7,6 @@ import { EventEmitter } from "node:events";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -30,7 +29,7 @@ import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy
 import { assertKnownRecipients, deliveryReceipts, offlineWarnings, receiptLine, recipientReceipts, sentPage } from "./receipts.ts";
 import { forwardMessage, ledgerPage, projectLeadView } from "./project-ledger.ts";
 import { buildRoster, rosterText } from "./roster.ts";
-import { skillFiles } from "./setup.ts";
+import { CLIS, skillFiles } from "./setup.ts";
 import { claudeSessionId, claudeSessionTracker, grokSessionId, grokSessionTracker, procStart, procTable, withProcSnapshot } from "./proc.ts";
 import { updateAvailable } from "./update.ts";
 import { installKind, version } from "./version.ts";
@@ -359,16 +358,20 @@ export function socketPush(text: string, env: NodeJS.ProcessEnv = process.env): 
   });
 }
 
-/** Default agent name: $MBX_AGENT when the owner set one, otherwise the project folder. The home folder and `/` are
- *  not projects, so they do not invent a name from the harness or from the account. An existing mailbox the owner
- *  names with MBX_AGENT, including one already named after a harness, is kept. */
-export function agentName(cwd = process.cwd()): string | null {
-  const explicit = process.env.MBX_AGENT;
-  const inHome = resolve(cwd) === resolve(homedir()) || resolve(cwd) === "/";
-  const raw = explicit || (inHome ? "" : basename(cwd));
-  if (!raw) return null;
-  const n = raw.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
-  return NAME_RE.test(n) ? n : "agent";
+/** A name only when the owner set MBX_AGENT (T492). A folder, the home directory and `/` do not invent one.
+ *  An existing mailbox the owner names with MBX_AGENT, including one already named after a harness, is kept. */
+export function agentName(_cwd = process.cwd()): string | null {
+  const explicit = process.env.MBX_AGENT?.trim();
+  if (!explicit) return null;
+  const n = explicit.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+  return NAME_RE.test(n) ? n : null;
+}
+
+/** A mailbox that does not exist yet may not be the project folder or end in a harness id (T492). */
+export function reservedNewName(name: string, cwd: string): boolean {
+  const bare = basename(resolve(cwd));
+  if (name === bare || name === bare.toLowerCase()) return true;
+  return CLIS.some((cli) => name.endsWith(`-${cli}`));
 }
 
 const text = (s: string, structured?: Record<string, unknown>) => ({ content: [{ type: "text" as const, text: s }], ...(structured ? { structuredContent: structured } : {}) });
@@ -1220,6 +1223,8 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
       // A new identity is chosen deliberately: a readable name and a role (R1.6). Older auto-generated mailboxes may
       // still be claimed without one, to read their mail.
       if (AUTO_NAME_RE.test(target)) throw Object.assign(new Error(`"${target}" looks auto-generated; register a readable name such as <project>-<role>`), { code: "IDENTITY_NAME_UNREADABLE" });
+      if (!node.knownLocalName(target) && reservedNewName(target, process.cwd()))
+        throw Object.assign(new Error(`${target} is reserved. Register a role persona such as <project>-<role>, not the project folder or a harness suffix.`), { code: "IDENTITY_NAME_UNREADABLE" });
       // A mailbox that already exists here (it had mail, a lease, an agents row or an alias) is resumed by name, keeping
       // the role it was known by, so the list's "claimable" and the claim agree (T315). A new name still needs a role.
       if (!role && !(action === "claim" && node.knownLocalName(target)))

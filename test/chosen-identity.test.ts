@@ -78,6 +78,46 @@ test("a fresh session is unbound until it registers a chosen name and role; mail
   assert.notEqual((await c.callTool({ name: "mbx_inbox", arguments: {} })).isError, true, "mailbox tools work once bound");
 });
 
+test("T492 a new name cannot be the project folder or a harness suffix; an existing mailbox stays claimable", async (t) => {
+  const { node, connect } = fixture(t);
+  node.registerAgent("agentmbx-grok", { role: "builder" });
+  registerIdentity(node.store, { name: "agentmbx-grok", role: "builder", by: "test" });
+  node.send({ from: "boss", to: ["agentmbx-grok"], subject: "s", body: "kept" });
+  const c = await connect("sess-reserve");
+  const bare = await c.callTool({ name: "mbx_identity", arguments: { action: "register", name: "orbit", role: "lead" } });
+  assert.equal(bare.isError, true);
+  assert.match(textOf(bare), /orbit is reserved/);
+  const suffixed = await c.callTool({ name: "mbx_identity", arguments: { action: "register", name: "orbit-claude", role: "lead" } });
+  assert.equal(suffixed.isError, true);
+  assert.match(textOf(suffixed), /orbit-claude is reserved/);
+  const created = await c.callTool({ name: "mbx_identity", arguments: { action: "claim", name: "orbit-codex", role: "lead" } });
+  assert.equal(created.isError, true, "a claim does not create a harness-suffixed name");
+  const claimed = await c.callTool({ name: "mbx_identity", arguments: { action: "claim", name: "agentmbx-grok" } });
+  assert.notEqual(claimed.isError, true, textOf(claimed));
+  const who = json(await c.callTool({ name: "mbx_whoami", arguments: {} }));
+  assert.equal(who.agent, "agentmbx-grok");
+  assert.equal(who.role, "builder");
+  assert.equal(who.unread, 1);
+});
+
+test("T492 the same persona claimed from claude and then codex keeps its mail and its role", async (t) => {
+  const { node, connect } = fixture(t);
+  const claude = await connect("sess-claude", { MBX_CLI: "claude" });
+  const reg = await claude.callTool({ name: "mbx_identity", arguments: { action: "register", name: "orbit-lead", role: "lead" } });
+  assert.notEqual(reg.isError, true, textOf(reg));
+  node.send({ from: "boss", to: ["orbit-lead"], subject: "s", body: "kept" });
+  const released = await claude.callTool({ name: "mbx_identity", arguments: { action: "release" } });
+  assert.notEqual(released.isError, true, textOf(released));
+  const codex = await connect("sess-codex", { MBX_CLI: "codex" });
+  const claimed = await codex.callTool({ name: "mbx_identity", arguments: { action: "claim", name: "orbit-lead" } });
+  assert.notEqual(claimed.isError, true, textOf(claimed));
+  const who = json(await codex.callTool({ name: "mbx_whoami", arguments: {} }));
+  assert.equal(who.agent, "orbit-lead");
+  assert.equal(who.role, "lead");
+  assert.equal(who.cli, "codex");
+  assert.equal(who.unread, 1);
+});
+
 test("a resumed session gets its own identity back; another session in the folder never takes it", async (t) => {
   const { node, connect } = fixture(t);
   const a = await connect("sess-a");

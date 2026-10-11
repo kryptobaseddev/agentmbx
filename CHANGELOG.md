@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **A new mailbox is a role persona, never the folder or a harness (T492).** `agentName` returns a name only when `MBX_AGENT` is set. Register and claim refuse a name that does not already exist when it equals the project folder or ends in a harness id (`claude`, `codex`, `opencode`, `kimi`, `hermes`, `grok`). An existing mailbox under either shape stays readable and claimable. The same persona claimed from one harness and then another keeps its mail and its role.
+
 - **Paired hosts publish a signed agent directory (T546).** `GET /v1/agents` adds `state` (`live`, `idle`, `unknown`, or `offline`), `harness` (the holder cli when live or idle, otherwise null), and `project_keys` (normalized git origins, not folder paths). The body is signed with the host key, the same way `/v1/enc-key` is. `refreshDirectory` stores those columns only when the signature matches the pinned peer key. An older unsigned directory still updates the five original fields and clears any previously verified columns. A bad signature is audited and not applied. A name that leaves a signed directory keeps its row and loses the verified columns. The schema version stays 3. `mbx_agents` shows that stored state and harness for a paired host; a row with no verified columns stays `remote`. `project_keys` is optional on an `mbx.agents/v1` row and is omitted when the row is unverified.
 
 - **Schema refusals keep answering every MCP tool (T487 follow-up).** A running connector reloads an upgraded store only when a different build is installed. Replacing itself with the identical incompatible build could turn later tool refusals into MCP protocol exceptions. The connector now keeps returning the usual error result, with mail preserved; a changed build still reloads.
