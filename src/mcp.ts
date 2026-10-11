@@ -5,7 +5,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -40,6 +40,9 @@ import { encodeReplayFrame, replayMaximum } from "./replay.ts";
 import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wake.ts";
 import { isStoreBusy, withStoreBusyTimeout } from "./store.ts";
 import { markMcpStarting } from "./mcp-startup.ts";
+import { recordMcpGeneration, startMcpLifecycle } from "./mcp-lifecycle.ts";
+
+let lifecycle: ReturnType<typeof startMcpLifecycle> | undefined;
 
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
 It is shared by AI coding agents on this machine and on paired machines. Your user set it up so agents can coordinate;
@@ -117,27 +120,6 @@ export const reexecEnv = (parentAgent: string | undefined, providerPid?: number,
 const REEXEC_PARENT_AGENT = "MBX_MCP_PARENT_AGENT";
 
 /**
- * T449: the original proxy tracks the current live generation through a small file record instead of waiting
- * on stdin EOF (a paused stdin never emits "end"). Each generation writes the pid of its replacement before
- * exiting; the original polls the record and exits when the recorded pid is dead or reused.
- */
-const generationDir = () => join(defaultHome(), "mcp-generation");
-const generationPath = (originalPid: number) => join(generationDir(), String(originalPid));
-function writeGeneration(originalPid: number, pid: number): void {
-  try {
-    mkdirSync(generationDir(), { recursive: true, mode: 0o700 });
-    writeFileSync(generationPath(originalPid), JSON.stringify({ pid, start: "" }), "utf8");
-  } catch { /* best-effort: the proxy still falls back to the child's exit code */ }
-}
-function readGeneration(originalPid: number): { pid: number; start: string } | null {
-  try { return JSON.parse(readFileSync(generationPath(originalPid), "utf8")) as { pid: number; start: string }; }
-  catch { return null; }
-}
-function clearGeneration(originalPid: number): void {
-  try { unlinkSync(generationPath(originalPid)); } catch { /* already gone */ }
-}
-
-/**
  * T317: the provider to hand to a re-exec child must be the *original* CLI provider process, not this MCP
  * process's current ppid. After the first re-exec, the MCP parent is itself a re-exec generation and may soon
  * exit; if reparented to launchd the ppid walk sees pid 1. Use the record this process stored at claim time,
@@ -170,6 +152,7 @@ const handoverProvider = (node: MbxNode | undefined, ppid: number): number | und
  * pending handover state.
  */
 function handOverToFreshProcess(pauseStdin: boolean, parentAgent?: string, providerPid?: number, detached?: DetachedReload, retired?: () => void, onAbort?: () => void): boolean {
+  lifecycle ??= startMcpLifecycle(defaultHome());
   const originalPid = Number(process.env.MBX_MCP_ORIGINAL_PID) || process.pid;
   let child: ReturnType<typeof spawn>;
   try {
@@ -181,6 +164,8 @@ function handOverToFreshProcess(pauseStdin: boolean, parentAgent?: string, provi
   let spawned = false;
   child.once("spawn", () => {
     spawned = true;
+    if (child.pid) recordMcpGeneration(lifecycle!.home, originalPid, { pid: child.pid, start: inspectLeaseProcess(child.pid).start });
+    if (!process.env[REEXEC_ENV]) lifecycle!.retireToProxy();
     try {
       retired?.();
     } catch (e) {
@@ -191,12 +176,8 @@ function handOverToFreshProcess(pauseStdin: boolean, parentAgent?: string, provi
     if (process.env[REEXEC_ENV]) {
       // T449: tell the original which pid is now serving, then exit. The original watches this pid and
       // mirrors its exit, so a crash or a clean stop both close the provider transport.
-      if (child.pid) writeGeneration(originalPid, child.pid);
       process.exit(0);
     }
-    // T449: the original records its direct child so the poller below has a pid to watch even when this
-    // child never hands off again.
-    if (child.pid) writeGeneration(originalPid, child.pid);
   });
   child.once("error", (err) => {
     if (!spawned) {
@@ -212,24 +193,6 @@ function handOverToFreshProcess(pauseStdin: boolean, parentAgent?: string, provi
     if (signal) { process.kill(process.pid, signal); return; }
     // T317: the original proxy keeps the provider transport alive. A zero exit means the replacement has
     // itself handed off to a newer generation; a non-zero exit means the replacement died and we mirror it.
-    if (code === 0 && !process.env[REEXEC_ENV]) {
-      // T449: poll the generation record and exit when the current live generation dies. This avoids the
-      // stdin.once("end") bug: a paused stdin never emits "end" on EOF, so the proxy would leak forever.
-      // Use process.kill(pid, 0) directly: inspectLeaseProcess relies on ps, whose cache can report a
-      // just-spawned generation as missing and make the proxy exit prematurely (closing stdin and killing it).
-      const poller = setInterval(() => {
-        const rec = readGeneration(originalPid);
-        if (!rec) return; // no generation bound yet; the child is still starting up
-        let genAlive = false;
-        try { process.kill(rec.pid, 0); genAlive = true; } catch { /* dead or permission denied */ }
-        if (!genAlive) {
-          clearGeneration(originalPid);
-          process.exit(0);
-        }
-      }, 1_000);
-      process.once("exit", () => clearInterval(poller));
-      return;
-    }
     if (code !== 0) process.exit(code ?? 0);
   });
   if (pauseStdin) try { process.stdin.pause(); } catch { /* already closed */ }
@@ -441,6 +404,7 @@ export const externalWarning = (origin: "agent" | "external" | undefined, taint:
 };
 
 export async function runMcp(existing?: MbxNode) {
+  lifecycle ??= startMcpLifecycle(existing?.home ?? defaultHome());
   const clearStarting = markMcpStarting(existing?.home ?? defaultHome());
   try {
     // Transport initialization must not need a database, process inspection, or an identity lease.
@@ -509,6 +473,7 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
   // the project this session works in (not the home folder), stamped on what it sends and recorded per identity
   let project = projectOf(process.cwd()); // a hosted conversation moves it to its own folder when it links (bind ticket)
   const env = detectHost();
+  if (env.ppid > 1) lifecycle?.watchClient({ pid: env.ppid, start: process.env.MBX_MCP_PROVIDER_START || inspectLeaseProcess(env.ppid).start });
   const detached = detachedReloadState(process.env);
   // Chosen identities only (T204): the launch config (MBX_AGENT) or the identity this provider session held before. A
   // re-exec child reclaims the name its parent released at handover. Nothing else ever names a session.
@@ -1639,9 +1604,9 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
     if (closed) return;
     closed = true;
     for (const timer of timers) clearInterval(timer);
-    process.stdin.off("end", retire);
     process.off("exit", retire);
     try {
+      node.store.db.exec("PRAGMA busy_timeout=0"); // Terminal cleanup must not wait behind another writer.
       node.store.tx(() => {
         for (const { key, agent, leaseToken, coUse } of [base, ...states.values()]) {
           if (leaseToken && !coUse) leases.release(agent, leaseToken); // a co-user never releases the holder's lease (T439)
@@ -1656,13 +1621,10 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
       });
     } catch (e) { process.stderr.write(`[mbx] session cleanup failed: ${(e as Error).message}\n`); }
   };
-  server.server.onclose = retire;
-  // The SDK stdio transport does not forward stdin EOF to onclose.
-  process.stdin.once("end", retire);
+  lifecycle?.onShutdown(() => { try { retire(); } finally { node.close(); } });
+  server.server.onclose = () => lifecycle ? lifecycle.shutdown() : retire();
   process.once("exit", retire);
-  // A provider that ends its servers with a signal (claude -p, a closed terminal) releases the identity cleanly instead
-  // of leaving a dead holder to expire. SIGINT is left alone: a terminal's Ctrl-C interrupts a turn, not the session.
-  for (const [signal, code] of [["SIGTERM", 143], ["SIGHUP", 129]] as const) process.once(signal, () => { retire(); process.exit(code); });
+  // SIGTERM/SIGHUP and EOF remain owned by the lifecycle controller across mailbox retirement.
   if (closed) return;
   // The reused client does not initialize again. Registration happened before
   // connection, so announce the replacement catalog on this live transport.
