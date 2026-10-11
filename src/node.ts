@@ -72,6 +72,28 @@ const sessionWakeable = (x: { cli: string; session_id: string; pid?: number | nu
   !!x.channel || ((WAKEABLE.has(x.cli) || (x.cli === "kimi" && kimiHostedCheck(x.pid))) && !x.session_id.startsWith("mcp-"));
 
 export const defaultHome = () => process.env.MBX_HOME || join(homedir(), ".local", "share", "agentmbx");
+
+/** One directory row. `state` is null when this host has not verified it (an older or unsigned directory). */
+export interface AgentRecord {
+  name: string;
+  host: string;
+  role: string | null;
+  cli: string | null;
+  description: string | null;
+  last_seen: string | null;
+  state: "live" | "idle" | "unknown" | "offline" | null;
+  harness: string | null;
+  /** Parsed `project_keys` column. Null when the column is null or not a list of strings. */
+  project_keys: string[] | null;
+}
+
+function parseProjectKeys(raw: string | null): string[] | null {
+  if (raw == null) return null;
+  try {
+    const v = JSON.parse(raw) as unknown;
+    return Array.isArray(v) && v.every((k) => typeof k === "string") ? v : null;
+  } catch { return null; }
+}
 const shortHost = () => hostname().split(".")[0].toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) || "host";
 
 export class MbxNode {
@@ -154,8 +176,16 @@ export class MbxNode {
       .run(name, this.host, info.role ?? null, info.cli ?? null, info.description ?? null, new Date().toISOString());
   }
 
-  agents(): { name: string; host: string; role: string | null; cli: string | null; description: string | null; last_seen: string | null }[] {
-    return this.store.db.prepare("SELECT * FROM agents ORDER BY host, name").all() as never;
+  agents(): AgentRecord[] {
+    const rows = this.store.db.prepare(
+      "SELECT name,host,role,cli,description,last_seen,state,harness,project_keys FROM agents ORDER BY host, name",
+    ).all() as { name: string; host: string; role: string | null; cli: string | null; description: string | null; last_seen: string | null; state: string | null; harness: string | null; project_keys: string | null }[];
+    return rows.map((r) => ({
+      name: r.name, host: r.host, role: r.role, cli: r.cli, description: r.description, last_seen: r.last_seen,
+      state: r.state === "live" || r.state === "idle" || r.state === "unknown" || r.state === "offline" ? r.state : null,
+      harness: typeof r.harness === "string" ? r.harness : null,
+      project_keys: parseProjectKeys(r.project_keys),
+    }));
   }
 
   /**

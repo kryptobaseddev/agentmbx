@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS outbox (       -- envelopes waiting to reach a paired
   last_error TEXT, created_at TEXT NOT NULL, PRIMARY KEY (msg_id, host));
 CREATE TABLE IF NOT EXISTS agents (       -- agents known on this host and on paired hosts
   name TEXT NOT NULL, host TEXT NOT NULL, role TEXT, cli TEXT, description TEXT, last_seen TEXT,
+  state TEXT, harness TEXT, project_keys TEXT, -- verified directory cache (T546); null means unverified
   PRIMARY KEY (name, host));
 CREATE TABLE IF NOT EXISTS sessions (     -- live CLI sessions bound to local agents (for wake-up)
   agent TEXT NOT NULL, cli TEXT NOT NULL, session_id TEXT NOT NULL, cwd TEXT, pid INTEGER,
@@ -143,8 +144,9 @@ CREATE TABLE IF NOT EXISTS pair_tokens (  -- one-time pairing tokens (agentmbx p
 export const SCHEMA_VERSION = 3;
 
 // Additive columns on version 3. A missing one is added on open; user_version stays 3.
-// sessions.task and sessions.lane are the live session's CLEO task and phase (T497), like sessions.pid_start.
-const SCHEMA_COLUMNS = [["sessions", "pid_start"], ["sessions", "task"], ["sessions", "lane"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"]] as const;
+// sessions.task and sessions.lane are the live session's CLEO task and phase (T497).
+// agents.state, agents.harness and agents.project_keys are the signed directory (T546).
+const SCHEMA_COLUMNS = [["sessions", "pid_start"], ["sessions", "task"], ["sessions", "lane"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"], ["agents", "state"], ["agents", "harness"], ["agents", "project_keys"]] as const;
 const SCHEMA_OBJECTS = [...SCHEMA.matchAll(/CREATE\s+(?:VIRTUAL\s+)?(?:TABLE|INDEX|TRIGGER)\s+IF NOT EXISTS\s+(\w+)/g)].map(match => match[1]);
 const SCHEMA_DEFINITION = createHash("sha256").update(SCHEMA).update(JSON.stringify(SCHEMA_COLUMNS)).digest("hex");
 const opening = new AsyncLocalStorage<{ busyTimeoutMs: number; stores: Store[] }>();

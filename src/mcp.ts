@@ -1081,12 +1081,14 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
     return register(name, config, (...a: unknown[]) => {
       try { node.store.assertCurrent(version()); }
       catch (e) {
-        if (storeMismatchCode(e) && canReloadBuild(process.env, codeFingerprint(), boot)) {
+        // The same installed build cannot fix a newer schema; keep returning its normal tool refusal.
+        if (storeMismatchCode(e) && codeFingerprint() !== boot && canReloadBuild(process.env, codeFingerprint(), boot)) {
           // Validate the payload first and let handOverToFreshProcess retire only once the replacement has
           // provably spawned: a failure here leaves this server fully serving (T441).
           const detached = detachedReloadSchema.parse(detachedForReload());
-          handOverToFreshProcess(false, bound(base) ? base.agent : undefined, handoverProvider(node, env.ppid), detached, retire);
-        } else reloadFromDisk(e);
+          // Subsequent requests belong to the replacement's reader, as on a build-only handover.
+          handOverToFreshProcess(true, bound(base) ? base.agent : undefined, handoverProvider(node, env.ppid), detached, retire);
+        }
         throw e;
       }
       // a deployed build replaced the one this server loaded: finish this call on the old code, then hand

@@ -79,6 +79,8 @@ export function validateAgentsV1(x) {
         for (const k of ["task", "lane"])
             if (r[k] !== undefined && !strOrNull(r[k]))
                 bad.push(`${at}.${k} is not a string or null`);
+        if (r.project_keys !== undefined && !strList(r.project_keys))
+            bad.push(`${at}.project_keys is not a list of strings`);
         if (r.harness !== null && r.state !== "live" && r.state !== "idle")
             bad.push(`${at}.harness is set but the persona is not live or idle`);
     });

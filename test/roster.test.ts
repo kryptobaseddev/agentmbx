@@ -11,6 +11,7 @@ import { IdentityLeases, type ProcessEvidence } from "../src/identity-leases.ts"
 import { activeLeads, makeLead, storeLead } from "../src/lead-record.ts";
 import { createOwnerKey, unlockOwnerKey } from "../src/owner.ts";
 import { noteProject, registerIdentity } from "../src/registry.ts";
+import { setSessionPresence } from "../src/presence.ts";
 import { buildRoster, rosterText } from "../src/roster.ts";
 import { activityKey } from "../src/identity-availability.ts";
 import { retiredKey } from "../src/identity-cleanup.ts";
@@ -248,4 +249,27 @@ test("activeLeads lists each project's current lead and drops expired or revoked
   assert.deepEqual(activeLeads(w.node, new Date(w.NOW + 400 * 86_400_000)), [], "past the expiry nothing is active");
   w.designate("lead-a2", A);
   assert.deepEqual(activeLeads(w.node, new Date(w.NOW)).filter((l) => l.project === A).map((l) => l.agent), ["lead-a2"], "the newest record for a project wins");
+});
+
+test("T497: a live local row shows the session task and lane; a remote row leaves them off", (t) => {
+  const w = world(t);
+  w.hold("on-task", { project: A, cwd: A });
+  w.hold("plain", { project: A, cwd: A });
+  const gone = w.hold("was-on-task", { project: A, cwd: A });
+  w.evidence.set(gone, { alive: false, start: null });
+  setSessionPresence(w.node, { cli: "claude", sessionId: "s-on-task", task: "T497", lane: "implementation" });
+  setSessionPresence(w.node, { cli: "claude", sessionId: "s-was-on-task", task: "T497", lane: "implementation" });
+  w.node.store.db.prepare("INSERT INTO agents (name,host,role) VALUES ('far-dev','beta','builder')").run();
+
+  const r = w.roster({ project: A, ask: "*" });
+  assert.deepEqual([row(r, "on-task").task, row(r, "on-task").lane], ["T497", "implementation"]);
+  assert.equal(row(r, "plain").task, undefined);
+  assert.equal(row(r, "plain").lane, undefined);
+  assert.deepEqual([row(r, "was-on-task").task, row(r, "was-on-task").lane, row(r, "was-on-task").state], [undefined, undefined, "offline"], "a dead session does not keep the task on the row");
+  assert.equal(row(r, "far-dev").task, undefined);
+  assert.equal(row(r, "far-dev").lane, undefined);
+  assert.match(rosterText(r).split("\n").find((l) => l.startsWith("on-task@alpha"))!, /task:T497 {2}lane:implementation/);
+  assert.doesNotMatch(rosterText(r).split("\n").find((l) => l.startsWith("plain@alpha"))!, /task:/);
+  assert.doesNotMatch(rosterText(r).split("\n").find((l) => l.startsWith("far-dev@beta"))!, /task:/);
+  assert.deepEqual(validateAgentsV1(r), []);
 });
