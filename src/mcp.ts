@@ -484,7 +484,13 @@ export async function runMcp(existing?: MbxNode) {
     server.server.onclose = stopStartup;
     process.stdin.once("end", stopStartup);
     server.server.oninitialized = () => setImmediate(resolveInitialized);
-    await server.connect(transport);
+    try { await server.connect(transport); }
+    catch (error) {
+      lifecycle.dispose();
+      process.stdin.off("end", stopStartup);
+      await server.close().catch(() => {}); // Preserve the startup error if transport cleanup also fails.
+      throw error;
+    }
     // A re-exec takes over an already initialized client, which will not send initialized a second time.
     if (process.env[REEXEC_ENV]) resolveInitialized();
     await initialized;
