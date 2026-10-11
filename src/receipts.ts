@@ -11,7 +11,7 @@ import { procTable } from "./proc.ts";
 import { activityKey, parseActivity, SHARED_IDLE_MS } from "./identity-availability.ts";
 import { remoteReceipts } from "./remote-receipts.ts";
 import { isSlotName } from "./project-slot.ts";
-import { projectLabel, projectReader } from "./project-mailbox.ts";
+import { projectLabel, projectMailboxBySlot, projectReader } from "./project-mailbox.ts";
 
 /** A holder renews its lease every minute; three missed beats mean its session is suspended or gone. */
 const STALE_HEARTBEAT_MS = 3 * 60_000;
@@ -77,6 +77,15 @@ export function recipientReceipts(node: MbxNode, msgId: string, targets: RouteTa
     const address = `${name}@${node.host}`;
     if (name === "owner") { out.push({ to: t.to, address, state: "live-next-prompt", detail: "the owner sees it in agentmbx inbox and as a desktop notification" }); continue; }
     const live = mailboxLiveness(node, name, now);
+    if (isSlotName(name)) {
+      // T493: the recipient is the project, not a session. With no live lead it is queued exactly like mail to `lead` with no holder
+      // (T491); with one, the lead sees it in its project inbox section on its next prompt (waking it is the wake path's, not claimed here).
+      const box = projectMailboxBySlot(node.store, name), label = box ? projectLabel(box) : name;
+      out.push(live.live
+        ? { to: t.to, address, state: "live-next-prompt", detail: `addressed to the project mailbox ${label}; ${live.detail}; it sees this in its project inbox on its next prompt` }
+        : { to: t.to, address, state: "queued-no-holder", detail: `addressed to the project mailbox ${label}; ${live.detail}; it waits here until the project's lead reconnects or the owner designates one, and urgent mail is reported to the owner` });
+      continue;
+    }
     let state: RecipientState, detail: string;
     if (t.lead && !live.live) {
       // T491: `lead`/`role:lead` names the owner-designated lead. When its mailbox has no live holder the

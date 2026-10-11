@@ -100,5 +100,23 @@ export function projectReader(node, slot, now = new Date()) {
     const lead = leadFor(node, mailbox.folder ?? mailbox.key, mailbox.key, now);
     return { mailbox, lead: lead && lead.host === node.host ? lead : null };
 }
+/**
+ * The project mailboxes whose current lead on this host is `agent`: owner-signed, unrevoked, unexpired, designated here. Database
+ * reads only (it runs inside the caller's lease operation). A role label, a folder or an old lead record is not in this list.
+ */
+export function projectsLedBy(node, agent, now = new Date()) {
+    const rows = node.store.db.prepare("SELECT key,slot,alias,home_host,source,folder,created_at FROM project_mailboxes WHERE home_host=?").all(node.host);
+    const out = [];
+    for (const row of rows) {
+        const lead = leadFor(node, row.folder ?? row.key, row.key, now);
+        if (lead && lead.host === node.host && lead.agent === agent)
+            out.push({ ...row });
+    }
+    return out;
+}
+/** A project mailbox named by its bare name, its slot or its key. */
+export function resolveProjectMailbox(store, ref) {
+    return projectMailboxByAlias(store, ref) ?? projectMailboxBySlot(store, ref) ?? projectMailboxByKey(store, ref);
+}
 /** How a person should read a slot: the bare name when it has one, otherwise the key's source. */
 export const projectLabel = (m) => m.alias ?? m.slot;

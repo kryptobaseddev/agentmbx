@@ -6,6 +6,7 @@ import { canonical, fingerprint, ulid, verifyData } from "./crypto.js";
 import { ownerKeys } from "./policy.js";
 import { resolveProject } from "./project-key.js";
 import { identityProjects } from "./registry.js";
+import { allocateProjectMailbox } from "./project-mailbox.js";
 export const LEAD_DEFAULT_TTL_MS = 30 * 86_400_000;
 export const LEAD_MAX_TTL_MS = 180 * 86_400_000;
 const LeadRecord = z.object({
@@ -43,9 +44,15 @@ export function storeLead(node, rec, sig) {
     if (!signedBy(node, r.data, sig, r.data.owner_fp))
         fail("LEAD_SIGNATURE", "lead record is not signed by an owner key this host trusts");
     // project_key is derived here from the signed folder and is never part of what the owner signed (T543); NULL without a CLEO id.
-    node.store.db.prepare("INSERT OR IGNORE INTO project_leads (id,project,agent,record,sig,received_at,project_key) VALUES (?,?,?,?,?,?,?)")
-        .run(r.data.id, r.data.project, r.data.agent, JSON.stringify(r.data), sig, new Date().toISOString(), resolveProject(r.data.project).cleoId);
-    node.store.audit("lead.set", { id: r.data.id, project: r.data.project, agent: `${r.data.agent}@${r.data.host}`, exp: r.data.exp });
+    // One transaction: a lead set on this host also allocates the project's mailbox (T493, once; the first lead set fixes its home host),
+    // and a refusal there (the reserved name is taken) leaves no half-designated lead behind.
+    node.store.tx(() => {
+        node.store.db.prepare("INSERT OR IGNORE INTO project_leads (id,project,agent,record,sig,received_at,project_key) VALUES (?,?,?,?,?,?,?)")
+            .run(r.data.id, r.data.project, r.data.agent, JSON.stringify(r.data), sig, new Date().toISOString(), resolveProject(r.data.project).cleoId);
+        node.store.audit("lead.set", { id: r.data.id, project: r.data.project, agent: `${r.data.agent}@${r.data.host}`, exp: r.data.exp });
+        if (r.data.host === node.host)
+            allocateProjectMailbox(node, r.data.project);
+    });
     return r.data;
 }
 /** Revoke a stored lead record with a signed revocation. */

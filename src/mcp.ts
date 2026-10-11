@@ -38,9 +38,10 @@ import { connectorKey } from "./diagnostics.ts";
 import { catchupHint, catchupUnchanged, commitCatchup, ensureCatchup, missedCount, moveCatchup, readCatchup, restartCatchup, CATCHUP_FILTER } from "./catchup.ts";
 import { encodeReplayFrame, replayMaximum } from "./replay.ts";
 import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wake.ts";
-import { isStoreBusy, withStoreBusyTimeout } from "./store.ts";
+import { isStoreBusy, withStoreBusyTimeout, type MessageRow } from "./store.ts";
 import { markMcpStarting } from "./mcp-startup.ts";
 import { recordMcpGeneration, startMcpLifecycle } from "./mcp-lifecycle.ts";
+import { projectLabel } from "./project-mailbox.ts";
 
 let lifecycle: ReturnType<typeof startMcpLifecycle> | undefined;
 
@@ -1007,7 +1008,7 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
     return { draft, warnings: externalWarning(origin, taint) };
   };
   /** Opening mail marks the reader's own copies read (delivered/notified → read; never past acked), for sender receipts (T207). */
-  const markRead = (rows: { id: string }[], agent: string) => { for (const r of rows) node.setDelivery(r.id, agent, "read"); };
+  const markRead = (rows: { id: string }[], agent: string) => node.markRead(rows, agent); // its own copy, else a project copy it may read (T493)
   // Identity and policy notes belong to the ready caller, never the transport's provisional mailbox.
   const sessionNotes = (state: State): string => {
     if (!bound(state)) return "";
@@ -1346,6 +1347,8 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
     const leadView = projectLeadView(node, project);
     const out = { agent, host: node.host, address: `${agent}@${node.host}`, role: reg?.role ?? me?.role ?? null, description: reg?.description ?? me?.description ?? null,
       registered: !!reg, project: project ?? null, lead: leadView.address && leadView.exp ? { address: leadView.address, exp: leadView.exp } : null,
+      // T493: the project mailboxes this session reads as the project's lead, with their unread counts. Absent for everyone else.
+      ...((ps) => ps.length ? { project_mailboxes: ps } : {})(node.projectInboxes(agent, { limit: 1 }).map((s) => ({ project: projectLabel(s.project), key: s.project.key, unread: s.unread }))),
       // T548: `session` keeps its historical meaning (the lease key fingerprint) for old clients; the id the
       // statusline/HUD key on is the sessions-table session id, reported as `harness_session`; `lease_key` labels it.
       cli: env.cli, session: fingerprint(key.publicKey), harness_session: state.sessionId, lease_key: fingerprint(key.publicKey),
@@ -1462,10 +1465,15 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
   }, ({ all, limit }) => {
     const { agent } = current();
     const rows = node.inbox(agent, { all, limit });
-    if (!rows.length) return text(`No ${all ? "" : "unread "}messages for ${agent}@${node.host}.`, { messages: [] });
-    const lines = rows.map((m) => { const p = node.policyFor(m, agent); return `${summaryLine(m)}\n    trust: ${trustLabel(m)} · policy: ${p.level === "yolo" ? "YOLO" : p.level}${p.classes.length ? ` [${p.classes.join(", ")}]` : ""}`; });
-    return text(`${rows.length} message(s) for ${agent}@${node.host}:\n${lines.join("\n")}\n\nRead one with mbx_read {"ids": ["<id>"]}.`,
-      { messages: rows.map((m) => ({ id: m.id, from: m.from_addr, subject: m.subject, kind: m.kind, ts: m.ts, state: m.state, trust: trustLabel(m) })) });
+    // T493: the project mailboxes this session leads, as labelled sections. Empty for everyone else, and outside the holder's own lease.
+    const sections = node.projectInboxes(agent, { all, limit });
+    const describe = (m: MessageRow) => { const p = node.policyFor(m, agent); return `${summaryLine(m)}\n    trust: ${trustLabel(m)} · policy: ${p.level === "yolo" ? "YOLO" : p.level}${p.classes.length ? ` [${p.classes.join(", ")}]` : ""}`; };
+    const brief = (m: MessageRow) => ({ id: m.id, from: m.from_addr, subject: m.subject, kind: m.kind, ts: m.ts, state: m.state, trust: trustLabel(m) });
+    const projectOut = sections.length ? { project_inboxes: sections.map((s) => ({ project: projectLabel(s.project), key: s.project.key, unread: s.unread, messages: s.messages.map(brief) })) } : {};
+    const projectText = sections.map((s) => `Project mailbox ${projectLabel(s.project)} (${s.unread} unread; stored once for the project, you read it as its lead):${s.messages.length ? `\n${s.messages.map((m) => describe(m).replace(s.project.slot, `project:${projectLabel(s.project)}`)).join("\n")}` : "\n(nothing)"}`);
+    if (!rows.length && !sections.some((s) => s.messages.length)) return text(`No ${all ? "" : "unread "}messages for ${agent}@${node.host}.${projectText.length ? `\n${projectText.join("\n")}` : ""}`, { messages: [], ...projectOut });
+    const personal = rows.length ? `${rows.length} message(s) for ${agent}@${node.host}:\n${rows.map(describe).join("\n")}` : `No ${all ? "" : "unread "}personal messages for ${agent}@${node.host}.`;
+    return text(`${[personal, ...projectText].join("\n\n")}\n\nRead one with mbx_read {"ids": ["<id>"]}.`, { messages: rows.map(brief), ...projectOut });
   });
 
   server.registerTool("mbx_read", {
@@ -1502,10 +1510,11 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
     description: "Mark messages as dealt with (optionally with a short note). Acked messages leave the unread inbox. Ack after you reply or act; no need to send a separate \"acknowledged\" message. Keep `did` to one line of at most 200 characters, action first; put detail in your thread reply. Next: mbx_inbox for anything else.",
     inputSchema: { ids: z.array(z.string().min(6)).min(1).max(50), note: z.string().max(500).optional(),
       // No schema max: an over-long line must never fail the acks themselves; node.ack keeps it bounded and marked.
-      did: z.string().max(10_000).optional().describe("if you acted on the request: one line, at most 200 characters, saying what you did, action first (owner's audit log; longer text is cut and marked truncated)") },
+      did: z.string().max(10_000).optional().describe("if you acted on the request: one line, at most 200 characters, saying what you did, action first (owner's audit log; longer text is cut and marked truncated)"),
+      project: z.string().min(1).max(200).optional().describe("the project mailbox (its bare name) whose copy to acknowledge, when you lead the project and the message also reached you personally; otherwise your own copy is acknowledged first") },
     annotations: { idempotentHint: true },
-  }, ({ ids, note, did }) => {
-    const acked = ids.map((i) => node.ack(i, current().agent, note ?? null, did)), warning = didWarning(did);
+  }, ({ ids, note, did, project }) => {
+    const acked = ids.map((i) => node.ack(i, current().agent, note ?? null, did, project === undefined ? {} : { project })), warning = didWarning(did);
     return text(`Acked: ${acked.join(", ")}${warning ? `\nwarning: ${warning}` : ""}`);
   });
 

@@ -9,7 +9,7 @@ import { procTable } from "./proc.js";
 import { activityKey, parseActivity, SHARED_IDLE_MS } from "./identity-availability.js";
 import { remoteReceipts } from "./remote-receipts.js";
 import { isSlotName } from "./project-slot.js";
-import { projectLabel, projectReader } from "./project-mailbox.js";
+import { projectLabel, projectMailboxBySlot, projectReader } from "./project-mailbox.js";
 /** A holder renews its lease every minute; three missed beats mean its session is suspended or gone. */
 const STALE_HEARTBEAT_MS = 3 * 60_000;
 const iso = (ms) => new Date(ms).toISOString();
@@ -87,6 +87,15 @@ export function recipientReceipts(node, msgId, targets, now = Date.now()) {
             continue;
         }
         const live = mailboxLiveness(node, name, now);
+        if (isSlotName(name)) {
+            // T493: the recipient is the project, not a session. With no live lead it is queued exactly like mail to `lead` with no holder
+            // (T491); with one, the lead sees it in its project inbox section on its next prompt (waking it is the wake path's, not claimed here).
+            const box = projectMailboxBySlot(node.store, name), label = box ? projectLabel(box) : name;
+            out.push(live.live
+                ? { to: t.to, address, state: "live-next-prompt", detail: `addressed to the project mailbox ${label}; ${live.detail}; it sees this in its project inbox on its next prompt` }
+                : { to: t.to, address, state: "queued-no-holder", detail: `addressed to the project mailbox ${label}; ${live.detail}; it waits here until the project's lead reconnects or the owner designates one, and urgent mail is reported to the owner` });
+            continue;
+        }
         let state, detail;
         if (t.lead && !live.live) {
             // T491: `lead`/`role:lead` names the owner-designated lead. When its mailbox has no live holder the
