@@ -1332,6 +1332,8 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
       const taken = registeredIdentity(node.store, to);
       if (taken) throw Object.assign(new Error(`${to} is a registered identity (role ${taken.role}); to take it over, release yours and claim it with mbx_identity`), { code: "NAME_IN_USE" });
       if (AUTO_NAME_RE.test(to)) throw Object.assign(new Error(`"${to}" looks auto-generated; choose a readable name such as <project>-<role>`), { code: "IDENTITY_NAME_UNREADABLE" });
+      if (!node.knownLocalName(to) && reservedNewName(to, process.cwd()))
+        throw Object.assign(new Error(`${to} is reserved. Register a role persona such as <project>-<role>, not the project folder or a harness suffix.`), { code: "IDENTITY_NAME_UNREADABLE" });
       checkLegacy(to, state, node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions WHERE agent=?`).all(to) as LegacyBinding[]);
       const lease = leases.rename(agent, state.leaseToken!, to);
       node.addAlias(agent, to, env.ppid);

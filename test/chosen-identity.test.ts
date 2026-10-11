@@ -118,6 +118,23 @@ test("T492 the same persona claimed from claude and then codex keeps its mail an
   assert.equal(who.unread, 1);
 });
 
+test("T492 a whoami rename cannot land on the project folder or a harness suffix", async (t) => {
+  const { connect } = fixture(t);
+  const c = await connect("sess-rename");
+  const reg = await c.callTool({ name: "mbx_identity", arguments: { action: "register", name: "orbit-lead", role: "lead" } });
+  assert.notEqual(reg.isError, true, textOf(reg));
+  const folder = await c.callTool({ name: "mbx_whoami", arguments: { name: "orbit" } });
+  assert.equal(folder.isError, true);
+  assert.match(textOf(folder), /orbit is reserved/);
+  const harness = await c.callTool({ name: "mbx_whoami", arguments: { name: "orbit-claude" } });
+  assert.equal(harness.isError, true);
+  assert.match(textOf(harness), /orbit-claude is reserved/);
+  assert.equal(json(await c.callTool({ name: "mbx_whoami", arguments: {} })).agent, "orbit-lead", "a refused rename leaves the persona in place");
+  const ok = await c.callTool({ name: "mbx_whoami", arguments: { name: "orbit-reviewer" } });
+  assert.notEqual(ok.isError, true, textOf(ok));
+  assert.equal(json(ok).agent, "orbit-reviewer");
+});
+
 test("a resumed session gets its own identity back; another session in the folder never takes it", async (t) => {
   const { node, connect } = fixture(t);
   const a = await connect("sess-a");
