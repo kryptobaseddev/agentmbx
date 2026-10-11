@@ -15,6 +15,7 @@ import {
   type Draft, type AuthorityCheck, type Envelope, type Grant,
 } from "./envelope.ts";
 import { ownerPublicKey } from "./owner.ts";
+import { auditLeadGrantUse, leadGrantForSender } from "./lead-grants.ts";
 import { effectivePolicy, policyLine } from "./policy.ts";
 import { procStart, procTable, provenProcess, sameProcess } from "./proc.ts";
 import { bumpPostToolMarker, bumpPostToolMarkersForAgent } from "./posttool.ts";
@@ -951,7 +952,8 @@ export class MbxNode {
     const envelope = JSON.parse(m.envelope) as Envelope;
     const keys = (m.origin === "local" && fromHost === this.host) || (m.origin === fromHost && m.trust === "verified") ? this.hostKeys(fromHost) : [];
     const senderVerified = envelope.from === m.from_addr && envelope.sig?.host === fromHost && keys.some((k) => verifyEnvelope(envelope, k));
-    return effectivePolicy(this.store.db, { agent, host: this.host, fromAgent, fromHost, envelope, senderVerified });
+    const lead = senderVerified ? leadGrantForSender(this, agent, fromAgent, fromHost) : null;
+    return effectivePolicy(this.store.db, { agent, host: this.host, fromAgent, fromHost, envelope, senderVerified, lead });
   }
 
   /** A thread's messages, oldest first; with `agent`, only the ones that agent can see. */
@@ -1011,12 +1013,25 @@ export class MbxNode {
 }
 
 // ---- presentation (shared by CLI and MCP) -----------------------------------------------------
+/** One `lead.grant_used` row the first time a message's lead segment is shown. A second read of the same message does not write another. */
+function auditLeadRead(node: MbxNode, agent: string, messageId: string, lead: { lead: string; record: string; grant: string; exp: string } | undefined): void {
+  if (!lead) return;
+  const wrote = node.store.db.prepare("INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO NOTHING").run(`lead-read:${messageId}:${lead.grant}`, "1");
+  if (wrote.changes !== 1) return;
+  auditLeadGrantUse(node.store, { grant: { lead: lead.lead, record: lead.record, grants: lead.grant, exp: lead.exp }, agent, cli: "", via: "read" });
+}
+
 /** A message framed for `agent`, with the policy line computed on this host. */
 export function formatFor(node: MbxNode, m: MessageRow, agent: string): string {
   const row = node.currentAuthority(m), a = storedAuthority(row);
   // An owner-signed message is the owner's own task: "policy: ask" beside "authority: OWNER" read as a contradiction (T022).
-  const policy = a?.ok ? `policy: n/a, owner authority applies${a.session === "signed by the owner" ? "" : " within its caps"} (delegation policies limit only other agents' requests)`
-    : policyLine(node.policyFor(m, agent));
+  let policy: string;
+  if (a?.ok) policy = `policy: n/a, owner authority applies${a.session === "signed by the owner" ? "" : " within its caps"} (delegation policies limit only other agents' requests)`;
+  else {
+    const decided = node.policyFor(m, agent);
+    auditLeadRead(node, agent, m.id, decided.lead);
+    policy = policyLine(decided);
+  }
   // T208: a project lead re-delivered this message to `agent`; the policy above still comes from the original sender
   const lead = node.store.get(`forwarded:${m.id}:${agent}`);
   // T493: say which project mailbox a message was addressed to, in words, instead of its reserved slot name.

@@ -16,9 +16,10 @@ import { killSwitchSince, within } from "./policy.js";
 import { resolveProject } from "./project-key.js";
 import { sessionUntainted } from "./session-taint.js";
 const H = 3_600_000;
-/** What an owner can delegate through a lead record: only what has an enforcement point. read and edit are policy-line text with
- *  none yet (T551), and a signature must not gain effect later by an upgrade; `outward` and `permissions` are never delegated. */
-export const DELEGABLE_CLASSES = ["outward-reversible"];
+/** What an owner can delegate through a lead record. read and edit are enforced on the policy line (T551).
+ *  A stored outward-reversible-only blob does not gain those classes; they appear only on a fresh signature.
+ *  `outward` and `permissions` are never delegated. */
+export const DELEGABLE_CLASSES = ["outward-reversible", "read", "edit"];
 /** A grant lives at most as long as a collaborate policy (720 h) and never past the lead record it hangs on. */
 export const GRANT_MAX_TTL_MS = 720 * H;
 const LeadGrantsSchema = z.object({
@@ -32,9 +33,8 @@ const fail = (code, message) => { throw Object.assign(new Error(message), { code
 function checkShape(g) {
     for (const c of g.classes) {
         if (!DELEGABLE_CLASSES.includes(c)) {
-            return c === "read" || c === "edit" ? `class "${c}" has no enforcement point yet (T551); only ${DELEGABLE_CLASSES.join(", ")} can be delegated`
-                : c === "outward" || c === "permissions" ? `class "${c}" is never delegated through a lead record (only ${DELEGABLE_CLASSES.join(", ")})`
-                    : `unknown class "${c}" (only ${DELEGABLE_CLASSES.join(", ")} can be delegated)`;
+            return c === "outward" || c === "permissions" ? `class "${c}" is never delegated through a lead record (only ${DELEGABLE_CLASSES.join(", ")})`
+                : `unknown class "${c}" (only ${DELEGABLE_CLASSES.join(", ")} can be delegated)`;
         }
     }
     if (new Set(g.classes).size !== g.classes.length)
@@ -65,13 +65,19 @@ export function makeLeadGrants(o) {
         fail("LEAD_GRANTS_INVALID", bad);
     return g;
 }
-const CLASS_TEXT = { "outward-reversible": "push a non-default branch and open a draft PR" };
+const CLASS_TEXT = {
+    "outward-reversible": "push a non-default branch and open a draft PR",
+    read: "inspect, verify and test",
+    edit: "make reversible changes inside the project",
+};
 /** One plain line: what the owner is signing. Shown before the signature. */
 export function leadGrantsSummary(g, lead) {
     const who = g.agents.includes("*")
         ? `ANY persona that is a member of project ${lead.project} (a session becomes a member by registering itself with mbx_identity)`
         : `${g.agents.join(", ")}, as members of project ${lead.project}`;
-    return `Let ${who} ${g.classes.map((c) => CLASS_TEXT[c] ?? c).join(" and ")} with automatic approval, while ${lead.agent}@${lead.host} (the lead) `
+    const acts = g.classes.map((c) => CLASS_TEXT[c] ?? c).join(" and ");
+    const how = g.classes.length === 1 && g.classes[0] === "outward-reversible" ? "with automatic approval" : "on that lead's requests";
+    return `Let ${who} ${acts} ${how}, while ${lead.agent}@${lead.host} (the lead) `
         + `is live and not tainted by outside content, until ${g.exp}. Granted through lead record ${lead.id}; it ends with that record or with a policy kill switch.`;
 }
 /** Store a signed grants blob on the lead's current record. One immutable blob per record: to change grants the owner signs a new lead record. */
@@ -208,4 +214,42 @@ export function auditLeadGrantUse(store, d) {
         return;
     store.audit("lead.grant_used", { persona: d.agent ?? null, cli: d.cli, session_id: d.session_id ?? null, tool: d.tool ?? null, class: d.class ?? null,
         action: d.action ?? null, cwd: d.cwd ?? null, lead: d.grant.lead, record: d.grant.record, grants: d.grant.grants, exp: d.grant.exp, ...(d.via ? { via: d.via } : {}) });
+}
+function coveringLeadGrant(node, recipient, now) {
+    const members = node.store.db.prepare("SELECT project, project_key FROM identity_projects WHERE name=?").all(recipient);
+    for (const m of members) {
+        const lead = leadFor(node, m.project, m.project_key ?? m.project, now);
+        if (!lead || lead.host !== node.host || lead.agent === recipient)
+            continue;
+        const g = verifiedLeadGrants(node, lead, now);
+        if (!g || !(g.agents.includes(recipient) || g.agents.includes("*")))
+            continue;
+        if (killSwitchSince(node.store.db, g.iat, g.owner_fp))
+            continue;
+        if (leadLiveness(node.store, lead, now.getTime()) !== "ok")
+            continue;
+        return { classes: g.classes, project: m.project, record: lead.id, grant: g.id, exp: g.exp, lead: `${lead.agent}@${lead.host}` };
+    }
+    return null;
+}
+/** The grant a lead's message carries for `recipient`. Nothing unless the sender is that live lead, and never when the lead writes to themselves. */
+export function leadGrantForSender(node, recipient, fromAgent, fromHost, now = new Date()) {
+    if (!fromAgent || fromAgent === recipient || fromHost !== node.host)
+        return null;
+    const g = coveringLeadGrant(node, recipient, now);
+    if (!g)
+        return null;
+    const at = g.lead.split("@");
+    return at[0] === fromAgent && at[1] === fromHost ? g : null;
+}
+/** The grant covering `recipient` for whoami and session-start, with no sender. */
+export function leadGrantCovering(node, recipient, now = new Date()) {
+    return coveringLeadGrant(node, recipient, now);
+}
+/** One `lead.grant_used` row per session-start call. Returns the covering grant so the note can name it. */
+export function sessionStartLeadAudit(node, agent, cli) {
+    const g = leadGrantCovering(node, agent);
+    if (g)
+        auditLeadGrantUse(node.store, { grant: { lead: g.lead, record: g.record, grants: g.grant, exp: g.exp }, agent, cli, via: "session-start" });
+    return g;
 }

@@ -281,12 +281,23 @@ export function killSwitchSince(db: DatabaseSync, iat: string, ownerFp: string):
 
 /** One policy's grant: its classes only apply within its own projects (no mixing scopes across policies). */
 export interface Grant { id: string; level: Level; classes: PolicyClass[]; projects: string[]; exp: string | null }
-export interface Effective { level: Level; classes: PolicyClass[]; ids: string[]; exp: string | null; projects: string[]; grants: Grant[]; notes: string[]; hop?: number; depthSuppressed?: boolean }
+/** A lead grant passed into effectivePolicy. Classes stay in the signed order. policy.ts does not import lead-grants.ts. */
+export interface LeadSegment { classes: PolicyClass[]; project: string; record: string; grant: string; exp: string; lead: string }
+export interface Effective { level: Level; classes: PolicyClass[]; ids: string[]; exp: string | null; projects: string[]; grants: Grant[]; notes: string[]; hop?: number; depthSuppressed?: boolean; lead?: LeadSegment }
 
 const ORDER = (l: Level) => LEVELS.indexOf(l);
 
-/** What the receiving agent may do for this message's sender. Downgrades apply even under yolo. */
-export function effectivePolicy(db: DatabaseSync, o: { agent: string; host: string; fromAgent: string; fromHost: string; envelope?: Envelope; senderVerified?: boolean; now?: Date }): Effective {
+function leadSegment(o: { lead?: { classes: readonly string[]; project: string; record: string; grant: string; exp: string; lead: string } | null; envelope?: Envelope }): LeadSegment | undefined {
+  const src = o.lead;
+  if (!src) return undefined;
+  let classes = src.classes.filter((c): c is PolicyClass => (CLASSES as readonly string[]).includes(c));
+  if ((o.envelope?.meta as { origin?: string } | undefined)?.origin === "external") classes = classes.filter((c) => c === "read");
+  if (!classes.length) return undefined;
+  return { classes, project: src.project, record: src.record, grant: src.grant, exp: src.exp, lead: src.lead };
+}
+
+/** What the receiving agent may do for this message's sender. Downgrades apply even under yolo. The lead grant is passed in; this function does not look it up. */
+export function effectivePolicy(db: DatabaseSync, o: { agent: string; host: string; fromAgent: string; fromHost: string; envelope?: Envelope; senderVerified?: boolean; now?: Date; lead?: { classes: readonly string[]; project: string; record: string; grant: string; exp: string; lead: string } | null }): Effective {
   if (o.envelope && checkShape(o.envelope)) return { level: "ask", classes: [], ids: [], exp: null, projects: [], grants: [], notes: ["malformed-envelope: stored message structure is invalid"] };
   if (o.envelope && (o.envelope.meta.sender_verification !== "leased" || o.senderVerified !== true)) return { level: "ask", classes: [], ids: [], exp: null, projects: [], grants: [], notes: ["unverified-sender: the claimed identity has no verified lease"] };
   const isLocal = o.fromHost === o.host;
@@ -306,7 +317,13 @@ export function effectivePolicy(db: DatabaseSync, o: { agent: string; host: stri
   const hostOk = (h: string[]) => h.includes("*") || (isLocal ? h.includes("local") || h.includes(o.host) : h.includes(o.fromHost)) || h.some(principalOk);
   const ps = activePolicies(db, o.agent, o.host, o.now).filter((p) => matches(p.from.agents, o.fromAgent) && hostOk(p.from.hosts));
   const notes: string[] = [];
-  if (!ps.length) return { level: "ask", classes: [], ids: [], exp: null, projects: [], grants: [], notes };
+  if (!ps.length) {
+    const lead = leadSegment(o);
+    if (!lead) return { level: "ask", classes: [], ids: [], exp: null, projects: [], grants: [], notes };
+    const hop = Math.max(0, (o.envelope?.meta as { hop?: number } | undefined)?.hop ?? 0);
+    // A lead grant is not an owner policy, and it must not render as ask or the message will not wake.
+    return { level: "collaborate", classes: lead.classes, ids: [], exp: lead.exp, projects: [lead.project], grants: [], notes, lead, ...(o.envelope ? { hop } : {}) };
+  }
   let grants: Grant[] = ps.map((p) => ({ id: p.id, level: p.level, classes: [...p.classes], projects: p.projects ?? [], exp: p.exp }));
   const e = o.envelope, meta = (e?.meta ?? {}) as { origin?: string; hop?: number };
   if (meta.origin === "external") { grants = grants.map((g) => ({ ...g, classes: g.classes.filter((c) => c === "read") })); notes.push("content from outside (origin: external): read only"); }
@@ -321,7 +338,11 @@ export function effectivePolicy(db: DatabaseSync, o: { agent: string; host: stri
   grants = grants.filter((g) => g.classes.length || g.level !== "ask");
   const level = grants.reduce((a, g) => (ORDER(g.level) > ORDER(a) ? g.level : a), "ask" as Level);
   const classes = CLASSES.filter((c) => grants.some((g) => g.classes.includes(c)));
-  return { level, classes, ids: ps.map((p) => p.id), exp: ps.flatMap((p) => p.exp === null ? [] : [p.exp]).sort()[0] ?? null, projects: [...new Set(grants.flatMap((g) => g.projects))], grants, notes,
+  const lead = leadSegment(o);
+  const levelOut = level === "ask" && lead ? "collaborate" : level;
+  const merged = CLASSES.filter((c) => classes.includes(c) || (lead?.classes.includes(c) ?? false));
+  return { level: levelOut, classes: merged, ids: ps.map((p) => p.id), exp: ps.flatMap((p) => p.exp === null ? [] : [p.exp]).sort()[0] ?? null, projects: [...new Set(grants.flatMap((g) => g.projects))], grants, notes,
+    ...(lead ? { lead } : {}),
     ...(e ? { hop, depthSuppressed: originalLevel !== "ask" && level === "ask" && over.size > 0 } : {}) };
 }
 
@@ -355,16 +376,22 @@ export function hasClass(db: DatabaseSync, agent: string, host: string, cls: Pol
 
 const hhmm = (iso: string) => iso.slice(0, 16).replace("T", " ") + "Z";
 
-/** The header line every delivered message carries. */
+/** The header line every delivered message carries. A lead segment is not an owner-signed grant, and it is not dropped when relay depth is high. */
 export function policyLine(p: Effective): string {
-  if (!p.ids.length) return "policy: ask (no owner policy covers this sender): reply, answer and ack freely; ask your user before acting";
-  if (!p.grants.length) return [`policy: ask (owner policy ${p.ids.map((i) => i.slice(-6)).join(",")} doesn't allow acting on this message): reply, answer and ack; ask your user before acting`,
+  const g = p.lead;
+  const leadSeg = g?.classes.length
+    ? `lead-delegated [${g.classes.join(", ")}] in ${g.project} · lead-record ${g.record.slice(-6)} · grant ${g.grant.slice(-6)} · expires ${hhmm(g.exp)} · relay depth ${p.hop ?? 0} (no limit for lead-delegated)`
+    : "";
+  if (!p.ids.length && !leadSeg) return "policy: ask (no owner policy covers this sender): reply, answer and ack freely; ask your user before acting";
+  if (!p.grants.length && !leadSeg) return [`policy: ask (owner policy ${p.ids.map((i) => i.slice(-6)).join(",")} doesn't allow acting on this message): reply, answer and ack; ask your user before acting`,
     ...p.notes.map((n) => `note: ${n}`)].join(" · ");
-  const depth = (g: Grant) => p.hop === undefined ? "" : Number.isFinite(maxHopFor(g.level))
-    ? ` · relay depth ${p.hop} of ${maxHopFor(g.level)} (acting grants: no limit)` : ` · relay depth ${p.hop} (no limit for ${g.level})`;
-  const grant = (g: Grant) => `${g.level === "yolo" && g.classes.includes("permissions") ? "YOLO" : g.level} [${g.classes.join(", ") || "reply only"}]`
-    + ` in ${g.projects.length ? g.projects.join(", ") : "your session's project"} · owner-signed ${g.id.slice(-6)} · ${g.exp === null ? "never expires" : `expires ${hhmm(g.exp)}`}${depth(g)}`;
-  return [`policy: ${p.grants.map(grant).join(" ; ")}`, ...p.notes.map((n) => `note: ${n}`)].join(" · ");
+  const depth = (grantRow: Grant) => p.hop === undefined ? "" : Number.isFinite(maxHopFor(grantRow.level))
+    ? ` · relay depth ${p.hop} of ${maxHopFor(grantRow.level)} (acting grants: no limit)` : ` · relay depth ${p.hop} (no limit for ${grantRow.level})`;
+  const grant = (grantRow: Grant) => `${grantRow.level === "yolo" && grantRow.classes.includes("permissions") ? "YOLO" : grantRow.level} [${grantRow.classes.join(", ") || "reply only"}]`
+    + ` in ${grantRow.projects.length ? grantRow.projects.join(", ") : "your session's project"} · owner-signed ${grantRow.id.slice(-6)} · ${grantRow.exp === null ? "never expires" : `expires ${hhmm(grantRow.exp)}`}${depth(grantRow)}`;
+  const owner = p.grants.map(grant).join(" ; ");
+  const head = owner && leadSeg ? `${owner} ; ${leadSeg}` : owner || leadSeg;
+  return [`policy: ${head}`, ...p.notes.map((n) => `note: ${n}`)].join(" · ");
 }
 
 /** Keep each grant's constraints together: merging classes or expiries invents authority. */
@@ -372,17 +399,21 @@ const noticeGrant = (p: PolicyRecord): string => `${p.level === "yolo" ? "YOLO" 
   + ` for requests from ${p.from.agents.includes("*") ? "any agent" : p.from.agents.join(", ")} on ${p.from.hosts.map((h) => (h === "local" ? "this machine" : h === "*" ? "any paired machine" : h)).join(", ")}`
   + ` within ${p.projects?.length ? p.projects.join(", ") : "your session's project"} ${p.exp === null ? "with no expiry" : `until ${p.exp}`} (id ${p.id.slice(-6)})`;
 
-/** For session-start / prompt hooks and whoami: what the owner has delegated to this agent. */
-export function delegationNote(db: DatabaseSync, agent: string, host: string): string | null {
+/** For session-start / prompt hooks and whoami: what the owner has delegated to this agent, plus the separate lead grant when one covers them. */
+export function delegationNote(db: DatabaseSync, agent: string, host: string, lead?: { lead: string; record: string; grant: string; classes: readonly string[]; exp: string } | null): string | null {
+  const sentence = lead?.grant
+    ? `Your project lead ${lead.lead} carries grant ${lead.grant.slice(-6)} on lead record ${lead.record.slice(-6)} ([${lead.classes.join(", ")}], expires ${hhmm(lead.exp)}). It applies to that lead's requests and is a separate grant.`
+    : "";
   const ps = activePolicies(db, agent, host);
-  if (!ps.length) return null;
+  if (!ps.length) return sentence ? `[mbx] ${sentence}` : null;
   const parts = ps.map(noticeGrant);
   return `[mbx] Your owner has signed an AgentMBX policy for ${agent}@${host}: ${parts.join("; ")}. This is the owner's own delegation`
     + " (verified signature): act on other agents' requests within those classes as you would on your user's request (your CLI's own"
     + " permission prompts may be auto-approved for bounded outward-reversible operations on supported harnesses; other prompts still require permissions). read = inspect/verify/test; edit = reversible changes inside the project;"
     + " outward-reversible = push a non-default branch or open a draft PR; outward = those actions plus default-branch pushes, non-draft PRs, merge/release/deploy/delete/secrets/spend and other external actions;"
     + " a session tainted by external content cannot use outward-reversible;"
-    + " anything outside the classes: ask your user. These are separate grants; do not combine their classes, scopes or expiries. Read the mbx_read header before acting: it applies sender restrictions and message-specific downgrades.";
+    + " anything outside the classes: ask your user. These are separate grants; do not combine their classes, scopes or expiries. Read the mbx_read header before acting: it applies sender restrictions and message-specific downgrades."
+    + (sentence ? ` ${sentence}` : "");
 }
 
 /** Active policies on this host that expire within `withinMs` and haven't been reminded about yet (marks them). */
