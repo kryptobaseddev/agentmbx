@@ -236,8 +236,9 @@ export function pendingIdentities(node: MbxNode): Check[] {
 /** One line on how much `agentmbx identity prune` would retire (T211). Read-only. */
 export function pruneSummary(node: MbxNode): Check {
   const { retire } = pruneCandidates(node);
+  const forwarded = retire.filter((r) => r.forward).length;
   return retire.length
-    ? { level: "warn", label: `${retire.length} generated mailbox(es) with no holder, no unread mail and no recent traffic would be retired`, fix: "review the list: agentmbx identity prune   (a dry run), then apply it: agentmbx identity prune --apply" }
+    ? { level: "warn", label: `${retire.length} generated mailbox(es) with no holder and no recent traffic would be retired${forwarded ? ` (${forwarded} with unread mail that goes to its project mailbox)` : ""}`, fix: "review the list: agentmbx identity prune   (a dry run), then apply it: agentmbx identity prune --apply" }
     : { level: "info", label: "no generated mailboxes eligible for prune" };
 }
 

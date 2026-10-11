@@ -421,7 +421,7 @@ const RATCHET: Record<string, { max: number; category: Category; why: string }> 
   "src/diagnostics.ts": { max: 2, category: "by name (the caller's own mailbox)", why: "scoped to one mailbox argument" },
   "src/doctor.ts": { max: 1, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "strandedMail recognises slots and shows the lead's remedy instead of 'claim'" },
   "src/hud.ts": { max: 2, category: "by name (the caller's own mailbox)", why: "counts for the session's own agent" },
-  "src/identity-cleanup.ts": { max: 6, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "prune names exclude slots; forward refuses a slot as source or target (T495 owns lifting that)" },
+  "src/identity-cleanup.ts": { max: 7, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "prune names exclude slots; a prune forward and a lead forward move one named mailbox's unread rows through moveUnread (T495); the owner-signed forward still refuses a slot at either end" },
   "src/identity-status.ts": { max: 1, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "identity listing" },
   "src/loop-detector.ts": { max: 1, category: "per message", why: "the recipient list of one message" },
   "src/mcp.ts": { max: 3, category: "by name (the caller's own mailbox)", why: "handoff counts and the channel loop for the caller's agent" },

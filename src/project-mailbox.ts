@@ -125,6 +125,18 @@ export function rewriteProjectAliases(node: MbxNode, to: string[], project?: str
   return { to: out, notes };
 }
 
+/**
+ * The project keys a mailbox name belongs to. A project mailbox slot belongs to its own project. A persona belongs to the projects
+ * in its identity_projects bindings (T515: the explicit membership, never a cwd or a folder name): the CLEO id stored with the
+ * binding, else the folder, which is then the key (resolveProject, T543). Empty for a name bound to nothing.
+ */
+export function projectKeysOf(store: Store, name: string): string[] {
+  const box = projectMailboxBySlot(store, name);
+  if (box) return [box.key];
+  const rows = store.db.prepare("SELECT project,project_key FROM identity_projects WHERE name=?").all(name) as { project: string; project_key: string | null }[];
+  return [...new Set(rows.map((r) => r.project_key ?? r.project))].sort();
+}
+
 export interface ProjectReader { mailbox: ProjectMailbox; lead: LeadRecord | null }
 
 /**
@@ -150,12 +162,18 @@ export function projectReader(node: MbxNode, slot: string, now = new Date()): Pr
  * The project mailboxes whose current lead on this host is `agent`: owner-signed, unrevoked, unexpired, designated here. Database
  * reads only (it runs inside the caller's lease operation). A role label, a folder or an old lead record is not in this list.
  */
-export function projectsLedBy(node: MbxNode, agent: string, now = new Date()): ProjectMailbox[] {
+export const projectsLedBy = (node: MbxNode, agent: string, now = new Date()): ProjectMailbox[] => leadingReaders(node, agent, now).map((r) => r.mailbox);
+
+/**
+ * `projectsLedBy` with the lead record that makes `agent` the lead of each project, for an action that must name the record it acted
+ * on (T495). The one lookup behind reading, waking and moving project mail, so the three can never disagree about who leads.
+ */
+export function leadingReaders(node: MbxNode, agent: string, now = new Date()): (ProjectReader & { lead: LeadRecord })[] {
   const rows = node.store.db.prepare("SELECT key,slot,alias,home_host,source,folder,created_at FROM project_mailboxes WHERE home_host=?").all(node.host) as unknown as ProjectMailbox[];
-  const out: ProjectMailbox[] = [];
+  const out: (ProjectReader & { lead: LeadRecord })[] = [];
   for (const row of rows) {
     const lead = leadFor(node, row.folder ?? row.key, row.key, now);
-    if (lead && lead.host === node.host && lead.agent === agent) out.push({ ...row });
+    if (lead && lead.host === node.host && lead.agent === agent) out.push({ mailbox: { ...row }, lead });
   }
   return out;
 }
