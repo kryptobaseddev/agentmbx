@@ -407,9 +407,12 @@ export function delegationNote(db: DatabaseSync, agent: string, host: string, le
   const ps = activePolicies(db, agent, host);
   if (!ps.length) return sentence ? `[mbx] ${sentence}` : null;
   const parts = ps.map(noticeGrant);
+  const reversible = ps.some((p) => p.classes.includes("outward-reversible") || p.classes.includes("outward"));
+  const prompts = reversible
+    ? "your CLI's own permission prompts may be auto-approved for bounded outward-reversible operations on supported harnesses; other prompts still require permissions"
+    : "pushes and PRs are outside the grant; your CLI's permission prompts still require permissions";
   return `[mbx] Your owner has signed an AgentMBX policy for ${agent}@${host}: ${parts.join("; ")}. This is the owner's own delegation`
-    + " (verified signature): act on other agents' requests within those classes as you would on your user's request (your CLI's own"
-    + " permission prompts may be auto-approved for bounded outward-reversible operations on supported harnesses; other prompts still require permissions). read = inspect/verify/test; edit = reversible changes inside the project;"
+    + ` (verified signature): act on other agents' requests within those classes as you would on your user's request (${prompts}). read = inspect/verify/test; edit = reversible changes inside the project;`
     + " outward-reversible = push a non-default branch or open a draft PR; outward = those actions plus default-branch pushes, non-draft PRs, merge/release/deploy/delete/secrets/spend and other external actions;"
     + " a session tainted by external content cannot use outward-reversible;"
     + " anything outside the classes: ask your user. These are separate grants; do not combine their classes, scopes or expiries. Read the mbx_read header before acting: it applies sender restrictions and message-specific downgrades."
