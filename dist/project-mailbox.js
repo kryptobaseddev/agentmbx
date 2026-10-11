@@ -101,6 +101,12 @@ export function rewriteProjectAliases(node, to, project) {
     return { to: out, notes };
 }
 /**
+ * The agent that leads the project mailbox `slot` on this host right now, or null: no such mailbox, no lead, a lead designated for
+ * another host, an expired or a revoked record. The wake dispatcher keys project mail to this agent (T557); it is the same lookup
+ * `projectReader` and `projectsLedBy` end in, so who is woken and who may read can never disagree.
+ */
+export const leadAgentOf = (node, slot, now = new Date()) => projectReader(node, slot, now)?.lead?.agent ?? null;
+/**
  * The project mailbox for `slot` and the lead who may read it right now: the owner-signed, unrevoked, unexpired lead record for
  * the project's key, designated on THIS host (a lead elsewhere cannot read the home mailbox, T552). Null for a name that is not
  * an allocated slot. Re-verified on every call; a role label, a folder or a lead record alone is not read access to anything.
