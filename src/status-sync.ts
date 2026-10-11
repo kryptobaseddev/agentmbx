@@ -9,9 +9,9 @@ const NAME_RE = /^[a-z0-9][a-z0-9-]{1,39}$/;
 const ROLE_RE = /^[A-Za-z0-9][A-Za-z0-9 _-]{0,39}$/;
 const HOST_RE = /^[a-z0-9][a-z0-9-]{1,39}$/;
 const SEMVER_RE = /^\d{1,4}\.\d{1,4}\.\d{1,6}(?:-[0-9A-Za-z.-]{1,40})?$/;
-const CLIS = new Set(["claude", "codex", "kimi", "opencode", "hermes", "cli", "unknown"]);
+const CLIS = new Set(["claude", "codex", "kimi", "opencode", "hermes", "grok", "cli", "unknown"]);
 const LEVELS = new Set(["ask", "collaborate", "autonomous", "yolo"]);
-const CLASSES = new Set(["read", "edit", "outward", "permissions"]);
+const CLASSES = new Set(["read", "edit", "outward-reversible", "outward", "permissions"]);
 const STATES = new Set(["live", "idle", "offline", "pending", "conflict", "free", "retired", "unknown"]);
 const REACH = new Set(["reachable", "offline", "unknown"]);
 const RESOLVED = new Set(["manual", "alias", "lease", "project_match", "ambiguous"]);
@@ -52,6 +52,12 @@ function oneOf(value: unknown, allowed: Set<string>, fallback: string): string {
   return typeof value === "string" && allowed.has(value) ? value : fallback;
 }
 
+const STAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+function stamp(value: unknown): string | null {
+  return typeof value === "string" && STAMP_RE.test(value) && Number.isFinite(Date.parse(value)) ? value : null;
+}
+
 /** Copy only the allowlisted status fields. Returns undefined when the version or schema is not one the cloud can store. */
 export function allowStatus(input: unknown): StatusSync | undefined {
   const src = record(input);
@@ -64,8 +70,8 @@ export function allowStatus(input: unknown): StatusSync | undefined {
     if (!item || identities.length >= 500) continue;
     const name = text(item.name);
     const role = text(item.role);
+    if (!name || !NAME_RE.test(name) || !role || !ROLE_RE.test(role)) continue;
     const cli = text(item.harness_cli);
-    if (!name || !NAME_RE.test(name) || !role || !ROLE_RE.test(role) || !cli || !CLIS.has(cli)) continue;
     const lease = record(item.lease);
     const holder = lease ? text(lease.holder_cli) : undefined;
     const policy = record(item.policy);
@@ -75,9 +81,9 @@ export function allowStatus(input: unknown): StatusSync | undefined {
       role,
       state: oneOf(item.state, STATES, "offline") as StatusSync["identities"][number]["state"],
       registered: item.registered === true,
-      lease: holder && CLIS.has(holder) ? { holder_cli: holder, verified: lease?.verified === true } : null,
+      lease: holder ? { holder_cli: CLIS.has(holder) ? holder : "unknown", verified: lease?.verified === true } : null,
       unread: count(item.unread),
-      harness_cli: cli,
+      harness_cli: cli && CLIS.has(cli) ? cli : "unknown",
       policy: { level: oneOf(policy?.level, LEVELS, "ask"), classes },
     });
   }
@@ -103,7 +109,7 @@ export function allowStatus(input: unknown): StatusSync | undefined {
     const leadCli = lead ? text(lead.cli) : undefined;
     const members = Array.isArray(item.members) ? item.members.filter((entry): entry is string => typeof entry === "string" && NAME_RE.test(entry)).slice(0, 50) : [];
     projects.push({
-      lead: leadName && NAME_RE.test(leadName) && leadCli && CLIS.has(leadCli) ? { name: leadName, cli: leadCli } : null,
+      lead: leadName && NAME_RE.test(leadName) ? { name: leadName, cli: leadCli && CLIS.has(leadCli) ? leadCli : "unknown" } : null,
       members,
     });
   }
@@ -115,8 +121,8 @@ export function allowStatus(input: unknown): StatusSync | undefined {
     outbox_unsent: count(src.outbox_unsent),
     cloud: {
       relay_enrolled: cloud?.relay_enrolled === true,
-      last_ack: null,
-      key_ad_expiry: null,
+      last_ack: stamp(cloud?.last_ack),
+      key_ad_expiry: stamp(cloud?.key_ad_expiry),
       account: null,
     },
     devices,

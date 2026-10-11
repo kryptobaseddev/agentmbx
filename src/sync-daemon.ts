@@ -10,6 +10,7 @@ import { storedPolicies } from "./policy.ts";
 import { activeLead } from "./lead-record.ts";
 import { projectKey } from "./registry.ts";
 import { relayFor } from "./relay-client.ts";
+import { relayState } from "./relay-v2.ts";
 import { newSyncNonce, syncOnce, type SyncDeps, type SyncResult, type SyncSigner } from "./sync-client.ts";
 import { allowStatus } from "./status-sync.ts";
 import { CAPS, PATH_FLAG_PREFIX, PROJECT_KEY_RE, type AgentInput, type HostInput, type LeadInput, type PathInput, type PolicyInput, type ReceiptInput, type SyncSnapshot, type ThreadInput } from "./sync-projection.ts";
@@ -39,7 +40,7 @@ type MsgRow = { id: string; thread: string; kind: string; from_addr: string; tru
 type DelRow = { msg_id: string; agent: string; state: string; updated_at: string };
 
 /** Columns are listed on purpose: body, subject, envelope, description, note, session_id, pid, and token are never read. */
-export function loadSyncSnapshot(node: MbxNode, ctx: { contractAllowsProjectPaths: boolean }, projectKeyOf: (project: string) => string | undefined = projectKey): SyncSource {
+export function loadSyncSnapshot(node: MbxNode, ctx: { contractAllowsProjectPaths: boolean; lastAck?: string | null }, projectKeyOf: (project: string) => string | undefined = projectKey): SyncSource {
   const db = node.store.db;
   const hostName = node.host;
   const identities = db.prepare("SELECT name, role FROM identities").all() as { name: string; role: string }[];
@@ -158,6 +159,9 @@ export function loadSyncSnapshot(node: MbxNode, ctx: { contractAllowsProjectPath
 
   const policies = policyInputs(node, nowMs);
   const enrolled = relayEnrolled(node);
+  const relayUrl = relayFor(node);
+  const relay = relayUrl ? relayState(node, relayUrl) : null;
+  const keyAdExpiry = typeof relay?.enc_ad_exp === "string" ? relay.enc_ad_exp : null;
   const approved = node.peers().filter((peer) => peer.state === "approved");
   const outbox = db.prepare("SELECT COUNT(*) AS n FROM outbox").get() as { n: number };
   const membersByKey = new Map<string, string[]>();
@@ -183,7 +187,7 @@ export function loadSyncSnapshot(node: MbxNode, ctx: { contractAllowsProjectPath
       };
     }),
     outbox_unsent: outbox.n,
-    cloud: { relay_enrolled: enrolled, last_ack: null, key_ad_expiry: null, account: null },
+    cloud: { relay_enrolled: enrolled, last_ack: ctx.lastAck ?? null, key_ad_expiry: keyAdExpiry, account: null },
     devices: approved.map((peer) => ({ host: peer.host, reachability: "unknown", last_presence: null })),
     projects: [...membersByKey.entries()].map(([key, members]) => {
       const lead = leads.find((row) => row.project_key === key);

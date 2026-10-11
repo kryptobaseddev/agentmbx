@@ -83,6 +83,41 @@ test("no link means no fetch and no source call", async () => {
   assert.equal(sources, 0);
 });
 
+test("a strict 400 retries once without the status snapshot (T423)", async () => {
+  const kv = mem();
+  kv.set(LINK_KEY, JSON.stringify(link()));
+  const status = {
+    schema: "mbx.status/v2", mbx_version: "0.5.26",
+    identities: [
+      { name: "worker", role: "builder", state: "live", registered: true, lease: null, unread: 2, harness_cli: "grok", policy: { level: "autonomous", classes: ["outward-reversible", "read"] } },
+      { name: "other", role: "builder", state: "idle", registered: true, lease: null, unread: 0, harness_cli: "pi", policy: { level: "ask", classes: ["nope"] } },
+    ],
+    outbox_unsent: 1, devices: [], projects: [],
+    cloud: { relay_enrolled: true, last_ack: "2026-10-11T16:00:00.000Z", key_ad_expiry: "2026-11-11T16:00:00.000Z", account: "acct_other" },
+    resolved_by: "lease",
+  };
+  const bodies: string[] = [];
+  const result = await syncOnce({ signer: pop, kv, now: 1_710_000_000_000,
+    fetch: async (_url, init) => {
+      const text = String(init?.body ?? "");
+      bodies.push(text);
+      const seq = (JSON.parse(text) as { seq: number }).seq;
+      if (text.includes("mbx.status/v2")) return ok(seq, {}, 400);
+      return ok(seq);
+    },
+    source: () => ({ ...body(), status }),
+  });
+  assert.equal(result.outcome, "acked");
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0]!.includes("grok"), true);
+  assert.equal(bodies[0]!.includes("outward-reversible"), true);
+  assert.equal(bodies[0]!.includes("2026-10-11T16:00:00.000Z"), true);
+  assert.equal(bodies[0]!.includes("acct_other"), false);
+  assert.equal(bodies[0]!.includes("\"pi\""), false);
+  assert.equal(bodies[0]!.includes("other"), true);
+  assert.equal(bodies[1]!.includes("mbx.status/v2"), false);
+});
+
 test("a contract range that excludes version 1 makes no network call", async () => {
   const kv = mem();
   kv.set(LINK_KEY, JSON.stringify(link({ contract: { min: 2, max: 4 } })));
@@ -265,7 +300,7 @@ test("the daemon tick stays silent without a link, and a linked tick does not se
   assert.deepEqual(batch.threads.upsert[0].trust, ["unverified"]);
   assert.equal(batch.threads.upsert[0].subject_hash, null);
   assert.equal(batch.threads.upsert[0].max_relay_depth, 3);
-  assert.equal(posted.includes(`"grok"`), false);
+  assert.equal(posted.includes(`"harness_cli":"grok"`) || posted.includes(`"harness_cli": "grok"`), true);
   assert.equal(posted.includes(fingerprint(n.key.publicKey)), true);
 });
 

@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **Sync carries an allowlisted status snapshot (T423).** The daemon adds `mbx.status/v2` counts, enums, names and timestamps to the contract-1 host report. Subjects, bodies, paths, session ids, relay URLs, keys and tokens stay off the wire. `needs_reply` and `from_owner` stay off because those counts are read from message bodies. Contract 2 remains reserved for the lead record.
+- **Sync carries an allowlisted status snapshot (T423).** The daemon adds `mbx.status/v2` counts, enums, names and timestamps to the contract-1 host report. Subjects, bodies, paths, session ids, relay URLs, keys and tokens stay off the wire. `needs_reply` and `from_owner` stay off because those counts are read from message bodies. `grok` and `outward-reversible` are sent as themselves. `last_ack` is the previous sync ack time and `key_ad_expiry` is the relay key-ad expiry. A cloud that rejects the snapshot with HTTP 400 is retried once without it. Contract 2 remains reserved for the lead record.
 
 - **OpenCode plugin diagnostics distinguish wiring from runtime proof (T412).** Doctor reports managed, missing, outdated and foreign plugin wiring, then checks up to 20 exact session bindings using one bounded loopback waiter request and private HUD files. A matching session/pid waiter proves only a server wake poll; producer freshness uses the daemon heartbeat, never an unchanged snapshot's mtime. Missing or mismatched evidence remains explicit, and TUI loading, reading and render cost are unobserved. Checks expose no message subjects or counts, change no state, and point to `agentmbx setup --only opencode` without restarting sessions or overwriting foreign plugins.
 
