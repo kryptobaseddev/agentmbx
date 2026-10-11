@@ -1,7 +1,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { closeSync, existsSync, mkdtempSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -55,11 +55,10 @@ async function until(check: () => boolean, label: string, ms = 9000) {
 function world(t: TestContext) {
   const home = mkdtempSync(join(tmpdir(), "mbx-client-life-")), script = join(home, "fixture.mjs");
   writeFileSync(script, fixture);
-  const children: ChildProcessWithoutNullStreams[] = [], descendants = new Map<number, string>(), fds = new Set<number>();
+  const children: ChildProcess[] = [], descendants = new Map<number, string>();
   t.after(async () => {
-    for (const fd of fds) try { closeSync(fd); } catch { /* Already closed. */ }
     for (const p of children) {
-      p.stdin.destroy(); p.stdout.destroy(); p.stderr.destroy();
+      p.stdin?.destroy(); p.stdout?.destroy(); p.stderr?.destroy();
       if (p.exitCode === null && p.signalCode === null) p.kill("SIGKILL");
     }
     for (const [pid, start] of descendants) {
@@ -86,15 +85,19 @@ function world(t: TestContext) {
   };
   const duplicateWriter = (p: ChildProcessWithoutNullStreams) => {
     const raw = (p.stdin as unknown as { _handle: { fd: number } })._handle.fd;
-    const fd = openSync(`/dev/fd/${raw}`, "w"); fds.add(fd); return fd;
+    // Inherit the socket directly: Linux cannot reopen it through /dev/fd.
+    const writer = spawn(process.execPath, ["-e", "process.stdin.pipe(require('node:fs').createWriteStream(null, { fd: 3 }));"], { stdio: ["pipe", "pipe", "pipe", raw] });
+    children.push(writer);
+    assert.ok(writer.stdin);
+    writer.stdin.on("error", () => {});
+    return writer.stdin;
   };
-  const closeWriter = (fd: number) => { closeSync(fd); fds.delete(fd); };
   const remember = async (pid: number) => {
     let start: string | null = null;
     await until(() => { start = inspectLeaseProcess(pid).start; return !!start; }, "owned generation birth");
     descendants.set(pid, start!);
   };
-  return { home, children, run, duplicateWriter, closeWriter, remember };
+  return { home, children, run, duplicateWriter, remember };
 }
 
 test("client EOF exits within 10s and cleans up once", async t => {
@@ -126,7 +129,7 @@ test("recorded client death exits within 10s even when another process holds its
 });
 
 test("proxy death preserves a reparented generation's live client pipe, and EOF then exits", { skip: process.platform === "win32" }, async t => {
-  const w = world(t), { p, output, errors } = await w.run(), fd = w.duplicateWriter(p);
+  const w = world(t), { p, output, errors } = await w.run(), writer = w.duplicateWriter(p);
   p.stdin.write("handover\n");
   await until(() => /child (\d+)/.test(output()), `generation spawn: ${errors()}`);
   const child = Number(/child (\d+)/.exec(output())![1]);
@@ -137,9 +140,9 @@ test("proxy death preserves a reparented generation's live client pipe, and EOF 
   p.kill("SIGTERM");
   await until(() => p.exitCode !== null, "proxy SIGTERM exit");
   await until(() => procTable(0).get(child)?.ppid === 1, "generation reparented to PID 1");
-  writeSync(fd, "ping\n");
+  writer.write("ping\n");
   await until(() => output().includes(`pong ${child}\n`), `reparented generation serves: ${errors()}`);
-  w.closeWriter(fd);
+  writer.end();
   await until(() => inspectLeaseProcess(child).alive === false, "reparented generation exits on client EOF");
 });
 
