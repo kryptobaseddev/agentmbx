@@ -16,10 +16,13 @@ import { procSeams } from ${JSON.stringify(new URL("../src/proc.ts", import.meta
 import { spawn } from 'node:child_process';
 import { appendFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
+import { DatabaseSync } from 'node:sqlite';
 const life = startMcpLifecycle(process.env.MBX_HOME);
+const db = new DatabaseSync(':memory:');
 if (process.env.FAIL_PS) { procSeams.platform = 'darwin'; procSeams.ps = () => { throw new Error('inspection unavailable'); }; }
 life.watchClient({ pid: Number(process.env.MBX_MCP_PROVIDER_PID), start: process.env.MBX_MCP_PROVIDER_START });
 life.onShutdown(() => {
+  db.close();
   appendFileSync(process.env.MBX_HOME + '/cleanup', process.pid + '\\n');
   if (process.env.CLEANUP_FAIL) throw new Error('cleanup failed');
 });
@@ -35,7 +38,7 @@ input.on('line', line => {
   if (line === 'handover-pending') {
     life.retireToProxy(); input.close(); process.stdin.pause();
     process.on('SIGTERM', () => {});
-    process.stdout.write('pending\\n');
+    process.stdout.write('pending ' + db.prepare('SELECT 1 n').get().n + '\\n');
   }
   if (line === 'reused-generation') {
     recordMcpGeneration(process.env.MBX_HOME, process.pid, { pid: Number(process.env.MBX_MCP_PROVIDER_PID), start: 'ps-utc:Mon Oct 12 11:00:00 2026' });
@@ -172,10 +175,12 @@ test("EOF exits a paused proxy after its current generation stops", async t => {
 test("SIGTERM during pending handover exits despite another signal handler and cleanup failure", async t => {
   const w = world(t), { p, output, errors } = await w.run({ CLEANUP_FAIL: "1" });
   p.stdin.write("handover-pending\n");
-  await until(() => output().includes("pending\n"), "handover pending");
+  await until(() => output().includes("pending 1\n"), "proxy retirement keeps the mailbox open");
+  assert.equal(existsSync(join(w.home, "cleanup")), false, "proxy retirement does not run shutdown cleanup");
   p.kill("SIGTERM");
   await until(() => p.exitCode !== null, "SIGTERM exit");
   assert.equal(p.exitCode, 143); assert.match(errors(), /cleanup failed/);
+  assert.equal(existsSync(join(w.home, "cleanup")), true, "real shutdown runs cleanup");
 });
 
 test("SIGTERM before any client request exits", async t => {

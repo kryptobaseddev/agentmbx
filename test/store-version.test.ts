@@ -58,14 +58,22 @@ test("every MCP tool refuses an upgraded schema before its callback", async (t) 
     mbx_catchup: {},
   };
   const tools = (await client.listTools()).tools;
+  const holderPid = n.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE released_at IS NULL").get()!.holder_pid;
   n.store.db.exec(`PRAGMA user_version=${SCHEMA_VERSION + 1}`);
   for (const tool of tools) {
     assert.ok(args[tool.name], `supply valid input for ${tool.name}`);
     const result = await client.callTool({ name: tool.name, arguments: args[tool.name] });
     assert.equal(result.isError, true, tool.name);
     assert.match(JSON.stringify(result.content), /Restart your CLI session/, tool.name);
+    // Let a replacement start and the lifecycle poll run before checking the remaining callbacks.
+    if (tool === tools[0]) await new Promise(resolve => setTimeout(resolve, 2100));
   }
+  assert.equal(n.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE released_at IS NULL").get()!.holder_pid, holderPid,
+    "the identical installed build cannot resolve the mismatch by replacing the serving process");
   assert.equal((n.store.db.prepare("SELECT count(*) n FROM messages").get() as { n: number }).n, 0);
+  assert.equal(n.store.schemaVersion(), SCHEMA_VERSION + 1, "refusal leaves the upgraded schema intact");
+  n.store.db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`);
+  assert.notEqual((await client.callTool({ name: "mbx_whoami", arguments: {} })).isError, true, "the serving mailbox stays open");
 });
 
 test("v1 lease migration preserves signed message bytes and pending/acked delivery history", (t) => {
