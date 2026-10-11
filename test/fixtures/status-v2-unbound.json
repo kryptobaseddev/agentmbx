@@ -1,0 +1,12 @@
+{
+  "schema": "mbx.status/v2",
+  "mbx_version": "0.5.26",
+  "identity": { "name": null, "role": null, "state": "unbound" },
+  "registration": { "registered": false, "lease": null },
+  "inbox": { "unread": 0, "needs_reply": 0, "from_owner": 0, "outbox_unsent": 0 },
+  "harness": { "cli": "opencode", "session_id": "ses_fixture", "wake_path": "none", "policy": [] },
+  "cloud": { "relay": { "url": null, "state": "unset", "last_ack": null }, "key_ad_expiry": null, "account": null },
+  "devices": [],
+  "project": null,
+  "resolved_by": "none"
+}

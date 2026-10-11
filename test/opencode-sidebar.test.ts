@@ -5,11 +5,12 @@
 // and never derives anything itself.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { opencodeSidebarSource, opencodeSidebarServerSource, opencodeSidebarPackageJson, OPENCODE_SIDEBAR_MARKER } from "../src/opencode-sidebar.ts";
 import { version } from "../src/version.ts";
+import { STATUS_V2_SCHEMA, type StatusV2 } from "../src/status-schema.ts";
 
 // The consumer contract, copied from plugins/claude/fixtures/v2-*.json on feat/t401-claude-mod.
 const FIXTURE_BOUND = {
@@ -241,4 +242,49 @@ test("T410: switching sessions drops old data immediately and rejects a late res
   await ui.status();
   assert.match(textOf(beta), /opencode-goal-dev/);
   assert.doesNotMatch(textOf(beta), /LATE ALPHA MAIL|↑|↺/);
+});
+
+for (const state of ["bound", "unbound", "cloud-down", "peers-down"]) test(`T413: shared ${state} fixture renders without a daemon`, async t => {
+  const fixture = JSON.parse(readFileSync(join(import.meta.dirname, "fixtures", `status-v2-${state}.json`), "utf8")) as StatusV2;
+  assert.equal(fixture.schema, STATUS_V2_SCHEMA);
+  assert.ok(["bound", "unbound", "ambiguous"].includes(fixture.identity.state));
+  for (const count of Object.values(fixture.inbox)) assert.ok(Number.isSafeInteger(count) && count >= 0);
+  assert.equal(typeof fixture.cloud.relay.state, "string");
+  for (const peer of fixture.devices) {
+    assert.equal(typeof peer.host, "string");
+    assert.equal(typeof peer.reachability, "string");
+    assert.ok(peer.last_presence === null || typeof peer.last_presence === "string");
+  }
+  // Adapt only the host correlation: the shared bound fixture also serves non-OpenCode consumers.
+  const sid = "ses_sharedFixture", snapshot = { ...fixture, harness: { ...fixture.harness, cli: "opencode", session_id: sid } };
+  const before = JSON.stringify(fixture);
+  const ui = await uiFixture(t, [snapshot]);
+  ui.setSession(sid);
+  const tree = ui.sidebar();
+  await new Promise(resolve => setImmediate(resolve));
+  const panel = textOf(ui.dashboard()), compact = textOf(tree);
+  if (state === "unbound") {
+    assert.match(compact, /mbx unbound.*claim or register/s);
+    assert.match(panel, /No persona.*mbx_identity list/s);
+    assert.doesNotMatch(panel + compact, /↑|↺|INBOX|Registered: yes/);
+  } else {
+    assert.ok(compact.includes(fixture.identity.name!));
+    assert.match(compact, /2↑ 1↺/);
+    assert.match(panel, /Registered: yes.*Lease: verified/s);
+    assert.match(panel, /2 unread · 1 needs reply.*3 pending sends/s);
+    assert.match(panel, /Identity & session.*Inbox.*Cloud & devices.*Project/s);
+    assert.ok(panel.includes(`Wake: ${fixture.harness.wake_path}`), "wake path is rendered, not re-derived from the host CLI");
+    if (fixture.project) {
+      assert.ok(panel.includes(fixture.project.directory));
+      assert.ok(panel.includes(fixture.project.lead!));
+    }
+    if (state === "cloud-down") assert.match(panel, /Relay: unreachable.*https:\/\/relay\.example.*Account: unknown/s);
+    if (state === "peers-down") {
+      // The contract supports unreachable; the current producer may only know "unknown". Neither invents presence.
+      assert.match(panel, /fixture-offline · unreachable.*presence unknown/s);
+      assert.match(panel, /fixture-unknown · unknown.*presence unknown/s);
+    }
+  }
+  assert.equal(JSON.stringify(fixture), before, "renderer never changes shared fixture inputs");
+  assert.equal(ui.toasts.length, 0, "loading a fixture backlog never emits a new-mail toast");
 });
