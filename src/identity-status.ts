@@ -19,6 +19,8 @@ export interface IdentityStatus {
   description: string | null;
   /** Chosen with a role (register, launch config, rename): false for names an older version generated. */
   registered: boolean;
+  /** Retired by identity prune (T209): hidden from the default listing unless a session holds it. */
+  retired: boolean;
   projects: string[];
   unread: number;
   messages: number;
@@ -41,7 +43,7 @@ export function listIdentityStatus(home: string, options: { now?: number; inspec
   let schema: number;
   const row = (name: string) => {
     let value = rows.get(name);
-    if (!value) { value = { name, state: "legacy", claimable: true, reason: "ownership has not been established by a lease", role: null, description: null, registered: false,
+    if (!value) { value = { name, state: "legacy", claimable: true, reason: "ownership has not been established by a lease", role: null, description: null, registered: false, retired: false,
       projects: [], unread: 0, messages: 0, last_activity: null, holder: null }; rows.set(name, value); }
     return value;
   };
@@ -117,6 +119,7 @@ export function listIdentityStatus(home: string, options: { now?: number; inspec
     item.holder = { cli: lease.cli, session_id: lease.session_id, pid: lease.holder_pid };
   }
   for (const name of conflicts) { const item = row(name); item.state = "conflict"; item.claimable = false; item.reason = "historical ownership requires explicit recovery"; }
+  for (const item of rows.values()) item.retired = retired.has(item.name);
   // Retired mailboxes (identity prune, T209) leave listings unless asked for; their history is still in the store.
   const all = [...rows.values()].filter(i => options.includeRetired || !retired.has(i.name) || i.state === "held").sort((a, b) => a.name.localeCompare(b.name));
   return { host: config.host as string, schema_version: schema, observed_at: new Date(now).toISOString(), advisory: true,

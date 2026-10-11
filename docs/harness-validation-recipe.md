@@ -13,7 +13,7 @@ isolated setup (separate `HOME`/`XDG_*`, recorded PIDs — see `scripts/t409-iso
 
 1. **Session detection and lease bind.** `mbx_whoami` shows this session's cli and session id and
    the held identity; `agentmbx identity list` shows this session as the holder.
-   Evidence: the `mbx_whoami` JSON (`cli`, `session`, `agent`) and the identity-list row.
+   Evidence: the `mbx_whoami` JSON (`cli`, `harness_session`, `agent`) and the identity-list row.
 2. **Wake.** A leased peer sends a `request` with `needs_reply`. The session wakes on its own path.
    Evidence: the sender's `mbx_sent` receipt and this session's reply. Audit-row expectations are
    per harness: channel CLIs record `wake.attempt admitted`; a terminal Kimi session wakes through
@@ -24,10 +24,13 @@ isolated setup (separate `HOME`/`XDG_*`, recorded PIDs — see `scripts/t409-iso
    human prompt; name the hook line from the harness's config.
 4. **Resume and rebind.** Restart the session (owner-approved); the identity and mailbox survive.
    Evidence: `mbx_whoami` after restart shows the same identity; unread mail is still unacked.
-5. **Statusline renders the owner's session only.** `echo '{"session_id":"<sid>"}' | agentmbx
-   statusline <cli>` prints this session's segment (`mbx <identity> …`); an unknown session id
-   prints nothing (never another identity's data — T308 AC2). Evidence: stdout for both cases.
-   Automated per CLI by `test/status-surface.test.ts`.
+5. **Statusline renders the owner's session only.** Use the **harness session id** — the
+   `harness_session` field of this session's `mbx_whoami` JSON (NOT `session`, which is the lease
+   key fingerprint, and NOT the lease session id; T548). `echo '{"session_id":"<harness_session>"}'
+   | agentmbx statusline <cli>` prints this session's segment (`mbx <identity> …`); an unknown
+   session id prints nothing (never another identity's data — T308 AC2). Evidence: stdout for both
+   cases. Automated per CLI by `test/status-surface.test.ts`; the whoami→statusline id hand-off is
+   automated in `test/whoami-harness-session.test.ts`.
 6. **Doctor is clean for the harness.** `agentmbx doctor` shows the harness's MCP, hooks and
    statusline rows green; unrelated warnings (other harnesses, stranded legacy mailboxes, peers)
    are noted but do not fail this harness's result. Evidence: the doctor rows.
@@ -48,6 +51,21 @@ against the same bound session so the numbers must agree across surfaces.
 | Loopback endpoint (T407) | `GET /v1/status?cli=<cli>&session=<sid>[&schema=mbx.status/v2]` | response JSON; an unknown session is an explicit `unbound` result, never an error; loopback only |
 | Claude mod (T401) | renders the v2 model band/pane | fixture render: `plugins/claude/fixtures/v2-*.json` + `test/claude-mod.test.ts` on `feat/t401-claude-mod`; live: screenshot of the band |
 | OpenCode sidebar (T409) | renders identity + counts from the v2 endpoint | fixture render: `test/opencode-sidebar.test.ts` (`formatStatusV2` against the v2 fixture); live: isolated-script run, rendered line + endpoint JSON |
+
+### Hermes evidence (T527, recorded 2026-10-10)
+
+agentmbx-hermes verified live in its terminal:
+
+- Hermes has **no status-line feature** — there is nothing in the TUI to render a segment, so the
+  statusline surface is N/A for Hermes and `agentmbx doctor` says so explicitly (the opencode
+  precedent). The daemon still writes `hud/hermes-<sid>.json`/`.v2.json`/`.line` for
+  `agentmbx status` and any future surface (automated in `test/status-surface.test.ts`).
+- Only `pre_llm_call` consumes hook stdout as injected context (`{"context": ...}`). Hermes also
+  runs `on_session_start` (an observer; its stdout is dropped) and supports `pre_tool_call` /
+  `post_tool_call`, but neither injects stdout — so there is no post-tool injection channel, and
+  none was wired. Mid-turn mail instead rides `pre_llm_call`, which fires per LLM call: mail that
+  arrives between two calls of one tool loop is injected on the next call of the same turn
+  (automated in `test/hermes-hooks.test.ts`).
 
 Rules that hold on every surface:
 

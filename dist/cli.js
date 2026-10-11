@@ -49,12 +49,14 @@ import { formatUnboundStart, listIdentityStatus } from "./identity-status.js";
 import { REBINDING_CLIS, withCliIdentity, withHookIdentity } from "./cli-identity.js";
 import { declaredOriginWarning, readSessionTaint, refuseAgentOrigin, taintSendWarning } from "./session-taint.js";
 import { runProbe, storeProbeIO } from "./probe.js";
+import { resolveProject } from "./project-key.js";
 import { DEFAULT_LOGIN_BASE_URL, defaultLoginIO, parseLoginBase, runLogin } from "./login.js";
 import { buildIdentityTakeover } from "./identity-takeover.js";
 import { publishIdentityControl, findIdentityControl, identityControlReceipt, resolveIdentityControlReceipt, submitIdentityControl } from "./identity-control.js";
 import { armDaemonSync } from "./sync-daemon.js";
 import { armConversationLoopReports } from "./loop-detector.js";
 import { mcpStarting } from "./mcp-startup.js";
+import { hookDisconnectedNote } from "./hook-connection.js";
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
 
 Start here
@@ -146,7 +148,7 @@ Agent integration
   agentmbx hook session-end --cli claude         release the exact session on terminal exit (keeps /clear and /resume bindings)
   agentmbx hook prompt --cli <…>                adds "N unread mbx messages" to the next turn when there is mail
   agentmbx hook post-tool --cli claude          surfaces new unread mail between tool calls (bundled sh fast path: zero node starts in steady state, T342)
-  agentmbx hook permission --cli <claude|codex|kimi>   YOLO: approves the prompt only under an active owner policy with the permissions class
+  agentmbx hook permission --cli <claude|codex|kimi>   untainted signed-policy approval for bounded outward-reversible work; permissions enables YOLO
   agentmbx import-v2 <MAILBOX/v2 dir>           import this caller's leased mailbox as unsigned 'legacy' messages
 
 Env: MBX_HOME (default ~/.local/share/agentmbx), MBX_AGENT (agent name for mcp/hooks), MBX_ADVERTISE (host:port others use),
@@ -1134,7 +1136,7 @@ If the codes differ, do not approve: someone is in the middle.`);
                     await flushOutbox(node);
                     await flushReceipts(node);
                     await dispatchWakes(node);
-                    await opencodePermissionPass(node, yoloLookup(node), opencodeService);
+                    await opencodePermissionPass(node, permissionLookup(node), opencodeService);
                     if (v2)
                         await relayReceive(node, v2);
                     else if (relay && route?.mode === "v1") {
@@ -1417,12 +1419,15 @@ async function lead(node, pos, str, o) {
     const dir = str("project") ?? (Array.isArray(o.project) ? o.project[0] : undefined); // --project is a multiple option
     const project = dir ? (projectOf(resolve(dir)) ?? die(`${dir} is the home folder or /, not a project`)) : undefined;
     if (sub === "show") {
-        const rows = node.store.db.prepare("SELECT DISTINCT project FROM project_leads" + (project ? " WHERE project=?" : "")).all(...(project ? [project] : []));
+        // A record covers its folder and every other checkout of the same CLEO project (T543): show the key and those folders.
+        const key = project ? resolveProject(project).key : undefined;
+        const rows = node.store.db.prepare("SELECT project, MAX(project_key) AS project_key FROM project_leads" + (project ? " WHERE project=? OR project_key=?" : "") + " GROUP BY project").all(...(project ? [project, key] : []));
         if (!rows.length)
             return console.log(project ? `no lead for ${project}` : "no project leads");
         for (const r of rows) {
             const l = activeLead(node, r.project);
-            console.log(`${r.project}\t${l ? `${l.agent}@${l.host} until ${l.exp} (id ${l.id})` : "none (expired or revoked)"}`);
+            const also = r.project_key ? node.store.db.prepare("SELECT DISTINCT project FROM identity_projects WHERE project_key=? AND project<>?").all(r.project_key, r.project).map((x) => x.project) : [];
+            console.log(`${r.project}\t${l ? `${l.agent}@${l.host} until ${l.exp} (id ${l.id})` : "none (expired or revoked)"}\tkey ${r.project_key ? `${r.project_key} (CLEO project id)` : "folder path"}${also.length ? `\talso covers ${also.join(", ")}` : ""}`);
         }
         return;
     }
@@ -1600,8 +1605,8 @@ async function policy(node, pos, str, o) {
     die("policy set | list | renew <id> | revoke <id>|--all");
 }
 // ---- hooks -----------------------------------------------------------------------------------
-/** YOLO policy lookup (docs/POLICY.md §5): an active owner policy with the permissions class for that agent on this host. */
-const yoloLookup = (node) => (agent, ctx) => hasClass(node.store.db, agent, node.host, "permissions", { cwd: ctx?.cwd });
+/** One independently signed grant must cover the requested class and session project (POLICY.md §5). */
+const permissionLookup = (node) => (agent, ctx) => hasClass(node.store.db, agent, node.host, ctx?.class ?? "permissions", { cwd: ctx?.cwd });
 /** Exact command a Grok session runs as a tracked background task (T435). Its exit starts the next turn. */
 function grokWatchCommand(sid) {
     return sid ? `agentmbx watch --cli grok --session ${sid}` : "agentmbx watch --cli grok";
@@ -1659,11 +1664,11 @@ async function hook(node, event, cli) {
             parsed = JSON.parse(raw);
         }
         catch { /* malformed */ }
-        const d = decidePermission(parsed, cli, yoloLookup(node), { node, pid: process.ppid });
+        const d = await decidePermission(parsed, cli, permissionLookup(node), { node, pid: process.ppid });
         if (d.output)
             console.log(d.output);
         if (d.kimi)
-            await approveKimi(node, d, { recheck: () => yoloLookup(node)(d.agent, { cwd: d.cwd }).ok });
+            await approveKimi(node, d, { recheck: () => permissionLookup(node)(d.agent, { cwd: d.cwd, class: d.class }).ok });
         return;
     }
     if (!["session-start", "session-end", "prompt", "post-tool", "stop"].includes(event ?? ""))
@@ -1909,6 +1914,7 @@ async function hook(node, event, cli) {
         const grokUnboundPost = cli === "grok" && event === "post-tool";
         if (!sid || (event !== "session-start" && event !== "prompt" && !grokUnboundPost))
             return;
+        const disconnected = grokUnboundPost ? null : hookDisconnectedNote(node, cli, sid, process.ppid);
         const multi = cli === "kimi" && kimiMultiHost(process.ppid);
         // A conversation in a multi-conversation Kimi host can't be matched to its mbx server from here: hand it a bind
         // ticket, once; after it linked, it only needs the identity guidance.
@@ -1933,14 +1939,14 @@ async function hook(node, event, cli) {
         if (event === "session-start") {
             if (cli !== "hermes") {
                 node.store.set(guided, new Date().toISOString());
-                emit(cli, "SessionStart", link ? `${unbound}\n${link}` : unbound);
+                emit(cli, "SessionStart", [disconnected, unbound, link].filter(Boolean).join("\n"));
             }
         }
         else if (grokUnboundPost)
             emit(cli, "PostToolUse", link ? `${unbound}\n${link}` : unbound);
-        else if (link || first) {
+        else if (disconnected || link || first) {
             node.store.set(guided, new Date().toISOString());
-            emit(cli, "UserPromptSubmit", first ? (link ? `${unbound}\n${link}` : unbound) : link);
+            emit(cli, "UserPromptSubmit", [disconnected, first ? unbound : null, link].filter(Boolean).join("\n"));
         }
     }
 }

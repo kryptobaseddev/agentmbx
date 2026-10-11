@@ -14,15 +14,18 @@ import { version } from "./version.ts";
 import { GROK_NO_PUSH, MbxNode, RETRY_HOURS, staleMcpKvCensus } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
 import { claudePluginChecks } from "./claude-plugin.ts";
-import { detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConsent, mcpConfiguredCmd, mcpConfiguredTimeout, skillDest, skillStatus, statuslineConfiguredCommand, statuslineCurrent, statuslineState, wired, type CliId, type SetupCtx } from "./setup.ts";
+import { detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConfigPath, hermesConsent, mcpConfiguredCmd, mcpConfiguredTimeout, skillDest, skillStatus, statuslineConfiguredCommand, statuslineCurrent, statuslineState, wired, type CliId, type SetupCtx } from "./setup.ts";
 import { mailboxLiveness } from "./receipts.ts";
 import { liveWatcher } from "./wake.ts";
 import { findIdentityControl, listIdentityControls } from "./identity-control.ts";
 import { pruneCandidates } from "./identity-cleanup.ts";
-import { staleProjectBindings } from "./registry.ts";
+import { projectOf, staleProjectBindings } from "./registry.ts";
+import { resolveProject } from "./project-key.ts";
 import { deadHolderLeases, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
 import { providerLabel, sameLiveProvider } from "./identity-takeover.ts";
 import { conversationLoopLabel, detectConversationLoops } from "./loop-detector.ts";
+import { opencodeDuplicateLoopChecks } from "./opencode-duplicate-loop.ts";
+import { mcpOrphanCheck } from "./mcp-lifecycle.ts";
 
 export type Level = "ok" | "fail" | "warn" | "info";
 export interface Check { level: Level; label: string; fix?: string }
@@ -232,6 +235,34 @@ export function staleBindingSummary(node: MbxNode): Check {
     : { level: "info", label: "no project bindings older than another project for the same identity" };
 }
 
+/**
+ * Which key names this folder's project, and where it came from (T543). A CLEO id from `.cleo/project-id` is shared by every
+ * checkout and host; without one the folder path is the key and nothing else matches it. A key that this host has seen on
+ * folders with different git origins means a `.cleo` directory was copied, which would merge two unrelated projects.
+ */
+export function projectKeyChecks(node: MbxNode, cwd = process.cwd()): Check[] {
+  const folder = projectOf(cwd);
+  if (!folder) return [];
+  const id = resolveProject(folder);
+  const out: Check[] = [];
+  if (!id.cleoId) {
+    out.push({ level: "info",
+      label: `project key is the folder path ${folder} (no .cleo/project-id): other checkouts of this project are not recognised${id.gitKey ? `; cross-host key ${id.gitKey} (git origin)` : "; no git origin either, so nothing matches it on another host"}`,
+      fix: "cleo init, then commit .cleo/project-id" });
+    return out;
+  }
+  const file = id.source === "cleo-project-id" ? ".cleo/project-id" : ".cleo/project.json";
+  out.push({ level: "ok", label: `project key ${id.cleoId} (source ${file} in ${id.cleoRoot}): the same on every checkout and host${id.gitKey ? `; the cloud keeps the git origin ${id.gitKey}` : ""}` });
+  const folders = (node.store.db.prepare("SELECT project FROM identity_projects WHERE project_key=? UNION SELECT project FROM project_leads WHERE project_key=?")
+    .all(id.cleoId, id.cleoId) as { project: string }[]).map((r) => r.project);
+  const origins = new Map<string, string[]>();
+  for (const f of new Set([...folders, folder])) { const g = resolveProject(f).gitKey; if (g) origins.set(g, [...(origins.get(g) ?? []), f]); }
+  if (origins.size > 1) out.push({ level: "warn",
+    label: `project key ${id.cleoId} is used by folders with different git origins (${[...origins.keys()].join(", ")}): a copied .cleo directory merges unrelated projects' members, leads and ledgers`,
+    fix: "give the copy its own id: remove the copied .cleo/project-id there and run cleo init" });
+  return out;
+}
+
 /** OpenCode's LocationActivity drops an idle service about every 60 minutes, and the plugin then releases and claims again.
  *  A claim within ~65 minutes of its release, with those pairs about 61 minutes apart, is that eviction. One restart is not.
  *  Only the last 24 hours of audit rows are read. */
@@ -301,24 +332,57 @@ function hourlyOpencodeEviction(events: LeaseEvent[]): boolean {
  *  and grok are replace-only — `command` replaces the footer and never renders alongside the user's
  *  other keys. opencode has no custom status line feature at all (built-in segments only), so the
  *  honest result is an explicit skip note, not a check against an invented config path. */
-/** T391/T524: the shared OpenCode service is the push-wake path only for sessions it hosts itself.
- *  Sessions hosted by a standalone serve (`opencode --standalone` → `opencode serve --stdio`) are
- *  never pushed through the service (it would start a duplicate agent loop): they get mail on their
- *  next prompt. Doctor counts both and proves the service answers when a service-hosted session is
- *  bound. A warn never fails doctor (the T435 rule). Unbound hosts stay silent. */
+/** T391/T524/T519/T520: each OpenCode binding is service-hosted, standalone with a live plugin
+ *  consumer, or unwakeable. The shared service is the push path only for sessions it hosts. A
+ *  standalone serve is woken by the plugin already polling its wake queue for that session and pid.
+ *  No poller, or an unknown host, is unwakeable: the shared service is not called. A warn never
+ *  fails doctor (the T435 rule). Unbound hosts stay silent. */
+const UNWAKEABLE_FIX = "agentmbx setup --only opencode installs the plugin; a standalone session is woken only while that plugin is polling inside its serve";
+
+/** Pollers live in the daemon. A missing daemon means no consumer, not a crash. */
+async function pluginConsumers(port: number): Promise<(sessionID: string, pid: number) => boolean> {
+  const none = (): boolean => false;
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/v1/opencode-wake/waiters`, { signal: AbortSignal.timeout(300) });
+    if (!res.ok) return none;
+    const body = await res.json() as { waiters?: { sessionID?: unknown; pid?: unknown }[] };
+    const keys = new Set<string>();
+    for (const w of body.waiters ?? []) {
+      if (typeof w.sessionID === "string" && typeof w.pid === "number") keys.add(`${w.sessionID}\0${w.pid}`);
+    }
+    return (sessionID, pid) => keys.has(`${sessionID}\0${pid}`);
+  } catch { return none; }
+}
+
 export async function opencodeServiceCheck(node: MbxNode, service: () => Promise<{ url: string; auth: string } | null> = opencodeService,
-  host: (pid: number | null) => OpencodeHost = opencodeHostClassifier()): Promise<Check | null> {
-  const bound = node.store.db.prepare("SELECT agent, pid FROM sessions WHERE cli='opencode' AND session_id NOT LIKE 'mcp-%'").all() as { agent: string; pid: number | null }[];
+  host: (pid: number | null) => OpencodeHost = opencodeHostClassifier(),
+  waiting?: (sessionID: string, pid: number) => boolean): Promise<Check | null> {
+  const bound = node.store.db.prepare("SELECT session_id, pid FROM sessions WHERE cli='opencode' AND session_id NOT LIKE 'mcp-%'").all() as { session_id: string; pid: number | null }[];
   if (!bound.length) return null;
-  const hosted = bound.filter((b) => host(b.pid) === "service").length, standalone = bound.length - hosted;
-  const rest = standalone ? `${standalone} binding(s) in a standalone OpenCode serve (or unknown host): no push wake yet, next-prompt delivery only` : "";
-  if (!hosted) return { level: "info", label: `opencode: ${rest}` };
+  const consumers = waiting ?? (bound.some((b) => host(b.pid) === "standalone") ? await pluginConsumers(node.config.port) : () => false);
+  let hosted = 0, plugin = 0, unwakeable = 0;
+  for (const b of bound) {
+    const kind = host(b.pid);
+    if (kind === "service") { hosted++; continue; }
+    if (kind === "standalone" && b.pid !== null && consumers(b.session_id, b.pid)) { plugin++; continue; }
+    unwakeable++;
+  }
+  const parts = [
+    hosted ? `${hosted} service-hosted` : "",
+    plugin ? `${plugin} standalone binding(s) with a live plugin consumer` : "",
+    unwakeable ? `${unwakeable} unwakeable binding(s): standalone with no plugin consumer, or an unknown host` : "",
+  ].filter(Boolean);
+  const detail = parts.join("; ");
+  if (!hosted && !unwakeable) return { level: "ok", label: `opencode: ${detail}` };
+  if (!hosted) return { level: "warn", label: `opencode: ${detail}`, fix: UNWAKEABLE_FIX };
   const svc = await service().catch(() => null);
-  if (svc) return { level: "ok", label: `opencode: service reachable (${svc.url}) — wake path for ${hosted} service-hosted mailbox binding(s)${rest ? `; ${rest}` : ""}` };
+  const extra = [plugin ? `${plugin} standalone binding(s) with a live plugin consumer` : "", unwakeable ? `${unwakeable} unwakeable binding(s): standalone with no plugin consumer, or an unknown host` : ""].filter(Boolean).join("; ");
+  if (svc && !unwakeable) return { level: "ok", label: `opencode: service reachable (${svc.url}) — wake path for ${hosted} service-hosted mailbox binding(s)${extra ? `; ${extra}` : ""}` };
+  if (svc) return { level: "warn", label: `opencode: service reachable (${svc.url}) — wake path for ${hosted} service-hosted mailbox binding(s); ${extra}`, fix: UNWAKEABLE_FIX };
   return {
     level: "warn",
-    label: `opencode: service not reachable, so ${hosted} service-hosted OpenCode binding(s) cannot be woken${rest ? `; ${rest}` : ""}`,
-    fix: "run any opencode command (or `opencode service start`) so the service API comes up; config: ~/.config/opencode/service.json",
+    label: `opencode: service not reachable, so ${hosted} service-hosted OpenCode binding(s) cannot be woken${extra ? `; ${extra}` : ""}`,
+    fix: unwakeable ? `run any opencode command (or \`opencode service start\`) so the service API comes up; config: ~/.config/opencode/service.json. ${UNWAKEABLE_FIX}` : "run any opencode command (or `opencode service start`) so the service API comes up; config: ~/.config/opencode/service.json",
   };
 }
 
@@ -406,6 +470,12 @@ export function mcpCommandChecks(ctx: SetupCtx, cli: CliId): Check[] {
 export function statuslineChecks(ctx: SetupCtx, cli: string): Check[] {
   if (cli === "opencode")
     return [{ level: "info", label: "opencode: no custom status line feature (built-in segments only: anomalyco/opencode#30295); nothing to verify" }];
+  // T527: Hermes has no status-line feature at all (agentmbx-hermes verified live in its terminal,
+  // 2026-10-10). The daemon still writes hermes-<sid> HUD snapshots for `agentmbx status` and any
+  // future surface; there is just nothing in the TUI to render a segment. Silent when Hermes is
+  // not installed (the doctor loop only asks for detected CLIs; a direct call should stay quiet too).
+  if (cli === "hermes" && existsSync(hermesConfigPath(ctx.home)))
+    return [{ level: "info", label: "hermes: no status line feature in Hermes (agentmbx-hermes verified live, 2026-10-10); nothing to verify" }];
   if (cli !== "claude" && cli !== "kimi" && cli !== "grok") return [];
   const out: Check[] = [];
   const where = edits(ctx, cli).find((e) => e.kind === "statusline")?.path.replace(ctx.home, "~") ?? "-";
@@ -482,6 +552,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
   const out: Check[] = [];
   const add = (level: Level, label: string, fix?: string) => out.push({ level, label, fix });
   add("info", `agentmbx ${VERSION} (node ${process.versions.node})`);
+  out.push(mcpOrphanCheck(mbxHome));
   if (Number(process.versions.node.split(".")[0]) < 24) add("fail", `Node ${process.versions.node} is too old`, "install Node 24 or later");
 
   // T314: stay out of the grok block. OpenCode's own doctor function must not collide with this.
@@ -515,6 +586,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     // collision — see the T435 note above) and runs only when an opencode mailbox is bound.
     if (d.cli === "opencode" && node) { const c = await opencodeServiceCheck(node); if (c) out.push(c); }
     if (d.cli === "opencode" && node) { const c = opencodeEvictionCheck(node.store.db); if (c) out.push(c); }
+    if (d.cli === "opencode" && node) for (const c of opencodeDuplicateLoopChecks(node)) out.push(c);
     // T460: its own function too (the T435 rule): a refused hooks layout and the not-approved state are Hermes facts.
     if (d.cli === "hermes") for (const c of hermesHooksChecks(ctx)) out.push(c);
     // T502/T504: the explicit MCP startup timeout and the resolved command path are checked for
@@ -579,6 +651,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     for (const c of foreignSessionProvider(node)) out.push(c);
     out.push(pruneSummary(node));
     out.push(staleBindingSummary(node));
+    for (const c of projectKeyChecks(node)) out.push(c);
     const peers = node.peers();
     const approved = peers.filter((p) => p.state === "approved");
     if (!approved.length) add("info", "no paired hosts (optional: agentmbx pair <host>:7373)");

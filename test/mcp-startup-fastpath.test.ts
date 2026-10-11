@@ -246,6 +246,20 @@ test("closing the transport during startup contention exits without waiting for 
   assert.notEqual(server.child.exitCode, null, server.stderr());
 });
 
+for (const cause of ["EOF", "SIGTERM", "EPIPE"] as const) test(`${cause} exits a ready MCP while another process retains the SQLite writer lock`, { timeout: 15_000 }, async t => {
+  const f = fixture(t), server = f.start(); await server.initialized;
+  const who = await server.rpc(2, "tools/call", { name: "mbx_whoami", arguments: {} });
+  assert.equal(who.result?.structuredContent?.agent, "reader");
+  const lock = await f.holdLock(20_000), started = performance.now();
+  if (cause === "EOF") server.child.stdin.end();
+  else if (cause === "SIGTERM") server.child.kill("SIGTERM");
+  else { server.child.stdout.destroy(); void server.rpc(3, "ping").catch(() => {}); }
+  while (server.child.exitCode === null && performance.now() - started < 9000) await pause(25);
+  assert.equal(server.child.exitCode, cause === "SIGTERM" ? 143 : 0, server.stderr());
+  assert.ok(performance.now() - started < 2500, "terminal cleanup must not wait for the SQLite busy timeout");
+  assert.equal(lock.exitCode, null, "shutdown must finish while the writer still owns its lock");
+});
+
 // Opt in to the host-load benchmark with MBX_STARTUP_BENCH=1. Add MBX_STARTUP_BENCH_DIST=1
 // after npm run build to measure the shipped dist launcher rather than Node's source type stripping.
 test(`60 concurrent cold starts on a populated store have p99 initialize under ${COLD_START_P99_MAX_MS}ms`, { skip: process.env.MBX_STARTUP_BENCH !== "1", timeout: 30_000 }, async t => {

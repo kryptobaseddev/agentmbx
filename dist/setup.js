@@ -1271,10 +1271,13 @@ const nativeMsgId = (result: unknown): string | null => {
   const id = typeof r.id === "string" ? r.id : r.data && typeof r.data.id === "string" ? r.data.id : "";
   return id.startsWith("msg_") ? id : null;
 };
-/** A queued wake is a different admission from a hook note. The host's id is what we report back. */
+/** T544: hook notes stay resume:false (T518). A daemon wake is the same in-process call with
+ *  resume:true. Live on an idle standalone TUI, resume:false returned a msg_ receipt and wrote
+ *  no session_message, so the turn never started; resume:true wrote one synthetic row, one
+ *  assistant row, and then idle. This still does not POST to the shared service (T524). */
 const admitWake = async (ctx: NoteCtx, sid: string, text: string): Promise<string | null> => {
   if (!sid || !text) return null;
-  const body = { sessionID: sid, id: noteId(sid, "wake", text), text, resume: false, delivery: "queue" };
+  const body = { sessionID: sid, id: noteId(sid, "wake", text), text, resume: true, delivery: "queue" };
   const session = ctx?.session;
   try {
     if (typeof session?.synthetic === "function") return nativeMsgId(await session.synthetic(body));
@@ -1283,6 +1286,37 @@ const admitWake = async (ctx: NoteCtx, sid: string, text: string): Promise<strin
     if (typeof session?.prompt === "function") return nativeMsgId(await session.prompt(body));
   } catch { return null; }
   return null;
+};
+/** A service-hosted plugin must not evaluate: that races the daemon's HTTP reply. Standalone is
+ *  --stdio, or any argv that is not the shared service. */
+const standaloneServe = (): boolean => {
+  const argv = process.argv;
+  const service = argv.some((a) => a === "--service" || String(a).startsWith("--service="));
+  const stdio = argv.includes("--stdio");
+  return stdio || !service;
+};
+const permissionWatching = { on: false };
+/** Ask this machine's daemon, then set effect on the in-process evaluate hook. A skip, a down
+ *  daemon, or a missing hook leaves the prompt. This never posts to the shared OpenCode service
+ *  and does not use the T519 wake queue. */
+const watchPermission = (ctx: NoteCtx & { permission?: { hook?: (name: string, fn: (req: { sessionID?: string; effect?: string }) => Promise<void> | void) => void } }): void => {
+  if (permissionWatching.on || !standaloneServe() || wakePort() === null) return;
+  const hook = ctx?.permission?.hook;
+  if (typeof hook !== "function") return;
+  permissionWatching.on = true;
+  try {
+    hook("evaluate", async (req) => {
+      const sid = req && typeof req.sessionID === "string" ? req.sessionID : "";
+      const port = wakePort();
+      if (!sid || !port) return;
+      try {
+        const res = await fetch("http://127.0.0.1:" + port + "/v1/opencode-permission?session=" + encodeURIComponent(sid) + "&pid=" + String(process.pid));
+        if (!res.ok) return;
+        const body = await res.json() as { decision?: unknown };
+        if (body && body.decision === "allow" && req && typeof req === "object") req.effect = "allow";
+      } catch { /* leave the prompt */ }
+    });
+  } catch { permissionWatching.on = false; }
 };
 const wakeWatching = new Set<string>();
 const pause = (ms: number) => new Promise<void>((r) => { const t = setTimeout(r, ms); t.unref(); });
@@ -1343,6 +1377,7 @@ const sidOf = (v: unknown): string | undefined => {
 /** OpenCode v1 generation: the loader calls this factory with { $, client, directory } and runs the
  *  returned hooks object (v1 names: session.created/session.idle/tool.execute.after). */
 export const AgentMBXHooks = async (ctx: NoteCtx & { $?: unknown; client?: unknown; directory?: string }) => {
+  watchPermission(ctx);
   const directory = ctx?.directory;
   const run = runFor(ctx, ${bin}, directory);
   return {
@@ -1371,7 +1406,9 @@ export default {
     location?: { directory?: string };
     event?: { subscribe?: (o?: unknown) => AsyncIterable<{ type?: string; location?: { directory?: string }; data?: unknown }> };
     tool?: { hook?: (name: "execute.after", fn: (input: unknown) => unknown) => unknown };
+    permission?: { hook?: (name: string, fn: (req: { sessionID?: string; effect?: string }) => Promise<void> | void) => void };
   }) {
+    watchPermission(ctx);
     const dir = ctx?.location?.directory;
     const run = runFor(ctx, ${bin}, dir);
     const here = (ev: { location?: { directory?: string } }) => !ev.location?.directory || !dir || ev.location.directory === dir;
@@ -2185,9 +2222,14 @@ function hermesApprovals(cmd) {
     };
 }
 /** Are the hooks setup wrote approved to run? `auto` when hooks_auto_accept is on in config.yaml; HERMES_ACCEPT_HOOKS / --accept-hooks
- *  are per-process and cannot be seen from here. Read-only: doctor reports it, setup writes it. */
+ *  are per-process and cannot be seen from here. Read-only: doctor reports it, setup writes it.
+ *  T547: an allowlist entry matches by this install's entry script and the hook arguments, under any
+ *  node binary that still exists (hookNamesInstalledEntry, the same rule as mcpNodeScriptCurrent).
+ *  The node path inside ctx.cmd is not part of that match, so doctor run from a different node than
+ *  the one that wrote the allowlist still reports approved. An exact command match stays, for the
+ *  single-binary form that has no entry script. A foreign script does not match. */
 export function hermesConsent(ctx) {
-    const wanted = HERMES_HOOK_EVENTS.map(([event, sub]) => ({ event, command: hookCommand(ctx.cmd, sub, "hermes") }));
+    const wanted = HERMES_HOOK_EVENTS.map(([event, sub]) => ({ event, sub, command: hookCommand(ctx.cmd, sub, "hermes") }));
     if (/^hooks_auto_accept:[ \t]*true[ \t]*(#.*)?\r?$/m.test(read(hermesConfigPath(ctx.home)) ?? ""))
         return { state: "auto", missing: [] };
     const text = read(hermesAllowlistPath(ctx.home));
@@ -2206,7 +2248,14 @@ export function hermesConsent(ctx) {
     }
     if (!Array.isArray(approvals))
         return { state: "unreadable", missing: wanted.map((w) => w.event) };
-    const missing = wanted.filter((w) => !approvals.some((e) => !!e && typeof e === "object" && e.event === w.event && e.command === w.command)).map((w) => w.event);
+    const matches = (entry, w) => {
+        if (!entry || typeof entry !== "object")
+            return false;
+        const command = entry.command;
+        return entry.event === w.event && typeof command === "string"
+            && (command === w.command || hookNamesInstalledEntry(command, w.sub, "hermes"));
+    };
+    const missing = wanted.filter((w) => !approvals.some((entry) => matches(entry, w))).map((w) => w.event);
     return { state: missing.length ? "missing" : "approved", missing };
 }
 export function detect(ctx) {

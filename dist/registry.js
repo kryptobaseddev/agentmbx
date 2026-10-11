@@ -2,11 +2,12 @@
 // with a role: AgentMBX never invents one. A session resumes the identity it held before (same provider session id), or
 // stays unbound until it claims one from its project's list or registers a new one. The registry records each chosen
 // identity's role and which project folders it has worked in, so a restarted agent can find its own mailbox by role.
-import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { resolveProject } from "./project-key.js";
+// The git-origin key and the CLEO project key live in project-key.ts (T543); these names keep working from here.
+export { crossHostKey, normalizeRemote, projectKey, resolveProject } from "./project-key.js";
 /** Roles are short labels ("lead", "reviewer", "lab-staff"), never sentences. */
 export const ROLE_RE = /^[a-z0-9][a-z0-9 _-]{0,39}$/i;
 export const UNSPECIFIED_ROLE = "unspecified";
@@ -25,65 +26,6 @@ export function projectOf(dir) {
     catch {
         return resolve(dir);
     }
-}
-/**
- * The same repository has a different folder on every host, so a project's mail is matched across paired hosts by its
- * git origin, normalized to `host/path` without scheme, credentials or `.git` (T219): `git@github.com:org/repo.git` and
- * `https://github.com/org/repo` are both `github.com/org/repo`. None for a folder without an origin or with a
- * local-path origin (which means nothing on another host). A key is cached for the process (a later `git remote
- * set-url` shows after a restart); "no key" is cached for a minute only, so a `git` call that timed out on a loaded host
- * heals without a restart.
- */
-const keys = new Map();
-const NO_KEY_TTL_MS = 60_000;
-export function normalizeRemote(url) {
-    const u = url.trim();
-    const scp = /^(?:[^@/\s]+@)?([A-Za-z0-9.-]+):(?!\/\/)(.+)$/.exec(u); // git@host:org/repo
-    let host, path;
-    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) {
-        let parsed;
-        try {
-            parsed = new URL(u);
-        }
-        catch {
-            return undefined;
-        }
-        if (parsed.protocol === "file:" || !parsed.hostname)
-            return undefined;
-        host = parsed.hostname;
-        path = parsed.pathname;
-    }
-    else if (scp && !u.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(u)) {
-        host = scp[1];
-        path = scp[2];
-    }
-    else
-        return undefined;
-    path = path.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "");
-    if (!path)
-        return undefined;
-    const key = `${host}/${path}`.toLowerCase();
-    // A public forge's org/repo is not private. A self-hosted remote's path can name a machine, a user and a folder
-    // (nas.local/volume1/homes/keaton/git/foo), and the key travels in envelopes and to the cloud read model: those are
-    // reduced to a digest that both hosts still compute identically, so cross-host matching keeps working.
-    return FORGES.has(host.toLowerCase()) ? key.slice(0, 300) : `h:${createHash("sha256").update(key).digest("hex").slice(0, 32)}`;
-}
-const FORGES = new Set(["github.com", "gitlab.com", "bitbucket.org", "codeberg.org", "git.sr.ht", "dev.azure.com", "ssh.dev.azure.com", "gitee.com"]);
-export function projectKey(project, now = Date.now()) {
-    if (!project)
-        return undefined;
-    const hit = keys.get(project);
-    if (hit && (hit.key !== undefined || now - hit.at < NO_KEY_TTL_MS))
-        return hit.key;
-    let key;
-    try {
-        key = normalizeRemote(execFileSync("git", ["-C", project, "config", "--get", "remote.origin.url"], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] }));
-    }
-    catch {
-        key = undefined;
-    } // not a repository, no origin, no git, or a timeout under load
-    keys.set(project, { key, at: now });
-    return key;
 }
 export function registeredIdentity(store, name) {
     return store.db.prepare("SELECT name,role,description,registered_at,registered_by FROM identities WHERE name=?").get(name) ?? null;
@@ -105,26 +47,39 @@ export function renameRegistration(store, from, to) {
     store.db.prepare("UPDATE OR IGNORE identity_projects SET name=? WHERE name=?").run(to, from);
     store.db.prepare("DELETE FROM identity_projects WHERE name=?").run(from);
 }
-/** Remember that `name` works in `project` (every bind, so a restarted agent finds its mailbox from its folder). */
-export function noteProject(store, name, project, now = new Date()) {
-    if (!project)
+/** Remember that `name` is a member of `project` — but ONLY on an explicit claim or registration in
+ *  that project (T538). A session's cwd is not a binding: a persona served by a shared host process,
+ *  or an agent that happens to start in another project's folder, must not become a member merely by
+ *  where its process ran — that cwd upsert re-added foreign personas to the members surface as fast
+ *  as T515's prune removed them. Callers pass explicit=true only from the mbx_identity claim/register
+ *  path; every other call is a cwd observation and writes nothing. */
+export function noteProject(store, name, project, explicit, now = new Date()) {
+    if (!project || !explicit)
         return;
     const at = now.toISOString();
-    store.db.prepare(`INSERT INTO identity_projects (name,project,first_seen,last_seen) VALUES (?,?,?,?)
-    ON CONFLICT(name,project) DO UPDATE SET last_seen=excluded.last_seen`).run(name, project, at, at);
+    // The CLEO-id key is stored with the folder (T543), so the binding still belongs to its project after the folder is gone
+    // (a deleted worktree). NULL when the folder has no id: the folder is then the key.
+    const id = resolveProject(project);
+    store.db.prepare(`INSERT INTO identity_projects (name,project,project_key,first_seen,last_seen) VALUES (?,?,?,?,?)
+    ON CONFLICT(name,project) DO UPDATE SET last_seen=excluded.last_seen, project_key=COALESCE(excluded.project_key, identity_projects.project_key)`)
+        .run(name, project, id.cleoId, at, at);
 }
-/** Identities recorded in identity_projects for this folder. A session cwd is not a binding:
- *  a shared host process records its own folder for every persona it serves (T515). */
+/** Identities recorded in identity_projects for this project. A session cwd is not a binding:
+ *  a shared host process records its own folder for every persona it serves (T515). The project is the folder or, when
+ *  the folder belongs to a CLEO project, every checkout of it (T543): the stored key matches as well as the stored folder. */
 export function projectIdentities(store, project) {
     const out = new Set();
-    for (const r of store.db.prepare("SELECT name FROM identity_projects WHERE project=?").all(project))
+    const key = resolveProject(project).key;
+    for (const r of store.db.prepare("SELECT name FROM identity_projects WHERE project=? OR project_key=?").all(project, key))
         out.add(r.name);
     return out;
 }
 /** Bindings older than another project for the same identity. One project stays. A tie for the
  *  newest last_seen stays. Read-only: the dry run of `agentmbx identity bindings`. */
 export function staleProjectBindings(store) {
-    const rows = store.db.prepare("SELECT name, project, last_seen FROM identity_projects ORDER BY name, last_seen DESC, project").all();
+    const rows = store.db.prepare("SELECT name, project, project_key, last_seen FROM identity_projects ORDER BY name, last_seen DESC, project").all();
+    // Two checkouts of one CLEO project are one project (T543): a binding is not stale next to another folder with its key.
+    const sameProject = (a, b) => a.project === b.project || (a.project_key !== null && a.project_key === b.project_key);
     const out = [];
     let i = 0;
     while (i < rows.length) {
@@ -135,7 +90,7 @@ export function staleProjectBindings(store) {
         const newest = group[0].last_seen;
         const keeper = group.find((r) => r.last_seen === newest);
         for (const r of group) {
-            if (r.last_seen < newest)
+            if (r.last_seen < newest && !group.some((o) => o.last_seen === newest && sameProject(r, o)))
                 out.push({
                     name: r.name, project: r.project, last_seen: r.last_seen,
                     kept_project: keeper.project, kept_last_seen: keeper.last_seen,
@@ -158,6 +113,31 @@ export function removeStaleProjectBindings(store, rows) {
                 bindings: rows.slice(0, 50).map((r) => ({ name: r.name, project: r.project, kept: r.kept_project })),
             });
         return n;
+    });
+}
+/**
+ * Give rows written before the key column existed (or by an older runtime) the CLEO-id key of their folder (T543).
+ * Only NULL keys are filled, only for a folder that still resolves to an id; `project`, the signed lead `record` and
+ * `sig` are never touched, and a row whose folder is gone stays NULL and keeps matching by folder, exactly as before.
+ * Idempotent; runs at every store open, which is cheap (a few file reads per unresolved folder).
+ */
+export function backfillProjectKeys(store) {
+    // Read first: a store with nothing to fill (the usual case) must not take a write lock on every open.
+    const pending = [];
+    for (const table of ["identity_projects", "project_leads"]) {
+        for (const { project } of store.db.prepare(`SELECT DISTINCT project FROM ${table} WHERE project_key IS NULL`).all()) {
+            const id = resolveProject(project).cleoId;
+            if (id)
+                pending.push({ table, project, id });
+        }
+    }
+    if (!pending.length)
+        return 0;
+    return store.tx(() => {
+        let filled = 0;
+        for (const p of pending)
+            filled += Number(store.db.prepare(`UPDATE ${p.table} SET project_key=? WHERE project=? AND project_key IS NULL`).run(p.id, p.project).changes);
+        return filled;
     });
 }
 export function identityProjects(store, name) {

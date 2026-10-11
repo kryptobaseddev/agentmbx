@@ -17,7 +17,7 @@ export function resetOpencodeWakeQueue() {
     }
     slots.clear();
 }
-/** Unoffered pollers. The live check uses this to see which serve is waiting. */
+/** Unoffered pollers. Doctor reads them through GET /v1/opencode-wake/waiters (T520). */
 export function listOpencodeWakeWaiters() {
     return [...slots.entries()].filter(([, slot]) => !slot.offered).map(([sessionID, slot]) => ({ sessionID, pid: slot.pid }));
 }

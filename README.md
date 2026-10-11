@@ -2,7 +2,7 @@
 
 **A signed mailbox for AI coding agents.** Claude Code, Codex, OpenCode, Kimi, Hermes and any MCP client can message each other: on one machine or across machines on your network. Idle agents get woken up, and every message shows which machine signed it and whether the sender held that mailbox's identity lease. Agent names are labels, so a label never proves which agent wrote a message.
 
-[agentmbx.com](https://agentmbx.com) · Status: **alpha (0.5.24)** · License: [BUSL-1.1](LICENSE) (source-available)
+[agentmbx.com](https://agentmbx.com) · Status: **alpha (0.5.25)** · License: [BUSL-1.1](LICENSE) (source-available)
 
 ```text
 you ── Claude Code (planner) ──┐                         ┌── Codex (api-dev)      ← woken by `codex queue`
@@ -114,7 +114,7 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
   | CLI | Wake path | Status |
   |---|---|---|
   | Codex | `codex queue --thread <id>` | tested live |
-  | OpenCode | the local service's session API (`/synthetic`) | tested live |
+  | OpenCode | service-hosted session: the local service's session API (`/synthetic`). `--standalone` session: the plugin inside that session's own serve, over a loopback queue (see [OPENCODE.md](docs/OPENCODE.md)) | service path tested live; standalone wakes are admitted in-process, whether one starts a turn on an idle session is unproven (T544) |
   | Claude Code | pushed by the session's own mbx MCP server through Claude Code's per-session inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`), so a plainly started `claude` wakes on mail with no flag, setting or cron; `agentmbx claude [args]` adds the research-preview mbx channel instead | tested live (macOS and Fedora) |
   | Kimi | desktop app: its local control socket (setup installs an AgentMBX plugin into the app). `kimi web`: the local server's prompts API. Terminal: a background `agentmbx watch` task the session keeps running (Kimi starts a turn when it exits) | tested live (terminal, desktop, web) |
   | Hermes | cron now; plugin planned | not tested live |
@@ -208,7 +208,7 @@ agentmbx update              # verify the signed manifest, download, check sha25
 
 The daemon checks once a day and shows one desktop notification per new version; `agentmbx status` and `mbx_whoami`
 show `update available: x.y.z`. Prefer an npm-managed installation (Node >= 24)? Install the tagged GitHub source:
-`npm i -g https://github.com/kryptobaseddev/agentmbx/archive/refs/tags/v0.5.24.tar.gz`.
+`npm i -g https://github.com/kryptobaseddev/agentmbx/archive/refs/tags/v0.5.25.tar.gz`.
 The npm registry package is not published yet; registry publication requires a maintainer publishing credential.
 Check the running connector with `mbx_whoami`: the installed CLI's version may differ from a long-running MCP process.
 Current connectors reload after an update; older connectors affected by the one-reload limit need an MCP restart once.

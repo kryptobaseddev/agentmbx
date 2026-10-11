@@ -243,7 +243,7 @@ export function hudStatusV2(node, o, cached) {
     const v1 = cached?.v1 ?? hudStatus(node, { agent: o.agent, state: o.state, resolvedBy: o.resolvedBy, candidates: o.candidates });
     const name = o.agent;
     const sessionRow = o.sessionId
-        ? node.store.db.prepare("SELECT cwd, channel FROM sessions WHERE cli=? AND session_id=?").get(o.cli, o.sessionId)
+        ? node.store.db.prepare("SELECT agent, cwd, channel FROM sessions WHERE cli=? AND session_id=?").get(o.cli, o.sessionId)
         : undefined;
     const leaseRow = name && o.sessionId
         ? node.store.db.prepare("SELECT * FROM identity_leases WHERE name=? AND cli=? AND session_id=? AND released_at IS NULL")
@@ -266,7 +266,17 @@ export function hudStatusV2(node, o, cached) {
                 }
                 : null,
         },
-        inbox: { unread: v1.unread, needs_reply: v1.needs_reply, from_owner: v1.from_owner, outbox_unsent: v1.outbox_unsent },
+        inbox: {
+            unread: v1.unread, needs_reply: v1.needs_reply, from_owner: v1.from_owner, outbox_unsent: v1.outbox_unsent,
+            ...(o.includeInbox ? { recent: name && o.state === "bound" && sessionRow?.agent === name
+                    ? node.store.db.prepare(`SELECT m.id, m.from_addr AS sender, m.subject, m.kind, m.ts,
+            json_extract(m.envelope, '$.needs_reply') AS needs_reply
+            FROM deliveries d JOIN messages m ON m.id=d.msg_id
+            WHERE d.agent=? AND d.state<>'acked' ORDER BY m.ts DESC, m.id DESC LIMIT 3`)
+                        .all(name)
+                        .map(m => ({ ...m, needs_reply: m.needs_reply === 1 }))
+                    : [] } : {}),
+        },
         harness: {
             cli: o.cli,
             session_id: o.sessionId,

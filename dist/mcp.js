@@ -5,7 +5,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -20,7 +20,7 @@ import { BIND_TICKET_RE, takeBindTicket } from "./bind-ticket.js";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess } from "./identity-leases.js";
 import { activityKey, holderProviderView, identityAvailability, parseActivity, parseProviderRecord, providerRecordKey } from "./identity-availability.js";
 import { reviveMailbox } from "./identity-cleanup.js";
-import { AUTO_NAME_RE, linkedKey, noteProject, projectKey, projectOf, registeredIdentity, registerIdentity, renameRegistration, ROLE_RE, sessionHint, UNSPECIFIED_ROLE } from "./registry.js";
+import { AUTO_NAME_RE, crossHostKey, linkedKey, noteProject, projectOf, registeredIdentity, registerIdentity, renameRegistration, ROLE_RE, sessionHint, UNSPECIFIED_ROLE } from "./registry.js";
 import { applyIdentityTakeover } from "./identity-takeover.js";
 import { opencodeHostOf, opencodeProviderPid } from "./opencode-provider.js";
 import { formatUnboundStart, listIdentityStatus } from "./identity-status.js";
@@ -28,7 +28,8 @@ import { consumeIdentityControl, identityControlAliases, identityControlKey, ide
 import { alive, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
 import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy.js";
 import { assertKnownRecipients, deliveryReceipts, offlineWarnings, receiptLine, recipientReceipts, sentPage } from "./receipts.js";
-import { forwardMessage, ledgerPage, projectLeadLine, projectLeadView } from "./project-ledger.js";
+import { forwardMessage, ledgerPage, projectLeadView } from "./project-ledger.js";
+import { buildRoster, rosterText } from "./roster.js";
 import { skillFiles } from "./setup.js";
 import { claudeSessionId, claudeSessionTracker, grokSessionId, grokSessionTracker, procStart, procTable, withProcSnapshot } from "./proc.js";
 import { updateAvailable } from "./update.js";
@@ -39,6 +40,8 @@ import { encodeReplayFrame, replayMaximum } from "./replay.js";
 import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wake.js";
 import { isStoreBusy, withStoreBusyTimeout } from "./store.js";
 import { markMcpStarting } from "./mcp-startup.js";
+import { recordMcpGeneration, startMcpLifecycle } from "./mcp-lifecycle.js";
+let lifecycle;
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
 It is shared by AI coding agents on this machine and on paired machines. Your user set it up so agents can coordinate;
 replying, answering questions, sharing status and acking are always fine.
@@ -112,34 +115,6 @@ export const reexecEnv = (parentAgent, providerPid, detached, originalPid) => ({
     ...(originalPid ? { MBX_MCP_ORIGINAL_PID: String(originalPid) } : {}) });
 const REEXEC_PARENT_AGENT = "MBX_MCP_PARENT_AGENT";
 /**
- * T449: the original proxy tracks the current live generation through a small file record instead of waiting
- * on stdin EOF (a paused stdin never emits "end"). Each generation writes the pid of its replacement before
- * exiting; the original polls the record and exits when the recorded pid is dead or reused.
- */
-const generationDir = () => join(defaultHome(), "mcp-generation");
-const generationPath = (originalPid) => join(generationDir(), String(originalPid));
-function writeGeneration(originalPid, pid) {
-    try {
-        mkdirSync(generationDir(), { recursive: true, mode: 0o700 });
-        writeFileSync(generationPath(originalPid), JSON.stringify({ pid, start: "" }), "utf8");
-    }
-    catch { /* best-effort: the proxy still falls back to the child's exit code */ }
-}
-function readGeneration(originalPid) {
-    try {
-        return JSON.parse(readFileSync(generationPath(originalPid), "utf8"));
-    }
-    catch {
-        return null;
-    }
-}
-function clearGeneration(originalPid) {
-    try {
-        unlinkSync(generationPath(originalPid));
-    }
-    catch { /* already gone */ }
-}
-/**
  * T317: the provider to hand to a re-exec child must be the *original* CLI provider process, not this MCP
  * process's current ppid. After the first re-exec, the MCP parent is itself a re-exec generation and may soon
  * exit; if reparented to launchd the ppid walk sees pid 1. Use the record this process stored at claim time,
@@ -173,6 +148,7 @@ const handoverProvider = (node, ppid) => {
  * pending handover state.
  */
 function handOverToFreshProcess(pauseStdin, parentAgent, providerPid, detached, retired, onAbort) {
+    lifecycle ??= startMcpLifecycle(defaultHome());
     const originalPid = Number(process.env.MBX_MCP_ORIGINAL_PID) || process.pid;
     let child;
     try {
@@ -185,6 +161,10 @@ function handOverToFreshProcess(pauseStdin, parentAgent, providerPid, detached, 
     let spawned = false;
     child.once("spawn", () => {
         spawned = true;
+        if (child.pid)
+            recordMcpGeneration(lifecycle.home, originalPid, { pid: child.pid, start: inspectLeaseProcess(child.pid).start });
+        if (!process.env[REEXEC_ENV])
+            lifecycle.retireToProxy();
         try {
             retired?.();
         }
@@ -196,14 +176,8 @@ function handOverToFreshProcess(pauseStdin, parentAgent, providerPid, detached, 
         if (process.env[REEXEC_ENV]) {
             // T449: tell the original which pid is now serving, then exit. The original watches this pid and
             // mirrors its exit, so a crash or a clean stop both close the provider transport.
-            if (child.pid)
-                writeGeneration(originalPid, child.pid);
             process.exit(0);
         }
-        // T449: the original records its direct child so the poller below has a pid to watch even when this
-        // child never hands off again.
-        if (child.pid)
-            writeGeneration(originalPid, child.pid);
     });
     child.once("error", (err) => {
         if (!spawned) {
@@ -226,29 +200,6 @@ function handOverToFreshProcess(pauseStdin, parentAgent, providerPid, detached, 
         }
         // T317: the original proxy keeps the provider transport alive. A zero exit means the replacement has
         // itself handed off to a newer generation; a non-zero exit means the replacement died and we mirror it.
-        if (code === 0 && !process.env[REEXEC_ENV]) {
-            // T449: poll the generation record and exit when the current live generation dies. This avoids the
-            // stdin.once("end") bug: a paused stdin never emits "end" on EOF, so the proxy would leak forever.
-            // Use process.kill(pid, 0) directly: inspectLeaseProcess relies on ps, whose cache can report a
-            // just-spawned generation as missing and make the proxy exit prematurely (closing stdin and killing it).
-            const poller = setInterval(() => {
-                const rec = readGeneration(originalPid);
-                if (!rec)
-                    return; // no generation bound yet; the child is still starting up
-                let genAlive = false;
-                try {
-                    process.kill(rec.pid, 0);
-                    genAlive = true;
-                }
-                catch { /* dead or permission denied */ }
-                if (!genAlive) {
-                    clearGeneration(originalPid);
-                    process.exit(0);
-                }
-            }, 1_000);
-            process.once("exit", () => clearInterval(poller));
-            return;
-        }
         if (code !== 0)
             process.exit(code ?? 0);
     });
@@ -484,6 +435,7 @@ export const externalWarning = (origin, taint) => {
     return [`${origin === "agent" ? "origin \"agent\" overridden: " : ""}sent with origin external because this session read outside content: recipients may only read it under owner policy (no edit or outward).${until}`];
 };
 export async function runMcp(existing) {
+    lifecycle ??= startMcpLifecycle(existing?.home ?? defaultHome());
     const clearStarting = markMcpStarting(existing?.home ?? defaultHome());
     try {
         // Transport initialization must not need a database, process inspection, or an identity lease.
@@ -577,6 +529,8 @@ async function configureMcp(server, node, startupClosed) {
     // the project this session works in (not the home folder), stamped on what it sends and recorded per identity
     let project = projectOf(process.cwd()); // a hosted conversation moves it to its own folder when it links (bind ticket)
     const env = detectHost();
+    if (env.ppid > 1)
+        lifecycle?.watchClient({ pid: env.ppid, start: process.env.MBX_MCP_PROVIDER_START || inspectLeaseProcess(env.ppid).start });
     const detached = detachedReloadState(process.env);
     // Chosen identities only (T204): the launch config (MBX_AGENT) or the identity this provider session held before. A
     // re-exec child reclaims the name its parent released at handover. Nothing else ever names a session.
@@ -901,7 +855,7 @@ async function configureMcp(server, node, startupClosed) {
             const leaseToken = state.leaseToken ?? claimFor(state, agent, explicit);
             rememberProvider();
             node.registerAgent(agent, { cli: env.cli, role: process.env.MBX_ROLE, description: process.env.MBX_DESCRIPTION });
-            noteProject(node.store, agent, project);
+            noteProject(node.store, agent, project, explicit);
             publishControl({ ...state, agent, leaseToken });
             return { agent, leaseToken };
         });
@@ -1243,7 +1197,7 @@ async function configureMcp(server, node, startupClosed) {
         const taint = taintOf(state, now);
         const draft = { hop: depths.length ? Math.min(MAX_RELAY_DEPTH, Math.max(...depths) + 1) : 0, origin: origin === "external" || taint ? "external" : "agent",
             // inherited taint carries its ROOT exposure; a declared send is first-hand, rooted at its own send time
-            ...(origin !== "external" && taint ? { external_since: isoAt(taint.root) } : {}), project, project_key: projectKey(project) };
+            ...(origin !== "external" && taint ? { external_since: isoAt(taint.root) } : {}), project, project_key: crossHostKey(project) };
         return { draft, warnings: externalWarning(origin, taint) };
     };
     /** Opening mail marks the reader's own copies read (delivered/notified → read; never past acked), for sender receipts (T207). */
@@ -1329,14 +1283,14 @@ async function configureMcp(server, node, startupClosed) {
                 node.store.assertCurrent(version());
             }
             catch (e) {
-                if (storeMismatchCode(e) && canReloadBuild(process.env, codeFingerprint(), boot)) {
+                // The same installed build cannot fix a newer schema; keep returning its normal tool refusal.
+                if (storeMismatchCode(e) && codeFingerprint() !== boot && canReloadBuild(process.env, codeFingerprint(), boot)) {
                     // Validate the payload first and let handOverToFreshProcess retire only once the replacement has
                     // provably spawned: a failure here leaves this server fully serving (T441).
                     const detached = detachedReloadSchema.parse(detachedForReload());
-                    handOverToFreshProcess(false, bound(base) ? base.agent : undefined, handoverProvider(node, env.ppid), detached, retire);
+                    // Subsequent requests belong to the replacement's reader, as on a build-only handover.
+                    handOverToFreshProcess(true, bound(base) ? base.agent : undefined, handoverProvider(node, env.ppid), detached, retire);
                 }
-                else
-                    reloadFromDisk(e);
                 throw e;
             }
             // a deployed build replaced the one this server loaded: finish this call on the old code, then hand
@@ -1576,7 +1530,6 @@ async function configureMcp(server, node, startupClosed) {
             prepareState(base, undefined, () => node.store.tx(() => {
                 leases.renew(base.agent, base.leaseToken);
                 node.bindSession({ agent: base.agent, cli: env.cli, session_id: t.session_id, cwd: t.cwd, pid: env.ppid, session_key: base.key.publicKey, channel: false, mcp_pid: process.pid });
-                noteProject(node.store, base.agent, project);
                 publishControl(base);
             }));
         }
@@ -1605,7 +1558,7 @@ async function configureMcp(server, node, startupClosed) {
                 return identityOperation({ action: registeredIdentity(node.store, name) || AUTO_NAME_RE.test(name) ? "claim" : "register", name, role, description });
             const list = listIdentityStatus(node.home, { project, caller: { cli: env.cli, sessionId: state.sessionId, pid: process.pid, providerPid: env.ppid, canonicalHarness: !!env.harnessProvider } });
             const leadView = projectLeadView(node, project);
-            const out = { agent: null, host: node.host, cli: env.cli, unbound: true, project: project ?? null,
+            const out = { agent: null, host: node.host, cli: env.cli, unbound: true, project: project ?? null, harness_session: state.sessionId,
                 lead: leadView.address && leadView.exp ? { address: leadView.address, exp: leadView.exp } : null, pending: state.pending ?? null,
                 reason: state.lostTo ? `claimed by ${state.lostTo}` : state.pendingReason ?? null, next: unboundMessage(state),
                 project_identities: list.identities.map(i => ({ name: i.name, role: i.role, state: i.state, claimable: i.claimable, unread: i.unread, last_activity: i.last_activity, reason: i.reason })),
@@ -1649,7 +1602,10 @@ async function configureMcp(server, node, startupClosed) {
         const leadView = projectLeadView(node, project);
         const out = { agent, host: node.host, address: `${agent}@${node.host}`, role: reg?.role ?? me?.role ?? null, description: reg?.description ?? me?.description ?? null,
             registered: !!reg, project: project ?? null, lead: leadView.address && leadView.exp ? { address: leadView.address, exp: leadView.exp } : null,
-            cli: env.cli, session: fingerprint(key.publicKey), ...(state.coUse ? { co_use: CO_USE_NOTE } : {}),
+            // T548: `session` keeps its historical meaning (the lease key fingerprint) for old clients; the id the
+            // statusline/HUD key on is the sessions-table session id, reported as `harness_session`; `lease_key` labels it.
+            cli: env.cli, session: fingerprint(key.publicKey), harness_session: state.sessionId, lease_key: fingerprint(key.publicKey),
+            ...(state.coUse ? { co_use: CO_USE_NOTE } : {}),
             owner_grant: s.grant ? { caps: s.grant.caps, expires: s.grant.exp } : null, delivery: node.deliveryMode(agent), unread: node.unreadCount(agent),
             missed: missedCount(node.store, agent).missed,
             // T344: whether this session's sends go out external, since when (root exposure), why, and when that ends
@@ -1835,15 +1791,17 @@ async function configureMcp(server, node, startupClosed) {
     });
     server.registerTool("mbx_agents", {
         title: "List mbx agents",
-        description: "Agents known on this host and on paired hosts, with role, CLI and when they were last seen. Next: address one with mbx_send (name, name@host or role:<role>).",
-        inputSchema: {},
+        description: "Who you can reach, and whether they are really there. state is live (a verified session holds it), idle (a shared-process conversation quiet for 10 minutes), unknown (a holder exists but could not be verified right now), offline, or remote (listed by a paired host; this host cannot verify it). Each row shows role, the harness holding it, its projects and lead_of (the projects it is the owner-designated lead of). Default: this session's project plus the leads of other projects, plus any live or idle persona whose session works in this folder (seen_here: true; visibility only, it does not make the persona a member); project:\"*\" lists every project. Retired and generated names are hidden unless they are live or idle; all:true lists them. Next: address one with mbx_send (name, name@host or role:<role>).",
+        inputSchema: {
+            project: z.string().max(1024).optional().describe("\"*\" for every project, or this session's own folder (the default view)"),
+            all: z.boolean().optional().describe("also list retired and generated names"),
+        },
         annotations: { readOnlyHint: true },
-    }, () => {
-        const rows = node.agents();
-        const leadView = projectLeadView(node, project);
-        const lead = leadView.address && leadView.exp ? { address: leadView.address, exp: leadView.exp } : null;
-        const lines = rows.map((a) => `${a.name}@${a.host}${a.role ? `  role:${a.role}` : ""}${a.cli ? `  (${a.cli})` : ""}  last seen ${a.last_seen ?? "never"}${a.description ? `  — ${a.description}` : ""}`).join("\n") || "No agents yet.";
-        return text(`${lines}\n${projectLeadLine(leadView)}`, { agents: rows, lead });
+    }, ({ project: asked, all }) => {
+        const state = current();
+        const roster = buildRoster(node, { project, ask: asked, all, self: bound(state) ? state.agent : null,
+            caller: { cli: env.cli, sessionId: state.sessionId, pid: process.pid, providerPid: env.ppid, canonicalHarness: !!env.harnessProvider } });
+        return text(rosterText(roster), roster);
     });
     server.registerTool("mbx_sent", {
         title: "What happened to mail you sent",
@@ -1903,9 +1861,9 @@ async function configureMcp(server, node, startupClosed) {
         closed = true;
         for (const timer of timers)
             clearInterval(timer);
-        process.stdin.off("end", retire);
         process.off("exit", retire);
         try {
+            node.store.db.exec("PRAGMA busy_timeout=0"); // Terminal cleanup must not wait behind another writer.
             node.store.tx(() => {
                 for (const { key, agent, leaseToken, coUse } of [base, ...states.values()]) {
                     if (leaseToken && !coUse)
@@ -1924,14 +1882,15 @@ async function configureMcp(server, node, startupClosed) {
             process.stderr.write(`[mbx] session cleanup failed: ${e.message}\n`);
         }
     };
-    server.server.onclose = retire;
-    // The SDK stdio transport does not forward stdin EOF to onclose.
-    process.stdin.once("end", retire);
+    lifecycle?.onShutdown(() => { try {
+        retire();
+    }
+    finally {
+        node.close();
+    } });
+    server.server.onclose = () => lifecycle ? lifecycle.shutdown() : retire();
     process.once("exit", retire);
-    // A provider that ends its servers with a signal (claude -p, a closed terminal) releases the identity cleanly instead
-    // of leaving a dead holder to expire. SIGINT is left alone: a terminal's Ctrl-C interrupts a turn, not the session.
-    for (const [signal, code] of [["SIGTERM", 143], ["SIGHUP", 129]])
-        process.once(signal, () => { retire(); process.exit(code); });
+    // SIGTERM/SIGHUP and EOF remain owned by the lifecycle controller across mailbox retirement.
     if (closed)
         return;
     // The reused client does not initialize again. Registration happened before

@@ -38,11 +38,11 @@ test("T328 session-start lists only this directory's claimable mailboxes, the sa
   const here = projectOf(dir);
   assert.ok(here);
   registerIdentity(node.store, { name: "orbit-grok", role: "grok" });
-  noteProject(node.store, "orbit-grok", here);
+  noteProject(node.store, "orbit-grok", here, true);
   registerIdentity(node.store, { name: "orbit-held", role: "reviewer" });
-  noteProject(node.store, "orbit-held", here);
+  noteProject(node.store, "orbit-held", here, true);
   registerIdentity(node.store, { name: "elsewhere-codex", role: "codex" });
-  noteProject(node.store, "elsewhere-codex", projectOf(other)!);
+  noteProject(node.store, "elsewhere-codex", projectOf(other)!, true);
   const startTime = inspectLeaseProcess(process.pid).start;
   assert.ok(startTime);
   new IdentityLeases(node.store).claim("orbit-held", {
@@ -107,7 +107,7 @@ test("T328 caps the claimable list at ten and points at mbx_identity list", () =
   for (let n = 1; n <= 11; n++) {
     const name = `box-${String(n).padStart(2, "0")}`;
     registerIdentity(node.store, { name, role: "grok" });
-    noteProject(node.store, name, here);
+    noteProject(node.store, name, here, true);
   }
   try {
     const result = start(home, "opencode", dir, "start-cap");

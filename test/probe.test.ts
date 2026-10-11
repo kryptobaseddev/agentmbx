@@ -16,7 +16,7 @@ import { noteProject } from "../src/registry.ts";
 import { bindWakeLease } from "./helpers/wake-lease.ts";
 
 const identity = (name: string, state: IdentityStatus["state"], holder: IdentityStatus["holder"] = null): IdentityStatus =>
-  ({ name, state, claimable: false, reason: `${state} fixture`, role: null, description: null, registered: true,
+  ({ name, state, claimable: false, reason: `${state} fixture`, role: null, description: null, registered: true, retired: false,
     projects: [], unread: 0, messages: 0, last_activity: null, holder });
 
 test("planProbe addresses every live leased identity and excludes the sender", () => {
@@ -475,7 +475,7 @@ test("storeProbeIO: historical membership but a live session elsewhere is not ta
   bindWakeLease(n, { agent: "outsider", cli: "claude", session_id: "term-elsewhere", pid: process.pid, cwd: "/other" });
   bindWakeLease(n, { agent: "probe-runner", cli: "claude", session_id: "runner-1", pid: process.pid, cwd: "/proj" });
   // A session cwd is not membership (T515). local-worker is a member because of the binding, and the live cwd still has to match (T445).
-  noteProject(n.store, "local-worker", "/proj");
+  noteProject(n.store, "local-worker", "/proj", true);
   // outsider once worked in /proj — historical identity_projects membership only.
   n.store.db.prepare("INSERT INTO identity_projects (name,project,first_seen,last_seen) VALUES (?,?,?,?)")
     .run("outsider", "/proj", new Date().toISOString(), new Date().toISOString());

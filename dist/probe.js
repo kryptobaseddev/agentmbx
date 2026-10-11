@@ -1,6 +1,6 @@
 import { IdentityLeases } from "./identity-leases.js";
 import { listIdentityStatus } from "./identity-status.js";
-import { projectKey as defaultProjectKey } from "./registry.js";
+import { crossHostKey as defaultProjectKey } from "./project-key.js";
 import { realpathSync } from "node:fs";
 import { sep } from "node:path";
 export const PROBE_SUBJECT_PREFIX = "[mbx-probe]";
@@ -30,29 +30,32 @@ export function globMatch(pattern, name) {
     const re = new RegExp("^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$");
     return re.test(name);
 }
+/** True when a holder's session cwd is the project, inside it, or has the same project key: a second checkout of one CLEO
+ *  project, or of one git origin (T445, T543). One rule
+ *  for `planProbe` and the roster's `seen_here` (T496), so the two cannot drift. A missing cwd is not in the project. */
+export function cwdInProject(rawCwd, project, keyOf = defaultProjectKey) {
+    if (!rawCwd)
+        return false;
+    const cwd = (() => { try {
+        return realpathSync(rawCwd);
+    }
+    catch {
+        return rawCwd;
+    } })();
+    if (cwd === project || cwd.startsWith(project + sep))
+        return true;
+    const targetKey = keyOf(cwd), projectKey = keyOf(project);
+    return targetKey !== undefined && projectKey !== undefined && targetKey === projectKey;
+}
 export function planProbe(identities, sender, options = {}) {
     const only = options.only?.length ? new Set(options.only) : null;
     const keyOf = options.projectKeyOf ?? defaultProjectKey;
-    const projectKey = options.project ? keyOf(options.project) : undefined;
     return identities
         .filter((i) => i.name !== sender && (i.state === "held" || i.state === "idle"))
         .filter((i) => {
         if (!options.project || !options.holderProject)
             return true;
-        const rawCwd = i.holder ? options.holderProject(i.holder) : null;
-        if (!rawCwd)
-            return false;
-        const cwd = (() => { try {
-            return realpathSync(rawCwd);
-        }
-        catch {
-            return rawCwd;
-        } })();
-        const project = options.project;
-        if (cwd === project || cwd.startsWith(project + sep))
-            return true;
-        const targetKey = keyOf(cwd);
-        return targetKey !== undefined && projectKey !== undefined && targetKey === projectKey;
+        return cwdInProject(i.holder ? options.holderProject(i.holder) : null, options.project, keyOf);
     })
         .filter((i) => !only || only.has(i.name))
         .filter((i) => !(options.exclude ?? []).some((p) => globMatch(p, i.name)))
