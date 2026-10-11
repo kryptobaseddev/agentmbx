@@ -65,24 +65,24 @@ test("a desktop conversation links its own mbx server by ticket, registers its o
   assert.deepEqual([linked.agent, linked.project], [null, realpathSync(project)], "linked to its conversation and folder, still without a name");
   assert.equal((await b.callTool({ name: "mbx_whoami", arguments: { bind: nonce } })).isError, true, "a used ticket links nothing else");
   assert.doesNotMatch(hook("prompt", "conv-aaa").stdout, /bind=/, "a linked conversation is not re-ticketed");
-  const reg = await a.callTool({ name: "mbx_identity", arguments: { action: "register", name: "orbit-kimi", role: "builder" } });
+  const reg = await a.callTool({ name: "mbx_identity", arguments: { action: "register", name: "orbit-builder", role: "builder" } });
   assert.notEqual(reg.isError, true, JSON.stringify(reg));
   const who = (await a.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent: string; delivery: string };
-  assert.equal(who.agent, "orbit-kimi");
+  assert.equal(who.agent, "orbit-builder");
   assert.match(who.delivery, /^push \(kimi web or desktop app\)/);
   const row = n.store.db.prepare("SELECT agent, cwd, pid FROM sessions WHERE cli='kimi' AND session_id='conv-aaa'").get() as { agent: string; cwd: string; pid: number };
-  assert.deepEqual({ ...row }, { agent: "orbit-kimi", cwd: realpathSync(project), pid: process.pid });
+  assert.deepEqual({ ...row }, { agent: "orbit-builder", cwd: realpathSync(project), pid: process.pid });
 
   // a second conversation in the same folder: its own ticket, its own chosen identity; the first one's is not offered to it
   const second = ticketOf(hook("prompt", "conv-bbb").stdout);
   assert.ok(second, "the prompt hook hands an unlinked conversation its ticket (Kimi drops SessionStart context)");
   const other = (await b.callTool({ name: "mbx_whoami", arguments: { bind: second } })).structuredContent as { agent: string | null; project_identities: { name: string; claimable: boolean }[] };
   assert.equal(other.agent, null);
-  assert.deepEqual(other.project_identities.map(i => [i.name, i.claimable]), [["orbit-kimi", false]]);
+  assert.deepEqual(other.project_identities.map(i => [i.name, i.claimable]), [["orbit-builder", false]]);
 
-  n.send({ from: "boss", to: ["orbit-kimi"], subject: "s", body: "b", kind: "request" });
+  n.send({ from: "boss", to: ["orbit-builder"], subject: "s", body: "b", kind: "request" });
   const prompt = hook("prompt", "conv-aaa");
-  assert.match(prompt.stdout, /1 unread for orbit-kimi@alpha: mbx_inbox/, "hooks now resolve the linked conversation");
+  assert.match(prompt.stdout, /1 unread for orbit-builder@alpha: mbx_inbox/, "hooks now resolve the linked conversation");
   assert.doesNotMatch(prompt.stdout, /bind=/);
 
   // the app restarts the conversation's server: a fresh ticket links the new server, which resumes the chosen identity
@@ -90,7 +90,7 @@ test("a desktop conversation links its own mbx server by ticket, registers its o
   await connect(c);
   const again = ticketOf(hook("prompt", "conv-aaa").stdout);
   assert.ok(again, "a conversation whose server ended is ticketed again");
-  assert.equal(((await c.callTool({ name: "mbx_whoami", arguments: { bind: again } })).structuredContent as { agent: string }).agent, "orbit-kimi");
+  assert.equal(((await c.callTool({ name: "mbx_whoami", arguments: { bind: again } })).structuredContent as { agent: string }).agent, "orbit-builder");
 });
 
 const desktop: KimiDesktop = { url: "ws://127.0.0.1:9/control", token: "t", pid: 1, dir: "/x" };
