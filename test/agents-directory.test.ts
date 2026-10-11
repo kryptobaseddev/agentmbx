@@ -10,6 +10,8 @@ import { canonical, generateKeyPair, signData, verifyData } from "../src/crypto.
 import { refreshDirectory, signHop, startServer } from "../src/http.ts";
 import { inspectLeaseProcess } from "../src/identity-leases.ts";
 import { MbxNode } from "../src/node.ts";
+import { buildRoster, rosterText } from "../src/roster.ts";
+import { validateAgentsV1 } from "../src/status-schema.ts";
 import { SCHEMA_VERSION } from "../src/store.ts";
 
 process.env.MBX_NO_DESKTOP = "1";
@@ -94,6 +96,19 @@ test("AC2: refreshDirectory stores a signed directory, clears an unsigned one, a
   assert.equal(stored()?.state, "live");
   assert.equal(stored()?.harness, "grok");
   assert.deepEqual(stored()?.project_keys, [KEY]);
+  const shown = () => buildRoster(b, { ask: "*" });
+  const text = () => rosterText(shown());
+  const listed = (address: string) => shown().agents.find((row) => row.address === address);
+  assert.deepEqual(validateAgentsV1(shown()), []);
+  assert.equal(listed("live-one@alpha")?.state, "live");
+  assert.equal(listed("live-one@alpha")?.harness, "grok");
+  assert.deepEqual(listed("live-one@alpha")?.project_keys, [KEY]);
+  assert.match(listed("live-one@alpha")?.reason ?? "", /verified by paired host alpha/);
+  assert.equal(listed("offline-one@alpha")?.state, "offline");
+  assert.equal(listed("offline-one@alpha")?.harness, null);
+  assert.deepEqual(listed("offline-one@alpha")?.project_keys, []);
+  assert.match(text(), /live-one@alpha {2}live/);
+  assert.match(text(), /offline-one@alpha {2}offline/);
 
   const forged = { v: 1, host: "alpha", agents: [
     { name: "live-one", role: "dev", cli: "grok", description: "holding", last_seen: null, state: "offline", harness: null, project_keys: [] },
@@ -112,6 +127,11 @@ test("AC2: refreshDirectory stores a signed directory, clears an unsigned one, a
   assert.equal(stored()?.harness, null);
   assert.equal(stored()?.project_keys, null);
   assert.equal(stored()?.description, "legacy");
+  assert.equal(listed("live-one@alpha")?.state, "remote");
+  assert.equal(listed("live-one@alpha")?.harness, null);
+  assert.equal(listed("live-one@alpha")?.project_keys, undefined);
+  assert.match(listed("live-one@alpha")?.reason ?? "", /cannot verify/);
+  assert.match(text(), /live-one@alpha {2}remote/);
   const away = b.agents().find((row) => row.name === "offline-one");
   assert.ok(away, "a name missing from the unsigned list keeps its row");
   assert.equal(away?.state, null);
