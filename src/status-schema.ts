@@ -97,6 +97,11 @@ export interface AgentsV1Row {
    *  the session has no project. */
   seen_here: boolean;
   last_seen: string | null;
+  /**
+   * Normalized git origins from a signed directory (T546). Absent when this host has not verified the row.
+   * Folder paths stay in `projects`.
+   */
+  project_keys?: string[];
 }
 
 export interface AgentsV1 {
@@ -151,6 +156,7 @@ export function validateAgentsV1(x: unknown): string[] {
     for (const k of ["projects", "lead_of"] as const) if (!strList(r[k])) bad.push(`${at}.${k} is not a list of strings`);
     if (typeof r.self !== "boolean") bad.push(`${at}.self is not a boolean`);
     if (typeof r.seen_here !== "boolean") bad.push(`${at}.seen_here is not a boolean`);
+    if (r.project_keys !== undefined && !strList(r.project_keys)) bad.push(`${at}.project_keys is not a list of strings`);
     if (r.harness !== null && r.state !== "live" && r.state !== "idle") bad.push(`${at}.harness is set but the persona is not live or idle`);
   });
   return bad;

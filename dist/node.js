@@ -58,6 +58,17 @@ export const HERMES_NO_PUSH = "no push: Hermes has no idle-session inject. Run `
 /** Adapter boundary (T067): node core never imports kimi-web; the adapter registers the real check in wake-check. */
 const sessionWakeable = (x) => !!x.channel || ((WAKEABLE.has(x.cli) || (x.cli === "kimi" && kimiHostedCheck(x.pid))) && !x.session_id.startsWith("mcp-"));
 export const defaultHome = () => process.env.MBX_HOME || join(homedir(), ".local", "share", "agentmbx");
+function parseProjectKeys(raw) {
+    if (raw == null)
+        return null;
+    try {
+        const v = JSON.parse(raw);
+        return Array.isArray(v) && v.every((k) => typeof k === "string") ? v : null;
+    }
+    catch {
+        return null;
+    }
+}
 const shortHost = () => hostname().split(".")[0].toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) || "host";
 export class MbxNode {
     home;
@@ -148,7 +159,13 @@ export class MbxNode {
             .run(name, this.host, info.role ?? null, info.cli ?? null, info.description ?? null, new Date().toISOString());
     }
     agents() {
-        return this.store.db.prepare("SELECT * FROM agents ORDER BY host, name").all();
+        const rows = this.store.db.prepare("SELECT name,host,role,cli,description,last_seen,state,harness,project_keys FROM agents ORDER BY host, name").all();
+        return rows.map((r) => ({
+            name: r.name, host: r.host, role: r.role, cli: r.cli, description: r.description, last_seen: r.last_seen,
+            state: r.state === "live" || r.state === "idle" || r.state === "unknown" || r.state === "offline" ? r.state : null,
+            harness: typeof r.harness === "string" ? r.harness : null,
+            project_keys: parseProjectKeys(r.project_keys),
+        }));
     }
     /**
      * Bind a CLI session to an agent. The hook binding (wake target) and the MCP binding (session key) come from the same

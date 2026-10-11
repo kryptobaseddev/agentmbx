@@ -19,6 +19,8 @@ import { version } from "./version.js";
 import { rotationLog, saveRotationLog } from "./key-rotation.js";
 import { storedPolicies, acceptSigned, policyUnexpired } from "./policy.js";
 import { acceptReceipt, dueReceipts, RECEIPT_BATCH, receiptsDeferred, receiptsSent, signReceipt } from "./remote-receipts.js";
+import { listIdentityStatus } from "./identity-status.js";
+import { projectKey } from "./registry.js";
 export const HOP_SKEW_MS = 5 * 60_000;
 const HELLO_TTL_MS = 2 * 60_000;
 const TOKEN_REQS_PER_MIN = 30;
@@ -584,7 +586,8 @@ export function startServer(node, port = node.config.port, bind = node.config.bi
                 return send(200, { items: rest.slice(0, limit), more: rest.length > limit });
             }
             if (req.method === "GET" && url.pathname === "/v1/agents") {
-                return send(200, { host: node.host, agents: node.agents().filter((a) => a.host === node.host).map(({ name, role, cli, description, last_seen }) => ({ name, role, cli, description, last_seen })) });
+                // Signed directory (T546). The hop signs the request; the body signature is what a peer trusts.
+                return send(200, signedDirectory(node));
             }
             if (req.method === "GET" && url.pathname === "/v1/enc-key") {
                 // Pairwise body-encryption key (T028 Option A). The channel is peer-authenticated by verifyHop
@@ -757,21 +760,123 @@ export async function notifyUnpair(node, host) {
         return false;
     }
 }
+const DIRECTORY_STATE = new Set(["live", "idle", "unknown", "offline"]);
+/** `held` is this host's word for a verified live holder. `remote` is never published. */
+function publishedState(state) {
+    if (state === "held")
+        return "live";
+    if (state === "idle")
+        return "idle";
+    if (state === "unknown")
+        return "unknown";
+    return "offline";
+}
+/** This host's agents table only. State comes from holder evidence, never from last_seen or another host's row. */
+function directoryAgents(node) {
+    const byName = new Map(listIdentityStatus(node.home).identities.map((s) => [s.name, s]));
+    return node.agents().filter((a) => a.host === node.host).map((a) => {
+        const s = byName.get(a.name);
+        const state = s ? publishedState(s.state) : "offline";
+        const harness = (state === "live" || state === "idle") && s?.holder?.cli ? s.holder.cli : null;
+        const keys = new Set();
+        for (const project of s?.projects ?? []) {
+            try {
+                const key = projectKey(project);
+                if (key)
+                    keys.add(key);
+            }
+            catch { /* one bad folder does not blank the directory */ }
+        }
+        return {
+            name: a.name, role: a.role, cli: a.cli, description: a.description, last_seen: a.last_seen,
+            state, harness, project_keys: [...keys].sort(),
+        };
+    });
+}
+/** The directory body a peer verifies: `canonical` of this object, not of the object that also carries `sig`. */
+export function signedDirectory(node) {
+    const body = { v: 1, host: node.host, agents: directoryAgents(node) };
+    return { ...body, sig: signData(node.key.privateKey, canonical(body)) };
+}
+const textOrNull = (v) => typeof v === "string" ? v : null;
+function directoryFive(a) {
+    if (!a || typeof a !== "object")
+        return null;
+    const r = a;
+    if (typeof r.name !== "string" || !NAME_RE.test(r.name))
+        return null;
+    return { name: r.name, role: textOrNull(r.role), cli: textOrNull(r.cli), description: textOrNull(r.description), last_seen: textOrNull(r.last_seen) };
+}
+/** Verified columns for one signed row, or null when the row must be stored unverified. */
+function verifiedColumns(a) {
+    if (!a || typeof a !== "object")
+        return null;
+    const r = a;
+    if (typeof r.state !== "string" || !DIRECTORY_STATE.has(r.state))
+        return null;
+    if (!(r.harness === null || (typeof r.harness === "string" && r.harness.length > 0 && r.harness.length <= 64)))
+        return null;
+    if (r.harness !== null && r.state !== "live" && r.state !== "idle")
+        return null;
+    if (!Array.isArray(r.project_keys) || r.project_keys.length > 50)
+        return null;
+    const keys = [];
+    for (const k of r.project_keys) {
+        if (typeof k !== "string" || k.length === 0 || k.length > 300)
+            return null;
+        keys.push(k);
+    }
+    return { state: r.state, harness: r.harness, project_keys: JSON.stringify([...new Set(keys)].sort()) };
+}
+/**
+ * Replace this peer's directory. Verified columns are cleared first, then each accepted row is written,
+ * so a name that left the list cannot stay live. An unsigned directory writes the five legacy fields and
+ * leaves the verified columns null.
+ */
+function storeDirectory(node, host, agents, signed) {
+    node.store.tx(() => {
+        node.store.db.prepare("UPDATE agents SET state=NULL, harness=NULL, project_keys=NULL WHERE host=?").run(host);
+        const upsert = node.store.db.prepare(`INSERT INTO agents (name,host,role,cli,description,last_seen,state,harness,project_keys) VALUES (?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(name,host) DO UPDATE SET role=excluded.role, cli=excluded.cli, description=excluded.description, last_seen=excluded.last_seen,
+      state=excluded.state, harness=excluded.harness, project_keys=excluded.project_keys`);
+        for (const raw of agents.slice(0, 500)) {
+            const row = directoryFive(raw);
+            if (!row)
+                continue;
+            const verified = signed ? verifiedColumns(raw) : null;
+            upsert.run(row.name, host, row.role, row.cli, row.description, row.last_seen, verified?.state ?? null, verified?.harness ?? null, verified?.project_keys ?? null);
+        }
+    });
+}
 /** Pull each paired host's agent list so bare names and `mbx agents` work across machines. */
-export async function refreshDirectory(node) {
+export async function refreshDirectory(node, f = fetch) {
     for (const p of node.peers().filter((x) => x.state === "approved")) {
         try {
             const path = "/v1/agents";
-            const res = await fetch(`http://${p.addr}${path}`, { headers: signHop(node, "GET", path, ""), signal: AbortSignal.timeout(5_000) });
+            const res = await f(`http://${p.addr}${path}`, { headers: signHop(node, "GET", path, ""), signal: AbortSignal.timeout(5_000) });
             if (!res.ok)
                 continue;
-            const { agents } = await res.json();
-            for (const a of agents.slice(0, 500)) {
-                if (!NAME_RE.test(a.name))
+            const j = await res.json();
+            if (typeof j?.sig === "string") {
+                if (j.v !== 1 || j.host !== p.host || !Array.isArray(j.agents)) {
+                    node.store.audit("directory.rejected", { host: p.host, reason: "signed directory does not match this peer" });
                     continue;
-                node.store.db.prepare(`INSERT INTO agents (name,host,role,cli,description,last_seen) VALUES (?,?,?,?,?,?) ON CONFLICT(name,host)
-          DO UPDATE SET role=excluded.role, cli=excluded.cli, description=excluded.description, last_seen=excluded.last_seen`)
-                    .run(a.name, p.host, a.role, a.cli, a.description, a.last_seen);
+                }
+                let ok = false;
+                try {
+                    ok = verifyData(p.pubkey, canonical({ v: 1, host: p.host, agents: j.agents }), j.sig);
+                }
+                catch {
+                    ok = false;
+                }
+                if (!ok) {
+                    node.store.audit("directory.rejected", { host: p.host, reason: "signature does not verify against the pinned host key" });
+                    continue;
+                }
+                storeDirectory(node, p.host, j.agents, true);
+            }
+            else if (Array.isArray(j?.agents)) {
+                storeDirectory(node, p.host, j.agents, false);
             }
         }
         catch { /* peer offline; try next time */ }
