@@ -18,7 +18,7 @@ import { resolveStatusIdentity } from "../src/status-identity.ts";
 import { sendLeased } from "./helpers/leased-send.ts";
 
 const SID = "20261010_070000_abc123"; // the shape of a real Hermes session id: YYYYMMDD_HHMMSS_<6 hex>
-const AGENT = "t525-hermes";
+const AGENT = "t525-builder";
 const BIG = 200_000; // bytes of conversation history in one pre_llm_call payload
 
 interface Hook { status: number | null; stdout: string; stderr: string }
