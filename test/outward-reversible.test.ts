@@ -154,7 +154,15 @@ test("T498 AC5 (policy documentation): published POLICY.md and emitted delegatio
   assert.match(delegationNote(n.store.db, "worker", "alpha")!, /permission prompts may be auto-approved for bounded outward-reversible operations on supported harnesses; other prompts still require permissions/);
 });
 
-test.todo("T498 AC5 tool-description text pending mcp.ts handoff from T516");
+test("T498 AC5 tool descriptions name the outward split", () => {
+  const src = readFileSync(join(import.meta.dirname, "../src/mcp.ts"), "utf8");
+  const phrase = "outward-reversible = push a non-default branch or open a draft PR; outward = merge, release, deploy, delete, secrets, spend.";
+  const inbox = src.slice(src.indexOf('server.registerTool("mbx_inbox"'), src.indexOf('server.registerTool("mbx_read"'));
+  const read = src.slice(src.indexOf('server.registerTool("mbx_read"'), src.indexOf('server.registerTool("mbx_replay"'));
+  assert.ok(inbox.includes(phrase));
+  assert.ok(read.includes(phrase));
+  assert.equal(src.split(phrase).length - 1, 2);
+});
 
 test("T539 AC1: literal branch pushes and explicit-head draft PRs classify", () => {
   for (const command of ["git push origin feature", "git push -u origin HEAD:refs/heads/feature", "git push --no-follow-tags --recurse-submodules=no origin refs/heads/feature:feature",
