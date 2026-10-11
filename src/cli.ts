@@ -50,6 +50,7 @@ import { formatUnboundStart, listIdentityStatus } from "./identity-status.ts";
 import { REBINDING_CLIS, withCliIdentity, withHookIdentity, type CliIdentitySelection } from "./cli-identity.ts";
 import { declaredOriginWarning, readSessionTaint, refuseAgentOrigin, taintSendWarning, type SessionTaint } from "./session-taint.ts";
 import { runProbe, storeProbeIO } from "./probe.ts";
+import { leadGrantsSummary, leadGrantsView, makeLeadGrants, storeLeadGrants, withLeadGrants } from "./lead-grants.ts";
 import { resolveProject } from "./project-key.ts";
 import { DEFAULT_LOGIN_BASE_URL, defaultLoginIO, parseLoginBase, runLogin } from "./login.ts";
 import { buildIdentityTakeover, type IdentityTakeoverApproval } from "./identity-takeover.ts";
@@ -136,8 +137,10 @@ Owner (each signature needs you: a Touch ID / password prompt on macOS with Agen
 Policy (what agents may do for each other; each change needs you, like the owner commands)
   agentmbx policy set <agent[,agent]|*> <${LEVELS.join("|")}> [--from local,<host>,principal:<fp>|*] [--host <host,…>|*] [--project <dir>]… [--classes ${CLASSES.join(",")}] [--ttl 8h|never]
   agentmbx policy list [--json]      agentmbx policy renew <id> [--ttl 30d|never]      agentmbx policy revoke <id> | --all   (--all is the kill switch, sent to every paired host)
-  agentmbx lead set <agent> --project <dir> [--ttl 30d]     agentmbx lead revoke --project <dir>     agentmbx lead show [--project <dir>]
+  agentmbx lead set <agent> --project <dir> [--ttl 30d] [--classes outward-reversible --to <agent[,agent]|*>]     agentmbx lead revoke --project <dir>     agentmbx lead show [--project <dir>]
                   owner-signed project lead: reads every message of that project (mbx_project) and can forward them (mbx_forward)
+  agentmbx lead grant <agent[,agent]|*> --project <dir> [--classes outward-reversible] [--ttl 7d]
+                  owner-signed grant on the lead's record: the named members may push non-default branches and open draft PRs with automatic approval while the lead is live and untainted
   agentmbx audit [--since 24h] [--json]      what agents did on peer requests, YOLO approvals, policy and owner changes
 
 Install
@@ -1144,6 +1147,7 @@ export async function ownerInit(home: string, backend: OwnerBackend = defaultOwn
 /** `agentmbx lead`: owner-signed project leads (T208). Signed like policies; verified again on every read. */
 async function lead(node: MbxNode, pos: string[], str: (k: string) => string | undefined, o: Record<string, unknown>) {
   const sub = pos[0];
+  const csv = (x: string | undefined) => x?.split(",").map((p) => p.trim()).filter(Boolean);
   const dir = str("project") ?? (Array.isArray(o.project) ? (o.project as string[])[0] : undefined); // --project is a multiple option
   const project = dir ? (projectOf(resolve(dir)) ?? die(`${dir} is the home folder or /, not a project`)) : undefined;
   if (sub === "show") {
@@ -1154,19 +1158,41 @@ async function lead(node: MbxNode, pos: string[], str: (k: string) => string | u
     for (const r of rows) {
       const l = activeLead(node, r.project);
       const also = r.project_key ? (node.store.db.prepare("SELECT DISTINCT project FROM identity_projects WHERE project_key=? AND project<>?").all(r.project_key, r.project) as { project: string }[]).map((x) => x.project) : [];
+      const gv = l ? leadGrantsView(node, l) : null;
       console.log(`${r.project}\t${l ? `${l.agent}@${l.host} until ${l.exp} (id ${l.id})` : "none (expired or revoked)"}\tkey ${r.project_key ? `${r.project_key} (CLEO project id)` : "folder path"}${also.length ? `\talso covers ${also.join(", ")}` : ""}`);
+      if (gv?.grants) console.log(`  grants ${gv.grants.classes.join(",")} to ${gv.grants.agents.join(",")} until ${gv.grants.exp} (id ${gv.grants.id}): ${gv.state}`);
+      else if (gv?.state === "expired") console.log("  grants: expired, or no longer valid for this lead record");
     }
     return;
   }
   if (!project) die(`lead ${sub ?? "set"} needs --project <dir>`);
   const ownerPub = node.ownerPub ?? die("no owner key on this machine: run 'agentmbx owner init'");
   if (sub === "set") {
-    const agent = pos[1] ?? die("lead set <agent> --project <dir> [--ttl 30d]");
+    const agent = pos[1] ?? die("lead set <agent> --project <dir> [--ttl 30d] [--classes outward-reversible --to <agent[,agent]|*>]");
     if (!node.knownLocalName(agent)) die(`"${agent}" is not an agent on ${node.host}`);
     const rec = makeLead({ project: project!, agent, host: node.host, ownerPub, ttlMs: str("ttl") ? parseTtl(str("ttl")!) : undefined });
+    // Build the grants first, so a bad class or persona list fails before the owner is asked to sign anything (T499).
+    const who = csv(str("to"));
+    if (str("classes") && !who) die("lead set --classes needs --to <agent[,agent]|*>: name who the grant covers, or spell out *");
+    const grants = str("classes") ? makeLeadGrants({ lead: rec, classes: csv(str("classes"))!, agents: who!, ownerPub }) : undefined;
     const { sig } = await ownerSignCanonical(node.home, canonical(rec), leadSummary(rec));
     storeLead(node, rec, sig);
-    return console.log(`${agent}@${node.host} is the lead of ${project} until ${rec.exp} (id ${rec.id}).`);
+    console.log(`${agent}@${node.host} is the lead of ${project} until ${rec.exp} (id ${rec.id}).`);
+    if (grants) {
+      const signed = await ownerSignCanonical(node.home, canonical(grants), leadGrantsSummary(grants, rec));
+      storeLeadGrants(node, grants, signed.sig);
+      console.log(`grants ${grants.classes.join(",")} to ${grants.agents.join(",")} until ${grants.exp} (id ${grants.id}).`);
+    }
+    return;
+  }
+  if (sub === "grant") {
+    const cur = activeLead(node, project!) ?? die(`no active lead for ${project}`);
+    const who = csv(pos[1]) ?? die("lead grant <agent[,agent]|*> --project <dir> [--classes outward-reversible] [--ttl 7d]: name who the grant covers, or spell out *");
+    if (leadGrantsView(node, cur!).state !== "none") die(`the lead record ${cur!.id} already carries grants; they cannot change. Sign a new lead record: lead set ${cur!.agent} --project ${project} --classes … --to …`);
+    const g = makeLeadGrants({ lead: cur!, classes: csv(str("classes")) ?? ["outward-reversible"], agents: who!, ownerPub, ttlMs: str("ttl") ? parseTtl(str("ttl")!) : undefined });
+    const { sig } = await ownerSignCanonical(node.home, canonical(g), leadGrantsSummary(g, cur!));
+    storeLeadGrants(node, g, sig);
+    return console.log(`grants ${g.classes.join(",")} to ${g.agents.join(",")} through the lead record of ${project} until ${g.exp} (id ${g.id}).`);
   }
   if (sub === "revoke") {
     const cur = activeLead(node, project!) ?? die(`no active lead for ${project}`);
@@ -1175,7 +1201,7 @@ async function lead(node: MbxNode, pos: string[], str: (k: string) => string | u
     revokeLead(node, rev, sig);
     return console.log(`revoked: ${cur!.agent}@${cur!.host} is no longer the lead of ${project}.`);
   }
-  die("lead set <agent> --project <dir> [--ttl 30d] | lead revoke --project <dir> | lead show [--project <dir>]");
+  die("lead set <agent> --project <dir> [--ttl 30d] [--classes outward-reversible --to <agent[,agent]|*>] | lead grant <agent[,agent]|*> --project <dir> [--classes outward-reversible] [--ttl 7d] | lead revoke --project <dir> | lead show [--project <dir>]");
 }
 
 async function owner(node: MbxNode, pos: string[], str: (k: string) => string | undefined, o: Record<string, unknown>) {
@@ -1308,7 +1334,8 @@ async function policy(node: MbxNode, pos: string[], str: (k: string) => string |
 
 // ---- hooks -----------------------------------------------------------------------------------
 /** One independently signed grant must cover the requested class and session project (POLICY.md §5). */
-const permissionLookup = (node: MbxNode): Lookup => (agent, ctx) => hasClass(node.store.db, agent, node.host, ctx?.class ?? "permissions", { cwd: ctx?.cwd });
+// An owner policy first; for outward-reversible only, then the grants the owner signed onto the project lead's record (T499).
+const permissionLookup = (node: MbxNode): Lookup => withLeadGrants(node, (agent, ctx) => hasClass(node.store.db, agent, node.host, ctx?.class ?? "permissions", { cwd: ctx?.cwd }));
 
 /** Exact command a Grok session runs as a tracked background task (T435). Its exit starts the next turn. */
 function grokWatchCommand(sid?: string): string {

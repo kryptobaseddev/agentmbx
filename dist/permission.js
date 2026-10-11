@@ -6,6 +6,7 @@ import { fingerprint } from "./crypto.js";
 import { IdentityLeases } from "./identity-leases.js";
 import { opencodeHostOf } from "./opencode-provider.js";
 import { sessionUntainted } from "./session-taint.js";
+import { auditLeadGrantUse } from "./lead-grants.js";
 import { checkOutwardReversible, parseOutwardReversible } from "./outward-reversible.js";
 import { realpathSync } from "node:fs";
 export { kimiServer } from "./kimi-web.js";
@@ -127,10 +128,11 @@ export async function decidePermission(input, cli, lookup, o) {
                 return NONE;
             if (cli === "kimi") { // Kimi's hook can't decide; the approval goes through the kimi web API (approveKimi), which audits
                 const approval = s("id");
-                return sessionId && approval ? { allow: true, agent, tool, policy_id: p.policy_id, class: cls, intent, output: "", cwd, authority, kimi: { session_id: sessionId, approval_id: approval } } : NONE;
+                return sessionId && approval ? { allow: true, agent, tool, policy_id: p.policy_id, grant: p.grant, class: cls, intent, output: "", cwd, authority, kimi: { session_id: sessionId, approval_id: approval } } : NONE;
             }
             o.node.store.audit("yolo_allow", { agent, cli, tool, policy_id: p.policy_id ?? null, ...(intent ? { class: cls, action: intent.kind } : {}) });
-            return { allow: true, agent, tool, policy_id: p.policy_id, class: cls,
+            auditLeadGrantUse(o.node.store, { grant: p.grant, agent, cli, session_id: authority.binding.session_id, tool, class: cls, action: intent?.kind, cwd });
+            return { allow: true, agent, tool, policy_id: p.policy_id, grant: p.grant, class: cls,
                 output: JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } }) };
         }) ?? NONE;
     }
@@ -180,6 +182,7 @@ export async function approveKimi(node, d, o = {}) {
         if (!res.ok || j?.code !== 0)
             return false;
         node.store.audit("yolo_allow", { agent: d.agent, cli: "kimi", tool: d.tool, policy_id: d.policy_id ?? null, via: "kimi web", ...(d.intent ? { class: d.class, action: d.intent.kind } : {}) });
+        auditLeadGrantUse(node.store, { grant: d.grant, agent: d.agent, cli: "kimi", session_id, tool: d.tool, class: d.class, action: d.intent?.kind, cwd: d.cwd, via: "kimi web" });
         return true;
     }
     catch {

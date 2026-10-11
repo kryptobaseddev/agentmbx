@@ -31,7 +31,7 @@ export function makeLeadRevocation(target, ownerPub, now = new Date()) {
 export const leadSummary = (r) => `Make ${r.agent}@${r.host} the lead of project ${r.project} until ${r.exp}: it can read every message of that project and forward them.`;
 /** Owner keys this host trusts: its own, plus adopted owners (paired-device principals). */
 const trustedOwners = (node) => [...new Set([...(node.ownerPub ? [node.ownerPub] : []), ...ownerKeys(node.store.db)])];
-function signedBy(node, rec, sig, owner_fp) {
+export function signedBy(node, rec, sig, owner_fp) {
     const pub = trustedOwners(node).find((k) => fingerprint(k) === owner_fp);
     return !!pub && verifyData(pub, canonical(rec), sig);
 }
@@ -67,7 +67,7 @@ export function revokeLead(node, rev, sig) {
 export function activeLead(node, project, now = new Date()) {
     return leadFor(node, project, resolveProject(project).key, now);
 }
-function leadFor(node, project, key, now) {
+export function leadFor(node, project, key, now) {
     const rows = node.store.db.prepare("SELECT record,sig,revocation,revocation_sig,project_key FROM project_leads WHERE project=? OR project_key=? ORDER BY id DESC").all(project, key);
     for (const row of rows) {
         let rec;
