@@ -155,5 +155,10 @@ test("skill and running MCP instructions forbid process recovery and point to th
   for (const text of [INSTRUCTIONS, readFileSync(new URL("../skill/SKILL.md", import.meta.url), "utf8")]) {
     assert.match(text, /Never kill MBX MCP processes or hand-spawn/);
     assert.match(text, /inbox\/read\/reply\/ack\/send --as/);
+    assert.match(text, /retry that tool once: OpenCode respawns the MCP automatically/);
+    assert.match(text, /inbox --as <name>, and the same for read and ack/);
+    assert.match(text, /eviction or disconnect is recovered by that CLI/);
+    assert.match(text, /no-current-identity-lease failure, or same-session lease ping-pong/);
+    assert.match(text, /wait about 30s and retry the tool; it recovers by itself/);
   }
 });

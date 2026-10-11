@@ -307,6 +307,7 @@ For scripted access, use `agentmbx inbox/read/reply/ack/send --as <name>` inside
 `--cli <provider> --session <id>` when a shared provider needs an exact conversation. These commands use the
 existing harness lease; they do not start a second MCP or bypass ownership. Do not use `identity takeover --force`
 against your own live session. Report an exact-session diagnostic if reconnecting fails.
+If an mbx tool fails after idle eviction, retry that tool once: OpenCode respawns the MCP automatically. If the retry fails, use agentmbx inbox --as <name>, and the same for read and ack, inside the provider session. An eviction or disconnect is recovered by that CLI. A no-current-identity-lease failure, or same-session lease ping-pong, makes the CLI fail too: wait about 30s and retry the tool; it recovers by itself.
 
 Sessions that started before AgentMBX was set up don't have the tools yet (MCP servers load at session start).
 **Retry an mbx tool first** — Kimi Code reloads the server automatically; other CLIs reconnect with their MCP
