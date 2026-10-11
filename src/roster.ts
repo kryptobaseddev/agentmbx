@@ -7,7 +7,7 @@
 //     project "*" lists every project;
 //   - retired and generated names are left out unless a session holds them (or all:true).
 // Rows are built from an explicit field list. IdentityStatus carries unread and message counts; they never reach a
-// roster row (T308 AC2). A row from a paired host is `remote` and unverified: its liveness is that host's to say.
+// roster row (T308 AC2). A paired-host row stays `remote` unless a signed directory stored a verified state (T546).
 import { basename } from "node:path";
 import type { MbxNode } from "./node.ts";
 import { listIdentityStatus, type IdentityStatus } from "./identity-status.ts";
@@ -77,12 +77,18 @@ export function buildRoster(node: MbxNode, o: RosterOptions = {}): AgentsV1 {
       self: !!o.self && o.self === i.name, seen_here: seenHere, last_seen: a?.last_seen ?? i.last_activity,
     };
   });
-  const remoteRow = (name: string, host: string, a?: { role: string | null; cli: string | null; description: string | null; last_seen: string | null }): AgentsV1Row => ({
-    name, host, address: `${name}@${host}`, state: "remote",
-    reason: `listed by paired host ${host}; this host cannot verify whether it is running`,
-    role: a?.role ?? null, description: a?.description ?? null, registered: null, retired: null,
-    harness: null, cli: a?.cli ?? null, projects: [], lead_of: ledBy(name, host), self: false, seen_here: false, last_seen: a?.last_seen ?? null,
-  });
+  const remoteRow = (name: string, host: string, a?: { role: string | null; cli: string | null; description: string | null; last_seen: string | null; state?: AgentState | null; harness?: string | null; project_keys?: string[] | null }): AgentsV1Row => {
+    const verified = a?.state && a.state !== "remote" ? a.state : null;
+    const state: AgentState = verified ?? "remote";
+    const harness = (state === "live" || state === "idle") && a?.harness ? a.harness : null;
+    return {
+      name, host, address: `${name}@${host}`, state,
+      reason: verified ? `verified by paired host ${host}` : `listed by paired host ${host}; this host cannot verify whether it is running`,
+      role: a?.role ?? null, description: a?.description ?? null, registered: null, retired: null,
+      harness, cli: a?.cli ?? null, projects: [], lead_of: ledBy(name, host), self: false, seen_here: false, last_seen: a?.last_seen ?? null,
+      ...(verified ? { project_keys: a?.project_keys ?? [] } : {}),
+    };
+  };
   for (const a of directory) if (a.host !== node.host) rows.push(remoteRow(a.name, a.host, a));
   // A designated lead is always listed, even when its mailbox has no row yet or lives on a host we only know by its record.
   for (const l of leads as LeadRecord[]) {

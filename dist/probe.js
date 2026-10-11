@@ -1,6 +1,6 @@
 import { IdentityLeases } from "./identity-leases.js";
 import { listIdentityStatus } from "./identity-status.js";
-import { projectKey as defaultProjectKey } from "./registry.js";
+import { crossHostKey as defaultProjectKey } from "./project-key.js";
 import { realpathSync } from "node:fs";
 import { sep } from "node:path";
 export const PROBE_SUBJECT_PREFIX = "[mbx-probe]";
@@ -30,7 +30,8 @@ export function globMatch(pattern, name) {
     const re = new RegExp("^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$");
     return re.test(name);
 }
-/** True when a holder's session cwd is the project, inside it, or has the same git-origin project key (T445). One rule
+/** True when a holder's session cwd is the project, inside it, or has the same project key: a second checkout of one CLEO
+ *  project, or of one git origin (T445, T543). One rule
  *  for `planProbe` and the roster's `seen_here` (T496), so the two cannot drift. A missing cwd is not in the project. */
 export function cwdInProject(rawCwd, project, keyOf = defaultProjectKey) {
     if (!rawCwd)
