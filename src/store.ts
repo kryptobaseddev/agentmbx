@@ -142,7 +142,9 @@ CREATE TABLE IF NOT EXISTS pair_tokens (  -- one-time pairing tokens (agentmbx p
  */
 export const SCHEMA_VERSION = 3;
 
-const SCHEMA_COLUMNS = [["sessions", "pid_start"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"]] as const;
+// Additive columns on version 3. A missing one is added on open; user_version stays 3.
+// sessions.task and sessions.lane are the live session's CLEO task and phase (T497), like sessions.pid_start.
+const SCHEMA_COLUMNS = [["sessions", "pid_start"], ["sessions", "task"], ["sessions", "lane"], ["principals", "peer"], ["policy_revocations", "owner_fp"], ["peers", "enc_pub"], ["peers", "prev_keys"]] as const;
 const SCHEMA_OBJECTS = [...SCHEMA.matchAll(/CREATE\s+(?:VIRTUAL\s+)?(?:TABLE|INDEX|TRIGGER)\s+IF NOT EXISTS\s+(\w+)/g)].map(match => match[1]);
 const SCHEMA_DEFINITION = createHash("sha256").update(SCHEMA).update(JSON.stringify(SCHEMA_COLUMNS)).digest("hex");
 const opening = new AsyncLocalStorage<{ busyTimeoutMs: number; stores: Store[] }>();

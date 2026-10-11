@@ -16,6 +16,7 @@ import { effectivePolicy, policyLine } from "./policy.js";
 import { procStart, procTable, provenProcess, sameProcess } from "./proc.js";
 import { bumpPostToolMarker, bumpPostToolMarkersForAgent } from "./posttool.js";
 import { privatePath } from "./private-files.js";
+import { TASK_RE } from "./presence.js";
 import { backfillRegistry } from "./registry.js";
 import { resolveLeadRecipients } from "./lead-record.js";
 import { Store } from "./store.js";
@@ -601,6 +602,15 @@ export class MbxNode {
         WHERE id=? AND state='live'`).run(PAIR_TOKEN_MAX_FAILURES, id);
         }
     }
+    /** Agents whose live session row records this CLEO task (T497). A dead row of a live agent does not count. */
+    taskAgents(task) {
+        const out = new Set();
+        const rows = this.store.db.prepare("SELECT agent, pid, pid_start, updated_at FROM sessions WHERE task=?").all(task);
+        for (const r of rows)
+            if (r.pid && this.sameSession(r.pid, r))
+                out.add(r.agent);
+        return out;
+    }
     // ---- addressing --------------------------------------------------------------------------
     /** Split recipients into local agent names and remote hosts that must receive the envelope. */
     route(to, forReceive = false, senderLocal) {
@@ -621,6 +631,17 @@ export class MbxNode {
             if (t.startsWith("role:")) {
                 const role = t.slice(5);
                 this.agents().filter((a) => a.host === this.host && a.role === role && live.has(a.name)).forEach((a) => { local.add(a.name); targets.push({ to: t, name: a.name }); });
+                if (!forReceive)
+                    approved.forEach((h) => { remote.add(h); targets.push({ to: t, host: h }); });
+                continue;
+            }
+            if (t.startsWith("task:")) {
+                const id = t.slice(5);
+                if (!TASK_RE.test(id)) {
+                    warnings.push(`${t}: not a CLEO task id`);
+                    continue;
+                }
+                this.taskAgents(id).forEach((a) => { local.add(a); targets.push({ to: t, name: a }); });
                 if (!forReceive)
                     approved.forEach((h) => { remote.add(h); targets.push({ to: t, host: h }); });
                 continue;
@@ -699,7 +720,7 @@ export class MbxNode {
         const localAgents = new Set(this.agents().filter((a) => a.host === this.host).map((a) => a.name));
         const approved = this.peers().filter((p) => p.state === "approved").map((p) => p.host);
         for (const t of to) {
-            if (t === "*" || t.startsWith("role:"))
+            if (t === "*" || t.startsWith("role:") || t.startsWith("task:"))
                 return null;
             if (t === "owner") {
                 out.add(`owner@${this.host}`);
@@ -775,7 +796,7 @@ export class MbxNode {
         }
         // Name the bare recipients this host delivered to its own agents, inside the signed envelope, so a paired host that
         // also has an agent of that name skips its copy exactly (no reliance on its possibly stale directory of this host).
-        const localBare = [...new Set(r.targets.filter((t) => !t.host && t.name && t.name !== "owner" && !t.to.includes("@") && !t.to.startsWith("role:") && t.to !== "*").map((t) => t.to))];
+        const localBare = [...new Set(r.targets.filter((t) => !t.host && t.name && t.name !== "owner" && !t.to.includes("@") && !t.to.startsWith("role:") && !t.to.startsWith("task:") && t.to !== "*").map((t) => t.to))];
         if (!prebuilt && localBare.length && r.remote.size)
             e.meta.local_names = localBare.slice(0, 100);
         if (owner)
