@@ -7,7 +7,7 @@ import { z } from "zod";
 import { canonical, sha256 } from "./crypto.ts";
 import { NAME_RE } from "./envelope.ts";
 import { inspectLeaseProcess, inspectLeaseProcesses, retryUnknown, UNKNOWN_PROCESS, type ProcessEvidence } from "./identity-leases.ts";
-import { opencodeServeAncestor } from "./opencode-provider.ts";
+import { opencodeServeRoot } from "./opencode-provider.ts";
 import { procTable } from "./proc.ts";
 import type { Store } from "./store.ts";
 import { identityTakeoverApprovalSchema, type IdentityTakeoverApproval } from "./identity-takeover.ts";
@@ -81,12 +81,15 @@ export function inspectIdentityControlCaller(target: IdentityControlDescriptor, 
     if (next === target.parent_pid) { ancestry = "valid"; break; }
     current = next;
   }
-  // OpenCode descriptors record the serve pid as parent_pid (mcp.ts resolves the provider through
-  // opencodeProviderPid), while a tool shell runs the CLI several levels below that serve: the first
-  // opencode ancestor is this session's serve. Any other ancestor set, and every non-opencode target,
-  // keeps the raw ppid-walk verdict (T550).
-  if (ancestry !== "valid" && target.cli === "opencode"
-    && opencodeServeAncestor(requesterPid, freshTable) === target.parent_pid) ancestry = "valid";
+  // OpenCode descriptors record whatever parent_pid the MCP-side resolve produced (mcp.ts): the raw
+  // mcp ppid when opencodeProviderPid found no runtime path, or the first opencode executable on the
+  // MCP's branch — neither of which has to sit in a tool shell's ancestry (T550 live repro: the two
+  // branches diverge below the serve). What both ends of one session provably share is the TOPMOST
+  // opencode executable, so accept on root equality. Broken chains (null roots) never authorize.
+  if (ancestry !== "valid" && target.cli === "opencode") {
+    const requesterRoot = opencodeServeRoot(requesterPid, freshTable), mcpRoot = opencodeServeRoot(target.mcp_pid, freshTable);
+    if (requesterRoot !== null && requesterRoot === mcpRoot) ancestry = "valid";
+  }
   const verdicts = [ancestry, sameBirth(requester, requesterStart), sameBirth(parent, target.parent_start), sameBirth(mcp, target.mcp_start)];
   const state: CallerVerdict = verdicts.includes("invalid") ? "invalid" : verdicts.every(v => v === "valid") ? "valid" : "unknown";
   // Freshness is measured from when the evidence was taken, not from when collection began:

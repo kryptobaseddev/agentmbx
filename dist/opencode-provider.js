@@ -79,23 +79,29 @@ export function opencodeProviderPid(pid, table = procTable(), command = invokedE
 /** Test seam: production never reassigns it. */
 export const opencodeServeSeams = { exe: invokedExecutable };
 /**
- * The FIRST opencode executable among `requesterPid`'s ancestors, never any further one: a serve can
- * sit under another serve's shell, so the chain above the first opencode is not proof of this session.
- * Unlike `opencodeProviderPid` (which starts from a runtime and fails closed on non-runtime names),
- * the requester here is an arbitrary CLI tool shell, so only the executable name gates the walk; a
- * broken ancestry chain answers null. Callers compare the result against a descriptor's serve pid.
+ * The TOPMOST opencode executable among `pid`'s ancestors (including `pid` itself), or null when there
+ * is none or the ancestry chain breaks before the walk finishes. Unlike `opencodeProviderPid` — which
+ * starts from a runtime and fails closed on any other executable — this walk skips arbitrary
+ * intermediates (tool shells, session hosts), because the caller proof compares the root computed from
+ * two ends of one session's process tree (T550): the descriptor's recorded parent_pid can sit anywhere
+ * in the MCP's branch — a raw intermediate when the runtime resolve found nothing, or the first
+ * opencode executable on that branch — so only the topmost opencode executable is stable on both sides.
+ * Bounded at 64 hops; a chain that never reaches pid 1 is treated as broken (fail closed).
  */
-export function opencodeServeAncestor(requesterPid, table = procTable(), exeOf = opencodeServeSeams.exe) {
-    for (let current = requesterPid, n = 0; current > 1 && n < 64; n++) {
+export function opencodeServeRoot(pid, table = procTable(), exeOf = opencodeServeSeams.exe) {
+    let topmost = null;
+    for (let current = pid, n = 0;; current = table.get(current).ppid, n++) {
+        if (current <= 1)
+            return topmost; // launchd: the walk is complete
+        if (n >= 64)
+            return null; // bounded; a chain this deep is not proof
         const row = table.get(current);
         if (!row)
-            return null;
+            return null; // broken chain: fail closed
         const name = basename(exeOf(current));
         if (name === "opencode" || name === "opencode.exe")
-            return current;
-        current = row.ppid;
+            topmost = current;
     }
-    return null;
 }
 /** True when this argv is the shared OpenCode service: a `--service` flag and no private `--stdio` transport. */
 export const isOpencodeServiceArgv = (argv) => argv.some((a) => a === "--service" || a.startsWith("--service=")) && !argv.includes("--stdio");
