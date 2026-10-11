@@ -76,6 +76,27 @@ export function opencodeProviderPid(pid, table = procTable(), command = invokedE
     }
     return null;
 }
+/** Test seam: production never reassigns it. */
+export const opencodeServeSeams = { exe: invokedExecutable };
+/**
+ * The FIRST opencode executable among `requesterPid`'s ancestors, never any further one: a serve can
+ * sit under another serve's shell, so the chain above the first opencode is not proof of this session.
+ * Unlike `opencodeProviderPid` (which starts from a runtime and fails closed on non-runtime names),
+ * the requester here is an arbitrary CLI tool shell, so only the executable name gates the walk; a
+ * broken ancestry chain answers null. Callers compare the result against a descriptor's serve pid.
+ */
+export function opencodeServeAncestor(requesterPid, table = procTable(), exeOf = opencodeServeSeams.exe) {
+    for (let current = requesterPid, n = 0; current > 1 && n < 64; n++) {
+        const row = table.get(current);
+        if (!row)
+            return null;
+        const name = basename(exeOf(current));
+        if (name === "opencode" || name === "opencode.exe")
+            return current;
+        current = row.ppid;
+    }
+    return null;
+}
 /** True when this argv is the shared OpenCode service: a `--service` flag and no private `--stdio` transport. */
 export const isOpencodeServiceArgv = (argv) => argv.some((a) => a === "--service" || a.startsWith("--service=")) && !argv.includes("--stdio");
 /** Every process's argv from one read: procfs cmdline on Linux, otherwise one `ps -A -o pid=,args=`

@@ -66,6 +66,28 @@ export function opencodeProviderPid(pid: number, table: Map<number, { ppid: numb
   return null;
 }
 
+/** Test seam: production never reassigns it. */
+export const opencodeServeSeams: { exe: (pid: number) => string } = { exe: invokedExecutable };
+
+/**
+ * The FIRST opencode executable among `requesterPid`'s ancestors, never any further one: a serve can
+ * sit under another serve's shell, so the chain above the first opencode is not proof of this session.
+ * Unlike `opencodeProviderPid` (which starts from a runtime and fails closed on non-runtime names),
+ * the requester here is an arbitrary CLI tool shell, so only the executable name gates the walk; a
+ * broken ancestry chain answers null. Callers compare the result against a descriptor's serve pid.
+ */
+export function opencodeServeAncestor(requesterPid: number, table: Map<number, { ppid: number }> = procTable(),
+  exeOf: (pid: number) => string = opencodeServeSeams.exe): number | null {
+  for (let current = requesterPid, n = 0; current > 1 && n < 64; n++) {
+    const row = table.get(current);
+    if (!row) return null;
+    const name = basename(exeOf(current));
+    if (name === "opencode" || name === "opencode.exe") return current;
+    current = row.ppid;
+  }
+  return null;
+}
+
 // ---- service vs standalone host (T524) ---------------------------------------------------------
 // OpenCode 2.x runs sessions in two kinds of server process that share one opencode.db: the shared
 // `opencode serve --service` and the private `opencode serve --stdio --port 0` every

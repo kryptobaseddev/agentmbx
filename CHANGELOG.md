@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **`agentmbx watch --cli opencode` accepts the serve ancestor in the caller proof (T550).** An OpenCode control descriptor records the serve pid as `parent_pid` (mcp.ts resolves the provider through `opencodeProviderPid`), while a tool shell can run the CLI outside the serve's exact ppid ancestry, so `withCliIdentity` refused the session's own `agentmbx watch --cli opencode --session …` with "no current identity lease belongs to this caller". `inspectIdentityControlCaller` now also accepts the requester's first opencode-executable ancestor (`opencodeServeAncestor`, src/opencode-provider.ts) when it equals the descriptor's `parent_pid`, gated on `target.cli === "opencode"`; it never walks past the first opencode executable (a serve can sit under another serve), never accepts a different serve, and leaves the pid+birth and unknown-evidence semantics unchanged. The `watch` command itself is untouched.
+
 ## 0.5.26 (2026-10-11)
 
 The OpenCode sidebar becomes a full dashboard, mbx_agents is a live roster with verified state across hosts from a signed directory, and the project key is the CLEO project id. An agentmbx mcp exits when its client goes away and a reload keeps one process per connection, which cuts the orphaned MCP processes that piled up on busy hosts. OpenCode permissions stay inside the serve that hosts the session, and mbx_whoami names the session id the status line uses.
