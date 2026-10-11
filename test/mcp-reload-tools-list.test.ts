@@ -58,9 +58,9 @@ test("tools/list refreshed straight from tools/list_changed returns the full cat
   assert.equal(catalogChanges, 0, "fresh initialization needs no replacement notification");
   assert.deepEqual(transportEvents, []);
 
-  const holder = () => node.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE released_at IS NULL").all() as { holder_pid: number }[];
+  const holder = () => node.store.db.prepare("SELECT holder_pid,token FROM identity_leases WHERE released_at IS NULL").all() as { holder_pid: number; token: string }[];
   assert.equal(holder().length, 1, "the launch identity is held by the original process");
-  let holderPid = holder()[0].holder_pid;
+  let previous = holder()[0];
 
   for (let generation = 1; generation <= 2; generation++) {
     // Deploy a new build under the running server: the next call finishes on the old code, then hands the transport over.
@@ -84,8 +84,10 @@ test("tools/list refreshed straight from tools/list_changed returns the full cat
 
     const now = holder();
     assert.equal(now.length, 1, "exactly one live holder after the handover");
-    assert.notEqual(now[0].holder_pid, holderPid, `generation ${generation}: a new process took over the transport`);
-    holderPid = now[0].holder_pid;
+    assert.notEqual(now[0].token, previous.token, `generation ${generation}: a fresh runtime took over the lease`);
+    if (typeof process.execve === "function") assert.equal(now[0].holder_pid, previous.holder_pid, "exec preserves the PID");
+    else assert.notEqual(now[0].holder_pid, previous.holder_pid, "unsupported exec spawns a replacement");
+    previous = now[0];
     assert.equal(catalogChanges, generation, "exactly one tools/list_changed per replacement");
     assert.deepEqual(transportEvents, [], `generation ${generation}: the transport was never closed or errored`);
   }

@@ -6,9 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { _resetEvidenceCacheForTests, inspectLeaseProcess, type ProcessEvidence } from "../src/identity-leases.ts";
-import { mcpOrphanCensus, mcpOrphanCheck } from "../src/mcp-lifecycle.ts";
+import { mbxProcessInventory, mcpOrphanCensus, mcpOrphanCheck } from "../src/mcp-lifecycle.ts";
 import { procSeams, procTable, recordedStartMatches } from "../src/proc.ts";
-import { doctor } from "../src/doctor.ts";
+import { doctor, processChecks } from "../src/doctor.ts";
 
 const moduleUrl = pathToFileURL(fileURLToPath(new URL("../src/mcp-lifecycle.ts", import.meta.url))).href;
 const fixture = `import { startMcpLifecycle, recordMcpGeneration } from ${JSON.stringify(moduleUrl)};
@@ -224,7 +224,7 @@ test("doctor deduplicates orphans, sums RSS in bytes and retains unknown/legacy 
   w.record(900004, 990000, { start: "ps-utc:Mon Oct 12 11:00:00 2026" }); // PID reuse.
   w.record(900005, 990000);
   procSeams.ps = args => args.join().includes("rss")
-    ? "900001 2048 node /tmp/agentmbx.js mcp\n900001 2048 node /tmp/agentmbx.js mcp\n900002 4096 node --no-warnings /tmp/agentmbx.js mcp\n900003 1000 agentmbx mcp\n900004 1000 agentmbx mcp\n900005 ? agentmbx mcp\n900006 9000 node /tmp/cleo.js docs --content agentmbx mcp\n900007 9000 sh -c echo agentmbx mcp\n"
+    ? "900001 1 2048 node /tmp/agentmbx.js mcp\n900001 1 2048 node /tmp/agentmbx.js mcp\n900002 1 4096 node --no-warnings /tmp/agentmbx.js mcp\n900003 1 1000 agentmbx mcp\n900004 1 1000 agentmbx mcp\n900005 1 ? agentmbx mcp\n900006 1 9000 node /tmp/cleo.js docs --content agentmbx mcp\n900007 1 9000 sh -c echo agentmbx mcp\n"
     : "";
   const inspect = (pids: number[]) => new Map<number, ProcessEvidence>(pids.map(pid => [pid, { alive: pid !== 990000, start: pid === 990000 ? null : w.start }]));
   assert.deepEqual(mcpOrphanCensus(w.home, inspect), { total: 5, orphans: 2, orphanRssBytes: 2 * 1024 ** 2, unknown: 2, unknownMemory: 1, unavailable: false });
@@ -237,7 +237,7 @@ test("doctor deduplicates orphans, sums RSS in bytes and retains unknown/legacy 
 test("failed process inspection never reports clean orphans or kills a live fixture", t => {
   const w = censusWorld(t); w.record(900001, 990000);
   procSeams.ps = args => {
-    if (args.join().includes("rss")) return "900001 2048 agentmbx mcp\n";
+    if (args.join().includes("rss")) return "900001 1 2048 agentmbx mcp\n";
     throw new Error("unavailable process evidence");
   };
   const inspect = (pids: number[]) => new Map<number, ProcessEvidence>(pids.map(pid => [pid, { alive: null, start: null }]));
@@ -255,7 +255,7 @@ test("empty or malformed inventory is unavailable; malformed lifecycle records s
     assert.equal(mcpOrphanCensus(w.home, inspect).unavailable, true);
   }
   writeFileSync(join(w.home, "mcp-lifecycle", "900001.json"), "{" + " ".repeat(4096));
-  procSeams.ps = () => "900001 1024 agentmbx mcp\n";
+  procSeams.ps = () => "900001 1 1024 agentmbx mcp\n";
   assert.equal(mcpOrphanCensus(w.home, inspect).unknown, 1);
   assert.equal(mcpOrphanCensus(w.home, inspect).orphans, 0);
 });
@@ -266,4 +266,18 @@ test("doctor includes the read-only orphan census without a configured harness o
   const checks = await doctor({ home: w.home, cmd: ["agentmbx"], which: () => null, useClis: false }, w.home);
   assert.equal(checks.filter(c => /MCP orphan census unavailable/.test(c.label)).length, 1);
   assert.equal(readFileSync(join(w.home, "mcp-lifecycle", "900001.json"), "utf8"), body);
+});
+
+test("doctor process details include MCP and watch, birth, parent, client and RSS without mutating records", t => {
+  const w = censusWorld(t), body = w.record(process.pid, 990000);
+  procSeams.ps = args => args.join().includes("rss")
+    ? `${process.pid} 123 2048 agentmbx mcp\n900007 1 1024 node /tmp/agentmbx.js watch --as watcher\n`
+    : `${process.pid} S ${w.start.slice(7)}\n`;
+  const inventory = mbxProcessInventory(w.home);
+  assert.equal(inventory.processes.length, 2);
+  assert.equal(inventory.processes[0].client, "dead");
+  const checks = processChecks(w.home);
+  assert.match(checks[1].label, /mcp pid=\d+ ppid=123 start=ps-utc:.* client=dead \(pid=990000\) RSS=2.0 MiB/);
+  assert.match(checks[2].label, /watch pid=900007 ppid=1 start=unknown client=unknown RSS=1.0 MiB/);
+  assert.equal(readFileSync(join(w.home, "mcp-lifecycle", `${process.pid}.json`), "utf8"), body);
 });

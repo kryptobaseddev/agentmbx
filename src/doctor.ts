@@ -24,10 +24,19 @@ import { deadHolderLeases, inspectLeaseProcess, type IdentityLease } from "./ide
 import { providerLabel, sameLiveProvider } from "./identity-takeover.ts";
 import { conversationLoopLabel, detectConversationLoops } from "./loop-detector.ts";
 import { opencodeDuplicateLoopChecks } from "./opencode-duplicate-loop.ts";
-import { mcpOrphanCheck } from "./mcp-lifecycle.ts";
+import { mbxProcessInventory, mcpOrphanCheck } from "./mcp-lifecycle.ts";
 
 export type Level = "ok" | "fail" | "warn" | "info";
 export interface Check { level: Level; label: string; fix?: string }
+
+/** --processes observes only the process inventory; it never initializes or repairs the host. */
+export function processChecks(home: string): Check[] {
+  const inventory = mbxProcessInventory(home);
+  if (inventory.unavailable) return [{ level: "warn", label: "MCP/watch process inventory unavailable; nothing changed" }];
+  return [{ level: "info", label: `${inventory.processes.length} agentmbx MCP/watch process(es); read-only` },
+    ...inventory.processes.map(p => ({ level: "info" as const,
+      label: `${p.kind} pid=${p.pid} ppid=${p.ppid} start=${p.start ?? "unknown"} client=${p.client}${p.clientPid ? ` (pid=${p.clientPid})` : ""} RSS=${p.rssBytes === null ? "unknown" : `${(p.rssBytes / 1024 ** 2).toFixed(1)} MiB`}` }))];
+}
 
 /** Observational only: doctor must never notify, mark deliveries or consume wake reservations. */
 export function conversationLoopChecks(node: MbxNode, now = Date.now()): Check[] {

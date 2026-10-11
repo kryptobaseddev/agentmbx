@@ -1,6 +1,5 @@
 // T317: repeated in-place reloads must not leave a chain of nested MCP processes.
-// Each re-exec generation exits once it has spawned its replacement; the original proxy stays on the
-// provider transport. After N reloads only the current lease-holder's MCP process is still alive.
+// Exec replacement keeps the PID and client pipe. Unsupported runtimes retain the bounded legacy proxy.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { appendFileSync, cpSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -20,7 +19,8 @@ const countLiveMcpProcesses = (install: string) => {
   return lines.filter(l => l.includes(join(install, "bin/agentmbx.js")) && l.includes(" mcp")).length;
 };
 
-test(`after ${RELOADS} reloads only the current lease-holder's MCP process is alive`, async t => {
+for (const forceLegacy of [false, true]) test(`after ${RELOADS} reloads ${forceLegacy ? "unsupported exec retains only proxy and server" : "exec leaves one MCP"}`, async t => {
+  const execSupported = !forceLegacy && typeof process.execve === "function";
   const root = mkdtempSync(join(tmpdir(), "mbx-lifecycle-")), install = join(root, "install"), home = join(root, "mail");
   mkdirSync(install);
   for (const path of ["bin", "dist", "package.json"]) cpSync(resolve(path), join(install, path), { recursive: true });
@@ -41,6 +41,10 @@ test(`after ${RELOADS} reloads only the current lease-holder's MCP process is al
   delete env.MBX_MCP_REEXEC_BUILD;
   delete env.MBX_MCP_DETACHED;
   delete env.MBX_MCP_PROVIDER_PID;
+  if (forceLegacy) {
+    const preload = join(root, "unsupported-exec.mjs"); writeFileSync(preload, "process.execve = undefined;");
+    env.NODE_OPTIONS = `${env.NODE_OPTIONS ?? ""} --import=${preload}`;
+  }
 
   const transport = new StdioClientTransport({ command: process.execPath, args: [join(install, "bin/agentmbx.js"), "mcp"], env: env as Record<string, string>, stderr: "pipe" });
   const stderrLines: string[] = [];
@@ -48,11 +52,12 @@ test(`after ${RELOADS} reloads only the current lease-holder's MCP process is al
   await client.connect(transport);
   assert.notEqual((await client.callTool({ name: "mbx_whoami", arguments: { name: "lifecycle-reader", role: "builder" } })).isError, true);
 
-  const holderPids: number[] = [];
+  const holderPids: number[] = [], holderTokens: string[] = [];
   const pushHolderPid = () => {
-    const row = node.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE name=?").get("lifecycle-reader") as { holder_pid: number } | undefined;
+    const row = node.store.db.prepare("SELECT holder_pid,token FROM identity_leases WHERE name=?").get("lifecycle-reader") as { holder_pid: number; token: string } | undefined;
     assert.ok(row, "lease row must exist");
-    holderPids.push(row.holder_pid);
+    if (holderTokens.length) assert.notEqual(row.token, holderTokens[holderTokens.length - 1], "reload must acquire a fresh lease token");
+    holderPids.push(row.holder_pid); holderTokens.push(row.token);
   };
   pushHolderPid();
 
@@ -65,8 +70,8 @@ test(`after ${RELOADS} reloads only the current lease-holder's MCP process is al
 
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {
-      const row = node.store.db.prepare("SELECT holder_pid, released_at FROM identity_leases WHERE name=?").get("lifecycle-reader") as { holder_pid: number; released_at: string | null } | undefined;
-      if (row && row.holder_pid !== holderPids[holderPids.length - 1] && row.released_at === null) break;
+      const row = node.store.db.prepare("SELECT holder_pid, token, released_at FROM identity_leases WHERE name=?").get("lifecycle-reader") as { holder_pid: number; token: string; released_at: string | null } | undefined;
+      if (row && row.token !== holderTokens[holderTokens.length - 1] && row.released_at === null) break;
       await new Promise(r => setTimeout(r, 25));
     }
     pushHolderPid();
@@ -83,7 +88,7 @@ test(`after ${RELOADS} reloads only the current lease-holder's MCP process is al
       }
       assert.fail(`${label} pid ${pid} must not still be alive (stderr: ${stderrLines.join(" | ")})`);
     };
-    for (let i = 1; i < holderPids.length - 1; i++) {
+    for (let i = 1; !execSupported && i < holderPids.length - 1; i++) {
       waitForDead(holderPids[i], `re-exec generation ${i + 1}`);
     }
 
@@ -100,14 +105,16 @@ test(`after ${RELOADS} reloads only the current lease-holder's MCP process is al
       assert.fail(`current generation ${holderPids.length} pid ${current} must be alive (evidence=${JSON.stringify(evidence)}; stderr: ${stderrLines.join(" | ")})`);
     }
 
-    // At most two processes remain: the original proxy plus the current server. This proves the
-    // chain does not accumulate nested processes across reloads.
     const live = countLiveMcpProcesses(install);
-    assert.ok(live <= 2, `expected at most 2 live MCP processes after reload ${generation}, found ${live} (pids=${holderPids.join(",")}; stderr: ${stderrLines.join(" | ")})`);
+    if (execSupported) {
+      assert.equal(current, holderPids[0], "exec preserves the original provider-launched PID");
+      assert.equal(live, 1, `expected one MCP after reload ${generation}; stderr: ${stderrLines.join(" | ")}`);
+    } else assert.ok(live <= 2, "unsupported exec retains only the original proxy plus current server");
   }
 
   // Sanity: the final server can still serve.
   assert.notEqual((await client.callTool({ name: "mbx_inbox", arguments: {} })).isError, true);
+  if (forceLegacy) assert.match(stderrLines.join(""), /exec replacement unavailable; using legacy spawn handover/);
 });
 
 // T449: after reloads, closing the provider transport must stop the original proxy too. The T317 keep-alive
@@ -135,11 +142,12 @@ test("closing stdin stops every MCP process after 2 reloads", async t => {
   await client.connect(transport);
   assert.notEqual((await client.callTool({ name: "mbx_whoami", arguments: { name: "eof-reader", role: "builder" } })).isError, true);
 
-  const holderPids: number[] = [];
+  const holderPids: number[] = [], holderTokens: string[] = [];
   const pushHolderPid = () => {
-    const row = node.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE name=?").get("eof-reader") as { holder_pid: number } | undefined;
+    const row = node.store.db.prepare("SELECT holder_pid,token FROM identity_leases WHERE name=?").get("eof-reader") as { holder_pid: number; token: string } | undefined;
     assert.ok(row, "lease row must exist");
-    holderPids.push(row.holder_pid);
+    if (holderTokens.length) assert.notEqual(row.token, holderTokens[holderTokens.length - 1], "reload must acquire a fresh lease token");
+    holderPids.push(row.holder_pid); holderTokens.push(row.token);
   };
   pushHolderPid();
 
@@ -149,8 +157,8 @@ test("closing stdin stops every MCP process after 2 reloads", async t => {
     assert.notEqual((await client.callTool({ name: "mbx_whoami", arguments: {} })).isError, true, "trigger call must finish");
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {
-      const row = node.store.db.prepare("SELECT holder_pid, released_at FROM identity_leases WHERE name=?").get("eof-reader") as { holder_pid: number; released_at: string | null } | undefined;
-      if (row && row.holder_pid !== holderPids[holderPids.length - 1] && row.released_at === null) break;
+      const row = node.store.db.prepare("SELECT holder_pid, token, released_at FROM identity_leases WHERE name=?").get("eof-reader") as { holder_pid: number; token: string; released_at: string | null } | undefined;
+      if (row && row.token !== holderTokens[holderTokens.length - 1] && row.released_at === null) break;
       await new Promise(r => setTimeout(r, 25));
     }
     pushHolderPid();
@@ -195,11 +203,12 @@ test("a crashed current generation closes the provider transport", async t => {
   await client.connect(transport);
   assert.notEqual((await client.callTool({ name: "mbx_whoami", arguments: { name: "crash-reader", role: "builder" } })).isError, true);
 
-  const holderPids: number[] = [];
+  const holderPids: number[] = [], holderTokens: string[] = [];
   const pushHolderPid = () => {
-    const row = node.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE name=?").get("crash-reader") as { holder_pid: number } | undefined;
+    const row = node.store.db.prepare("SELECT holder_pid,token FROM identity_leases WHERE name=?").get("crash-reader") as { holder_pid: number; token: string } | undefined;
     assert.ok(row, "lease row must exist");
-    holderPids.push(row.holder_pid);
+    if (holderTokens.length) assert.notEqual(row.token, holderTokens[holderTokens.length - 1], "reload must acquire a fresh lease token");
+    holderPids.push(row.holder_pid); holderTokens.push(row.token);
   };
   pushHolderPid();
 
@@ -209,8 +218,8 @@ test("a crashed current generation closes the provider transport", async t => {
   assert.notEqual((await client.callTool({ name: "mbx_whoami", arguments: {} })).isError, true, "trigger call must finish");
   const reloadDeadline = Date.now() + 10_000;
   while (Date.now() < reloadDeadline) {
-    const row = node.store.db.prepare("SELECT holder_pid, released_at FROM identity_leases WHERE name=?").get("crash-reader") as { holder_pid: number; released_at: string | null } | undefined;
-    if (row && row.holder_pid !== holderPids[holderPids.length - 1] && row.released_at === null) break;
+    const row = node.store.db.prepare("SELECT holder_pid, token, released_at FROM identity_leases WHERE name=?").get("crash-reader") as { holder_pid: number; token: string; released_at: string | null } | undefined;
+    if (row && row.token !== holderTokens[holderTokens.length - 1] && row.released_at === null) break;
     await new Promise(r => setTimeout(r, 25));
   }
   pushHolderPid();
