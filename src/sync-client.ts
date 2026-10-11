@@ -30,6 +30,7 @@ interface SyncState {
   force_full?: boolean;
   sent_receipts: string[];
   floor_seconds: number;
+  acked_at?: string;
 }
 
 export interface Kv { get(k: string): string | undefined; set(k: string, v: string): void }
@@ -72,7 +73,7 @@ export interface SyncDeps {
   fetch: typeof fetch;
   now: number;
   /** Called only when a new batch will be sent. Not called when unlinked, waiting, or resending. */
-  source: (ctx: { now: string; seq: number; full: boolean; contract: number; contractAllowsProjectPaths: boolean; contractAllowsProjectLeads: boolean; sentReceipts: string[] }) => Omit<SyncSnapshot, "now" | "seq" | "full" | "contract" | "contractAllowsProjectPaths" | "contractAllowsProjectLeads" | "sentReceipts">;
+  source: (ctx: { now: string; seq: number; full: boolean; contract: number; contractAllowsProjectPaths: boolean; contractAllowsProjectLeads: boolean; sentReceipts: string[]; lastAck?: string | null }) => Omit<SyncSnapshot, "now" | "seq" | "full" | "contract" | "contractAllowsProjectPaths" | "contractAllowsProjectLeads" | "sentReceipts">;
   signer?: SyncSigner;
   audit?: (event: string, detail: Record<string, string | number | boolean>) => void;
 }
@@ -176,7 +177,7 @@ export async function syncOnce(o: SyncDeps): Promise<SyncResult> {
     const allowsPaths = contract >= PROJECT_PATHS_SINCE && link.project_paths === true;
     const allowsLeads = contract >= PROJECT_LEADS_SINCE && link.project_leads === true;
     const sentAt = new Date(o.now).toISOString();
-    const snap = o.source({ now: sentAt, seq, full: true, contract, contractAllowsProjectPaths: allowsPaths, contractAllowsProjectLeads: allowsLeads, sentReceipts: state.sent_receipts });
+    const snap = o.source({ now: sentAt, seq, full: true, contract, contractAllowsProjectPaths: allowsPaths, contractAllowsProjectLeads: allowsLeads, sentReceipts: state.sent_receipts, lastAck: state.acked_at ?? null });
     const common = { ...snap, now: sentAt, seq, contract, contractAllowsProjectPaths: allowsPaths, contractAllowsProjectLeads: allowsLeads, sentReceipts: state.sent_receipts };
     const fullTry: Projection = projectSync({ ...common, full: true });
     if (!fullTry.ok) {
@@ -199,6 +200,15 @@ export async function syncOnce(o: SyncDeps): Promise<SyncResult> {
     writeState(o.kv, state);
   }
   return send(o, link, state, pending);
+}
+
+function withoutStatus(body: string): string | null {
+  try {
+    const parsed = JSON.parse(body) as { host?: { status?: unknown } };
+    if (!parsed.host || !Object.prototype.hasOwnProperty.call(parsed.host, "status")) return null;
+    delete parsed.host.status;
+    return JSON.stringify(parsed);
+  } catch { return null; }
 }
 
 async function send(o: SyncDeps, link: SyncLink, state: SyncState, pending: Pending): Promise<SyncResult> {
@@ -230,6 +240,15 @@ async function send(o: SyncDeps, link: SyncLink, state: SyncState, pending: Pend
     return recover(o, state, pending, res);
   }
   if (res.status < 200 || res.status >= 300) {
+    if (res.status === 400) {
+      const stripped = withoutStatus(pending.body);
+      if (stripped) {
+        pending.body = stripped;
+        state.pending = pending;
+        writeState(o.kv, state);
+        return send(o, link, state, pending);
+      }
+    }
     state.attempt += 1;
     state.next_at = o.now + backoffMs(state.attempt, state.floor_seconds);
     writeState(o.kv, state);
@@ -247,6 +266,7 @@ async function send(o: SyncDeps, link: SyncLink, state: SyncState, pending: Pend
   }
   const wait = clampSeconds(ack.next_sync_seconds, 15);
   state.ack_seq = pending.seq;
+  state.acked_at = new Date(Number(timestamp) * 1000).toISOString();
   state.pending = undefined;
   state.attempt = 0;
   state.floor_seconds = wait;
