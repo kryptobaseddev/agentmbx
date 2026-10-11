@@ -4,7 +4,7 @@
 // MBX_TEST_SPAWN_FAIL so no real install is harmed.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, cpSync, mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { appendFileSync, cpSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -31,7 +31,12 @@ const start = async (t: { after: (fn: () => void | Promise<void>) => void }, ins
   const env: NodeJS.ProcessEnv = { ...process.env, MBX_HOME: home, MBX_AGENT: "rollback-reader", MBX_CLI: "claude", MBX_NO_DESKTOP: "1", MBX_TEST_SPAWN_FAIL: failMode };
   for (const key of ["AGENTMBX_DEV", "MBX_MCP_REEXEC", "MBX_MCP_REEXEC_BUILD", "MBX_MCP_DETACHED", "MBX_MCP_PROVIDER_PID"]) delete env[key];
   env.AGENTMBX_DEV = "1"; // the failure-injection seam is gated behind the dev flag, as in `npm test`
-  const transport = new StdioClientTransport({ command: process.execPath, args: [join(install, "bin/agentmbx.js"), "mcp"], env: env as Record<string, string>, stderr: "pipe" });
+  const preload = join(install, "exec-behavior.mjs");
+  writeFileSync(preload, failMode === "exec-throw" ? "process.execve = () => {throw Error('injected exec failure')};"
+    : failMode === "exec-return" ? "process.execve = () => {};"
+    : failMode === "exec-preflight" ? "Object.defineProperty(process,'execPath',{value:'/nonexistent-t488-owned-fixture/executable'});"
+    : "process.execve = undefined;");
+  const transport = new StdioClientTransport({ command: process.execPath, args: ["--import", preload, join(install, "bin/agentmbx.js"), "mcp"], env: env as Record<string, string>, stderr: "pipe" });
   await client.connect(transport);
   const stderrLines: string[] = [];
   (transport as unknown as { stderr: { on: (ev: string, cb: (d: unknown) => void) => void } }).stderr.on("data", d => stderrLines.push(String(d)));
@@ -103,4 +108,25 @@ test("an async spawn error resets the pending handover: a later build change ret
   const retryDeadline = Date.now() + 5_000;
   while (Date.now() < retryDeadline && announcements() < 2) await new Promise(r => setTimeout(r, 25));
   assert.equal(announcements(), 2, "the async spawn failure reset handedOver, so the next build change retries the handover");
+});
+
+test("exec preflight failure preserves serving, lease and control endpoint", { skip: typeof process.execve !== "function" }, async t => {
+  const { install, home, node, entry } = fixture(t), { client } = await start(t, install, home, "exec-preflight");
+  const before = await whoami(client), name = (before.structuredContent as { agent: string }).agent;
+  const lease = node.store.db.prepare("SELECT token FROM identity_leases WHERE name=?").get(name)!;
+  appendFileSync(entry, "\n// deployed build\n");
+  assert.notEqual((await whoami(client)).isError, true);
+  assert.notEqual((await client.callTool({ name: "mbx_inbox", arguments: {} })).isError, true);
+  assert.equal(node.store.db.prepare("SELECT token FROM identity_leases WHERE name=? AND released_at IS NULL").get(name)?.token, lease.token);
+  assert.ok(listIdentityControls(node.store).some(d => d.agent === name));
+});
+
+for (const mode of ["exec-throw", "exec-return"]) test(`${mode} closes the transport after retirement instead of serving half-retired`, { skip: typeof process.execve !== "function" }, async t => {
+  const { install, home, node, entry } = fixture(t), { client } = await start(t, install, home, mode);
+  const before = await whoami(client), name = (before.structuredContent as { agent: string }).agent;
+  appendFileSync(entry, "\n// deployed build\n");
+  assert.notEqual((await whoami(client)).isError, true, "the triggering result must flush before replacement");
+  await assert.rejects(() => whoami(client));
+  assert.notEqual(node.store.db.prepare("SELECT released_at FROM identity_leases WHERE name=?").get(name)?.released_at, null);
+  assert.ok(!listIdentityControls(node.store).some(d => d.agent === name));
 });
