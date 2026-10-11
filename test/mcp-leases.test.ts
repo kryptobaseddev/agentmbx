@@ -14,13 +14,15 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} MCP clai
   const c = new Client({ name: cli, version: "test" });
   t.after(async () => { await c.close(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const transport = new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
-    env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: cli, MBX_AGENT: "reader", MBX_NO_DESKTOP: "1" } as Record<string, string> });
+    env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: cli, MBX_AGENT: cli === "opencode" ? "" : "reader", MBX_NO_DESKTOP: "1" } as Record<string, string> });
   await c.connect(transport);
-  await c.callTool({ name: "mbx_whoami", arguments: {} });
+  const meta = cli === "opencode" ? { sessionID: "ses_leases" } : undefined;
+  if (meta) assert.notEqual((await c.callTool({ name: "mbx_identity", arguments: { action: "register", name: "reader", role: "builder" }, _meta: meta })).isError, true);
+  await c.callTool({ name: "mbx_whoami", arguments: {}, _meta: meta });
   const before = node.store.db.prepare("SELECT * FROM identity_leases WHERE name='reader'").get();
   assert.ok(before, "startup must claim the identity"); assert.equal(before.holder_pid, transport.pid);
   const id = node.send({ from: "sender", to: ["reader"], subject: "pending", body: "preserved" }).envelope.id;
-  const renamed = await c.callTool({ name: "mbx_whoami", arguments: { name: "renamed" } }); assert.notEqual(renamed.isError, true);
+  const renamed = await c.callTool({ name: "mbx_whoami", arguments: { name: "renamed" }, _meta: meta }); assert.notEqual(renamed.isError, true);
   const after = node.store.db.prepare("SELECT * FROM identity_leases WHERE name='renamed'").get()!;
   assert.equal(after.released_at, null); assert.notEqual(after.token, before.token);
   assert.notEqual(node.store.db.prepare("SELECT released_at FROM identity_leases WHERE name='reader'").get()!.released_at, null);
@@ -82,13 +84,15 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} legacy c
   const id = node.send({ from: "sender", to: ["reader"], subject: "ambiguous", body: "preserved" }).envelope.id;
   await c.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: cli, MBX_AGENT: "reader", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
-  // T204: no substitute name. The session stays unbound with its launch identity pending; identity tools still work.
-  const identity = (await c.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent: string | null; unbound: boolean; pending: string };
-  assert.deepEqual([identity.agent, identity.unbound, identity.pending], [null, true, "reader"]);
-  assert.notEqual((await c.callTool({ name: "mbx_identity", arguments: { action: "list" } })).isError, true);
-  const read = await c.callTool({ name: "mbx_read", arguments: { ids: [id] } });
+  // T204: native session metadata never inherits the launch identity or ambiguous mail.
+  const meta = cli === "opencode" ? { sessionID: "ses_legacy" } : undefined;
+  if (meta) node.keepName(cli, meta.sessionID, "reader");
+  const identity = (await c.callTool({ name: "mbx_whoami", arguments: {}, _meta: meta })).structuredContent as { agent: string | null; unbound: boolean; pending: string | null };
+  assert.deepEqual([identity.agent, identity.unbound, identity.pending], [null, true, meta ? null : "reader"]);
+  assert.notEqual((await c.callTool({ name: "mbx_identity", arguments: { action: "list" }, _meta: meta })).isError, true);
+  const read = await c.callTool({ name: "mbx_read", arguments: { ids: [id] }, _meta: meta });
   assert.equal(read.isError, true);
-  assert.match(JSON.stringify(read), /reader is not available yet/);
+  assert.match(JSON.stringify(read), meta ? /no identity|unbound|claim|register/ : /reader is not available yet/);
   assert.equal(node.inbox("reader")[0].id, id);
   assert.ok(node.store.get("identity-conflict:reader"));
   assert.equal(node.store.db.prepare("SELECT 1 FROM identity_leases WHERE name='reader'").get(), undefined);

@@ -2,7 +2,8 @@ import { sendLeased } from "./helpers/leased-send.ts";
 // Drive `mbx mcp` with the official MCP client over stdio.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -10,9 +11,34 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { z } from "zod";
 import { delegateWake } from "./helpers/wake-lease.ts";
 import { MbxNode } from "../src/node.ts";
+import { opencodeHostOf, opencodeProviderPid } from "../src/opencode-provider.ts";
 
 const BIN = join(import.meta.dirname, "../bin/agentmbx.js");
 const textOf = (r: unknown) => ((r as { content: { text: string }[] }).content[0].text);
+
+/** Exercise production process classification under an isolated Node fixture, never a real OpenCode server. */
+function providerFixture(t: { after: (fn: () => void) => void }, name: string, host: "standalone" | "unknown"): boolean {
+  if (process.env.T516_RECONNECT_PROVIDER === host) return false;
+  const dir = mkdtempSync(join(tmpdir(), "mbx-reconnect-provider-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const executable = join(dir, host === "standalone" ? "opencode" : "zsh");
+  if (process.platform === "darwin") symlinkSync(process.execPath, executable);
+  else { copyFileSync(process.execPath, executable); chmodSync(executable, 0o755); }
+  const env: NodeJS.ProcessEnv = { ...process.env, T516_RECONNECT_PROVIDER: host };
+  delete env.NODE_TEST_CONTEXT;
+  for (const key of Object.keys(env)) if (key.startsWith("MBX_MCP_")) delete env[key];
+  const wrapper = join(dir, "provider.mjs");
+  const args = ["--test", "--test-isolation=none", "--test-name-pattern=^" + name + "$", "--test-timeout=120000", "--test-force-exit", import.meta.filename];
+  writeFileSync(wrapper, `import { spawn } from 'node:child_process';
+const child=spawn(${JSON.stringify(process.execPath)},${JSON.stringify(args)},{stdio:'inherit'});
+child.on('exit',code=>process.exit(code??1));
+process.on('SIGTERM',()=>child.kill('SIGTERM'));
+`);
+  const result = spawnSync(executable, [wrapper, host === "standalone" ? "--stdio" : "--fixture"], { env, encoding: "utf8", timeout: 150000 });
+  assert.equal(result.status, 0, `${result.error ?? ""}\n${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /(?:#|ℹ) pass 1\b/, "the fixture ran its reconnect test rather than filtering everything out");
+  return true;
+}
 
 test("MCP search finds recipient mail behind unrelated higher-ranked matches", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mbx-mcp-search-"));
@@ -183,13 +209,18 @@ for (const hook of [false, true]) test(`MCP SIGKILL recovery ${hook ? "preserves
 });
 
 for (const cli of ["claude", "codex", "kimi", "opencode"]) for (const crash of [false, true])
-  test(`${cli}: renamed mailbox survives ${crash ? "crash" : "clean"} reconnect`, async () => {
+  test(`${cli}: renamed mailbox survives ${crash ? "crash" : "clean"} reconnect`, async t => {
+    const name = `${cli}: renamed mailbox survives ${crash ? "crash" : "clean"} reconnect`;
+    if (cli === "opencode" && providerFixture(t, name, "standalone")) return;
     const home = mkdtempSync(join(tmpdir(), "mbx-resume-name-"));
     const n = new MbxNode(home, { host: "alpha" });
     const first = await client(home, "initial", { MBX_CLI: cli });
+    const meta = cli === "opencode" ? { "ai.opencode/sessionID": "ses_renamed" } : undefined;
     try {
-      n.bindSession({ agent: "initial", cli, session_id: "real-thread", pid: process.pid, cwd: process.cwd() });
-      await first.c.callTool({ name: "mbx_whoami", arguments: { name: "chosen" } });
+      const providerPid = cli === "opencode" ? opencodeProviderPid(process.pid)! : process.pid;
+      if (cli === "opencode") assert.equal(opencodeHostOf(providerPid), "standalone");
+      n.bindSession({ agent: "initial", cli, session_id: cli === "opencode" ? "ses_renamed" : "real-thread", pid: providerPid, cwd: process.cwd() });
+      await first.c.callTool({ name: "mbx_whoami", arguments: { name: "chosen" }, _meta: meta });
       const id = n.send({ from: "sender", to: ["chosen"], subject: "mail before reconnect", body: "preserved" }).envelope.id;
       if (crash) {
         const closed = new Promise<void>((resolve) => { first.c.onclose = resolve; });
@@ -199,15 +230,36 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) for (const crash of [
       // No explicit MBX_AGENT override on restart: resume the verified session's chosen name.
       const next = await client(home, "", { MBX_CLI: cli });
       try {
-        const who = (await next.c.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent: string };
+        const who = (await next.c.callTool({ name: "mbx_whoami", arguments: {}, _meta: meta })).structuredContent as { agent: string };
         assert.equal(who.agent, "chosen");
-        assert.match(textOf(await next.c.callTool({ name: "mbx_inbox", arguments: {} })), /mail before reconnect/);
-        assert.equal((await next.c.callTool({ name: "mbx_ack", arguments: { ids: [id] } })).isError, undefined);
+        assert.match(textOf(await next.c.callTool({ name: "mbx_inbox", arguments: {}, _meta: meta })), /mail before reconnect/);
+        assert.equal((await next.c.callTool({ name: "mbx_ack", arguments: { ids: [id] }, _meta: meta })).isError, undefined);
         assert.equal(n.unreadCount("chosen"), 0);
         assert.equal(n.sessionsFor("chosen").length, 1);
       } finally { await next.c.close(); }
     } finally { await first.c.close(); n.close(); }
   });
+
+test("opencode: unknown host cannot resume a sole recorded mailbox without metadata", async t => {
+  if (providerFixture(t, "opencode: unknown host cannot resume a sole recorded mailbox without metadata", "unknown")) return;
+  const home = mkdtempSync(join(tmpdir(), "mbx-unknown-resume-"));
+  const n = new MbxNode(home, { host: "scratch" });
+  const first = await client(home, "chosen", { MBX_CLI: "opencode" });
+  try {
+    assert.equal(opencodeProviderPid(process.pid), null, "fixture is not a verified OpenCode host");
+    n.bindSession({ agent: "chosen", cli: "opencode", session_id: "ses_recorded", pid: process.pid, cwd: process.cwd() });
+    const id = n.send({ from: "sender", to: ["chosen"], subject: "private remembered mail", body: "preserved" }).envelope.id;
+    await first.c.close();
+    const next = await client(home, "", { MBX_CLI: "opencode" });
+    try {
+      const who = await next.c.callTool({ name: "mbx_whoami", arguments: {} });
+      assert.equal(who.isError, true, "a generic provider cannot infer its caller from one recorded conversation");
+      assert.match(textOf(who), /session metadata is required/);
+      assert.equal((await next.c.callTool({ name: "mbx_read", arguments: { ids: [id] } })).isError, true);
+      assert.equal(n.unreadCount("chosen"), 1, "refused reconnect never consumes another conversation's mail");
+    } finally { await next.c.close(); }
+  } finally { await first.c.close(); n.close(); rmSync(home, { recursive: true, force: true }); }
+});
 
 test("channel mode ignores retired links and preserves separate mailbox deliveries", async () => {
   const home = mkdtempSync(join(tmpdir(), "mbx-channel-linked-"));
