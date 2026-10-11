@@ -2,7 +2,7 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -128,6 +128,7 @@ for (const recover of [true, false]) test(`a separate session-start hook ${recov
   else { assert.match(result.stdout, /identity is still resuming/); writeFileSync(release, "ready"); }
   const who = await server.rpc(2, "tools/call", { name: "mbx_whoami", arguments: {} });
   assert.equal(who.result?.structuredContent?.agent, "reader");
+  assert.equal(existsSync(join(f.home, "mcp-errors.log")), false, "successful startup and transient busy retries are not startup errors");
   assert.equal(mcpStarting(f.home, "claude", process.pid), false, "ready removes the advisory marker");
 });
 

@@ -25,6 +25,7 @@ import { providerLabel, sameLiveProvider } from "./identity-takeover.ts";
 import { conversationLoopLabel, detectConversationLoops } from "./loop-detector.ts";
 import { opencodeDuplicateLoopChecks } from "./opencode-duplicate-loop.ts";
 import { mbxProcessInventory, mcpOrphanCheck } from "./mcp-lifecycle.ts";
+import { recentMcpStartupErrors } from "./logs.ts";
 
 export type Level = "ok" | "fail" | "warn" | "info";
 export interface Check { level: Level; label: string; fix?: string }
@@ -533,6 +534,10 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
   const add = (level: Level, label: string, fix?: string) => out.push({ level, label, fix });
   add("info", `agentmbx ${VERSION} (node ${process.versions.node})`);
   out.push(mcpOrphanCheck(mbxHome));
+  try {
+    const errors = recentMcpStartupErrors(mbxHome);
+    add(errors.length ? "warn" : "info", `MCP startup errors in the last 24h (${errors.length} shown):${errors.length ? `\n${errors.join("\n")}` : " none"}`);
+  } catch (error) { add("warn", `MCP startup error log unavailable: ${(error as Error).message}`); }
   if (Number(process.versions.node.split(".")[0]) < 24) add("fail", `Node ${process.versions.node} is too old`, "install Node 24 or later");
 
   // T314: stay out of the grok block. OpenCode's own doctor function must not collide with this.

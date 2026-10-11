@@ -41,6 +41,7 @@ import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wa
 import { isStoreBusy, withStoreBusyTimeout } from "./store.js";
 import { markMcpStarting } from "./mcp-startup.js";
 import { recordMcpGeneration, startMcpLifecycle } from "./mcp-lifecycle.js";
+import { recordMcpStartupError } from "./logs.js";
 let lifecycle;
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
 It is shared by AI coding agents on this machine and on paired machines. Your user set it up so agents can coordinate;
@@ -455,33 +456,54 @@ export const externalWarning = (origin, taint) => {
     return [`${origin === "agent" ? "origin \"agent\" overridden: " : ""}sent with origin external because this session read outside content: recipients may only read it under owner policy (no edit or outward).${until}`];
 };
 export async function runMcp(existing) {
-    lifecycle ??= startMcpLifecycle(existing?.home ?? defaultHome());
-    const claimDeadline = performance.now() + 1500;
-    for (;;) {
-        const claim = lifecycle.claimConnection();
-        if (claim.state === "held")
-            break;
-        const handoverParent = claim.state === "duplicate" && process.env[REEXEC_ENV]
-            && (claim.pid === process.ppid || claim.pid === Number(process.env.MBX_MCP_ORIGINAL_PID));
-        if ((claim.state === "retry" || handoverParent) && performance.now() < claimDeadline) {
-            await new Promise(resolve => setTimeout(resolve, 10));
-            continue;
+    const home = existing?.home ?? defaultHome();
+    let logged = false, startupComplete = false, clearStarting = () => { };
+    const reportError = (error) => {
+        if (logged)
+            return;
+        logged = true;
+        let cli = process.env.MBX_CLI || "unknown";
+        try {
+            cli = detectHost().cli;
         }
-        if (claim.state === "duplicate") {
-            process.stderr.write(`[mbx] duplicate MCP client connection already served by pid ${claim.pid}; refusing this reader.\n`);
-            lifecycle.shutdown(1);
-        }
-        process.stderr.write("[mbx] client connection ownership unknown; duplicate exclusion unavailable.\n");
-        break;
-    }
-    const clearStarting = markMcpStarting(existing?.home ?? defaultHome());
+        catch { /* Provider detection may itself be the startup failure. */ }
+        recordMcpStartupError(home, cli, error);
+    };
+    const outputError = (error) => { if (error.code !== "EPIPE")
+        reportError(error); };
+    process.once("uncaughtExceptionMonitor", reportError);
+    process.stdin.prependOnceListener("error", reportError);
+    process.stdout.prependOnceListener("error", outputError);
     try {
+        lifecycle ??= startMcpLifecycle(home);
+        const claimDeadline = performance.now() + 1500;
+        for (;;) {
+            const claim = lifecycle.claimConnection();
+            if (claim.state === "held")
+                break;
+            const handoverParent = claim.state === "duplicate" && process.env[REEXEC_ENV]
+                && (claim.pid === process.ppid || claim.pid === Number(process.env.MBX_MCP_ORIGINAL_PID));
+            if ((claim.state === "retry" || handoverParent) && performance.now() < claimDeadline) {
+                await new Promise(resolve => setTimeout(resolve, 10));
+                continue;
+            }
+            if (claim.state === "duplicate") {
+                reportError(new Error(`duplicate MCP client connection already served by pid ${claim.pid}; refusing this reader`));
+                process.stderr.write(`[mbx] duplicate MCP client connection already served by pid ${claim.pid}; refusing this reader.\n`);
+                lifecycle.shutdown(1);
+            }
+            process.stderr.write("[mbx] client connection ownership unknown; duplicate exclusion unavailable.\n");
+            break;
+        }
+        clearStarting = markMcpStarting(home);
         // Connection exclusion precedes reading the pipe; mailbox/store/identity readiness never gates initialize.
         // Channel support is a server capability; whether this session uses it is detected after initialize.
         const server = new McpServer({ name: "mbx", version: version() }, {
             instructions: INSTRUCTIONS,
             capabilities: { experimental: { "claude/channel": {} } },
         });
+        server.server.onerror = error => { if (!startupComplete)
+            reportError(error); };
         // Startup registration changes the catalog before its first gated read. Suppress incremental notifications;
         // a reused transport still receives the single explicit replacement notification in configureMcp.
         const changed = { tools: server.sendToolListChanged.bind(server), resources: server.sendResourceListChanged.bind(server),
@@ -545,6 +567,7 @@ export async function runMcp(existing) {
         }
         try {
             await configureMcp(server, node, () => closed);
+            startupComplete = true;
         }
         catch (error) {
             startupError = error;
@@ -559,8 +582,15 @@ export async function runMcp(existing) {
             resolveReady();
         }
     }
+    catch (error) {
+        reportError(error);
+        throw error;
+    }
     finally {
         clearStarting();
+        process.off("uncaughtExceptionMonitor", reportError);
+        process.stdin.off("error", reportError);
+        process.stdout.off("error", outputError);
     }
 }
 async function configureMcp(server, node, startupClosed) {

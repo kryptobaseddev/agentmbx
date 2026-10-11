@@ -41,6 +41,7 @@ import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wa
 import { isStoreBusy, withStoreBusyTimeout } from "./store.ts";
 import { markMcpStarting } from "./mcp-startup.ts";
 import { recordMcpGeneration, startMcpLifecycle } from "./mcp-lifecycle.ts";
+import { recordMcpStartupError } from "./logs.ts";
 
 let lifecycle: ReturnType<typeof startMcpLifecycle> | undefined;
 
@@ -414,29 +415,44 @@ export const externalWarning = (origin: "agent" | "external" | undefined, taint:
 };
 
 export async function runMcp(existing?: MbxNode) {
-  lifecycle ??= startMcpLifecycle(existing?.home ?? defaultHome());
-  const claimDeadline = performance.now() + 1500;
-  for (;;) {
-    const claim = lifecycle.claimConnection();
-    if (claim.state === "held") break;
-    const handoverParent = claim.state === "duplicate" && process.env[REEXEC_ENV]
-      && (claim.pid === process.ppid || claim.pid === Number(process.env.MBX_MCP_ORIGINAL_PID));
-    if ((claim.state === "retry" || handoverParent) && performance.now() < claimDeadline) { await new Promise(resolve => setTimeout(resolve, 10)); continue; }
-    if (claim.state === "duplicate") {
-      process.stderr.write(`[mbx] duplicate MCP client connection already served by pid ${claim.pid}; refusing this reader.\n`);
-      lifecycle.shutdown(1);
-    }
-    process.stderr.write("[mbx] client connection ownership unknown; duplicate exclusion unavailable.\n");
-    break;
-  }
-  const clearStarting = markMcpStarting(existing?.home ?? defaultHome());
+  const home = existing?.home ?? defaultHome();
+  let logged = false, startupComplete = false, clearStarting = () => {};
+  const reportError = (error: unknown) => {
+    if (logged) return;
+    logged = true;
+    let cli = process.env.MBX_CLI || "unknown";
+    try { cli = detectHost().cli; } catch { /* Provider detection may itself be the startup failure. */ }
+    recordMcpStartupError(home, cli, error);
+  };
+  const outputError = (error: NodeJS.ErrnoException) => { if (error.code !== "EPIPE") reportError(error); };
+  process.once("uncaughtExceptionMonitor", reportError);
+  process.stdin.prependOnceListener("error", reportError);
+  process.stdout.prependOnceListener("error", outputError);
   try {
+    lifecycle ??= startMcpLifecycle(home);
+    const claimDeadline = performance.now() + 1500;
+    for (;;) {
+      const claim = lifecycle.claimConnection();
+      if (claim.state === "held") break;
+      const handoverParent = claim.state === "duplicate" && process.env[REEXEC_ENV]
+        && (claim.pid === process.ppid || claim.pid === Number(process.env.MBX_MCP_ORIGINAL_PID));
+      if ((claim.state === "retry" || handoverParent) && performance.now() < claimDeadline) { await new Promise(resolve => setTimeout(resolve, 10)); continue; }
+      if (claim.state === "duplicate") {
+        reportError(new Error(`duplicate MCP client connection already served by pid ${claim.pid}; refusing this reader`));
+        process.stderr.write(`[mbx] duplicate MCP client connection already served by pid ${claim.pid}; refusing this reader.\n`);
+        lifecycle.shutdown(1);
+      }
+      process.stderr.write("[mbx] client connection ownership unknown; duplicate exclusion unavailable.\n");
+      break;
+    }
+    clearStarting = markMcpStarting(home);
     // Connection exclusion precedes reading the pipe; mailbox/store/identity readiness never gates initialize.
     // Channel support is a server capability; whether this session uses it is detected after initialize.
     const server = new McpServer({ name: "mbx", version: version() }, {
       instructions: INSTRUCTIONS,
       capabilities: { experimental: { "claude/channel": {} } },
     });
+    server.server.onerror = error => { if (!startupComplete) reportError(error); };
     // Startup registration changes the catalog before its first gated read. Suppress incremental notifications;
     // a reused transport still receives the single explicit replacement notification in configureMcp.
     const changed = { tools: server.sendToolListChanged.bind(server), resources: server.sendResourceListChanged.bind(server),
@@ -483,14 +499,20 @@ export async function runMcp(existing?: MbxNode) {
         }
       }
     }
-    try { await configureMcp(server, node, () => closed); }
+    try { await configureMcp(server, node, () => closed); startupComplete = true; }
     catch (error) { startupError = error; node.close(); throw error; }
     finally {
       process.stdin.off("end", stopStartup);
       server.sendToolListChanged = changed.tools; server.sendResourceListChanged = changed.resources; server.sendPromptListChanged = changed.prompts;
       resolveReady();
     }
-  } finally { clearStarting(); }
+  } catch (error) { reportError(error); throw error; }
+  finally {
+    clearStarting();
+    process.off("uncaughtExceptionMonitor", reportError);
+    process.stdin.off("error", reportError);
+    process.stdout.off("error", outputError);
+  }
 }
 
 async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () => boolean) {

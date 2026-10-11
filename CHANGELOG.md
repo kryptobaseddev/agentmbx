@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Startup failures leave bounded diagnostics (T505).** Daemon output prefixes every line with a UTC timestamp. MCP bootstrap and initialization errors record the PID, CLI and error in `mcp-errors.log` (256 KiB cap); `agentmbx doctor` shows the latest five from the last 24 hours. An unwritable log preserves the original failure and exit status.
+
 - **MCP reloads replace the process on runtimes with `process.execve` (T488).** The reply and client pipe survive while the PID stays the same. Exec preflight failure keeps serving; failure after retirement closes the transport. Unsupported runtimes explicitly retain the legacy proxy handover. Kernel pipe/socket endpoints distinguish connections on macOS and Linux, so a proven duplicate reader is refused before SDK initialization while separate connections under one provider remain valid; unknown endpoints or owner evidence stay non-actionable. `agentmbx doctor --processes` lists MCP/watch PID, parent, birth, client liveness and RSS without initializing or repairing the host.
 
 - **Schema refusals keep answering every MCP tool (T487 follow-up).** A running connector reloads an upgraded store only when a different build is installed. Replacing itself with the identical incompatible build could turn later tool refusals into MCP protocol exceptions. The connector now keeps returning the usual error result, with mail preserved; a changed build still reloads.
