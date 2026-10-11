@@ -50,6 +50,7 @@ import { formatUnboundStart, listIdentityStatus } from "./identity-status.ts";
 import { REBINDING_CLIS, withCliIdentity, withHookIdentity, type CliIdentitySelection } from "./cli-identity.ts";
 import { declaredOriginWarning, readSessionTaint, refuseAgentOrigin, taintSendWarning, type SessionTaint } from "./session-taint.ts";
 import { runProbe, storeProbeIO } from "./probe.ts";
+import { resolveProject } from "./project-key.ts";
 import { DEFAULT_LOGIN_BASE_URL, defaultLoginIO, parseLoginBase, runLogin } from "./login.ts";
 import { buildIdentityTakeover, type IdentityTakeoverApproval } from "./identity-takeover.ts";
 import { publishIdentityControl, findIdentityControl, identityControlReceipt, resolveIdentityControlReceipt, submitIdentityControl, type IdentityControlReceipt } from "./identity-control.ts";
@@ -1146,9 +1147,15 @@ async function lead(node: MbxNode, pos: string[], str: (k: string) => string | u
   const dir = str("project") ?? (Array.isArray(o.project) ? (o.project as string[])[0] : undefined); // --project is a multiple option
   const project = dir ? (projectOf(resolve(dir)) ?? die(`${dir} is the home folder or /, not a project`)) : undefined;
   if (sub === "show") {
-    const rows = node.store.db.prepare("SELECT DISTINCT project FROM project_leads" + (project ? " WHERE project=?" : "")).all(...(project ? [project] : [])) as { project: string }[];
+    // A record covers its folder and every other checkout of the same CLEO project (T543): show the key and those folders.
+    const key = project ? resolveProject(project).key : undefined;
+    const rows = node.store.db.prepare("SELECT project, MAX(project_key) AS project_key FROM project_leads" + (project ? " WHERE project=? OR project_key=?" : "") + " GROUP BY project").all(...(project ? [project, key!] : [])) as { project: string; project_key: string | null }[];
     if (!rows.length) return console.log(project ? `no lead for ${project}` : "no project leads");
-    for (const r of rows) { const l = activeLead(node, r.project); console.log(`${r.project}\t${l ? `${l.agent}@${l.host} until ${l.exp} (id ${l.id})` : "none (expired or revoked)"}`); }
+    for (const r of rows) {
+      const l = activeLead(node, r.project);
+      const also = r.project_key ? (node.store.db.prepare("SELECT DISTINCT project FROM identity_projects WHERE project_key=? AND project<>?").all(r.project_key, r.project) as { project: string }[]).map((x) => x.project) : [];
+      console.log(`${r.project}\t${l ? `${l.agent}@${l.host} until ${l.exp} (id ${l.id})` : "none (expired or revoked)"}\tkey ${r.project_key ? `${r.project_key} (CLEO project id)` : "folder path"}${also.length ? `\talso covers ${also.join(", ")}` : ""}`);
+    }
     return;
   }
   if (!project) die(`lead ${sub ?? "set"} needs --project <dir>`);

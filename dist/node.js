@@ -16,7 +16,7 @@ import { effectivePolicy, policyLine } from "./policy.js";
 import { procStart, procTable, provenProcess, sameProcess } from "./proc.js";
 import { bumpPostToolMarker, bumpPostToolMarkersForAgent } from "./posttool.js";
 import { privatePath } from "./private-files.js";
-import { backfillRegistry } from "./registry.js";
+import { backfillProjectKeys, backfillRegistry } from "./registry.js";
 import { resolveLeadRecipients } from "./lead-record.js";
 import { Store } from "./store.js";
 export const DEFAULT_PORT = 7373;
@@ -58,6 +58,17 @@ export const HERMES_NO_PUSH = "no push: Hermes has no idle-session inject. Run `
 /** Adapter boundary (T067): node core never imports kimi-web; the adapter registers the real check in wake-check. */
 const sessionWakeable = (x) => !!x.channel || ((WAKEABLE.has(x.cli) || (x.cli === "kimi" && kimiHostedCheck(x.pid))) && !x.session_id.startsWith("mcp-"));
 export const defaultHome = () => process.env.MBX_HOME || join(homedir(), ".local", "share", "agentmbx");
+function parseProjectKeys(raw) {
+    if (raw == null)
+        return null;
+    try {
+        const v = JSON.parse(raw);
+        return Array.isArray(v) && v.every((k) => typeof k === "string") ? v : null;
+    }
+    catch {
+        return null;
+    }
+}
 const shortHost = () => hostname().split(".")[0].toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) || "host";
 export class MbxNode {
     home;
@@ -96,6 +107,12 @@ export class MbxNode {
         this.syncOwner();
         if (!this.store.get("registry-backfill:v1"))
             this.store.tx(() => { backfillRegistry(this.store, this.host); this.store.set("registry-backfill:v1", new Date().toISOString()); });
+        // T543: key the project bindings and lead rows that predate the key column (or were written by an older runtime). Best effort:
+        // a read-only or busy store simply leaves them NULL, and every read still matches them by folder.
+        try {
+            backfillProjectKeys(this.store);
+        }
+        catch { /* retried on the next open */ }
     }
     /** Record this host's own owner key (if any) as the principal it takes policies from. */
     syncOwner() {
@@ -148,7 +165,13 @@ export class MbxNode {
             .run(name, this.host, info.role ?? null, info.cli ?? null, info.description ?? null, new Date().toISOString());
     }
     agents() {
-        return this.store.db.prepare("SELECT * FROM agents ORDER BY host, name").all();
+        const rows = this.store.db.prepare("SELECT name,host,role,cli,description,last_seen,state,harness,project_keys FROM agents ORDER BY host, name").all();
+        return rows.map((r) => ({
+            name: r.name, host: r.host, role: r.role, cli: r.cli, description: r.description, last_seen: r.last_seen,
+            state: r.state === "live" || r.state === "idle" || r.state === "unknown" || r.state === "offline" ? r.state : null,
+            harness: typeof r.harness === "string" ? r.harness : null,
+            project_keys: parseProjectKeys(r.project_keys),
+        }));
     }
     /**
      * Bind a CLI session to an agent. The hook binding (wake target) and the MCP binding (session key) come from the same

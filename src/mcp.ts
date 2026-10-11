@@ -20,7 +20,7 @@ import { BIND_TICKET_RE, takeBindTicket } from "./bind-ticket.ts";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
 import { activityKey, holderProviderView, identityAvailability, parseActivity, parseProviderRecord, providerRecordKey } from "./identity-availability.ts";
 import { reviveMailbox } from "./identity-cleanup.ts";
-import { AUTO_NAME_RE, linkedKey, noteProject, projectKey, projectOf, registeredIdentity, registerIdentity, renameRegistration, ROLE_RE, sessionHint, UNSPECIFIED_ROLE } from "./registry.ts";
+import { AUTO_NAME_RE, crossHostKey, linkedKey, noteProject, projectOf, registeredIdentity, registerIdentity, renameRegistration, ROLE_RE, sessionHint, UNSPECIFIED_ROLE } from "./registry.ts";
 import { applyIdentityTakeover, type IdentityTakeoverApproval } from "./identity-takeover.ts";
 import { opencodeProviderPid } from "./opencode-provider.ts";
 import { formatUnboundStart, listIdentityStatus } from "./identity-status.ts";
@@ -1003,7 +1003,7 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
     const taint = taintOf(state, now);
     const draft = { hop: depths.length ? Math.min(MAX_RELAY_DEPTH, Math.max(...depths) + 1) : 0, origin: origin === "external" || taint ? "external" as const : "agent" as const,
       // inherited taint carries its ROOT exposure; a declared send is first-hand, rooted at its own send time
-      ...(origin !== "external" && taint ? { external_since: isoAt(taint.root) } : {}), project, project_key: projectKey(project) };
+      ...(origin !== "external" && taint ? { external_since: isoAt(taint.root) } : {}), project, project_key: crossHostKey(project) };
     return { draft, warnings: externalWarning(origin, taint) };
   };
   /** Opening mail marks the reader's own copies read (delivered/notified → read; never past acked), for sender receipts (T207). */

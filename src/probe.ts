@@ -9,7 +9,7 @@
 import type { MbxNode } from "./node.ts";
 import { IdentityLeases } from "./identity-leases.ts";
 import { listIdentityStatus, type IdentityStatus } from "./identity-status.ts";
-import { projectKey as defaultProjectKey } from "./registry.ts";
+import { crossHostKey as defaultProjectKey } from "./project-key.ts";
 import { realpathSync } from "node:fs";
 import { sep } from "node:path";
 
@@ -60,7 +60,7 @@ export interface ProbePlanOptions {
   only?: readonly string[];
   exclude?: readonly string[];
   holderProject?: (holder: { cli: string; session_id: string }) => string | null;
-  /** For tests: override the git-origin project key lookup. Defaults to `registry.projectKey`. */
+  /** For tests: override the project key lookup. Defaults to `crossHostKey` (the CLEO id, else the git origin; T543). */
   projectKeyOf?: (project: string) => string | undefined;
 }
 
@@ -70,7 +70,8 @@ export function globMatch(pattern: string, name: string): boolean {
   return re.test(name);
 }
 
-/** True when a holder's session cwd is the project, inside it, or has the same git-origin project key (T445). One rule
+/** True when a holder's session cwd is the project, inside it, or has the same project key: a second checkout of one CLEO
+ *  project, or of one git origin (T445, T543). One rule
  *  for `planProbe` and the roster's `seen_here` (T496), so the two cannot drift. A missing cwd is not in the project. */
 export function cwdInProject(rawCwd: string | null | undefined, project: string,
   keyOf: (path: string) => string | undefined = defaultProjectKey): boolean {
