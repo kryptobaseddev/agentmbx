@@ -60,6 +60,12 @@ export function buildRoster(node: MbxNode, o: RosterOptions = {}): AgentsV1 {
       .get(h.cli, h.session_id) as { cwd: string | null } | undefined;
     return r?.cwd ?? null;
   };
+  // This host only (T497). A paired host's row does not carry task or lane.
+  const sessionPresence = (h: { cli: string; session_id: string }): { task: string | null; lane: string | null } => {
+    const r = node.store.db.prepare("SELECT task, lane FROM sessions WHERE cli=? AND session_id=? ORDER BY updated_at DESC LIMIT 1")
+      .get(h.cli, h.session_id) as { task: string | null; lane: string | null } | undefined;
+    return { task: r?.task ?? null, lane: r?.lane ?? null };
+  };
 
   const rows: AgentsV1Row[] = status.identities.map((i) => {
     const a = here.get(i.name), held = i.state === "held" || i.state === "idle";
@@ -67,6 +73,7 @@ export function buildRoster(node: MbxNode, o: RosterOptions = {}): AgentsV1 {
     // though it is not a member. Nothing is written to identity_projects, and an offline persona that once ran here is not shown.
     const seenHere = !!o.project && held && !!i.holder && !(!!o.self && o.self === i.name) && !i.projects.includes(o.project)
       && cwdInProject(sessionCwd(i.holder), o.project);
+    const presence = held && i.holder ? sessionPresence(i.holder) : { task: null, lane: null };
     return {
       name: i.name, host: node.host, address: `${i.name}@${node.host}`,
       state: stateOf(i.state), reason: i.reason,
@@ -75,6 +82,8 @@ export function buildRoster(node: MbxNode, o: RosterOptions = {}): AgentsV1 {
       harness: held && i.holder ? i.holder.cli : null, cli: a?.cli ?? null,
       projects: [...i.projects].sort(), lead_of: ledBy(i.name, node.host),
       self: !!o.self && o.self === i.name, seen_here: seenHere, last_seen: a?.last_seen ?? i.last_activity,
+      ...(presence.task != null ? { task: presence.task } : {}),
+      ...(presence.lane != null ? { lane: presence.lane } : {}),
     };
   });
   const remoteRow = (name: string, host: string, a?: { role: string | null; cli: string | null; description: string | null; last_seen: string | null; state?: AgentState | null; harness?: string | null; project_keys?: string[] | null }): AgentsV1Row => {
@@ -128,7 +137,7 @@ export function rosterText(r: AgentsV1): string {
   const lines = r.agents.map((a) => {
     const led = a.lead_of.length ? `  LEAD of ${a.lead_of.map((p) => basename(p) || p).join(", ")}` : "";
     const cli = a.harness ?? a.cli;
-    return `${a.address}  ${a.state}${led}${a.self ? "  (you)" : ""}${a.seen_here ? "  seen here (not a member)" : ""}${a.role ? `  role:${a.role}` : ""}${cli ? `  (${cli})` : ""}`
+    return `${a.address}  ${a.state}${led}${a.self ? "  (you)" : ""}${a.seen_here ? "  seen here (not a member)" : ""}${a.role ? `  role:${a.role}` : ""}${a.task ? `  task:${a.task}` : ""}${a.lane ? `  lane:${a.lane}` : ""}${cli ? `  (${cli})` : ""}`
       + `  last seen ${a.last_seen ?? "never"}${a.description ? `  — ${oneLine(a.description)}` : ""}`;
   });
   const leadLine = !r.scope.project ? "lead: no project" : r.lead ? `lead: ${r.lead.address} until ${r.lead.exp}` : "lead: none";
