@@ -63,11 +63,25 @@ test("tools/list refreshed straight from tools/list_changed returns the full cat
   let holderPid = holder()[0].holder_pid;
 
   for (let generation = 1; generation <= 2; generation++) {
+    if (generation === 1) {
+      // The deployed build accepts the upgraded store; the already loaded server must refuse and reload.
+      const store = join(install, "dist/store.js"), source = readFileSync(store, "utf8");
+      const schema = node.store.schemaVersion() + 1;
+      const upgraded = source.replace(/SCHEMA_VERSION = \d+/, `SCHEMA_VERSION = ${schema}`);
+      assert.notEqual(upgraded, source, "the fixture upgrades the installed schema reader");
+      writeFileSync(store, upgraded);
+      node.store.db.exec(`PRAGMA user_version=${schema}`);
+    }
     // Deploy a new build under the running server: the next call finishes on the old code, then hands the transport over.
     appendFileSync(join(install, "dist/cli.js"), `\n// deployed build ${generation}\n`);
     const final = await client.callTool({ name: "mbx_whoami", arguments: {} });
-    assert.notEqual(final.isError, true, "the call that triggers the handover must still be answered");
-    assert.match(String((final.structuredContent as { switching?: string }).switching), /hands over to it after this call/);
+    if (generation === 1) {
+      assert.equal(final.isError, true, "the stale schema is refused before handover");
+      assert.match(JSON.stringify(final.content), /Restart your CLI session/);
+    } else {
+      assert.notEqual(final.isError, true, "the call that triggers the handover must still be answered");
+      assert.match(String((final.structuredContent as { switching?: string }).switching), /hands over to it after this call/);
+    }
 
     const deadline = Date.now() + 10_000;
     while (catalogChanges < generation) {
