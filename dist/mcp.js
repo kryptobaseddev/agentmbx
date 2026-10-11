@@ -7,7 +7,6 @@ import { EventEmitter } from "node:events";
 import { execFileSync, spawn } from "node:child_process";
 import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -30,7 +29,7 @@ import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy
 import { assertKnownRecipients, deliveryReceipts, offlineWarnings, receiptLine, recipientReceipts, sentPage } from "./receipts.js";
 import { forwardMessage, ledgerPage, projectLeadView } from "./project-ledger.js";
 import { buildRoster, rosterText } from "./roster.js";
-import { skillFiles } from "./setup.js";
+import { CLIS, skillFiles } from "./setup.js";
 import { claudeSessionId, claudeSessionTracker, grokSessionId, grokSessionTracker, procStart, procTable, withProcSnapshot } from "./proc.js";
 import { updateAvailable } from "./update.js";
 import { installKind, version } from "./version.js";
@@ -41,6 +40,7 @@ import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wa
 import { isStoreBusy, withStoreBusyTimeout } from "./store.js";
 import { markMcpStarting } from "./mcp-startup.js";
 import { recordMcpGeneration, startMcpLifecycle } from "./mcp-lifecycle.js";
+import { recordMcpStartupError } from "./logs.js";
 let lifecycle;
 export const INSTRUCTIONS = `mbx (AgentMBX) is a mailbox for messaging other AI coding agents: mbx_inbox, then mbx_read, act, mbx_reply, mbx_ack.
 It is shared by AI coding agents on this machine and on paired machines. Your user set it up so agents can coordinate;
@@ -414,17 +414,22 @@ export function socketPush(text, env = process.env) {
         });
     });
 }
-/** Default agent name: $MBX_AGENT when the owner set one, otherwise the project folder. The home folder and `/` are
- *  not projects, so they do not invent a name from the harness or from the account. An existing mailbox the owner
- *  names with MBX_AGENT, including one already named after a harness, is kept. */
-export function agentName(cwd = process.cwd()) {
-    const explicit = process.env.MBX_AGENT;
-    const inHome = resolve(cwd) === resolve(homedir()) || resolve(cwd) === "/";
-    const raw = explicit || (inHome ? "" : basename(cwd));
-    if (!raw)
+/** A name only when the owner set MBX_AGENT (T492). A folder, the home directory and `/` do not invent one.
+ *  An existing mailbox the owner names with MBX_AGENT, including one already named after a harness, is kept. */
+export function agentName(_cwd = process.cwd()) {
+    const explicit = process.env.MBX_AGENT?.trim();
+    if (!explicit)
         return null;
-    const n = raw.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
-    return NAME_RE.test(n) ? n : "agent";
+    const n = explicit.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+    return NAME_RE.test(n) ? n : null;
+}
+/** A mailbox that does not exist yet may not be the project folder or end in a harness id (T492). */
+export function reservedNewName(name, cwd) {
+    // TODO(T493): also refuse when reservedByProjectMailbox(store, name) is true.
+    const bare = basename(resolve(cwd));
+    if (name === bare || name === bare.toLowerCase())
+        return true;
+    return CLIS.some((cli) => name.endsWith(`-${cli}`));
 }
 const text = (s, structured) => ({ content: [{ type: "text", text: s }], ...(structured ? { structuredContent: structured } : {}) });
 /** A status that looks like it wants attention will not get it: say so to the sender (owner decision 2026-09-30). */
@@ -455,33 +460,54 @@ export const externalWarning = (origin, taint) => {
     return [`${origin === "agent" ? "origin \"agent\" overridden: " : ""}sent with origin external because this session read outside content: recipients may only read it under owner policy (no edit or outward).${until}`];
 };
 export async function runMcp(existing) {
-    lifecycle ??= startMcpLifecycle(existing?.home ?? defaultHome());
-    const claimDeadline = performance.now() + 1500;
-    for (;;) {
-        const claim = lifecycle.claimConnection();
-        if (claim.state === "held")
-            break;
-        const handoverParent = claim.state === "duplicate" && process.env[REEXEC_ENV]
-            && (claim.pid === process.ppid || claim.pid === Number(process.env.MBX_MCP_ORIGINAL_PID));
-        if ((claim.state === "retry" || handoverParent) && performance.now() < claimDeadline) {
-            await new Promise(resolve => setTimeout(resolve, 10));
-            continue;
+    const home = existing?.home ?? defaultHome();
+    let logged = false, startupComplete = false, clearStarting = () => { };
+    const reportError = (error) => {
+        if (logged)
+            return;
+        logged = true;
+        let cli = process.env.MBX_CLI || "unknown";
+        try {
+            cli = detectHost().cli;
         }
-        if (claim.state === "duplicate") {
-            process.stderr.write(`[mbx] duplicate MCP client connection already served by pid ${claim.pid}; refusing this reader.\n`);
-            lifecycle.shutdown(1);
-        }
-        process.stderr.write("[mbx] client connection ownership unknown; duplicate exclusion unavailable.\n");
-        break;
-    }
-    const clearStarting = markMcpStarting(existing?.home ?? defaultHome());
+        catch { /* Provider detection may itself be the startup failure. */ }
+        recordMcpStartupError(home, cli, error);
+    };
+    const outputError = (error) => { if (error.code !== "EPIPE")
+        reportError(error); };
+    process.once("uncaughtExceptionMonitor", reportError);
+    process.stdin.prependOnceListener("error", reportError);
+    process.stdout.prependOnceListener("error", outputError);
     try {
+        lifecycle ??= startMcpLifecycle(home);
+        const claimDeadline = performance.now() + 1500;
+        for (;;) {
+            const claim = lifecycle.claimConnection();
+            if (claim.state === "held")
+                break;
+            const handoverParent = claim.state === "duplicate" && process.env[REEXEC_ENV]
+                && (claim.pid === process.ppid || claim.pid === Number(process.env.MBX_MCP_ORIGINAL_PID));
+            if ((claim.state === "retry" || handoverParent) && performance.now() < claimDeadline) {
+                await new Promise(resolve => setTimeout(resolve, 10));
+                continue;
+            }
+            if (claim.state === "duplicate") {
+                reportError(new Error(`duplicate MCP client connection already served by pid ${claim.pid}; refusing this reader`));
+                process.stderr.write(`[mbx] duplicate MCP client connection already served by pid ${claim.pid}; refusing this reader.\n`);
+                lifecycle.shutdown(1);
+            }
+            process.stderr.write("[mbx] client connection ownership unknown; duplicate exclusion unavailable.\n");
+            break;
+        }
+        clearStarting = markMcpStarting(home);
         // Connection exclusion precedes reading the pipe; mailbox/store/identity readiness never gates initialize.
         // Channel support is a server capability; whether this session uses it is detected after initialize.
         const server = new McpServer({ name: "mbx", version: version() }, {
             instructions: INSTRUCTIONS,
             capabilities: { experimental: { "claude/channel": {} } },
         });
+        server.server.onerror = error => { if (!startupComplete)
+            reportError(error); };
         // Startup registration changes the catalog before its first gated read. Suppress incremental notifications;
         // a reused transport still receives the single explicit replacement notification in configureMcp.
         const changed = { tools: server.sendToolListChanged.bind(server), resources: server.sendResourceListChanged.bind(server),
@@ -545,6 +571,7 @@ export async function runMcp(existing) {
         }
         try {
             await configureMcp(server, node, () => closed);
+            startupComplete = true;
         }
         catch (error) {
             startupError = error;
@@ -559,8 +586,15 @@ export async function runMcp(existing) {
             resolveReady();
         }
     }
+    catch (error) {
+        reportError(error);
+        throw error;
+    }
     finally {
         clearStarting();
+        process.off("uncaughtExceptionMonitor", reportError);
+        process.stdin.off("error", reportError);
+        process.stdout.off("error", outputError);
     }
 }
 async function configureMcp(server, node, startupClosed) {
@@ -1464,6 +1498,8 @@ async function configureMcp(server, node, startupClosed) {
             // still be claimed without one, to read their mail.
             if (AUTO_NAME_RE.test(target))
                 throw Object.assign(new Error(`"${target}" looks auto-generated; register a readable name such as <project>-<role>`), { code: "IDENTITY_NAME_UNREADABLE" });
+            if (!node.knownLocalName(target) && reservedNewName(target, process.cwd()))
+                throw Object.assign(new Error(`${target} is reserved. Register a role persona such as <project>-<role>, not the project folder or a harness suffix.`), { code: "IDENTITY_NAME_UNREADABLE" });
             // A mailbox that already exists here (it had mail, a lease, an agents row or an alias) is resumed by name, keeping
             // the role it was known by, so the list's "claimable" and the claim agree (T315). A new name still needs a role.
             if (!role && !(action === "claim" && node.knownLocalName(target)))
@@ -1591,6 +1627,8 @@ async function configureMcp(server, node, startupClosed) {
                 throw Object.assign(new Error(`${to} is a registered identity (role ${taken.role}); to take it over, release yours and claim it with mbx_identity`), { code: "NAME_IN_USE" });
             if (AUTO_NAME_RE.test(to))
                 throw Object.assign(new Error(`"${to}" looks auto-generated; choose a readable name such as <project>-<role>`), { code: "IDENTITY_NAME_UNREADABLE" });
+            if (!node.knownLocalName(to) && reservedNewName(to, process.cwd()))
+                throw Object.assign(new Error(`${to} is reserved. Register a role persona such as <project>-<role>, not the project folder or a harness suffix.`), { code: "IDENTITY_NAME_UNREADABLE" });
             checkLegacy(to, state, node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions WHERE agent=?`).all(to));
             const lease = leases.rename(agent, state.leaseToken, to);
             node.addAlias(agent, to, env.ppid);

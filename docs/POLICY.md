@@ -158,6 +158,26 @@ Rules shared with YOLO:
 
 While a YOLO policy is active, the status line and `mbx_whoami` show it, and the owner receives the existing start/end notifications. A narrow grant does not enable a global permissive mode.
 
+### Lead-carried grants (T499)
+
+The owner can let a project's lead stand behind the narrow `outward-reversible` class for named members, so a team can self-organise without the owner approving every branch push. The owner still signs: a grant is a second owner-signed record stored on the lead's row (`agentmbx lead grant <agent[,agent]|*> --project <dir> [--classes outward-reversible] [--ttl 7d]`, or `lead set <agent> --project <dir> --classes outward-reversible --to <agent[,agent]|*>` to sign the lead record and its grants together). It is a separate blob, not a key inside the lead record, so a runtime that predates it keeps the lead and simply enforces nothing extra.
+
+What can be delegated: **only `outward-reversible`**. `outward` and `permissions` are never delegated. `read` and `edit` are refused too: they have no enforcement point today, and a signature must not gain effect later through an upgrade (T551 adds the lead-delegated policy line and is where they become delegable, with a fresh signature).
+
+The branch-push and draft-PR hook asks the owner's policies first. Only when they do not cover the class does it ask for a lead grant, which applies when **all** of these hold, each re-verified at the moment of the request from the database alone:
+
+- the persona is an explicit member of the project (a session that merely sits in the folder is not one) and the grant names it, or names `*`, which the owner sees spelled out in the text they sign; the lead is never its own grantee;
+- the session's folder is in the lead's project, by folder or by the shared CLEO project id, and the lead was designated on this host;
+- the lead record is unexpired and unrevoked, and the grants are owner-signed for that very record, within the 30-day cap and never past the record's expiry;
+- the lead is live (an unreleased lease with a fresh heartbeat) and **every conversation the store knows for the lead is untainted**. External-origin content in any of them suspends the grant from that moment until the exposure's hour has passed, and an unreadable taint record suspends it too;
+- no `policy revoke --all` has been signed since the grants were issued.
+
+Every persona-side check in this section still applies unchanged: the exact session binding, the persona's own persisted taint, the bounded command parser and the Git preflight. A grant never widens what the hook approves; it only supplies the owner-equivalent authority for that one class.
+
+To change grants the owner signs a new lead record: a newer record supersedes the old one together with its grants, and one record carries at most one grants blob, so an older, broader blob cannot be replayed. `lead revoke` ends the grants with the record. `lead show` prints each grant with its state (`active`, `suspended: lead tainted`, `suspended: lead not live`, `killed`).
+
+Audit: `lead.grants_set` when the owner stores grants; `lead.grant_used` once per approved hook decision (for Kimi, when the hosted approval is committed), with persona, CLI, session, tool, action, folder, lead, record, grants id and expiry. The existing `yolo_allow` row is still written and its `policy_id` is `lead-grant:<id>`.
+
 ## 6. Owner key: human presence without a passphrase
 
 **Backends:**
