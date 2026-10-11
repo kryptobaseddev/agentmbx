@@ -1312,7 +1312,7 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
       if (name) return identityOperation({ action: registeredIdentity(node.store, name) || AUTO_NAME_RE.test(name) ? "claim" : "register", name, role, description });
       const list = listIdentityStatus(node.home, { project, caller: { cli: env.cli, sessionId: state.sessionId, pid: process.pid, providerPid: env.ppid, canonicalHarness: !!env.harnessProvider } });
       const leadView = projectLeadView(node, project);
-      const out = { agent: null, host: node.host, cli: env.cli, unbound: true, project: project ?? null,
+      const out = { agent: null, host: node.host, cli: env.cli, unbound: true, project: project ?? null, harness_session: state.sessionId,
         lead: leadView.address && leadView.exp ? { address: leadView.address, exp: leadView.exp } : null, pending: state.pending ?? null,
         reason: state.lostTo ? `claimed by ${state.lostTo}` : state.pendingReason ?? null, next: unboundMessage(state),
         project_identities: list.identities.map(i => ({ name: i.name, role: i.role, state: i.state, claimable: i.claimable, unread: i.unread, last_activity: i.last_activity, reason: i.reason })),
@@ -1346,7 +1346,10 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
     const leadView = projectLeadView(node, project);
     const out = { agent, host: node.host, address: `${agent}@${node.host}`, role: reg?.role ?? me?.role ?? null, description: reg?.description ?? me?.description ?? null,
       registered: !!reg, project: project ?? null, lead: leadView.address && leadView.exp ? { address: leadView.address, exp: leadView.exp } : null,
-      cli: env.cli, session: fingerprint(key.publicKey), ...(state.coUse ? { co_use: CO_USE_NOTE } : {}),
+      // T548: `session` keeps its historical meaning (the lease key fingerprint) for old clients; the id the
+      // statusline/HUD key on is the sessions-table session id, reported as `harness_session`; `lease_key` labels it.
+      cli: env.cli, session: fingerprint(key.publicKey), harness_session: state.sessionId, lease_key: fingerprint(key.publicKey),
+      ...(state.coUse ? { co_use: CO_USE_NOTE } : {}),
       owner_grant: s.grant ? { caps: s.grant.caps, expires: s.grant.exp } : null, delivery: node.deliveryMode(agent), unread: node.unreadCount(agent),
       missed: missedCount(node.store, agent).missed,
       // T344: whether this session's sends go out external, since when (root exposure), why, and when that ends
