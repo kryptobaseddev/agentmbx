@@ -15,7 +15,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 /**
  * The same repository has a different folder on every host, so a project's mail is matched across paired hosts by its
  * git origin, normalized to `host/path` without scheme, credentials or `.git` (T219): `git@github.com:org/repo.git` and
@@ -110,6 +110,8 @@ const readSmall = (path) => {
     }
 };
 function findCleoId(folder) {
+    if (!isAbsolute(folder))
+        return null; // a folder string from another host or a hand-written record is never searched relative to this process's cwd
     const home = resolve(homedir());
     let dir = resolve(folder);
     for (let i = 0; i < MAX_WALK; i++) {

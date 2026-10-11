@@ -16,7 +16,7 @@ import { effectivePolicy, policyLine } from "./policy.js";
 import { procStart, procTable, provenProcess, sameProcess } from "./proc.js";
 import { bumpPostToolMarker, bumpPostToolMarkersForAgent } from "./posttool.js";
 import { privatePath } from "./private-files.js";
-import { backfillRegistry } from "./registry.js";
+import { backfillProjectKeys, backfillRegistry } from "./registry.js";
 import { resolveLeadRecipients } from "./lead-record.js";
 import { Store } from "./store.js";
 export const DEFAULT_PORT = 7373;
@@ -96,6 +96,12 @@ export class MbxNode {
         this.syncOwner();
         if (!this.store.get("registry-backfill:v1"))
             this.store.tx(() => { backfillRegistry(this.store, this.host); this.store.set("registry-backfill:v1", new Date().toISOString()); });
+        // T543: key the project bindings and lead rows that predate the key column (or were written by an older runtime). Best effort:
+        // a read-only or busy store simply leaves them NULL, and every read still matches them by folder.
+        try {
+            backfillProjectKeys(this.store);
+        }
+        catch { /* retried on the next open */ }
     }
     /** Record this host's own owner key (if any) as the principal it takes policies from. */
     syncOwner() {

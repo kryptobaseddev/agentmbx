@@ -19,7 +19,7 @@ import { effectivePolicy, policyLine } from "./policy.ts";
 import { procStart, procTable, provenProcess, sameProcess } from "./proc.ts";
 import { bumpPostToolMarker, bumpPostToolMarkersForAgent } from "./posttool.ts";
 import { privatePath } from "./private-files.ts";
-import { backfillRegistry } from "./registry.ts";
+import { backfillProjectKeys, backfillRegistry } from "./registry.ts";
 import { resolveLeadRecipients } from "./lead-record.ts";
 import { Store, type DeliveryState, type MessageRow } from "./store.ts";
 
@@ -103,6 +103,9 @@ export class MbxNode {
     this.retireIdentityLinks();
     this.syncOwner();
     if (!this.store.get("registry-backfill:v1")) this.store.tx(() => { backfillRegistry(this.store, this.host); this.store.set("registry-backfill:v1", new Date().toISOString()); });
+    // T543: key the project bindings and lead rows that predate the key column (or were written by an older runtime). Best effort:
+    // a read-only or busy store simply leaves them NULL, and every read still matches them by folder.
+    try { backfillProjectKeys(this.store); } catch { /* retried on the next open */ }
   }
 
   /** Record this host's own owner key (if any) as the principal it takes policies from. */

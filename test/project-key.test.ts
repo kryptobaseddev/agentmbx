@@ -111,6 +111,18 @@ test("keys: key is the id or the folder; crossHostKey is the id, else the git or
   assert.equal(crossHostKey(""), undefined);
 });
 
+test("a relative folder or another host's path is never searched relative to this process's cwd", (t) => {
+  const w = tree(t);
+  const proj = w.cleo(w.dir("cwd-proj"), { "project-id": `${UUID}\n` });
+  const before = process.cwd();
+  process.chdir(proj);
+  try {
+    assert.deepEqual([resolveProject(".").key, resolveProject(".").source], [".", "folder"], "'.' is the cwd, and the cwd's id must not leak into a record's folder string");
+    assert.equal(resolveProject("rel/dir").source, "folder");
+  } finally { process.chdir(before); }
+  assert.equal(resolveProject("C:\\Users\\someone\\proj").key, "C:\\Users\\someone\\proj", "a Windows path from a paired host is just a string here");
+});
+
 test("two checkouts of one CLEO project share a key; a different id does not", (t) => {
   const w = tree(t);
   const one = w.git(w.cleo(w.dir("clone-one"), { "project-id": `${HEADER}${UUID}\n` }), "git@github.com:org/p.git");

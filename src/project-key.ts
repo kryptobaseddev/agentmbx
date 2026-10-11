@@ -15,7 +15,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 /**
  * The same repository has a different folder on every host, so a project's mail is matched across paired hosts by its
@@ -89,6 +89,7 @@ const readSmall = (path: string): string | null => {
   try { const st = statSync(path); return st.isFile() && st.size <= MAX_FILE_BYTES ? readFileSync(path, "utf8") : null; } catch { return null; }
 };
 function findCleoId(folder: string): CleoFound | null {
+  if (!isAbsolute(folder)) return null; // a folder string from another host or a hand-written record is never searched relative to this process's cwd
   const home = resolve(homedir());
   let dir = resolve(folder);
   for (let i = 0; i < MAX_WALK; i++) {

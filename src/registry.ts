@@ -60,15 +60,21 @@ export function renameRegistration(store: Store, from: string, to: string) {
 export function noteProject(store: Store, name: string, project: string | undefined, explicit: boolean, now = new Date()) {
   if (!project || !explicit) return;
   const at = now.toISOString();
-  store.db.prepare(`INSERT INTO identity_projects (name,project,first_seen,last_seen) VALUES (?,?,?,?)
-    ON CONFLICT(name,project) DO UPDATE SET last_seen=excluded.last_seen`).run(name, project, at, at);
+  // The CLEO-id key is stored with the folder (T543), so the binding still belongs to its project after the folder is gone
+  // (a deleted worktree). NULL when the folder has no id: the folder is then the key.
+  const id = resolveProject(project);
+  store.db.prepare(`INSERT INTO identity_projects (name,project,project_key,first_seen,last_seen) VALUES (?,?,?,?,?)
+    ON CONFLICT(name,project) DO UPDATE SET last_seen=excluded.last_seen, project_key=COALESCE(excluded.project_key, identity_projects.project_key)`)
+    .run(name, project, id.cleoId, at, at);
 }
 
-/** Identities recorded in identity_projects for this folder. A session cwd is not a binding:
- *  a shared host process records its own folder for every persona it serves (T515). */
+/** Identities recorded in identity_projects for this project. A session cwd is not a binding:
+ *  a shared host process records its own folder for every persona it serves (T515). The project is the folder or, when
+ *  the folder belongs to a CLEO project, every checkout of it (T543): the stored key matches as well as the stored folder. */
 export function projectIdentities(store: Store, project: string): Set<string> {
   const out = new Set<string>();
-  for (const r of store.db.prepare("SELECT name FROM identity_projects WHERE project=?").all(project) as { name: string }[]) out.add(r.name);
+  const key = resolveProject(project).key;
+  for (const r of store.db.prepare("SELECT name FROM identity_projects WHERE project=? OR project_key=?").all(project, key) as { name: string }[]) out.add(r.name);
   return out;
 }
 
@@ -84,8 +90,11 @@ export interface StaleProjectBinding {
  *  newest last_seen stays. Read-only: the dry run of `agentmbx identity bindings`. */
 export function staleProjectBindings(store: Store): StaleProjectBinding[] {
   const rows = store.db.prepare(
-    "SELECT name, project, last_seen FROM identity_projects ORDER BY name, last_seen DESC, project",
-  ).all() as { name: string; project: string; last_seen: string }[];
+    "SELECT name, project, project_key, last_seen FROM identity_projects ORDER BY name, last_seen DESC, project",
+  ).all() as { name: string; project: string; project_key: string | null; last_seen: string }[];
+  // Two checkouts of one CLEO project are one project (T543): a binding is not stale next to another folder with its key.
+  const sameProject = (a: { project: string; project_key: string | null }, b: { project: string; project_key: string | null }) =>
+    a.project === b.project || (a.project_key !== null && a.project_key === b.project_key);
   const out: StaleProjectBinding[] = [];
   let i = 0;
   while (i < rows.length) {
@@ -95,7 +104,7 @@ export function staleProjectBindings(store: Store): StaleProjectBinding[] {
     const newest = group[0].last_seen;
     const keeper = group.find((r) => r.last_seen === newest)!;
     for (const r of group) {
-      if (r.last_seen < newest) out.push({
+      if (r.last_seen < newest && !group.some((o) => o.last_seen === newest && sameProject(r, o))) out.push({
         name: r.name, project: r.project, last_seen: r.last_seen,
         kept_project: keeper.project, kept_last_seen: keeper.last_seen,
       });
@@ -116,6 +125,29 @@ export function removeStaleProjectBindings(store: Store, rows: readonly StalePro
       bindings: rows.slice(0, 50).map((r) => ({ name: r.name, project: r.project, kept: r.kept_project })),
     });
     return n;
+  });
+}
+
+/**
+ * Give rows written before the key column existed (or by an older runtime) the CLEO-id key of their folder (T543).
+ * Only NULL keys are filled, only for a folder that still resolves to an id; `project`, the signed lead `record` and
+ * `sig` are never touched, and a row whose folder is gone stays NULL and keeps matching by folder, exactly as before.
+ * Idempotent; runs at every store open, which is cheap (a few file reads per unresolved folder).
+ */
+export function backfillProjectKeys(store: Store): number {
+  // Read first: a store with nothing to fill (the usual case) must not take a write lock on every open.
+  const pending: { table: "identity_projects" | "project_leads"; project: string; id: string }[] = [];
+  for (const table of ["identity_projects", "project_leads"] as const) {
+    for (const { project } of store.db.prepare(`SELECT DISTINCT project FROM ${table} WHERE project_key IS NULL`).all() as { project: string }[]) {
+      const id = resolveProject(project).cleoId;
+      if (id) pending.push({ table, project, id });
+    }
+  }
+  if (!pending.length) return 0;
+  return store.tx(() => {
+    let filled = 0;
+    for (const p of pending) filled += Number(store.db.prepare(`UPDATE ${p.table} SET project_key=? WHERE project=? AND project_key IS NULL`).run(p.id, p.project).changes);
+    return filled;
   });
 }
 
