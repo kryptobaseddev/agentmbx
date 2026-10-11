@@ -13,7 +13,7 @@ import { opencodePluginSource } from "../src/setup.ts";
 import { version } from "../src/version.ts";
 import {
   auditOpencodeDuplicateLoops, findOpencodeDuplicateLoops, opencodeDuplicateLoopChecks, overlappingTurns,
-  type AssistantTurn,
+  OPENCODE_OVERLAP_WINDOW_MS, type AssistantTurn,
 } from "../src/opencode-duplicate-loop.ts";
 
 function turn(id: string, created: number, completed: number, snapshot = true): AssistantTurn {
@@ -56,6 +56,7 @@ test("T522: the daemon audits a new overlap once, and doctor warns without faili
   const home = mkdtempSync(join(tmpdir(), "mbx-t522-"));
   const dbPath = join(home, "opencode.db");
   const node = new MbxNode(home, { host: "alpha" });
+  const options = { dbPath, now: 4_000 };
   try {
     writeDb(dbPath, [
       { id: "msg_a", session: "ses_bound", created: 1_000, completed: 2_000 },
@@ -68,7 +69,7 @@ test("T522: the daemon audits a new overlap once, and doctor warns without faili
     bind(node, "mcp-not-a-session");
     assert.equal(findOpencodeDuplicateLoops(node, { dbPath: join(home, "missing.db") }).length, 0);
 
-    const found = auditOpencodeDuplicateLoops(node, { dbPath });
+    const found = auditOpencodeDuplicateLoops(node, options);
     assert.equal(found.length, 1);
     assert.equal(found[0]!.session_id, "ses_bound");
     assert.equal(found[0]!.pairs, 1);
@@ -81,14 +82,16 @@ test("T522: the daemon audits a new overlap once, and doctor warns without faili
     assert.equal(detail.snapshots, true);
     assert.equal(detail.pairs, 1);
 
-    auditOpencodeDuplicateLoops(node, { dbPath });
+    auditOpencodeDuplicateLoops(node, options);
     assert.equal(audits(node).length, 1, "the same overlap is one audit row");
 
-    const checks = opencodeDuplicateLoopChecks(node, { dbPath });
-    assert.equal(checks.length, 1);
-    assert.equal(checks[0]!.level, "warn");
-    assert.match(checks[0]!.label, /overlapping assistant messages on bound session ses_bound/);
-    assert.match(checks[0]!.label, /with snapshots/);
+    const checks = opencodeDuplicateLoopChecks(node, options);
+    assert.equal(checks.length, 2);
+    const warning = checks.find(c => c.level === "warn")!;
+    assert.match(warning.label, /overlapping assistant messages began within the last hour on bound session ses_bound/);
+    assert.match(warning.label, /with snapshots/);
+    assert.doesNotMatch(warning.fix!, /two OpenCode processes|stop the extra serve/);
+    assert.match(warning.fix!, /Do not stop a serve based on this check alone/);
     assert.equal(failed(checks), false);
 
     writeDb(dbPath, [
@@ -96,7 +99,7 @@ test("T522: the daemon audits a new overlap once, and doctor warns without faili
       { id: "msg_b", session: "ses_bound", created: 1_500, completed: 2_500 },
       { id: "msg_c", session: "ses_bound", created: 2_200, completed: 3_000 },
     ]);
-    auditOpencodeDuplicateLoops(node, { dbPath });
+    auditOpencodeDuplicateLoops(node, options);
     assert.equal(audits(node).length, 2, "a new overlapping turn writes another row");
   } finally {
     node.close();
@@ -116,11 +119,59 @@ test("T522: a session whose turns only meet at an endpoint writes nothing", () =
     bind(node, "ses_clean");
     assert.deepEqual(auditOpencodeDuplicateLoops(node, { dbPath }), []);
     assert.equal(audits(node).length, 0);
-    assert.deepEqual(opencodeDuplicateLoopChecks(node, { dbPath }), []);
+    const checks = opencodeDuplicateLoopChecks(node, { dbPath, now: 4000 });
+    assert.ok(checks.every(c => c.level === "info"));
+    assert.match(checks[0]!.label, /older overlaps are historical/);
   } finally {
     node.close();
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+test("T561: real completed historical overlaps and old interrupted messages do not warn", () => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-overlap-history-")), path = join(home, "opencode.db");
+  const node = new MbxNode(home, { host: "scratch" });
+  const now = 10 * OPENCODE_OVERLAP_WINDOW_MS;
+  try {
+    bind(node, "ses_history");
+    writeDb(path, [
+      { id: "old-a", session: "ses_history", created: 1000, completed: 6000 },
+      { id: "old-b", session: "ses_history", created: 2000, completed: 5000 },
+      { id: "interrupted", session: "ses_history", created: 3000, completed: now, raw: JSON.stringify({ time: { created: 3000 } }) },
+    ]);
+    const options = { dbPath: path, now };
+    assert.deepEqual(findOpencodeDuplicateLoops(node, options), []);
+    assert.deepEqual(auditOpencodeDuplicateLoops(node, options), []);
+    assert.equal(audits(node).length, 0);
+    const checks = opencodeDuplicateLoopChecks(node, options);
+    assert.ok(checks.every(c => c.level === "info"));
+    assert.match(checks[0].label, /last hour.*1000 candidate messages.*older overlaps are historical/);
+  } finally { node.close(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test("T561: an old long tool can overlap a current message; old intersections and future starts stay out", () => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-overlap-current-")), path = join(home, "opencode.db");
+  const node = new MbxNode(home, { host: "scratch" });
+  const now = 10 * OPENCODE_OVERLAP_WINDOW_MS, cutoff = now - OPENCODE_OVERLAP_WINDOW_MS;
+  try {
+    bind(node, "ses_current");
+    const long = { id: "long-tool", session: "ses_current", created: 1000, completed: now };
+    writeDb(path, [long, { id: "current", session: "ses_current", created: cutoff, completed: cutoff + 100 },
+      { id: "older", session: "ses_current", created: cutoff - 200, completed: cutoff + 50 },
+      { id: "future", session: "ses_current", created: now + 1, completed: now + 200 }]);
+    const options = { dbPath: path, now };
+    const loops = findOpencodeDuplicateLoops(node, options);
+    assert.equal(loops[0].pairs, 2, "both intersections with the cutoff-time message began inside the inclusive window");
+    assert.ok(!loops[0].messages.includes("future"));
+    const warnings = opencodeDuplicateLoopChecks(node, options).filter(c => c.level === "warn");
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0].label, /within the last hour/);
+    assert.match(warnings[0].fix!, /possible concurrent loops/);
+    assert.doesNotMatch(warnings[0].fix!, /two OpenCode processes/);
+    assert.equal(audits(node).length, 0, "the doctor check does not write audit state");
+    writeDb(path, [long, { id: "older-only", session: "ses_current", created: cutoff - 1, completed: cutoff + 10 }]);
+    assert.deepEqual(findOpencodeDuplicateLoops(node, options), [], "a recent completion does not make an old intersection current");
+  } finally { node.close(); rmSync(home, { recursive: true, force: true }); }
 });
 
 test("T522: the plugin spawns no per-hook opencode child, and the daemon arm starts the audit", () => {

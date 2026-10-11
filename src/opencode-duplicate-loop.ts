@@ -24,6 +24,8 @@ export interface DuplicateLoop {
 
 const EVENT = "opencode.duplicate_loop";
 const MESSAGE_CAP = 20;
+export const OPENCODE_OVERLAP_WINDOW_MS = 60 * 60_000;
+const TURN_CAP = 1000;
 
 export function opencodeDbPath(env: NodeJS.ProcessEnv = process.env, home = homedir()): string {
   if (typeof env.OPENCODE_DB === "string" && env.OPENCODE_DB !== "") return env.OPENCODE_DB;
@@ -52,23 +54,28 @@ function boundSessions(node: MbxNode): Array<{ agent: string; session_id: string
   ).all() as Array<{ agent: string; session_id: string }>;
 }
 
-function turnsIn(db: DatabaseSync, sessionId: string): AssistantTurn[] {
+function turnsIn(db: DatabaseSync, sessionId: string, now: number): AssistantTurn[] {
   const rows = db.prepare(
-    "SELECT id, time_updated, data FROM session_message WHERE session_id = ? AND type = 'assistant'",
-  ).all(sessionId) as Array<{ id: string; time_updated: number | null; data: string }>;
+    `SELECT id, time_updated, json_extract(payload, '$.time.created') AS created,
+      json_extract(payload, '$.time.completed') AS completed, json_extract(payload, '$.snapshot.start') AS snapshot
+      FROM (SELECT id, time_updated, CASE WHEN json_valid(data) THEN data ELSE '{}' END AS payload
+        FROM session_message WHERE session_id=? AND type='assistant')
+      WHERE created<=? AND (CASE WHEN typeof(completed) IN ('integer','real') AND completed>=created
+        THEN completed ELSE time_updated END)>=? ORDER BY created DESC, id DESC LIMIT ?`,
+  ).all(sessionId, now, now - OPENCODE_OVERLAP_WINDOW_MS, TURN_CAP) as Array<{
+    id: string; time_updated: number | null; created: unknown; completed: unknown; snapshot: unknown;
+  }>;
   const turns: AssistantTurn[] = [];
   for (const row of rows) {
-    let data: { time?: { created?: unknown; completed?: unknown }; snapshot?: { start?: unknown } };
-    try { data = JSON.parse(row.data) as typeof data; } catch { continue; }
-    const created = data.time?.created;
+    const created = row.created;
     if (typeof created !== "number" || !Number.isFinite(created)) continue;
-    const completedRaw = data.time?.completed;
+    const completedRaw = row.completed;
     const completed = typeof completedRaw === "number" && Number.isFinite(completedRaw) && completedRaw >= created
       ? completedRaw
       : typeof row.time_updated === "number" && Number.isFinite(row.time_updated) && row.time_updated >= created
         ? row.time_updated
         : created;
-    const start = data.snapshot?.start;
+    const start = row.snapshot;
     turns.push({ id: row.id, created, completed, snapshot: typeof start === "string" && start.length > 0 });
   }
   return turns;
@@ -81,7 +88,7 @@ function openDb(path: string): DatabaseSync | null {
 
 interface Found extends DuplicateLoop { fingerprint: string }
 
-function scan(node: MbxNode, dbPath: string): Found[] {
+function scan(node: MbxNode, dbPath: string, now: number): Found[] {
   const bound = boundSessions(node);
   if (!bound.length) return [];
   const db = openDb(dbPath);
@@ -90,8 +97,9 @@ function scan(node: MbxNode, dbPath: string): Found[] {
     const out: Found[] = [];
     for (const row of bound) {
       let turns: AssistantTurn[];
-      try { turns = turnsIn(db, row.session_id); } catch { continue; }
-      const pairs = overlappingTurns(turns);
+      try { turns = turnsIn(db, row.session_id, now); } catch { continue; }
+      // The intersection begins at the later message's creation, not the first long-running tool's start.
+      const pairs = overlappingTurns(turns).filter(([, b]) => b.created >= now - OPENCODE_OVERLAP_WINDOW_MS && b.created <= now);
       if (!pairs.length) continue;
       const ids = [...new Set(pairs.flatMap(([a, b]) => [a.id, b.id]))].sort();
       const loop: DuplicateLoop = {
@@ -111,8 +119,8 @@ function published(loop: Found): DuplicateLoop {
   return { session_id: loop.session_id, agent: loop.agent, pairs: loop.pairs, messages: loop.messages, snapshots: loop.snapshots };
 }
 
-export function findOpencodeDuplicateLoops(node: MbxNode, opts: { dbPath?: string } = {}): DuplicateLoop[] {
-  return scan(node, opts.dbPath ?? opencodeDbPath()).map(published);
+export function findOpencodeDuplicateLoops(node: MbxNode, opts: { dbPath?: string; now?: number } = {}): DuplicateLoop[] {
+  return scan(node, opts.dbPath ?? opencodeDbPath(), opts.now ?? Date.now()).map(published);
 }
 
 function kvKey(sessionId: string): string {
@@ -120,8 +128,8 @@ function kvKey(sessionId: string): string {
 }
 
 /** The daemon writes one audit row when the overlapping set for a bound session changes. */
-export function auditOpencodeDuplicateLoops(node: MbxNode, opts: { dbPath?: string } = {}): DuplicateLoop[] {
-  const found = scan(node, opts.dbPath ?? opencodeDbPath());
+export function auditOpencodeDuplicateLoops(node: MbxNode, opts: { dbPath?: string; now?: number } = {}): DuplicateLoop[] {
+  const found = scan(node, opts.dbPath ?? opencodeDbPath(), opts.now ?? Date.now());
   const seen = new Set(found.map((loop) => loop.session_id));
   for (const loop of found) {
     const key = kvKey(loop.session_id);
@@ -141,12 +149,14 @@ export function auditOpencodeDuplicateLoops(node: MbxNode, opts: { dbPath?: stri
   return found.map(published);
 }
 
-export function opencodeDuplicateLoopChecks(node: MbxNode, opts: { dbPath?: string } = {}): Array<{ level: "warn"; label: string; fix: string }> {
-  return findOpencodeDuplicateLoops(node, opts).map((loop) => ({
+export function opencodeDuplicateLoopChecks(node: MbxNode, opts: { dbPath?: string; now?: number } = {}): Array<{ level: "warn" | "info"; label: string; fix?: string }> {
+  if (!boundSessions(node).length) return [];
+  return [{ level: "info", label: `opencode: overlap check covers the last hour and up to ${TURN_CAP} candidate messages per session; older overlaps are historical, not evidence of a current duplicate loop` },
+    ...findOpencodeDuplicateLoops(node, opts).map((loop) => ({
     level: "warn" as const,
-    label: `opencode: overlapping assistant messages on bound session ${loop.session_id} (${loop.pairs} pair${loop.pairs === 1 ? "" : "s"}${loop.snapshots ? ", with snapshots" : ""})`,
-    fix: "two OpenCode processes took turns on this session; stop the extra serve so only one loop writes it",
-  }));
+    label: `opencode: overlapping assistant messages began within the last hour on bound session ${loop.session_id} (${loop.pairs} pair${loop.pairs === 1 ? "" : "s"} observed${loop.snapshots ? ", with snapshots" : ""})`,
+    fix: "inspect the session's recent execution for possible concurrent loops; timestamps do not identify writer processes. Do not stop a serve based on this check alone",
+  }))];
 }
 
 /** Started by the daemon's existing loop-report arm. cli.ts is not edited from this task. */

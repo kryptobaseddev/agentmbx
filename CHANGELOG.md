@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **OpenCode overlap diagnostics no longer treat old history as a current duplicate loop (T561).** Only intersections that began in the last hour warn; older overlaps are explicitly historical. The scan reads bounded candidate metadata, not message bodies, and preserves old audit records. A long tool message can still overlap a recent message, but recent completion alone does not make an old intersection current. Guidance describes possible concurrent execution without claiming writer process identity or telling the owner to stop a serve from timestamps alone.
+
 - **OpenCode plugin diagnostics distinguish wiring from runtime proof (T412).** Doctor reports managed, missing, outdated and foreign plugin wiring, then checks up to 20 exact session bindings using one bounded loopback waiter request and private HUD files. A matching session/pid waiter proves only a server wake poll; producer freshness uses the daemon heartbeat, never an unchanged snapshot's mtime. Missing or mismatched evidence remains explicit, and TUI loading, reading and render cost are unobserved. Checks expose no message subjects or counts, change no state, and point to `agentmbx setup --only opencode` without restarting sessions or overwriting foreign plugins.
 
 - **A new mailbox is a role persona, never the folder or a harness (T492).** `agentName` returns a name only when `MBX_AGENT` is set. Register, claim, and a whoami rename refuse a name that does not already exist when it equals the project folder or ends in a harness id (`claude`, `codex`, `opencode`, `kimi`, `hermes`, `grok`). An existing mailbox under either shape stays readable and claimable. The same persona claimed from one harness and then another keeps its mail and its role.
