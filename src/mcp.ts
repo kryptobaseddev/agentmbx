@@ -5,9 +5,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -30,7 +29,7 @@ import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy
 import { assertKnownRecipients, deliveryReceipts, offlineWarnings, receiptLine, recipientReceipts, sentPage } from "./receipts.ts";
 import { forwardMessage, ledgerPage, projectLeadView } from "./project-ledger.ts";
 import { buildRoster, rosterText } from "./roster.ts";
-import { skillFiles } from "./setup.ts";
+import { CLIS, skillFiles } from "./setup.ts";
 import { claudeSessionId, claudeSessionTracker, grokSessionId, grokSessionTracker, procStart, procTable, withProcSnapshot } from "./proc.ts";
 import { updateAvailable } from "./update.ts";
 import { installKind, version } from "./version.ts";
@@ -135,25 +134,34 @@ const handoverProvider = (node: MbxNode | undefined, ppid: number): number | und
 };
 
 /**
- * Re-exec this server from disk and hand over the transport, but keep serving the current call with the
- * loaded code: the parent's stdin is paused so every subsequent request is read by the new process alone.
- * Used both for store upgrades and for picking up a newly deployed build without restarting the agent session.
- *
- * T317: the original proxy (the process the provider launched) stays on its transport; each re-exec
- * generation exits(0) as soon as its replacement has spawned. This prevents an N+1 chain of nested MCP
- * processes after repeated in-place reloads. The original only exits when the replacement fails before
- * spawning (it keeps serving), when the replacement dies abnormally (it mirrors the failure), or when the
- * provider closes the transport.
- *
- * T441: nothing is torn down until the replacement has provably started. `retired` (when given) runs only on
- * the child's "spawn" event, so a spawn failure leaves this process fully serving on the loaded build — never
- * half-retired with its leases, timers and control endpoints gone. Returns false when the handover aborted
- * before the child spawned; `onAbort` also runs for an ASYNC pre-spawn child error, so callers can reset any
- * pending handover state.
+ * Flush the current reply, then exec the build from disk with the same PID and transport.
+ * Preflight failures keep serving; failure after retirement closes the transport.
+ * Runtimes without exec retain T317's original proxy and one replacement generation.
+ * T441's spawn fallback retires only after "spawn"; pre-spawn failures keep serving and
+ * return false or call `onAbort` so callers can clear their pending handover state.
  */
 function handOverToFreshProcess(pauseStdin: boolean, parentAgent?: string, providerPid?: number, detached?: DetachedReload, retired?: () => void, onAbort?: () => void): boolean {
   lifecycle ??= startMcpLifecycle(defaultHome());
   const originalPid = Number(process.env.MBX_MCP_ORIGINAL_PID) || process.pid;
+  if (typeof process.execve === "function") {
+    let env: Record<string, string>;
+    try {
+      accessSync(process.execPath, constants.X_OK);
+      env = Object.fromEntries(Object.entries(reexecEnv(parentAgent, providerPid, detached, originalPid)).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+    } catch (error) {
+      process.stderr.write(`[mbx] exec preflight failed; this session keeps serving the loaded build: ${(error as Error).message}\n`);
+      return false;
+    }
+    const replace = () => {
+      try { retired?.(); process.execve!(process.execPath, [process.execPath, ...process.argv.slice(1)], env); }
+      catch (error) { process.stderr.write(`[mbx] exec failed after retirement; closing the transport: ${(error as Error).message}\n`); }
+      lifecycle!.shutdown(1); // A throwing/returning implementation must never leave a half-retired server.
+    };
+    if (retired) { process.stdin.pause(); setImmediate(() => { process.stdout.write("", replace); }); }
+    else replace();
+    return true;
+  }
+  process.stderr.write("[mbx] exec replacement unavailable; using legacy spawn handover (up to two MCP processes).\n");
   let child: ReturnType<typeof spawn>;
   try {
     child = handoverSpawn(parentAgent, providerPid, detached, originalPid);
@@ -171,6 +179,7 @@ function handOverToFreshProcess(pauseStdin: boolean, parentAgent?: string, provi
     } catch (e) {
       process.stderr.write(`[mbx] session teardown failed during handover: ${(e as Error).message}\n`);
     }
+    lifecycle!.releaseConnection();
     // T317: a re-exec generation has done its job once the replacement is running; exit cleanly so we do
     // not accumulate nested MCP processes. The original proxy stays on its transport below.
     if (process.env[REEXEC_ENV]) {
@@ -359,16 +368,21 @@ export function socketPush(text: string, env: NodeJS.ProcessEnv = process.env): 
   });
 }
 
-/** Default agent name: $MBX_AGENT when the owner set one, otherwise the project folder. The home folder and `/` are
- *  not projects, so they do not invent a name from the harness or from the account. An existing mailbox the owner
- *  names with MBX_AGENT, including one already named after a harness, is kept. */
-export function agentName(cwd = process.cwd()): string | null {
-  const explicit = process.env.MBX_AGENT;
-  const inHome = resolve(cwd) === resolve(homedir()) || resolve(cwd) === "/";
-  const raw = explicit || (inHome ? "" : basename(cwd));
-  if (!raw) return null;
-  const n = raw.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
-  return NAME_RE.test(n) ? n : "agent";
+/** A name only when the owner set MBX_AGENT (T492). A folder, the home directory and `/` do not invent one.
+ *  An existing mailbox the owner names with MBX_AGENT, including one already named after a harness, is kept. */
+export function agentName(_cwd = process.cwd()): string | null {
+  const explicit = process.env.MBX_AGENT?.trim();
+  if (!explicit) return null;
+  const n = explicit.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+  return NAME_RE.test(n) ? n : null;
+}
+
+/** A mailbox that does not exist yet may not be the project folder or end in a harness id (T492). */
+export function reservedNewName(name: string, cwd: string): boolean {
+  // TODO(T493): also refuse when reservedByProjectMailbox(store, name) is true.
+  const bare = basename(resolve(cwd));
+  if (name === bare || name === bare.toLowerCase()) return true;
+  return CLIS.some((cli) => name.endsWith(`-${cli}`));
 }
 
 const text = (s: string, structured?: Record<string, unknown>) => ({ content: [{ type: "text" as const, text: s }], ...(structured ? { structuredContent: structured } : {}) });
@@ -405,9 +419,23 @@ export const externalWarning = (origin: "agent" | "external" | undefined, taint:
 
 export async function runMcp(existing?: MbxNode) {
   lifecycle ??= startMcpLifecycle(existing?.home ?? defaultHome());
+  const claimDeadline = performance.now() + 1500;
+  for (;;) {
+    const claim = lifecycle.claimConnection();
+    if (claim.state === "held") break;
+    const handoverParent = claim.state === "duplicate" && process.env[REEXEC_ENV]
+      && (claim.pid === process.ppid || claim.pid === Number(process.env.MBX_MCP_ORIGINAL_PID));
+    if ((claim.state === "retry" || handoverParent) && performance.now() < claimDeadline) { await new Promise(resolve => setTimeout(resolve, 10)); continue; }
+    if (claim.state === "duplicate") {
+      process.stderr.write(`[mbx] duplicate MCP client connection already served by pid ${claim.pid}; refusing this reader.\n`);
+      lifecycle.shutdown(1);
+    }
+    process.stderr.write("[mbx] client connection ownership unknown; duplicate exclusion unavailable.\n");
+    break;
+  }
   const clearStarting = markMcpStarting(existing?.home ?? defaultHome());
   try {
-    // Transport initialization must not need a database, process inspection, or an identity lease.
+    // Connection exclusion precedes reading the pipe; mailbox/store/identity readiness never gates initialize.
     // Channel support is a server capability; whether this session uses it is detected after initialize.
     const server = new McpServer({ name: "mbx", version: version() }, {
       instructions: INSTRUCTIONS,
@@ -1236,6 +1264,8 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
       // A new identity is chosen deliberately: a readable name and a role (R1.6). Older auto-generated mailboxes may
       // still be claimed without one, to read their mail.
       if (AUTO_NAME_RE.test(target)) throw Object.assign(new Error(`"${target}" looks auto-generated; register a readable name such as <project>-<role>`), { code: "IDENTITY_NAME_UNREADABLE" });
+      if (!node.knownLocalName(target) && reservedNewName(target, process.cwd()))
+        throw Object.assign(new Error(`${target} is reserved. Register a role persona such as <project>-<role>, not the project folder or a harness suffix.`), { code: "IDENTITY_NAME_UNREADABLE" });
       // A mailbox that already exists here (it had mail, a lease, an agents row or an alias) is resumed by name, keeping
       // the role it was known by, so the list's "claimable" and the claim agree (T315). A new name still needs a role.
       if (!role && !(action === "claim" && node.knownLocalName(target)))
@@ -1343,6 +1373,8 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
       const taken = registeredIdentity(node.store, to);
       if (taken) throw Object.assign(new Error(`${to} is a registered identity (role ${taken.role}); to take it over, release yours and claim it with mbx_identity`), { code: "NAME_IN_USE" });
       if (AUTO_NAME_RE.test(to)) throw Object.assign(new Error(`"${to}" looks auto-generated; choose a readable name such as <project>-<role>`), { code: "IDENTITY_NAME_UNREADABLE" });
+      if (!node.knownLocalName(to) && reservedNewName(to, process.cwd()))
+        throw Object.assign(new Error(`${to} is reserved. Register a role persona such as <project>-<role>, not the project folder or a harness suffix.`), { code: "IDENTITY_NAME_UNREADABLE" });
       checkLegacy(to, state, node.store.db.prepare(`SELECT ${legacyColumns} FROM sessions WHERE agent=?`).all(to) as LegacyBinding[]);
       const lease = leases.rename(agent, state.leaseToken!, to);
       node.addAlias(agent, to, env.ppid);

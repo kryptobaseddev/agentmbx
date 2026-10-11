@@ -1,12 +1,23 @@
 // Process identity: a PID plus its start time, so a reused PID never inherits a dead session's identity.
 // Linux uses kernel birth ticks and boot identity; other platforms use ps. Tables are cached briefly.
 import { execFileSync, type StdioOptions } from "node:child_process";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { fstatSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 export interface Proc { ppid: number; start: string }
+
+/** Kernel identity of both client pipe ends; inherited fds and exec keep it, separate connections do not. */
+export function stdioEndpoint(): string | null {
+  if (process.platform !== "darwin" && process.platform !== "linux") return null;
+  try {
+    const ends = [0, 1].map(fd => fstatSync(fd, { bigint: true }));
+    if (ends.some(s => !(s.isFIFO() || s.isSocket()) || s.ino === 0n)) return null;
+    // macOS pipe inode values may be signed and exceed Number precision; retain every bit.
+    return `${process.platform}:${ends.map(s => `${s.dev}:${s.ino}:${s.mode & 0o170000n}`).join("|")}`;
+  } catch { return null; }
+}
 let cache: { at: number; table: Map<number, Proc> } | null = null;
 const snapshots = new AsyncLocalStorage<{ active: boolean; at: number; table: Map<number, Proc> }>();
 
