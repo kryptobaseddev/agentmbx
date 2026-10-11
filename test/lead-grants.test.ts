@@ -120,17 +120,23 @@ test("T499 AC1: a store from before this change gains the columns and keeps its 
   assert.equal(activeLead(again, w.cwd)?.id, l.id);
 });
 
-test("T499 AC1: only outward-reversible can be delegated; read, edit, outward, permissions and unknown classes are refused with the reason", (t) => {
+test("T499 AC1: outward-reversible, read and edit can be delegated; outward, permissions and unknown classes are refused with the reason", (t) => {
   const w = world(t);
   const l = w.lead();
-  assert.deepEqual([...DELEGABLE_CLASSES], ["outward-reversible"]);
-  for (const [cls, why] of [["read", /no enforcement point/], ["edit", /no enforcement point/], ["outward", /never delegated/], ["permissions", /never delegated/], ["frobnicate", /unknown class/]] as const) {
+  assert.deepEqual([...DELEGABLE_CLASSES], ["outward-reversible", "read", "edit"]);
+  for (const cls of ["read", "edit"] as const) {
+    const made = makeLeadGrants({ lead: l, classes: [cls], agents: ["api-dev"], ownerPub: w.owner.publicKey });
+    assert.deepEqual(made.classes, [cls]);
+  }
+  const both = makeLeadGrants({ lead: l, classes: ["outward-reversible", "edit"], agents: ["api-dev"], ownerPub: w.owner.publicKey });
+  assert.deepEqual(both.classes, ["outward-reversible", "edit"]);
+  storeLeadGrants(w.n, both, w.sign(both));
+  for (const [cls, why] of [["outward", /never delegated/], ["permissions", /never delegated/], ["frobnicate", /unknown class/]] as const) {
     assert.throws(() => makeLeadGrants({ lead: l, classes: [cls], agents: ["api-dev"], ownerPub: w.owner.publicKey }), why, cls);
     // Not only at make time: a hand-built, correctly signed blob is refused on store too.
     const g = { v: 1, type: "lead-grants", id: ulid(), lead: l.id, classes: [cls], agents: ["api-dev"], iat: new Date().toISOString(), exp: new Date(Date.now() + H).toISOString(), owner_fp: fingerprint(w.owner.publicKey) };
     assert.throws(() => storeLeadGrants(w.n, g, w.sign(g)), why, `store ${cls}`);
   }
-  assert.throws(() => makeLeadGrants({ lead: l, classes: ["outward-reversible", "edit"], agents: ["api-dev"], ownerPub: w.owner.publicKey }), /no enforcement point/);
 });
 
 test("T499 AC1: a grants blob is refused unless owner-signed, bound to the current record, bounded by it, named and unique", (t) => {
@@ -204,7 +210,9 @@ test("T499 AC1: a signed blob that breaks the rules is refused on use too, not o
   };
   assert.equal(inject({}), true, "the injection itself works");
   assert.equal(inject({ classes: ["outward-reversible", "permissions"] }), false, "permissions");
-  assert.equal(inject({ classes: ["outward-reversible", "edit"] }), false, "edit");
+  assert.equal(inject({ classes: ["outward-reversible", "edit"] }), true, "edit on a fresh signature does not void the hook class");
+  assert.equal(inject({ classes: ["read"] }), false, "read does not answer the permission hook");
+  assert.equal(inject({ classes: ["edit"] }), false, "edit does not answer the permission hook");
   assert.equal(inject({ classes: ["outward-reversible", "outward"] }), false, "outward");
   assert.equal(inject({ agents: ["*", "api-dev"] }), false, "* mixed with names");
   assert.equal(inject({ agents: ["api-dev", "api-dev"] }), false, "duplicate names");
