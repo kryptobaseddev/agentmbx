@@ -1488,7 +1488,14 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
           if (sid) {
             try { recordSessionHint(node.store, cli, process.ppid, inspectLeaseProcess(process.ppid).start, sid); } catch { /* advisory */ }
           }
-          if (!liveWatcher(node, agent)) emit(cli, "PostToolUse", grokWatchReminder(sid));
+          // T599: SessionStart stdout is dropped, so the first bound PostToolUse of each entry carries the notice.
+          const lines: string[] = [];
+          if (sid) {
+            const at = node.store.db.prepare("SELECT pid,pid_start FROM sessions WHERE cli=? AND session_id=?").get(cli, sid) as { pid: number | null; pid_start: string | null } | undefined;
+            if (at?.pid && takeResumeEntry(node.store, cli, at.pid, at.pid_start, sid)) lines.push(resumeNotice(node.store, agent, held(agent)));
+          }
+          if (!liveWatcher(node, agent)) lines.push(grokWatchReminder(sid));
+          if (lines.length) emit(cli, "PostToolUse", lines.join("\n"));
           return;
         }
         if (cli !== "claude" && cli !== "opencode") return;
