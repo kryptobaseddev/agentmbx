@@ -18,6 +18,7 @@ import { HUD_ALIVE_MAX_MS, HUD_SCHEMA, hudAlivePath, hudDir, hudPidLinePath, hud
 import { STATUS_V2_SCHEMA } from "./status-schema.ts";
 import { detectHost, HERMES_WATCHER_INSTRUCTION, HERMES_WATCHER_REMINDER, MCP_HEARTBEAT_MS, noPush, runMcp, selfWatchInstruction } from "./mcp.ts";
 import { HERMES_NAG_MS, hermesHookInput, hermesHookOutput } from "./hermes-hook.ts";
+import { resumeNotice, takeResumeEntry } from "./resume-notice.ts";
 import { ancestors, processEvidenceSpawns, withProcSnapshot } from "./proc.ts";
 import { bumpPostToolMarkersForAgent, readPostToolMarker, writePostToolLast } from "./posttool.ts";
 import { resolveStatusIdentity } from "./status-identity.ts";
@@ -1516,6 +1517,12 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
         if (n && !wakePrompt) {
           lines.push(`[mbx] ${n} unread for ${agent}@${node.host}: mbx_inbox${event === "post-tool" ? " before continuing" : ""}.${newBrief ? brief : ""}`);
           if (newBrief) node.store.set(briefKey, brief);
+        }
+        // T189: on_session_start output is dropped and a resume does not fire it, so the first bound turn of each entry (a new
+        // conversation, --resume, /new, /resume, a compression's new id) carries the bounded resume notice (T184 spec R5-R9).
+        if (event === "prompt" && cli === "hermes" && sid) {
+          const at = node.store.db.prepare("SELECT pid,pid_start FROM sessions WHERE cli=? AND session_id=?").get(cli, sid) as { pid: number | null; pid_start: string | null } | undefined;
+          if (at?.pid && takeResumeEntry(node.store, cli, at.pid, at.pid_start, sid)) lines.push(resumeNotice(node.store, agent, held(agent)));
         }
         // T460: Hermes drops on_session_start output, and a finished watcher is what wakes it: say so while none runs (bounded).
         if (event === "prompt" && cli === "hermes" && !liveWatcher(node, agent)) {

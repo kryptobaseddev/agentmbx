@@ -12,6 +12,7 @@ import { MbxNode, HERMES_NO_PUSH } from "../src/node.ts";
 import { edits, hermesConsent, runSetup, wired, type SetupCtx } from "../src/setup.ts";
 import { doctor, hermesHooksChecks } from "../src/doctor.ts";
 import { hermesHookInput, hermesHookOutput, hermesIsSideAgent, hermesUserMessage } from "../src/hermes-hook.ts";
+import { RESUME_NOTICE_MAX_CHARS, RESUME_NOTICE_MAX_LINES, resumeNotice } from "../src/resume-notice.ts";
 import { delegateWake } from "./helpers/wake-lease.ts";
 import { sendLeased } from "./helpers/leased-send.ts";
 import { HERMES_WATCHER_INSTRUCTION, HERMES_WATCHER_REMINDER, selfWatchInstruction } from "../src/mcp.ts";
@@ -418,7 +419,9 @@ test("hermes hooks: a Hermes watcher wake is not announced twice and is not a hu
   n.store.set(`watcher:${agent}`, JSON.stringify({ pid: process.pid, at: Date.now() }));
   const wake = `[IMPORTANT: Background process proc_1 completed normally (exit code 0).\nOutput:\n[mbx] 1 new message(s) for ${agent} from boss@alpha [local] (ids ${mail}). mbx_inbox or mbx_read, reply, ack.\n[mbx-watch] After handling the mail, start this watcher again in the background.\n]`;
   const r = hook("prompt", "s1", { user_message: wake, platform: "tui" });
-  assert.equal(r.stdout, "", "the wake text is itself the notice");
+  assert.doesNotMatch(ctx(r.stdout), /unread for/, "the wake text is itself the notice");
+  assert.match(ctx(r.stdout), /^\[mbx\] You are worker@alpha/, "T189: only the entry's resume notice rides the first turn");
+  assert.equal(hook("prompt", "s1", { user_message: wake, platform: "tui" }).stdout, "", "a second wake in the same entry adds nothing");
   assert.equal(n.store.get(`human-prompt:${agent}`), undefined, "and it did not reset the relay chain as if the owner typed");
   assert.ok(ctx(hook("prompt", "s1", { user_message: "a real person typing", platform: "tui" }).stdout));
   assert.ok(n.store.get(`human-prompt:${agent}`), "a person's prompt does");
@@ -551,4 +554,82 @@ test("hermes hooks: mail arriving mid-turn is injected on the next pre_llm_call 
   assert.equal(mid.status, 0, mid.stderr);
   assert.match(ctx(mid.stdout), /\[mbx\] 1 unread for worker@alpha: mbx_inbox\./, "mid-turn mail surfaces on the next pre_llm_call, in the same turn");
   assert.doesNotMatch(ctx(mid.stdout), /mid-turn/, "counts only, never mail content");
+});
+
+// ---- T189: the bounded resume notice (spec t184-provider-resume-adapters R5-R9) ---------------------------------------
+const youAre = (s: string) => (s.match(/\[mbx\] You are worker@alpha/g) ?? []).length;
+const notices = (hook: (e: "prompt", s: unknown, x?: Record<string, unknown>) => { stdout: string }, sid: string) => {
+  const out = hook("prompt", sid, { user_message: "go on", platform: "tui" }).stdout;
+  return out ? youAre((JSON.parse(out) as { context: string }).context) : 0;
+};
+
+test("hermes hooks (T189): a fresh conversation's first bound turn carries the bounded resume notice once; counts only, nothing moves", async t => {
+  const { n, c, hook, ctx, agent } = await hermesHolder(t);
+  sendLeased(n, { from: "boss", to: [agent], subject: "PRIVATE SUBJECT", body: "SECRET BODY", kind: "request" });
+  const state = () => JSON.stringify([n.store.db.prepare("SELECT msg_id,agent,state FROM deliveries ORDER BY msg_id").all(),
+    n.store.get(`catchup:${agent}`), n.store.db.prepare("SELECT name,cli,session_id,released_at FROM identity_leases ORDER BY name").all()]);
+  hook("session-start", "fresh-A", { platform: "tui" });
+  const before = state();
+  const c1 = ctx(hook("prompt", "fresh-A", { user_message: "hi", is_first_turn: true, platform: "tui" }).stdout);
+  assert.match(c1, /^\[mbx\] 1 unread for worker@alpha: mbx_inbox\./m, "the unread line keeps its place");
+  assert.equal(youAre(c1), 1);
+  assert.match(c1, /\[mbx\] You are worker@alpha \(role: [^)]*\)\. When the owner ends this session/, "identity and role");
+  assert.match(c1, /\[mbx\] worker has 1 message\(s\) since \S+ not caught up on; call mbx_catchup/, "the catch-up hint, verbatim");
+  assert.match(c1, /\[mbx\] 1 open thread\(s\) with unacked mail\./);
+  assert.doesNotMatch(c1, /PRIVATE SUBJECT|SECRET BODY/, "counts only, never mail content");
+  const notice = c1.split("\n").filter(l => /You are worker|not caught up on|open thread/.test(l)).join("\n");
+  assert.ok(notice.length <= RESUME_NOTICE_MAX_CHARS && notice.split("\n").length <= RESUME_NOTICE_MAX_LINES, notice);
+  assert.equal(notices(hook, "fresh-A"), 0, "said once per entry, not every turn");
+  assert.equal(state(), before, "no delivery state, checkpoint or lease moved");
+  const who = JSON.stringify(await c.callTool({ name: "mbx_whoami", arguments: {} }));
+  assert.match(who, /not caught up on; call mbx_catchup/, "the MCP fallback still carries the hint");
+});
+
+test("hermes hooks (T189): /new, /resume back, a compression's new id and a new process on the same id are each one entry", async t => {
+  const { n, hook, rows } = await hermesHolder(t);
+  hook("session-start", "conv-A", { platform: "tui" });
+  assert.equal(notices(hook, "conv-A"), 1, "fresh");
+  assert.equal(notices(hook, "conv-A"), 0);
+  assert.equal(notices(hook, "conv-B"), 1, "/new");
+  assert.equal(notices(hook, "conv-B"), 0);
+  assert.equal(notices(hook, "conv-A"), 1, "/resume back to an earlier conversation");
+  assert.equal(notices(hook, "conv-A-compressed"), 1, "compression gives the conversation a new id");
+  assert.deepEqual(rows(), ["hermes:conv-A-compressed"]);
+  const pid = (n.store.db.prepare("SELECT pid FROM sessions WHERE cli='hermes' AND session_id='conv-A-compressed'").get() as { pid: number }).pid;
+  const cur = n.store.get(`resume-entry:hermes:${pid}`)!;
+  assert.match(cur, /^.+ conv-A-compressed$/, "the entry records this process's start time with the id");
+  n.store.set(`resume-entry:hermes:${pid}`, "an-earlier-process-start conv-A-compressed");
+  assert.equal(notices(hook, "conv-A-compressed"), 1, "hermes --resume: a process that reused the pid (other start time) on the same id");
+  assert.equal(notices(hook, "conv-A-compressed"), 0);
+  const key = n.store.get(`resume-entry:hermes:${pid}`);
+  assert.equal(hook("prompt", "bg_123_abc", { user_message: "side task", platform: "tui" }).stdout, "", "a side agent gets nothing");
+  assert.equal(hook("prompt", "conv-A-compressed", { user_message: "x", platform: "subagent" }).stdout, "", "a subagent gets nothing");
+  assert.equal(n.store.get(`resume-entry:hermes:${pid}`), key, "and neither consumes or starts an entry");
+});
+
+test("hermes hooks (T189): an unbound turn gets no notice and starts no entry; the first bound turn after the claim carries it", async t => {
+  const { n, c, hook, agent } = await hermesHolder(t);
+  await c.callTool({ name: "mbx_identity", arguments: { action: "release" } });
+  hook("session-start", "later-A", { platform: "tui" });
+  const unbound = hook("prompt", "later-A", { user_message: "hi", platform: "tui" });
+  assert.equal(unbound.status, 0, unbound.stderr);
+  assert.equal(youAre(unbound.stdout), 0, "no identity, no notice");
+  assert.equal(n.store.db.prepare("SELECT COUNT(*) n FROM kv WHERE k LIKE 'resume-entry:%'").get()!.n, 0, "no entry is recorded");
+  await c.callTool({ name: "mbx_identity", arguments: { action: "claim", name: agent } });
+  assert.equal(notices(hook, "later-A"), 1, "deferred to the first bound turn");
+  assert.equal(notices(hook, "later-A"), 0);
+});
+
+test("hermes hooks (T189): the notice is bounded; the open-thread line is cut before the catch-up hint", async t => {
+  const { n, agent } = await hermesHolder(t);
+  sendLeased(n, { from: "boss", to: [agent], subject: "s", body: "b", kind: "request" });
+  const full = resumeNotice(n.store, agent, "[mbx] id");
+  const [, hint, threads] = full.split("\n");
+  assert.match(hint, /not caught up on/); assert.match(threads, /open thread/);
+  const tight = resumeNotice(n.store, agent, "x".repeat(RESUME_NOTICE_MAX_CHARS - hint.length - 1 - 10));
+  assert.ok(tight.endsWith(hint), "the hint stays, the open-thread line goes");
+  const huge = resumeNotice(n.store, agent, "y".repeat(5000));
+  assert.equal(huge.length, RESUME_NOTICE_MAX_CHARS); assert.ok(huge.endsWith("…"));
+  const tall = resumeNotice(n.store, agent, Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n"));
+  assert.ok(tall.split("\n").length <= RESUME_NOTICE_MAX_LINES);
 });
