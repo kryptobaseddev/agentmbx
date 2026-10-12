@@ -1,6 +1,7 @@
 // Daemon sync client (T262, T468, T446). One POST writer, one seq per host. No network call
 // unless a local link record exists, and no bearer token. A SyncAck never turns project_paths on.
-// A SyncAck whose contract max is at least 2 sets project_leads on the stored link.
+// An in-range SyncAck stores the cloud's contract range, clamped to CONTRACT_VERSION and never
+// below the contract just spoken. A stored max of at least 2 sets project_leads.
 import { createHash, randomBytes } from "node:crypto";
 import {
   CONTRACT_VERSION, PATH_FLAG_PREFIX, PROJECT_LEADS_SINCE, PROJECT_PATHS_SINCE, projectSync, type Projection, type SyncSnapshot,
@@ -16,7 +17,7 @@ export interface SyncLink {
   contract: { min: number; max: number };
   /** Set by local enrolment when the spoken schema lists HostReport.project_paths. Never by a SyncAck. */
   project_paths?: boolean;
-  /** Set when a SyncAck advertises contract max >= 2. A SyncAck never sets project_paths. */
+  /** Set when an in-range SyncAck stores a contract max >= 2. A SyncAck never sets project_paths. */
   project_leads?: boolean;
 }
 
@@ -278,13 +279,14 @@ async function send(o: SyncDeps, link: SyncLink, state: SyncState, pending: Pend
   const sent = sentContract(pending.body);
   // Compare the contract this batch spoke, not CONTRACT_VERSION. A link capped at 1
   // speaks 1, and an old cloud that acks max 1 still accepts that batch.
+  // An out-of-range ack does not change the stored link.
   if (range && typeof range.min === "number" && typeof range.max === "number" && sent !== null && (sent < range.min || sent > range.max)) {
     state.force_full = true;
     writeState(o.kv, state);
     o.audit?.("sync.contract", { code: "sync.contract" });
     return { outcome: "sync.contract" };
   }
-  rememberLeads(o.kv, range && typeof range === "object" ? range.max : undefined);
+  rememberAck(o.kv, sent, range);
   writeState(o.kv, state);
   o.audit?.("sync.batch", { seq: pending.seq, outcome: "acked" });
   return { outcome: "acked", seq: pending.seq };
@@ -297,17 +299,21 @@ function sentContract(body: string): number | null {
   } catch { return null; }
 }
 
-/** A contract-2 ack opts this link into project leads. It never writes project_paths. */
-function rememberLeads(kv: Kv, max: unknown): void {
-  if (typeof max !== "number" || max < PROJECT_LEADS_SINCE) return;
+/** Store an in-range ack's contract. Never lower it past the contract just spoken, and never write project_paths. */
+function rememberAck(kv: Kv, sent: number | null, range: { min?: unknown; max?: unknown } | undefined): void {
+  if (sent === null || !range || typeof range.min !== "number" || typeof range.max !== "number") return;
+  if (!Number.isInteger(range.min) || !Number.isInteger(range.max) || range.min < 1 || range.min > range.max) return;
+  const max = Math.min(range.max, CONTRACT_VERSION);
+  const min = range.min;
+  if (max < sent || min > sent) return;
   const raw = kv.get(LINK_KEY);
   if (!raw) return;
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch { return; }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
   const stored = parsed as Record<string, unknown>;
-  if (stored.project_leads === true) return;
-  stored.project_leads = true;
+  stored.contract = { min, max };
+  if (max >= PROJECT_LEADS_SINCE) stored.project_leads = true;
   kv.set(LINK_KEY, JSON.stringify(stored));
 }
 

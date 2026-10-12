@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **The daemon speaks sync contract 2 after the cloud accepts it (T446).** `CONTRACT_VERSION` is 2. A batch uses the lower of that and the stored link's contract max, so a link capped at 1 is spoken as contract 1 and a max-1 ack is accepted. A SyncAck whose contract max is at least 2 sets `project_leads` on the stored link and does not set `project_paths`.
+- **The daemon speaks sync contract 2 after the cloud accepts it (T446).** `CONTRACT_VERSION` is 2. A batch uses the lower of that and the stored link's contract max, so a link still at max 1 is spoken as contract 1. An in-range SyncAck stores the cloud's contract range, clamped to `CONTRACT_VERSION` and never below the contract just spoken, and never sets `project_paths`. An ack of `{1,2}` raises a max-1 link to max 2 and sets `project_leads`; the next batch speaks contract 2 and can carry leads. An ack of `{1,1}` leaves the link at 1. An out-of-range ack does not change the link.
 - **`whoami.harness_session` follows the hook-bound session after an in-place upgrade (T571).** A server whose lease still carries the provisional `mcp-<pid>` id while this provider's hooks have bound exactly one real session now reports that session as `harness_session` — the id the statusline, HUD, `agentmbx status` and the endpoint key on — instead of the lease id. Report-only: `state.sessionId`, the lease and the resolver are unchanged, and `session`/`lease_key` still carry the lease key fingerprint.
 
 ## 0.5.27 (2026-10-11)

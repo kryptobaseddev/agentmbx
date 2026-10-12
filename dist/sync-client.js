@@ -1,6 +1,7 @@
 // Daemon sync client (T262, T468, T446). One POST writer, one seq per host. No network call
 // unless a local link record exists, and no bearer token. A SyncAck never turns project_paths on.
-// A SyncAck whose contract max is at least 2 sets project_leads on the stored link.
+// An in-range SyncAck stores the cloud's contract range, clamped to CONTRACT_VERSION and never
+// below the contract just spoken. A stored max of at least 2 sets project_leads.
 import { createHash, randomBytes } from "node:crypto";
 import { CONTRACT_VERSION, PATH_FLAG_PREFIX, PROJECT_LEADS_SINCE, PROJECT_PATHS_SINCE, projectSync, } from "./sync-projection.js";
 export const LINK_KEY = "sync.link";
@@ -235,13 +236,14 @@ async function send(o, link, state, pending) {
     const sent = sentContract(pending.body);
     // Compare the contract this batch spoke, not CONTRACT_VERSION. A link capped at 1
     // speaks 1, and an old cloud that acks max 1 still accepts that batch.
+    // An out-of-range ack does not change the stored link.
     if (range && typeof range.min === "number" && typeof range.max === "number" && sent !== null && (sent < range.min || sent > range.max)) {
         state.force_full = true;
         writeState(o.kv, state);
         o.audit?.("sync.contract", { code: "sync.contract" });
         return { outcome: "sync.contract" };
     }
-    rememberLeads(o.kv, range && typeof range === "object" ? range.max : undefined);
+    rememberAck(o.kv, sent, range);
     writeState(o.kv, state);
     o.audit?.("sync.batch", { seq: pending.seq, outcome: "acked" });
     return { outcome: "acked", seq: pending.seq };
@@ -255,9 +257,15 @@ function sentContract(body) {
         return null;
     }
 }
-/** A contract-2 ack opts this link into project leads. It never writes project_paths. */
-function rememberLeads(kv, max) {
-    if (typeof max !== "number" || max < PROJECT_LEADS_SINCE)
+/** Store an in-range ack's contract. Never lower it past the contract just spoken, and never write project_paths. */
+function rememberAck(kv, sent, range) {
+    if (sent === null || !range || typeof range.min !== "number" || typeof range.max !== "number")
+        return;
+    if (!Number.isInteger(range.min) || !Number.isInteger(range.max) || range.min < 1 || range.min > range.max)
+        return;
+    const max = Math.min(range.max, CONTRACT_VERSION);
+    const min = range.min;
+    if (max < sent || min > sent)
         return;
     const raw = kv.get(LINK_KEY);
     if (!raw)
@@ -272,9 +280,9 @@ function rememberLeads(kv, max) {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
         return;
     const stored = parsed;
-    if (stored.project_leads === true)
-        return;
-    stored.project_leads = true;
+    stored.contract = { min, max };
+    if (max >= PROJECT_LEADS_SINCE)
+        stored.project_leads = true;
     kv.set(LINK_KEY, JSON.stringify(stored));
 }
 function refusePathCommands(o, commands) {
