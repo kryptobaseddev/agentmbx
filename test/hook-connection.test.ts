@@ -83,8 +83,8 @@ for (const cli of ["claude", "codex", "kimi", "opencode", "hermes", "grok"]) tes
   const live = f.run("prompt");
   assert.equal(live.status, 0, live.stderr);
   assert.doesNotMatch(live.stdout, /mbx disconnected/);
-  if (cli === "codex" || cli === "opencode") assert.equal(live.stdout, "");
-  if (cli === "claude") { // T185: a Claude session whose SessionStart was never seen enters on its first bound prompt
+  if (cli === "opencode") assert.equal(live.stdout, "");
+  if (cli === "claude" || cli === "codex") { // T185/T186: a session whose SessionStart was never seen enters on its first bound prompt
     assert.match(JSON.parse(live.stdout).hookSpecificOutput.additionalContext, /^\[mbx\] You are builder@alpha\b.*call mbx_identity release/);
     assert.equal(f.run("prompt").stdout, "", "once per entry");
   }
@@ -110,7 +110,7 @@ for (const cli of ["claude", "codex", "kimi", "opencode", "hermes", "grok"]) tes
 
 test("T503 the compiled hook emits the same reconnect line", t => {
   const f = fixture(t);
-  assert.equal(f.run("prompt", false).stdout, "");
+  assert.doesNotMatch(f.run("prompt", false).stdout, /mbx disconnected/); // T186: the first bound prompt may carry the entry notice
   f.remove();
   const result = f.run("prompt", false);
   assert.equal(result.status, 0, result.stderr);

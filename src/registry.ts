@@ -71,7 +71,7 @@ export function noteProject(store: Store, name: string, project: string | undefi
 /** Identities recorded in identity_projects for this project. A session cwd is not a binding:
  *  a shared host process records its own folder for every persona it serves (T515). The project is the folder or, when
  *  the folder belongs to a CLEO project, every checkout of it (T543): the stored key matches as well as the stored folder. */
-export function projectIdentities(store: Store, project: string): Set<string> {
+export function projectIdentities(store: Pick<Store, "db">, project: string): Set<string> {
   const out = new Set<string>();
   const key = resolveProject(project).key;
   for (const r of store.db.prepare("SELECT name FROM identity_projects WHERE project=? OR project_key=?").all(project, key) as { name: string }[]) out.add(r.name);

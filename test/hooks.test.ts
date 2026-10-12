@@ -438,5 +438,5 @@ test("T185: an unbound Claude SessionStart defers the notice to the first bound 
   assert.equal(hinted(additional(run("prompt", "later", "claude", {}, { prompt: "again" }).stdout)), 0);
   const codex = await holder(t, "codex"); codex.send();
   const cx = additional(codex.run("session-start", codex.sid, "codex", {}, { source: "resume" }).stdout);
-  assert.match(cx, /You are builder@alpha/); assert.equal(hinted(cx), 0, "Codex is T186's: its SessionStart is not changed here");
+  assert.match(cx, /You are builder@alpha/); assert.equal(hinted(cx), 1, "Codex SessionStart carries T186's notice");
 });

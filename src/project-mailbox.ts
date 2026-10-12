@@ -28,9 +28,9 @@ export interface ProjectMailbox {
 
 const fail = (code: string, message: string): never => { throw Object.assign(new Error(message), { code }); };
 
-export const projectMailboxByKey = (store: Store, key: string): ProjectMailbox | undefined =>
+export const projectMailboxByKey = (store: Pick<Store, "db">, key: string): ProjectMailbox | undefined =>
   store.db.prepare("SELECT key,slot,alias,home_host,source,folder,created_at FROM project_mailboxes WHERE key=?").get(key) as unknown as ProjectMailbox | undefined;
-export const projectMailboxBySlot = (store: Store, slot: string): ProjectMailbox | undefined =>
+export const projectMailboxBySlot = (store: Pick<Store, "db">, slot: string): ProjectMailbox | undefined =>
   isSlotName(slot) ? store.db.prepare("SELECT key,slot,alias,home_host,source,folder,created_at FROM project_mailboxes WHERE slot=?").get(slot) as unknown as ProjectMailbox | undefined : undefined;
 export const projectMailboxByAlias = (store: Store, alias: string): ProjectMailbox | undefined =>
   store.db.prepare("SELECT key,slot,alias,home_host,source,folder,created_at FROM project_mailboxes WHERE alias=?").get(alias) as unknown as ProjectMailbox | undefined;
@@ -130,7 +130,7 @@ export function rewriteProjectAliases(node: MbxNode, to: string[], project?: str
  * in its identity_projects bindings (T515: the explicit membership, never a cwd or a folder name): the CLEO id stored with the
  * binding, else the folder, which is then the key (resolveProject, T543). Empty for a name bound to nothing.
  */
-export function projectKeysOf(store: Store, name: string): string[] {
+export function projectKeysOf(store: Pick<Store, "db">, name: string): string[] {
   const box = projectMailboxBySlot(store, name);
   if (box) return [box.key];
   const rows = store.db.prepare("SELECT project,project_key FROM identity_projects WHERE name=?").all(name) as { project: string; project_key: string | null }[];
