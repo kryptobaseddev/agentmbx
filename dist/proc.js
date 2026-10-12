@@ -5,7 +5,7 @@ import { fstatSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
-/** Kernel identity of both client pipe ends; inherited fds and exec keep it, separate connections do not. */
+/** fstat identity of both client pipe ends; inherited fds and exec keep it. On macOS separate live socket connections can share it, so claimMcpConnection confirms a collision with lsof (T564). */
 export function stdioEndpoint() {
     if (process.platform !== "darwin" && process.platform !== "linux")
         return null;

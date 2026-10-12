@@ -8,7 +8,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 export interface Proc { ppid: number; start: string }
 
-/** Kernel identity of both client pipe ends; inherited fds and exec keep it, separate connections do not. */
+/** fstat identity of both client pipe ends; inherited fds and exec keep it. On macOS separate live socket connections can share it, so claimMcpConnection confirms a collision with lsof (T564). */
 export function stdioEndpoint(): string | null {
   if (process.platform !== "darwin" && process.platform !== "linux") return null;
   try {
