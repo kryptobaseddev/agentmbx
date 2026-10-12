@@ -24,7 +24,7 @@ import { applyIdentityTakeover, type IdentityTakeoverApproval } from "./identity
 import { opencodeProviderPid } from "./opencode-provider.ts";
 import { formatUnboundStart, listIdentityStatus } from "./identity-status.ts";
 import { consumeIdentityControl, identityControlAliases, identityControlKey, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl, type IdentityControlDescriptor } from "./identity-control.ts";
-import { alive, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
+import { alive, defaultHome, didWarning, formatFor, LIVE_AGENT_MS, MbxNode, summaryLine, trustLabel, type Session } from "./node.ts";
 import { auditLeadGrantUse, leadGrantCovering } from "./lead-grants.ts";
 import { setSessionPresence } from "./presence.ts";
 import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy.ts";
@@ -42,7 +42,7 @@ import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wa
 import { isStoreBusy, withStoreBusyTimeout, type MessageRow } from "./store.ts";
 import { markMcpStarting } from "./mcp-startup.ts";
 import { recordMcpGeneration, startMcpLifecycle } from "./mcp-lifecycle.ts";
-import { projectLabel, projectMailboxBySlot } from "./project-mailbox.ts";
+import { projectLabel, projectMailboxBySlot, projectsLedBy } from "./project-mailbox.ts";
 import { isSlotName } from "./project-slot.ts";
 import { recordMcpStartupError } from "./logs.ts";
 
@@ -808,6 +808,8 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
     if (providerPid !== null && providerStart) node.store.set(providerRecordKey(process.pid), JSON.stringify({ providerPid, providerStart, ...(env.harnessProvider ? { harness: true } : {}) }));
   };
   const bind = (state: State, explicit = false) => state.coUse ? undefined : prepareState(state, undefined, () => {
+    // Heartbeat calls bind directly, so this write is the outer lock. bindSession then reads the table inside it (T591).
+    procTable();
     const result = node.store.tx(() => {
       if (state.leaseToken) leases.renew(state.agent, state.leaseToken);
       // Snapshot before bindSession can replace or consolidate any rows.
@@ -847,7 +849,10 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
   const followSession = (state: State, id: string) => {
     const previous = state.sessionId, controlKey = fingerprint(state.key.publicKey);
     const controlAliases = state.controlAliases?.filter(alias => alias !== previous);
-    const moved = prepareState(state, undefined, () => node.store.tx(() => {
+    const moved = prepareState(state, undefined, () => {
+      // A bound follow calls bindSession inside this write. An unbound follow never reads the process table (T591).
+      if (bound(state) && !state.coUse) procTable();
+      return node.store.tx(() => {
       if (heldElsewhere(id, controlKey)) return false;
       if (bound(state) && !state.coUse) { // a co-user never moves the holder's lease or binding (T439)
         leases.renew(state.agent, state.leaseToken!);
@@ -864,7 +869,8 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
       catch { /* malformed: leave it to the endpoint parser */ }
       publishControl({ ...state, sessionId: id, controlAliases });
       return true;
-    }));
+    });
+    });
     if (moved) { state.sessionId = env.sessionId = id; state.controlAliases = controlAliases; }
   };
   const followProvider = (state: State) => {
@@ -1238,7 +1244,31 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
           ? leases.withHeldRead(state.agent, state.leaseToken!, () => cb(...a))
           : leases.withHeld(state.agent, state.leaseToken!, () => cb(...a)));
         const target = (a[0] as { name?: string } | undefined)?.name;
-        const result = withProcSnapshot(() => name === "mbx_whoami" ? prepareState(state, target, invoke) : invoke());
+        // These handlers ask inside the lease write. Fill the snapshot first. A call that does not ask stays at zero (T591).
+        const freshProcSession = (agent?: string) => !!node.store.db.prepare(
+          `SELECT 1 FROM sessions WHERE pid IS NOT NULL AND pid_start<>'' AND updated_at>=?${agent ? " AND agent=?" : ""} LIMIT 1`,
+        ).get(...(agent ? [new Date(Date.now() - LIVE_AGENT_MS).toISOString(), agent] : [new Date(Date.now() - LIVE_AGENT_MS).toISOString()]));
+        const readsProcInWrite = () => {
+          const args = a[0] as { name?: string; role?: string; description?: string; id?: string } | undefined;
+          if (name === "mbx_whoami" && bound(state))
+            return !!(args?.name || args?.role || args?.description) || freshProcSession(state.agent);
+          if (name === "mbx_send" || name === "mbx_reply") return freshProcSession();
+          if (name !== "mbx_thread" || !args?.id) return false;
+          // readableSlots is empty until withHeld. Include the slots the in-lease canSee will see.
+          const names = [state.agent, ...node.linkedNames(state.agent), ...projectsLedBy(node, state.agent).map((p) => p.slot)];
+          const visible = (m: MessageRow) => {
+            const [fromAgent, fromHost] = m.from_addr.split("@");
+            if ((m.origin === "local" || fromHost === node.host) && names.includes(fromAgent)) return true;
+            return names.some((n) => node.store.db.prepare("SELECT 1 FROM deliveries WHERE msg_id=? AND agent=?").get(m.id, n));
+          };
+          const found = node.message(args.id, state.agent);
+          const threadId = found && visible(found) ? found.thread : args.id;
+          return (node.store.db.prepare("SELECT * FROM messages WHERE thread=?").all(threadId) as unknown as MessageRow[]).some(visible);
+        };
+        const result = withProcSnapshot(() => {
+          if (readsProcInWrite()) procTable();
+          return name === "mbx_whoami" ? prepareState(state, target, invoke) : invoke();
+        });
         if (result && typeof result === "object" && receiptResult in result)
           return withProcSnapshot((result as ReturnType<typeof afterLease>)[receiptResult]);
         if ((name === "mbx_whoami" || name === "mbx_inbox") && result && typeof result === "object") {
@@ -1330,7 +1360,10 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
     const next: State = { ...state, agent: target, leaseToken: undefined, coUse: undefined, released: false, pending: undefined, pendingReason: undefined, lostTo: undefined, parent: null };
     let result: ReturnType<typeof handoff>;
     try {
-      result = prepareState(next, target, () => node.store.tx(() => {
+      result = prepareState(next, target, () => {
+        // This write is already open when bind() runs, so bind's own read is too late (T591).
+        procTable();
+        return node.store.tx(() => {
         reviveMailbox(node, target);
         bind(next, true);
         node.keepName(env.cli, next.sessionId, next.agent);
@@ -1338,7 +1371,8 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
         node.registerAgent(target, { cli: env.cli, ...(role ? { role } : {}), ...(description ? { description } : {}) });
         if (task || lane) setSessionPresence(node, { cli: env.cli, sessionId: next.sessionId, ...(task ? { task } : {}), ...(lane ? { lane } : {}) });
         return handoff(next.agent);
-      }));
+      });
+      });
     } catch (error) {
       // T439: the session's own live server holds it; this sibling co-uses it (the claim transaction wrote nothing).
       const co = coUseError(error);
@@ -1378,11 +1412,14 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
     project = projectOf(t.cwd);
     node.store.set(linkedKey(env.cli, t.session_id), JSON.stringify({ at: new Date().toISOString(), mcp_pid: process.pid }));
     if (bound(base) && !base.coUse) {
-      prepareState(base, undefined, () => node.store.tx(() => {
+      prepareState(base, undefined, () => {
+        procTable(); // bindSession reads the table inside this write (T591)
+        return node.store.tx(() => {
         leases.renew(base.agent, base.leaseToken!);
         node.bindSession({ agent: base.agent, cli: env.cli, session_id: t.session_id, cwd: t.cwd, pid: env.ppid, session_key: base.key.publicKey, channel: false, mcp_pid: process.pid });
         publishControl(base);
-      }));
+      });
+      });
     } else if (!base.coUse) {
       base.sessionId = t.session_id;
       const remembered = node.store.get(`name:${env.cli}:${t.session_id}`);

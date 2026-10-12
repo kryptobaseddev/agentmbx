@@ -344,6 +344,10 @@ export class MbxNode {
     addAlias(oldName, newName, pid) {
         if (oldName === newName)
             return;
+        // inUseElsewhere and the owned-row proof read the table. A rename with no such row still spawns nothing (T591).
+        const cutoff = new Date(Date.now() - LIVE_AGENT_MS).toISOString();
+        if (this.store.db.prepare("SELECT 1 FROM sessions WHERE pid IS NOT NULL AND pid_start<>'' AND updated_at>=? AND agent IN (?, ?) LIMIT 1").get(cutoff, oldName, newName))
+            procTable();
         this.store.tx(() => {
             if (this.inUseElsewhere(newName, pid))
                 throw Object.assign(new Error(`agent name ${newName} is in use; choose another name`), { code: "NAME_IN_USE" });

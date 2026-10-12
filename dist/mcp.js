@@ -24,7 +24,7 @@ import { applyIdentityTakeover } from "./identity-takeover.js";
 import { opencodeProviderPid } from "./opencode-provider.js";
 import { formatUnboundStart, listIdentityStatus } from "./identity-status.js";
 import { consumeIdentityControl, identityControlAliases, identityControlKey, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl } from "./identity-control.js";
-import { alive, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.js";
+import { alive, defaultHome, didWarning, formatFor, LIVE_AGENT_MS, MbxNode, summaryLine, trustLabel } from "./node.js";
 import { auditLeadGrantUse, leadGrantCovering } from "./lead-grants.js";
 import { setSessionPresence } from "./presence.js";
 import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy.js";
@@ -42,7 +42,7 @@ import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wa
 import { isStoreBusy, withStoreBusyTimeout } from "./store.js";
 import { markMcpStarting } from "./mcp-startup.js";
 import { recordMcpGeneration, startMcpLifecycle } from "./mcp-lifecycle.js";
-import { projectLabel, projectMailboxBySlot } from "./project-mailbox.js";
+import { projectLabel, projectMailboxBySlot, projectsLedBy } from "./project-mailbox.js";
 import { isSlotName } from "./project-slot.js";
 import { recordMcpStartupError } from "./logs.js";
 let lifecycle;
@@ -927,6 +927,8 @@ async function configureMcp(server, node, startupClosed) {
             node.store.set(providerRecordKey(process.pid), JSON.stringify({ providerPid, providerStart, ...(env.harnessProvider ? { harness: true } : {}) }));
     };
     const bind = (state, explicit = false) => state.coUse ? undefined : prepareState(state, undefined, () => {
+        // Heartbeat calls bind directly, so this write is the outer lock. bindSession then reads the table inside it (T591).
+        procTable();
         const result = node.store.tx(() => {
             if (state.leaseToken)
                 leases.renew(state.agent, state.leaseToken);
@@ -973,28 +975,33 @@ async function configureMcp(server, node, startupClosed) {
     const followSession = (state, id) => {
         const previous = state.sessionId, controlKey = fingerprint(state.key.publicKey);
         const controlAliases = state.controlAliases?.filter(alias => alias !== previous);
-        const moved = prepareState(state, undefined, () => node.store.tx(() => {
-            if (heldElsewhere(id, controlKey))
-                return false;
-            if (bound(state) && !state.coUse) { // a co-user never moves the holder's lease or binding (T439)
-                leases.renew(state.agent, state.leaseToken);
-                leases.moveSession(state.agent, state.leaseToken, id);
-                node.bindSession({ agent: state.agent, cli: env.cli, session_id: id, cwd: process.cwd(), pid: env.ppid,
-                    session_key: state.key.publicKey, channel: env.channel || env.socket, mcp_pid: process.pid });
-                node.store.db.prepare("DELETE FROM sessions WHERE cli=? AND pid=? AND session_key=? AND session_id<>?").run(env.cli, env.ppid, state.key.publicKey, id);
-                node.keepName(env.cli, id, state.agent);
-            }
-            // The control endpoint published under the old id (an unbound session publishes one too) stops answering for it;
-            // only this server's own endpoint is removed.
-            const old = identityControlKey(env.cli, previous), raw = node.store.get(old);
-            try {
-                if (raw && JSON.parse(raw).control_key === controlKey)
-                    node.store.db.prepare("DELETE FROM kv WHERE k=?").run(old);
-            }
-            catch { /* malformed: leave it to the endpoint parser */ }
-            publishControl({ ...state, sessionId: id, controlAliases });
-            return true;
-        }));
+        const moved = prepareState(state, undefined, () => {
+            // A bound follow calls bindSession inside this write. An unbound follow never reads the process table (T591).
+            if (bound(state) && !state.coUse)
+                procTable();
+            return node.store.tx(() => {
+                if (heldElsewhere(id, controlKey))
+                    return false;
+                if (bound(state) && !state.coUse) { // a co-user never moves the holder's lease or binding (T439)
+                    leases.renew(state.agent, state.leaseToken);
+                    leases.moveSession(state.agent, state.leaseToken, id);
+                    node.bindSession({ agent: state.agent, cli: env.cli, session_id: id, cwd: process.cwd(), pid: env.ppid,
+                        session_key: state.key.publicKey, channel: env.channel || env.socket, mcp_pid: process.pid });
+                    node.store.db.prepare("DELETE FROM sessions WHERE cli=? AND pid=? AND session_key=? AND session_id<>?").run(env.cli, env.ppid, state.key.publicKey, id);
+                    node.keepName(env.cli, id, state.agent);
+                }
+                // The control endpoint published under the old id (an unbound session publishes one too) stops answering for it;
+                // only this server's own endpoint is removed.
+                const old = identityControlKey(env.cli, previous), raw = node.store.get(old);
+                try {
+                    if (raw && JSON.parse(raw).control_key === controlKey)
+                        node.store.db.prepare("DELETE FROM kv WHERE k=?").run(old);
+                }
+                catch { /* malformed: leave it to the endpoint parser */ }
+                publishControl({ ...state, sessionId: id, controlAliases });
+                return true;
+            });
+        });
         if (moved) {
             state.sessionId = env.sessionId = id;
             state.controlAliases = controlAliases;
@@ -1454,7 +1461,33 @@ async function configureMcp(server, node, startupClosed) {
                     ? leases.withHeldRead(state.agent, state.leaseToken, () => cb(...a))
                     : leases.withHeld(state.agent, state.leaseToken, () => cb(...a)));
                 const target = a[0]?.name;
-                const result = withProcSnapshot(() => name === "mbx_whoami" ? prepareState(state, target, invoke) : invoke());
+                // These handlers ask inside the lease write. Fill the snapshot first. A call that does not ask stays at zero (T591).
+                const freshProcSession = (agent) => !!node.store.db.prepare(`SELECT 1 FROM sessions WHERE pid IS NOT NULL AND pid_start<>'' AND updated_at>=?${agent ? " AND agent=?" : ""} LIMIT 1`).get(...(agent ? [new Date(Date.now() - LIVE_AGENT_MS).toISOString(), agent] : [new Date(Date.now() - LIVE_AGENT_MS).toISOString()]));
+                const readsProcInWrite = () => {
+                    const args = a[0];
+                    if (name === "mbx_whoami" && bound(state))
+                        return !!(args?.name || args?.role || args?.description) || freshProcSession(state.agent);
+                    if (name === "mbx_send" || name === "mbx_reply")
+                        return freshProcSession();
+                    if (name !== "mbx_thread" || !args?.id)
+                        return false;
+                    // readableSlots is empty until withHeld. Include the slots the in-lease canSee will see.
+                    const names = [state.agent, ...node.linkedNames(state.agent), ...projectsLedBy(node, state.agent).map((p) => p.slot)];
+                    const visible = (m) => {
+                        const [fromAgent, fromHost] = m.from_addr.split("@");
+                        if ((m.origin === "local" || fromHost === node.host) && names.includes(fromAgent))
+                            return true;
+                        return names.some((n) => node.store.db.prepare("SELECT 1 FROM deliveries WHERE msg_id=? AND agent=?").get(m.id, n));
+                    };
+                    const found = node.message(args.id, state.agent);
+                    const threadId = found && visible(found) ? found.thread : args.id;
+                    return node.store.db.prepare("SELECT * FROM messages WHERE thread=?").all(threadId).some(visible);
+                };
+                const result = withProcSnapshot(() => {
+                    if (readsProcInWrite())
+                        procTable();
+                    return name === "mbx_whoami" ? prepareState(state, target, invoke) : invoke();
+                });
                 if (result && typeof result === "object" && receiptResult in result)
                     return withProcSnapshot(result[receiptResult]);
                 if ((name === "mbx_whoami" || name === "mbx_inbox") && result && typeof result === "object") {
@@ -1568,17 +1601,21 @@ async function configureMcp(server, node, startupClosed) {
         const next = { ...state, agent: target, leaseToken: undefined, coUse: undefined, released: false, pending: undefined, pendingReason: undefined, lostTo: undefined, parent: null };
         let result;
         try {
-            result = prepareState(next, target, () => node.store.tx(() => {
-                reviveMailbox(node, target);
-                bind(next, true);
-                node.keepName(env.cli, next.sessionId, next.agent);
-                if (role || description || inheritedRole)
-                    registerIdentity(node.store, { name: target, role: role ?? registration?.role ?? inheritedRole ?? UNSPECIFIED_ROLE, description, by: `${env.cli}:${next.sessionId}` });
-                node.registerAgent(target, { cli: env.cli, ...(role ? { role } : {}), ...(description ? { description } : {}) });
-                if (task || lane)
-                    setSessionPresence(node, { cli: env.cli, sessionId: next.sessionId, ...(task ? { task } : {}), ...(lane ? { lane } : {}) });
-                return handoff(next.agent);
-            }));
+            result = prepareState(next, target, () => {
+                // This write is already open when bind() runs, so bind's own read is too late (T591).
+                procTable();
+                return node.store.tx(() => {
+                    reviveMailbox(node, target);
+                    bind(next, true);
+                    node.keepName(env.cli, next.sessionId, next.agent);
+                    if (role || description || inheritedRole)
+                        registerIdentity(node.store, { name: target, role: role ?? registration?.role ?? inheritedRole ?? UNSPECIFIED_ROLE, description, by: `${env.cli}:${next.sessionId}` });
+                    node.registerAgent(target, { cli: env.cli, ...(role ? { role } : {}), ...(description ? { description } : {}) });
+                    if (task || lane)
+                        setSessionPresence(node, { cli: env.cli, sessionId: next.sessionId, ...(task ? { task } : {}), ...(lane ? { lane } : {}) });
+                    return handoff(next.agent);
+                });
+            });
         }
         catch (error) {
             // T439: the session's own live server holds it; this sibling co-uses it (the claim transaction wrote nothing).
@@ -1624,11 +1661,14 @@ async function configureMcp(server, node, startupClosed) {
         project = projectOf(t.cwd);
         node.store.set(linkedKey(env.cli, t.session_id), JSON.stringify({ at: new Date().toISOString(), mcp_pid: process.pid }));
         if (bound(base) && !base.coUse) {
-            prepareState(base, undefined, () => node.store.tx(() => {
-                leases.renew(base.agent, base.leaseToken);
-                node.bindSession({ agent: base.agent, cli: env.cli, session_id: t.session_id, cwd: t.cwd, pid: env.ppid, session_key: base.key.publicKey, channel: false, mcp_pid: process.pid });
-                publishControl(base);
-            }));
+            prepareState(base, undefined, () => {
+                procTable(); // bindSession reads the table inside this write (T591)
+                return node.store.tx(() => {
+                    leases.renew(base.agent, base.leaseToken);
+                    node.bindSession({ agent: base.agent, cli: env.cli, session_id: t.session_id, cwd: t.cwd, pid: env.ppid, session_key: base.key.publicKey, channel: false, mcp_pid: process.pid });
+                    publishControl(base);
+                });
+            });
         }
         else if (!base.coUse) {
             base.sessionId = t.session_id;

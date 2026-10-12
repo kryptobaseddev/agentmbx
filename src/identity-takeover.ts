@@ -75,6 +75,7 @@ export function applyIdentityTakeover<T>(node: MbxNode, leases: IdentityLeases, 
   claimant: IdentityControlDescriptor, operation: () => T): T {
   if (operation.constructor.name === "AsyncFunction") throw refused("takeover operations must be synchronous");
   const { payload, sig } = identityTakeoverApprovalSchema.parse(approval);
+  procTable(); // refuseSelfTakeover → sameLiveProvider reads the table inside the write below (T591)
   return node.store.tx(() => {
     const owner = node.ownerPub, now = Date.now();
     if (!owner || fingerprint(owner) !== payload.owner_fp || !verifyData(owner, canonical(payload), sig)) throw refused("invalid owner takeover signature");
