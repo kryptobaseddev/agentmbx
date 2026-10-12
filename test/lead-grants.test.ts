@@ -418,6 +418,23 @@ test("T499 AC3: expiry, lead revocation, a newer lead record and the owner kill 
   }
 });
 
+for (const end of ["revoked", "expired"]) test(`T562: a ${end} replacement cannot reactivate the predecessor's grants`, t => {
+  const w = live(t), now = Date.now(), before = w.row(w.l.id);
+  assert.equal(leadGrantFor(w.n, "api-dev", { cwd: w.cwd, class: "outward-reversible" }).ok, true);
+  const replacement = w.lead({ agent: "other", now: new Date(now + 1000), ttlMs: 1000 });
+  if (end === "revoked") {
+    const rev = makeLeadRevocation(replacement.id, w.owner.publicKey, new Date(now + 1000)); revokeLead(w.n, rev, w.sign(rev));
+  }
+  const at = new Date(now + (end === "revoked" ? 1500 : 2000));
+  assert.equal(activeLead(w.n, w.cwd, at), null);
+  assert.equal(leadGrantFor(w.n, "api-dev", { cwd: w.cwd, class: "outward-reversible", now: at }).ok, false);
+  assert.deepEqual(w.row(w.l.id), before, "revocation must not delete or rewrite the older signed grants");
+  const freshTime = new Date(now + 3000), fresh = w.lead({ now: freshTime });
+  assert.equal(leadGrantFor(w.n, "api-dev", { cwd: w.cwd, class: "outward-reversible", now: freshTime }).ok, false, "new record never inherits old grants");
+  w.grant(fresh, ["api-dev"], { now: freshTime });
+  assert.equal(leadGrantFor(w.n, "api-dev", { cwd: w.cwd, class: "outward-reversible", now: freshTime }).ok, true);
+});
+
 // ── AC4: audit ──────────────────────────────────────────────────────────────────────────────────────────────
 
 for (const cli of ["claude", "codex"]) test(`T499 AC4: ${cli} — exactly one lead.grant_used per approved decision, none per refusal or lookup`, async (t) => {

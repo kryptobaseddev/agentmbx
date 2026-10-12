@@ -311,7 +311,7 @@ test("T557: who the dispatcher wakes and who may read the slot are the same answ
   assert.deepEqual(answers(), { wakes: "agentmbx-second", reads: ["agentmbx-second"] }, "replaced");
   const gone = f.designate("agentmbx-lead", 4_000);
   f.revoke(gone.id);
-  assert.deepEqual(answers(), { wakes: "agentmbx-second", reads: ["agentmbx-second"] }, "a revoked record falls back to the previous designation, for both");
+  assert.deepEqual(answers(), { wakes: null, reads: [] }, "T562: a revoked head restores neither the previous reader nor its wake target");
   f.designate("agentmbx-lead", 6_000, { host: "elsewhere" });
   assert.deepEqual(answers(), { wakes: null, reads: [] }, "a newer designation for another host: neither wakes nor reads here");
 });
