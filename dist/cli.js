@@ -59,7 +59,7 @@ import { publishIdentityControl, findIdentityControl, identityControlReceipt, re
 import { armDaemonSync } from "./sync-daemon.js";
 import { armConversationLoopReports } from "./loop-detector.js";
 import { mcpStarting } from "./mcp-startup.js";
-import { hookDisconnectedNote } from "./hook-connection.js";
+import { hookDisconnectedNote, hookResumingNote } from "./hook-connection.js";
 import { projectLabel, projectMailboxBySlot, projectsLedBy } from "./project-mailbox.js";
 import { isSlotName } from "./project-slot.js";
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
@@ -2003,6 +2003,13 @@ async function hook(node, event, cli) {
                 recordSessionHint(node.store, cli, process.ppid, inspectLeaseProcess(process.ppid).start, sid);
             }
             catch { /* advisory */ }
+        // T573: a resumed process whose mbx server has not connected yet keeps its identity; say so instead of "lost" or "unbound".
+        const resuming = grokUnboundPost ? null : hookResumingNote(node, cli, sid, process.ppid);
+        if (resuming) {
+            if (cli !== "hermes" || event !== "session-start")
+                emit(cli, event === "session-start" ? "SessionStart" : "UserPromptSubmit", resuming);
+            return;
+        }
         // Guidance on session start; Kimi drops SessionStart context, so a Kimi session gets it once on its first prompt.
         // Kimi and Hermes drop SessionStart output, so their first prompt carries the guidance (Hermes: pre_llm_call context).
         const guided = `guided:${cli}:${sid}`, first = (cli === "kimi" || cli === "hermes") && !node.store.get(guided);

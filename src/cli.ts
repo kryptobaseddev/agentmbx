@@ -60,7 +60,7 @@ import { publishIdentityControl, findIdentityControl, identityControlReceipt, re
 import { armDaemonSync } from "./sync-daemon.ts";
 import { armConversationLoopReports } from "./loop-detector.ts";
 import { mcpStarting } from "./mcp-startup.ts";
-import { hookDisconnectedNote } from "./hook-connection.ts";
+import { hookDisconnectedNote, hookResumingNote } from "./hook-connection.ts";
 import { projectLabel, projectMailboxBySlot, projectsLedBy } from "./project-mailbox.ts";
 import { isSlotName } from "./project-slot.ts";
 
@@ -1622,6 +1622,12 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
     const link = multi && !linked ? bindInstruction(issueBindTicket(node.store, { cli, session_id: sid, cwd, parent_pid: process.ppid })) : null;
     // A dedicated provider process tells its mbx server which session it is, so a resumed session gets its identity back.
     if (!multi && !["codex", "opencode"].includes(cli)) try { recordSessionHint(node.store, cli, process.ppid, inspectLeaseProcess(process.ppid).start, sid); } catch { /* advisory */ }
+    // T573: a resumed process whose mbx server has not connected yet keeps its identity; say so instead of "lost" or "unbound".
+    const resuming = grokUnboundPost ? null : hookResumingNote(node, cli, sid, process.ppid);
+    if (resuming) {
+      if (cli !== "hermes" || event !== "session-start") emit(cli, event === "session-start" ? "SessionStart" : "UserPromptSubmit", resuming);
+      return;
+    }
     // Guidance on session start; Kimi drops SessionStart context, so a Kimi session gets it once on its first prompt.
     // Kimi and Hermes drop SessionStart output, so their first prompt carries the guidance (Hermes: pre_llm_call context).
     const guided = `guided:${cli}:${sid}`, first = (cli === "kimi" || cli === "hermes") && !node.store.get(guided);
