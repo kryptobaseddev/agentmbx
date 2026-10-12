@@ -132,7 +132,7 @@ commit carries a regression test that failed before the fix.
 | F7 | Medium | Envelope metadata, including body-derived tags and mentions, is not sealed | Follow-up (T198) |
 | F8 | Medium | Subject and body can imitate header lines and the end-of-message frame | Fixed (T196) |
 | F9 | Medium | Rotation cannot recover from a compromised host key | Accepted |
-| F10 | Low | Pending code-compare pairings never expire; anyone can create them | Follow-up (T200) |
+| F10 | Low | Pending code-compare pairings never expire; anyone can create them | Fixed (T200) |
 | F11 | Low | Signed hops can be replayed inside the 5 min skew window | Accepted |
 | F12 | Low | Reference relay keeps unbounded challenge and dedupe state | Follow-up (T197) |
 | F13 | Low | `/v1/status` and mDNS disclose host name, key fingerprint and version | Accepted |
@@ -248,9 +248,9 @@ and pair again with a token. Documented here and to be added to the rotation hel
 
 ### Low findings
 
-- **F10, follow-up.** Pending code-compare pairings never expire, although SPEC claimed 10 minutes, and any unpaired
-  host can create them (`src/node.ts:381-390`); the table and the daemon log grow. Expire pending rows after 10 min and
-  cap their number.
+- **F10, fixed (T200).** Pending code-compare pairings expire after 10 min. `approvePeer` refuses and deletes a
+  pending row older than that, and the daemon's 60 s sweep deletes the rest. Approved peers are unchanged. Anyone can
+  still create a pending row; `POST /v1/pair` stays limited to 10 requests a minute. No separate count cap.
 - **F11, accepted.** Hops carry a timestamp but no nonce (`src/http.ts:19-35`), so A2 can replay a captured request
   within ±5 min. Envelope ids deduplicate, policy records are idempotent, and `/v1/unpair` is only ever signed when the
   peer really unpaired. A response-bound nonce would come with F5.

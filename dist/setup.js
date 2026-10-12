@@ -14,7 +14,7 @@ import { parse as parseToml } from "smol-toml";
 import { fingerprint } from "./crypto.js";
 import { claudePluginStep, execCli } from "./claude-plugin.js";
 import { version } from "./version.js";
-import { opencodeSidebarPackageJson, opencodeSidebarServerSource, opencodeSidebarSource, OPENCODE_SIDEBAR_MARKER } from "./opencode-sidebar.js";
+import { opencodeSidebarPackageJson, opencodeSidebarSchemaSource, opencodeSidebarServerSource, opencodeSidebarSource, OPENCODE_SIDEBAR_MARKER } from "./opencode-sidebar.js";
 import { authHelperPath, canPrompt, createKeychainOwner, ownerInfo } from "./owner.js";
 export const CLIS = ["claude", "codex", "opencode", "kimi", "hermes", "grok"];
 // T502: the explicit MCP startup timeout setup writes. Measured cold starts sit close to the harness
@@ -2364,6 +2364,7 @@ export function edits(ctx, cli) {
                 { cli, kind: "sidebar", item: "tui.json plugin registration", path: opencodeTuiConfig(home), ...opencodeTuiPlugins(opencodeSidebarDir(home)) },
                 { cli, kind: "sidebar", item: "packaged plugin package.json", path: join(opencodeSidebarDir(home), "package.json"), ...opencodeSidebarPackage(opencodeSidebarPackageJson()) },
                 { cli, kind: "sidebar", item: "packaged plugin server.ts", path: join(opencodeSidebarDir(home), "server.ts"), ...opencodeSidebarFile(opencodeSidebarServerSource(), false) },
+                { cli, kind: "sidebar", item: "packaged plugin status-schema.ts", path: join(opencodeSidebarDir(home), "status-schema.ts"), ...opencodeSidebarFile(opencodeSidebarSchemaSource(), false) },
                 { cli, kind: "sidebar", item: "packaged plugin tui.ts", path: join(opencodeSidebarDir(home), "tui.ts"), ...opencodeSidebarFile(opencodeSidebarSource(version()), true) },
             ];
         case "kimi": {

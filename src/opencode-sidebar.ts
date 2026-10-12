@@ -32,6 +32,85 @@ export default { id: "agentmbx-sidebar", setup: () => {} };
 `;
 }
 
+/** Embedded canonical v2 contract asset: works in SEA installs without a source tree.
+ *  The byte-for-byte drift test against src/status-schema.ts gates any contract change. */
+export function opencodeSidebarSchemaSource(): string {
+  return `${OPENCODE_SIDEBAR_MARKER} — canonical status schema companion\n` + `// mbx.status/v2 (T404): the one status model every renderer consumes — the Claude mod (band/pane) and the
+// OpenCode sidebar read it through the T407 loopback endpoint, the CLI emits it (T406), and the cloud repo
+// imports THIS module at a pinned tag as the contract. The daemon computes it; adapters render and hold
+// zero business logic. Versioned additively: v1 renderers (statusline adapters) keep working untouched.
+//
+// The shape matches plugins/claude/fixtures/v2-*.json on feat/t401-claude-mod — that is the consumer
+// contract. Fields the daemon cannot source honestly yet are null (cloud.account until the T402 sync
+// client links an account; devices[].last_presence until presence tracking lands), never invented.
+export const STATUS_V2_SCHEMA = "mbx.status/v2" as const;
+
+export type StatusV2ResolvedBy = "session_id" | "pid" | "none";
+
+export interface StatusV2Identity {
+  name: string | null;
+  role: string | null;
+  state: "bound" | "unbound" | "ambiguous";
+  candidates?: string[];
+}
+
+/** The identity lease this (cli, session) holds, when it holds one. \`verified\` means process evidence
+ * proves the recorded holder pid alive at its recorded birth time (identityLeaseStatus "live"). */
+export interface StatusV2Lease {
+  holder_cli: string;
+  holder_session: string;
+  verified: boolean;
+}
+
+export interface StatusV2Cloud {
+  relay: { url: string | null; state: string; last_ack: string | null };
+  key_ad_expiry: string | null;
+  account: string | null;
+}
+
+export interface StatusV2Device {
+  host: string;
+  address: string;
+  reachability: string;
+  last_presence: string | null;
+}
+
+export interface StatusV2Project {
+  directory: string;
+  lead: string | null;
+  members: string[];
+}
+
+export interface StatusV2 {
+  schema: typeof STATUS_V2_SCHEMA;
+  mbx_version: string;
+  identity: StatusV2Identity;
+  registration: { registered: boolean; lease: StatusV2Lease | null };
+  inbox: { unread: number; needs_reply: number; from_owner: number; outbox_unsent: number };
+  harness: { cli: string; session_id: string | null; wake_path: string; policy: string[] };
+  cloud: StatusV2Cloud;
+  devices: StatusV2Device[];
+  project: StatusV2Project | null;
+  resolved_by: StatusV2ResolvedBy;
+}
+
+/** Opt-in preview for loopback renderers. Bounded to three pending messages; no bodies or authority. */
+export interface StatusInboxMessage {
+  id: string;
+  sender: string;
+  subject: string;
+  kind: string;
+  ts: string;
+  needs_reply: boolean;
+}
+
+/** Additive extension: the pinned base v2 contract stays unchanged for existing clients. */
+export type StatusV2WithInbox = Omit<StatusV2, "inbox"> & {
+  inbox: StatusV2["inbox"] & { recent?: StatusInboxMessage[] };
+};
+`;
+}
+
 /** The self-contained TUI plugin module OpenCode loads. Plain TypeScript with no static imports of
  *  host-provided packages: the TUI runtime resolves @opentui/solid for packaged plugins, but the
  *  factory is still loaded dynamically with a graceful null fallback (renders nothing rather than
@@ -41,21 +120,13 @@ export function opencodeSidebarSource(ver: string): string {
 // Renders mbx.status/v2 in the OpenCode sidebar. Read-only: fetches the daemon loopback status
 // endpoint and renders; it never derives status itself. Local edits make this file foreign:
 // setup stops managing it and doctor reports it. Uninstall with: agentmbx setup --uninstall --only opencode
+import { STATUS_V2_SCHEMA, type StatusV2, type StatusV2WithInbox } from "./status-schema.ts";
 
 /** Pure render: one v2 snapshot -> one display line. Free of any UI import so tests exercise
  *  exactly what the TUI shows. Field-for-field with src/status-schema.ts; unknown shapes degrade
  *  to a bare marker instead of throwing inside the host. */
-type Snapshot = {
-  schema?: string;
-  identity?: { state?: string; name?: string | null; role?: string | null };
-  registration?: { registered?: boolean; lease?: { verified?: boolean; holder_cli?: string; holder_session?: string } | null };
-  inbox?: { unread?: number; needs_reply?: number; from_owner?: number; outbox_unsent?: number; recent?: { id: string; sender: string; subject: string; kind: string; ts: string; needs_reply: boolean }[] };
-  harness?: { cli?: string; session_id?: string | null; wake_path?: string; policy?: string[] };
-  cloud?: { relay?: { url?: string | null; state?: string; last_ack?: string | null }; key_ad_expiry?: string | null; account?: string | null };
-  devices?: { host: string; address: string; reachability: string; last_presence: string | null }[];
-  project?: { directory: string; lead: string | null; members: string[] } | null;
-};
-const snapshot = (value: unknown): Snapshot | null => value && typeof value === "object" && (value as Snapshot).schema === "mbx.status/v2" ? value as Snapshot : null;
+type Snapshot = StatusV2 & StatusV2WithInbox;
+const snapshot = (value: unknown): Snapshot | null => value && typeof value === "object" && (value as Snapshot).schema === STATUS_V2_SCHEMA ? value as Snapshot : null;
 const clean = (value: unknown, max = 80): string => String(value ?? "unknown").replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(0, max);
 const bound = (s: Snapshot | null): boolean => s?.identity?.state === "bound" && !!s.identity.name;
 export const formatStatusV2 = (value: unknown): string => {
@@ -91,7 +162,7 @@ export const statusSections = (value: unknown, project = "project-dev", now = Da
 
 /** The one read path: the T407 loopback endpoint answering mbx.status/v2 (src/http.ts). */
 export const statusUrl = (port: string, cli: string, sessionID: string): string =>
-  "http://127.0.0.1:" + port + "/v1/status?cli=" + encodeURIComponent(cli) + "&session=" + encodeURIComponent(sessionID) + "&schema=" + encodeURIComponent("mbx.status/v2") + "&include=inbox";
+  "http://127.0.0.1:" + port + "/v1/status?cli=" + encodeURIComponent(cli) + "&session=" + encodeURIComponent(sessionID) + "&schema=" + encodeURIComponent(STATUS_V2_SCHEMA) + "&include=inbox";
 
 /** Fetch seam: tests replace globalThis.__mbxFetch (read per call); production runs globalThis.fetch. */
 const fetchJson = async (url: string): Promise<unknown> => {

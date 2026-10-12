@@ -1,5 +1,9 @@
-// Daemon sync client (T262, T468). One POST writer, one seq per host. No network call
-// unless a local link record exists, and no bearer token. SyncAck cannot turn the path or lead opt-in on.
+// Daemon sync client (T262, T468, T446). One POST writer, one seq per host. No network call
+// unless a local link record exists, and no bearer token. A SyncAck never turns project_paths on.
+// An in-range SyncAck stores the cloud's contract range, clamped to CONTRACT_VERSION and never
+// below the contract just spoken. A stored max of at least 2 sets project_leads. An out-of-range
+// ack whose range overlaps contracts 1..CONTRACT_VERSION stores that clamped range and leaves
+// project_leads set. A range that does not overlap, such as {3,4}, does not change the link.
 import { createHash, randomBytes } from "node:crypto";
 import {
   CONTRACT_VERSION, PATH_FLAG_PREFIX, PROJECT_LEADS_SINCE, PROJECT_PATHS_SINCE, projectSync, type Projection, type SyncSnapshot,
@@ -15,7 +19,7 @@ export interface SyncLink {
   contract: { min: number; max: number };
   /** Set by local enrolment when the spoken schema lists HostReport.project_paths. Never by a SyncAck. */
   project_paths?: boolean;
-  /** Set by local enrolment when the spoken schema lists HostReport.project_leads. Never by a SyncAck. */
+  /** Set when an in-range SyncAck stores a contract max >= 2. A later lower ack leaves it set; it is ignored below contract 2. A SyncAck never sets project_paths. */
   project_leads?: boolean;
 }
 
@@ -274,15 +278,52 @@ async function send(o: SyncDeps, link: SyncLink, state: SyncState, pending: Pend
   state.snapshot_hash = pending.snapshotHash;
   state.sent_receipts = [...new Set([...state.sent_receipts, ...pending.receiptKeys])];
   const range = ack.contract;
-  if (range && typeof range.min === "number" && typeof range.max === "number" && (CONTRACT_VERSION < range.min || CONTRACT_VERSION > range.max)) {
+  const sent = sentContract(pending.body);
+  // Compare the contract this batch spoke, not CONTRACT_VERSION. A link capped at 1
+  // speaks 1, and an old cloud that acks max 1 still accepts that batch.
+  // An out-of-range ack that still overlaps a contract this daemon can speak follows
+  // the cloud, so the next batch is inside the range. Anything else stays put.
+  if (range && typeof range.min === "number" && typeof range.max === "number" && sent !== null && (sent < range.min || sent > range.max)) {
     state.force_full = true;
     writeState(o.kv, state);
+    rememberAck(o.kv, sent, range, true);
     o.audit?.("sync.contract", { code: "sync.contract" });
     return { outcome: "sync.contract" };
   }
+  rememberAck(o.kv, sent, range);
   writeState(o.kv, state);
   o.audit?.("sync.batch", { seq: pending.seq, outcome: "acked" });
   return { outcome: "acked", seq: pending.seq };
+}
+
+function sentContract(body: string): number | null {
+  try {
+    const n = (JSON.parse(body) as { contract?: unknown }).contract;
+    return typeof n === "number" ? n : null;
+  } catch { return null; }
+}
+
+/** Store an ack's contract. An in-range ack never excludes the contract just spoken. An overlapping out-of-range ack follows the cloud. Never writes project_paths, and never clears project_leads. */
+function rememberAck(kv: Kv, sent: number | null, range: { min?: unknown; max?: unknown } | undefined, followCloud = false): void {
+  if (!range || typeof range.min !== "number" || typeof range.max !== "number") return;
+  if (!Number.isInteger(range.min) || !Number.isInteger(range.max) || range.min < 1 || range.min > range.max) return;
+  const max = Math.min(range.max, CONTRACT_VERSION);
+  const min = range.min;
+  const overlaps = range.max >= 1 && range.min <= CONTRACT_VERSION;
+  if (followCloud) {
+    if (!overlaps) return;
+  } else if (sent === null || max < sent || min > sent) {
+    return;
+  }
+  const raw = kv.get(LINK_KEY);
+  if (!raw) return;
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return; }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+  const stored = parsed as Record<string, unknown>;
+  stored.contract = { min, max };
+  if (max >= PROJECT_LEADS_SINCE) stored.project_leads = true;
+  kv.set(LINK_KEY, JSON.stringify(stored));
 }
 
 function refusePathCommands(o: SyncDeps, commands: unknown): void {

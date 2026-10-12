@@ -17,7 +17,7 @@ import { parse as parseToml } from "smol-toml";
 import { fingerprint } from "./crypto.ts";
 import { claudePluginStep, execCli, type CliRunner } from "./claude-plugin.ts";
 import { version } from "./version.ts";
-import { opencodeSidebarPackageJson, opencodeSidebarServerSource, opencodeSidebarSource, OPENCODE_SIDEBAR_MARKER } from "./opencode-sidebar.ts";
+import { opencodeSidebarPackageJson, opencodeSidebarSchemaSource, opencodeSidebarServerSource, opencodeSidebarSource, OPENCODE_SIDEBAR_MARKER } from "./opencode-sidebar.ts";
 import { authHelperPath, canPrompt, createKeychainOwner, ownerInfo } from "./owner.ts";
 
 export const CLIS = ["claude", "codex", "opencode", "kimi", "hermes", "grok"] as const;
@@ -2054,6 +2054,7 @@ export function edits(ctx: SetupCtx, cli: CliId): Edit[] {
         { cli, kind: "sidebar", item: "tui.json plugin registration", path: opencodeTuiConfig(home), ...opencodeTuiPlugins(opencodeSidebarDir(home)) },
         { cli, kind: "sidebar", item: "packaged plugin package.json", path: join(opencodeSidebarDir(home), "package.json"), ...opencodeSidebarPackage(opencodeSidebarPackageJson()) },
         { cli, kind: "sidebar", item: "packaged plugin server.ts", path: join(opencodeSidebarDir(home), "server.ts"), ...opencodeSidebarFile(opencodeSidebarServerSource(), false) },
+        { cli, kind: "sidebar", item: "packaged plugin status-schema.ts", path: join(opencodeSidebarDir(home), "status-schema.ts"), ...opencodeSidebarFile(opencodeSidebarSchemaSource(), false) },
         { cli, kind: "sidebar", item: "packaged plugin tui.ts", path: join(opencodeSidebarDir(home), "tui.ts"), ...opencodeSidebarFile(opencodeSidebarSource(version()), true) },
       ];
     case "kimi": {

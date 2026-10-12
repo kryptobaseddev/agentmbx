@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { edits, headerOnlyDiff, opencodePluginSource, opencodeSidebarDir, opencodeTuiConfig, runSetup, versionOnlyPackageDiff, wired, type SetupCtx } from "../src/setup.ts";
-import { opencodeSidebarPackageJson, opencodeSidebarSource, OPENCODE_SIDEBAR_MARKER } from "../src/opencode-sidebar.ts";
+import { opencodeSidebarPackageJson, opencodeSidebarSchemaSource, opencodeSidebarSource, OPENCODE_SIDEBAR_MARKER } from "../src/opencode-sidebar.ts";
 import { version } from "../src/version.ts";
 import { parseJsonc, valueOf } from "../src/jsonc.ts";
 
@@ -27,12 +27,13 @@ const wf = (home: string, rel: string, body: string) => {
 test("T411: install wires the sidebar package + tui.json registration; idempotent", () => {
   const home = fakeHome();
   const rows = runSetup(ctxFor(home), { mode: "install", only: ["opencode"], stamp: "S1" });
-  const side = rows.filter((r) => r.cli === "opencode" && ["tui.json plugin registration", "packaged plugin package.json", "packaged plugin server.ts", "packaged plugin tui.ts"].includes(r.item));
-  assert.ok(side.length >= 4, "four sidebar rows");
+  const side = rows.filter((r) => r.cli === "opencode" && ["tui.json plugin registration", "packaged plugin package.json", "packaged plugin server.ts", "packaged plugin status-schema.ts", "packaged plugin tui.ts"].includes(r.item));
+  assert.equal(side.length, 5, "registration and four managed files");
   assert.ok(side.every((r) => r.action === "added"), "all added");
-  // The three files, with the managed marker, and the tui.json registration pointing at the dir.
+  // The four files, with the managed marker, and the tui.json registration pointing at the dir.
   const dir = opencodeSidebarDir(home);
-  for (const f of ["package.json", "server.ts", "tui.ts"]) assert.ok(existsSync(join(dir, f)), f);
+  for (const f of ["package.json", "server.ts", "status-schema.ts", "tui.ts"]) assert.ok(existsSync(join(dir, f)), f);
+  assert.equal(readFileSync(join(dir, "status-schema.ts"), "utf8"), opencodeSidebarSchemaSource());
   assert.ok(rd(home, ".config/opencode/plugins/agentmbx-sidebar/tui.ts").startsWith(OPENCODE_SIDEBAR_MARKER));
   const tui = JSON.parse(rd(home, ".config/opencode/tui.json"));
   assert.deepEqual(tui.plugin, [dir]);
@@ -42,6 +43,25 @@ test("T411: install wires the sidebar package + tui.json registration; idempoten
   const again = runSetup(ctxFor(home), { mode: "install", only: ["opencode"], stamp: "S2" });
   assert.ok(again.every((r) => r.action === "unchanged"), JSON.stringify(again));
   assert.equal(rd(home, ".config/opencode/plugins/agentmbx-sidebar/tui.ts"), opencodeSidebarSource(version()));
+});
+
+test("T399 AC5: a stale canonical companion is refreshed and a foreign one is preserved", () => {
+  const home = fakeHome(), ctx = ctxFor(home);
+  try {
+    runSetup(ctx, { mode: "install", only: ["opencode"], stamp: "C1" });
+    const path = join(opencodeSidebarDir(home), "status-schema.ts");
+    writeFileSync(path, `${OPENCODE_SIDEBAR_MARKER}\n// older contract\n`);
+    const refreshed = runSetup(ctx, { mode: "install", only: ["opencode"], stamp: "C2" });
+    assert.equal(refreshed.find(r => r.path === path)?.action, "updated");
+    assert.equal(readFileSync(path, "utf8"), opencodeSidebarSchemaSource());
+    const foreign = "// owner custom schema module\nexport const custom = true;\n";
+    writeFileSync(path, foreign);
+    const refused = runSetup(ctx, { mode: "install", only: ["opencode"], stamp: "C3" });
+    assert.equal(refused.find(r => r.path === path)?.action, "manual");
+    assert.equal(readFileSync(path, "utf8"), foreign);
+    runSetup(ctx, { mode: "uninstall", only: ["opencode"], stamp: "C4" });
+    assert.equal(readFileSync(path, "utf8"), foreign, "uninstall never removes a foreign companion");
+  } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
 test("T411: tui.json keeps foreign entries, comments and formatting byte-for-byte; uninstall removes only ours", () => {
@@ -72,6 +92,7 @@ test("T411: tui.json keeps foreign entries, comments and formatting byte-for-byt
   runSetup(ctxFor(home), { mode: "uninstall", only: ["opencode"], stamp: "U1" });
   assert.equal(rd(home, ".config/opencode/tui.json"), foreign, "byte-for-byte the user's file again");
   assert.ok(!existsSync(join(opencodeSidebarDir(home), "tui.ts")), "sidebar files removed");
+  assert.ok(!existsSync(join(opencodeSidebarDir(home), "status-schema.ts")), "canonical companion removed");
   assert.equal(rd(home, ".config/opencode/plugins/orca.ts"), "// the user's own plugin\nexport default {};\n", "foreign plugin untouched");
 });
 
@@ -134,9 +155,12 @@ test("doctor: the sidebar edits report wired through the generic kinds loop", as
   const ctx = ctxFor(home);
   runSetup(ctx, { mode: "install", only: ["opencode"], stamp: "S1" });
   const side = edits(ctx, "opencode").filter((e) => e.kind === "sidebar");
-  assert.equal(side.length, 4);
-  assert.ok(side.every(wired), "all four sidebar edits wired (files present + registered in the TUI plugin list)");
+  assert.equal(side.length, 5);
+  assert.ok(side.every(wired), "registration and all four managed files wired");
+  rmSync(join(opencodeSidebarDir(home), "status-schema.ts"));
+  assert.ok(!side.every(wired), "a missing canonical companion is not wired");
+  runSetup(ctx, { mode: "install", only: ["opencode"], stamp: "S2" });
+  assert.ok(side.every(wired), "setup restores the missing canonical companion");
   rmSync(join(opencodeSidebarDir(home), "tui.ts"));
   assert.ok(!side.every(wired), "a missing file is not wired");
 });
-
