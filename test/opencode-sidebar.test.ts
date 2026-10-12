@@ -8,7 +8,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { opencodeSidebarSource, opencodeSidebarServerSource, opencodeSidebarPackageJson, OPENCODE_SIDEBAR_MARKER } from "../src/opencode-sidebar.ts";
+import { spawnSync } from "node:child_process";
+import { opencodeSidebarSource, opencodeSidebarSchemaSource, opencodeSidebarServerSource, opencodeSidebarPackageJson, OPENCODE_SIDEBAR_MARKER } from "../src/opencode-sidebar.ts";
 import { version } from "../src/version.ts";
 import { STATUS_V2_SCHEMA, type StatusV2 } from "../src/status-schema.ts";
 
@@ -48,6 +49,7 @@ async function loadPlugin(): Promise<{
 }> {
   const dir = mkdtempSync(join(tmpdir(), "mbx-sidebar-eval-"));
   const file = join(dir, "agentmbx-sidebar.ts");
+  writeFileSync(join(dir, "status-schema.ts"), opencodeSidebarSchemaSource());
   writeFileSync(file, opencodeSidebarSource(version()));
   try {
     const mod = (await import(file)) as Awaited<ReturnType<typeof loadPlugin>>["mod"];
@@ -62,6 +64,32 @@ test("generated source carries the marker, targets sidebar.content, and reads th
   assert.ok(src.includes("mbx.status/v2"), "asks the endpoint for mbx.status/v2");
   assert.ok(src.includes("/v1/status?cli="), "the T407 loopback endpoint");
   assert.ok(!src.includes("resolveStatusIdentity") && !src.includes("SELECT "), "renders only — zero status derivation of its own");
+});
+
+test("T399 AC5: generated plugin imports the canonical v2 contract without an inline model", () => {
+  const source = opencodeSidebarSource(version());
+  assert.match(source, /import \{ STATUS_V2_SCHEMA, type StatusV2, type StatusV2WithInbox \} from "\.\/status-schema.ts"/);
+  assert.match(source, /type Snapshot = StatusV2 & StatusV2WithInbox;/);
+  assert.doesNotMatch(source, /type Snapshot = \{|interface StatusV2/);
+  const canonical = readFileSync(new URL("../src/status-schema.ts", import.meta.url), "utf8").split("// ---- mbx.agents/v1")[0].trim()
+    + "\n\n" + readFileSync(new URL("../src/status-inbox.ts", import.meta.url), "utf8").split("\n").slice(2).join("\n").trim() + "\n";
+  const companion = opencodeSidebarSchemaSource();
+  assert.ok(companion.startsWith(OPENCODE_SIDEBAR_MARKER));
+  assert.equal(companion.slice(companion.indexOf("\n") + 1), canonical, "embedded canonical contract must be updated whenever the source changes");
+});
+
+test("T399 AC5: generated plugin typechecks against its shipped canonical companion", async t => {
+  const plugin = await loadPlugin();
+  t.after(() => rmSync(plugin.dir, { recursive: true, force: true }));
+  // Only the host-owned JSX seam is declared; all status types must come from the companion.
+  const host = join(plugin.dir, "host.d.ts");
+  writeFileSync(host, 'declare module "@opentui/solid/jsx-runtime" { export const jsx: (type: string, props: Record<string, unknown>) => unknown; }\n');
+  const result = spawnSync(join(process.cwd(), "node_modules/.bin/tsc"), [
+    "--noEmit", "--strict", "--skipLibCheck", "--allowImportingTsExtensions", "--module", "nodenext",
+    "--target", "es2022", "--types", "node", "--typeRoots", join(process.cwd(), "node_modules/@types"),
+    host, join(plugin.dir, "agentmbx-sidebar.ts"),
+  ], { encoding: "utf8", timeout: 60_000, cwd: plugin.dir });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
 });
 
 test("formatStatusV2 renders the bound fixture line-for-line", async () => {

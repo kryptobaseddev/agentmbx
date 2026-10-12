@@ -140,8 +140,14 @@ export function writeHud(node: MbxNode, now = Date.now()): void {
     return { ...base, resolved_by: resolvedBy };
   };
   const pidDone = new Set<string>();
-  // One ps for every distinct pid, not one per row (review low 4).
-  const pids = [...new Set(rows.map((r) => r.pid).filter((p): p is number => !!p))];
+  // One ps for every distinct pid, not one per row (review low 4). Session rows record the
+  // harness parent; the lease holder is the MCP pid, and the v2 file has to verify that pid
+  // in the same pass (T572).
+  const holderPids = (node.store.db.prepare(
+    `SELECT l.holder_pid AS pid FROM identity_leases l
+     JOIN sessions s ON s.agent=l.name AND s.cli=l.cli AND s.session_id=l.session_id
+     WHERE l.released_at IS NULL AND l.holder_pid > 0`).all() as { pid: number }[]).map((r) => r.pid);
+  const pids = [...new Set([...rows.map((r) => r.pid).filter((p): p is number => !!p), ...holderPids])];
   const evidence = new Map<number, { alive: boolean | null; start: string | null }>();
   try {
     for (const [pid, ev] of inspectLeaseProcesses(pids)) evidence.set(pid, ev);
@@ -271,7 +277,7 @@ export function hudStatusV2(node: MbxNode, o: {
         ? {
             holder_cli: leaseRow.cli,
             holder_session: leaseRow.session_id,
-            verified: identityLeaseStatus(leaseRow, cached?.now ?? Date.now(), cached ? (cached.processes.get(leaseRow.holder_pid) ?? { alive: null, start: null }) : inspectLeaseProcess(leaseRow.holder_pid)).state === "live",
+            verified: identityLeaseStatus(leaseRow, cached?.now ?? Date.now(), cached?.processes.get(leaseRow.holder_pid) ?? inspectLeaseProcess(leaseRow.holder_pid)).state === "live",
           }
         : null,
     },

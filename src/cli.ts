@@ -61,7 +61,7 @@ import { publishIdentityControl, findIdentityControl, identityControlReceipt, re
 import { armDaemonSync } from "./sync-daemon.ts";
 import { armConversationLoopReports } from "./loop-detector.ts";
 import { mcpStarting } from "./mcp-startup.ts";
-import { hookDisconnectedNote } from "./hook-connection.ts";
+import { hookDisconnectedNote, hookResumingNote } from "./hook-connection.ts";
 import { projectLabel, projectMailboxBySlot, projectsLedBy } from "./project-mailbox.ts";
 import { isSlotName } from "./project-slot.ts";
 
@@ -997,7 +997,7 @@ If the codes differ, do not approve: someone is in the middle.`);
       let lastAddrs = addrSignature(node), lastBeacon = 0;
       const beacon = () => { const sig = addrSignature(node); if (sig !== lastAddrs || Date.now() - lastBeacon > 300_000) { lastAddrs = sig; lastBeacon = Date.now(); void sendPresence(node).catch(() => {}); } };
       setInterval(beacon, 10_000).unref(); setTimeout(() => { lastBeacon = 0; beacon(); }, 2_000).unref();
-      setInterval(() => { void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node); void healStuckPeers(node, () => browse(3_000)).then(() => sendPresence(node, fetch, stuckHosts(node))).catch(() => {}); try { node.pruneDeadSessions(); } catch { /* db busy: next minute */ } try { node.sweepStaleRows(); } catch { /* db busy: next minute */ } try { escalateUnheldMail(node, Date.now(), (subtitle, body) => void notifyDesktop({ subtitle, body })); } catch { /* db busy: next minute */ } }, 60_000); void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node);
+      setInterval(() => { void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node); void healStuckPeers(node, () => browse(3_000)).then(() => sendPresence(node, fetch, stuckHosts(node))).catch(() => {}); try { node.pruneDeadSessions(); } catch { /* db busy: next minute */ } try { node.sweepStaleRows(); } catch { /* db busy: next minute */ } try { node.expirePendingPeers(); } catch { /* db busy: next minute */ } try { escalateUnheldMail(node, Date.now(), (subtitle, body) => void notifyDesktop({ subtitle, body })); } catch { /* db busy: next minute */ } }, 60_000); void refreshDirectory(node); void pullPolicies(node); void refreshPeerEncKeys(node);
       // a policy about to lapse: one desktop reminder, 48 h ahead, with the renew command (only where the owner key is)
       const remind = () => { try { if (!node.ownerPub) return; for (const p of dueReminders(node.store.db)) void notifyDesktop({ subtitle: "Policy expires soon",
         body: `${policySummary(p)} expires ${p.exp.slice(0, 16).replace("T", " ")}Z. Renew: agentmbx policy renew ${p.id.slice(-6)}` }); } catch { /* db busy */ } };
@@ -1632,6 +1632,12 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
     const link = multi && !linked ? bindInstruction(issueBindTicket(node.store, { cli, session_id: sid, cwd, parent_pid: process.ppid })) : null;
     // A dedicated provider process tells its mbx server which session it is, so a resumed session gets its identity back.
     if (!multi && !["codex", "opencode"].includes(cli)) try { recordSessionHint(node.store, cli, process.ppid, inspectLeaseProcess(process.ppid).start, sid); } catch { /* advisory */ }
+    // T573: a resumed process whose mbx server has not connected yet keeps its identity; say so instead of "lost" or "unbound".
+    const resuming = grokUnboundPost ? null : hookResumingNote(node, cli, sid, process.ppid);
+    if (resuming) {
+      if (cli !== "hermes" || event !== "session-start") emit(cli, event === "session-start" ? "SessionStart" : "UserPromptSubmit", resuming);
+      return;
+    }
     // Guidance on session start; Kimi drops SessionStart context, so a Kimi session gets it once on its first prompt.
     // Kimi and Hermes drop SessionStart output, so their first prompt carries the guidance (Hermes: pre_llm_call context).
     const guided = `guided:${cli}:${sid}`, first = (cli === "kimi" || cli === "hermes") && !node.store.get(guided);

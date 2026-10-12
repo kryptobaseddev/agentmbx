@@ -31,7 +31,16 @@ The tag must match `package.json`; the workflow refuses to build otherwise.
 |-----|---------|------|
 | `build` | `macos-14` (darwin-arm64), `macos-15-intel` (darwin-x64), `ubuntu-24.04` (linux-x64), `ubuntu-24.04-arm` (linux-arm64) | `npm ci`, `npm test`, typecheck, `node scripts/build-sea.mjs`, `node scripts/smoke-sea.mjs` (init, send, inbox, MCP initialize over stdio), upload `agentmbx-<platform>` |
 | `release` | ubuntu | `scripts/make-manifest.mjs` writes `SHA256SUMS` and `manifest.json`; `scripts/sign-manifest.mjs` writes `manifest.json.sig` with the `RELEASE_SIGNING_KEY` secret; `gh release create` uploads the four binaries, `SHA256SUMS`, `manifest.json`, `manifest.json.sig` and `install.sh` |
-| `npm` | ubuntu | `npm publish --provenance`, only when the `NPM_TOKEN` secret exists |
+| `npm` | ubuntu | `npm publish --provenance` through npm trusted publishing (GitHub OIDC, no token), then installs the published version in a scratch `HOME` and checks `agentmbx --version` |
+
+npm publishing uses trusted publishing: the `agentmbx` package on npmjs.com trusts this repository's
+`release.yml` (Settings → Trusted Publisher → GitHub Actions, owner `kryptobaseddev`, repository `agentmbx`,
+workflow `release.yml`), and its publishing access is "require two-factor authentication and disallow tokens".
+There is no npm secret. Renaming `release.yml` breaks the trust binding. A version can never be published twice:
+if `npm view` lags after a publish, wait; never re-publish.
+
+Pull requests run CI on Linux only. macOS runs on every push to `main` and in the release build; before tagging,
+run the macOS-sensitive suites on a Mac.
 
 `manifest.json`:
 
