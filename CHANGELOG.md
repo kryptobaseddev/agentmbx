@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **A concurrently started MCP on macOS is no longer refused as a duplicate reader of another connection (T564).** macOS reports stdio sockets with device -1 and an inode that separate live connections can share (in a 20-way concurrent probe, 6 of 800 distinct connections collided and were refused, so their clients saw `MCP error -32000: Connection closed`). When the fstat key's live owner is another process, the claim now compares both processes' fd 0/1 kernel addresses with one `lsof` call: the same sockets stay a duplicate (T488), a different connection claims its own address-qualified key, and unreadable addresses keep serving. Linux and uncontended starts run no `lsof`.
+
 - **`whoami.harness_session` follows the hook-bound session after an in-place upgrade (T571).** A server whose lease still carries the provisional `mcp-<pid>` id while this provider's hooks have bound exactly one real session now reports that session as `harness_session` — the id the statusline, HUD, `agentmbx status` and the endpoint key on — instead of the lease id. Report-only: `state.sessionId`, the lease and the resolver are unchanged, and `session`/`lease_key` still carry the lease key fingerprint.
 
 ## 0.5.27 (2026-10-11)
