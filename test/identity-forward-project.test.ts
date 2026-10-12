@@ -327,10 +327,9 @@ test("T495 AC3: an expired, revoked, replaced or other-host lead record is not a
   const second = w.lead(w.A, "alpha-w2");
   assert.equal(ok(), false, "replaced by another lead");
   assert.deepEqual(projectsLedBy(w.n, "alpha-lead").map((m) => m.key), [], "and the single lookup agrees");
-  // Revoked: lead records are a stack (the newest unrevoked, unexpired one is the lead), so revoking the replacement alone would
-  // bring the previous record back; the owner revokes both to leave the project with no lead.
+  // T562: a revoked replacement stays the head; the prior designation never silently regains authority.
   const rv2 = makeLeadRevocation(second.id, w.owner.publicKey); revokeLead(w.n, rv2, w.sign(rv2));
-  assert.equal(ok(), true, "revoking only the replacement makes the previous, never-revoked record the lead again (lead-record.ts leadFor)");
+  assert.equal(ok(), false, "revoking the replacement leaves no lead instead of reviving the prior designation");
   reset();
   const rv1 = makeLeadRevocation(w.leadRec.id, w.owner.publicKey); revokeLead(w.n, rv1, w.sign(rv1));
   assert.equal(ok(), false, "revoked");
