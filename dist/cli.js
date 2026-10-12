@@ -19,6 +19,7 @@ import { STATUS_V2_SCHEMA } from "./status-schema.js";
 import { detectHost, HERMES_WATCHER_INSTRUCTION, HERMES_WATCHER_REMINDER, MCP_HEARTBEAT_MS, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
 import { HERMES_NAG_MS, hermesHookInput, hermesHookOutput } from "./hermes-hook.js";
 import { resumeNotice, takeResumeEntry } from "./resume-notice.js";
+import { missedCount } from "./catchup.js";
 import { ancestors, processEvidenceSpawns, withProcSnapshot } from "./proc.js";
 import { bumpPostToolMarkersForAgent, readPostToolMarker, writePostToolLast } from "./posttool.js";
 import { resolveStatusIdentity } from "./status-identity.js";
@@ -1809,6 +1810,10 @@ async function hook(node, event, cli) {
     // Every line starts with [mbx] so OpenCode's plugin keeps the whole list (it drops a run at the first other line).
     const unbound = `${formatUnboundStart(node.home, projectOf(cwd) ?? undefined).split("\n").map(line => `[mbx] ${line}`).join("\n")}\n[mbx] When the owner ends this session or hands it off, call mbx_identity release after your final mailbox work.`;
     const held = (agent) => `[mbx] You are ${agent}@${node.host}${((r) => r ? ` (role: ${r.role})` : "")(registeredIdentity(node.store, agent))}. When the owner ends this session or hands it off, call mbx_identity release after your final mailbox work; finishing a turn is not ending a session.`;
+    // T187: only native session.created establishes an entry. Ordinary shared-serve activity is NOT resume.
+    const ocEntry = cli === "opencode" && sid && /^[A-Za-z0-9_-]{1,128}$/.test(sid) ? `resume-pending:opencode:${sid}` : null;
+    if (ocEntry && event === "session-start" && input.mbx_entry === "created")
+        node.store.set(ocEntry, "created");
     // T189/T185: record this provider process's entry into the session (src/resume-notice.ts); true for a new entry. pid and its
     // start time come from the sessions row bindSession just wrote, so this spawns nothing.
     const enteredNow = (session) => {
@@ -1848,6 +1853,19 @@ async function hook(node, event, cli) {
                 node.store.set(activityKey(agent), JSON.stringify({ at: Date.now(), shared: ["codex", "opencode"].includes(cli) || (cli === "kimi" && kimiMultiHost(process.ppid)) }));
             }
             catch { /* advisory */ }
+            if (ocEntry && sid && ["session-start", "prompt", "post-tool"].includes(event) && node.store.get(ocEntry) === "created") {
+                const noticed = `resume-noticed:opencode:${sid}:${agent}`;
+                if (!node.store.get(noticed)) {
+                    // The shared helper records provenance, but its per-PID last-sid value cannot dedup interleaved conversations.
+                    enteredNow(sid);
+                    const unread = node.unreadCount(agent), missed = missedCount(node.store, agent).missed;
+                    if (unread || missed) {
+                        const identity = held(agent) + (unread ? `\n[mbx] ${unread} unread mbx message(s): call mbx_inbox.` : "");
+                        console.log(JSON.stringify({ mbx_resume: { session_id: sid, text: resumeNotice(node.store, agent, identity) } }));
+                    }
+                    node.store.set(noticed, "created"); // emitted or deliberately silent (D7), not a read/ACK or delivery receipt
+                }
+            }
             if (event === "session-start") {
                 // T185: a bound Claude SessionStart is itself the entry (startup, resume, clear, compact; T184 spec C1): it carries the
                 // resume notice even on an unchanged id, because /clear and /compact do not re-send the MCP instructions. A fork only
