@@ -245,3 +245,96 @@ test("T553: project catch-up starts at the current end and does not move the per
   assert.equal(w.stateOf(fresh, slot), "delivered");
   assert.equal(w.kv(personalKey), personalStored);
 });
+
+test("T553: a personal cursor cannot page the slot, and a slot cursor cannot page the personal mailbox", async (t) => {
+  const w = world(t);
+  w.designate("agentmbx-lead");
+  w.send(["agentmbx"]);
+  w.send(["agentmbx-lead"], { subject: "personal note", body: "only for the lead persona" });
+  const lead = await w.connect("agentmbx-lead");
+  const project = parsed(await call(lead, "mbx_replay", { project_mailbox: "agentmbx" }));
+  const own = parsed(await call(lead, "mbx_replay"));
+  const crossed: Array<[Record<string, unknown>, string]> = [
+    [{ project_mailbox: "agentmbx", cursor: own.next_cursor }, "personal cursor on the slot"],
+    [{ cursor: project.next_cursor }, "slot cursor on the personal mailbox"],
+  ];
+  for (const [args, label] of crossed) {
+    const result = await call(lead, "mbx_replay", args);
+    assert.equal(result.isError, true, label);
+    const body = parsed(result);
+    assert.equal(body.error?.code, "CURSOR_SCOPE_MISMATCH", label);
+    assert.equal(body.messages, undefined, label);
+    assert.equal(body.next_cursor, undefined, label);
+  }
+});
+
+test("T553: a replaced lead cannot replay or catch up with the cursor it held", async (t) => {
+  const w = world(t);
+  w.designate("agentmbx-lead", new Date(Date.now() - 2000));
+  w.send(["agentmbx"]);
+  const lead = await w.connect("agentmbx-lead");
+  const page = parsed(await call(lead, "mbx_replay", { project_mailbox: "agentmbx" }));
+  const caught = parsed(await call(lead, "mbx_catchup", { project_mailbox: "agentmbx", restart: "all" }));
+  w.designate("agentmbx-second", new Date());
+  assert.equal(await refusal(lead, "mbx_replay", { project_mailbox: "agentmbx", cursor: page.next_cursor }), "no project mailbox");
+  assert.equal(await refusal(lead, "mbx_catchup", { project_mailbox: "agentmbx", cursor: caught.next_cursor }), "no project mailbox");
+  assert.equal(await refusal(lead, "mbx_catchup", { project_mailbox: "agentmbx", commit: caught.next_cursor }), "no project mailbox");
+});
+
+test("T553: a revoked or expired head does not revive an older lead through a cursor that lead stored", async (t) => {
+  const revoked = world(t);
+  revoked.designate("agentmbx-lead", new Date(Date.now() - 10_000));
+  revoked.send(["agentmbx"]);
+  const older = await revoked.connect("agentmbx-lead");
+  const held = parsed(await call(older, "mbx_replay", { project_mailbox: "agentmbx" }));
+  const head = revoked.designate("agentmbx-second", new Date(Date.now() - 1000));
+  revoked.revoke(head.id);
+  assert.equal(await refusal(older, "mbx_replay", { project_mailbox: "agentmbx", cursor: held.next_cursor }), "no project mailbox");
+  assert.equal(await refusal(older, "mbx_catchup", { project_mailbox: "agentmbx", cursor: held.next_cursor }), "no project mailbox");
+
+  const expired = world(t);
+  expired.designate("agentmbx-lead", new Date(Date.now() - 86_400_000));
+  expired.send(["agentmbx"]);
+  const prior = await expired.connect("agentmbx-lead");
+  const priorPage = parsed(await call(prior, "mbx_replay", { project_mailbox: "agentmbx" }));
+  expired.designate("agentmbx-second", new Date(Date.now() - 5_000), 1000);
+  assert.equal(await refusal(prior, "mbx_replay", { project_mailbox: "agentmbx", cursor: priorPage.next_cursor }), "no project mailbox");
+  assert.equal(await refusal(prior, "mbx_catchup", { project_mailbox: "agentmbx" }), "no project mailbox");
+});
+
+test("T553: committing the project checkpoint leaves the personal checkpoint byte for byte", async (t) => {
+  const w = world(t);
+  const slot = slotFor(CLEO_ID);
+  w.designate("agentmbx-lead");
+  const lead = await w.connect("agentmbx-lead");
+  const personal = parsed(await call(lead, "mbx_catchup"));
+  const personalKey = catchupKey("agentmbx-lead");
+  const before = w.kv(personalKey);
+  parsed(await call(lead, "mbx_catchup", { project_mailbox: "agentmbx" }));
+  const arrived = w.send(["agentmbx"]);
+  const page = parsed(await call(lead, "mbx_catchup", { project_mailbox: "agentmbx" }));
+  assert.deepEqual(ids(page), [arrived]);
+  const committed = parsed(await call(lead, "mbx_catchup", { project_mailbox: "agentmbx", commit: page.next_cursor }));
+  assert.equal(committed.noop, false);
+  assert.equal(w.kv(personalKey), before);
+  assert.equal(parsed(await call(lead, "mbx_catchup")).catchup!.position, personal.catchup!.position);
+  assert.equal(JSON.parse(w.kv(projectCatchupKey(slot))!).position, committed.to);
+});
+
+test("T553: replaying or fetching project mail does not acknowledge it", async (t) => {
+  const w = world(t);
+  const slot = slotFor(CLEO_ID);
+  w.designate("agentmbx-lead");
+  const mailed = w.send(["agentmbx"]);
+  const lead = await w.connect("agentmbx-lead");
+  assert.equal(w.stateOf(mailed, slot), "delivered");
+  const replayed = parsed(await call(lead, "mbx_replay", { project_mailbox: "agentmbx" }));
+  assert.deepEqual(ids(replayed), [mailed]);
+  assert.equal(w.stateOf(mailed, slot), "delivered");
+  const restarted = parsed(await call(lead, "mbx_catchup", { project_mailbox: "agentmbx", restart: "all" }));
+  assert.equal(restarted.position, 0);
+  const fetched = parsed(await call(lead, "mbx_catchup", { project_mailbox: "agentmbx" }));
+  assert.deepEqual(ids(fetched), [mailed]);
+  assert.equal(fetched.catchup!.position, 0);
+  assert.equal(w.stateOf(mailed, slot), "delivered");
+});
