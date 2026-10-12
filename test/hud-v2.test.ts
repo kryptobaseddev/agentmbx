@@ -46,6 +46,20 @@ test("T405: v2 and v1 are emitted together, private, content-compared, refreshed
   assert.deepEqual(readdirSync(hudDir(f.home)), [".alive"]);
 });
 
+test("T572: the v2 file verifies the lease holder when it is not the session pid", t => {
+  const f = fixture(); t.after(f.close);
+  assert.notEqual(process.pid, process.ppid);
+  const start = inspectLeaseProcess(process.pid).start;
+  assert.ok(start);
+  f.node.bindSession({ agent: "drum", cli: "grok", session_id: "session-a", pid: process.ppid, session_key: "session-a" });
+  new IdentityLeases(f.node.store).claim("drum", { pid: process.pid, start, keyFp: "aaaa-bbbb-cccc-dddd", cli: "grok", sessionId: "session-a" });
+  writeHud(f.node);
+  const file = read(hudSessionV2Path(f.home, "grok", "session-a"));
+  const direct = hudStatusV2(f.node, { cli: "grok", sessionId: "session-a", agent: "drum", state: "bound", resolvedBy: "session_id" });
+  assert.equal(direct.registration.lease?.verified, true);
+  assert.equal(file.registration.lease.verified, direct.registration.lease?.verified);
+});
+
 test("T405: shared PID sessions keep separate mailboxes and unknown sessions remain unbound", t => {
   const f = fixture(); t.after(f.close); f.bind("one", "a"); f.bind("other", "b");
   f.node.send({ from: "boss", to: ["one"], subject: "mail", body: "b" }); writeHud(f.node);
