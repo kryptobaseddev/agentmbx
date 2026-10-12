@@ -1539,8 +1539,9 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
         // T189: on_session_start output is dropped and a resume does not fire it, so the first bound turn of each entry (a new
         // conversation, --resume, /new, /resume, a compression's new id) carries the bounded resume notice (T184 spec R5-R9).
         // T185: the same deferral for a Claude entry whose SessionStart ran unbound or still resuming (C3: prompts only, never
-        // PostToolUse, whose wrapper must stay node-free).
-        if (event === "prompt" && (cli === "hermes" || cli === "claude") && sid && enteredNow(sid)) lines.push(resumeNotice(node.store, agent, held(agent)));
+        // PostToolUse, whose wrapper must stay node-free). T188: Kimi drops SessionStart output too (binding-only), so each Kimi
+        // entry (a new conversation, --continue/--session, a /clear rotation, a hosted bind-ticket link) rides its first bound prompt.
+        if (event === "prompt" && (cli === "hermes" || cli === "claude" || cli === "kimi") && sid && enteredNow(sid)) lines.push(resumeNotice(node.store, agent, held(agent)));
         // T460: Hermes drops on_session_start output, and a finished watcher is what wakes it: say so while none runs (bounded).
         if (event === "prompt" && cli === "hermes" && !liveWatcher(node, agent)) {
           const w = hermesWatcherNote(node, agent, sid ?? process.ppid, !!delegationNote(node.store.db, agent, node.host));
