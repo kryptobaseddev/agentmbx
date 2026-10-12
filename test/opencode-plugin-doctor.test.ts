@@ -68,8 +68,8 @@ test("T412: version-only header/package changes are current, not stale", async t
   assert.equal((await f.check())[0].level, "ok");
 });
 
-test("T412: outdated managed and foreign plugin files have different non-destructive guidance", async t => {
-  const f = fixture(t), path = join(opencodeSidebarDir(f.home), "tui.ts"), current = readFileSync(path, "utf8");
+for (const name of ["tui.ts", "status-schema.ts"]) test(`T412: outdated managed and foreign ${name} have different non-destructive guidance`, async t => {
+  const f = fixture(t), path = join(opencodeSidebarDir(f.home), name), current = readFileSync(path, "utf8");
   writeFileSync(path, current + "\n// outdated body\n");
   const stale = await f.check();
   assert.match(stale[0].label, /outdated managed wiring/);

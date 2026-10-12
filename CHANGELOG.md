@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **OpenCode's sidebar imports the canonical status contract (T399 AC5).** Setup ships a managed `status-schema.ts` companion, including the opt-in inbox extension, instead of an inline sidebar model; drift tests keep its embedded contract identical to the canonical sources, and doctor reports missing, stale, or foreign companions without changing live UI state.
+
 ## 0.5.27 (2026-10-11)
 
 A project now has its own mailbox: mail to the bare project name is stored once and read by the owner-signed lead, across paired hosts, and the wake dispatcher wakes only that lead; prune forwards a retired mailbox's unread mail into it and the lead moves mail within its own project without Touch ID. OpenCode calls without session metadata fail closed, agentmbx watch works inside an OpenCode session, and the OpenCode doctor checks no longer report historical overlaps as a live loop. agentmbx mcp exits cleanly after a failed startup and records one bounded error; leads can delegate read and edit, and policy text now separates outward-reversible (branch push, draft PR) from outward. Hosts sync an allowlisted status snapshot to the cloud read model.
