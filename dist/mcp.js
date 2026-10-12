@@ -1051,6 +1051,20 @@ async function configureMcp(server, node, startupClosed) {
             return false;
         }
     };
+    /**
+     * The real session ids this provider process's own hooks have bound (verified against the live process,
+     * provisional `mcp-*` ids excluded), or null when the caller is not this server's own conversation:
+     * hosted processes serve many conversations and link by bind ticket, and a shared transport's sole
+     * recorded binding is not caller attribution.
+     */
+    const hookBoundRealSessions = (state) => {
+        if (state !== base || hosted)
+            return null;
+        if (env.cli === "opencode")
+            return null;
+        const rows = node.store.db.prepare("SELECT session_id,pid_start,updated_at FROM sessions WHERE cli=? AND pid=? AND session_id NOT GLOB 'mcp-*'").all(env.cli, env.ppid).filter(r => node.sameSession(env.ppid, r, { proof: true }));
+        return [...new Set(rows.map(r => r.session_id))];
+    };
     /** The identity this session held before: by its provider session id, or by the session its own hooks reported. */
     const rememberedName = (state) => {
         if (!state.sessionId.startsWith("mcp-"))
@@ -1058,14 +1072,10 @@ async function configureMcp(server, node, startupClosed) {
         // A provisional id (terminal Kimi, a Claude session file not written yet): the provider's own hooks know the real
         // session of this parent process, from a verified hook binding (exactly one) or a session hint. Hosted processes
         // serve many conversations and link by bind ticket; shared transports name sessions per call.
-        if (state !== base || hosted)
+        const real = hookBoundRealSessions(state);
+        if (real === null)
             return null;
-        // Standalone tabs share a transport too; a sole recorded binding is not caller attribution.
-        if (env.cli === "opencode")
-            return null;
-        const rows = node.store.db.prepare("SELECT session_id,pid_start,updated_at FROM sessions WHERE cli=? AND pid=? AND session_id NOT GLOB 'mcp-*'").all(env.cli, env.ppid).filter(r => node.sameSession(env.ppid, r, { proof: true }));
-        const real = new Set(rows.map(r => r.session_id));
-        const hint = real.size === 1 ? [...real][0] : real.size || env.cli === "codex" || env.cli === "opencode" ? null
+        const hint = real.length === 1 ? real[0] : real.length || env.cli === "codex" || env.cli === "opencode" ? null
             : sessionHint(node.store, env.cli, env.ppid, leases.processEvidence(env.ppid).start);
         if (!hint)
             return null;
@@ -1640,12 +1650,16 @@ async function configureMcp(server, node, startupClosed) {
         const state = current();
         if (ticket)
             linkConversation(state, ticket);
+        // T571: after an in-place upgrade the lease can still carry the provisional `mcp-<pid>` id while this
+        // provider's hooks have bound the real session the statusline/HUD key on; report that, without mutating state.
+        const hookBound = state.sessionId.startsWith("mcp-") ? hookBoundRealSessions(state) : null;
+        const harnessSession = hookBound && hookBound.length === 1 ? hookBound[0] : state.sessionId;
         if (!bound(state)) {
             if (name)
                 return identityOperation({ action: registeredIdentity(node.store, name) || AUTO_NAME_RE.test(name) ? "claim" : "register", name, role, description });
             const list = listIdentityStatus(node.home, { project, caller: { cli: env.cli, sessionId: state.sessionId, pid: process.pid, providerPid: env.ppid, canonicalHarness: !!env.harnessProvider } });
             const leadView = projectLeadView(node, project);
-            const out = { agent: null, host: node.host, cli: env.cli, unbound: true, project: project ?? null, harness_session: state.sessionId,
+            const out = { agent: null, host: node.host, cli: env.cli, unbound: true, project: project ?? null, harness_session: harnessSession,
                 lead: leadView.address && leadView.exp ? { address: leadView.address, exp: leadView.exp } : null, pending: state.pending ?? null,
                 reason: state.lostTo ? `claimed by ${state.lostTo}` : state.pendingReason ?? null, next: unboundMessage(state),
                 project_identities: list.identities.map(i => ({ name: i.name, role: i.role, state: i.state, claimable: i.claimable, unread: i.unread, last_activity: i.last_activity, reason: i.reason })),
@@ -1698,7 +1712,8 @@ async function configureMcp(server, node, startupClosed) {
             ...((ps) => ps.length ? { project_mailboxes: ps } : {})(node.projectInboxes(agent, { limit: 1 }).map((s) => ({ project: projectLabel(s.project), key: s.project.key, unread: s.unread }))),
             // T548: `session` keeps its historical meaning (the lease key fingerprint) for old clients; the id the
             // statusline/HUD key on is the sessions-table session id, reported as `harness_session`; `lease_key` labels it.
-            cli: env.cli, session: fingerprint(key.publicKey), harness_session: state.sessionId, lease_key: fingerprint(key.publicKey),
+            // T571: with a provisional lease id, that is the hook-bound real session when exactly one proves out.
+            cli: env.cli, session: fingerprint(key.publicKey), harness_session: harnessSession, lease_key: fingerprint(key.publicKey),
             ...(state.coUse ? { co_use: CO_USE_NOTE } : {}),
             owner_grant: s.grant ? { caps: s.grant.caps, expires: s.grant.exp } : null, delivery: node.deliveryMode(agent), unread: node.unreadCount(agent),
             missed: missedCount(node.store, agent).missed,
