@@ -56,6 +56,7 @@ test("every MCP tool refuses an upgraded schema before its callback", async (t) 
     mbx_reply: { id: "missing", body: "test" }, mbx_send: { to: ["other"], subject: "test", body: "test" },
     mbx_thread: { id: "missing" }, mbx_search: { query: "test" }, mbx_sent: {}, mbx_project: {}, mbx_forward: { id: "missing", to: "nobody" },
     mbx_catchup: {},
+    mbx_handoff: {},
   };
   const tools = (await client.listTools()).tools;
   const holderPid = n.store.db.prepare("SELECT holder_pid FROM identity_leases WHERE released_at IS NULL").get()!.holder_pid;

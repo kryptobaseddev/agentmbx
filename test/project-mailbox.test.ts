@@ -420,6 +420,7 @@ const RATCHET: Record<string, { max: number; category: Category; why: string }> 
   "src/cli.ts": { max: 7, category: "by name (the caller's own mailbox)", why: "inbox/read/status/watch/hook paths all take an agent; the whole-store counter in `status` is an owner-level aggregate" },
   "src/diagnostics.ts": { max: 2, category: "by name (the caller's own mailbox)", why: "scoped to one mailbox argument" },
   "src/doctor.ts": { max: 1, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "strandedMail recognises slots and shows the lead's remedy instead of 'claim'" },
+  "src/handoff.ts": { max: 1, category: "by name (the caller's own mailbox)", why: "T159: mbx_handoff's open-thread context for the held identity (d.agent=?); lists threads, never mailbox names" },
   "src/hud.ts": { max: 2, category: "by name (the caller's own mailbox)", why: "counts for the session's own agent" },
   "src/identity-cleanup.ts": { max: 7, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "prune names exclude slots; a prune forward and a lead forward move one named mailbox's unread rows through moveUnread (T495); the owner-signed forward still refuses a slot at either end" },
   "src/identity-status.ts": { max: 1, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "identity listing" },
