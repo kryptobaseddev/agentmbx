@@ -208,6 +208,91 @@ test("T391 v2 setup: ctx.event.subscribe drives session-start and stop; ctx.tool
   } finally { restoreSpawn(); restoreFetch(); rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("T187: native creation routes bounded structured resume text only to its exact session", async () => {
+  const { mod, dir } = await loadPlugin(), calls: Spawned[] = [], notes: Note[] = [];
+  const restore = stubSpawn(calls, c => JSON.stringify({ mbx_resume: { session_id: c.input.session_id, text: "[mbx] worker@alpha: mbx_catchup" } }));
+  const { session } = stubSession(notes);
+  try {
+    await (mod.default.setup as (c: unknown) => Promise<() => unknown>)({
+      session, location: { directory: "/work" },
+      event: { subscribe: async function* () {
+        yield { type: "session.created", data: { info: { id: "ses_created", location: { directory: "/work" }, time: { created: 1, updated: 1 } } } };
+        yield { type: "session.created", data: { info: { id: "ses_foreign", location: { directory: "/elsewhere" } } } };
+        for (const type of ["session.status", "session.updated", "session.execution.started"]) yield { type, data: { sessionID: "ses_sibling" } };
+      } }, tool: { hook: () => undefined },
+    });
+    await new Promise(r => setTimeout(r, 50));
+    assert.equal(calls.length, 1, "candidate activity does not create a resume hook");
+    assert.equal(calls[0].input.mbx_entry, "created");
+    assert.equal(calls[0].input.cwd, "/work", "native Session.Info metadata scopes the hook without selecting identity by directory");
+    assert.equal(notes.length, 1); assert.equal(notes[0].sessionID, "ses_created");
+    assert.equal(notes[0].text, "[mbx] worker@alpha: mbx_catchup"); assert.equal(notes[0].resume, false);
+  } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("T187: failed admission retries on the next hook without another node spawn or cross-session delivery", async () => {
+  const { mod, dir } = await loadPlugin(), calls: Spawned[] = [], notes: Note[] = [];
+  const home = process.env.MBX_HOME;
+  process.env.MBX_HOME = dir;
+  mkdirSync(join(dir, "posttool"));
+  for (const ext of ["marker", "last"]) writeFileSync(join(dir, "posttool", `opencode-ses_retry.${ext}`), "same-marker");
+  const restore = stubSpawn(calls, c => c.args[1] === "session-start"
+    ? JSON.stringify({ mbx_resume: { session_id: c.input.session_id, text: "[mbx] worker@alpha: mbx_catchup" } }) : "");
+  let ready = false;
+  try {
+    const hooks = await mod.AgentMBXHooks({ directory: "/work", session: { synthetic: async (body: Note) => {
+      notes.push(body); if (!ready) throw new Error("not admitted"); return body;
+    } } }) as { event: (event: unknown) => Promise<void>; "tool.execute.after": (event: unknown) => Promise<void> };
+    await hooks.event({ event: { type: "session.created", properties: { info: { id: "ses_retry" } } } });
+    assert.equal(notes.length, 1); ready = true;
+    await hooks["tool.execute.after"]({ sessionID: "ses_sibling" });
+    assert.equal(notes.length, 1, "sibling never receives or drains another entry");
+    await hooks["tool.execute.after"]({ sessionID: "ses_retry" });
+    assert.equal(notes.length, 2); assert.equal(notes[0].id, notes[1].id);
+    assert.ok(notes.every(note => note.sessionID === "ses_retry" && note.resume === false));
+    await hooks["tool.execute.after"]({ sessionID: "ses_retry" });
+    assert.equal(notes.length, 2, "admitted entry is removed from pending");
+    assert.equal(calls.filter(c => c.args[1] === "session-start").length, 1);
+    assert.equal(calls.filter(c => c.args[1] === "post-tool" && c.input.session_id === "ses_retry").length, 0, "steady retries don't spawn node");
+  } finally {
+    if (home === undefined) delete process.env.MBX_HOME; else process.env.MBX_HOME = home;
+    restore(); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("T187: mismatched, oversized or non-MBX structured output never becomes context", async () => {
+  const { mod, dir } = await loadPlugin(), calls: Spawned[] = [], notes: Note[] = [];
+  const variants = [
+    { session_id: "ses_other", text: "[mbx] wrong thread" },
+    { session_id: "ses_safe", text: "[mbx] " + "x".repeat(1200) },
+    { session_id: "ses_safe", text: "[mbx] line\n".repeat(9) },
+    { session_id: "ses_safe", text: "untrusted body" },
+  ];
+  const restore = stubSpawn(calls, () => JSON.stringify({ mbx_resume: variants.shift() }));
+  try {
+    const hooks = await mod.AgentMBXHooks({ directory: "/work", ...stubSession(notes) }) as { event: (event: unknown) => Promise<void> };
+    for (let i = 0; i < 4; i++) await hooks.event({ event: { type: "session.created", properties: { info: { id: "ses_safe" } } } });
+    assert.deepEqual(notes, []);
+  } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("T187: a resolved native call with no receipt remains pending instead of claiming admission", async () => {
+  const { mod, dir } = await loadPlugin(), calls: Spawned[] = [], notes: Note[] = [];
+  const restore = stubSpawn(calls, c => c.args[1] === "session-start"
+    ? JSON.stringify({ mbx_resume: { session_id: "ses_no_receipt", text: "[mbx] worker@alpha: mbx_catchup" } }) : "");
+  let attempts = 0;
+  try {
+    const hooks = await mod.AgentMBXHooks({ directory: "/work", session: { synthetic: async (body: Note) => {
+      notes.push(body); return ++attempts === 1 ? {} : { data: { id: body.id } };
+    } } }) as { event: (event: unknown) => Promise<void>; "tool.execute.after": (event: unknown) => Promise<void> };
+    await hooks.event({ event: { type: "session.created", properties: { info: { id: "ses_no_receipt" } } } });
+    await hooks["tool.execute.after"]({ sessionID: "ses_no_receipt" });
+    assert.equal(notes.length, 2); assert.equal(notes[0].id, notes[1].id);
+    await hooks["tool.execute.after"]({ sessionID: "ses_no_receipt" });
+    assert.equal(notes.length, 2, "recognized data.id closes only the pending admission, not work completion");
+  } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("T466 OpenCode 2.0.24 turn end is session.execution.succeeded with data.sessionID and no location", async () => {
   const { mod, dir } = await loadPlugin();
   const calls: Spawned[] = [], notes: Note[] = [];
@@ -254,7 +339,7 @@ test("T391 B4(a): v1 factory session.created runs session-start with the sid (ge
     assert.equal(calls[0].args[2], "--cli");
     assert.equal(calls[0].args[3], "opencode");
     assert.equal(calls[0].input.session_id, "ses_eval1");
-    assert.equal(calls[0].input.cwd, "/work");
+    assert.equal(calls[0].input.cwd, "/work/proj", "native session metadata supplies the directory, not the shared plugin's directory");
     assert.equal(notes.length, 1, "the [mbx] note is injected (B2)");
     assert.equal(notes[0].sessionID, "ses_eval1", "injected into that session");
     assert.match(notes[0].text, /You are agentmbx-opencode/, "first line of the run");

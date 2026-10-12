@@ -1249,10 +1249,16 @@ const inject = async (ctx: NoteCtx, sid: string, hook: string, text: string): Pr
   const body = { sessionID: sid, id: noteId(sid, hook, text), text, resume: false, delivery: "queue" };
   const session = ctx?.session;
   try {
-    if (typeof session?.synthetic === "function") { await session.synthetic(body); return true; }
+    if (typeof session?.synthetic === "function") {
+      const result = await session.synthetic(body);
+      if (hook !== "resume-entry" || nativeMsgId(result)) return true;
+    }
   } catch { /* this host has no synthetic: try prompt with the same admission */ }
   try {
-    if (typeof session?.prompt === "function") { await session.prompt(body); return true; }
+    if (typeof session?.prompt === "function") {
+      const result = await session.prompt(body);
+      if (hook !== "resume-entry" || nativeMsgId(result)) return true;
+    }
   } catch { return false; }
   return false;
 };
@@ -1372,24 +1378,53 @@ const postToolSteady = (sid: string): boolean => {
 /** One hook call: the JSON payload goes in on stdin; stdout is captured; a reason we recognize is
  *  admitted through the hosting serve's session API. A failure never surfaces. The same call starts
  *  the standalone wake poll once the session id is known. */
-const call = async (ctx: NoteCtx, bin: string[], event: string, payload: Record<string, unknown>): Promise<void> => {
+const call = async (ctx: NoteCtx, bin: string[], event: string, payload: Record<string, unknown>, pending: Map<string, string>, sending: Set<string>): Promise<void> => {
   try {
     const sid = typeof payload.session_id === "string" ? payload.session_id : null;
     if (sid) watchWake(ctx, sid);
+    // T187: retry an unadmitted notice on an existing hook, without bypassing the zero-spawn fast path.
+    const deliver = async () => {
+      if (!sid || sending.has(sid)) return;
+      const text = pending.get(sid);
+      if (!text) return;
+      sending.add(sid);
+      try { if (await inject(ctx, sid, "resume-entry", text) && pending.get(sid) === text) pending.delete(sid); }
+      finally { sending.delete(sid); }
+    };
+    await deliver();
     if (event === "post-tool" && sid && postToolSteady(sid)) return;
     const out = await new Promise<string>((resolve) => spawnCli(bin, ["hook", event, "--cli", "opencode"], JSON.stringify(payload), resolve));
+    for (const line of out.split("\\n")) {
+      try {
+        const notice = JSON.parse(line).mbx_resume;
+        if (sid && notice?.session_id === sid && typeof notice.text === "string" && notice.text.length <= 1200
+          && notice.text.split("\\n").length <= 8 && notice.text.split("\\n").every((l: string) => l.startsWith("[mbx]"))) pending.set(sid, notice.text);
+      } catch { /* only our bounded, exact-session resume envelope counts */ }
+    }
+    await deliver();
     const reason = hookReason(out);
     if (reason && sid) await inject(ctx, sid, event, reason);
   } catch { /* hook failures must never surface in the host TUI */ }
 };
 
-const runFor = (ctx: NoteCtx, bin: string[], cwd: string | undefined) => (event: string, payload: Record<string, unknown>) => call(ctx, bin, event, { cwd, ...payload });
+const runFor = (ctx: NoteCtx, bin: string[], cwd: string | undefined) => {
+  const pending = new Map<string, string>(), sending = new Set<string>();
+  return (event: string, payload: Record<string, unknown>) => call(ctx, bin, event, { cwd, ...payload }, pending, sending);
+};
 
 const sidOf = (v: unknown): string | undefined => {
   const o = v as { sessionID?: unknown; session_id?: unknown; id?: unknown; info?: unknown; session?: unknown; properties?: unknown } | undefined;
   const info = (o?.info ?? o?.session ?? o?.properties) as { id?: unknown; directory?: unknown } | undefined;
   return typeof o?.sessionID === "string" ? o.sessionID : typeof o?.session_id === "string" ? o.session_id
     : typeof o?.id === "string" && o.id.startsWith("ses_") ? o.id : typeof info?.id === "string" ? info.id : undefined;
+};
+
+/** Use native event/Session.Info location metadata, never a directory to discover a conversation. */
+const directoryOf = (v: unknown): string | undefined => {
+  const data = v as { info?: unknown; session?: unknown } | undefined;
+  const info = (data?.info ?? data?.session ?? v) as { location?: { directory?: unknown }; directory?: unknown } | undefined;
+  const directory = info?.location?.directory ?? info?.directory;
+  return typeof directory === "string" && directory ? directory : undefined;
 };
 
 /** OpenCode v1 generation: the loader calls this factory with { $, client, directory } and runs the
@@ -1402,7 +1437,7 @@ export const AgentMBXHooks = async (ctx: NoteCtx & { $?: unknown; client?: unkno
     event: async ({ event }: { event?: { type?: string; properties?: Record<string, unknown> } }) => {
       const sid = sidOf(event?.properties);
       if (!sid) return;
-      if (event?.type === "session.created") return run("session-start", { session_id: sid, cwd: directory });
+      if (event?.type === "session.created") return run("session-start", { session_id: sid, cwd: directoryOf(event.properties) ?? directory, mbx_entry: "created" });
       if (event?.type === "session.idle") return run("stop", { session_id: sid });
     },
     "tool.execute.after": async (input: { sessionID?: unknown; session_id?: unknown }) => {
@@ -1429,7 +1464,10 @@ export default {
     watchPermission(ctx);
     const dir = ctx?.location?.directory;
     const run = runFor(ctx, ${bin}, dir);
-    const here = (ev: { location?: { directory?: string } }) => !ev.location?.directory || !dir || ev.location.directory === dir;
+    const here = (ev: { location?: { directory?: string }; data?: unknown }) => {
+      const directory = ev.location?.directory ?? directoryOf(ev.data);
+      return !directory || !dir || directory === dir;
+    };
     const ctl = new AbortController();
     void (async () => {
       try {
@@ -1438,7 +1476,7 @@ export default {
         for await (const ev of stream) {
           const sid = sidOf(ev?.data);
           if (!sid || !here(ev)) continue;
-          if (ev.type === "session.created") void run("session-start", { session_id: sid, cwd: dir });
+          if (ev.type === "session.created") void run("session-start", { session_id: sid, cwd: ev.location?.directory ?? directoryOf(ev.data) ?? dir, mbx_entry: "created" });
           else if (ev.type === "session.idle" || ev.type === "session.execution.succeeded") void run("stop", { session_id: sid });
           else if (ev.type === "session.tool.called" && !ctx?.tool?.hook) void run("post-tool", { session_id: sid });
         }
