@@ -118,9 +118,9 @@ test("a strict 400 retries once without the status snapshot (T423)", async () =>
   assert.equal(bodies[1]!.includes("mbx.status/v2"), false);
 });
 
-test("a contract range that excludes version 1 makes no network call", async () => {
+test("a contract range above contract 2 makes no network call", async () => {
   const kv = mem();
-  kv.set(LINK_KEY, JSON.stringify(link({ contract: { min: 2, max: 4 } })));
+  kv.set(LINK_KEY, JSON.stringify(link({ contract: { min: 3, max: 4 } })));
   const audits: string[] = [];
   let fetches = 0;
   const result = await syncOnce({ signer: pop,
@@ -342,6 +342,93 @@ test("readLink keeps project_leads only when it is true", () => {
   const kept = readLink((k) => kv.get(k));
   assert.equal(kept?.project_leads, true);
   assert.equal(kept?.project_paths, true);
+});
+
+test("T446: a {1,2} ack raises a max-1 link and the next batch carries leads; a {1,1} ack leaves it", async () => {
+  const lead = { project_key: KEY, agent: "agentmbx-lead", host: "alpha", exp: "2026-11-05T00:00:00.000Z", id: ulid(1_700_000_000_000) };
+  const spoken: number[] = [];
+  const carried: boolean[] = [];
+  const post = async (kv: ReturnType<typeof mem>, now: number, ackMin: number, ackMax: number) => syncOnce({
+    signer: pop, kv, now,
+    fetch: async (_url, init) => {
+      const batch = JSON.parse(String(init?.body)) as { contract: number; seq: number; host: { project_leads?: unknown; project_paths?: unknown } };
+      spoken.push(batch.contract);
+      carried.push(Array.isArray(batch.host.project_leads) && batch.host.project_leads.length === 1);
+      assert.equal(batch.host.project_paths, undefined);
+      return ok(batch.seq, { contract: { min: ackMin, max: ackMax } });
+    },
+    source: () => ({ ...body(), leads: [lead] }),
+  });
+
+  const kv = mem();
+  kv.set(LINK_KEY, JSON.stringify({ ...link(), token: "keep-me" }));
+  const raised = await post(kv, 0, 1, 2);
+  assert.equal(raised.outcome, "acked");
+  const stored = JSON.parse(kv.raw.get(LINK_KEY)!) as { contract: { min: number; max: number }; project_leads?: unknown; project_paths?: unknown; token?: unknown };
+  assert.deepEqual(stored.contract, { min: 1, max: 2 });
+  assert.equal(stored.project_leads, true);
+  assert.equal(stored.project_paths, undefined);
+  assert.equal(stored.token, "keep-me");
+  const next = await post(kv, 60_000, 1, 2);
+  assert.equal(next.outcome, "acked");
+  assert.deepEqual(spoken, [1, 2], "the link starts at contract 1 and the next batch speaks 2");
+  assert.deepEqual(carried, [false, true], "leads ride the batch after the {1,2} ack");
+
+  spoken.length = 0;
+  carried.length = 0;
+  const oldKv = mem();
+  oldKv.set(LINK_KEY, JSON.stringify(link()));
+  const stayed = await post(oldKv, 0, 1, 1);
+  assert.equal(stayed.outcome, "acked");
+  const again = await post(oldKv, 60_000, 1, 1);
+  assert.equal(again.outcome, "acked");
+  assert.deepEqual(spoken, [1, 1]);
+  assert.deepEqual(carried, [false, false]);
+  const oldStored = JSON.parse(oldKv.raw.get(LINK_KEY)!) as { contract: { min: number; max: number }; project_leads?: unknown; project_paths?: unknown };
+  assert.deepEqual(oldStored.contract, { min: 1, max: 1 });
+  assert.equal(oldStored.project_leads, undefined);
+  assert.equal(oldStored.project_paths, undefined);
+});
+
+test("T446: an ack of {1,1} lowers a max-2 link and the next batch is contract 1", async () => {
+  const kv = mem();
+  kv.set(LINK_KEY, JSON.stringify({ ...link({ contract: { min: 1, max: 2 }, project_leads: true }), token: "keep-me" }));
+  const spoken: number[] = [];
+  const post = async (now: number, ackMin: number, ackMax: number) => syncOnce({
+    signer: pop, kv, now,
+    fetch: async (_url, init) => {
+      const batch = JSON.parse(String(init?.body)) as { contract: number; seq: number; host: { project_paths?: unknown } };
+      spoken.push(batch.contract);
+      assert.equal(batch.host.project_paths, undefined);
+      return ok(batch.seq, { contract: { min: ackMin, max: ackMax } });
+    },
+    source: () => body(),
+  });
+  const rejected = await post(0, 1, 1);
+  assert.equal(rejected.outcome, "sync.contract");
+  const stored = JSON.parse(kv.raw.get(LINK_KEY)!) as { contract: { min: number; max: number }; project_leads?: unknown; project_paths?: unknown; token?: unknown };
+  assert.deepEqual(stored.contract, { min: 1, max: 1 });
+  assert.equal(stored.project_leads, true);
+  assert.equal(stored.project_paths, undefined);
+  assert.equal(stored.token, "keep-me");
+  const next = await post(60_000, 1, 1);
+  assert.equal(next.outcome, "acked");
+  assert.deepEqual(spoken, [2, 1]);
+
+  const above = mem();
+  above.set(LINK_KEY, JSON.stringify(link({ contract: { min: 1, max: 2 }, project_leads: true })));
+  const untouched = await syncOnce({
+    signer: pop, kv: above, now: 0,
+    fetch: async (_url, init) => {
+      const batch = JSON.parse(String(init?.body)) as { seq: number };
+      return ok(batch.seq, { contract: { min: 3, max: 4 } });
+    },
+    source: () => body(),
+  });
+  assert.equal(untouched.outcome, "sync.contract");
+  const same = JSON.parse(above.raw.get(LINK_KEY)!) as { contract: { min: number; max: number }; project_leads?: unknown };
+  assert.deepEqual(same.contract, { min: 1, max: 2 });
+  assert.equal(same.project_leads, true);
 });
 
 test("a console command that names project_leads is refused", async () => {
