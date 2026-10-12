@@ -15,6 +15,7 @@ import { inspectLeaseProcess } from "../src/identity-leases.ts";
 import { MbxNode } from "../src/node.ts";
 import { registerIdentity, sessionHint, sessionHintKey } from "../src/registry.ts";
 import { runSetup, type SetupCtx } from "../src/setup.ts";
+import { sendLeased } from "./helpers/leased-send.ts";
 
 const CMD = ["/opt/bin/agentmbx"];
 const EVENTS = [["SessionStart", "session-start"], ["UserPromptSubmit", "prompt"], ["PostToolUse", "post-tool"], ["Stop", "stop"]] as const;
@@ -265,4 +266,121 @@ test("T384 AC4: doctor fails when a wired grok MCP command path does not exist",
     const checks = await doctor(ctxFor(bareHome, ["agentmbx"]), bareMbx);
     assert.equal(checks.some((c) => c.label.includes("MCP command path does not exist")), false, `a PATH name is not a missing file: ${JSON.stringify(checks)}`);
   } finally { rmSync(bareHome, { recursive: true, force: true }); }
+});
+
+// ---- T599: the bounded resume notice on the first bound PostToolUse (spec t184-provider-resume-adapters) ----
+const noticeLines = (text: string) => text.split("\n").filter(l => /You are worker|not caught up on|open thread/.test(l));
+
+async function grokHolder(t: { after: (fn: () => Promise<void> | void) => void }, session = "grok-A") {
+  const home = mkdtempSync(join(tmpdir(), "mbx-grok-notice-"));
+  const sessions = join(home, "active_sessions.json");
+  const writeSid = (id: string) => writeFileSync(sessions, JSON.stringify([{ session_id: id, pid: process.pid, cwd: "/work", opened_at: new Date().toISOString() }]));
+  writeSid(session);
+  const n = new MbxNode(home, { host: "alpha" });
+  const c = new Client({ name: "grok-notice", version: "1" });
+  const env: Record<string, string> = { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "grok", MBX_AGENT: "worker", MBX_ROLE: "grok", MBX_NO_DESKTOP: "1", MBX_GROK_SESSIONS_FILE: sessions };
+  delete env.MBX_DESCRIPTION;
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  await c.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"], env }));
+  await c.callTool({ name: "mbx_whoami", arguments: {} });
+  const hookEnv: NodeJS.ProcessEnv = { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1", MBX_NO_DESKTOP: "1" };
+  delete hookEnv.MBX_AGENT; delete hookEnv.MBX_ROLE; delete hookEnv.MBX_DESCRIPTION;
+  const hookCli = (cli: string, event: string, sid: string) => spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", event, "--cli", cli], {
+    input: JSON.stringify({ session_id: sid, cwd: "/work" }), encoding: "utf8", timeout: 20_000, env: hookEnv,
+  });
+  const ctx = (out: string) => out.trim()
+    ? ((JSON.parse(out) as { hookSpecificOutput?: { additionalContext?: string } }).hookSpecificOutput?.additionalContext ?? "")
+    : "";
+  const entries = () => (n.store.db.prepare("SELECT COUNT(*) n FROM kv WHERE k LIKE 'resume-entry:%'").get() as { n: number }).n;
+  return { n, c, writeSid, hookCli, ctx, entries, follow: () => c.callTool({ name: "mbx_whoami", arguments: {} }) };
+}
+
+test("grok hooks (T599): SessionStart then the first bound PostToolUse carries the notice once; nothing moves", async t => {
+  const { n, hookCli, ctx, entries } = await grokHolder(t);
+  sendLeased(n, { from: "boss", to: ["worker"], subject: "PRIVATE SUBJECT", body: "SECRET BODY", kind: "request" });
+  const state = () => JSON.stringify([
+    n.store.db.prepare("SELECT msg_id,agent,state FROM deliveries ORDER BY msg_id").all(),
+    n.store.get("catchup:worker"),
+    n.store.db.prepare("SELECT name,cli,session_id,released_at FROM identity_leases ORDER BY name").all(),
+  ]);
+  const start = hookCli("grok", "session-start", "grok-A");
+  assert.equal(start.status, 0, start.stderr);
+  assert.equal(JSON.parse(start.stdout).hookSpecificOutput.hookEventName, "SessionStart");
+  assert.equal(noticeLines(ctx(start.stdout)).filter(l => /not caught up on|open thread/.test(l)).length, 0, "SessionStart does not carry the notice");
+  assert.equal(entries(), 0, "SessionStart does not take the entry");
+  const before = state();
+  const first = hookCli("grok", "post-tool", "grok-A");
+  assert.equal(first.status, 0, first.stderr);
+  const c1 = ctx(first.stdout);
+  assert.equal(JSON.parse(first.stdout).hookSpecificOutput.hookEventName, "PostToolUse");
+  const notice = noticeLines(c1).join("\n");
+  assert.match(notice, /\[mbx\] You are worker@alpha \(role: grok\)\. When the owner ends this session/);
+  assert.match(notice, /\[mbx\] worker has 1 message\(s\) since \S+ not caught up on; call mbx_catchup/);
+  assert.match(notice, /\[mbx\] 1 open thread\(s\) with unacked mail\./);
+  assert.doesNotMatch(c1, /PRIVATE SUBJECT|SECRET BODY/);
+  assert.equal(noticeLines(c1).length, 3);
+  const second = hookCli("grok", "post-tool", "grok-A");
+  assert.equal(second.status, 0, second.stderr);
+  assert.equal(noticeLines(ctx(second.stdout)).length, 0, "the same entry is not told again");
+  assert.match(ctx(second.stdout), /No live mbx watcher/, "the watcher reminder still rides a later PostToolUse");
+  assert.equal(state(), before, "no delivery state, checkpoint or lease moved");
+});
+
+test("grok hooks (T599): a new session id, a return to the old id, and a new process start each deliver once", async t => {
+  const { n, hookCli, ctx, writeSid, follow } = await grokHolder(t);
+  const told = (sid: string) => noticeLines(ctx(hookCli("grok", "post-tool", sid).stdout)).some(l => /You are worker/.test(l));
+  hookCli("grok", "session-start", "grok-A");
+  assert.equal(told("grok-A"), true);
+  assert.equal(told("grok-A"), false);
+  writeSid("grok-session-B");
+  await follow();
+  hookCli("grok", "session-start", "grok-session-B");
+  assert.equal(told("grok-session-B"), true, "a new session id");
+  assert.equal(told("grok-session-B"), false);
+  writeSid("grok-A");
+  await follow();
+  hookCli("grok", "session-start", "grok-A");
+  assert.equal(told("grok-A"), true, "back to an earlier id");
+  const pid = (n.store.db.prepare("SELECT pid FROM sessions WHERE cli='grok' AND session_id='grok-A'").get() as { pid: number }).pid;
+  n.store.set(`resume-entry:grok:${pid}`, "an-earlier-process-start grok-A");
+  assert.equal(told("grok-A"), true, "a different pid_start on the same id");
+  assert.equal(told("grok-A"), false);
+});
+
+test("grok hooks (T599): an unbound PostToolUse records no entry; the first bound one after the claim does", async t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-grok-unbound-notice-"));
+  const sessions = join(home, "active_sessions.json");
+  writeFileSync(sessions, JSON.stringify([{ session_id: "later-A", pid: process.pid, cwd: "/work", opened_at: new Date().toISOString() }]));
+  const n = new MbxNode(home, { host: "alpha" });
+  const entries = () => (n.store.db.prepare("SELECT COUNT(*) n FROM kv WHERE k LIKE 'resume-entry:%'").get() as { n: number }).n;
+  const unbound = hook(home, "post-tool", "later-A");
+  assert.equal(unbound.status, 0, unbound.stderr);
+  assert.match(unbound.stdout, /no mailbox identity yet/);
+  assert.equal(entries(), 0);
+  const c = new Client({ name: "grok-later", version: "1" });
+  t.after(async () => { await c.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const env: Record<string, string> = { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "grok", MBX_AGENT: "worker", MBX_ROLE: "grok", MBX_NO_DESKTOP: "1", MBX_GROK_SESSIONS_FILE: sessions };
+  delete env.MBX_DESCRIPTION;
+  await c.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"], env }));
+  await c.callTool({ name: "mbx_whoami", arguments: {} });
+  const start = hook(home, "session-start", "later-A");
+  assert.equal(start.status, 0, start.stderr);
+  assert.equal(entries(), 0, "the bound SessionStart still does not take the entry");
+  const bound = hook(home, "post-tool", "later-A");
+  assert.equal(bound.status, 0, bound.stderr);
+  assert.match(bound.stdout, /You are worker@alpha/);
+  assert.equal(entries(), 1);
+});
+
+test("grok hooks (T599): the Claude compatibility PostToolUse emits no notice and does not take the entry", async t => {
+  const { hookCli, ctx, entries } = await grokHolder(t, "grok-compat");
+  hookCli("grok", "session-start", "grok-compat");
+  const claude = hookCli("claude", "post-tool", "grok-compat");
+  assert.equal(claude.status, 0, claude.stderr);
+  assert.equal(claude.stdout, "");
+  assert.equal(entries(), 0, "the compat hook does not consume the entry");
+  const grok = hookCli("grok", "post-tool", "grok-compat");
+  assert.equal(grok.status, 0, grok.stderr);
+  assert.match(ctx(grok.stdout), /You are worker@alpha/);
+  assert.equal(entries(), 1);
 });

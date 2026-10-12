@@ -1848,8 +1848,17 @@ async function hook(node, event, cli) {
                         }
                         catch { /* advisory */ }
                     }
+                    // T599: SessionStart stdout is dropped, so the first bound PostToolUse of each entry carries the notice.
+                    const lines = [];
+                    if (sid) {
+                        const at = node.store.db.prepare("SELECT pid,pid_start FROM sessions WHERE cli=? AND session_id=?").get(cli, sid);
+                        if (at?.pid && takeResumeEntry(node.store, cli, at.pid, at.pid_start, sid))
+                            lines.push(resumeNotice(node.store, agent, held(agent)));
+                    }
                     if (!liveWatcher(node, agent))
-                        emit(cli, "PostToolUse", grokWatchReminder(sid));
+                        lines.push(grokWatchReminder(sid));
+                    if (lines.length)
+                        emit(cli, "PostToolUse", lines.join("\n"));
                     return;
                 }
                 if (cli !== "claude" && cli !== "opencode")
