@@ -15,6 +15,7 @@ import { acceptSigned, makePolicy } from "../src/policy.ts";
 import { MbxNode } from "../src/node.ts";
 import { IdentityLeases } from "../src/identity-leases.ts";
 import { applyForward, buildForward } from "../src/identity-cleanup.ts";
+import { RESUME_NOTICE_MAX_CHARS, RESUME_NOTICE_MAX_LINES } from "../src/resume-notice.ts";
 
 for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} startup offers recovery choices without claiming historical mail`, t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-startup-choice-")), node = new MbxNode(home, { host: "alpha" });
@@ -367,10 +368,11 @@ test("Claude /clear with a real session file: the hook rebinds the holder to the
   write("after-clear");
   const r = run("session-start", "after-clear"); assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /You are builder@alpha/); assert.match(r.stdout, /1 unread/);
+  assert.match(r.stdout, /not caught up on; call mbx_catchup/, "T185: the real /clear rebind carries the resume notice");
   assert.deepEqual(n.sessionsFor("builder").map((s) => s.session_id), ["after-clear"]);
   assert.match(run("prompt", "after-clear").stdout, /1 unread/);
   // A session id the provider's own file does not name never rebinds the holder.
-  const forged = run("prompt", "someone-else"); assert.equal(forged.status, 0, forged.stderr); assert.doesNotMatch(forged.stdout, /unread/);
+  const forged = run("prompt", "someone-else"); assert.equal(forged.status, 0, forged.stderr); assert.doesNotMatch(forged.stdout, /unread/); assert.doesNotMatch(forged.stdout, /not caught up on/);
   assert.deepEqual(n.sessionsFor("builder").map((s) => s.session_id), ["after-clear"]);
   assert.notEqual((await client.callTool({ name: "mbx_inbox", arguments: {} })).isError, true);
 });
@@ -385,4 +387,56 @@ test("lean notices: a wake prompt adds no second notice, and the policy recap is
   const wake = run("prompt", "real-hook-session", "claude", {}, { prompt: `[mbx] 1 new message(s) for ${agent} from sender@alpha [local] (ids X). mbx_read, reply, ack.` });
   assert.doesNotMatch(wake.stdout, /unread for/, "the wake prompt is the notice");
   void n;
+});
+
+// ---- T185: Claude SessionStart carries the bounded resume notice (spec t184-provider-resume-adapters, Claude section) ----
+const additional = (stdout: string): string => stdout ? (JSON.parse(stdout) as { hookSpecificOutput: { additionalContext: string } }).hookSpecificOutput.additionalContext : "";
+const hinted = (s: string) => (s.match(/not caught up on; call mbx_catchup/g) ?? []).length;
+
+test("T185: every Claude SessionStart source but fork is an entry with one bounded notice; prompts after it add none; nothing moves", async t => {
+  const { n, agent, run, send } = await holder(t, "claude");
+  send();
+  const state = () => JSON.stringify([n.store.db.prepare("SELECT msg_id,agent,state FROM deliveries ORDER BY msg_id").all(),
+    n.store.get(`catchup:${agent}`), n.store.db.prepare("SELECT name,cli,session_id,released_at,token FROM identity_leases ORDER BY name").all()]);
+  const start = (sid: string, source: string) => {
+    const r = run("session-start", sid, "claude", {}, { source });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal((JSON.parse(r.stdout) as { hookSpecificOutput: { hookEventName: string } }).hookSpecificOutput.hookEventName, "SessionStart");
+    return additional(r.stdout);
+  };
+  const prompt = (sid: string) => additional(run("prompt", sid, "claude", {}, { prompt: "go on" }).stdout);
+  assert.match(prompt("first"), /1 unread/); // binds the holder's real id; the first prompt of that entry carries the notice
+  const before = state();
+  const s1 = start("first", "startup");
+  assert.equal((s1.match(/\[mbx\] You are builder@alpha \(role: /g) ?? []).length, 1, "the identity line once, not twice (C4)");
+  assert.equal(hinted(s1), 1); assert.match(s1, /\[mbx\] 1 open thread\(s\) with unacked mail\./);
+  assert.doesNotMatch(s1, /PRIVATE SUBJECT|SECRET BODY/, "counts only");
+  const notice = s1.split("\n").filter(l => /You are builder@alpha \(|not caught up on|open thread/.test(l)).join("\n");
+  assert.ok(notice.length <= RESUME_NOTICE_MAX_CHARS && notice.split("\n").length <= RESUME_NOTICE_MAX_LINES, notice);
+  assert.equal(hinted(prompt("first")), 0, "the SessionStart was the entry: the next prompt adds no notice");
+  assert.equal(hinted(start("after-clear", "clear")), 1, "/clear: the hook is the only channel for the hint");
+  assert.equal(hinted(prompt("after-clear")), 0);
+  assert.equal(hinted(start("after-clear", "compact")), 1, "compaction on an unchanged id still gets the notice (C1)");
+  assert.equal(hinted(prompt("after-clear")), 0);
+  assert.equal(hinted(start("first", "resume")), 1, "/resume back to an earlier conversation");
+  const fork = start("forked", "fork");
+  assert.equal(hinted(fork), 0, "fork is unsupported (D4/C2): no notice"); assert.match(fork, /You are builder@alpha/);
+  assert.equal(hinted(prompt("forked")), 0, "and none is deferred to its first prompt");
+  assert.equal(state(), before, "no delivery state, checkpoint or lease moved");
+});
+
+test("T185: an unbound Claude SessionStart defers the notice to the first bound prompt, once; Codex SessionStart is unchanged", async t => {
+  const { n, call, agent, run, send } = await holder(t, "claude");
+  send();
+  await call("mbx_identity", { action: "release" });
+  const unbound = additional(run("session-start", "later", "claude", {}, { source: "startup" }).stdout);
+  assert.equal(hinted(unbound), 0); assert.doesNotMatch(unbound, /You are builder/);
+  assert.equal(n.store.db.prepare("SELECT COUNT(*) n FROM kv WHERE k LIKE 'resume-entry:%'").get()!.n, 0, "no entry recorded while unbound");
+  await call("mbx_identity", { action: "claim", name: agent });
+  const first = additional(run("prompt", "later", "claude", {}, { prompt: "hi" }).stdout);
+  assert.equal(hinted(first), 1, "deferred to the first bound prompt"); assert.match(first, /1 unread/);
+  assert.equal(hinted(additional(run("prompt", "later", "claude", {}, { prompt: "again" }).stdout)), 0);
+  const codex = await holder(t, "codex"); codex.send();
+  const cx = additional(codex.run("session-start", codex.sid, "codex", {}, { source: "resume" }).stdout);
+  assert.match(cx, /You are builder@alpha/); assert.equal(hinted(cx), 0, "Codex is T186's: its SessionStart is not changed here");
 });

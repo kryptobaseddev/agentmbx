@@ -83,7 +83,11 @@ for (const cli of ["claude", "codex", "kimi", "opencode", "hermes", "grok"]) tes
   const live = f.run("prompt");
   assert.equal(live.status, 0, live.stderr);
   assert.doesNotMatch(live.stdout, /mbx disconnected/);
-  if (cli === "claude" || cli === "codex" || cli === "opencode") assert.equal(live.stdout, "");
+  if (cli === "codex" || cli === "opencode") assert.equal(live.stdout, "");
+  if (cli === "claude") { // T185: a Claude session whose SessionStart was never seen enters on its first bound prompt
+    assert.match(JSON.parse(live.stdout).hookSpecificOutput.additionalContext, /^\[mbx\] You are builder@alpha\b.*call mbx_identity release/);
+    assert.equal(f.run("prompt").stdout, "", "once per entry");
+  }
   f.remove();
   const before = f.node.store.db.prepare("SELECT * FROM identity_leases").all();
   for (const event of ["prompt", "prompt", "session-start"]) {
@@ -154,9 +158,13 @@ test("T573 a resumed Claude session's hook, run before its MCP reconnects, does 
   t.after(() => mcp.close());
   bindWakeLease(mcp, { agent: "builder", cli: "claude", session_id: f.sid, pid: process.pid });
   assert.equal(f.note(), null);
+  // T185: the SessionStart ran while resuming, so the first bound prompt carries the deferred resume notice, once.
   const after = f.run("prompt");
   assert.equal(after.status, 0, after.stderr);
-  assert.equal(after.stdout, "");
+  const notice = contextOf("claude", after.stdout);
+  assert.match(notice, /^\[mbx\] You are builder@alpha\b.*call mbx_identity release/);
+  assert.doesNotMatch(notice, /no longer holds|mbx disconnected|no mailbox identity yet|Resuming/);
+  assert.equal(f.run("prompt").stdout, "", "and the next prompt is quiet again");
 });
 
 test("T573 Hermes resumes the same way: quiet session start, the resuming line on its first prompt", async t => {
