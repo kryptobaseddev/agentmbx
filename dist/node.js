@@ -15,7 +15,7 @@ import { ownerPublicKey } from "./owner.js";
 import { auditLeadGrantUse, leadGrantForSender } from "./lead-grants.js";
 import { effectivePolicy, policyLine } from "./policy.js";
 import { procStart, procTable, provenProcess, sameProcess } from "./proc.js";
-import { bumpPostToolMarker, bumpPostToolMarkersForAgent } from "./posttool.js";
+import { bumpPostToolMarker, bumpPostToolMarkersForAgent, POSTTOOL_FAST_CLIS } from "./posttool.js";
 import { privatePath } from "./private-files.js";
 import { TASK_RE } from "./presence.js";
 import { backfillProjectKeys, backfillRegistry } from "./registry.js";
@@ -273,10 +273,10 @@ export class MbxNode {
                 db.prepare("UPDATE deliveries SET state='delivered', note=NULL WHERE agent=? AND state='notified' AND note='desktop'").run(agent);
             return agent;
         });
-        // T342: a claude bind can change the session→agent mapping the post-tool hook resolves, so the
-        // hook's fast path must run the full decision once. After the tx: fs writes never inside it.
-        if (s.cli === "claude" && s.session_id)
-            bumpPostToolMarker(this.home, "claude", s.session_id);
+        // T342/T341: a claude or opencode bind can change the session→agent mapping the post-tool hook resolves,
+        // so the hook's fast path must run the full decision once. After the tx: fs writes never inside it.
+        if (POSTTOOL_FAST_CLIS.includes(s.cli) && s.session_id)
+            bumpPostToolMarker(this.home, s.cli, s.session_id);
         return bound;
     }
     /** The agent name the MCP server of this CLI process uses (fresh binding of a live pid), if any. */
