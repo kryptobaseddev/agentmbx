@@ -1221,6 +1221,9 @@ If the codes differ, do not approve: someone is in the middle.`);
                 node.sweepStaleRows();
             }
             catch { /* db busy: next minute */ } try {
+                node.expirePendingPeers();
+            }
+            catch { /* db busy: next minute */ } try {
                 escalateUnheldMail(node, Date.now(), (subtitle, body) => void notifyDesktop({ subtitle, body }));
             }
             catch { /* db busy: next minute */ } }, 60_000);
