@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **A resumed Claude or Hermes session no longer hears that it lost its identity (T573).** `claude --resume` starts a new provider process whose SessionStart hook can run before that process's mbx server connects (live: 413 ms before the reclaim). When the provider has never connected, the session's remembered identity is released or held by this same session, and there is no identity conflict, the hook prints `[mbx] Resuming <name>@<host>: this session's mailbox server is still connecting. Call mbx_whoami and wait for its result before claiming or registering.` instead of the T503 disconnect line and the unbound/register guidance. A provider that connected before and lost its connector still gets the T503 line; an explicit release, another holder, or a non-rebinding CLI keep today's text. The hook still records the session hint and claims nothing.
+
 ## 0.5.27 (2026-10-11)
 
 A project now has its own mailbox: mail to the bare project name is stored once and read by the owner-signed lead, across paired hosts, and the wake dispatcher wakes only that lead; prune forwards a retired mailbox's unread mail into it and the lead moves mail within its own project without Touch ID. OpenCode calls without session metadata fail closed, agentmbx watch works inside an OpenCode session, and the OpenCode doctor checks no longer report historical overlaps as a live loop. agentmbx mcp exits cleanly after a failed startup and records one bounded error; leads can delegate read and edit, and policy text now separates outward-reversible (branch push, draft PR) from outward. Hosts sync an allowlisted status snapshot to the cloud read model.

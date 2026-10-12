@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
-import { hookDisconnectedNote } from "../src/hook-connection.ts";
+import { hookDisconnectedNote, hookResumingNote } from "../src/hook-connection.ts";
 import { findIdentityControl, identityControlKey, publishIdentityControl } from "../src/identity-control.ts";
 import { _resetEvidenceCacheForTests } from "../src/identity-leases.ts";
 import { MbxNode } from "../src/node.ts";
-import { _resetProcCache, procSeams } from "../src/proc.ts";
+import { _resetProcCache, procSeams, procStart } from "../src/proc.ts";
+import { sessionHintKey } from "../src/registry.ts";
 import { bindWakeLease } from "./helpers/wake-lease.ts";
 
 const MESSAGE = "mbx disconnected: reconnect (e.g. /mcp in Claude Code)";
@@ -109,4 +111,113 @@ test("T503 the compiled hook emits the same reconnect line", t => {
   const result = f.run("prompt", false);
   assert.equal(result.status, 0, result.stderr);
   assert.equal(JSON.parse(result.stdout).hookSpecificOutput.additionalContext, `[mbx] ${MESSAGE}; this session no longer holds builder@alpha.`);
+});
+
+// T573: `claude --resume` starts a new provider process. Its SessionStart hook runs before that process's mbx server has
+// connected and reclaimed the identity the old process released (live: hook 05:11:51.031Z, reclaim 05:11:51.444Z).
+const RESUMING = "[mbx] Resuming builder@alpha: this session's mailbox server is still connecting. Call mbx_whoami and wait for its result before claiming or registering.";
+async function resumed(t: TestContext, cli = "claude") {
+  const home = mkdtempSync(join(tmpdir(), "mbx-t573-")), node = new MbxNode(home, { host: "alpha" });
+  const old = spawn("sleep", ["600"], { stdio: "ignore" });
+  t.after(() => { old.kill("SIGKILL"); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const sid = "resumed-session";
+  // The old provider process held the identity for this session, then exited; its MCP released the lease on the way out.
+  const held = bindWakeLease(node, { agent: "builder", cli, session_id: sid, pid: old.pid! });
+  const key = node.sessionsFor("builder")[0].session_key!, descriptor = findIdentityControl(node.store, cli, sid);
+  node.store.db.prepare("DELETE FROM kv WHERE k IN (?,?)").run(identityControlKey(cli, sid), `mcp-process:${key}`);
+  assert.equal(held.release(), true);
+  old.kill("SIGKILL");
+  await once(old, "exit");
+  const run = (event: string) => spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", event, "--cli", cli], {
+    input: JSON.stringify({ session_id: sid, cwd: process.cwd(), prompt: "continue" }), encoding: "utf8", timeout: 10_000,
+    env: { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1", MBX_AGENT: "unrelated" },
+  });
+  return { home, node, sid, run, descriptor, note: () => hookResumingNote(node, cli, sid, process.pid) };
+}
+const contextOf = (cli: string, stdout: string) =>
+  cli === "hermes" ? JSON.parse(stdout).context as string : JSON.parse(stdout).hookSpecificOutput.additionalContext as string;
+
+test("T573 a resumed Claude session's hook, run before its MCP reconnects, does not report the identity lost", async t => {
+  const f = await resumed(t);
+  const leases = f.node.store.db.prepare("SELECT * FROM identity_leases").all();
+  for (const event of ["session-start", "prompt"]) {
+    const result = f.run(event);
+    assert.equal(result.status, 0, result.stderr);
+    const context = contextOf("claude", result.stdout);
+    assert.equal(context, RESUMING);
+    assert.doesNotMatch(context, /no longer holds|mbx disconnected|no mailbox identity yet|mbx_identity/);
+  }
+  assert.deepEqual(f.node.store.db.prepare("SELECT * FROM identity_leases").all(), leases, "the hook claims nothing");
+  assert.match(f.node.store.get(sessionHintKey("claude", process.pid)) ?? "", /resumed-session/, "the session hint the MCP resumes from is still recorded");
+  // The provider's MCP now connects and reclaims the same identity for the same session: the hook is quiet again.
+  const mcp = new MbxNode(f.home, { host: "alpha" });
+  t.after(() => mcp.close());
+  bindWakeLease(mcp, { agent: "builder", cli: "claude", session_id: f.sid, pid: process.pid });
+  assert.equal(f.note(), null);
+  const after = f.run("prompt");
+  assert.equal(after.status, 0, after.stderr);
+  assert.equal(after.stdout, "");
+});
+
+test("T573 Hermes resumes the same way: quiet session start, the resuming line on its first prompt", async t => {
+  const f = await resumed(t, "hermes");
+  const start = f.run("session-start");
+  assert.equal(start.status, 0, start.stderr);
+  assert.equal(start.stdout, "");
+  const prompt = f.run("prompt");
+  assert.equal(prompt.status, 0, prompt.stderr);
+  assert.equal(contextOf("hermes", prompt.stdout), RESUMING);
+});
+
+test("T573 an identity that will not come back keeps the disconnected and unbound guidance", async t => {
+  const f = await resumed(t);
+  assert.equal(f.note(), RESUMING);
+  const reset = () => f.node.store.db.prepare("UPDATE identity_leases SET released_at=?,release_reason='released',cli='claude',session_id=? WHERE name='builder'").run(Date.now(), f.sid);
+  f.node.store.db.prepare("UPDATE identity_leases SET released_at=NULL,release_reason=NULL,session_id='another-session' WHERE name='builder'").run();
+  assert.equal(f.note(), null, "another session holds it now");
+  f.node.store.db.prepare("UPDATE identity_leases SET released_at=NULL,release_reason=NULL WHERE name='builder'").run();
+  f.node.store.db.prepare("UPDATE identity_leases SET session_id=? WHERE name='builder'").run(f.sid);
+  assert.equal(f.note(), RESUMING, "still held by this same session (the old server is exiting)");
+  f.node.store.db.prepare("UPDATE identity_leases SET cli='codex' WHERE name='builder'").run();
+  assert.equal(f.note(), null, "held by the same session id under another cli");
+  reset();
+  f.node.store.set("identity-conflict:builder", JSON.stringify({ reason: "test" }));
+  assert.equal(f.note(), null, "historical ownership needs owner recovery");
+  f.node.store.db.prepare("DELETE FROM kv WHERE k='identity-conflict:builder'").run();
+  assert.equal(f.note(), RESUMING);
+  // This provider process connected before (T503): a missing connector now is a disconnect, not a resume.
+  f.node.store.db.prepare("UPDATE sessions SET pid=?, pid_start=? WHERE session_id=?").run(process.pid, procStart(process.pid), f.sid);
+  assert.equal(f.note(), null);
+  f.node.store.db.prepare("UPDATE sessions SET pid_start='Sun Jan  1 00:00:00 1995' WHERE session_id=?").run(f.sid);
+  assert.equal(f.note(), RESUMING, "a row left by an earlier process with this pid is not this process");
+  f.node.store.db.prepare("UPDATE sessions SET pid_start=NULL WHERE session_id=?").run(f.sid);
+  assert.equal(f.note(), null, "unknown birth time counts as connected");
+  f.node.store.db.prepare("UPDATE sessions SET pid=? WHERE session_id=?").run(2147483647, f.sid);
+  assert.equal(f.note(), RESUMING);
+  publishIdentityControl(f.node.store, { ...f.descriptor, parent_pid: process.pid });
+  assert.equal(f.note(), null, "a connector of this provider process exists: T503 decides whether it is alive");
+  f.node.store.db.prepare("DELETE FROM kv WHERE k=?").run(identityControlKey("claude", f.sid));
+  assert.equal(f.note(), RESUMING);
+  for (const invalid of ["", " bad", "bad\nline", "mcp-provisional", "x".repeat(301)]) {
+    f.node.store.set(`name:claude:${invalid}`, "builder");
+    assert.equal(hookResumingNote(f.node, "claude", invalid, process.pid), null, JSON.stringify(invalid.slice(0, 20)));
+  }
+  f.node.store.set(`name:claude:${f.sid}`, "Not A Name");
+  assert.equal(f.note(), null, "a malformed name binding names nothing");
+  f.node.store.set(`name:claude:${f.sid}`, "builder");
+  assert.equal(f.note(), RESUMING);
+  // An explicit release (or takeover) deletes the session's name binding: nothing will be reclaimed.
+  f.node.store.db.prepare("DELETE FROM kv WHERE k=?").run(`name:claude:${f.sid}`);
+  assert.equal(f.note(), null);
+  const result = f.run("session-start");
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(contextOf("claude", result.stdout), /no mailbox identity yet/);
+});
+
+test("T573 a cli that does not rebind sessions keeps the T503 text", async t => {
+  const f = await resumed(t, "codex");
+  assert.equal(hookResumingNote(f.node, "codex", f.sid, process.pid), null);
+  const result = f.run("prompt");
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(contextOf("codex", result.stdout), /this session no longer holds builder@alpha/);
 });
