@@ -82,6 +82,23 @@ test("T493 AC1: mail to the bare project name is one durable delivery to the pro
   assert.equal((reopened.store.db.prepare("SELECT count(*) n FROM deliveries WHERE agent=? AND state<>'acked'").get(mailbox.slot) as { n: number }).n, 2);
 });
 
+for (const end of ["revoked", "expired"]) test(`T562: a ${end} replacement never restores the old project mailbox reader`, t => {
+  const w = world(t), now = Date.now();
+  w.lead("agentmbx-lead", new Date(now - 1000));
+  const rec = makeLead({ project: w.folder, agent: "replacement", host: w.n.host, ownerPub: w.owner.publicKey, now: new Date(now), ttlMs: 1000 });
+  storeLead(w.n, rec, w.sign(rec));
+  const box = allocateProjectMailbox(w.n, w.folder).mailbox;
+  assert.equal(projectReader(w.n, box.slot, new Date(now))?.lead?.id, rec.id);
+  const mail = w.n.send(w.draft(["agentmbx"]));
+  const before = w.deliveriesOf(mail.envelope.id);
+  if (end === "revoked") { const rev = makeLeadRevocation(rec.id, w.owner.publicKey, new Date(now)); revokeLead(w.n, rev, w.sign(rev)); }
+  const at = new Date(now + (end === "revoked" ? 500 : 1000));
+  assert.equal(projectReader(w.n, box.slot, at)?.lead, null);
+  assert.deepEqual(w.deliveriesOf(mail.envelope.id), before, "project mail remains queued, never ACKed or moved by head expiry/revocation");
+  const fresh = w.lead("agentmbx-lead", new Date(now + 2000));
+  assert.equal(projectReader(w.n, box.slot, new Date(now + 2000))?.lead?.id, fresh.id);
+});
+
 test("T493 AC1: an owner-signed send to the bare name is rewritten before the owner signs, and its bytes still verify", async (t) => {
   const w = world(t);
   const { mailbox } = allocateProjectMailbox(w.n, w.folder);
@@ -422,7 +439,7 @@ const RATCHET: Record<string, { max: number; category: Category; why: string }> 
   "src/doctor.ts": { max: 1, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "strandedMail recognises slots and shows the lead's remedy instead of 'claim'" },
   "src/handoff.ts": { max: 1, category: "by name (the caller's own mailbox)", why: "T159: mbx_handoff's open-thread context for the held identity (d.agent=?); lists threads, never mailbox names" },
   "src/hud.ts": { max: 2, category: "by name (the caller's own mailbox)", why: "counts for the session's own agent" },
-  "src/identity-cleanup.ts": { max: 7, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "prune names exclude slots; a prune forward and a lead forward move one named mailbox's unread rows through moveUnread (T495); the owner-signed forward still refuses a slot at either end" },
+  "src/identity-cleanup.ts": { max: 9, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "prune names exclude slots; forwarding uses moveUnread (T495); T494 adds only a canonical-source delivery-state scan and a per-message exact-target dedup lookup, neither enumerates names; migration tests assert project/lease boundaries and preserved history; owner forward still refuses slots" },
   "src/identity-status.ts": { max: 1, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "identity listing" },
   "src/loop-detector.ts": { max: 1, category: "per message", why: "the recipient list of one message" },
   "src/mcp.ts": { max: 3, category: "by name (the caller's own mailbox)", why: "handoff counts and the channel loop for the caller's agent" },

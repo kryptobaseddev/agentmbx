@@ -31,7 +31,12 @@ export const procSeams = {
 };
 /** Synchronous sleep for retry backoff; evidence paths must stay synchronous. */
 export const sleepSync = (ms) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
-/** Capture process inventory before a database transaction; expired or escaped scopes fail closed. */
+/**
+ * Share one process table across a synchronous operation. The table is read on the first
+ * procTable() inside the scope, not before it, so a scope that never asks spawns nothing (T591).
+ * A filled table is the module cache, at most 2 s old, and start times do not change within it,
+ * so proof decisions (start equality) cannot drift. Expired or escaped scopes fail closed.
+ */
 export function withProcSnapshot(operation) {
     if (operation.constructor.name === "AsyncFunction")
         throw new Error("process snapshots require synchronous operations");
@@ -40,9 +45,7 @@ export function withProcSnapshot(operation) {
         return operation();
     if (prior)
         throw new Error("process snapshot scope is closed");
-    // Share the short module cache instead of forcing a fresh ps -A per call: the snapshot may be at most
-    // 2 s old, and start times do not change within it, so proof decisions (start equality) cannot drift.
-    const table = procTable(), scope = { active: true, at: performance.now(), table };
+    const scope = { active: true, at: performance.now(), table: null };
     return snapshots.run(scope, () => {
         try {
             const result = operation();
@@ -74,10 +77,7 @@ export function readLinuxProcess(pid, bootId) {
         return null;
     }
 }
-export function procTable(maxAgeMs = 2_000) {
-    const snapshot = snapshots.getStore();
-    if (snapshot)
-        return snapshot.active && performance.now() - snapshot.at <= 5000 ? snapshot.table : new Map();
+function readProcTable(maxAgeMs) {
     if (cache && Date.now() - cache.at < maxAgeMs)
         return cache.table;
     const table = new Map();
@@ -105,6 +105,16 @@ export function procTable(maxAgeMs = 2_000) {
     catch { /* unavailable process inventory: proof-required callers fail closed */ }
     cache = { at: Date.now(), table };
     return table;
+}
+export function procTable(maxAgeMs = 2_000) {
+    const snapshot = snapshots.getStore();
+    if (!snapshot)
+        return readProcTable(maxAgeMs);
+    if (!snapshot.active || performance.now() - snapshot.at > 5000)
+        return new Map();
+    if (!snapshot.table)
+        snapshot.table = readProcTable(maxAgeMs);
+    return snapshot.table;
 }
 export const procStart = (pid) => (pid ? procTable().get(pid)?.start ?? null : null);
 /** Is this the same live process that was recorded (pid + start time)? Rows without a start time fall back to pid liveness. */

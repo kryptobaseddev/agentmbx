@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { canonical, signData } from "../src/crypto.ts";
-import { makeLead, storeLead } from "../src/lead-record.ts";
+import { makeLead, makeLeadRevocation, revokeLead, storeLead } from "../src/lead-record.ts";
 import { MbxNode } from "../src/node.ts";
 import { createOwnerKey, unlockOwnerKey } from "../src/owner.ts";
 import { allocateProjectMailbox } from "../src/project-mailbox.ts";
@@ -36,11 +36,15 @@ function world(t: TestContext) {
   for (const name of ["alpha-lead", "alpha-w1", "alpha-w2", "beta-w1", "sender"]) n.registerAgent(name);
   for (const name of ["alpha-lead", "alpha-w1", "alpha-w2"]) noteProject(n.store, name, projA, true);
   noteProject(n.store, "beta-w1", projB, true);
+  n.registerAgent("alpha"); noteProject(n.store, "alpha", projA, true);
+  const legacy = n.send({ from: "sender", to: ["alpha"], subject: "legacy pending", body: "x" }).envelope.id;
+  const legacyRead = n.send({ from: "sender", to: ["alpha"], subject: "legacy read", body: "x" }).envelope.id;
+  n.store.setDelivery(legacyRead, "alpha", "read", "historical read");
   const slotA = allocateProjectMailbox(n, projA).mailbox.slot; allocateProjectMailbox(n, projB);
   const rec = makeLead({ project: projA, agent: "alpha-lead", host: "alpha", ownerPub: owner.publicKey });
   storeLead(n, rec, signData(owner.privateKey, canonical(rec)));
   const mail = (to: string) => n.send({ from: "sender", to: [to], subject: `for ${to}`, body: "x", kind: "message" }).envelope.id;
-  const ids = { w1: mail("alpha-w1"), w1b: mail("alpha-w1"), bw: mail("beta-w1") };
+  const ids = { w1: mail("alpha-w1"), w1b: mail("alpha-w1"), bw: mail("beta-w1"), legacy, legacyRead };
   n.close();
   const clients: Client[] = [];
   t.after(async () => { for (const c of clients) await c.close().catch(() => {}); for (const d of [root, user]) rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
@@ -54,7 +58,7 @@ function world(t: TestContext) {
   const db = () => new DatabaseSync(join(home, "mbx.db"), { readOnly: true });
   const where = (id: string) => { const d = db(); try { return (d.prepare("SELECT agent FROM deliveries WHERE msg_id=?").all(id) as { agent: string }[]).map((r) => r.agent); } finally { d.close(); } };
   const audits = (event: string) => { const d = db(); try { return (d.prepare("SELECT detail FROM audit WHERE event=? ORDER BY rowid").all(event) as { detail: string }[]).map((r) => JSON.parse(r.detail) as Record<string, unknown>); } finally { d.close(); } };
-  return { ids, slotA, connect, cli, where, audits, projA, projB, rec };
+  return { ids, slotA, connect, cli, where, audits, projA, projB, rec, home };
 }
 
 test("T495 AC2: the lead runs `identity forward` inside its own session and the mail moves with no owner prompt", async (t) => {
@@ -95,4 +99,52 @@ test("T495 AC3: another project's mailbox, or a caller that is not the session's
   assert.equal(decoy.err.includes("Not forwarded as a project lead"), false);
   assert.deepEqual(w.where(w.ids.w1), ["alpha-w1"]);
   assert.equal(w.audits("identity.forward").length, 0);
+});
+
+test("T494: CLI apply uses the real lead lease, preserves read history and is a no-op on repeat", async t => {
+  const w = world(t);
+  await w.connect("alpha-lead", w.projA);
+  const first = w.cli("identity", "migrate-basename", "--project", w.projA, "--apply", "--json");
+  assert.equal(first.status, 0, first.err);
+  assert.equal(JSON.parse(first.out).moved, 1);
+  assert.deepEqual(w.where(w.ids.legacy), [w.slotA]); assert.deepEqual(w.where(w.ids.legacyRead), ["alpha"]);
+  assert.equal(w.audits("identity.basename_migrated").length, 1);
+  const repeated = w.cli("identity", "migrate-basename", "--project", w.projA, "--apply", "--json");
+  assert.equal(repeated.status, 0, repeated.err); assert.equal(JSON.parse(repeated.out).moved, 0);
+  assert.equal(w.audits("identity.basename_migrated").length, 1); assert.equal(w.audits("identity.forward").length, 1);
+});
+
+test("T494: CLI rejects a leased non-lead and a source that became live", async t => {
+  const w = world(t);
+  await w.connect("alpha-w1", w.projA);
+  const denied = w.cli("identity", "migrate-basename", "--project", w.projA, "--apply", "--json");
+  assert.notEqual(denied.status, 0); assert.match(denied.err, /not the current lead/);
+  assert.deepEqual(w.where(w.ids.legacy), ["alpha"]); assert.equal(w.audits("identity.basename_migrated").length, 0);
+  await w.connect("alpha", w.projA);
+  const live = w.cli("identity", "migrate-basename", "--project", w.projA, "--apply", "--as", "alpha-w1");
+  assert.notEqual(live.status, 0); assert.match(live.err, /held by live/);
+  assert.deepEqual(w.where(w.ids.legacy), ["alpha"]);
+});
+
+test("T494: per-message audit failure rolls delivery and alias changes back", async t => {
+  const w = world(t); await w.connect("alpha-lead", w.projA);
+  const db = new DatabaseSync(join(w.home, "mbx.db"));
+  db.exec("CREATE TRIGGER fail_basename_audit BEFORE INSERT ON audit WHEN NEW.event='identity.basename_migrated' BEGIN SELECT RAISE(ABORT,'test audit failure'); END;"); db.close();
+  const failed = w.cli("identity", "migrate-basename", "--project", w.projA, "--apply", "--json");
+  assert.notEqual(failed.status, 0); assert.match(failed.err, /test audit failure/);
+  assert.deepEqual(w.where(w.ids.legacy), ["alpha"]); assert.deepEqual(w.where(w.ids.legacyRead), ["alpha"]);
+  assert.equal(w.audits("identity.basename_migrated").length, 0); assert.equal(w.audits("identity.forward").length, 0);
+  const check = new DatabaseSync(join(w.home, "mbx.db"), { readOnly: true });
+  try { assert.notEqual(check.prepare("SELECT v FROM kv WHERE k='alias:alpha'").get()?.v, w.slotA); } finally { check.close(); }
+});
+
+test("T494: preview does not authorize apply after the lead is revoked", async t => {
+  const w = world(t); await w.connect("alpha-lead", w.projA);
+  const preview = w.cli("identity", "migrate-basename", "--project", w.projA, "--json");
+  assert.equal(preview.status, 0, preview.err); assert.deepEqual(JSON.parse(preview.out).ids, [w.ids.legacy]);
+  const node = new MbxNode(w.home), owner = unlockOwnerKey(w.home, PASS);
+  const rev = makeLeadRevocation(w.rec.id, owner.publicKey); revokeLead(node, rev, signData(owner.privateKey, canonical(rev))); node.close();
+  const denied = w.cli("identity", "migrate-basename", "--project", w.projA, "--apply", "--json");
+  assert.notEqual(denied.status, 0); assert.match(denied.err, /not the current lead/);
+  assert.deepEqual(w.where(w.ids.legacy), ["alpha"]); assert.equal(w.audits("identity.basename_migrated").length, 0);
 });

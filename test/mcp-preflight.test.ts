@@ -7,7 +7,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { MbxNode } from "../src/node.ts";
 
-test("MCP startup, rename and heartbeat inspect processes outside SQLite transactions", async t => {
+test("MCP startup, rename, send, thread and heartbeat inspect processes outside SQLite transactions", async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-preflight-")), trace = join(home, "trace.jsonl"), preload = join(home, "trace.mjs");
   const client = new Client({ name: "claude", version: "test" });
   t.after(async () => { await client.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
@@ -25,6 +25,11 @@ test("MCP startup, rename and heartbeat inspect processes outside SQLite transac
   await client.connect(new StdioClientTransport({ command: process.execPath, args: ["--import", preload, join(import.meta.dirname, "../bin/agentmbx.js"), "mcp"],
     env: { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_AGENT: "reader", MBX_CLI: "claude", MBX_NO_DESKTOP: "1" } as Record<string, string> }));
   assert.notEqual((await client.callTool({ name: "mbx_whoami", arguments: { name: "renamed" } })).isError, true);
+  const sent = await client.callTool({ name: "mbx_send", arguments: { to: ["renamed"], subject: "ps", body: "outside the lock" } });
+  assert.notEqual(sent.isError, true);
+  const sentId = (sent.structuredContent as { id?: string } | undefined)?.id;
+  assert.equal(typeof sentId, "string");
+  assert.notEqual((await client.callTool({ name: "mbx_thread", arguments: { id: sentId } })).isError, true);
   await new Promise(resolve => setTimeout(resolve, 200));
   assert.notEqual((await client.callTool({ name: "mbx_inbox", arguments: {} })).isError, true);
   await client.close();

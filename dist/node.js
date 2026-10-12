@@ -15,7 +15,7 @@ import { ownerPublicKey } from "./owner.js";
 import { auditLeadGrantUse, leadGrantForSender } from "./lead-grants.js";
 import { effectivePolicy, policyLine } from "./policy.js";
 import { procStart, procTable, provenProcess, sameProcess } from "./proc.js";
-import { bumpPostToolMarker, bumpPostToolMarkersForAgent } from "./posttool.js";
+import { bumpPostToolMarker, bumpPostToolMarkersForAgent, POSTTOOL_FAST_CLIS } from "./posttool.js";
 import { privatePath } from "./private-files.js";
 import { TASK_RE } from "./presence.js";
 import { backfillProjectKeys, backfillRegistry } from "./registry.js";
@@ -273,10 +273,10 @@ export class MbxNode {
                 db.prepare("UPDATE deliveries SET state='delivered', note=NULL WHERE agent=? AND state='notified' AND note='desktop'").run(agent);
             return agent;
         });
-        // T342: a claude bind can change the session→agent mapping the post-tool hook resolves, so the
-        // hook's fast path must run the full decision once. After the tx: fs writes never inside it.
-        if (s.cli === "claude" && s.session_id)
-            bumpPostToolMarker(this.home, "claude", s.session_id);
+        // T342/T341: a claude or opencode bind can change the session→agent mapping the post-tool hook resolves,
+        // so the hook's fast path must run the full decision once. After the tx: fs writes never inside it.
+        if (POSTTOOL_FAST_CLIS.includes(s.cli) && s.session_id)
+            bumpPostToolMarker(this.home, s.cli, s.session_id);
         return bound;
     }
     /** The agent name the MCP server of this CLI process uses (fresh binding of a live pid), if any. */
@@ -351,6 +351,10 @@ export class MbxNode {
     addAlias(oldName, newName, pid) {
         if (oldName === newName)
             return;
+        // inUseElsewhere and the owned-row proof read the table. A rename with no such row still spawns nothing (T591).
+        const cutoff = new Date(Date.now() - LIVE_AGENT_MS).toISOString();
+        if (this.store.db.prepare("SELECT 1 FROM sessions WHERE pid IS NOT NULL AND pid_start<>'' AND updated_at>=? AND agent IN (?, ?) LIMIT 1").get(cutoff, oldName, newName))
+            procTable();
         this.store.tx(() => {
             if (this.inUseElsewhere(newName, pid))
                 throw Object.assign(new Error(`agent name ${newName} is in use; choose another name`), { code: "NAME_IN_USE" });
@@ -1023,9 +1027,11 @@ export class MbxNode {
     /**
      * Can `agent` (or a name linked to its session) see this message: it sent it or it was delivered to it. Everything
      * that takes a message id for an agent checks this and answers "not found" otherwise, so ids leak nothing.
+     * `also` is names the caller already resolved. The thread pre-check passes led project slots, because
+     * readableSlots stays empty until that agent's own lease is held.
      */
-    canSee(m, agent) {
-        const names = [agent, ...this.linkedNames(agent), ...this.readableSlots(agent)];
+    canSee(m, agent, also = []) {
+        const names = [agent, ...this.linkedNames(agent), ...this.readableSlots(agent), ...also];
         const [fa, fh] = m.from_addr.split("@");
         if ((m.origin === "local" || fh === this.host) && names.includes(fa))
             return true;

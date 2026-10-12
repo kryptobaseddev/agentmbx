@@ -10,7 +10,7 @@ import { deliveryReceipts, type DeliveryReceipt } from "./receipts.ts";
 import { resolveProject } from "./project-key.ts";
 import { SLOT_GLOB } from "./project-slot.ts";
 import { projectIdentities, registeredIdentity } from "./registry.ts";
-import type { MessageRow } from "./store.ts";
+import type { MessageRow, Store } from "./store.ts";
 
 export {
   LEAD_DEFAULT_TTL_MS, LEAD_MAX_TTL_MS, leadSummary, makeLead, makeLeadRevocation,
@@ -40,7 +40,7 @@ const roleOf = (node: MbxNode, address: string) => {
 /** SQL condition (and parameters) for "a message of this project": stamped with meta.project, stamped with this project's
  *  key (its CLEO id, T543, or the git origin that mail written before that was stamped with, T219) from another checkout or a
  *  paired host's own folder, or sent by / delivered to an identity associated with the project. */
-function ledgerWhere(node: MbxNode, project: string): { sql: string; args: string[] } {
+function ledgerWhere(node: { store: Pick<Store, "db">; host: string }, project: string): { sql: string; args: string[] } {
   const members = [...projectIdentities(node.store, project)];
   const addrs = members.map((n) => `${n}@${node.host}`);
   const inList = (xs: string[]) => (xs.length ? xs.map(() => "?").join(",") : "NULL");
@@ -61,7 +61,7 @@ function ledgerIds(node: MbxNode, project: string, after: string, upTo: string, 
     .all(after, upTo, ...w.args, `${caller}@${node.host}`, ...mine, limit) as { id: string }[]).map((r) => r.id);
 }
 /** Is `id` a message of `project`'s ledger? */
-export function inLedger(node: MbxNode, project: string, id: string): boolean {
+export function inLedger(node: { store: Pick<Store, "db">; host: string }, project: string, id: string): boolean {
   const w = ledgerWhere(node, project);
   return !!node.store.db.prepare(`SELECT 1 FROM messages WHERE id=? AND ${w.sql}`).get(id, ...w.args);
 }

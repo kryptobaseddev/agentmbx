@@ -68,43 +68,83 @@ export function revokeLead(node, rev, sig) {
     node.store.audit("lead.revoke", { id: r.data.target, revocation: r.data.id });
     return r.data;
 }
-/** The current lead of `project`, re-verified now: newest valid, unexpired, unrevoked record wins. A record belongs to the
+/** The current lead of `project`, re-verified now: the newest authenticated record supersedes older ones even when it ends. A record belongs to the
  *  folder it was signed for, or to any other checkout of the same CLEO project (T543: the stored key matches). The owner's
  *  signature is checked exactly as before; the key only decides which signed records are candidates for this project. */
 export function activeLead(node, project, now = new Date()) {
     return leadFor(node, project, resolveProject(project).key, now);
 }
 export function leadFor(node, project, key, now) {
-    const rows = node.store.db.prepare("SELECT record,sig,revocation,revocation_sig,project_key FROM project_leads WHERE project=? OR project_key=? ORDER BY id DESC").all(project, key);
+    const rows = node.store.db.prepare("SELECT id,record,sig,revocation,revocation_sig,project_key FROM project_leads WHERE project=? OR project_key=? ORDER BY id DESC").iterate(project, key);
     for (const row of rows) {
-        let rec;
-        try {
-            const p = LeadRecord.safeParse(JSON.parse(row.record));
-            if (!p.success)
-                continue;
-            rec = p.data;
-        }
-        catch {
-            continue;
-        }
-        if ((rec.project !== project && !(row.project_key !== null && row.project_key === key)) || !signedBy(node, rec, row.sig, rec.owner_fp))
-            continue;
-        if (row.revocation && row.revocation_sig) {
-            try {
-                const rv = LeadRevocation.safeParse(JSON.parse(row.revocation));
-                if (rv.success && rv.data.target === rec.id && signedBy(node, rv.data, row.revocation_sig, rv.data.owner_fp))
-                    continue; // revoked
-            }
-            catch { /* a malformed revocation takes nothing away */ }
-        }
-        if (Date.parse(rec.exp) <= now.getTime())
-            continue;
-        return rec;
+        const checked = checkedLead(node, row, project, key, now);
+        if (checked)
+            return checked.validity === "active" ? checked.record : null;
     }
     return null;
 }
-/** Every project's current lead, each re-verified now like `activeLead` (T496). A project whose records are all
- *  expired, revoked or not signed by a trusted owner key has no entry. One entry per project, however many checkouts have
+/** Authenticate a matching record before its lifetime/revocation can shadow older authority. */
+function checkedLead(node, row, project, key, now) {
+    let rec;
+    try {
+        const p = LeadRecord.safeParse(JSON.parse(row.record));
+        if (!p.success)
+            return null;
+        rec = p.data;
+    }
+    catch {
+        return null;
+    }
+    if (rec.id !== row.id || (rec.project !== project && row.project_key !== key) || !signedBy(node, rec, row.sig, rec.owner_fp))
+        return null;
+    if (row.revocation && row.revocation_sig) {
+        try {
+            const rv = LeadRevocation.safeParse(JSON.parse(row.revocation));
+            if (rv.success && rv.data.target === rec.id && signedBy(node, rv.data, row.revocation_sig, rv.data.owner_fp))
+                return { record: rec, validity: "revoked" };
+        }
+        catch { /* a malformed revocation takes nothing away */ }
+    }
+    return { record: rec, validity: Date.parse(rec.exp) <= now.getTime() ? "expired" : "active" };
+}
+export const LEAD_HISTORY_LIMIT = 20;
+/** Bounded diagnostic history, not a new authority/liveness source. Unknown coverage never means vacant. */
+export function leadHistory(node, project, key = resolveProject(project).key, now = new Date(), limit = LEAD_HISTORY_LIMIT) {
+    if (!Number.isInteger(limit) || limit < 1 || limit > LEAD_HISTORY_LIMIT)
+        fail("LEAD_HISTORY_LIMIT", "lead history limit must be between 1 and 20");
+    const rows = node.store.db.prepare(`SELECT id,substr(record,1,8193) AS record,substr(sig,1,129) AS sig,
+    substr(revocation,1,2049) AS revocation,substr(revocation_sig,1,129) AS revocation_sig,project_key,
+    (length(record)>8192 OR length(sig)>128 OR COALESCE(length(revocation),0)>2048 OR COALESCE(length(revocation_sig),0)>128) AS oversized
+    FROM project_leads WHERE project=? OR project_key=? ORDER BY id DESC LIMIT ?`).all(project, key, limit + 1);
+    const view = { head: null, active: null, state: "none", records: [], truncated: rows.length > limit };
+    let unknownHead = false;
+    for (const row of rows.slice(0, limit)) {
+        if (row.oversized) {
+            if (!view.head)
+                unknownHead = true;
+            view.records.push({ id: row.id, record: null, state: "unverified", reason: "oversized" });
+            continue;
+        }
+        const checked = checkedLead(node, row, project, key, now);
+        if (!checked) {
+            view.records.push({ id: row.id, record: null, state: "invalid", reason: "invalid" });
+            continue;
+        }
+        const head = !view.head && !unknownHead;
+        if (head) {
+            view.head = checked.record;
+            view.state = checked.validity;
+            if (checked.validity === "active")
+                view.active = checked.record;
+        }
+        view.records.push({ id: row.id, record: checked.record, state: head ? "head" : unknownHead ? "unverified" : "shadowed", reason: checked.validity });
+    }
+    if (!view.head && (view.truncated || unknownHead))
+        view.state = "unknown";
+    return view;
+}
+/** Every project's current lead, each re-verified now like `activeLead` (T496). A project whose head is
+ *  expired/revoked, or has no authenticated record, has no entry. One entry per project, however many checkouts have
  *  records (T543). Ordered by project folder. */
 export function activeLeads(node, now = new Date()) {
     const out = [];

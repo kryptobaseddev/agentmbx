@@ -6,7 +6,7 @@ import { sendLeased } from "./helpers/leased-send.ts";
 // the prompts/status REST shape against a fake HTTP server, the busy gate in dispatchWakes, and the shared
 // wake brake + desktop fallback. All kimi-home dirs here are isolated temp dirs; KIMI_CODE_HOME is only ever
 // pointed at them in this file, never at the user's real ~/.kimi-code.
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
@@ -27,8 +27,12 @@ const tmp = () => mkdtempSync(join(tmpdir(), "mbx-kimi-"));
 interface Seen { method: string; url: string; auth: string | null; body: string }
 interface FakeState { busy?: boolean; model?: string | null; defaultModel?: string | null; failPrompts?: boolean }
 
-/** The kimi web REST API as the wake adapter expects it (envelope: {code, data}), recording every request. */
-function fakeKimiServer(state: FakeState) {
+/**
+ * The kimi web REST API as the wake adapter expects it (envelope: {code, data}), recording every request.
+ * The server closes through t.after at creation time: a failed assertion can never strand the listener and
+ * retain the test runner (T113). `close` is idempotent for tests that close early to inspect handles.
+ */
+function fakeKimiServer(t: TestContext, state: FakeState) {
   const seen: Seen[] = [];
   const server = createServer((req, res) => {
     let body = "";
@@ -51,8 +55,12 @@ function fakeKimiServer(state: FakeState) {
       res.end(JSON.stringify({ code: 40400, message: "not found" }));
     });
   });
-  return new Promise<{ server: Server; url: string; seen: Seen[] }>((resolve) => {
-    server.listen(0, "127.0.0.1", () => resolve({ server, url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, seen }));
+  let closing: Promise<void> | null = null;
+  const close = () => (closing ??= new Promise<void>((resolve, reject) =>
+    server.close((err) => err && (err as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING" ? reject(err) : resolve())));
+  t.after(close);
+  return new Promise<{ server: Server; url: string; seen: Seen[]; close: () => Promise<void> }>((resolve) => {
+    server.listen(0, "127.0.0.1", () => resolve({ server, url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, seen, close }));
   });
 }
 
@@ -166,8 +174,8 @@ test("kimiHostedServer: only a live instances row for this very pid counts as ho
 });
 
 // ---- wakeKimi against a fake kimi web server -----------------------------------------------------
-test("wakeKimi submits the wake text as a user prompt with the bearer token", async () => {
-  const { server, url, seen } = await fakeKimiServer({ model: "kimi-code/kimi-for-coding" });
+test("wakeKimi submits the wake text as a user prompt with the bearer token", async (t) => {
+  const { url, seen } = await fakeKimiServer(t, { model: "kimi-code/kimi-for-coding" });
   const r = await wakeKimi({ session_id: "session_t", pid: null }, "wake text here", { server: { url, token: "tok" } });
   assert.deepEqual(legacy(r), { ok: true, via: "kimi web" }); assert.equal(r.outcome?.kind, "admitted");
   assert.equal(seen.length, 2);
@@ -180,36 +188,32 @@ test("wakeKimi submits the wake text as a user prompt with the bearer token", as
   const body = JSON.parse(seen[1].body) as { content: { type: string; text: string }[]; model?: string };
   assert.deepEqual(body.content, [{ type: "text", text: "wake text here" }]);
   assert.equal(body.model, undefined, "a session that already has a model needs no model field");
-  server.close();
 });
 
-test("wakeKimi on a busy session returns retry and submits no prompt", async () => {
-  const { server, url, seen } = await fakeKimiServer({ busy: true, model: "m" });
+test("wakeKimi on a busy session returns retry and submits no prompt", async (t) => {
+  const { url, seen } = await fakeKimiServer(t, { busy: true, model: "m" });
   const r = await wakeKimi({ session_id: "session_t", pid: null }, "wake", { server: { url, token: "tok" } });
   assert.deepEqual(legacy(r), { ok: false, via: "kimi web", error: "session busy", retry: true }); assert.equal(r.outcome?.kind, "busy");
   assert.equal(seen.filter((s) => s.method === "POST").length, 0, "no prompt submitted while the session is mid-turn");
-  server.close();
 });
 
-test("wakeKimi passes the server default model when the session has none bound (the 'Model not set' fix)", async () => {
-  const { server, url, seen } = await fakeKimiServer({ model: null, defaultModel: "kimi-code/kimi-for-coding" });
+test("wakeKimi passes the server default model when the session has none bound (the 'Model not set' fix)", async (t) => {
+  const { url, seen } = await fakeKimiServer(t, { model: null, defaultModel: "kimi-code/kimi-for-coding" });
   const r = await wakeKimi({ session_id: "session_t", pid: null }, "wake", { server: { url, token: "tok" } });
   assert.deepEqual(legacy(r), { ok: true, via: "kimi web" }); assert.equal(r.outcome?.kind, "admitted");
   const post = seen.find((s) => s.method === "POST")!;
   assert.equal((JSON.parse(post.body) as { model?: string }).model, "kimi-code/kimi-for-coding");
-  server.close();
 });
 
-test("wakeKimi surfaces the server's 'Model not set' error when no model can be resolved", async () => {
-  const { server, url } = await fakeKimiServer({ model: null, defaultModel: null, failPrompts: true });
+test("wakeKimi surfaces the server's 'Model not set' error when no model can be resolved", async (t) => {
+  const { url } = await fakeKimiServer(t, { model: null, defaultModel: null, failPrompts: true });
   const r = await wakeKimi({ session_id: "session_t", pid: null }, "wake", { server: { url, token: "tok" } });
   assert.equal(r.ok, false);
   assert.match(err(r), /Model not set/);
-  server.close();
 });
 
-test("wakeKimi reports HTTP and envelope failures", async () => {
-  const { server, url, seen } = await fakeKimiServer({ model: null, defaultModel: null, failPrompts: true });
+test("wakeKimi reports HTTP and envelope failures", async (t) => {
+  const { url, seen } = await fakeKimiServer(t, { model: null, defaultModel: null, failPrompts: true });
   const r = await wakeKimi({ session_id: "session_t", pid: null }, "wake", { server: { url, token: "tok" } });
   assert.equal(r.ok, false);
   assert.match(err(r), /Model not set/);
@@ -217,27 +221,58 @@ test("wakeKimi reports HTTP and envelope failures", async () => {
   // unreachable server: a plain error, not a throw
   const down = await wakeKimi({ session_id: "session_t", pid: null }, "wake", { server: { url: "http://127.0.0.1:9", token: "tok" } });
   assert.equal(down.ok, false);
-  server.close();
 });
 
-test("wakeKimi refuses terminal TUI sessions (no instances row for the pid) without any HTTP call", async () => {
+test("wakeKimi refuses terminal TUI sessions (no instances row for the pid) without any HTTP call", async (t) => {
   const home = tmp();
   let httpCalls = 0;
-  const { server, url } = await fakeKimiServer({ model: "m" });
+  const { server } = await fakeKimiServer(t, { model: "m" });
   server.on("request", () => { httpCalls++; });
   await withKimiHome(home, async () => {
     const r = await wakeKimi({ session_id: "session_t", pid: 2 ** 22 + 12345 }, "wake");
     assert.deepEqual(legacy(r), { ok: false, via: "kimi web", error: "not a kimi web-hosted session" }); assert.equal(r.outcome?.kind, "not_submitted");
   });
   assert.equal(httpCalls, 0, "terminal sessions are rejected before any request");
-  server.close();
+});
+
+// T113: a kept-alive socket outliving the stub server retains the test runner at 0% CPU after every test
+// has passed. The stub answers Connection: close and a plain node --test run of this file (no
+// --test-force-exit) is the gate; this test pins the drain on the happy path.
+test("a completed wake leaves no socket handle on the closed stub server (T113)", async (t) => {
+  const { url, seen, close } = await fakeKimiServer(t, { model: "m" });
+  const port = Number(new URL(url).port);
+  const r = await wakeKimi({ session_id: "session_t", pid: null }, "wake", { server: { url, token: "tok" } });
+  assert.equal(r.ok, true, JSON.stringify(legacy(r)));
+  assert.ok(seen.length >= 2, "status then prompt were requested");
+  await close();
+  await new Promise((resolve) => setTimeout(resolve, 50)); // let both ends retire the closed socket
+  const handles = (process as unknown as { _getActiveHandles(): object[] })._getActiveHandles();
+  const leftover = handles.filter((h) => {
+    const d = h as { localPort?: number; remotePort?: number };
+    return d.localPort === port || d.remotePort === port;
+  });
+  assert.deepEqual(leftover, [], "no socket handle may outlive the closed stub server");
+});
+
+// T113: cleanup must be registered when the server is created, before any assertion can throw and strand
+// the listener: a failed test must never leave the stub server (and with it the test runner) alive.
+test("fakeKimiServer registers its close with t.after at creation (T113)", async () => {
+  const cleanups: (() => void | Promise<void>)[] = [];
+  const fakeT = { after: (fn: () => void | Promise<void>) => { cleanups.push(fn); } } as unknown as TestContext;
+  const { server } = await fakeKimiServer(fakeT, { model: "m" });
+  assert.equal(cleanups.length, 1, "the close is registered at creation, not after the test's assertions");
+  assert.equal(server.listening, true);
+  await cleanups[0]!();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(server.listening, false, "the registered cleanup closes the listener");
 });
 
 // ---- dispatchWakes wiring ------------------------------------------------------------------------
-test("dispatchWakes wakes a hosted kimi session with the shared brake and no desktop notice", async () => {
-  const { server, url, seen } = await fakeKimiServer({ model: "kimi-code/kimi-for-coding" });
+test("dispatchWakes wakes a hosted kimi session with the shared brake and no desktop notice", async (t) => {
+  const { url, seen } = await fakeKimiServer(t, { model: "kimi-code/kimi-for-coding" });
   const home = kimiHomeWithInstance(Number(new URL(url).port));
   const n = new MbxNode(tmp(), { host: "alpha" });
+  t.after(() => n.close());
   await withKimiHome(home, async () => {
     n.registerAgent("web");
     bindWakeLease(n, { agent: "web", cli: "kimi", session_id: "session_t049", pid: process.pid });
@@ -252,15 +287,14 @@ test("dispatchWakes wakes a hosted kimi session with the shared brake and no des
     assert.equal(body.model, undefined, "session already has a model");
     assert.equal((n.store.db.prepare("SELECT count(*) n FROM wakes WHERE agent='web'").get() as { n: number }).n, 1, "one wake recorded against the shared brake");
   });
-  n.close();
-  server.close();
 });
 
-test("a busy hosted session is skipped without spending the brake, and is woken once idle", async () => {
+test("a busy hosted session is skipped without spending the brake, and is woken once idle", async (t) => {
   const state: FakeState = { busy: true, model: "kimi-code/kimi-for-coding" };
-  const { server, url, seen } = await fakeKimiServer(state);
+  const { url, seen } = await fakeKimiServer(t, state);
   const home = kimiHomeWithInstance(Number(new URL(url).port));
   const n = new MbxNode(tmp(), { host: "alpha" });
+  t.after(() => n.close());
   await withKimiHome(home, async () => {
     n.registerAgent("web");
     bindWakeLease(n, { agent: "web", cli: "kimi", session_id: "session_t049", pid: process.pid });
@@ -277,14 +311,13 @@ test("a busy hosted session is skipped without spending the brake, and is woken 
     assert.deepEqual(deliveries(n), [{ state: "notified", note: null }]);
     assert.equal(seen.filter((s) => s.method === "POST").length, 1, "exactly one prompt, submitted once idle");
   });
-  n.close();
-  server.close();
 });
 
-test("the shared wake brake batches a second wake inside 30 s (same as the other adapters)", async () => {
-  const { server, url, seen } = await fakeKimiServer({ model: "m" });
+test("the shared wake brake batches a second wake inside 30 s (same as the other adapters)", async (t) => {
+  const { url, seen } = await fakeKimiServer(t, { model: "m" });
   const home = kimiHomeWithInstance(Number(new URL(url).port));
   const n = new MbxNode(tmp(), { host: "alpha" });
+  t.after(() => n.close());
   await withKimiHome(home, async () => {
     n.registerAgent("web");
     bindWakeLease(n, { agent: "web", cli: "kimi", session_id: "session_t049", pid: process.pid });
@@ -296,14 +329,13 @@ test("the shared wake brake batches a second wake inside 30 s (same as the other
     assert.equal(seen.filter((s) => s.method === "POST").length, 1, "no second HTTP wake within the brake window");
     assert.equal((n.store.db.prepare("SELECT count(*) n FROM deliveries WHERE state='delivered'").get() as { n: number }).n, 1, "the second message waits for the next pass");
   });
-  n.close();
-  server.close();
 });
 
-test("terminal kimi sessions are never woken: the wake falls back to the desktop notice", async () => {
-  const { server, url } = await fakeKimiServer({ model: "m" });
+test("terminal kimi sessions are never woken: the wake falls back to the desktop notice", async (t) => {
+  const { url } = await fakeKimiServer(t, { model: "m" });
   const home = tmp(); // no instances: nothing is hosted
   const n = new MbxNode(tmp(), { host: "alpha" });
+  t.after(() => n.close());
   await withKimiHome(home, async () => {
     n.registerAgent("term");
     bindWakeLease(n, { agent: "term", cli: "kimi", session_id: "session_term", pid: process.pid });
@@ -315,14 +347,13 @@ test("terminal kimi sessions are never woken: the wake falls back to the desktop
     assert.deepEqual(deliveries(n), [{ state: "notified", note: "desktop" }]);
     assert.equal(n.deliveryMode("term"), "no push: new mail shows on your user's next prompt, or when your mbx watcher or [mbx-watch] self-check runs");
   });
-  n.close();
-  server.close();
 });
 
-test("mail that only reached the desktop is retried when a hosted kimi session binds", async () => {
-  const { server, url } = await fakeKimiServer({ model: "m" });
+test("mail that only reached the desktop is retried when a hosted kimi session binds", async (t) => {
+  const { url } = await fakeKimiServer(t, { model: "m" });
   const home = kimiHomeWithInstance(Number(new URL(url).port));
   const n = new MbxNode(tmp(), { host: "alpha" });
+  t.after(() => n.close());
   await withKimiHome(home, async () => {
     n.registerAgent("web");
     const id = sendLeased(n, { from: "boss", to: ["web"], subject: "s", body: "b", kind: "request" }).envelope.id;
@@ -331,8 +362,6 @@ test("mail that only reached the desktop is retried when a hosted kimi session b
     assert.equal((n.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=?").get(id) as { state: string }).state, "delivered", "a hosted binding re-queues desktop-only mail for a real wake");
     assert.equal(n.deliveryMode("web"), "push (kimi web or desktop app)");
   });
-  n.close();
-  server.close();
 });
 
 for (const change of ["release-before-post", "policy-before-post", "ack-before-post", "release-after-post", "ack-after-post", "grant-before-post", "grant-after-post"]) test(`wake rechecks authority across async adapter work: ${change}`, async t => {
@@ -364,7 +393,7 @@ for (const change of ["release-before-post", "policy-before-post", "ack-before-p
     assert.equal(result[0].result.ok, false); assert.equal(result[0].result.via, "lease");
     assert.equal(prompts, change.endsWith("before-post") ? 0 : 1);
     assert.equal(n.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=?").get(id)!.state, change.startsWith("ack") ? "acked" : "delivered");
-    assert.equal(n.store.db.prepare("SELECT count(*) n FROM wakes").get()!.n, change.endsWith("before-post") ? 0 : 1,
+    assert.equal((n.store.db.prepare("SELECT count(*) n FROM wakes").get() as { n: number }).n, change.endsWith("before-post") ? 0 : 1,
       "only known-unsent submissions refund their reservation");
   });
 });

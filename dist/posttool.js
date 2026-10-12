@@ -29,14 +29,16 @@ export function bumpPostToolMarker(home, cli, sessionId) {
     }
     catch { /* advisory: a missed bump only costs one node-path run, never a wrong decision */ }
 }
-/** Bump markers for every claude session bound to `agent` (a delivery can arrive while the agent
+/** The CLIs whose post-tool hook has a marker fast path: Claude's sh wrapper (T342) and the OpenCode plugin (T341). */
+export const POSTTOOL_FAST_CLIS = ["claude", "opencode"];
+/** Bump markers for every fast-path session bound to `agent` (a delivery can arrive while the agent
  *  holds several sessions; each session's hook must notice). */
 export function bumpPostToolMarkersForAgent(db, home, agent) {
     try {
-        const rows = db.prepare("SELECT session_id FROM sessions WHERE agent=? AND cli='claude' AND session_id NOT LIKE 'mcp-%'")
-            .all(agent);
+        const rows = db.prepare(`SELECT cli,session_id FROM sessions WHERE agent=? AND cli IN (${POSTTOOL_FAST_CLIS.map(() => "?").join(",")}) AND session_id NOT LIKE 'mcp-%'`)
+            .all(agent, ...POSTTOOL_FAST_CLIS);
         for (const row of rows)
-            bumpPostToolMarker(home, "claude", row.session_id);
+            bumpPostToolMarker(home, row.cli, row.session_id);
     }
     catch { /* advisory, same as above */ }
 }

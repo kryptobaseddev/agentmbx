@@ -137,3 +137,63 @@ export function moveCatchup(store, from, to) {
     store.db.prepare("DELETE FROM kv WHERE k=?").run(catchupKey(from));
     store.audit("catchup.move", { from, to });
 }
+/** One checkpoint per project slot. A new lead does not inherit it, and a rename never moves it. */
+export const projectCatchupKey = (slot) => `catchup:project:${slot}`;
+function readProject(store, slot) {
+    const raw = store.get(projectCatchupKey(slot));
+    if (!raw)
+        return null;
+    try {
+        const r = JSON.parse(raw);
+        return r && r.v === 1 && typeof r.epoch === "string" && Number.isSafeInteger(r.position) && r.position >= 0
+            && r.filter === CATCHUP_FILTER && Number.isSafeInteger(r.updated_at) && typeof r.by === "string" ? r : null;
+    }
+    catch {
+        return null;
+    }
+}
+export function readProjectCatchup(store, slot) {
+    return readProject(store, slot);
+}
+/**
+ * First project checkpoint: the current end, the same rule as an identity that was never held.
+ * Earlier history, including acknowledged mail, is `mbx_replay` with no cursor.
+ */
+export function ensureProjectCatchup(store, slot, by, now = Date.now()) {
+    const existing = readProject(store, slot);
+    if (existing)
+        return existing;
+    const epoch = store.get("replay:epoch") ?? fail("CURSOR_EXPIRED", "Replay generation is unavailable; initialize this store before catch-up");
+    const position = replayMaximum(store, slot);
+    const record = { v: 1, epoch, position, filter: CATCHUP_FILTER, updated_at: now, by };
+    store.set(projectCatchupKey(slot), JSON.stringify(record));
+    store.audit("catchup.init", { name: slot, position, origin: "project: start at the current end", by });
+    return record;
+}
+export function commitProjectCatchup(store, slot, cursor, by) {
+    const record = readProject(store, slot) ?? fail("CURSOR_INVALID", "no project catch-up checkpoint; call mbx_catchup without commit first");
+    const epoch = store.get("replay:epoch") ?? fail("CURSOR_EXPIRED", "Replay generation is unavailable; initialize this store before catch-up");
+    const frame = parseCatchupCursor(cursor);
+    if (frame.mailbox !== slot || frame.filter !== CATCHUP_FILTER)
+        fail("CURSOR_SCOPE_MISMATCH", "catch-up commits must come from this project mailbox's unfiltered catch-up pages");
+    if (frame.epoch !== epoch)
+        fail("CURSOR_EXPIRED", "the store was restored or reset; restart catch-up explicitly (restart: all | now)");
+    if (frame.end > replayMaximum(store, slot))
+        fail("CURSOR_INVALID", "catch-up commit exceeds available history");
+    if (frame.position < record.position)
+        fail("CURSOR_INVALID", "catch-up commits never rewind; the stored checkpoint is ahead of this cursor");
+    if (frame.position === record.position)
+        return { from: record.position, to: frame.position, noop: true };
+    const next = { v: 1, epoch, position: frame.position, filter: CATCHUP_FILTER, updated_at: Date.now(), by };
+    store.set(projectCatchupKey(slot), JSON.stringify(next));
+    store.audit("catchup.advance", { name: slot, from: record.position, to: frame.position, by });
+    return { from: record.position, to: frame.position, noop: false };
+}
+export function restartProjectCatchup(store, slot, mode, by) {
+    const epoch = store.get("replay:epoch") ?? fail("CURSOR_EXPIRED", "Replay generation is unavailable; initialize this store before catch-up");
+    const position = mode === "now" ? replayMaximum(store, slot) : 0;
+    const record = { v: 1, epoch, position, filter: CATCHUP_FILTER, updated_at: Date.now(), by };
+    store.set(projectCatchupKey(slot), JSON.stringify(record));
+    store.audit("catchup.restart", { name: slot, mode, position, by });
+    return record;
+}
