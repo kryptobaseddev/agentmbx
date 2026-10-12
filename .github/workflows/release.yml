@@ -109,28 +109,29 @@ jobs:
             release/agentmbx-* release/AgentMBX-macos.zip release/SHA256SUMS release/manifest.json release/manifest.json.sig release/install.sh
 
   npm:
-    # Optional: runs only when the NPM_TOKEN secret exists.
+    # Trusted publishing (T013): npm exchanges this job's GitHub OIDC token, so there is no npm token or secret.
+    # The trust binding on npmjs.com names this repo and this workflow filename; renaming release.yml breaks it.
     needs: release
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write
-    env:
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-        if: env.NPM_TOKEN != ''
       - uses: actions/setup-node@v4
-        if: env.NPM_TOKEN != ''
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
       - name: npm publish
-        if: env.NPM_TOKEN != ''
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           tag=latest; case "$GITHUB_REF_NAME" in *-*) tag=next ;; esac
           npm publish --provenance --access public --tag "$tag"
-      - if: env.NPM_TOKEN == ''
-        run: echo "NPM_TOKEN not set; skipping npm publish"
+      - name: Install the published package and run it
+        # Accepted is not yet visible: poll the registry, never re-publish (a version cannot be published twice).
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          for i in $(seq 1 30); do npm view "agentmbx@$v" version >/dev/null 2>&1 && break; sleep 10; done
+          npm view "agentmbx@$v" version dist.integrity
+          home="$(mktemp -d)"; prefix="$(mktemp -d)"
+          HOME="$home" npm install -g --prefix "$prefix" "agentmbx@$v"
+          HOME="$home" "$prefix/bin/agentmbx" --version | grep -F "agentmbx $v"

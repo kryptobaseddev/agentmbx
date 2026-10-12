@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **npm publishing uses trusted publishing (T013).** Release tags publish `agentmbx` to npm through GitHub OIDC with provenance and no npm token, then install the published version and run it. Pull-request CI runs on Linux only; macOS runs on `main` pushes and in the release build.
 - **The v2 HUD file agrees with CLI and loopback on lease.verified (T572).** The writer was inspecting only the session pid, the harness parent, and treating a missing lease-holder pid as unverified. It now inspects that holder pid in the same process pass.
 - **`whoami.harness_session` follows the hook-bound session after an in-place upgrade (T571).** A server whose lease still carries the provisional `mcp-<pid>` id while this provider's hooks have bound exactly one real session now reports that session as `harness_session` — the id the statusline, HUD, `agentmbx status` and the endpoint key on — instead of the lease id. Report-only: `state.sessionId`, the lease and the resolver are unchanged, and `session`/`lease_key` still carry the lease key fingerprint.
 
