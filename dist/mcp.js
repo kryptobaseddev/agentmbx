@@ -1471,14 +1471,9 @@ async function configureMcp(server, node, startupClosed) {
                         return freshProcSession();
                     if (name !== "mbx_thread" || !args?.id)
                         return false;
-                    // readableSlots is empty until withHeld. Include the slots the in-lease canSee will see.
-                    const names = [state.agent, ...node.linkedNames(state.agent), ...projectsLedBy(node, state.agent).map((p) => p.slot)];
-                    const visible = (m) => {
-                        const [fromAgent, fromHost] = m.from_addr.split("@");
-                        if ((m.origin === "local" || fromHost === node.host) && names.includes(fromAgent))
-                            return true;
-                        return names.some((n) => node.store.db.prepare("SELECT 1 FROM deliveries WHERE msg_id=? AND agent=?").get(m.id, n));
-                    };
+                    // readableSlots is empty until withHeld. Pass the slots the in-lease canSee will see.
+                    const slots = projectsLedBy(node, state.agent).map((p) => p.slot);
+                    const visible = (m) => node.canSee(m, state.agent, slots);
                     const found = node.message(args.id, state.agent);
                     const threadId = found && visible(found) ? found.thread : args.id;
                     return node.store.db.prepare("SELECT * FROM messages WHERE thread=?").all(threadId).some(visible);

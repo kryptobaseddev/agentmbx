@@ -903,9 +903,11 @@ export class MbxNode {
   /**
    * Can `agent` (or a name linked to its session) see this message: it sent it or it was delivered to it. Everything
    * that takes a message id for an agent checks this and answers "not found" otherwise, so ids leak nothing.
+   * `also` is names the caller already resolved. The thread pre-check passes led project slots, because
+   * readableSlots stays empty until that agent's own lease is held.
    */
-  canSee(m: MessageRow, agent: string): boolean {
-    const names = [agent, ...this.linkedNames(agent), ...this.readableSlots(agent)];
+  canSee(m: MessageRow, agent: string, also: readonly string[] = []): boolean {
+    const names = [agent, ...this.linkedNames(agent), ...this.readableSlots(agent), ...also];
     const [fa, fh] = m.from_addr.split("@");
     if ((m.origin === "local" || fh === this.host) && names.includes(fa)) return true;
     return names.some((n) => this.store.db.prepare("SELECT 1 FROM deliveries WHERE msg_id=? AND agent=?").get(m.id, n));
