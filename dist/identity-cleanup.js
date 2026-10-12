@@ -12,6 +12,84 @@ import { identityAvailability, activityKey, parseActivity } from "./identity-ava
 import { hasHeldIdentity, inspectLeaseProcess } from "./identity-leases.js";
 import { bumpPostToolMarkersForAgent } from "./posttool.js";
 import { AUTO_NAME_RE, registeredIdentity } from "./registry.js";
+import { DatabaseSync } from "node:sqlite";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { resolveProject } from "./project-key.js";
+import { SCHEMA_VERSION } from "./store.js";
+/** Pure candidate assessment shared by the read-only preview and guarded apply. No authority is granted by a preview. */
+export function basenameMigrationPlan(node, project, now = Date.now()) {
+    const key = resolveProject(project).key, box = projectMailboxByKey(node.store, key);
+    const plan = { project, key, source: box?.alias ?? null, target: box?.slot ?? null,
+        ids: [], preserved: 0, aliasCorrect: false, reason: null };
+    const no = (reason) => ({ ...plan, reason });
+    if (!box || !box.alias)
+        return no("no allocated project mailbox with a canonical basename alias; designate/setup the project first");
+    if (box.home_host !== node.host)
+        return no("project mailbox is homed on another host");
+    const keys = projectKeysOf(node.store, box.alias);
+    if (keys.length !== 1 || keys[0] !== key)
+        return no("legacy basename has missing, ambiguous or other-project membership");
+    if (node.store.db.prepare("SELECT 1 FROM kv WHERE k=?").get(`identity-conflict:${box.alias}`))
+        return no("legacy ownership requires owner recovery");
+    const held = heldReason(node, box.alias, now);
+    if (held)
+        return no(`legacy basename is ${held}`);
+    const alias = node.store.db.prepare("SELECT v FROM kv WHERE k=?").get(`alias:${box.alias}`)?.v;
+    if (typeof alias === "string" && isSlotName(alias) && alias !== box.slot)
+        return no("legacy alias points to another project's mailbox");
+    plan.aliasCorrect = alias === box.slot;
+    const rows = node.store.db.prepare("SELECT msg_id,state FROM deliveries WHERE agent=? ORDER BY msg_id").all(box.alias);
+    for (const row of rows) {
+        if (row.state === "read" || row.state === "acked") {
+            plan.preserved++;
+            continue;
+        }
+        if (!["queued", "delivered", "notified"].includes(row.state))
+            return no("legacy mailbox has an unsupported delivery state");
+        if (!inLedger(node, box.key, row.msg_id))
+            return no("legacy pending mail is outside the project's ledger");
+        plan.ids.push(row.msg_id);
+    }
+    return plan;
+}
+/** Existing-store read snapshot: never construct MbxNode, initialize keys, repair schema or allocate a slot. */
+export function readBasenameMigrationPlan(home, project) {
+    const path = join(home, "mbx.db");
+    if (!existsSync(path))
+        throw new Error("mailbox is not initialized; run setup before previewing migration");
+    const config = JSON.parse(readFileSync(join(home, "config.json"), "utf8"));
+    if (typeof config.host !== "string" || !NAME_RE.test(config.host))
+        throw new Error("mailbox host configuration is invalid");
+    const db = new DatabaseSync(path, { readOnly: true });
+    try {
+        db.exec("PRAGMA busy_timeout=5000; PRAGMA query_only=ON; BEGIN");
+        if (Number(db.prepare("PRAGMA user_version").get().user_version) !== SCHEMA_VERSION)
+            throw new Error("mailbox schema is not compatible with this preview; update/setup first");
+        return basenameMigrationPlan({ store: { db }, host: config.host }, project);
+    }
+    finally {
+        db.close();
+    }
+}
+/** Lead-only migration under its existing write lease; use the shared mover, never bootstrap a second route. */
+export function migrateBasename(node, caller, project, now = new Date()) {
+    const result = node.store.tx(() => {
+        const plan = basenameMigrationPlan(node, project, now.getTime());
+        if (plan.reason || !plan.source || !plan.target)
+            throw new Error(plan.reason ?? "legacy basename is not eligible");
+        const auth = authorizeLeadForward(node, caller, plan.source, plan.target, now);
+        if (!auth.ok || auth.project !== plan.key)
+            throw new Error(auth.ok ? "lead authority is for another project" : auth.reason);
+        const moved = plan.aliasCorrect && !plan.ids.length ? { moved: 0, ids: [] }
+            : moveUnread(node, plan.source, plan.target, { authority: "lead", project: auth.project,
+                lead: { agent: caller, record: auth.record }, basenameMigration: true });
+        return { source: plan.source, target: plan.target, project: plan.key, ...moved, preserved: plan.preserved };
+    });
+    if (result.moved)
+        bumpPostToolMarkersForAgent(node.store.db, node.home, caller);
+    return result;
+}
 export const retiredKey = (name) => `retired:${name}`;
 export const isRetired = (node, name) => node.store.get(retiredKey(name)) !== undefined;
 /**
@@ -166,10 +244,16 @@ export function buildForward(node, from, to, now = Date.now()) {
  * its own transaction. Returns the moved ids so the caller can say what moved.
  */
 export function moveUnread(node, from, to, o) {
-    const pending = node.store.db.prepare("SELECT msg_id,state,updated_at,note FROM deliveries WHERE agent=? AND state<>'acked'").all(from);
+    const pending = node.store.db.prepare("SELECT msg_id,state,updated_at,note FROM deliveries WHERE agent=? AND "
+        + (o.basenameMigration ? "state IN ('queued','delivered','notified') ORDER BY msg_id" : "state<>'acked'")).all(from);
     for (const row of pending) {
+        const existing = o.basenameMigration ? node.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=? AND agent=?").get(row.msg_id, to) : undefined;
         node.store.db.prepare("INSERT OR IGNORE INTO deliveries (msg_id,agent,state,updated_at,note) VALUES (?,?,?,?,?)").run(row.msg_id, to, row.state, row.updated_at, row.note);
         node.store.db.prepare("DELETE FROM deliveries WHERE msg_id=? AND agent=?").run(row.msg_id, from);
+        if (o.basenameMigration)
+            node.store.audit("identity.basename_migrated", { msg: row.msg_id, from, to, project: o.project,
+                authority: o.authority, lead_record: o.lead?.record, by: o.lead?.agent,
+                outcome: existing ? "deduplicated" : "moved", source_state: row.state, target_state: existing?.state ?? row.state });
     }
     if (!isSlotName(from))
         node.store.set(`alias:${from}`, to);

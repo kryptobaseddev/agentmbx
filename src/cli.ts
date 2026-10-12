@@ -43,7 +43,7 @@ import { activityKey } from "./identity-availability.ts";
 import { fillCleoPresence } from "./cleo-presence.ts";
 import { identityLeaseStatus, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
 import { AUTO_NAME_RE, identityProjects, linkedKey, projectOf, recordSessionHint, registeredIdentity, removeStaleProjectBindings, staleProjectBindings } from "./registry.ts";
-import { applyForward, applyPrune, buildForward, leadForward, pruneCandidates, type LeadForward } from "./identity-cleanup.ts";
+import { applyForward, applyPrune, buildForward, leadForward, migrateBasename, pruneCandidates, readBasenameMigrationPlan, type LeadForward } from "./identity-cleanup.ts";
 import { installDesktopPlugin, kimiDesktop, kimiDesktopDir, removeDesktopPlugin, writeDesktopPlugin } from "./kimi-desktop.ts";
 import { approveKimi, decidePermission, opencodePermissionPass, type Lookup } from "./permission.ts";
 import { diagnosticSnapshot, type RuntimeObservation } from "./diagnostics.ts";
@@ -94,6 +94,7 @@ Messages
   agentmbx identity prune [--days 7] [--apply]   retire mailboxes older versions generated that nobody holds (dry run by default)
   agentmbx identity bindings [--apply]           remove project bindings older than a newer project for the same identity (dry run by default)
   agentmbx identity forward <from> <to>          move a mailbox's unread mail to another, with your owner signature
+  agentmbx identity migrate-basename --project <dir> [--apply] [--json]   preview legacy unread copies; --apply requires this session's current project-lead write lease
   agentmbx identity claim [name] --cli <provider> --session <id> [--wait-ms 5000] [--json]
   agentmbx identity release --cli <provider> --session <id> [--wait-ms 5000] [--json]
   agentmbx diagnostics --mailbox <name> [--cli <provider> --session <id>] [--limit 20] [--json]
@@ -406,6 +407,24 @@ async function run(argv: string[]) {
   }
   if (cmd === "notify-test") return notifyTest(str("as") ?? process.env.MBX_AGENT ?? "notify-test");
   if (cmd === "identity") {
+    if (pos[0] === "migrate-basename" && pos.length === 1) {
+      const folders = (o.project as string[] | undefined) ?? [];
+      if (folders.length !== 1) die("identity migrate-basename requires exactly one --project <dir>");
+      const folder = folders[0];
+      const plan = readBasenameMigrationPlan(defaultHome(), resolve(folder));
+      if (o.apply) {
+        if (plan.reason) die(plan.reason);
+        const node = new MbxNode();
+        try {
+          const result = withCliIdentity(node, { as: str("as") ?? (process.env.MBX_AGENT || undefined), cli: str("cli"), session: str("session") },
+            caller => migrateBasename(node, caller, resolve(folder)));
+          return console.log(o.json ? JSON.stringify({ applied: true, ...result }, null, 2)
+            : `Migrated ${result.moved} unread copies from ${result.source} to ${result.target}; kept ${result.preserved} read/acked copies.`);
+        } finally { node.close(); }
+      }
+      return console.log(o.json ? JSON.stringify({ applied: false, ...plan }, null, 2)
+        : `${plan.reason ? "Blocked: " + plan.reason : `Would migrate ${plan.ids.length} unread copies from ${plan.source} to ${plan.target}; keep ${plan.preserved} read/acked copies`} (preview; add --apply)`);
+    }
     const outputReceipt = (receipt: IdentityControlReceipt) => {
       const pending = receipt.status === "pending";
       process.exitCode = pending ? 75 : receipt.status === "failed" ? 1 : 0;
@@ -516,7 +535,7 @@ async function run(argv: string[]) {
       } finally { node.close(); }
     }
     if ((pos[0] === "export" || pos[0] === "import") && pos.length === 2) return identityBackup(pos[0], pos[1], !!o.force);
-    die("identity list [--project <dir>] [--all] | prune [--days 7] [--apply] | bindings [--apply] | forward <from> <to> | export <file> | import <file> | claim [name] --cli <provider> --session <id> | release --cli <provider> --session <id> | takeover <name> --force --cli <provider> --session <id> | result <request-id>");
+    die("identity list [--project <dir>] [--all] | prune [--days 7] [--apply] | bindings [--apply] | forward <from> <to> | migrate-basename --project <dir> [--apply] [--json] | export <file> | import <file> | claim [name] --cli <provider> --session <id> | release --cli <provider> --session <id> | takeover <name> --force --cli <provider> --session <id> | result <request-id>");
   }
   if (cmd === "statusline") {
     // T369: `statusline suggest` — a dry-run placement proposal (JSON + human text) for the MBX
