@@ -22,6 +22,10 @@ export function stdioEndpoint() {
 }
 let cache = null;
 const snapshots = new AsyncLocalStorage();
+/** Birth time of this process or its current parent, from the first table that contained that pid.
+ *  A pid that is still `process.pid` or `process.ppid` has not been reused, so later checks compare
+ *  the recorded start to this memory and do not spawn. Any other pid still reads the table. */
+const residentStart = new Map();
 /** Count of ps spawns for process evidence (T206 measurement); never reset by production code. */
 export const processEvidenceSpawns = { count: 0 };
 /** Test seam (T332): the platform branch and the ps runner. Production code never reassigns either. */
@@ -104,6 +108,13 @@ function readProcTable(maxAgeMs) {
     }
     catch { /* unavailable process inventory: proof-required callers fail closed */ }
     cache = { at: Date.now(), table };
+    for (const pid of [process.pid, process.ppid]) {
+        if (residentStart.has(pid))
+            continue;
+        const start = table.get(pid)?.start;
+        if (start)
+            residentStart.set(pid, start);
+    }
     return table;
 }
 export function procTable(maxAgeMs = 2_000) {
@@ -117,10 +128,19 @@ export function procTable(maxAgeMs = 2_000) {
     return snapshot.table;
 }
 export const procStart = (pid) => (pid ? procTable().get(pid)?.start ?? null : null);
+/** Remembered birth time when `pid` is this process or its current parent. Null means a table read is still required. */
+export function residentStartOf(pid) {
+    if (pid !== process.pid && pid !== process.ppid)
+        return null;
+    return residentStart.get(pid) ?? null;
+}
 /** Is this the same live process that was recorded (pid + start time)? Rows without a start time fall back to pid liveness. */
 export function sameProcess(pid, start) {
     if (!pid)
         return false;
+    const known = start ? residentStartOf(pid) : null;
+    if (known)
+        return known === start;
     const t = procTable();
     if (t.size) {
         const p = t.get(pid);
@@ -136,8 +156,16 @@ export function sameProcess(pid, start) {
         return e.code === "EPERM";
     }
 }
-/** For authorization: the row must carry a start time and the live process must match it. Unknown = no. */
-export const provenProcess = (pid, start) => !!pid && !!start && procTable().size > 0 && sameProcess(pid, start);
+/** For authorization: the row must carry a start time and the live process must match it. Unknown = no.
+ *  This process and its parent answer from the birth remembered on the first table read and do not spawn (T591 AC3). */
+export function provenProcess(pid, start) {
+    if (!pid || !start)
+        return false;
+    const known = residentStartOf(pid);
+    if (known)
+        return known === start;
+    return procTable().size > 0 && sameProcess(pid, start);
+}
 /** This process's ancestors, nearest first (the shell, the agent CLI, its parents …). */
 export function ancestors(pid = process.pid, max = 16) {
     const t = procTable(), out = [];
@@ -181,7 +209,7 @@ export function psEvidenceTable(maxAgeMs = PS_EVIDENCE_MAX_AGE_MS) {
     return psEvidence = { at, table };
 }
 export const _resetPsEvidenceCache = () => { psEvidence = null; };
-export const _resetProcCache = () => { cache = null; psEvidence = null; };
+export const _resetProcCache = () => { cache = null; psEvidence = null; residentStart.clear(); };
 /**
  * The session id Claude Code currently records for its process `pid` (~/.claude/sessions/<pid>.json). /clear, /resume
  * and compaction rewrite it while the same process (and its mbx MCP server) lives on, so it is read fresh each time.

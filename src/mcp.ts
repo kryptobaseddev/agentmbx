@@ -32,7 +32,7 @@ import { assertKnownRecipients, connectorGuidance, deliveryReceipts, offlineWarn
 import { forwardMessage, ledgerPage, projectLeadView } from "./project-ledger.ts";
 import { buildRoster, rosterText } from "./roster.ts";
 import { CLIS, skillFiles } from "./setup.ts";
-import { claudeSessionId, claudeSessionTracker, grokSessionId, grokSessionTracker, procStart, procTable, withProcSnapshot } from "./proc.ts";
+import { claudeSessionId, claudeSessionTracker, grokSessionId, grokSessionTracker, procStart, procTable, residentStartOf, withProcSnapshot } from "./proc.ts";
 import { updateAvailable } from "./update.ts";
 import { installKind, version } from "./version.ts";
 import { connectorKey } from "./diagnostics.ts";
@@ -1250,15 +1250,18 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
           ? leases.withHeldRead(state.agent, state.leaseToken!, () => cb(...a))
           : leases.withHeld(state.agent, state.leaseToken!, () => cb(...a)));
         const target = (a[0] as { name?: string } | undefined)?.name;
-        // These handlers ask inside the lease write. Fill the snapshot first. A call that does not ask stays at zero (T591).
-        const freshProcSession = (agent?: string) => !!node.store.db.prepare(
-          `SELECT 1 FROM sessions WHERE pid IS NOT NULL AND pid_start<>'' AND updated_at>=?${agent ? " AND agent=?" : ""} LIMIT 1`,
-        ).get(...(agent ? [new Date(Date.now() - LIVE_AGENT_MS).toISOString(), agent] : [new Date(Date.now() - LIVE_AGENT_MS).toISOString()]));
+        // These handlers ask inside the lease write. Fill the snapshot first when that ask still needs a
+        // table. This process and its parent answer from the birth time remembered on the first read, so a
+        // steady whoami or send does not spawn (T591 AC3). A call that does not ask stays at zero.
+        const liveSince = new Date(Date.now() - LIVE_AGENT_MS).toISOString();
+        const needsProcTable = (agent?: string) => (node.store.db.prepare(
+          `SELECT pid FROM sessions WHERE pid IS NOT NULL AND pid_start<>'' AND updated_at>=?${agent ? " AND agent=?" : ""}`,
+        ).all(...(agent ? [liveSince, agent] : [liveSince])) as { pid: number }[]).some((r) => residentStartOf(r.pid) == null);
         const readsProcInWrite = () => {
           const args = a[0] as { name?: string; role?: string; description?: string; id?: string } | undefined;
           if (name === "mbx_whoami" && bound(state))
-            return !!(args?.name || args?.role || args?.description) || freshProcSession(state.agent);
-          if (name === "mbx_send" || name === "mbx_reply") return freshProcSession();
+            return !!(args?.name || args?.role || args?.description) || needsProcTable(state.agent);
+          if (name === "mbx_send" || name === "mbx_reply") return needsProcTable();
           if (name !== "mbx_thread" || !args?.id) return false;
           // readableSlots is empty until withHeld. Pass the slots the in-lease canSee will see.
           const slots = projectsLedBy(node, state.agent).map((p) => p.slot);
