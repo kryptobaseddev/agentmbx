@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **The v2 HUD file agrees with CLI and loopback on lease.verified (T572).** The writer was inspecting only the session pid, the harness parent, and treating a missing lease-holder pid as unverified. It now inspects that holder pid in the same process pass.
+
 ## 0.5.27 (2026-10-11)
 
 A project now has its own mailbox: mail to the bare project name is stored once and read by the owner-signed lead, across paired hosts, and the wake dispatcher wakes only that lead; prune forwards a retired mailbox's unread mail into it and the lead moves mail within its own project without Touch ID. OpenCode calls without session metadata fail closed, agentmbx watch works inside an OpenCode session, and the OpenCode doctor checks no longer report historical overlaps as a live loop. agentmbx mcp exits cleanly after a failed startup and records one bounded error; leads can delegate read and edit, and policy text now separates outward-reversible (branch push, draft PR) from outward. Hosts sync an allowlisted status snapshot to the cloud read model.
