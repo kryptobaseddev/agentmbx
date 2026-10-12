@@ -1,7 +1,9 @@
 // Daemon sync client (T262, T468, T446). One POST writer, one seq per host. No network call
 // unless a local link record exists, and no bearer token. A SyncAck never turns project_paths on.
 // An in-range SyncAck stores the cloud's contract range, clamped to CONTRACT_VERSION and never
-// below the contract just spoken. A stored max of at least 2 sets project_leads.
+// below the contract just spoken. A stored max of at least 2 sets project_leads. An out-of-range
+// ack whose range overlaps contracts 1..CONTRACT_VERSION stores that clamped range and leaves
+// project_leads set. A range that does not overlap, such as {3,4}, does not change the link.
 import { createHash, randomBytes } from "node:crypto";
 import { CONTRACT_VERSION, PATH_FLAG_PREFIX, PROJECT_LEADS_SINCE, PROJECT_PATHS_SINCE, projectSync, } from "./sync-projection.js";
 export const LINK_KEY = "sync.link";
@@ -236,10 +238,12 @@ async function send(o, link, state, pending) {
     const sent = sentContract(pending.body);
     // Compare the contract this batch spoke, not CONTRACT_VERSION. A link capped at 1
     // speaks 1, and an old cloud that acks max 1 still accepts that batch.
-    // An out-of-range ack does not change the stored link.
+    // An out-of-range ack that still overlaps a contract this daemon can speak follows
+    // the cloud, so the next batch is inside the range. Anything else stays put.
     if (range && typeof range.min === "number" && typeof range.max === "number" && sent !== null && (sent < range.min || sent > range.max)) {
         state.force_full = true;
         writeState(o.kv, state);
+        rememberAck(o.kv, sent, range, true);
         o.audit?.("sync.contract", { code: "sync.contract" });
         return { outcome: "sync.contract" };
     }
@@ -257,16 +261,22 @@ function sentContract(body) {
         return null;
     }
 }
-/** Store an in-range ack's contract. Never lower it past the contract just spoken, and never write project_paths. */
-function rememberAck(kv, sent, range) {
-    if (sent === null || !range || typeof range.min !== "number" || typeof range.max !== "number")
+/** Store an ack's contract. An in-range ack never excludes the contract just spoken. An overlapping out-of-range ack follows the cloud. Never writes project_paths, and never clears project_leads. */
+function rememberAck(kv, sent, range, followCloud = false) {
+    if (!range || typeof range.min !== "number" || typeof range.max !== "number")
         return;
     if (!Number.isInteger(range.min) || !Number.isInteger(range.max) || range.min < 1 || range.min > range.max)
         return;
     const max = Math.min(range.max, CONTRACT_VERSION);
     const min = range.min;
-    if (max < sent || min > sent)
+    const overlaps = range.max >= 1 && range.min <= CONTRACT_VERSION;
+    if (followCloud) {
+        if (!overlaps)
+            return;
+    }
+    else if (sent === null || max < sent || min > sent) {
         return;
+    }
     const raw = kv.get(LINK_KEY);
     if (!raw)
         return;
