@@ -19,7 +19,7 @@ export function stdioEndpoint(): string | null {
   } catch { return null; }
 }
 let cache: { at: number; table: Map<number, Proc> } | null = null;
-const snapshots = new AsyncLocalStorage<{ active: boolean; at: number; table: Map<number, Proc> }>();
+const snapshots = new AsyncLocalStorage<{ active: boolean; at: number; table: Map<number, Proc> | null }>();
 
 /** Count of ps spawns for process evidence (T206 measurement); never reset by production code. */
 export const processEvidenceSpawns = { count: 0 };
@@ -34,15 +34,18 @@ export const procSeams: { platform: NodeJS.Platform; ps: (args: string[], option
 /** Synchronous sleep for retry backoff; evidence paths must stay synchronous. */
 export const sleepSync = (ms: number) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
 
-/** Capture process inventory before a database transaction; expired or escaped scopes fail closed. */
+/**
+ * Share one process table across a synchronous operation. The table is read on the first
+ * procTable() inside the scope, not before it, so a scope that never asks spawns nothing (T591).
+ * A filled table is the module cache, at most 2 s old, and start times do not change within it,
+ * so proof decisions (start equality) cannot drift. Expired or escaped scopes fail closed.
+ */
 export function withProcSnapshot<T>(operation: () => T): T {
   if (operation.constructor.name === "AsyncFunction") throw new Error("process snapshots require synchronous operations");
   const prior = snapshots.getStore();
   if (prior?.active) return operation();
   if (prior) throw new Error("process snapshot scope is closed");
-  // Share the short module cache instead of forcing a fresh ps -A per call: the snapshot may be at most
-  // 2 s old, and start times do not change within it, so proof decisions (start equality) cannot drift.
-  const table = procTable(), scope = { active: true, at: performance.now(), table };
+  const scope = { active: true, at: performance.now(), table: null as Map<number, Proc> | null };
   return snapshots.run(scope, () => {
     try {
       const result = operation();
@@ -65,9 +68,7 @@ export function readLinuxProcess(pid: number, bootId?: string): (Proc & { dead: 
   } catch { return null; }
 }
 
-export function procTable(maxAgeMs = 2_000): Map<number, Proc> {
-  const snapshot = snapshots.getStore();
-  if (snapshot) return snapshot.active && performance.now() - snapshot.at <= 5000 ? snapshot.table : new Map();
+function readProcTable(maxAgeMs: number): Map<number, Proc> {
   if (cache && Date.now() - cache.at < maxAgeMs) return cache.table;
   const table = new Map<number, Proc>();
   try {
@@ -89,6 +90,14 @@ export function procTable(maxAgeMs = 2_000): Map<number, Proc> {
   } catch { /* unavailable process inventory: proof-required callers fail closed */ }
   cache = { at: Date.now(), table };
   return table;
+}
+
+export function procTable(maxAgeMs = 2_000): Map<number, Proc> {
+  const snapshot = snapshots.getStore();
+  if (!snapshot) return readProcTable(maxAgeMs);
+  if (!snapshot.active || performance.now() - snapshot.at > 5000) return new Map();
+  if (!snapshot.table) snapshot.table = readProcTable(maxAgeMs);
+  return snapshot.table;
 }
 
 export const procStart = (pid: number | null | undefined): string | null => (pid ? procTable().get(pid)?.start ?? null : null);

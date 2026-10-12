@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MbxNode } from "../src/node.ts";
-import { procSeams, procStart, processEvidenceSpawns, sleepSync, withProcSnapshot, _resetProcCache } from "../src/proc.ts";
+import { procSeams, procStart, processEvidenceSpawns, sleepSync, withProcSnapshot, _resetProcCache, _resetPsEvidenceCache } from "../src/proc.ts";
 import { IdentityLeases, inspectLeaseProcess, inspectLeaseProcesses, UNKNOWN_RETRY_DELAYS_MS, _resetEvidenceCacheForTests } from "../src/identity-leases.ts";
 
 const EVIDENCE = "pid=,stat=,lstart=", TABLE = "pid=,ppid=,lstart=";
@@ -85,7 +85,42 @@ test("darwin: one full-table read per pass, filtered in process, never ps -p", t
   });
   assert.equal(ps.evidenceReads(), 1, "every pid of the pass came from one ps -A");
   assert.ok(ps.calls.every(args => !args.includes("-p")), "never ps -p <list>");
-  assert.equal(processEvidenceSpawns.count - spawns, 2, "the pass costs the snapshot's table plus one evidence table");
+  assert.equal(processEvidenceSpawns.count - spawns, 1, "the pass asks for evidence and does not read the proc table");
+});
+
+test("T591: a proc snapshot that never reads the table spawns no ps", t => {
+  const rows: Row[] = [{ pid: process.pid, utc: "Sat Oct  3 08:00:00 2026", local: "Sat Oct  3 01:00:00 2026" }];
+  const ps = fakePs(t, args => args[2] === EVIDENCE ? evidenceOut(rows) : tableOut(rows));
+  const spawns = processEvidenceSpawns.count;
+  assert.equal(withProcSnapshot(() => 7), 7);
+  assert.equal(processEvidenceSpawns.count, spawns, "a scope that does not ask for a row spawns nothing");
+  assert.equal(ps.calls.length, 0);
+  withProcSnapshot(() => { assert.equal(procStart(process.pid), "Sat Oct  3 01:00:00 2026"); });
+  assert.equal(processEvidenceSpawns.count - spawns, 1, "the first read inside a scope costs one table");
+  withProcSnapshot(() => { procStart(process.pid); });
+  assert.equal(processEvidenceSpawns.count - spawns, 1, "a second scope inside the 2s cache does not read again");
+});
+
+test("T591: a settled self check does not re-read ps after the evidence table cache is dropped", t => {
+  const rows: Row[] = [{ pid: process.pid, utc: "Sat Oct  3 08:00:00 2026" }];
+  const ps = fakePs(t, () => evidenceOut(rows));
+  assert.equal(inspectLeaseProcess(process.pid).start, "ps-utc:Sat Oct 3 08:00:00 2026");
+  assert.equal(ps.evidenceReads(), 1);
+  _resetPsEvidenceCache();
+  const spawns = processEvidenceSpawns.count;
+  assert.equal(inspectLeaseProcess(process.pid).alive, true);
+  assert.equal(processEvidenceSpawns.count, spawns, "the lifetime self cache is not the 1s table");
+  assert.equal(ps.evidenceReads(), 1);
+});
+
+test("T591: a linux proc snapshot never spawns ps", t => {
+  const saved = procSeams.platform;
+  procSeams.platform = "linux";
+  _resetProcCache();
+  t.after(() => { procSeams.platform = saved; _resetProcCache(); });
+  const before = processEvidenceSpawns.count;
+  withProcSnapshot(() => { procStart(process.pid); });
+  assert.equal(processEvidenceSpawns.count, before);
 });
 
 test("a failed or timed-out ps is never cached: the next inspection reads again", t => {
