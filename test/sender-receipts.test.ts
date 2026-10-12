@@ -9,12 +9,12 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { generateKeyPair } from "../src/crypto.ts";
 import { MbxNode } from "../src/node.ts";
-import { sentPage } from "../src/receipts.ts";
+import { receiptLine, sentPage } from "../src/receipts.ts";
 import { bindWakeLease } from "./helpers/wake-lease.ts";
 import { findIdentityControl, publishIdentityControl } from "../src/identity-control.ts";
 import { dispatchWakes } from "../src/wake.ts";
 
-type Receipt = { address: string; state: string; did: string | null; note: string | null; liveness: string; outbox?: { attempts: number } };
+type Receipt = { address: string; state: string; did: string | null; note: string | null; liveness: string; outbox?: { attempts: number; last_error_code: string | null } };
 type Page = { messages: { id: string; subject: string; recipients: Receipt[] }[]; next_cursor: string; has_more: boolean };
 
 async function world(t: { after: (fn: () => Promise<void>) => void }) {
@@ -112,9 +112,13 @@ test("paired-host recipients show the outbox: queued with attempts until accepte
   n.upsertPendingPeer({ host: "beta", pubkey: beta.publicKey, owner_pubkey: null, addr: "127.0.0.1:9", code: "000000", nonce_local: "n", nonce_remote: "n" });
   n.approvePeer("beta");
   const id = n.send({ from: "boss", to: ["worker@beta"], subject: "far", body: "b" }).envelope.id;
-  n.store.db.prepare("UPDATE outbox SET attempts=3, last_error='fetch failed'").run();
+  n.store.db.prepare("UPDATE outbox SET attempts=3, last_error='fetch failed https://secret:password@host PRIVATE_BODY'").run();
   let r = sentPage(n, "boss").messages[0].recipients[0];
   assert.equal(r.address, "worker@beta"); assert.equal(r.state, "queued"); assert.equal(r.outbox!.attempts, 3);
+  assert.equal(r.outbox!.last_error_code, "PEER_UNREACHABLE");
+  assert.equal(JSON.stringify(r).includes("secret"), false);
+  assert.match(receiptLine(r), /\(PEER_UNREACHABLE\)/);
+  assert.doesNotMatch(receiptLine(r), /secret|PRIVATE_BODY/);
   assert.match(r.liveness, /not accepted yet/);
   n.store.db.prepare("DELETE FROM outbox WHERE msg_id=?").run(id);
   r = sentPage(n, "boss").messages[0].recipients[0];

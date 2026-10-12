@@ -28,7 +28,7 @@ import { alive, defaultHome, didWarning, formatFor, LIVE_AGENT_MS, MbxNode, summ
 import { auditLeadGrantUse, leadGrantCovering } from "./lead-grants.js";
 import { setSessionPresence } from "./presence.js";
 import { activePolicies, delegationNote, LEVEL_MAX_HOP, MAX_HOP } from "./policy.js";
-import { assertKnownRecipients, deliveryReceipts, offlineWarnings, receiptLine, recipientReceipts, sentPage } from "./receipts.js";
+import { assertKnownRecipients, connectorGuidance, deliveryReceipts, offlineWarnings, ownDelivery, receiptLine, recipientReceipts, sentPage } from "./receipts.js";
 import { forwardMessage, ledgerPage, projectLeadView } from "./project-ledger.js";
 import { buildRoster, rosterText } from "./roster.js";
 import { CLIS, skillFiles } from "./setup.js";
@@ -1459,7 +1459,7 @@ async function configureMcp(server, node, startupClosed) {
                 // These handlers only query SQLite. mbx_read advances delivery state despite its
                 // readOnlyHint, and whoami can rename, so neither belongs in this snapshot set.
                 // mbx_read and mbx_thread mark the reader's copies read (T207), so they take the write path.
-                const readOnly = ["mbx_inbox", "mbx_replay", "mbx_search", "mbx_agents", "mbx_sent", "mbx_project"].includes(name);
+                const readOnly = ["mbx_inbox", "mbx_replay", "mbx_search", "mbx_agents", "mbx_sent", "mbx_delivery", "mbx_project"].includes(name);
                 // Replay prepares its own process evidence before taking the held-read snapshot.
                 // Wrapping it again would inspect a fresh lease instance inside an open transaction.
                 // Catch-up pages through replay and takes its own held lease per path (read for fetch,
@@ -2019,6 +2019,16 @@ async function configureMcp(server, node, startupClosed) {
         const roster = buildRoster(node, { project, ask: asked, all, self: bound(state) ? state.agent : null,
             caller: { cli: env.cli, sessionId: state.sessionId, pid: process.pid, providerPid: env.ppid, canonicalHarness: !!env.harnessProvider } });
         return text(rosterText(roster), roster);
+    });
+    server.registerTool("mbx_delivery", {
+        title: "Your own outgoing delivery",
+        description: "This identity's own outgoing delivery, bounded to 100 messages. Each row is one of accepted, queued, delivered, notified, read, or acked. A queued paired-host row includes a failure class, never the raw error. drafts is null (there is no draft store) and task_completion is not-reported: an ack is not a finished task. guidance is empty when this session's connector report is current; otherwise it says to reconnect and leaves ownership where it is. No other mailbox is included. Next: mbx_sent for the message page.",
+        inputSchema: {},
+        annotations: { readOnlyHint: true },
+    }, () => {
+        const { agent } = current();
+        const view = { ...ownDelivery(node, agent), guidance: connectorGuidance(node.store, agent) };
+        return text(JSON.stringify(view), view);
     });
     server.registerTool("mbx_sent", {
         title: "What happened to mail you sent",
