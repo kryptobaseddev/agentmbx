@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Pending code-compare pairings expire after 10 minutes (T200).** `pair approve` refuses and deletes a pending peer older than that, and the daemon drops those rows on its 60-second sweep. Approved peers stay. Token pairing is unchanged.
+
 - **`whoami.harness_session` follows the hook-bound session after an in-place upgrade (T571).** A server whose lease still carries the provisional `mcp-<pid>` id while this provider's hooks have bound exactly one real session now reports that session as `harness_session` — the id the statusline, HUD, `agentmbx status` and the endpoint key on — instead of the lease id. Report-only: `state.sessionId`, the lease and the resolver are unchanged, and `session`/`lease_key` still carry the lease key fingerprint.
 
 ## 0.5.27 (2026-10-11)
