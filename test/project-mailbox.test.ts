@@ -82,6 +82,23 @@ test("T493 AC1: mail to the bare project name is one durable delivery to the pro
   assert.equal((reopened.store.db.prepare("SELECT count(*) n FROM deliveries WHERE agent=? AND state<>'acked'").get(mailbox.slot) as { n: number }).n, 2);
 });
 
+for (const end of ["revoked", "expired"]) test(`T562: a ${end} replacement never restores the old project mailbox reader`, t => {
+  const w = world(t), now = Date.now();
+  w.lead("agentmbx-lead", new Date(now - 1000));
+  const rec = makeLead({ project: w.folder, agent: "replacement", host: w.n.host, ownerPub: w.owner.publicKey, now: new Date(now), ttlMs: 1000 });
+  storeLead(w.n, rec, w.sign(rec));
+  const box = allocateProjectMailbox(w.n, w.folder).mailbox;
+  assert.equal(projectReader(w.n, box.slot, new Date(now))?.lead?.id, rec.id);
+  const mail = w.n.send(w.draft(["agentmbx"]));
+  const before = w.deliveriesOf(mail.envelope.id);
+  if (end === "revoked") { const rev = makeLeadRevocation(rec.id, w.owner.publicKey, new Date(now)); revokeLead(w.n, rev, w.sign(rev)); }
+  const at = new Date(now + (end === "revoked" ? 500 : 1000));
+  assert.equal(projectReader(w.n, box.slot, at)?.lead, null);
+  assert.deepEqual(w.deliveriesOf(mail.envelope.id), before, "project mail remains queued, never ACKed or moved by head expiry/revocation");
+  const fresh = w.lead("agentmbx-lead", new Date(now + 2000));
+  assert.equal(projectReader(w.n, box.slot, new Date(now + 2000))?.lead?.id, fresh.id);
+});
+
 test("T493 AC1: an owner-signed send to the bare name is rewritten before the owner signs, and its bytes still verify", async (t) => {
   const w = world(t);
   const { mailbox } = allocateProjectMailbox(w.n, w.folder);

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Revoking or expiring a replacement lead never restores an older lead or its grants (T562).** A fresh signed designation is required to restore service. `lead show` names the head and shadowed history, limits output to 20 records per project and 50 projects, and reports truncated or unverified head coverage without claiming a vacancy.
+
 - **`whoami.harness_session` follows the hook-bound session after an in-place upgrade (T571).** A server whose lease still carries the provisional `mcp-<pid>` id while this provider's hooks have bound exactly one real session now reports that session as `harness_session` — the id the statusline, HUD, `agentmbx status` and the endpoint key on — instead of the lease id. Report-only: `state.sessionId`, the lease and the resolver are unchanged, and `session`/`lease_key` still carry the lease key fingerprint.
 
 ## 0.5.27 (2026-10-11)

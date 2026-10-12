@@ -99,6 +99,23 @@ test("the ledger: project members see traffic with roles; bodies for their own m
   assert.equal(asLead.messages.find((m) => m.id === sent.id)!.body, "SECRET-RESULTS");
 });
 
+test("T562: revoking the new lead removes the former lead's ledger-body and forwarding access", async t => {
+  const { n, owner, lead, projA } = ownerNode(t), open = await sessions(t, n);
+  const sender = await open("ada", projA), former = await open("eve", projA);
+  await open("bob", projA); await open("fay", projA);
+  const id = (await sender("mbx_send", { to: ["bob"], subject: "private", body: "SECRET-RESULTS" })).structuredContent.id as string;
+  lead("eve", projA);
+  assert.equal(((await former("mbx_project")).structuredContent as Ledger).messages.find(m => m.id === id)?.body, "SECRET-RESULTS");
+  const replacement = lead("fay", projA);
+  const rev = makeLeadRevocation(replacement.id, owner.publicKey); revokeLead(n, rev, signData(owner.privateKey, canonical(rev)));
+  const after = (await former("mbx_project")).structuredContent as Ledger;
+  assert.equal(after.lead, null); assert.equal(after.messages.find(m => m.id === id)?.body, null);
+  const refused = await former("mbx_forward", { id, to: "fay" });
+  assert.equal(refused.isError, true); assert.match(refused.content[0].text, /only the project lead can forward/);
+  lead("eve", projA);
+  assert.equal(((await former("mbx_project")).structuredContent as Ledger).messages.find(m => m.id === id)?.body, "SECRET-RESULTS");
+});
+
 test("mbx_forward: lead only, project messages only, known local recipients only; audited and labelled", async (t) => {
   const { n, lead, projA, projB } = ownerNode(t);
   const open = await sessions(t, n);

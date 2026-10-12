@@ -26,6 +26,7 @@ import { runStatuslineSuggest } from "./statusline-suggest.ts";
 import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.ts";
 import { escalateUnheldMail, retirePhantoms, returnNeverClaimed } from "./stranded.ts";
 import { activeLead, leadSummary, makeLead, makeLeadRevocation, projectLeadLine, projectLeadView, revokeLead, storeLead } from "./project-ledger.ts";
+import { leadHistory } from "./lead-record.ts";
 import { DEFAULT_PORT, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.ts";
 import { sessionStartLeadAudit } from "./lead-grants.ts";
 import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, parsePolicyTtl, policyUnexpired, policySummary,
@@ -1179,17 +1180,26 @@ async function lead(node: MbxNode, pos: string[], str: (k: string) => string | u
   const project = dir ? (projectOf(resolve(dir)) ?? die(`${dir} is the home folder or /, not a project`)) : undefined;
   if (sub === "show") {
     // A record covers its folder and every other checkout of the same CLEO project (T543): show the key and those folders.
+    const maxProjects = 50;
+    const label = (value: string, max = 1024) => value.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(0, max);
     const key = project ? resolveProject(project).key : undefined;
-    const rows = node.store.db.prepare("SELECT project, MAX(project_key) AS project_key FROM project_leads" + (project ? " WHERE project=? OR project_key=?" : "") + " GROUP BY project").all(...(project ? [project, key!] : [])) as { project: string; project_key: string | null }[];
+    const rows = node.store.db.prepare("SELECT project, MAX(project_key) AS project_key FROM project_leads" + (project ? " WHERE project=? OR project_key=?" : "") + " GROUP BY project ORDER BY project LIMIT ?").all(...(project ? [project, key!, maxProjects + 1] : [maxProjects + 1])) as { project: string; project_key: string | null }[];
     if (!rows.length) return console.log(project ? `no lead for ${project}` : "no project leads");
-    for (const r of rows) {
-      const l = activeLead(node, r.project);
-      const also = r.project_key ? (node.store.db.prepare("SELECT DISTINCT project FROM identity_projects WHERE project_key=? AND project<>?").all(r.project_key, r.project) as { project: string }[]).map((x) => x.project) : [];
+    for (const r of rows.slice(0, maxProjects)) {
+      const history = leadHistory(node, r.project, r.project_key ?? resolveProject(r.project).key);
+      const l = history.active;
+      const also = r.project_key ? (node.store.db.prepare("SELECT DISTINCT project FROM identity_projects WHERE project_key=? AND project<>? ORDER BY project LIMIT 21").all(r.project_key, r.project) as { project: string }[]).map((x) => label(x.project)) : [];
       const gv = l ? leadGrantsView(node, l) : null;
-      console.log(`${r.project}\t${l ? `${l.agent}@${l.host} until ${l.exp} (id ${l.id})` : "none (expired or revoked)"}\tkey ${r.project_key ? `${r.project_key} (CLEO project id)` : "folder path"}${also.length ? `\talso covers ${also.join(", ")}` : ""}`);
+      console.log(`${label(r.project)}\t${l ? `${l.agent}@${label(l.host, 40)} until ${label(l.exp, 80)} (id ${l.id})` : history.state === "unknown" ? "unknown (head outside diagnostic coverage)" : `none (${history.state === "none" ? "no authenticated records" : history.state})`}\tkey ${r.project_key ? `${label(r.project_key, 128)} (CLEO project id)` : "folder path"}${also.length ? `\talso covers ${also.slice(0, 20).join(", ")}${also.length > 20 ? " (truncated)" : ""}` : ""}`);
+      for (const item of history.records) {
+        const reason = item.reason === "active" && item.state !== "head" ? "valid" : item.reason;
+        console.log(`  ${item.state} ${label(item.id, 40)}${item.record ? ` ${item.record.agent}@${label(item.record.host, 40)}` : ""}: ${reason}`);
+      }
+      if (history.truncated) console.log("  history truncated (20 records); older records do not regain authority");
       if (gv?.grants) console.log(`  grants ${gv.grants.classes.join(",")} to ${gv.grants.agents.join(",")} until ${gv.grants.exp} (id ${gv.grants.id}): ${gv.state}`);
       else if (gv?.state === "expired") console.log("  grants: expired, or no longer valid for this lead record");
     }
+    if (rows.length > maxProjects) console.log("project list truncated (50 projects); use --project to narrow it");
     return;
   }
   if (!project) die(`lead ${sub ?? "set"} needs --project <dir>`);
