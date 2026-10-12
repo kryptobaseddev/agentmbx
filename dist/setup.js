@@ -1192,6 +1192,9 @@ export function opencodePluginSource(cmd, ver) {
 // Uninstall with: agentmbx setup --uninstall --only opencode
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 /** Only text we produced ourselves is ever injected: a Stop {"decision":"block"} reason, or a
  *  run of [mbx]/probe-ok lines (a session-start note is several of our lines joined by newline).
@@ -1352,6 +1355,20 @@ const watchWake = (ctx: NoteCtx, sid: string): void => {
   })();
 };
 
+/** T341: the post-tool fast path, the same rule as Claude's sh wrapper (T342). OpenCode runs the
+ *  post-tool hook on every tool call; steady state is "nothing new". The daemon bumps
+ *  posttool/opencode-<sid>.marker whenever the hook's decision could change (a delivery, a bind) and
+ *  the full hook records the marker it processed in .last. marker == last (non-empty) means the
+ *  decision is provably unchanged, so no node process starts. Any doubt runs the full hook. */
+const postToolSteady = (sid: string): boolean => {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sid)) return false;
+  try {
+    const dir = join(process.env.MBX_HOME || join(homedir(), ".local", "share", "agentmbx"), "posttool");
+    const marker = readFileSync(join(dir, "opencode-" + sid + ".marker"), "utf8");
+    return marker.length > 0 && marker === readFileSync(join(dir, "opencode-" + sid + ".last"), "utf8");
+  } catch { return false; }
+};
+
 /** One hook call: the JSON payload goes in on stdin; stdout is captured; a reason we recognize is
  *  admitted through the hosting serve's session API. A failure never surfaces. The same call starts
  *  the standalone wake poll once the session id is known. */
@@ -1359,6 +1376,7 @@ const call = async (ctx: NoteCtx, bin: string[], event: string, payload: Record<
   try {
     const sid = typeof payload.session_id === "string" ? payload.session_id : null;
     if (sid) watchWake(ctx, sid);
+    if (event === "post-tool" && sid && postToolSteady(sid)) return;
     const out = await new Promise<string>((resolve) => spawnCli(bin, ["hook", event, "--cli", "opencode"], JSON.stringify(payload), resolve));
     const reason = hookReason(out);
     if (reason && sid) await inject(ctx, sid, event, reason);

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **OpenCode tool calls no longer start node in steady state, and a CI guard holds the spawn budget (T341).** The OpenCode plugin ran `agentmbx hook post-tool` (a node start) on every tool call; a 60 s live sample on 2026-10-12 counted 3 of 3 and 5 of 5. It now takes the same marker fast path as Claude's wrapper (T342): it reads `posttool/opencode-<sid>.marker` and `.last` in process and skips the hook while they agree, and the daemon bumps opencode markers on bind and delivery. `test/spawn-budget.test.ts` traces every `child_process` call of a real MCP, watcher and plugin: steady-state tool calls start no agentmbx process and nothing but the cached macOS process tables (none on Linux); an idle watcher spawns nothing; the plugin starts node only after a delivery or bind. Run `agentmbx setup --only opencode` to install the updated plugin.
+
 - **`whoami.harness_session` follows the hook-bound session after an in-place upgrade (T571).** A server whose lease still carries the provisional `mcp-<pid>` id while this provider's hooks have bound exactly one real session now reports that session as `harness_session` — the id the statusline, HUD, `agentmbx status` and the endpoint key on — instead of the lease id. Report-only: `state.sessionId`, the lease and the resolver are unchanged, and `session`/`lease_key` still carry the lease key fingerprint.
 
 ## 0.5.27 (2026-10-11)

@@ -18,7 +18,7 @@ import { ownerPublicKey } from "./owner.ts";
 import { auditLeadGrantUse, leadGrantForSender } from "./lead-grants.ts";
 import { effectivePolicy, policyLine } from "./policy.ts";
 import { procStart, procTable, provenProcess, sameProcess } from "./proc.ts";
-import { bumpPostToolMarker, bumpPostToolMarkersForAgent } from "./posttool.ts";
+import { bumpPostToolMarker, bumpPostToolMarkersForAgent, POSTTOOL_FAST_CLIS } from "./posttool.ts";
 import { privatePath } from "./private-files.ts";
 import { TASK_RE } from "./presence.ts";
 import { backfillProjectKeys, backfillRegistry } from "./registry.ts";
@@ -267,9 +267,9 @@ export class MbxNode {
         db.prepare("UPDATE deliveries SET state='delivered', note=NULL WHERE agent=? AND state='notified' AND note='desktop'").run(agent);
       return agent;
     });
-    // T342: a claude bind can change the session→agent mapping the post-tool hook resolves, so the
-    // hook's fast path must run the full decision once. After the tx: fs writes never inside it.
-    if (s.cli === "claude" && s.session_id) bumpPostToolMarker(this.home, "claude", s.session_id);
+    // T342/T341: a claude or opencode bind can change the session→agent mapping the post-tool hook resolves,
+    // so the hook's fast path must run the full decision once. After the tx: fs writes never inside it.
+    if (POSTTOOL_FAST_CLIS.includes(s.cli) && s.session_id) bumpPostToolMarker(this.home, s.cli, s.session_id);
     return bound;
   }
 
