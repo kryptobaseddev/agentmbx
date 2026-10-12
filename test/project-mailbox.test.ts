@@ -431,6 +431,7 @@ const RATCHET: Record<string, { max: number; category: Category; why: string }> 
   "src/project-mailbox.ts": { max: 1, category: "writer", why: "allocation checks that a slot name has no deliveries" },
   "src/receipts.ts": { max: 1, category: "per message", why: "the recipients of one message; a slot shows as a project mailbox" },
   "src/relay-v2.ts": { max: 1, category: "per message", why: "re-queues receipts for one message" },
+  "src/resume-notice.ts": { max: 1, category: "by name (the caller's own mailbox)", why: "T189: the resume notice's open-thread count for the bound agent (d.agent=?); counts only, lists no names" },
   "src/retention.ts": { max: 6, category: "per message", why: "an unacked slot delivery keeps its message from being pruned" },
   "src/store.ts": { max: 3, category: "schema", why: "triggers and the legacy visibility backfill" },
   "src/stranded.ts": { max: 3, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "established-name gated; a slot is recognised, not claimed" },
