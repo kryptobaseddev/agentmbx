@@ -1882,6 +1882,13 @@ async function hook(node, event, cli) {
                     if (at?.pid && takeResumeEntry(node.store, cli, at.pid, at.pid_start, sid))
                         lines.push(resumeNotice(node.store, agent, held(agent)));
                 }
+                // T188: Kimi drops SessionStart output too (binding-only), so each entry — a new conversation, --continue/--session
+                // //resume, a /clear rotation, a hosted bind-ticket link — carries the bounded resume notice on its first bound prompt.
+                if (event === "prompt" && cli === "kimi" && sid) {
+                    const at = node.store.db.prepare("SELECT pid,pid_start FROM sessions WHERE cli=? AND session_id=?").get(cli, sid);
+                    if (at?.pid && takeResumeEntry(node.store, cli, at.pid, at.pid_start, sid))
+                        lines.push(resumeNotice(node.store, agent, held(agent)));
+                }
                 // T460: Hermes drops on_session_start output, and a finished watcher is what wakes it: say so while none runs (bounded).
                 if (event === "prompt" && cli === "hermes" && !liveWatcher(node, agent)) {
                     const w = hermesWatcherNote(node, agent, sid ?? process.ppid, !!delegationNote(node.store.db, agent, node.host));
