@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **The current lead can replay and catch up on the project mailbox (T553).** `mbx_replay` and `mbx_catchup` take `project_mailbox` (bare name, alias, or slot). The page walks that slot, including acknowledged mail, and the cursor names the slot. Omitting it leaves the personal mailbox unchanged. The lead check runs inside the caller's own lease before any cursor parse or history scan; a replaced lead, a non-lead, an unknown project, and a revoked or expired head get `NOT_FOUND` and no page. The project checkpoint is `catchup:project:<slot>`, starts at the current end, and does not move the personal checkpoint.
+
 - **Revoking or expiring a replacement lead never restores an older lead or its grants (T562).** A fresh signed designation is required to restore service. `lead show` names the head and shadowed history, limits output to 20 records per project and 50 projects, and reports truncated or unverified head coverage without claiming a vacancy.
 
 - **`whoami.harness_session` follows the hook-bound session after an in-place upgrade (T571).** A server whose lease still carries the provisional `mcp-<pid>` id while this provider's hooks have bound exactly one real session now reports that session as `harness_session` — the id the statusline, HUD, `agentmbx status` and the endpoint key on — instead of the lease id. Report-only: `state.sessionId`, the lease and the resolver are unchanged, and `session`/`lease_key` still carry the lease key fingerprint.
