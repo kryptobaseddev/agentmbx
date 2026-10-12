@@ -4,11 +4,12 @@
 import { IdentityLeases, identityLeaseStatus, type IdentityLease } from "./identity-leases.ts";
 import type { Envelope } from "./envelope.ts";
 import { GROK_NO_PUSH, type MbxNode, type RouteTarget } from "./node.ts";
-import type { MessageRow } from "./store.ts";
+import { type MessageRow, type Store } from "./store.ts";
 import { hasWakeAuthority, liveWatcher, watcherKey } from "./wake.ts";
 import { captureWakeIdentity } from "./wake-identity.ts";
 import { procTable } from "./proc.ts";
 import { activityKey, parseActivity, SHARED_IDLE_MS } from "./identity-availability.ts";
+import { connectorKey, retryErrorClass } from "./diagnostics.ts";
 import { remoteReceipts } from "./remote-receipts.ts";
 import { isSlotName } from "./project-slot.ts";
 import { projectLabel, projectMailboxBySlot, projectReader } from "./project-mailbox.ts";
@@ -180,7 +181,7 @@ export function assertKnownRecipients(node: MbxNode, to: string[]): void {
 
 export interface DeliveryReceipt {
   address: string; state: string; updated_at: string | null; note: string | null; did: string | null; liveness: string;
-  outbox?: { attempts: number; last_error: string | null; next_at: string };
+  outbox?: { attempts: number; last_error_code: string | null; next_at: string };
 }
 
 export function deliveryReceipts(node: MbxNode, m: MessageRow, now = Date.now()): DeliveryReceipt[] {
@@ -210,7 +211,7 @@ export function deliveryReceipts(node: MbxNode, m: MessageRow, now = Date.now())
       ...got.map((r): DeliveryReceipt => ({ address: r.recipient, state: r.state, updated_at: r.at, note: r.note, did: r.did, liveness: `${projectBoxNote(node, r.recipient.split("@")[0], h)}on paired host ${h} (signed receipt)` })),
       ...(got.length && !pending.length ? [] : [{ address: (got.length ? pending : names).join(",") || `*@${h}`, state: o ? "queued" : "handed-over", updated_at: null, note: null, did: null,
         liveness: o ? `paired host ${h}: not accepted yet` : `accepted by paired host ${h}; no receipt from it yet`,
-        ...(o ? { outbox: { attempts: o.attempts, last_error: o.last_error, next_at: o.next_at } } : {}) }]),
+        ...(o ? { outbox: { attempts: o.attempts, last_error_code: retryErrorClass(o.last_error), next_at: o.next_at } } : {}) }]),
     ];
   });
   return [...local, ...remote];
@@ -219,7 +220,69 @@ export function deliveryReceipts(node: MbxNode, m: MessageRow, now = Date.now())
 /** One line per recipient, for thread views. */
 // "notified" with note "desktop" means only the owner saw a desktop notice: no agent session was told.
 export const receiptLine = (r: DeliveryReceipt) => `  → ${r.address}: ${r.state === "notified" && r.note === "desktop" ? "notified (owner desktop notice only)" : r.state}${r.updated_at ? ` ${r.updated_at.slice(0, 19)}Z` : ""}`
-  + `${r.did ? ` · did: ${r.did}` : ""}${r.note ? ` · note: ${r.note}` : ""}${r.outbox ? ` · attempts ${r.outbox.attempts}${r.outbox.last_error ? ` (${r.outbox.last_error.slice(0, 60)})` : ""}` : ""} · ${r.liveness}`;
+  + `${r.did ? ` · did: ${r.did}` : ""}${r.note ? ` · note: ${r.note}` : ""}${r.outbox ? ` · attempts ${r.outbox.attempts}${r.outbox.last_error_code ? ` (${r.outbox.last_error_code})` : ""}` : ""} · ${r.liveness}`;
+
+const DELIVERY_RANKS = new Set(["queued", "delivered", "notified", "read", "acked"]);
+const OWN_DELIVERY_LIMIT = 100;
+/** Same window as the owner diagnostic's connector report. A missing or older report is not a reason to release. */
+const CONNECTOR_FRESH_MS = 5 * 60_000;
+
+export const DELIVERY_GUIDANCE = [
+  "Call mbx_whoami in the current provider thread to verify its actual connector and identity.",
+  "If its connector is disconnected or stale, reconnect the mbx MCP server before changing ownership.",
+  "Ownership stays with this session. Reconnecting does not release it, and this view does not take it over.",
+];
+
+export interface OwnDeliveryItem {
+  id: string;
+  peer: string;
+  state: "accepted" | "queued" | "delivered" | "notified" | "read" | "acked";
+  failure: { code: string | null; attempts: number; next_retry_at: string } | null;
+}
+
+export interface OwnDelivery {
+  items: OwnDeliveryItem[];
+  truncated: boolean;
+  drafts: null;
+  draft_reason: "no draft store";
+  task_completion: "not-reported";
+}
+
+/** This identity's outgoing rows only. A paired host that has taken the push, with no delivery rank yet, is accepted. */
+export function ownDelivery(node: MbxNode, agent: string, now = Date.now()): OwnDelivery {
+  const sender = `${agent}@${node.host}`;
+  const rows = node.store.db.prepare("SELECT * FROM messages WHERE from_addr=? AND origin='local' ORDER BY id LIMIT ?")
+    .all(sender, OWN_DELIVERY_LIMIT + 1) as unknown as MessageRow[];
+  const page = rows.slice(0, OWN_DELIVERY_LIMIT);
+  const items: OwnDeliveryItem[] = [];
+  for (const m of page) {
+    for (const r of deliveryReceipts(node, m, now)) {
+      const state = r.state === "handed-over" ? "accepted" : DELIVERY_RANKS.has(r.state) ? r.state as OwnDeliveryItem["state"] : null;
+      if (!state) continue;
+      items.push({
+        id: m.id, peer: r.address, state,
+        failure: r.outbox ? { code: r.outbox.last_error_code, attempts: r.outbox.attempts, next_retry_at: r.outbox.next_at } : null,
+      });
+    }
+  }
+  return { items, truncated: rows.length > OWN_DELIVERY_LIMIT, drafts: null, draft_reason: "no draft store", task_completion: "not-reported" };
+}
+
+/** Reconnect text when this identity's own connector report is missing or stale. Reads the lease; writes nothing. */
+export function connectorGuidance(store: Store, agent: string, now = Date.now()): string[] {
+  const lease = store.db.prepare("SELECT holder_pid, holder_start, released_at FROM identity_leases WHERE name=?").get(agent) as
+    { holder_pid: number; holder_start: string; released_at: number | null } | undefined;
+  if (!lease || lease.released_at != null) return DELIVERY_GUIDANCE;
+  const raw = store.get(connectorKey(lease.holder_pid));
+  if (!raw) return DELIVERY_GUIDANCE;
+  let report: { v?: unknown; pid?: unknown; start?: unknown; version?: unknown; tools?: unknown; at?: unknown };
+  try { report = JSON.parse(raw) as typeof report; } catch { return DELIVERY_GUIDANCE; }
+  const at = typeof report.at === "string" ? Date.parse(report.at) : NaN;
+  const current = report.v === 1 && report.pid === lease.holder_pid && report.start === lease.holder_start
+    && typeof report.version === "string" && Array.isArray(report.tools)
+    && Number.isFinite(at) && at <= now + 60_000 && now - at <= CONNECTOR_FRESH_MS;
+  return current ? [] : DELIVERY_GUIDANCE;
+}
 
 interface SentFrame { v: 1; epoch: string; sender: string; position: string; end: string }
 export interface SentItem { id: string; ts: string; kind: string; subject: string; thread: string; to: string[]; recipients: DeliveryReceipt[] }
