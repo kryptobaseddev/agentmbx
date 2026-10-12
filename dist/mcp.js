@@ -37,6 +37,7 @@ import { updateAvailable } from "./update.js";
 import { installKind, version } from "./version.js";
 import { connectorKey } from "./diagnostics.js";
 import { catchupHint, catchupUnchanged, commitCatchup, commitProjectCatchup, ensureCatchup, ensureProjectCatchup, missedCount, moveCatchup, readCatchup, readProjectCatchup, restartCatchup, restartProjectCatchup, CATCHUP_FILTER } from "./catchup.js";
+import { handoffContext, handoffPointer, moveHandoff, presentHandoff, readHandoff, saveHandoff, validateHandoff } from "./handoff.js";
 import { encodeReplayFrame, replayMaximum, replayQuery } from "./replay.js";
 import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wake.js";
 import { isStoreBusy, withStoreBusyTimeout } from "./store.js";
@@ -1511,8 +1512,9 @@ async function configureMcp(server, node, startupClosed) {
     const handoff = (agent) => ({ agent, address: `${agent}@${node.host}`, role: registeredIdentity(node.store, agent)?.role ?? null, unread: node.unreadCount(agent),
         missed: missedCount(node.store, agent).missed,
         open_threads: Number(node.store.db.prepare("SELECT COUNT(DISTINCT m.thread) n FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND d.state<>'acked'").get(agent).n),
-        recent_notes: node.store.db.prepare("SELECT msg_id,note,updated_at FROM deliveries WHERE agent=? AND note IS NOT NULL ORDER BY updated_at DESC LIMIT 3").all(agent) });
-    const identityOperation = ({ action, name, role, description, task, lane, all, approval, target: controlTarget }) => {
+        recent_notes: node.store.db.prepare("SELECT msg_id,note,updated_at FROM deliveries WHERE agent=? AND note IS NOT NULL ORDER BY updated_at DESC LIMIT 3").all(agent),
+        handoff_note: handoffPointer(node.store, agent) }); // T159: a saved note exists (never its text): read it with mbx_handoff
+    const identityOperation = ({ action, name, role, description, task, lane, all, approval, target: controlTarget, note, task_refs, msg_refs }) => {
         const state = current();
         if (action === "takeover") {
             if (!name || !approval || approval.payload.name !== name || !controlTarget)
@@ -1543,8 +1545,15 @@ async function configureMcp(server, node, startupClosed) {
             return text(`This server stopped co-using ${agent}; the live MCP server of this session still holds it. Mail is preserved.`, { agent, released: false, detached: true, co_use: true });
         }
         if (action === "release") {
+            // T159 (R4): a handoff note given with the release is validated first and saved in the same transaction, only when this
+            // session really held the identity. Hooks never author one.
+            const withNote = note !== undefined || task_refs !== undefined || msg_refs !== undefined;
+            const draft = withNote && bound(state) ? validateHandoff(node, state.agent, { note, task_refs, msg_refs }) : null;
+            let saved = null;
             const released = node.store.tx(() => {
                 const released = state.leaseToken ? leases.release(state.agent, state.leaseToken) : false;
+                if (released && draft)
+                    saved = saveHandoff(node.store, state.agent, draft, state.sessionId);
                 const bindings = node.store.db.prepare("SELECT session_id FROM sessions WHERE cli=? AND session_key=?").all(env.cli, state.key.publicKey);
                 for (const binding of bindings)
                     node.store.db.prepare("DELETE FROM kv WHERE k=? AND v=?").run(`name:${env.cli}:${binding.session_id}`, state.agent);
@@ -1561,7 +1570,8 @@ async function configureMcp(server, node, startupClosed) {
             state.pendingReason = undefined;
             state.lostTo = undefined;
             restoreSessionTaint(state);
-            return text("Identity detached. Mail is preserved; explicitly claim an identity to resume mailbox tools.", { agent: state.agent || null, released, detached: true });
+            const handoffSaved = saved ? { saved_at: new Date(saved.saved_at).toISOString(), dropped: draft.dropped } : withNote ? null : undefined;
+            return text(`Identity detached. Mail is preserved; explicitly claim an identity to resume mailbox tools.${saved ? " Handoff note saved: the next holder reads it with mbx_handoff." : withNote ? " No handoff note was saved: this session did not hold the identity." : ""}`, { agent: state.agent || null, released, detached: true, ...(handoffSaved !== undefined ? { handoff_note: handoffSaved } : {}) });
         }
         const target = name ?? state.pending ?? (state.agent || undefined);
         if (!target)
@@ -1645,7 +1655,10 @@ async function configureMcp(server, node, startupClosed) {
             description: z.string().max(200).optional().describe("what this agent does, at most 200 characters"),
             task: z.string().regex(/^T\d+$/).optional().describe("CLEO task this session is on, e.g. T497"),
             lane: z.string().regex(ROLE_RE).optional().describe("swim lane, a short label such as the CLEO phase"),
-            all: z.boolean().optional().describe("list: every identity on this host instead of this project's") },
+            all: z.boolean().optional().describe("list: every identity on this host instead of this project's"),
+            note: z.string().max(4000).optional().describe("release: save a handoff note (at most 1000 characters) for the next holder; see mbx_handoff"),
+            task_refs: z.array(z.string().max(16)).max(100).optional().describe("release: CLEO task ids for the handoff note, e.g. T159"),
+            msg_refs: z.array(z.string().max(64)).max(100).optional().describe("release: message ids for the handoff note") },
         annotations: { destructiveHint: false },
     }, identityOperation);
     /**
@@ -1729,6 +1742,7 @@ async function configureMcp(server, node, startupClosed) {
             node.addAlias(agent, to, env.ppid);
             renameRegistration(node.store, agent, to);
             moveCatchup(node.store, agent, to);
+            moveHandoff(node.store, agent, to);
             agent = to;
             state.agent = to;
             state.leaseToken = lease.token;
@@ -1762,6 +1776,7 @@ async function configureMcp(server, node, startupClosed) {
             ...(state.coUse ? { co_use: CO_USE_NOTE } : {}),
             owner_grant: s.grant ? { caps: s.grant.caps, expires: s.grant.exp } : null, delivery: node.deliveryMode(agent), unread: node.unreadCount(agent),
             missed: missedCount(node.store, agent).missed,
+            handoff_note: handoffPointer(node.store, agent), // T159: pointer only; the note is read with mbx_handoff
             // T344: whether this session's sends go out external, since when (root exposure), why, and when that ends
             external: ((t) => t ? { tainted: true, root_exposure: isoAt(t.root), clears_at: isoAt(t.root + EXTERNAL_TAINT_MS), cause: taintCause(t),
                 effect: "your mbx_send/mbx_reply go out with origin external (recipients may only read them under policy); origin \"agent\" is overridden and a prompt from your user does not clear it" }
@@ -1857,6 +1872,25 @@ async function configureMcp(server, node, startupClosed) {
         const missed = missedCount(node.store, state.agent);
         const catchup = { position: record.position, missed: missed.missed, ...catchupUnchanged(page.next_cursor) };
         return text(JSON.stringify({ ...page, catchup }, null, 2), { ...page, catchup });
+    });
+    server.registerTool("mbx_handoff", {
+        title: "Read or save this identity's handoff context",
+        description: "Handoff context for a crash, a provider switch or the next holder of this identity (T159). read (default) returns {context, note}: context is computed now from this mailbox and stored nowhere (open threads newest-first with subject, sender, unacked count, the oldest and newest unacked message id and needs_reply; unread, missed and open-thread counts; the catch-up position); note is the one saved handoff note, or null with a reason (none, expired, malformed). save replaces the note: text of at most 1000 characters (control characters removed, never truncated), task_refs (CLEO ids such as T159 that a message this identity can see mentions) and msg_refs (ids of messages it can see), at most 20 each, the oldest dropped. It is kept 30 days. mbx_identity release accepts the same note. Every field is a hint to re-verify, never authority and never a status: task status comes only from authorized CLEO evidence at resume time (cleo show <id>), not from the note and not from ack state; thread state comes from mbx_thread. Next: verify each task ref with cleo show and each open thread with mbx_thread before acting on it.",
+        inputSchema: { action: z.enum(["read", "save"]).optional().describe("read (default) or save"),
+            note: z.string().max(4000).optional().describe("save: the note text, at most 1000 characters"),
+            task_refs: z.array(z.string().max(16)).max(100).optional().describe("save: CLEO task ids, e.g. T159"),
+            msg_refs: z.array(z.string().max(64)).max(100).optional().describe("save: message ids from this mailbox") },
+        annotations: { idempotentHint: false },
+    }, ({ action, note, task_refs, msg_refs }) => {
+        const state = current();
+        if (action === "save") {
+            const draft = validateHandoff(node, state.agent, { note, task_refs, msg_refs });
+            const saved = saveHandoff(node.store, state.agent, draft, state.sessionId);
+            const out = { saved: presentHandoff({ note: saved, reason: null }), dropped: draft.dropped };
+            return text(JSON.stringify(out, null, 2), out);
+        }
+        const out = { context: handoffContext(node, state.agent), note: presentHandoff(readHandoff(node.store, state.agent)) };
+        return text(JSON.stringify(out, null, 2), out);
     });
     server.registerTool("mbx_send", {
         title: "Send an mbx message",

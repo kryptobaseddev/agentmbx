@@ -133,7 +133,10 @@ The local CLI view relies on the same OS user's filesystem access; it is not an 
 ### Ending a session and handing off its mailbox
 
 When the owner ends this agent session or requests a handoff, finish replies and record any useful
-handoff notes, then call `mbx_identity {"action":"release"}` as the last mailbox mutation. Do not
+handoff notes, then call `mbx_identity {"action":"release"}` as the last mailbox mutation. To leave the next holder a
+note, pass it with the release (`"note"`, at most 1000 characters, plus `"task_refs"`/`"msg_refs"`) or save it earlier with
+`mbx_handoff {"action":"save"}`; a resumed session reads it, with context computed fresh, through `mbx_handoff`. The note
+holds references only: take every task's status from `cleo show <id>`, never from the note or from ack state. Do not
 release merely because a turn finishes or the agent is waiting for more work. Release preserves
 messages, acknowledgements and notes, and stops this session's heartbeat and ordinary mailbox tools.
 Recovery controls remain available: `mbx_identity list` and an explicit `mbx_identity claim`.
