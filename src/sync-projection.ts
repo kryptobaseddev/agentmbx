@@ -1,14 +1,15 @@
 // Allowlisted SyncBatch projection (T262, daemon-sync-protocol-v1 version 3).
-// OpenAPI 1.0.0-draft.5 shapes. This daemon speaks contract 1, which has no
-// HostReport.project_paths or HostReport.project_leads (additionalProperties is
-// false). local_path is computed for an opted-in project and attached only when
-// the caller says the spoken contract lists that field. A lead row is the project
-// key, agent, host, expiry and record id — never the checkout path — and is
-// attached only when the spoken contract lists project_leads (T393).
+// OpenAPI 1.0.0-draft.5 shapes. This daemon can speak contract 2. The batch
+// uses the lower of CONTRACT_VERSION and the stored link's contract max, so a
+// link capped at 1 is still spoken as contract 1. local_path is computed for an
+// opted-in project and attached only when the caller says the spoken contract
+// lists that field. A lead row is the project key, agent, host, expiry and
+// record id — never the checkout path — and is attached only when the spoken
+// contract lists project_leads (T393, T446).
 
 import { allowStatus } from "./status-sync.ts";
 
-export const CONTRACT_VERSION = 1;
+export const CONTRACT_VERSION = 2;
 export const PROJECT_PATHS_SINCE = 2;
 export const PROJECT_LEADS_SINCE = 2;
 export const CAPS = { agents: 500, threads: 1000, receipts: 2000, policies: 200, approvals: 200, peers: 64, paths: 64, leads: 64 } as const;

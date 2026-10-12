@@ -1,5 +1,6 @@
-// Daemon sync client (T262, T468). One POST writer, one seq per host. No network call
-// unless a local link record exists, and no bearer token. SyncAck cannot turn the path or lead opt-in on.
+// Daemon sync client (T262, T468, T446). One POST writer, one seq per host. No network call
+// unless a local link record exists, and no bearer token. A SyncAck never turns project_paths on.
+// A SyncAck whose contract max is at least 2 sets project_leads on the stored link.
 import { createHash, randomBytes } from "node:crypto";
 import { CONTRACT_VERSION, PATH_FLAG_PREFIX, PROJECT_LEADS_SINCE, PROJECT_PATHS_SINCE, projectSync, } from "./sync-projection.js";
 export const LINK_KEY = "sync.link";
@@ -231,15 +232,50 @@ async function send(o, link, state, pending) {
     state.snapshot_hash = pending.snapshotHash;
     state.sent_receipts = [...new Set([...state.sent_receipts, ...pending.receiptKeys])];
     const range = ack.contract;
-    if (range && typeof range.min === "number" && typeof range.max === "number" && (CONTRACT_VERSION < range.min || CONTRACT_VERSION > range.max)) {
+    const sent = sentContract(pending.body);
+    // Compare the contract this batch spoke, not CONTRACT_VERSION. A link capped at 1
+    // speaks 1, and an old cloud that acks max 1 still accepts that batch.
+    if (range && typeof range.min === "number" && typeof range.max === "number" && sent !== null && (sent < range.min || sent > range.max)) {
         state.force_full = true;
         writeState(o.kv, state);
         o.audit?.("sync.contract", { code: "sync.contract" });
         return { outcome: "sync.contract" };
     }
+    rememberLeads(o.kv, range && typeof range === "object" ? range.max : undefined);
     writeState(o.kv, state);
     o.audit?.("sync.batch", { seq: pending.seq, outcome: "acked" });
     return { outcome: "acked", seq: pending.seq };
+}
+function sentContract(body) {
+    try {
+        const n = JSON.parse(body).contract;
+        return typeof n === "number" ? n : null;
+    }
+    catch {
+        return null;
+    }
+}
+/** A contract-2 ack opts this link into project leads. It never writes project_paths. */
+function rememberLeads(kv, max) {
+    if (typeof max !== "number" || max < PROJECT_LEADS_SINCE)
+        return;
+    const raw = kv.get(LINK_KEY);
+    if (!raw)
+        return;
+    let parsed;
+    try {
+        parsed = JSON.parse(raw);
+    }
+    catch {
+        return;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+        return;
+    const stored = parsed;
+    if (stored.project_leads === true)
+        return;
+    stored.project_leads = true;
+    kv.set(LINK_KEY, JSON.stringify(stored));
 }
 function refusePathCommands(o, commands) {
     const text = JSON.stringify(commands ?? null);
