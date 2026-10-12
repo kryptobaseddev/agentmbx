@@ -1,4 +1,5 @@
 // Process lifetime is independent of mailbox retirement: a reload proxy still owns the client transport.
+import { execFileSync } from "node:child_process";
 import { linkSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
@@ -17,14 +18,77 @@ const unknown = { alive: null, start: null };
 const recordPath = (home, processPid) => join(home, "mcp-lifecycle", `${processPid}.json`);
 const clientSchema = recordSchema.shape.client.unwrap();
 const generationPath = (home, originalPid) => join(home, "mcp-generation", String(originalPid));
-/** Publish the complete owner atomically; never infer a connection from its provider PID or session id. */
+/** macOS kernel addresses of fd 0 and fd 1 for each pid (`lsof -F pfd`, e.g. `0x3c9d…,0x6c0f…`); null when any is unreadable. */
+export function lsofStdioAddresses(pids) {
+    let listing;
+    try {
+        listing = execFileSync("lsof", ["-n", "-P", "-a", "-p", pids.join(","), "-d", "0,1", "-F", "pfd"], {
+            encoding: "utf8", timeout: 1000, maxBuffer: 64 * 1024, stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, LC_ALL: "C", LANG: "C" },
+        });
+    }
+    catch {
+        return null;
+    }
+    const fds = new Map();
+    let current, fd = "";
+    for (const line of listing.split("\n")) {
+        const value = line.slice(1);
+        if (line[0] === "p") {
+            current = new Map();
+            fds.set(Number(value), current);
+            fd = "";
+        }
+        else if (line[0] === "f")
+            fd = value;
+        else if (line[0] === "d" && current && (fd === "0" || fd === "1"))
+            current.set(fd, value);
+    }
+    const result = new Map();
+    for (const processPid of pids) {
+        const ends = [fds.get(processPid)?.get("0"), fds.get(processPid)?.get("1")];
+        if (!ends.every(end => end && /^0x[0-9a-f]+$/i.test(end)))
+            return null;
+        result.set(processPid, ends.join(","));
+    }
+    return result;
+}
+/** Test seams (T564), like procSeams. Production code never reassigns them. */
+export const connectionSeams = {
+    endpoint: stdioEndpoint,
+    addresses: lsofStdioAddresses,
+};
+// A live process's stdio addresses never change; the reexec handover loop retries the same owner many times.
+const confirmed = new Map();
+export const _resetConnectionConfirmationsForTests = () => confirmed.clear();
+/**
+ * Publish the complete owner atomically; never infer a connection from its provider PID or session id.
+ * T564: macOS reports stdio sockets with dev -1 and an inode that live, separate connections can share. A live owner of
+ * the fstat key is a duplicate reader only when lsof shows the same kernel addresses on fd 0 and 1; a different connection
+ * claims its own address-qualified key, and unreadable addresses keep serving (unknown) rather than exit.
+ */
 export function claimMcpConnection(home) {
-    const endpoint = stdioEndpoint();
+    const endpoint = connectionSeams.endpoint();
     if (!endpoint || process.pid <= 1)
         return { state: "unknown" };
     const start = inspectLeaseProcess(process.pid).start;
     if (!start)
         return { state: "unknown" };
+    const first = claimEndpoint(home, endpoint, start);
+    if (first.state !== "duplicate" || !endpoint.startsWith("darwin:"))
+        return first.state === "duplicate" ? { state: "duplicate", pid: first.pid } : first;
+    const cacheKey = `${first.pid}:${first.start}`;
+    if (!confirmed.has(cacheKey))
+        confirmed.set(cacheKey, connectionSeams.addresses([process.pid, first.pid]));
+    const addresses = confirmed.get(cacheKey), own = addresses?.get(process.pid), owner = addresses?.get(first.pid);
+    if (!own || !owner)
+        return { state: "unknown" };
+    if (own === owner)
+        return { state: "duplicate", pid: first.pid };
+    // The qualified key itself proves equal addresses, so a duplicate there needs no second lsof.
+    const second = claimEndpoint(home, `${endpoint}|lsof:${own}`, start);
+    return second.state === "duplicate" ? { state: "duplicate", pid: second.pid } : second;
+}
+function claimEndpoint(home, endpoint, start) {
     const dir = join(home, "mcp-connections"), path = join(dir, createHash("sha256").update(endpoint).digest("hex"));
     const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`, body = JSON.stringify({ pid: process.pid, start });
     const read = () => {
@@ -67,7 +131,7 @@ export function claimMcpConnection(home) {
             return { state: "unknown" };
         const live = inspectLeaseProcess(owner.pid);
         if (live.alive === true && live.start && owner.start === live.start)
-            return owner.pid === process.pid ? held() : { state: "duplicate", pid: owner.pid };
+            return owner.pid === process.pid ? held() : { state: "duplicate", pid: owner.pid, start: owner.start };
         if (!processGone(owner.start, live))
             return { state: "unknown" };
         // Only stale recovery needs a short OS lock. Normal startup performs no SQLite work before initialize.

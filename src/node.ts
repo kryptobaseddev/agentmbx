@@ -32,6 +32,13 @@ export const RETRY_HOURS = 72;
 export const PAIR_TOKEN_TTL_MS = 10 * 60_000;
 export const PAIR_TOKEN_MAX_TTL_MS = 60 * 60_000;
 export const PAIR_TOKEN_MAX_FAILURES = 5;
+/** How long a code-compare offer may sit in `peers` as pending (T200). Token pairing does not use this. */
+export const PAIR_PENDING_TTL_MS = 10 * 60_000;
+/** A pending code-compare row is stale once it is older than the window, or its timestamp does not parse. */
+export function pendingPairStale(createdAt: string, now = Date.now()): boolean {
+  const at = Date.parse(createdAt);
+  return !Number.isFinite(at) || now - at > PAIR_PENDING_TTL_MS;
+}
 /** The `did` audit line on an ack: one line, at most this many characters (longer input is kept truncated and marked). */
 export const DID_MAX = 200;
 export const didWarning = (did: string | undefined) => did && did.length > DID_MAX
@@ -455,10 +462,28 @@ export class MbxNode {
   approvePeer(host: string, code?: string) {
     const p = this.peer(host);
     if (!p) throw new Error(`no pending pairing with ${host}`);
+    if (p.state === "pending") {
+      const row = this.store.db.prepare("SELECT created_at FROM peers WHERE host=? AND state='pending'").get(host) as { created_at: string } | undefined;
+      if (!row || pendingPairStale(row.created_at)) {
+        this.store.db.prepare("DELETE FROM peers WHERE host=? AND state='pending'").run(host);
+        this.store.audit("pair.expired", { host, via: "approve" });
+        throw new Error(`pending pairing with ${host} expired; run pair --compare again`);
+      }
+    }
     if (code && p.code !== code) throw new Error(`code mismatch: this side shows ${p.code}. Do not approve; pair again.`);
     this.store.db.prepare("UPDATE peers SET state='approved', approved_at=? WHERE host=?").run(new Date().toISOString(), host);
     this.notePeerOwner(host, p.owner_pubkey);
     this.store.audit("pair.approved", { host, key: fingerprint(p.pubkey) });
+  }
+
+  /** Delete code-compare offers that outlived PAIR_PENDING_TTL_MS (T200). Approved peers stay. */
+  expirePendingPeers(now = Date.now()): number {
+    const rows = this.store.db.prepare("SELECT host, created_at FROM peers WHERE state='pending'").all() as { host: string; created_at: string }[];
+    const dead = rows.filter((r) => pendingPairStale(r.created_at, now));
+    const del = this.store.db.prepare("DELETE FROM peers WHERE host=? AND state='pending'");
+    for (const r of dead) del.run(r.host);
+    if (dead.length) this.store.audit("pair.expired", { count: dead.length, hosts: dead.slice(0, 20).map((r) => r.host), via: "sweep" });
+    return dead.length;
   }
 
   /**

@@ -9,7 +9,7 @@ import type { AddressInfo, Server } from "node:net";
 import { generateKeyPair, joinTranscript, nonce, normalizePairToken, pairingCode, pairMac, pairTokenKey, newPairToken } from "../src/crypto.ts";
 import { advertise, browse, decodeTxt, encodeTxt } from "../src/discovery.ts";
 import { flushOutbox, pairJoin, pairWith, startServer, type JoinRequest, type PairHello } from "../src/http.ts";
-import { MbxNode } from "../src/node.ts";
+import { MbxNode, PAIR_PENDING_TTL_MS } from "../src/node.ts";
 
 process.env.MBX_NO_DESKTOP = "1";
 const tmp = () => mkdtempSync(join(tmpdir(), "mbx-pair-"));
@@ -209,6 +209,29 @@ test("SAS: a reveal without a matching commitment is refused and pairs nothing (
     assert.equal((await post({ v: 2, offer })).status, 401, "a reveal nobody committed to is refused");
     assert.equal(B.n.peer("alpha"), undefined);
   } finally { down(B); A.close(); }
+});
+
+test("T200: a pending code-compare pairing older than 10 minutes is refused and removed", () => {
+  const n = new MbxNode(tmp(), { host: "alpha" });
+  const offer = (host: string) => ({ host, pubkey: generateKeyPair().publicKey, owner_pubkey: null as string | null, addr: "127.0.0.1:1", code: "000000", nonce_local: "n", nonce_remote: "n" });
+  const age = (host: string, ms: number) => n.store.db.prepare("UPDATE peers SET created_at=? WHERE host=?").run(new Date(Date.now() - ms).toISOString(), host);
+  const beta = offer("beta");
+  n.upsertPendingPeer(beta);
+  age("beta", PAIR_PENDING_TTL_MS + 1000);
+  assert.throws(() => n.approvePeer("beta", "000000"), /expired/);
+  assert.equal(n.peer("beta"), undefined);
+
+  n.upsertPendingPeer(beta);
+  n.approvePeer("beta", "000000");
+  assert.equal(n.approvedPeer("beta")?.pubkey, beta.pubkey);
+  age("beta", PAIR_PENDING_TTL_MS + 1000);
+
+  n.upsertPendingPeer(offer("gamma"));
+  age("gamma", PAIR_PENDING_TTL_MS + 1000);
+  assert.equal(n.expirePendingPeers(), 1);
+  assert.equal(n.peer("gamma"), undefined);
+  assert.equal(n.approvedPeer("beta")?.state, "approved");
+  n.close();
 });
 
 test("discovery TXT records round-trip", () => {

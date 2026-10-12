@@ -13,25 +13,46 @@ import { join, resolve } from "node:path";
 import { MbxNode } from "../src/node.ts";
 import { hudLine, writeHud } from "../src/hud.ts";
 import { IdentityLeases, inspectLeaseProcess } from "../src/identity-leases.ts";
+import { STATUS_V2_SCHEMA, type StatusV2 } from "../src/status-schema.ts";
+import { renderSections, renderStatus } from "../plugins/claude/hooks/register.js";
 
-const FIXTURE = JSON.parse(readFileSync(join(resolve("test"), "fixtures", "status-v2-bound.json"), "utf8"));
-
-test("the v2 fixture satisfies the mbx.status/v2 contract and renders to the shared v1 line", () => {
-  assert.equal(FIXTURE.schema, "mbx.status/v2");
-  for (const block of ["identity", "registration", "inbox", "harness", "cloud", "devices", "project"]) {
-    assert.ok(block in FIXTURE, `v2 fixture carries the ${block} block`);
+// T408: the same four checked-in snapshots exercised by the OpenCode renderer (T413).
+for (const state of ["bound", "unbound", "cloud-down", "peers-down"]) test(`T408: shared ${state} fixture renders through statusline and Claude mod`, () => {
+  const fixture = JSON.parse(readFileSync(new URL(`./fixtures/status-v2-${state}.json`, import.meta.url), "utf8")) as StatusV2;
+  const before = JSON.stringify(fixture);
+  assert.equal(fixture.schema, STATUS_V2_SCHEMA);
+  for (const block of ["identity", "registration", "inbox", "harness", "cloud", "devices", "project"]) assert.ok(block in fixture);
+  for (const count of Object.values(fixture.inbox)) assert.ok(Number.isSafeInteger(count) && count >= 0);
+  const compact = renderStatus(fixture.harness.session_id, fixture);
+  const sections = renderSections(fixture);
+  assert.ok(sections);
+  if (state === "unbound") {
+    assert.equal(fixture.identity.state, "unbound");
+    assert.equal(fixture.identity.name, null);
+    assert.equal(compact, "unbound");
+    assert.deepEqual(sections, ["mbx unbound"]);
+  } else {
+    assert.equal(fixture.identity.state, "bound");
+    // Existing v1 statusline compatibility: project/health fields don't alter own-mail counts.
+    const line = hudLine({
+      schema: "mbx.status/v1", mbx_version: fixture.mbx_version, update_available: null,
+      identity: fixture.identity, ...fixture.inbox,
+      policy: fixture.harness.policy, resolved_by: fixture.resolved_by,
+    });
+    assert.equal(line, state === "bound" ? "mbx agentmbx-kimi(builder) 2↑ 1↺ 3 unsent" : "mbx agentmbx-fixture(builder) 2↑ 1↺ 3 unsent");
+    assert.ok(compact.includes(fixture.identity.name!));
+    assert.match(compact, /unread 2\nneeds_reply 1\nfrom_owner 0\noutbox_unsent 3/);
+    const panel = sections.join("\n");
+    assert.match(panel, /inbox 2 unread · 1 needs reply · 0 from owner · 3 unsent/);
+    if (state === "cloud-down") assert.match(panel, /cloud relay unreachable \(https:\/\/relay.example\)/);
+    if (state === "peers-down") {
+      assert.match(panel, /device fixture-offline .*\(unreachable\)/);
+      assert.match(panel, /device fixture-unknown .*\(unknown\)/);
+      assert.doesNotMatch(panel, / · seen /, "unknown presence must not acquire a timestamp");
+    }
+    for (const member of fixture.project?.members ?? []) assert.ok(panel.includes(member));
   }
-  assert.equal(FIXTURE.identity.state, "bound");
-  assert.equal(typeof FIXTURE.inbox.unread, "number");
-  // the same numbers through the line renderer every statusline composes with
-  const line = hudLine({
-    schema: "mbx.status/v1", mbx_version: FIXTURE.mbx_version, update_available: null,
-    identity: { name: FIXTURE.identity.name, role: FIXTURE.identity.role, state: "bound" },
-    unread: FIXTURE.inbox.unread, needs_reply: FIXTURE.inbox.needs_reply,
-    from_owner: FIXTURE.inbox.from_owner, outbox_unsent: FIXTURE.inbox.outbox_unsent,
-    policy: FIXTURE.harness.policy, resolved_by: "session_id",
-  });
-  assert.equal(line, "mbx agentmbx-kimi(builder) 2↑ 1↺ 3 unsent", "fixture renders to the one line every CLI shows");
+  assert.equal(JSON.stringify(fixture), before, "renderers leave shared fixture inputs unchanged");
 });
 
 const statusline = (h: string, cli: string, sessionId: string) =>
