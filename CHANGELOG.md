@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **A resumed Claude or Hermes session no longer hears that it lost its identity (T573).** `claude --resume` starts a new provider process whose SessionStart hook can run before that process's mbx server connects (live: 413 ms before the reclaim). When the provider has never connected, the session's remembered identity is released or held by this same session, and there is no identity conflict, the hook prints `[mbx] Resuming <name>@<host>: this session's mailbox server is still connecting. Call mbx_whoami and wait for its result before claiming or registering.` instead of the T503 disconnect line and the unbound/register guidance. A provider that connected before and lost its connector still gets the T503 line; an explicit release, another holder, or a non-rebinding CLI keep today's text. The hook still records the session hint and claims nothing.
+- **`whoami.harness_session` follows the hook-bound session after an in-place upgrade (T571).** A server whose lease still carries the provisional `mcp-<pid>` id while this provider's hooks have bound exactly one real session now reports that session as `harness_session` — the id the statusline, HUD, `agentmbx status` and the endpoint key on — instead of the lease id. Report-only: `state.sessionId`, the lease and the resolver are unchanged, and `session`/`lease_key` still carry the lease key fingerprint.
 
 ## 0.5.27 (2026-10-11)
 
