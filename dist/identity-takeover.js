@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { canonical, fingerprint, sha256, verifyData } from "./crypto.js";
 import { NAME_RE } from "./envelope.js";
+import { activityKey, parseActivity, SHARED_IDLE_MS } from "./identity-availability.js";
 import { inspectLeaseProcess } from "./identity-leases.js";
 import { opencodeProviderPid } from "./opencode-provider.js";
 import { procTable } from "./proc.js";
@@ -43,9 +44,13 @@ export function providerLabel(pid, table = procTable()) {
     const parent = table.get(pid)?.ppid ?? 0;
     return parent > 1 ? `parent ${parent}` : "unknown";
 }
+const lastActivity = (node, row) => parseActivity(node.store.get(activityKey(row.name)))?.at ?? row.claimed_at;
 /** T469: a live holder under this session's own provider is the caller's own MCP, and force is not consent to replace it. */
-export function refuseSelfTakeover(row, claimant, evidence = inspectLeaseProcess(row.holder_pid)) {
+export function refuseSelfTakeover(row, claimant, evidence = inspectLeaseProcess(row.holder_pid), lastActivity = row.claimed_at) {
     if (row.released_at !== null || row.cli !== claimant.cli || row.session_id !== claimant.lease_session_id)
+        return;
+    // T608: a sibling idle for the stale threshold is stuck, not serving; the owner may replace it.
+    if (Date.now() - lastActivity >= SHARED_IDLE_MS)
         return;
     if (!(evidence.alive === true && evidence.start === row.holder_start))
         return;
@@ -60,7 +65,7 @@ export function buildIdentityTakeover(node, claimant, name) {
     const row = lease(node, name);
     if (!row || row.released_at !== null)
         throw refused("identity has no occupied lease; use identity claim");
-    refuseSelfTakeover(row, claimant);
+    refuseSelfTakeover(row, claimant, undefined, lastActivity(node, row));
     if (claimant.generation !== null)
         throw refused("release the destination session's current identity before takeover");
     if (node.store.get(`identity-conflict:${name}`))
@@ -96,7 +101,7 @@ export function applyIdentityTakeover(node, leases, approval, claimant, operatio
         const row = lease(node, payload.name);
         if (!row || row.released_at !== null || canonical(previousHolder(row)) !== canonical(payload.previous))
             throw refused("displaced identity generation changed after approval");
-        refuseSelfTakeover(row, claimant, leases.processEvidence(row.holder_pid));
+        refuseSelfTakeover(row, claimant, leases.processEvidence(row.holder_pid), lastActivity(node, row));
         if (!leases.release(payload.name, row.token))
             throw refused("displaced identity could not be released");
         // Retire only bindings belonging to the displaced key. Aliases may use a hook ID
