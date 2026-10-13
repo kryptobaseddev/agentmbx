@@ -27,7 +27,16 @@ export function hookResumingNote(node: MbxNode, cli: string, session: string, pr
   const start = procStart(providerPid);
   const rows = node.store.db.prepare("SELECT pid_start FROM sessions WHERE cli=? AND pid=?").all(cli, providerPid);
   if (rows.some(r => typeof r.pid_start !== "string" || !start || r.pid_start === start)) return null;
-  if (listIdentityControls(node.store).some(d => d.cli === cli && d.parent_pid === providerPid)) return null;
+  // A connector of this provider process that holds an identity is connected: T503 decides whether it is alive. T610: one that
+  // is live but holds nothing yet (an MCP restarted with the provider claims the remembered identity on its first tool call)
+  // is still resuming; a dead or reborn unbound connector is not, and the disconnected path reports it.
+  const controls = listIdentityControls(node.store).filter(d => d.cli === cli && d.parent_pid === providerPid);
+  if (controls.some(d => d.agent)) return null;
+  if (controls.length) {
+    const evidence = inspectLeaseProcesses([providerPid, ...controls.map(d => d.mcp_pid)]);
+    const parent = evidence.get(providerPid) ?? UNKNOWN_PROCESS;
+    if (!controls.some(d => !processGone(d.parent_start, parent) && !processGone(d.mcp_start, evidence.get(d.mcp_pid) ?? UNKNOWN_PROCESS))) return null;
+  }
   const lease = node.store.db.prepare("SELECT cli,session_id,released_at FROM identity_leases WHERE name=?").get(name);
   if (!lease || (lease.released_at === null && (lease.cli !== cli || lease.session_id !== session))) return null;
   return `[mbx] Resuming ${name}@${node.host}: this session's mailbox server is still connecting. Call mbx_whoami and wait for its result before claiming or registering.`;
