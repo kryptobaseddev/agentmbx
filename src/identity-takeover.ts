@@ -4,6 +4,7 @@ import { z } from "zod";
 import { canonical, fingerprint, sha256, verifyData } from "./crypto.ts";
 import { NAME_RE } from "./envelope.ts";
 import type { IdentityControlDescriptor } from "./identity-control.ts";
+import { activityKey, parseActivity, SHARED_IDLE_MS } from "./identity-availability.ts";
 import { inspectLeaseProcess, type IdentityLease, type IdentityLeases } from "./identity-leases.ts";
 import { opencodeProviderPid } from "./opencode-provider.ts";
 import type { MbxNode } from "./node.ts";
@@ -47,9 +48,13 @@ export function providerLabel(pid: number, table = procTable()): string {
   return parent > 1 ? `parent ${parent}` : "unknown";
 }
 
+const lastActivity = (node: MbxNode, row: IdentityLease) => parseActivity(node.store.get(activityKey(row.name)))?.at ?? row.claimed_at;
+
 /** T469: a live holder under this session's own provider is the caller's own MCP, and force is not consent to replace it. */
-export function refuseSelfTakeover(row: IdentityLease, claimant: IdentityControlDescriptor, evidence = inspectLeaseProcess(row.holder_pid)): void {
+export function refuseSelfTakeover(row: IdentityLease, claimant: IdentityControlDescriptor, evidence = inspectLeaseProcess(row.holder_pid), lastActivity = row.claimed_at): void {
   if (row.released_at !== null || row.cli !== claimant.cli || row.session_id !== claimant.lease_session_id) return;
+  // T608: a sibling idle for the stale threshold is stuck, not serving; the owner may replace it.
+  if (Date.now() - lastActivity >= SHARED_IDLE_MS) return;
   if (!(evidence.alive === true && evidence.start === row.holder_start)) return;
   if (!sameLiveProvider(row.holder_pid, claimant)) return;
   throw refused("identity takeover --force cannot target your own live session MCP; use the harness reconnect controls, never kill or hand-spawn MBX MCPs");
@@ -60,7 +65,7 @@ export function buildIdentityTakeover(node: MbxNode, claimant: IdentityControlDe
   if (!owner) throw refused("identity takeover requires a local owner key");
   const row = lease(node, name);
   if (!row || row.released_at !== null) throw refused("identity has no occupied lease; use identity claim");
-  refuseSelfTakeover(row, claimant);
+  refuseSelfTakeover(row, claimant, undefined, lastActivity(node, row));
   if (claimant.generation !== null) throw refused("release the destination session's current identity before takeover");
   if (node.store.get(`identity-conflict:${name}`)) throw refused("unresolved historical ownership requires separate recovery");
   const now = Date.now();
@@ -89,7 +94,7 @@ export function applyIdentityTakeover<T>(node: MbxNode, leases: IdentityLeases, 
     if (node.store.get(`identity-conflict:${payload.name}`)) throw refused("unresolved historical ownership requires separate recovery");
     const row = lease(node, payload.name);
     if (!row || row.released_at !== null || canonical(previousHolder(row)) !== canonical(payload.previous)) throw refused("displaced identity generation changed after approval");
-    refuseSelfTakeover(row, claimant, leases.processEvidence(row.holder_pid));
+    refuseSelfTakeover(row, claimant, leases.processEvidence(row.holder_pid), lastActivity(node, row));
     if (!leases.release(payload.name, row.token)) throw refused("displaced identity could not be released");
     // Retire only bindings belonging to the displaced key. Aliases may use a hook ID
     // distinct from the lease's canonical MCP session ID, so match by key as well.

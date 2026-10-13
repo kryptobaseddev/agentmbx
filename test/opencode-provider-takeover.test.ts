@@ -112,6 +112,8 @@ test("T481 force takeover recovers another OpenCode serve and still refuses the 
     const same = descriptor(session, held.nodes[1], held.pid, "bbbb-cccc-dddd-eeee");
     const row = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get("split-reader") as unknown as Parameters<typeof refuseSelfTakeover>[0];
     assert.throws(() => refuseSelfTakeover(row, same), /your own live session MCP/);
+    // T608: idle for the stale threshold, the same serve's sibling is stuck and the owner may replace it.
+    assert.doesNotThrow(() => refuseSelfTakeover(row, same, undefined, Date.now() - 10 * 60 * 1000));
     const mine = descriptor(session, other.nodes[0], other.pid, "cccc-dddd-eeee-ffff");
     const built = buildIdentityTakeover(node, mine, "split-reader");
     assert.equal(built.previous.pid, held.nodes[0]);

@@ -9,7 +9,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { MbxNode } from "../src/node.ts";
 import { readSessionTaint } from "../src/session-taint.ts";
-import { identityAvailability } from "../src/identity-availability.ts";
+import { identityAvailability, SHARED_IDLE_MS, type LeaseActivity } from "../src/identity-availability.ts";
 import type { IdentityLease, ProcessEvidence } from "../src/identity-leases.ts";
 
 const bin = join(import.meta.dirname, "../bin/agentmbx.js");
@@ -190,6 +190,14 @@ test("co-use requires the same session and the holder's own provider process", (
   assert.equal(at({ cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: 20, holderProviderAlive: false }).takeover, "same-session", "dead provider is takeover");
   assert.equal(at({ cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: 20, holderProviderAlive: true }).takeover, undefined, "a live provider is not takeover");
   assert.equal(at({ cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: 20, holderProviderAlive: true }).claimable, false);
+  // T608: the session's other server, quiet for the stale threshold, is taken back without the owner. In use, it stays.
+  const quiet = (activity: LeaseActivity | null, caller: Parameters<typeof at>[0]) => identityAvailability({ lease: { ...lease, heartbeat_at: now + SHARED_IDLE_MS }, evidence: live, activity, now: now + SHARED_IDLE_MS, caller });
+  const otherLive = { cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: 20, holderProviderAlive: true };
+  assert.equal(quiet(null, otherLive).takeover, "same-session", "quiet since its claim: this session takes it back");
+  assert.equal(quiet({ at: now + SHARED_IDLE_MS - 60_000, shared: true }, otherLive).claimable, false, "used a minute ago: it keeps the lease");
+  assert.equal(quiet(null, { cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: null }).takeover, "same-session", "unknown parentage, quiet");
+  assert.equal(quiet(null, { cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: 10 }).coUse, true, "same provider still co-uses");
+  assert.equal(quiet(null, { cli: "opencode", sessionId: "ses_b", providerPid: 10, holderProviderPid: 20, holderProviderAlive: true }).takeover, undefined, "another session never takes it this way");
   assert.equal(at({ cli: "opencode", sessionId: "ses_a", providerPid: 10, holderProviderPid: null }).coUse, undefined, "unknown parentage");
   assert.equal(at({ cli: "opencode", sessionId: "ses_a" }).coUse, undefined, "no provider evidence");
   assert.equal(at({ cli: "opencode", sessionId: "ses_b", providerPid: 10, holderProviderPid: 10 }).coUse, undefined, "another session");

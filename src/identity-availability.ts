@@ -127,11 +127,17 @@ export function identityAvailability(o: { lease?: IdentityLease; evidence: Proce
     // only when the holder's provider is confirmed dead — a shell-launched server must not evict a live one. Unknown
     // parentage never evicts a live holder and never co-uses it.
     const { providerPid, holderProviderPid: holderProvider, holderProviderAlive } = o.caller;
+    // T608: the same conversation's other server, quiet for the stale threshold (D039), is stuck, not serving: this
+    // session takes its own identity back without the owner. A holder still in use keeps it, so two live servers do not
+    // trade the lease.
+    const sessionQuiet = o.now - (o.activity?.at ?? lease.claimed_at);
+    if (holderProvider !== providerPid && sessionQuiet >= SHARED_IDLE_MS)
+      return { claimable: true, state: "idle", reason: `held by an idle MCP server of this same ${lease.cli} session (pid ${lease.holder_pid}, no mbx activity for ${minutes(sessionQuiet)})`, takeover: "same-session" };
     if (providerPid !== undefined && holderProvider != null && holderProvider !== providerPid) {
       if (holderProviderAlive === false)
         return { claimable: true, state: "live", reason: `held by an older process of this same ${lease.cli} session`, takeover: "same-session" };
       if (holderProviderAlive === true)
-        return { claimable: false, state: "live", reason: `held by the live MCP server of this same ${lease.cli} session (pid ${lease.holder_pid}); its provider process is still running` };
+        return { claimable: false, state: "live", reason: `held by the live MCP server of this same ${lease.cli} session (pid ${lease.holder_pid}); its provider process is still running. It becomes claimable from this session after ${minutes(SHARED_IDLE_MS)} without mbx activity` };
     }
     if (providerPid !== undefined && holderProvider === providerPid)
       return { claimable: false, state: "live", coUse: true, reason: `held by the live MCP server of this same ${lease.cli} session (pid ${lease.holder_pid}, same provider process); `
