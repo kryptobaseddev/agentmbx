@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **Grok's status line starts no node on a refresh (T613).** Setup writes `sh` plus `skill/scripts/grok-statusline.sh` when the skill ships it, and keeps `agentmbx statusline grok` when it does not (the SEA binary). Both forms are ours: an older node form is upgraded once, a second install does not rewrite it, and uninstall removes only ours. The adapter prints that session's HUD line and nothing for an unknown session.
+- **The first turn after a full Hermes restart is no longer silent (T610).** Relaunched with `--resume`, Hermes starts a new mbx server that connects at once but claims the conversation's remembered identity only on the agent's first mbx tool call. The first turn's hook saw that live connector, took the session for already connected, and said nothing: no resume notice, no resuming line, no guidance. A live connector of this provider that holds no identity now counts as still resuming, so the turn carries `Resuming <name>: … Call mbx_whoami`, and the bounded resume notice (T189) follows on the first bound turn; a connector that holds an identity, or whose server or provider is gone, keeps the T503 path. Claude's `--resume` takes the same path.
 
 ## 0.5.29 (2026-10-13)
 

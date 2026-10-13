@@ -16,7 +16,8 @@ import { registerIdentity } from "../src/registry.ts";
 
 // The test process plays Claude: the MCP server and the hooks are its children, so their parent pid is process.pid.
 // `before` sets up what earlier sessions left in the store, before this Claude process starts.
-async function resumedClaude(t: TestContext, before?: (n: MbxNode) => void) {
+// `resumedStart` is what SessionStart says under the resumed id while the live server is still unbound (T610).
+async function resumedClaude(t: TestContext, before?: (n: MbxNode) => void, resumedStart: RegExp = /no mailbox identity yet/) {
   const home = mkdtempSync(join(tmpdir(), "mbx-resume-")), fakeHome = mkdtempSync(join(tmpdir(), "mbx-resume-home-"));
   const n = new MbxNode(home, { host: "alpha" });
   const client = new Client({ name: "resume-test", version: "1" });
@@ -39,7 +40,7 @@ async function resumedClaude(t: TestContext, before?: (n: MbxNode) => void) {
   assert.equal(((await client.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent: string | null }).agent, null);
   // Then it switches to the resumed conversation's id; the hooks see that id while the session is still unbound.
   write("resumed");
-  assert.match(hook("session-start", "resumed").stdout, /no mailbox identity yet/);
+  assert.match(hook("session-start", "resumed").stdout, resumedStart);
   assert.equal(hook("prompt", "resumed").status, 0);
   return { n, client, hook, status, write, remove };
 }
@@ -126,7 +127,9 @@ test("a crashed session's remembered name comes back once the server follows the
     n.bindSession({ agent: "orbit-dev", cli: "claude", session_id: "resumed", pid: dead, cwd: process.cwd() });
     n.store.db.prepare(`INSERT INTO identity_leases (name,token,holder_pid,holder_start,key_fp,cli,session_id,claimed_at,heartbeat_at,idle_ttl,released_at,release_reason)
       VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL)`).run("orbit-dev", "crashed", dead, "ps-utc:Thu Jan 1 00:00:00 2026", "0000-0000-0000-0000", "claude", "resumed", Date.now(), Date.now(), 1_800_000);
-  });
+  // T610: the resumed id remembers orbit-dev and this Claude's live server will reclaim it on its next call, so the start
+  // says Resuming rather than offering a claim or a new registration.
+  }, /^(?![\s\S]*no mailbox identity yet)[\s\S]*\[mbx\] Resuming orbit-dev@alpha: this session's mailbox server is still connecting\. Call mbx_whoami/);
   // The server started under the temporary id, which remembers nothing; the resumed id remembers orbit-dev.
   assert.equal(((await client.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent: string | null }).agent, "orbit-dev");
   assert.deepEqual(n.sessionsFor("orbit-dev").map(s => [s.session_id, s.pid]), [["resumed", process.pid]]);
