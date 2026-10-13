@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Grok's status line starts no node on a refresh (T613).** Setup writes `sh` plus `skill/scripts/grok-statusline.sh` when the skill ships it, and keeps `agentmbx statusline grok` when it does not (the SEA binary). Both forms are ours: an older node form is upgraded once, a second install does not rewrite it, and uninstall removes only ours. The adapter prints that session's HUD line and nothing for an unknown session.
+
 ## 0.5.29 (2026-10-13)
 
 A session takes its identity back from its own idle MCP server: after 10 minutes without mbx activity the session's current server claims it, and the owner's takeover can replace it, so a provider restart no longer locks an agent out of its inbox. The npm release job now waits for the registry tarball and can be re-run without publishing twice.

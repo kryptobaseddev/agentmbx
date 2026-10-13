@@ -64,7 +64,7 @@ test("T368: ours in an older recognized form warns with the upgrade fix", (t) =>
 });
 
 test("T368: ours pointing at a deleted bundled script warns with the skill fix", (t) => {
-  for (const cli of ["claude", "kimi"]) {
+  for (const cli of ["claude", "kimi", "grok"]) {
     const h = home();
     t.after(() => rmSync(h, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
     put(h, CONFIG[cli][0], CONFIG[cli][1]);

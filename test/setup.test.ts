@@ -12,7 +12,7 @@ import { insertMember, member, parseJsonc, removeMember, valueOf } from "../src/
 import { detectHost } from "../src/mcp.ts";
 import { MbxNode } from "../src/node.ts";
 import { grokSessionId } from "../src/proc.ts";
-import { mcpConfiguredCmd, mcpConfiguredTimeout, resolveCommand, runSetup, skillDest, statuslineState, type SetupCtx } from "../src/setup.ts";
+import { mcpConfiguredCmd, mcpConfiguredTimeout, resolveCommand, runSetup, skillDest, statuslineCommand, statuslineState, type SetupCtx } from "../src/setup.ts";
 
 const ORCA = "if [ -f \"$HOME/.orca/agent-hooks/hook.sh\" ]; then /bin/sh \"$HOME/.orca/agent-hooks/hook.sh\"; fi";
 const orcaGroups = (events: string[]) => Object.fromEntries(events.map((e) => [e, [{ hooks: [{ type: "command", command: ORCA, timeout: 10 }] }]]));
@@ -128,6 +128,8 @@ test("setup wires every CLI, backs files up, leaves other hook groups alone, and
   assert.match(readFileSync(join(skillDest(home), "SKILL.md"), "utf8"), /Ending a session and handing off its mailbox/);
   assert.equal(readFileSync(join(skillDest(home), "scripts/claude-statusline.sh"), "utf8"),
     readFileSync(join(import.meta.dirname, "../skill/scripts/claude-statusline.sh"), "utf8"));
+  assert.equal(readFileSync(join(skillDest(home), "scripts/grok-statusline.sh"), "utf8"),
+    readFileSync(join(import.meta.dirname, "../skill/scripts/grok-statusline.sh"), "utf8"));
   for (const d of [".claude/skills/agentmbx", ".codex/skills/agentmbx"]) assert.equal(readlinkSync(join(home, d)), skillDest(home));
 
   // Review major 5: the skill installs BEFORE the CLI edits, so the very first run already wires
@@ -530,7 +532,9 @@ test("T337: grok session detection, MCP and statusline wiring, never overwrites"
   const rows = runSetup(ctx, { mode: "install", stamp: "G1" });
   const cfg = rd(home, ".grok/config.toml");
   assert.match(cfg, /\[mcp_servers\.mbx\]\ncommand = "\/opt\/bin\/agentmbx"\nargs = \["mcp"\]\nenabled = true\nstartup_timeout_sec = 30/, "grok's own MCP schema");
-  assert.match(cfg, /\[ui\.status_line\]\ntype = "command"\ncommand = "\/opt\/bin\/agentmbx statusline grok"/, "the status line section");
+  const grokLine = JSON.stringify(statuslineCommand(home, "grok", ctx.cmd));
+  assert.match(cfg, new RegExp(`\\[ui\\.status_line\\]\\ntype = "command"\\ncommand = ${grokLine.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`), "the status line is the bundled sh adapter");
+  assert.match(grokLine, /grok-statusline\.sh/, "setup writes the sh adapter when the skill ships it");
   assert.ok(rows.some((r) => r.cli === "grok" && r.action === "added"));
   assert.equal(runSetup(ctx, { mode: "install", stamp: "G2" }).filter((r) => r.cli === "grok" && r.action !== "unchanged" && r.action !== "skipped").length, 0, "idempotent");
   runSetup(ctx, { mode: "uninstall", stamp: "G3" });
@@ -568,7 +572,7 @@ test("T337: grok session detection, MCP and statusline wiring, never overwrites"
   rmSync(home3, { recursive: true, force: true });
 
   // T536: a mise shim is ours but not current. setup rewrites it in place; doctor warns until then.
-  // any existing binary plus this install's entry is current for both, so neither rewrites nor warns.
+  // T613: that rewrite lands on the bundled sh adapter. A non-ours command stays put.
   {
     const entry = realpathSync(fileURLToPath(new URL("../bin/agentmbx.js", import.meta.url)));
     const node = process.execPath;
@@ -581,7 +585,8 @@ test("T337: grok session detection, MCP and statusline wiring, never overwrites"
     assert.equal(rows536.find((r) => r.cli === "grok" && r.item.includes("status_line"))?.action, "updated");
     const cfg536 = rd(h, ".grok/config.toml");
     assert.match(cfg536, /type = "command"\ncommand = /, "the rewrite keeps the newline before command");
-    assert.match(cfg536, new RegExp(JSON.stringify(`${node} ${entry} statusline grok`).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(cfg536, new RegExp(JSON.stringify(statuslineCommand(h, "grok", c.cmd)).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.doesNotMatch(cfg536, new RegExp(JSON.stringify(`${node} ${entry} statusline grok`).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "the node form is not current once the adapter ships");
     assert.match(cfg536, /refresh_interval = 15/, "the user's other key stays");
     assert.ok(!statuslineChecks(c, "grok").some((x) => /older AgentMBX form/.test(x.label)), "doctor is quiet once the command is current");
     writeFileSync(join(h, ".grok/config.toml"), `[ui.status_line]\ntype = "command"\ncommand = ${JSON.stringify(`/usr/bin/true ${entry} statusline grok`)}\n`);
