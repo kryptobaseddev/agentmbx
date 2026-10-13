@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.29 (2026-10-13)
+
+A session takes its identity back from its own idle MCP server: after 10 minutes without mbx activity the session's current server claims it, and the owner's takeover can replace it, so a provider restart no longer locks an agent out of its inbox. The npm release job now waits for the registry tarball and can be re-run without publishing twice.
+
 - **An agent takes its own identity back from a stuck server of its own session (T608).** When a provider restarts or reconnects mid-conversation (seen with `opencode serve` during the v0.5.28 install), it can leave an older MCP server of the same session alive and idle, still holding the lease. Every claim from the session's current server was refused ("held by the live MCP server of this same opencode session") while `identity list` already showed the identity as idle and claimable, and even the owner's `identity takeover --force` refused it as the caller's own MCP. Now, a same-session holder with no mbx activity for 10 minutes (the D039 stale threshold) is taken back by the session's own claim, with an `identity.takeover` audit row, and the owner takeover may replace it too. A holder still in use keeps its lease, so two live servers do not trade it, and a server under the same provider still co-uses it.
 
 ## 0.5.28 (2026-10-13)
