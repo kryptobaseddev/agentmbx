@@ -12,25 +12,29 @@ const invalidSession = (session: string) =>
   session.length > 300 || session !== session.trim() || !session || /[\u0000-\u001f\u007f-\u009f]/u.test(session) || session.startsWith("mcp-");
 
 /**
- * T573: a resumed provider process (`claude --resume`, Hermes /resume) runs its first hook before its own mbx server has
- * connected. When that process has never connected and the session's remembered identity is free for this same session,
- * the server reclaims it by itself (mcp.ts rememberedName / sessionHint), so the hook must not report the identity lost.
- * Database reads plus one inspection of the provider's own birth time; it never binds, claims or releases.
+ * T573/T614: a resumed provider process runs its first hook before its own mbx server has
+ * connected. When this thread has not connected in the current process and its remembered identity is free for it,
+ * the server reclaims it by itself (mcp.ts rememberedName / contextFor), so the hook must not report the identity lost.
+ * It reads stored bindings and process birth evidence; it never binds, claims or releases.
  */
 export function hookResumingNote(node: MbxNode, cli: string, session: string, providerPid: number): string | null {
-  if (!REBINDING_CLIS.includes(cli) || invalidSession(session)) return null;
+  if ((!REBINDING_CLIS.includes(cli) && cli !== "codex") || invalidSession(session)) return null;
+  if (cli === "codex" && !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(session)) return null;
   const name = node.store.get(`name:${cli}:${session}`);
   // An explicit release or takeover deletes this binding: nothing will be reclaimed.
   if (!name || !NAME_RE.test(name) || node.store.get(`identity-conflict:${name}`) !== undefined) return null;
   // A provider that already connected and lost its connector is disconnected (T503), not resuming. A row whose recorded
   // birth time differs belongs to an earlier process that had this pid; unknown evidence counts as connected.
   const start = procStart(providerPid);
-  const rows = node.store.db.prepare("SELECT pid_start FROM sessions WHERE cli=? AND pid=?").all(cli, providerPid);
+  const rows = node.store.db.prepare("SELECT pid_start,session_id FROM sessions WHERE cli=? AND pid=?").all(cli, providerPid)
+    .filter(r => cli !== "codex" || r.session_id === session);
   if (rows.some(r => typeof r.pid_start !== "string" || !start || r.pid_start === start)) return null;
   // A connector of this provider process that holds an identity is connected: T503 decides whether it is alive. T610: one that
   // is live but holds nothing yet (an MCP restarted with the provider claims the remembered identity on its first tool call)
   // is still resuming; a dead or reborn unbound connector is not, and the disconnected path reports it.
-  const controls = listIdentityControls(node.store).filter(d => d.cli === cli && d.parent_pid === providerPid);
+  // Codex shares a transport: only this thread or an unclaimed provisional transport can establish its startup state.
+  const controls = listIdentityControls(node.store).filter(d => d.cli === cli && d.parent_pid === providerPid
+    && (cli !== "codex" || d.session_id === session || (!d.agent && d.session_id.startsWith("mcp-"))));
   if (controls.some(d => d.agent)) return null;
   if (controls.length) {
     const evidence = inspectLeaseProcesses([providerPid, ...controls.map(d => d.mcp_pid)]);

@@ -3,6 +3,7 @@ import { sendLeased } from "./helpers/leased-send.ts";
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -13,6 +14,8 @@ import { createOwnerKey, unlockOwnerKey } from "../src/owner.ts";
 import { acceptSigned, makePolicy } from "../src/policy.ts";
 import { MbxNode } from "../src/node.ts";
 import { RESUME_NOTICE_MAX_CHARS, RESUME_NOTICE_MAX_LINES } from "../src/resume-notice.ts";
+import { identityControlKey, listIdentityControls } from "../src/identity-control.ts";
+import { bindWakeLease } from "./helpers/wake-lease.ts";
 
 const BIN = resolve("bin/agentmbx.js");
 const additional = (stdout: string): string => stdout
@@ -124,6 +127,65 @@ test("T186: an unbound or still-resuming Codex SessionStart records no entry; th
   assert.doesNotMatch(additional(first.stdout), /PRIVATE SUBJECT|SECRET BODY/);
   assert.equal(hinted(additional(run("prompt", { prompt: "again" }).stdout)), 0);
   assert.equal(entries(), 1);
+});
+
+test("T614: a restarted Codex thread says resuming before its first mailbox call, then delivers the bound notice once", async t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-codex-restart-")), n = new MbxNode(home, { host: "alpha" });
+  const old = spawn("sleep", ["600"], { stdio: "ignore" });
+  const client = new Client({ name: "codex-restart", version: "1" });
+  t.after(async () => { await client.close().catch(() => {}); old.kill("SIGKILL"); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const sid = "77777777-7777-4777-8777-777777777777";
+  const held = bindWakeLease(n, { agent: "builder", cli: "codex", session_id: sid, pid: old.pid! });
+  const key = n.sessionsFor("builder")[0].session_key!;
+  n.store.db.prepare("DELETE FROM kv WHERE k IN (?,?)").run(identityControlKey("codex", sid), `mcp-process:${key}`);
+  assert.equal(held.release(), true);
+  old.kill("SIGKILL"); await once(old, "exit");
+  sendLeased(n, { from: "sender", to: ["builder"], subject: "PRIVATE SUBJECT", body: "SECRET BODY", kind: "request" });
+  const run = (event: string) => {
+    const r = spawnSync(process.execPath, [BIN, "hook", event, "--cli", "codex"], {
+      input: JSON.stringify({ session_id: sid, cwd: process.cwd(), source: "resume", prompt: "continue" }), encoding: "utf8", timeout: 10_000,
+      env: { ...process.env, MBX_HOME: home, MBX_AGENT: "unrelated", AGENTMBX_DEV: "1" } });
+    assert.equal(r.status, 0, r.stderr);
+    return additional(r.stdout);
+  };
+  const entries = () => Number(n.store.db.prepare("SELECT COUNT(*) n FROM kv WHERE k LIKE 'resume-entry:codex:%'").get()!.n);
+  const state = () => JSON.stringify([
+    n.store.db.prepare("SELECT * FROM identity_leases ORDER BY name").all(),
+    n.store.db.prepare("SELECT msg_id,agent,state FROM deliveries ORDER BY msg_id").all(),
+    n.store.get("catchup:builder"),
+  ]);
+  const resuming = () => {
+    const before = state();
+    for (const event of ["session-start", "prompt"]) {
+      assert.equal(run(event), "[mbx] Resuming builder@alpha: this session's mailbox server is still connecting. Call mbx_whoami and wait for its result before claiming or registering.");
+      assert.equal(entries(), 0, "advisory delivery does not consume the entry");
+    }
+    assert.equal(state(), before, "no lease, delivery or catch-up position moved");
+  };
+  resuming(); // The provider restarted, before it even launches its mailbox server.
+  await client.connect(new StdioClientTransport({ command: process.execPath, args: [BIN, "mcp"],
+    env: { ...process.env, MBX_HOME: home, MBX_AGENT: "", MBX_CLI: "codex", AGENTMBX_DEV: "1" } as Record<string, string> }));
+  await client.listTools(); // SDK ready, no thread metadata yet: the startup marker no longer covers this state.
+  const controls = listIdentityControls(n.store).filter(d => d.cli === "codex" && d.parent_pid === process.pid);
+  assert.ok(controls.length > 0 && controls.every(d => !d.agent && d.session_id.startsWith("mcp-")));
+  resuming();
+
+  const who = (await client.callTool({ name: "mbx_whoami", arguments: {}, _meta: { threadId: sid } })).structuredContent as { agent: string; harness_session: string };
+  assert.equal(who.agent, "builder");
+  assert.equal(who.harness_session, sid);
+  assert.equal(entries(), 0, "the first tool call still leaves notice delivery to the hook");
+  const before = state(), bound = run("prompt");
+  assert.match(bound, /\[mbx\] You are builder@alpha\b/);
+  assert.equal(hinted(bound), 1);
+  assert.match(bound, /1 open thread\(s\) with unacked mail/);
+  assert.doesNotMatch(bound, /Resuming|mbx disconnected|no mailbox identity yet|PRIVATE SUBJECT|SECRET BODY/);
+  const notice = bound.split("\n").filter(l => /You are builder@alpha|not caught up on|open thread/.test(l)).join("\n");
+  assert.ok(notice.length <= RESUME_NOTICE_MAX_CHARS && notice.split("\n").length <= RESUME_NOTICE_MAX_LINES);
+  assert.equal(entries(), 1);
+  assert.doesNotMatch(run("prompt"), /You are builder@alpha|Resuming|not caught up on|PRIVATE SUBJECT|SECRET BODY/,
+    "the notice is once per entry; unread reminders can still repeat");
+  assert.equal(entries(), 1);
+  assert.equal(state(), before, "the notice changes no mailbox state");
 });
 
 test("T186: two Codex threads on one app-server each get only their own identity", async t => {
