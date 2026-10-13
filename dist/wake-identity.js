@@ -2,7 +2,7 @@
 import { canonical, fingerprint } from "./crypto.js";
 import { findIdentityControl, identityGeneration } from "./identity-control.js";
 import { IdentityLeases, inspectLeaseProcesses } from "./identity-leases.js";
-import { procTable, withProcSnapshot } from "./proc.js";
+import { procTable, residentStartOf, withProcSnapshot } from "./proc.js";
 const refused = () => Object.assign(new Error("wake identity lease or binding changed"), { code: "WAKE_IDENTITY_LOST" });
 const binding = (s) => canonical([s.agent, s.cli, s.session_id, s.pid, s.pid_start, s.session_key, s.channel]);
 /** Capture once, then recheck before adapter submission and after asynchronous work. Never follows a successor. */
@@ -21,8 +21,10 @@ export function captureWakeIdentity(node, session) {
             if (operation.constructor.name === "AsyncFunction")
                 throw refused();
             return withProcSnapshot(() => {
-                // sameSession below runs inside the lease write. Read the table before either lock (T591).
-                procTable();
+                // sameSession below runs inside the lease write. Read the table before either lock when this
+                // process or its parent is not already remembered (T591). A remembered birth does not spawn.
+                if (residentStartOf(descriptor.parent_pid) == null || residentStartOf(descriptor.mcp_pid) == null)
+                    procTable();
                 const evidence = inspectLeaseProcesses([descriptor.parent_pid, descriptor.mcp_pid]);
                 const parent = evidence.get(descriptor.parent_pid) ?? { alive: null, start: null }, child = evidence.get(descriptor.mcp_pid) ?? { alive: null, start: null };
                 // Freshness is measured from after the evidence was taken; slow collection under load must not fence a valid wake.

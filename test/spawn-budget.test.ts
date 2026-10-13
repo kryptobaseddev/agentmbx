@@ -1,6 +1,5 @@
-// T341: process-spawn budget. A steady-state tool call starts no agentmbx process: the resident MCP spawns nothing but its
-// 2 s-cached macOS process table (none on Linux), an idle `agentmbx watch` spawns nothing, and the OpenCode plugin's
-// post-tool hook starts no node while nothing changed.
+// T341 / T591 AC3: process-spawn budget. After warm-up a steady-state tool call starts nothing, including no macOS
+// ps. An idle `agentmbx watch` spawns nothing, and the OpenCode plugin's post-tool hook starts no node while nothing changed.
 // Claude's post-tool wrapper is guarded with node absent from PATH in hooks.test.ts (T342).
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
@@ -66,17 +65,8 @@ for (const cli of ["claude", "kimi"]) test(`T341 ${cli}: steady-state MCP tool c
   }
   const steady = traces(log).slice(warm.length);
   t.diagnostic(`T341 ${cli} steady-state spawns over 18 calls: ${steady.length} ${JSON.stringify(steady.map(s => `${s.file} ${s.argv.join(" ")}`))}`);
-  // No agentmbx/node process and nothing but the process tables. On macOS each table is one cached `ps -A` (proc.ts:
-  // procTable 2 s, psEvidenceTable 1 s); Linux reads /proc and spawns nothing. A table read again inside its cache
-  // window, or any other spawn, is a regression toward a spawn per tool call.
-  const windowMs: Record<string, number> = { "-A -o pid=,ppid=,lstart=": 2_000, "-A -o pid=,stat=,lstart=": 1_000 };
-  const other = steady.filter(s => s.file !== "ps" || !(s.argv.join(" ") in windowMs));
-  assert.deepEqual(other, [], `steady-state tool calls started a process other than the cached ps table: ${JSON.stringify(other)}`);
-  if (process.platform !== "darwin") assert.deepEqual(steady, [], "Linux reads /proc: no spawn at all");
-  const byKind = new Map<string, number[]>();
-  for (const s of steady) byKind.set(s.argv.join(" "), [...(byKind.get(s.argv.join(" ")) ?? []), s.at]);
-  for (const [kind, at] of byKind) for (let i = 1; i < at.length; i++)
-    assert.ok(at[i] - at[i - 1] >= windowMs[kind] * 0.95, `ps ${kind} ran twice within its ${windowMs[kind]} ms cache window: ${at[i] - at[i - 1]} ms`);
+  // T591 AC3: warm-up may spawn. After it, macOS and Linux both stay at zero. A ps here is a regression.
+  assert.deepEqual(steady, [], `steady-state tool calls spawned a process: ${JSON.stringify(steady)}`);
 });
 
 test("T341 an idle agentmbx watch starts no process after startup", { timeout: 120_000 }, async t => {

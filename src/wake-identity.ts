@@ -2,7 +2,7 @@
 import { canonical, fingerprint } from "./crypto.ts";
 import { findIdentityControl, identityGeneration } from "./identity-control.ts";
 import { IdentityLeases, inspectLeaseProcesses, type IdentityLease } from "./identity-leases.ts";
-import { procTable, withProcSnapshot } from "./proc.ts";
+import { procTable, residentStartOf, withProcSnapshot } from "./proc.ts";
 import type { MbxNode } from "./node.ts";
 
 type WakeSession = ReturnType<MbxNode["sessionsFor"]>[number];
@@ -23,8 +23,9 @@ export function captureWakeIdentity(node: MbxNode, session: WakeSession) {
     const run = <T>(operation: () => T, readOnly = true): T => {
       if (operation.constructor.name === "AsyncFunction") throw refused();
       return withProcSnapshot(() => {
-      // sameSession below runs inside the lease write. Read the table before either lock (T591).
-      procTable();
+      // sameSession below runs inside the lease write. Read the table before either lock when this
+      // process or its parent is not already remembered (T591). A remembered birth does not spawn.
+      if (residentStartOf(descriptor.parent_pid) == null || residentStartOf(descriptor.mcp_pid) == null) procTable();
       const evidence = inspectLeaseProcesses([descriptor.parent_pid, descriptor.mcp_pid]);
       const parent = evidence.get(descriptor.parent_pid) ?? { alive: null, start: null }, child = evidence.get(descriptor.mcp_pid) ?? { alive: null, start: null };
       // Freshness is measured from after the evidence was taken; slow collection under load must not fence a valid wake.

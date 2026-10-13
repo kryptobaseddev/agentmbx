@@ -78,6 +78,8 @@ function inspectSelf() {
         selfEvidenceCache = value;
     return value;
 }
+/** While `pid` is still `process.ppid` it has not been reused. One settled birth answers later checks; a dead or unknown parent is not pinned. */
+let parentEvidenceCache = null;
 /**
  * Evidence for every requested pid from one inventory read: /proc on Linux, otherwise one full `ps -A` table filtered here
  * (T332; never `ps -p <list>`, which takes 0.3-0.7 s on macOS). Liveness is probed now; start times come from the table.
@@ -127,6 +129,10 @@ export function inspectLeaseProcesses(pids) {
             out.set(pid, inspectSelf());
             continue;
         }
+        if (pid === process.ppid && parentEvidenceCache?.pid === pid) {
+            out.set(pid, parentEvidenceCache.value);
+            continue;
+        }
         const cached = evidenceCache.get(pid);
         if (cached && now - cached.at <= EVIDENCE_CACHE_MS)
             out.set(pid, cached.value);
@@ -142,6 +148,8 @@ export function inspectLeaseProcesses(pids) {
                 evidenceCache.set(pid, { value, at });
             else
                 evidenceCache.delete(pid);
+            if (pid === process.ppid && value.alive === true && value.start)
+                parentEvidenceCache = { pid, value };
             out.set(pid, value);
         }
     }
@@ -150,7 +158,7 @@ export function inspectLeaseProcesses(pids) {
             evidenceCache.delete(pid);
     return out;
 }
-export const _resetEvidenceCacheForTests = () => { evidenceCache.clear(); selfEvidenceCache = null; _resetPsEvidenceCache(); };
+export const _resetEvidenceCacheForTests = () => { evidenceCache.clear(); selfEvidenceCache = null; parentEvidenceCache = null; _resetPsEvidenceCache(); };
 // ---- T507: sweep rows of processes that died before running their cleanup ---------------------
 /** Positive-death verdict shared by the stale-row sweeps: ESRCH, or a live pid whose birth time
  *  differs from the recorded one. Starts may be recorded in either format (mcp-process rows carry
