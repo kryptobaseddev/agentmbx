@@ -7,7 +7,7 @@ import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import { hookDisconnectedNote, hookResumingNote } from "../src/hook-connection.ts";
 import { findIdentityControl, identityControlKey, publishIdentityControl } from "../src/identity-control.ts";
-import { _resetEvidenceCacheForTests } from "../src/identity-leases.ts";
+import { _resetEvidenceCacheForTests, inspectLeaseProcess } from "../src/identity-leases.ts";
 import { MbxNode } from "../src/node.ts";
 import { _resetProcCache, procSeams, procStart } from "../src/proc.ts";
 import { sessionHintKey } from "../src/registry.ts";
@@ -203,7 +203,17 @@ test("T573 an identity that will not come back keeps the disconnected and unboun
   f.node.store.db.prepare("UPDATE sessions SET pid=? WHERE session_id=?").run(2147483647, f.sid);
   assert.equal(f.note(), RESUMING);
   publishIdentityControl(f.node.store, { ...f.descriptor, parent_pid: process.pid });
-  assert.equal(f.note(), null, "a connector of this provider process exists: T503 decides whether it is alive");
+  assert.equal(f.note(), null, "a connector of this provider process holds an identity: T503 decides whether it is alive");
+  // T610: a live connector of this provider that holds nothing yet (a restarted server claims on its first tool call) is resuming.
+  const self = inspectLeaseProcess(process.pid).start!;
+  publishIdentityControl(f.node.store, { ...f.descriptor, parent_pid: process.pid, parent_start: self, mcp_pid: process.pid, mcp_start: self, agent: "", generation: null });
+  assert.equal(f.note(), RESUMING, "connected but not yet claimed");
+  publishIdentityControl(f.node.store, { ...f.descriptor, parent_pid: process.pid, parent_start: self, mcp_pid: process.pid, mcp_start: self, agent: "builder" });
+  assert.equal(f.note(), null, "a live connector that holds an identity is connected, not resuming");
+  publishIdentityControl(f.node.store, { ...f.descriptor, parent_pid: process.pid, parent_start: self, mcp_pid: 2147483647, agent: "", generation: null });
+  assert.equal(f.note(), null, "an unbound connector whose server is gone is not resuming");
+  publishIdentityControl(f.node.store, { ...f.descriptor, parent_pid: process.pid, parent_start: "ps-utc:Sun Jan 1 00:00:00 1995", mcp_pid: process.pid, mcp_start: self, agent: "", generation: null });
+  assert.equal(f.note(), null, "nor one left by an earlier process that had this provider's pid");
   f.node.store.db.prepare("DELETE FROM kv WHERE k=?").run(identityControlKey("claude", f.sid));
   assert.equal(f.note(), RESUMING);
   for (const invalid of ["", " bad", "bad\nline", "mcp-provisional", "x".repeat(301)]) {
