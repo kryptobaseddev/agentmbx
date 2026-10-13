@@ -125,6 +125,8 @@ jobs:
       - name: npm publish
         run: |
           tag=latest; case "$GITHUB_REF_NAME" in *-*) tag=next ;; esac
+          # A re-run after a failed smoke check must not try to publish the same version again.
+          if npm view "agentmbx@${GITHUB_REF_NAME#v}" version >/dev/null 2>&1; then echo "already published"; exit 0; fi
           npm publish --provenance --access public --tag "$tag"
       - name: Install the published package and run it
         # Accepted is not yet visible: poll the registry, never re-publish (a version cannot be published twice).
@@ -132,6 +134,9 @@ jobs:
           v="${GITHUB_REF_NAME#v}"
           for i in $(seq 1 30); do npm view "agentmbx@$v" version >/dev/null 2>&1 && break; sleep 10; done
           npm view "agentmbx@$v" version dist.integrity
+          # The tarball reaches the CDN minutes after the metadata (v0.5.28: 404 for over 5 minutes).
+          url="$(npm view "agentmbx@$v" dist.tarball)"
+          for i in $(seq 1 90); do curl -sfI "$url" >/dev/null && break; sleep 20; done
           home="$(mktemp -d)"; prefix="$(mktemp -d)"
           HOME="$home" npm install -g --prefix "$prefix" "agentmbx@$v"
           HOME="$home" "$prefix/bin/agentmbx" --version | grep -F "agentmbx $v"
