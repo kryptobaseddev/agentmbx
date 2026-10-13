@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **`agentmbx doctor` reports a Kimi session whose process runs no hooks (T611).** A plain-terminal or app-restart-resumed kimi-code process may dispatch none of its configured hooks (Orca/desktop-pane sessions do), and Kimi fails hook errors open, so the session silently loses its unread line, the resume notice and Stop-hook continuation while the wiring rows stay green. A new warning names each affected live bound session (no `resume-entry`/`human-prompt` evidence since that process started, past a grace period); mail still arrives through `mbx_whoami`/MCP and the watcher. Documented in `docs/spec/automatic-resume-verification.md` and the upstream ask `docs/research/kimi-wake-channel-upstream.md`.
+
 ## 0.5.29 (2026-10-13)
 
 A session takes its identity back from its own idle MCP server: after 10 minutes without mbx activity the session's current server claims it, and the owner's takeover can replace it, so a provider restart no longer locks an agent out of its inbox. The npm release job now waits for the registry tarball and can be re-run without publishing twice.
