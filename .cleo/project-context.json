@@ -36,11 +36,6 @@
   "release": {
     "prRequiredWorkflows": [
       {
-        "name": "test (macos-14)",
-        "app": "github-actions",
-        "workflow": ".github/workflows/ci.yml"
-      },
-      {
         "name": "test (ubuntu-24.04)",
         "app": "github-actions",
         "workflow": ".github/workflows/ci.yml"

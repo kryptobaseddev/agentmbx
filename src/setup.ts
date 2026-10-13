@@ -152,8 +152,8 @@ export function hookNamesInstalledEntry(command: string, sub: string, cli: strin
 // removes only what setup wrote. "Ours" is an EXACT match against a command setup itself writes
 // (review blocker: the absolute script-path form or the shJoin(cmd) form — nothing else).
 export const statuslineCommand = (home: string, cli: "claude" | "kimi" | "grok", cmd: string[]): string => {
-  if (cli === "grok") return `${shJoin(cmd)} statusline grok`; // no bundled grok adapter: the direct form
-  // The bundled pure-sh adapter when the skill ships it (SEA bundles SKILL.md only: the node adapter)
+  // The bundled pure-sh adapter when the skill ships it (SEA bundles SKILL.md only: the node form).
+  // Grok uses the same rule (T613): sh plus grok-statusline.sh when present, otherwise the node form.
   const script = join(skillDest(home), "scripts", `${cli}-statusline.sh`);
   return existsSync(script) ? `sh ${shJoin([script])}` : `${shJoin(cmd)} statusline ${cli}`;
 };
@@ -167,6 +167,11 @@ export const statuslineForms = (home: string, cli: "claude" | "kimi" | "grok", c
  *  plus this install's entry (the T533 matcher). A mise shim or bare `agentmbx` is ours but not
  *  current, so setup rewrites it and doctor warns — the two never disagree. */
 export function statuslineCurrent(home: string, cli: "claude" | "kimi" | "grok", cmd: string[], command: string): boolean {
+  // T613: once the skill ships the grok adapter, only that exact sh command is current. The node
+  // form stays in statuslineForms, so it is still ours (setup upgrades it once; uninstall removes
+  // it) and doctor warns until the upgrade. No script (SEA) keeps today's node-form fallback.
+  const grokScript = join(skillDest(home), "scripts", "grok-statusline.sh");
+  if (cli === "grok" && existsSync(grokScript)) return command === `sh ${shJoin([grokScript])}`;
   if (statuslineForms(home, cli, cmd).has(command)) return true;
   const tail = ` statusline ${cli}`;
   if (!command.endsWith(tail)) return false;
@@ -387,10 +392,9 @@ const grokStatus = (cur: string): GrokStatus => {
   return { form: "section", body, commandLine };
 };
 const grokCommandValue = (body: string): string | null => tomlStringValue(body, "command");
-const grokStatusCommand = (cmd: string[]) => `${shJoin(cmd)} statusline grok`;
 
 function grokStatusLine(home: string, cmd: string[]) {
-  const want = () => grokStatusCommand(cmd);
+  const want = () => statuslineCommand(home, "grok", cmd);
   const lineText = (key: string, w: string) => `${key} = ${JSON.stringify(w)}\n`; // valid TOML basic string (review: escaping)
   const sectionText = (w: string) => `[ui.status_line]\n${lineText("type", "command")}${lineText("command", w)}`;
   return {

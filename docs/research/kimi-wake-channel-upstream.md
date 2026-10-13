@@ -51,6 +51,20 @@ The `[status_line]` custom command (stdin JSON → first stdout line renders) is
 minimal integration point, and `kimi web`'s `POST /api/v1/sessions/{id}/prompts` shows the
 outside→in direction already exists for one surface; this asks for the terminal equivalent.
 
+## Related upstream observation (T611, 2026-10-13)
+
+Separate from the wake-channel ask, and worth reporting alongside it: on this host, a **plain
+terminal** kimi-code process resumed after an app restart dispatched **none** of its configured
+hooks — 12 minutes of process sampling across a definite turn boundary (a turn end must fire
+`Stop`; a new user message must fire `UserPromptSubmit`) caught zero hook spawns, while
+Orca/desktop-pane kimi sessions on the same host fired the same shared config normally. Because
+Kimi fails hook errors open, the session was silently hook-less: no `UserPromptSubmit` context, no
+`Stop` continuation, nothing in any log. AgentMBX now detects and warns on this state (`kimiHookEvidence`,
+doctor), but the harness fix belongs to Kimi: either the terminal/resume launch path should load
+and dispatch configured hooks like the Orca-pane path, or a hook engine failure should be visible
+somewhere. Suggested repro: configure any `[[hooks]]` entry, start a terminal session via an
+app-restart resume, submit a message, and observe the hook never spawns.
+
 ---
 
 *Drafted by the AgentMBX maintainers, 2026-10. Happy to spec the wire format or test an early build.*

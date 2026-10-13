@@ -1,9 +1,11 @@
 // `agentmbx doctor`: one checklist that says what works, what doesn't, and the one command that fixes it.
 import { rotationLog } from "./key-rotation.ts";
+import { procStartEpochMs } from "./proc.ts";
 import { accessSync, closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { projectLabel, projectMailboxBySlot } from "./project-mailbox.ts";
 import { escalatedCount, phantomMailboxes, returnDays } from "./stranded.ts";
 import { delimiter, dirname, join } from "node:path";
+import { homedir } from "node:os";
 import { fingerprint } from "./crypto.ts";
 import { signHop } from "./http.ts";
 import { relayState, ROLLBACK_REASON } from "./relay-v2.ts";
@@ -183,6 +185,34 @@ export function kimiServerHooks(home: string, kimiHome = process.env.KIMI_CODE_H
   return kimiInstances(kimiHome).filter(i => typeof i.pid === "number" && typeof i.started_at === "number" && i.started_at < wiredAt && kimiHostedServer(i.pid, kimiHome) !== null)
     .map(i => ({ level: "warn" as Level, label: `kimi web server pid ${i.pid} (port ${i.port}) started before its AgentMBX hooks were last written: its sessions get no mbx hooks`,
       fix: "restart that kimi web server (stop it, then run kimi web again)" }));
+}
+
+/** T611: a live bound Kimi session whose process is past the grace period with no hook evidence recorded
+ *  (no per-process resume-entry key, no human-prompt at/after the process start) is silently hook-less:
+ *  no unread notices, no resume notice, no Stop continuation. Plain-terminal or app-restart-resumed
+ *  kimi-code processes may not dispatch configured hooks at all (Orca/desktop-pane sessions do), and
+ *  Kimi fails hook errors open, so nothing surfaces. Read-only advisory; mail still reaches the agent
+ *  through the MCP fallback and the watcher wake path. */
+export function kimiHookEvidence(node: MbxNode, kimiHome = process.env.KIMI_CODE_HOME || join(homedir(), ".kimi-code"), now = Date.now()): Check[] {
+  // setup writes the resolved bin path (…/agentmbx.js hook …), so match the name, not the literal "agentmbx hook".
+  try { if (!/agentmbx(\.js)? hook/.test(readFileSync(join(kimiHome, "config.toml"), "utf8"))) return []; } catch { return []; }
+  const GRACE_MS = 10 * 60_000;
+  const rows = node.store.db.prepare("SELECT pid, pid_start, updated_at, session_id, agent FROM sessions WHERE cli='kimi' AND session_id NOT GLOB 'mcp-*'").all() as
+    { pid: number | null; pid_start: string | null; updated_at: string; session_id: string; agent: string }[];
+  const seen = new Set<number>(), out: Check[] = [];
+  for (const r of rows) {
+    if (!r.pid || seen.has(r.pid) || !node.sameSession(r.pid, r, { proof: true })) continue;
+    seen.add(r.pid);
+    const start = procStartEpochMs(r.pid);
+    if (start === null || now - start < GRACE_MS) continue; // young or unverifiable process: not yet diagnosable
+    if (node.store.get(`resume-entry:kimi:${r.pid}`)) continue; // a prompt hook ran under this very process
+    const humanAt = Date.parse(node.store.get(`human-prompt:${r.agent}`) ?? "");
+    if (Number.isFinite(humanAt) && humanAt >= start) continue;
+    out.push({ level: "warn" as Level,
+      label: `kimi session ${r.session_id} (pid ${r.pid}, ${r.agent}): no hook evidence since this process started ${new Date(start).toISOString().slice(0, 16).replace("T", " ")}Z — its configured mbx hooks may not be dispatching (terminal or app-restart-resumed Kimi sessions can silently run none); mail still arrives via mbx_whoami/MCP and the watcher`,
+      fix: "restart the session from a Kimi desktop/Orca pane, or report to Kimi that this launch path does not dispatch configured hooks" });
+  }
+  return out;
 }
 
 const STRANDED_MAX = 10;
@@ -732,6 +762,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
   if (node) {
     for (const d of detect(ctx).filter((d) => d.found)) out.push(sessionReadiness(node, d.cli));
     for (const c of kimiServerHooks(ctx.home)) out.push(c);
+    for (const c of kimiHookEvidence(node)) out.push(c);
   }
 
   const sk = skillStatus(ctx.home);
