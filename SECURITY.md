@@ -30,6 +30,10 @@ The trust boundaries are in [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) and [do
 
 A way around any of these documented protections is in scope: signatures, body sealing, key pinning, owner grants, identity leases, wake limits, or the rule that message content never changes permissions.
 
+## Audit status
+
+[Current audit and remediation status](docs/security-status.md) consolidates historical findings, shipped fixes, accepted risks and remaining work. It separates published npm code, merged changes and cloud deployment evidence; it is not a new penetration test. The [roadmap](docs/plan/native-feature-roadmap.md) tracks implementation and live acceptance gates.
+
 ## Supported versions
 
-Fixes go into the latest release. Upgrade with the AgentMBX updater or a fresh install; older versions do not receive backports.
+Fixes go into the release selected by the npm `agentmbx@latest` dist-tag. Use [the install guide](docs/INSTALL.md) to install or update from the published npm package; repository versions and GitHub tags may be ahead of that artifact. Older versions do not receive backports.

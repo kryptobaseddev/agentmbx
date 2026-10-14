@@ -1,6 +1,6 @@
 # Collaboration policy, YOLO mode, and owner identity
 
-Status: implemented under CLEO epic T040 (tasks T048, T051–T054), with uncapped acting grants and optional permanent expiry (T537) and the signed outward class split (T498). The original design merged:
+Status: implemented under CLEO epic T040 (tasks T048, T051–T054), with uncapped acting grants and optional permanent expiry (T537) and the signed outward class split (T498). This maintained reference was checked against published npm 0.5.32 (`64ee20ebb1dd97b64be7dd122a11a5a5ce5eacbf`) on 2026-10-14. Runtime policy classes, scopes, and expiry come from signed records, not from this prose. Section 7 distinguishes current account/device components from proposed owner-authenticator and member contracts. The original design merged:
 - Keaton's request: agents should collaborate across sessions and machines without per-message approval, including an opt-in "true YOLO" mode;
 - the reviews from master-dev-setup and codex (2026-09-26): use action classes, default to `ask`, require human presence that an agent can't fake, record provenance, and add a kill switch.
 
@@ -35,9 +35,9 @@ Replying, reading and acking mail need no class. They're always allowed, even un
 | `autonomous` | read, edit, outward-reversible | none until done; full `outward` goes to the owner as a `decision` and dependent work pauses | long unattended runs |
 | `yolo` | read, edit, outward-reversible, outward, permissions | none | "get out of the way": the owner accepts all the risk |
 
-These presets apply when signing a new policy. Existing signed policies keep their exact class lists, scopes and expiry; a previously signed `read,edit` policy does not gain `outward-reversible`. Full `outward` remains broader authority and covers branch pushes and draft PRs even when that older signed record does not name the new class. Clients must upgrade to understand policies containing the new class; older clients reject unknown classes.
+These presets apply when signing a new policy without an explicit class list. Valid explicit signed classes can narrow or otherwise differ from the preset; `permissions` still requires `yolo`. A level name alone doesn't add a class absent from the signed record. Existing signed policies keep their exact class lists, scopes and expiry; a previously signed `read,edit` policy does not gain `outward-reversible`. Full `outward` remains broader authority and covers branch pushes and draft PRs even when that older signed record does not name the new class. Clients must upgrade to understand policies containing the new class; older clients reject unknown classes.
 
-An owner can also set classes directly: `--classes read,edit,outward-reversible`. Other branch pushes, non-draft PRs, merge, release, deploy, delete, secrets and spend still need full `outward`. The new class grants signed delegation only; it does not approve the CLI's permission prompts. Provider-hook approval for these two operations is tracked separately in T539.
+An owner can also set classes directly: `--classes read,edit,outward-reversible`. Other branch pushes, non-draft PRs, merge, release, deploy, delete, secrets and spend still need full `outward`. The class supplies signed delegation; a message itself doesn't approve a CLI permission prompt. T539's published provider hooks can approve only the two bounded operations in §5 after exact-session, lease, policy, persisted-taint, and Git/gh preflight checks. Providers without that narrow adapter keep their normal prompts.
 
 ## 3. The policy record
 
@@ -59,8 +59,16 @@ It is stored with `owner_sig`.
 - An explicit expiry field is required:
   - Finite `ask`, `collaborate` and `autonomous` policies default to 7 days, 30 days at most.
   - Finite `yolo` policies default to 8 hours, 7 days at most.
-  - `--ttl never` signs `exp: null`, valid until revoked, for any level. It never means an omitted, empty or malformed expiry.
+  - **Current npm 0.5.32:** `--ttl never` signs `exp: null`, valid until revoked, at all actual CLI levels: `ask`, `collaborate`, `autonomous`, and `yolo`. It never means an omitted, empty, or malformed expiry. `read` is an action class, not a policy level.
   - An expired or unverifiable policy fails closed to `ask`.
+
+**Accepted change, not shipped (D045; T639 pending).** The owner decided to refuse
+`--ttl never` for YOLO while keeping nonexpiring non-YOLO policies available.
+Finite YOLO policies retain their existing default and maximum. Doctor will report
+existing nonexpiring YOLO with a re-sign command, without revoking it. Until T639
+is implemented and published, 0.5.32 still accepts YOLO `never`; the decided refusal
+and doctor finding mustn't be treated as current enforcement.
+
 - **Resolution.** For a message from `S@H` to agent `A` on this host, take every unrevoked, unexpired policy that matches `A` and `S@H`. Each policy's classes apply only within that policy's own projects, so scopes never mix across policies. The header lists each grant separately.
 - **Owner on other machines.** A machine takes policies only from its own owner key, or from the owner key that signed a *device record* for it. You create that record on your owner machine with `agentmbx owner add-device <host>`, which needs one Touch ID / passphrase approval.
   - The record names the host and its host key.
@@ -82,9 +90,11 @@ Rapid automated loops are reported separately, without removing acting grants or
 
 `meta.origin` and `meta.hop` are signed envelope fields:
 - `mbx_send` gets `origin` (`agent` by default, or `external`).
-- `hop` is the parent's hop + 1 when a session sends while handling a message (the MCP server tracks the last read message).
+- `hop` is one more than the deepest still-live read exposure from an agent other than the send's recipients; it is zero when no such exposure remains. The MCP server tracks bounded exposure history, not only the last message.
 
-External taint (T344). A session that read external content sends everything as `origin: "external"` for one hour after its **root exposure**, whatever `origin` it passes (an explicit `agent` is overridden, and said so). The owner typing a prompt resets relay depth, never this. External mail carries two more signed fields:
+External taint (T344–T346) tracks marked external mail observed by AgentMBX read/reply paths. It doesn't automatically observe arbitrary browser, tool, or file reads outside those paths; declare `origin: "external"` when relaying that content. The live root and captured relay-depth history are persisted under the exact provider/session key in the mailbox KV store and restored across MCP restart and identity release/claim. Restart doesn't clear outside origin; the current root exposure still expires after one hour. D044's owner-cleared/isolated-task trust design is future implementation, not current behavior.
+
+A session that read external content sends everything as `origin: "external"` for one hour after its **root exposure**, regardless of an attempted `origin` override (MCP retains external origin; CLI `--origin agent` is refused while its conversation is tainted). The owner typing a prompt resets relay depth, never this. External mail carries two more signed fields:
 - `meta.external_since`: the root exposure time (ISO). For a send the sender marked external itself it is the send time. For a send that is external only because its session read external content earlier, it is the time that first-hand content was read.
 - `meta.external_source`: `declared` or `inherited`.
 
@@ -109,7 +119,7 @@ Agents are told why at each step:
 
 The daemon, not the sender, writes one extra header line on every delivered message:
 
-```
+```text
 policy: collaborate [read, edit, outward-reversible] · owner-signed 01J… · expires 2026-10-03 · projects: ~/projects/agentmbx
 policy: ask (no owner policy covers this sender)
 policy: yolo [read, edit, outward-reversible, outward, permissions] · owner-signed · expires 20:00
@@ -162,14 +172,14 @@ While a YOLO policy is active, the status line and `mbx_whoami` show it, and the
 
 The owner can let a project's lead stand behind the narrow `outward-reversible` class for named members, so a team can self-organise without the owner approving every branch push. The owner still signs: a grant is a second owner-signed record stored on the lead's row (`agentmbx lead grant <agent[,agent]|*> --project <dir> [--classes outward-reversible] [--ttl 7d]`, or `lead set <agent> --project <dir> --classes outward-reversible --to <agent[,agent]|*>` to sign the lead record and its grants together). It is a separate blob, not a key inside the lead record, so a runtime that predates it keeps the lead and simply enforces nothing extra.
 
-What can be delegated: **`outward-reversible`, `read` and `edit`**. `outward` and `permissions` are never delegated. `read` and `edit` are enforced on the policy line, and only a fresh signature lists them: a stored outward-reversible-only blob stays exactly that class. The permission hook still answers only `outward-reversible`. A message from the live, untainted lead of a project the recipient belongs to carries `policy: lead-delegated [<classes>] in <project folder> · lead-record <last 6 of the lead record> · grant <last 6 of the grant> · expires <YYYY-MM-DD HH:MMZ> · relay depth <n> (no limit for lead-delegated)`, and relay depth does not drop that segment. An external origin keeps `read` and drops every other class on the segment. An unverified sender, a lead who is tainted, killed or past its heartbeat, a recipient who is not a member, and the lead writing to themselves show no segment.
+What can be delegated: **`outward-reversible`, `read` and `edit`**. `outward` and `permissions` are never delegated. `read` and `edit` are enforced on the policy line, and only a fresh signature lists them: a stored outward-reversible-only blob stays exactly that class. The permission hook still answers only `outward-reversible`. A message from the live, untainted lead of a project the recipient belongs to carries `policy: lead-delegated [<classes>] in <project folder> · lead-record <last 6 of the lead record> · grant <last 6 of the grant> · expires <YYYY-MM-DD HH:MMZ> · relay depth <n> (no limit for lead-delegated)`, and relay depth does not drop that segment. An external origin keeps `read` and drops every other class on the segment. An unverified sender, a lead who is tainted, released, or past its heartbeat, a recipient who is not a member, and the lead writing to themselves show no segment.
 
 The branch-push and draft-PR hook asks the owner's policies first. Only when they do not cover the class does it ask for a lead grant, which applies when **all** of these hold, each re-verified at the moment of the request from the database alone:
 
 - the persona is an explicit member of the project (a session that merely sits in the folder is not one) and the grant names it, or names `*`, which the owner sees spelled out in the text they sign; the lead is never its own grantee;
 - the session's folder is in the lead's project, by folder or by the shared CLEO project id, and the lead was designated on this host;
 - the lead record is unexpired and unrevoked, and the grants are owner-signed for that very record, within the 30-day cap and never past the record's expiry;
-- the lead is live (an unreleased lease with a fresh heartbeat) and **every conversation the store knows for the lead is untainted**. External-origin content in any of them suspends the grant from that moment until the exposure's hour has passed, and an unreadable taint record suspends it too;
+- the lead's database lease is unreleased with a fresh heartbeat, and **every conversation the store knows for the lead is untainted**. This lead-liveness test doesn't inspect the process: a killed lead can retain grant eligibility until its heartbeat ages out; the persona-side process/birth checks are separate. External-origin content in any of them suspends the grant from that moment until the exposure's hour has passed, and an unreadable taint record suspends it too;
 - no `policy revoke --all` has been signed since the grants were issued.
 
 Every persona-side check in this section still applies unchanged: the exact session binding, the persona's own persisted taint, the bounded command parser and the Git preflight. A grant never widens what the hook approves; it only supplies the owner-equivalent authority for that one class.
@@ -193,13 +203,13 @@ Audit: `lead.grants_set` when the owner stores grants; `lead.grant_used` once pe
 
 ## 7. Accounts and devices
 
-- **Principal** = an owner key. Nothing else identifies a human to a daemon. The daemon and the CLI never store an email address or a passphrase, and never consult an account.
-- **Cloud accounts (optional).** AgentMBX Cloud has accounts (email with a passkey, or GitHub) for login, billing and cloud access only. An account links an owner public key with an owner-signed `account-link` record `{account_id, owner_pub, origin, challenge, iat}`, the way a Git host links an SSH key, and unlinks it with an owner-signed `account-unlink` record. An account, an account or organization role, or a plan never grants an agent anything and is never an input to policy resolution. LAN use needs no account.
-- **Owner authenticators.** The owner key can enroll a passkey as an owner authenticator with a signed `authenticator` record (one owner-key confirmation: Touch ID, or the passphrase on the tty). A console command carrying a valid WebAuthn assertion from an enrolled, unexpired, unrevoked authenticator counts as the owner's signature for that one command, within the daemon's device-confirmation rule. Anything above that rule needs an owner-key confirmation on a device, or, for an owner who chose passkey mode, a passkey step-up with a typed confirmation of the effect. Revocation is an owner-signed `authenticator-revocation` record, distributed like policy revocations.
+- **Principal** = an owner key. Policy resolution doesn't use cloud login or an account role as owner authority. `agentmbx login` does contact the account service for device authorization; that transport/account flow is separate from owner-signing and policy resolution.
+- **Cloud accounts (optional; components and proposed link contract).** Cloud account/device-authorization components exist; production enrollment and sharing still have open gates. The account-link/unlink contract below describes intended owner-key linkage, not a new published CLI permission mechanism. AgentMBX Cloud has accounts (email with a passkey, or GitHub) for login, billing and cloud access only. An account links an owner public key with an owner-signed `account-link` record `{account_id, owner_pub, origin, challenge, iat}`, the way a Git host links an SSH key, and unlinks it with an owner-signed `account-unlink` record. An account, an account or organization role, or a plan never grants an agent anything and is never an input to policy resolution. LAN use needs no account.
+- **Owner authenticators (proposed public-daemon contract).** The owner key can enroll a passkey as an owner authenticator with a signed `authenticator` record (one owner-key confirmation: Touch ID, or the passphrase on the tty). A console command carrying a valid WebAuthn assertion from an enrolled, unexpired, unrevoked authenticator counts as the owner's signature for that one command, within the daemon's device-confirmation rule. Anything above that rule needs an owner-key confirmation on a device, or, for an owner who chose passkey mode, a passkey step-up with a typed confirmation of the effect. Revocation is an owner-signed `authenticator-revocation` record, distributed like policy revocations.
 - **Devices.** The owner certifies each host key with a signed `device` record: `{host, host_pub, owner_fp, iat}`. A new machine pairs, then the owner approves it once on a machine that holds the owner key, so there's no second owner key. Policies and grants signed on one machine apply to all of the owner's devices.
-- **Members (sharing with a friend).** Another human's owner key is added with a role (`member` or `guest`) by an owner-signed `member` record. Policies can then name `from.principals`. A member's agents are treated like a paired host at the member's role:
+- **Members (proposed sharing contract).** Another human's owner key is added with a role (`member` or `guest`) by an owner-signed `member` record. The shipped v1 selector is `--from principal:<fp>`, stored in `from.hosts`; there is no `from.principals` input field. Member enrollment and bilateral sharing remain separate planned work. A member's agents are treated like a paired host at the member's role:
   - `guest`: `ask` only;
   - `member`: whatever the owner's policy grants to that principal.
-- **Cloud relay (T007).** It carries the same records. The relay stores and forwards signed envelopes and never holds a private key. It authenticates hosts for transport and quota only and never decides authorization.
+- **Cloud relay (T164–T168 shipped transport).** The durable relay stores sealed message bodies and signed transport records. It holds its own relay signing key, no host decryption keys, and decides no agent action authority. Future account/member/authenticator records aren't made current merely by the transport being available.
 
-The `principals` table ships in v0.3 with a single row (the owner, role `owner`). Policy `from` can already name `principal:<fp>`.
+Local owner and paired-owner/device records support current principal selectors. Their presence doesn't establish completed cross-owner membership or owner-authenticator enrollment.
