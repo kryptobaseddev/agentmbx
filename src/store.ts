@@ -134,6 +134,11 @@ CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, sub TEXT NOT NULL, grant
 CREATE TABLE IF NOT EXISTS wakes (agent TEXT NOT NULL, thread TEXT, at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (at TEXT NOT NULL, event TEXT NOT NULL, detail TEXT);
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+-- Observation-only provenance history, independent of mailbox personas and the expiring v1 taint key.
+-- Additive: old runtimes ignore it and keep their existing policy/approval semantics.
+CREATE TABLE IF NOT EXISTS session_exposures (
+  host TEXT NOT NULL, cli TEXT NOT NULL, session_id TEXT NOT NULL, record TEXT NOT NULL,
+  PRIMARY KEY (host, cli, session_id)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS policies (     -- owner-signed collaboration policies (src/policy.ts)
   id TEXT PRIMARY KEY, record TEXT NOT NULL, sig TEXT NOT NULL, owner_fp TEXT NOT NULL, iat TEXT NOT NULL, exp TEXT,
   revoked INTEGER NOT NULL DEFAULT 0, received_at TEXT NOT NULL);
