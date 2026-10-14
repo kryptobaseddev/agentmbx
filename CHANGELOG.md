@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Codex restart hooks now recognize a remembered thread whose mailbox server has not claimed it yet (T614).** The first entry says `Resuming <name>: … Call mbx_whoami`, and the bounded notice follows once on the first bound prompt; sibling threads cannot supply its identity or consume its entry.
+
 ## 0.5.30 (2026-10-13)
 
 The first turn after a full Hermes or Claude restart is never silent: a live but not yet claimed mailbox server counts as resuming, so the turn says to call mbx_whoami and the bounded resume notice follows. Grok's status line uses a pure-sh adapter, so a refresh starts no node, and `agentmbx doctor` flags a bound Kimi session whose process runs none of its configured hooks.

@@ -124,7 +124,7 @@ async function resumed(t: TestContext, cli = "claude") {
   const home = mkdtempSync(join(tmpdir(), "mbx-t573-")), node = new MbxNode(home, { host: "alpha" });
   const old = spawn("sleep", ["600"], { stdio: "ignore" });
   t.after(() => { old.kill("SIGKILL"); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
-  const sid = "resumed-session";
+  const sid = cli === "codex" ? "77777777-7777-4777-8777-777777777777" : "resumed-session";
   // The old provider process held the identity for this session, then exited; its MCP released the lease on the way out.
   const held = bindWakeLease(node, { agent: "builder", cli, session_id: sid, pid: old.pid! });
   const key = node.sessionsFor("builder")[0].session_key!, descriptor = findIdentityControl(node.store, cli, sid);
@@ -177,16 +177,16 @@ test("T573 Hermes resumes the same way: quiet session start, the resuming line o
   assert.equal(contextOf("hermes", prompt.stdout), RESUMING);
 });
 
-test("T573 an identity that will not come back keeps the disconnected and unbound guidance", async t => {
-  const f = await resumed(t);
+for (const cli of ["claude", "codex"]) test(`T573/T614 ${cli}: an identity that will not come back keeps the disconnected and unbound guidance`, async t => {
+  const f = await resumed(t, cli);
   assert.equal(f.note(), RESUMING);
-  const reset = () => f.node.store.db.prepare("UPDATE identity_leases SET released_at=?,release_reason='released',cli='claude',session_id=? WHERE name='builder'").run(Date.now(), f.sid);
+  const reset = () => f.node.store.db.prepare("UPDATE identity_leases SET released_at=?,release_reason='released',cli=?,session_id=? WHERE name='builder'").run(Date.now(), cli, f.sid);
   f.node.store.db.prepare("UPDATE identity_leases SET released_at=NULL,release_reason=NULL,session_id='another-session' WHERE name='builder'").run();
   assert.equal(f.note(), null, "another session holds it now");
   f.node.store.db.prepare("UPDATE identity_leases SET released_at=NULL,release_reason=NULL WHERE name='builder'").run();
   f.node.store.db.prepare("UPDATE identity_leases SET session_id=? WHERE name='builder'").run(f.sid);
   assert.equal(f.note(), RESUMING, "still held by this same session (the old server is exiting)");
-  f.node.store.db.prepare("UPDATE identity_leases SET cli='codex' WHERE name='builder'").run();
+  f.node.store.db.prepare("UPDATE identity_leases SET cli=? WHERE name='builder'").run(cli === "claude" ? "codex" : "claude");
   assert.equal(f.note(), null, "held by the same session id under another cli");
   reset();
   f.node.store.set("identity-conflict:builder", JSON.stringify({ reason: "test" }));
@@ -212,30 +212,54 @@ test("T573 an identity that will not come back keeps the disconnected and unboun
   assert.equal(f.note(), null, "a live connector that holds an identity is connected, not resuming");
   publishIdentityControl(f.node.store, { ...f.descriptor, parent_pid: process.pid, parent_start: self, mcp_pid: 2147483647, agent: "", generation: null });
   assert.equal(f.note(), null, "an unbound connector whose server is gone is not resuming");
+  publishIdentityControl(f.node.store, { ...f.descriptor, parent_pid: process.pid, parent_start: self, mcp_pid: process.pid, mcp_start: "ps-utc:Sun Jan 1 00:00:00 1995", agent: "", generation: null });
+  assert.equal(f.note(), null, "nor one whose MCP pid has been reused");
   publishIdentityControl(f.node.store, { ...f.descriptor, parent_pid: process.pid, parent_start: "ps-utc:Sun Jan 1 00:00:00 1995", mcp_pid: process.pid, mcp_start: self, agent: "", generation: null });
   assert.equal(f.note(), null, "nor one left by an earlier process that had this provider's pid");
-  f.node.store.db.prepare("DELETE FROM kv WHERE k=?").run(identityControlKey("claude", f.sid));
+  f.node.store.db.prepare("DELETE FROM kv WHERE k=?").run(identityControlKey(cli, f.sid));
   assert.equal(f.note(), RESUMING);
-  for (const invalid of ["", " bad", "bad\nline", "mcp-provisional", "x".repeat(301)]) {
-    f.node.store.set(`name:claude:${invalid}`, "builder");
-    assert.equal(hookResumingNote(f.node, "claude", invalid, process.pid), null, JSON.stringify(invalid.slice(0, 20)));
+  for (const invalid of ["", " bad", "bad\nline", "mcp-provisional", "x".repeat(301), ...(cli === "codex" ? ["not-a-thread-id"] : [])]) {
+    f.node.store.set(`name:${cli}:${invalid}`, "builder");
+    assert.equal(hookResumingNote(f.node, cli, invalid, process.pid), null, JSON.stringify(invalid.slice(0, 20)));
   }
-  f.node.store.set(`name:claude:${f.sid}`, "Not A Name");
+  f.node.store.set(`name:${cli}:${f.sid}`, "Not A Name");
   assert.equal(f.note(), null, "a malformed name binding names nothing");
-  f.node.store.set(`name:claude:${f.sid}`, "builder");
+  f.node.store.set(`name:${cli}:${f.sid}`, "builder");
   assert.equal(f.note(), RESUMING);
   // An explicit release (or takeover) deletes the session's name binding: nothing will be reclaimed.
-  f.node.store.db.prepare("DELETE FROM kv WHERE k=?").run(`name:claude:${f.sid}`);
+  f.node.store.db.prepare("DELETE FROM kv WHERE k=?").run(`name:${cli}:${f.sid}`);
   assert.equal(f.note(), null);
   const result = f.run("session-start");
   assert.equal(result.status, 0, result.stderr);
-  assert.match(contextOf("claude", result.stdout), /no mailbox identity yet/);
+  assert.match(contextOf(cli, result.stdout), /no mailbox identity yet/);
 });
 
 test("T573 a cli that does not rebind sessions keeps the T503 text", async t => {
-  const f = await resumed(t, "codex");
-  assert.equal(hookResumingNote(f.node, "codex", f.sid, process.pid), null);
+  const f = await resumed(t, "grok");
+  assert.equal(f.note(), null);
   const result = f.run("prompt");
   assert.equal(result.status, 0, result.stderr);
-  assert.match(contextOf("codex", result.stdout), /this session no longer holds builder@alpha/);
+  assert.match(contextOf("grok", result.stdout), /this session no longer holds builder@alpha/);
+});
+
+test("T614 a Codex thread resumes independently of sibling rows and controls on its shared provider", async t => {
+  const f = await resumed(t, "codex");
+  const sibling = "88888888-8888-4888-8888-888888888888";
+  bindWakeLease(f.node, { agent: "sibling", cli: "codex", session_id: sibling, pid: process.pid });
+  assert.equal(f.note(), RESUMING, "a sibling's binding does not make this thread previously connected");
+  const self = inspectLeaseProcess(process.pid).start!;
+  const unclaimed = { ...f.descriptor, parent_pid: process.pid, parent_start: self, mcp_pid: process.pid, mcp_start: self, agent: "", generation: null };
+  publishIdentityControl(f.node.store, { ...unclaimed, session_id: "mcp-provisional" });
+  assert.equal(f.note(), RESUMING, "an unclaimed shared transport can still initialize this exact remembered thread");
+  publishIdentityControl(f.node.store, { ...unclaimed, session_id: "mcp-provisional", mcp_pid: 2147483647 });
+  assert.equal(f.note(), null, "a live sibling cannot hide the dead provisional transport");
+  publishIdentityControl(f.node.store, { ...unclaimed, session_id: sibling });
+  assert.equal(f.note(), null, "an unclaimed real sibling cannot supply this thread's process evidence either");
+  publishIdentityControl(f.node.store, unclaimed);
+  assert.equal(f.note(), RESUMING, "this exact thread's live unclaimed control does count");
+  publishIdentityControl(f.node.store, { ...unclaimed, parent_pid: 2147483647 });
+  assert.equal(f.note(), null, "an exact control under another parent does not count");
+  assert.equal(hookResumingNote(f.node, "codex", sibling, process.pid), null, "the connected sibling stays connected");
+  assert.equal(hookResumingNote(f.node, "codex", "99999999-9999-4999-8999-999999999999", process.pid), null,
+    "a new thread cannot borrow the remembered name");
 });
