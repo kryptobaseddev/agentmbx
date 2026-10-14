@@ -41,7 +41,7 @@ export function makePolicy(o) {
     if (classes.includes("permissions") && o.level !== "yolo")
         throw new Error("the permissions class is only granted by the yolo level");
     // D045: a non-expiring yolo grant (agents approving their own permission prompts, forever) is refused;
-    // read, collaborate and autonomous may still last forever. Stored records made before this rule are
+    // ask, collaborate and autonomous may still last forever. Stored records made before this rule are
     // reported by doctor, not revoked.
     if (o.level === "yolo" && o.ttlMs === null)
         throw new Error(`yolo policies must expire: they approve their own permission prompts, so the most they can last is ${TTL.max.yolo / H} h (owner decision D045)`);
