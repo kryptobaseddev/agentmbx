@@ -4,7 +4,7 @@ This is a reconciliation of existing reviews, task receipts and source history, 
 
 ## Release baseline
 
-The published install baseline at review time is **npm `agentmbx@latest = 0.5.30`**, registry `gitHead 0d26b5bf`. [npm](https://www.npmjs.com/package/agentmbx) is authoritative for the current install; versions below are dated evidence, not an instruction to pin an old release. The extracted npm package reports 0.5.30. Public main `1eda360` contains the later T614 Codex restart correction `97718a7` and the 0.5.31 bump, which were **merged but unpublished on npm** at this snapshot.
+The published install baseline at review time is **npm `agentmbx@latest = 0.5.30`**, registry `gitHead 0d26b5bf`. [npm](https://www.npmjs.com/package/agentmbx) is authoritative for the current install; versions below are dated evidence, not an instruction to pin an old release. The extracted npm package reports 0.5.30; the registry snapshot was rechecked at 12:19Z. Public main `64ee20e` contains the later T614 Codex restart correction `97718a7` and the 0.5.31/0.5.32 version bumps, which were **merged but unpublished on npm** at this snapshot.
 
 The public fix commits cited below were verified as ancestors of the published npm gitHead. Cloud evidence is separate: cloud main `25c19b28` contains PR 2 /`6f0e836` and PR 12/`d852876`. A cloud merge or accepted contract does not prove a deployed authority path or a production security review.
 
