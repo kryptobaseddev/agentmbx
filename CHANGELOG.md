@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.33 (2026-10-14)
+
+Mailboxes know their git repository: every bind records the folder's repository (credentials stripped), `mbx_identity list` groups worktrees and clones of one repository, and sync contract 3 sends each agent's repository key and worktree count. `agentmbx policy --ttl never` is refused for yolo and doctor reports any existing non-expiring yolo policy (D045). An in-place MCP handover keeps the real harness session on its lease, the MCP instructions and skill name only real CLI commands, Hermes guidance moves into the bundled skill, and signed content provenance records land observation-only as the first slice of the trust design (T579).
+
 - **The MCP instructions and the skill no longer name `agentmbx reply` (T638).** That word is not a CLI command, so it prints the general help. Scripted access is `agentmbx inbox/read/ack/send`, and an answer is `send --reply-to`.
 - **`agentmbx policy --ttl never` is refused for yolo (owner decision D045).** YOLO agents approve their own permission prompts, so a non-expiring yolo grant is refused at creation and renewal with a clear message (read, collaborate and autonomous still accept never; an over-max yolo error no longer suggests it). Possession stays legal: records stored before the rule still apply, and `agentmbx doctor` now warns about each valid non-expiring yolo policy with the `policy renew <id6> --ttl …` re-sign command — it never revokes them.
 - **Sync contract 3 carries an agent's repository association (T640).** When the cloud accepts contract 3, each agent report gains `repo`: the normalized remote key (the same allowlisted project key T330 records) and the number of recorded worktree tops sharing that repository root. Below contract 3 the field is absent entirely, so older clouds keep receiving contract 2 byte-for-byte; a cloud advertising `{min:1,max:3}` moves the link to 3 on the next batch. Only the key and the count leave the host — never a path, a raw URL, a branch or a credential. The agentmbx-cloud ingress accepts it (apps/api migration 0010, one repo row per agent on `read_agent`) and contract 2 leaves a stored repo in place.
