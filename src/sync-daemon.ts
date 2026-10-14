@@ -9,6 +9,7 @@ import type { MbxNode } from "./node.ts";
 import { storedPolicies } from "./policy.ts";
 import { activeLead } from "./lead-record.ts";
 import { projectKey } from "./registry.ts";
+import { storedRepoAssociations } from "./repo-association.ts";
 import { relayFor } from "./relay-client.ts";
 import { relayState } from "./relay-v2.ts";
 import { newSyncNonce, syncOnce, type SyncDeps, type SyncResult, type SyncSigner } from "./sync-client.ts";
@@ -59,9 +60,11 @@ export function loadSyncSnapshot(node: MbxNode, ctx: { contractAllowsProjectPath
   const unread = new Map(unreadRows.map((row) => [row.agent, Number(row.n) || 0]));
   const keysByAgent = new Map<string, string[]>();
   const newestPath = new Map<string, { absolute: string; at: string }>();
+  // T330: the key recorded when the folder was bound comes first, so a removed worktree keeps its project; else read it now.
+  const repos = storedRepoAssociations(db);
   for (const row of projects) {
-    let key: string | undefined;
-    try { key = projectKeyOf(row.project); } catch { key = undefined; }
+    let key: string | undefined = repos.get(row.project)?.remote_key ?? undefined;
+    if (!key) try { key = projectKeyOf(row.project); } catch { key = undefined; }
     if (!key) continue;
     const mine = keysByAgent.get(row.name) ?? [];
     if (!mine.includes(key)) { mine.push(key); keysByAgent.set(row.name, mine); }

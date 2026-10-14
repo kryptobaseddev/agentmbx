@@ -6,6 +6,8 @@ import { inspectLeaseProcess, type IdentityLease, type ProcessEvidence } from ".
 import { activityKey, holderProviderView, identityAvailability, parseActivity, parseProviderRecord, type LeaseActivity, type RecordedProvider } from "./identity-availability.ts";
 import { procTable } from "./proc.ts";
 import { notSlot } from "./project-slot.ts";
+import { resolveProject } from "./project-key.ts";
+import { repoAssociation, repoIdentity, storedRepoAssociations, type RepoAssociation } from "./repo-association.ts";
 import { SCHEMA_VERSION } from "./store.ts";
 
 export interface IdentityStatus {
@@ -23,6 +25,8 @@ export interface IdentityStatus {
   /** Retired by identity prune (T209): hidden from the default listing unless a session holds it. */
   retired: boolean;
   projects: string[];
+  /** T330: the repository of the newest project folder (null when it is not in a repository or was never recorded). */
+  repo?: Pick<RepoAssociation, "git_root" | "repo_root" | "remote_url" | "default_branch"> | null;
   unread: number;
   messages: number;
   last_activity: string | null;
@@ -45,7 +49,7 @@ export function listIdentityStatus(home: string, options: { now?: number; inspec
   const row = (name: string) => {
     let value = rows.get(name);
     if (!value) { value = { name, state: "legacy", claimable: true, reason: "ownership has not been established by a lease", role: null, description: null, registered: false, retired: false,
-      projects: [], unread: 0, messages: 0, last_activity: null, holder: null }; rows.set(name, value); }
+      projects: [], repo: null, unread: 0, messages: 0, last_activity: null, holder: null }; rows.set(name, value); }
     return value;
   };
   const activity = (item: IdentityStatus, value: unknown) => {
@@ -81,9 +85,24 @@ export function listIdentityStatus(home: string, options: { now?: number; inspec
     if (has("identities")) for (const r of db.prepare("SELECT name,role,description FROM identities").all()) {
       const item = row(r.name as string); item.registered = true; item.role = r.role as string; item.description = (r.description as string | null) ?? item.description;
     }
-    if (has("identity_projects")) for (const r of db.prepare("SELECT name,project FROM identity_projects ORDER BY last_seen DESC").all()) {
-      row(r.name as string).projects.push(r.project as string);
-      if (options.project && r.project === options.project) inProject.add(r.name as string);
+    if (has("identity_projects")) {
+      // T330: a project is the folder, every checkout of its CLEO project (T543), and every worktree or clone of its git
+      // repository (the stored association, else the folder read now). Membership itself stays explicit (T538).
+      const repos = storedRepoAssociations(db);
+      const repoOf = (folder: string) => repos.get(folder) ?? repoAssociation(folder);
+      const keyed = db.prepare("PRAGMA table_info(identity_projects)").all().some((c) => c.name === "project_key");
+      const caller = options.project ? resolveProject(options.project) : null;
+      const callerRepo = options.project ? repoIdentity(repoOf(options.project)) : null;
+      for (const r of db.prepare(`SELECT name,project${keyed ? ",project_key" : ""} FROM identity_projects ORDER BY last_seen DESC`).all()) {
+        const item = row(r.name as string), folder = r.project as string;
+        if (!item.projects.length) {
+          const a = repoOf(folder);
+          item.repo = a.git_root ? { git_root: a.git_root, repo_root: a.repo_root, remote_url: a.remote_url, default_branch: a.default_branch } : null;
+        }
+        item.projects.push(folder);
+        if (options.project && (folder === options.project || (caller?.cleoId && r.project_key === caller.cleoId)
+          || (callerRepo !== null && repoIdentity(repoOf(folder)) === callerRepo))) inProject.add(r.name as string);
+      }
     }
     if (schema >= 2) leases.push(...db.prepare("SELECT * FROM identity_leases").all() as unknown as IdentityLease[]);
     db.exec("COMMIT");
