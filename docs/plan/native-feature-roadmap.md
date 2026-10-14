@@ -2,105 +2,102 @@
 
 ## Goal
 
-This roadmap separates shipped v0.5.0 behavior, repository guidance and admitted future work. No proposed feature is a claim of implementation. The first owner priority is same-thread connector recovery and physical LAN proof, followed by durable relay storage and actual home-to-work qualification (accepted D002). T134 released v0.5.0; T144 guidance is a later repository change requiring distribution/skill refresh. The existing root cached v0.4.1 native connector remains an observed reconnect limitation, not evidence that the new release failed installation.
+Keep shipped behavior, partial implementations, accepted designs and remaining release gates distinct. This snapshot was reconciled on 2026-10-14 against current CLEO records, public main `1eda360`, and the published npm `agentmbx@latest` artifact: **0.5.30**, registry `gitHead 0d26b5bf`. The registry dist-tag is the install authority; [check npm for the current release](https://www.npmjs.com/package/agentmbx). A repository version or GitHub tag alone does not establish what users install.
 
-## Sources and decisions
+Main also contains the T614 Codex first-entry restart fix `97718a7` and the 0.5.31 version bump. Those changes were **merged but unpublished on npm at this snapshot**. Historical v0.5.0 planning and live receipts remain evidence for their recorded revisions, not proof of every current provider or deployment.
 
-CLEO full task records fetched 2026-09-30, canonical native-session-catchup-audit, native-collaboration-coverage and production-network-wake-readiness; release60638c8267476d87d3cca67e28febf9235b3a5b1 and T134 signed artifact/install/preservation receipts. D002 accepted: LAN/connector before durable relay and WAN proof. D003 proposed: durable ingestion capture before checkpoint, processing/ACK separate. D004 proposed: committed recipient-scoped relay acceptance and immutable retry bytes; transport checkpoints distinct from mailbox ACK. D005 proposed: narrow provider outcomes with permission/brakes/mute in core, ambiguous admission reconciled rather than blindly repeated. D006 accepted: public native wording, historical evidence/provenance retained. Proposed decisions are design targets, not permission to claim shipped behavior.
+## Status and evidence
 
-## Current boundary
+- **Shipped** means the implementation commit is included in the published npm gitHead, with recorded task checks.
+- **Partial** means code or a contract exists but the complete task or live acceptance gate is still open.
+- **Accepted design** is an approved contract; it does not prove runtime implementation.
+- **Pending / blocked / deferred** retain the recorded work and owner decisions.
+- **Historical proof** records an observed version/session/device. It does not guarantee a current frontend behaves identically.
 
-A provider uses its own MCP connection to local AgentMBX; local daemon routes signed envelopes to paired LAN hosts. Signed hops provide authenticity/integrity, not direct-LAN body confidentiality. Optional relay already supports encrypted bodies and local retry, but its in-memory state and client deletion on HTTP200 leave a restart-loss gap. Durable acceptance is a future production gate. Local diagnostic CLI runs within the same OS-user boundary; it grants no agent access to foreign mailboxes. Replay filters existing signed project/host, tags and thread; no topic subscription or automatic consumer checkpoint exists. ACK means mailbox handling acknowledgement, not task completion.
+Task status is authoritative for dispatch; source and release evidence determine implementation claims. Fetch a task with `cleo show T### --full` before starting it. A green historical gate does not automatically complete a still-pending task.
+
+## Current product boundary
+
+Published code seals bodies on the direct LAN to a paired host's pinned body key. Metadata remains visible: addresses, subject, thread, refs, tags, sizes and timing, including body-derived metadata. The local store remains plaintext inside the same OS-user boundary. See [current security status](../security-status.md) for the outstanding metadata decision and response-authentication gap.
+
+Relay v2 has persistent SQLite queues and enrollment, immutable encrypted retries, signed durable acceptance, receiver checkpoints and crash/restore/retention drills (T164–T168). Its implementation is shipped. Production operations, end-to-end cloud enrollment, bilateral sharing and a physical home-to-work relay test remain separate open gates; the self-hosted relay is not proof of a fully launched managed service.
+
+Replay, explicit catch-up checkpoint commits, handoff notes and bounded own-mailbox delivery guidance are shipped. Capture/checkpoint, delivery, read, mailbox ACK and CLEO task completion remain separate. There is no durable draft store. Local console, topic subscriptions and a conforming A2A gateway remain future work.
 
 ## Steps
 
-1. Same-thread connector recovery T183 (under T004, depends T138) and current physical LAN T151/T091 come first. Preserve original persona/lease/mail, prove actual connector version/tool catalog, never fabricate provider context. Unsupported reconnect surfaces remain a reported gap. Wire these owner priorities before new production work; recorded links now require T151 after T183/T091 and T165 after T164/T151/T183; T157/T168/T178 also require T183.
-2. In parallel after appropriate identity baseline: T145 guided resume/capture and optional draft design; T129 private console; T148 topics; T149 provider adapters. Each requires its own accepted contract before runtime changes. Existing T127/T128 cover history/search and handoffs; do not duplicate them.
-3. T146 durable relay contract T164 precedes persistent store T165, sender receipt handling T166, restart recovery T167 and verified key/enrollment recovery T168. Sender outbox deletion requires explicit target acceptance after commit, not status200. Persist immutable encrypted wire bytes and target fanout/dedup identity before retry; receiver storage checkpoint, relay ACK-confirmed position and mbx_ack remain separate.
-4. T147 operator/deployment T169 includes HTTPS endpoint verification, bounded monitoring, backups/restores/drain and post-backup mail accounting. T170/T036 implement verified enrollment; T171/T037 owner-consented scoped sharing. T172 is physical home-to-work qualification after storage/security/device prerequisites, not a loopback proxy for WAN proof. T173/T039 gate production readiness; licensing T038 remains separate. No managed service claim follows merely from relay serve.
-5. T150 gateway T181 specifies pinned standard/identity/task lifecycle conformance; T182 implements a bounded approved adapter only. T068 verified signed discovery and T132 expressly nonconformant native preview do not implement this gateway. No arbitrary remote URL execution or ambient authority.
+1. Preserve current mailbox identity, permission and exact-session boundaries while qualifying provider startup/resume. Reuse T162/T185–T189 and later harness regressions; unsupported paths stay explicit.
+2. Finish production relay operations and enrollment before claiming WAN readiness. T172 requires another physical host; a second local daemon is useful transport coverage, not physical home/work proof.
+3. Complete reviewed contracts before new local console, topics, cards or gateway runtime work. Reuse existing tasks rather than treating old proposal labels as new tasks.
+4. Keep trust-design changes separate from current policy behavior. D044 is accepted design for T579/T580; its seven ordered implementation slices are pending, not shipped protections.
+
+## Complete task trace
+
+The original 39-task trace now contains **17 done and 22 pending tasks**. Five of those pending tasks (T185–T189) have merged adapter code and recorded checks; their broader live acceptance remains open. Dependencies below are the current recorded execution dependencies, not the original September proposal.
+
+| Task | Parent | Current status | Remaining boundary or evidence | Dependencies |
+|---|---|---|---|---|
+| T151 | T004 | Done; historical physical LAN proof | MacBook/Fedora receipts at `023688a`; Fedora retired. This does not satisfy T172 WAN proof. | T091, T183, T192 |
+| T152 | T129 | Pending design | Private local console contract/access/redaction; historical T120 audit retained. | T131 |
+| T153 | T129 | Pending | Local console access boundary after T152. | T152 |
+| T154 | T129 | Pending | Searchable owner thread/handoff views. | T128, T153 |
+| T155 | T129 | Pending | Browser privacy, read-only state and packaging verification. | T154 |
+| T156 | T145 | Done; contract shipped | Consumer checkpoint/resume contract, PR 61. | None |
+| T157 | T145 | Done; shipped | Durable captured-page/checkpoint CAS, PR 62. | T156, T183 |
+| T158 | T145 | Done; shipped | Guided catch-up MCP surface, PR 62. | T157 |
+| T159 | T145 | Done; shipped in 0.5.28 | Durable bounded handoff note and verifiable refs, PR 268. Supersedes earlier planned-only notes. | T156 |
+| T160 | T145 | Pending; draft design exists | Canonical draft/delivery-state spec awaits rulings; no draft runtime. | None |
+| T161 | T145 | Deferred | Draft store/explicit send parked for a later release after T160 decisions. | T160 |
+| T162 | T145 | Pending live verification | Cross-provider automatic resume matrix; per-provider restart/context proof remains required. | T158, T159, T185, T186, T187, T188, T189 |
+| T163 | T145 | Done; shipped in 0.5.28 | Own-mailbox delivery/recovery guidance, `6ae111e`; no draft store. | T156 |
+| T164 | T146 | Done; contract shipped | Transactional relay acceptance/recovery contract, PR 73. | T035 |
+| T165 | T146 | Done; shipped in 0.5.5 | Durable relay store, PR 79 (component PR 74). | T151, T164, T183 |
+| T166 | T146 | Done; shipped in 0.5.5 | Signed accept before outbox removal, immutable retry bytes, checkpoints, PR 79. | T165, T168 |
+| T167 | T146 | Done; shipped in 0.5.7 | Crash/restore/retention drills and receipts, PR 95; production rehearsal is separate. | T166 |
+| T168 | T146 | Done; shipped in 0.5.7 | Relay pinning, signed expiring encryption ads and enrollment recovery, PR 93. | T164, T183 |
+| T169 | T231 | Pending operations proof | Actual HTTPS deployment, alerts and exercised production upgrade/restore/rollback. | T029, T031, T032, T167 |
+| T170 | T231 | Partial | Enrollment/configuration, lost-device revocation and recovery still need end-to-end proof. | T030, T036, T165, T168 |
+| T171 | T229 | Pending | Bilateral cross-owner consent and bounded sharing/revocation. | T037, T170 |
+| T172 | T231 | Blocked | New second physical host required; forced relay home/work test never ran on retired Fedora. | T028, T151, T169, T170, T180 |
+| T173 | T231 | Pending readiness | Actual WAN/deployment, sharing, licensing, support, prototype metrics and decision date. T039 merged here. | T038, T171, T172 |
+| T174 | T148 | Pending design | Topic namespace, membership and late-delivery semantics. | None |
+| T175 | T148 | Pending | Authorized topic memberships/routing; tags alone do not subscribe. | T069, T084, T174 |
+| T176 | T148 | Pending | Topic exposure and provider workflow validation. | T128, T175 |
+| T177 | T149 | Done; contract shipped | Explicit native wake outcomes, `61f58dd`. | T191 |
+| T178 | T149 | Done; shipped | Exact-session adapter boundaries and receipt checks, `6446909`. | T177, T183 |
+| T179 | T149 | Done; shipped | Unknown/busy reconciliation and retry pressure, `a977df9`. | T178 |
+| T180 | T149 | Done; historical live proof | Receipt files reuse T091 evidence at `023688a`; later harness versions need their own observations. | T091, T179, T192 |
+| T181 | T150 | Blocked design | Owner consumer choice and reviewed gateway scope; preview metadata is not conformance. | T064, T068, T132 |
+| T182 | T150 | Blocked | Bounded gateway after approved contract/conformance prerequisites. | T133, T181 |
+| T183 | T004 | Done; historical connector proof | Recorded same-conversation Claude adoption; tests/receipts do not establish universal current frontend adoption. | T138, T191 |
+| T184 | T145 | Done; accepted design | D041/canonical provider-resume spec; accepted design is distinct from per-provider runtime/live proof. | T156, T183 |
+| T185 | T145 | Partial; code shipped | Claude startup/resume adapter checks exist; exact live context coverage remains open. | T158, T184 |
+| T186 | T145 | Partial; code shipped | Codex adapter shipped; T614 first-entry correction is merged beyond npm 0.5.30, with post-fix live proof pending. | T158, T184 |
+| T187 | T145 | Partial; code shipped | OpenCode fresh session supported; no distinguishing native reopen/resume signal proven. | T158, T184 |
+| T188 | T145 | Partial; code shipped | Kimi drops SessionStart stdout; first bound UserPromptSubmit/MCP fallback. | T158, T184 |
+| T189 | T145 | Partial; code shipped | Hermes entry notice code/tests exist; broader live context/restart proof remains open. | T158, T184 |
 
 ## Owners
 
-| Saga | Epic | Boundary |
+| Theme | Current owner tasks | Boundary |
 |---|---|---|
-| T001 local-network product | T004, T062, T116, T122, T129, T139 | Existing LAN, kernel identity/discovery, research, replay/history, private console and experience |
-| T001 | T145 | Managed session resume and durable catch-up |
-| T001 | T148 | Scoped local topics and subscription routing |
-| T001 | T149 | Provider wake adapter reliability/isolation |
-| T001 | T150 | Standards-compatible gateway boundary |
-| T002 cross-network theme | T146 | Durable encrypted relay storage/restart recovery |
-| T002 | T147 | Production operations and home-to-work proof |
-| T073 commercial SignalDock | Existing commercial work | Separate account/billing/UI theme; relate to T002, never duplicate local console or move receiver authority to a service |
+| Local product T001 | T004, T006, T040, T116, T122, T129, T145, T148, T149, T150 | LAN, identity, history, private console, resume, topics and gateway |
+| Cross-network/cloud T002 | T146, T221–T231 | Relay, accounts, console, owner authority, sharing, commercial and operational gates |
+| Identity/conduit follow-up | T586, T587 | T065/T066/T068 signed immutable principals/cards and real CLEO contract integration |
+| Security/trust design | T579, T580; T628→T629→T630→T631→T632→T627→T626 | D044 implementation and proven task isolation; no runtime authority widening yet |
 
-T116/T122/T129 are already beneath T001. No reparent was required. Historical T059 card design remains T040 provenance; T068 is the implementation owner. Cloud research/commercial boundary remains separate; no saga consolidation is performed.
+T574 consolidated T007 into T221, T147 into T231, T073 into T002 and T039 into T173 while preserving unmet criteria and historical evidence. T078 retains legacy security/cutover closeout. T073 is no longer a separate active commercial saga. Cancellation or reparenting is not a claim that a service was decommissioned.
 
-## Complete owner requirement trace
+## Other roadmap and audit documents
 
-All entries below are pending future tasks unless explicitly marked current elsewhere. Each row names recorded parent, execution dependencies and its acceptance gate. Task records, not prose phase labels, govern admission.
+- [Production network/wake readiness](production-network-wake-readiness.md) is a pinned v0.5.0 planning audit. Its memory-relay/plaintext-LAN observations are historical and superseded by the shipped work above.
+- [Mailbox foundation delivery](mailbox-foundation-delivery.md) records the pre-release implementation sequence; T123–T126/T134 shipped its replay foundation. Its staging labels are historical.
+- [Native collaboration coverage](../research/native-collaboration-coverage.md), source audits and [independent foundation review](../research/mailbox-foundation-independent-review.md) retain their September evidence; this roadmap supplies current status.
+- [Native agent workflow](../spec/native-agent-workflow.md) explains the supported workflow. [Automatic resume verification](../spec/automatic-resume-verification.md) defines proof obligations; a test plan is not proof that every live restart passed.
+- Cloud backlog disposition is recorded in canonical `t574-cloud-application` (2026-10-13); it is a task-reconciliation receipt, not a deployment/release report.
 
-| Task | Epic | Requirement | Recorded dependencies | Acceptance/evidence gate |
-|---|---|---|---|---|
-| T151 | T004 | Validate released AgentMBX on two physical LAN devices | T091, T183 | Both physical devices show current CLI daemon and actual connector versions; Cross-host request reply and delivery/wake/read/ACK receipts are correlated; Offline retry and same-thread recovery preserve mail and existing ownership |
-| T152 | T129 | Specify private local console and agent-thread views | T131 | Console scope distinguishes local OS-owner view from agent mailbox-scoped MCP; Unknown versions/holder evidence and delivery-versus-task states remain honest; No mutation or automatic remote endpoint probing is exposed |
-| T153 | T129 | Implement local console access boundary | T152 | Unauthenticated LAN wrong-origin and expired capability requests are denied; Local pages render mail as escaped data and load no remote content; Opening the console never ACKs claims releases or changes mailbox state |
-| T154 | T129 | Build searchable agent thread and handoff views | T153, T128 | Owner can inspect threads and search history with current runtime evidence; Pagination and error states expose missing coverage rather than global false health; Refresh is bounded and does not imply agent or task completion |
-| T155 | T129 | Validate local console privacy and operation | T154 | Browser security cases and before/after mail state checks pass; Large mailbox navigation remains bounded and supports reconnect resnapshot; Documentation accurately states same-OS-user filesystem access limits |
-| T156 | T145 | Specify native consumer checkpoints and resume boundaries | None recorded | Contract defines lost-response retry and page retention before checkpoint advancement; Lease, filter changes, restore epochs and concurrent consumers have explicit failure behavior; Design review approves a bounded resume contract before runtime implementation |
-| T157 | T145 | Persist mailbox consumer capture and checkpoints | T156, T183 | Restart and injected write failures preserve captured work and prior checkpoint; Concurrent consumers cannot silently skip or overwrite another checkpoint; No capture or checkpoint operation acknowledges mail or grants authority |
-| T158 | T145 | Expose guided start and catch-up through MCP | T157 | Fresh and resumed sessions receive concise bounded next actions; Saved checkpoint resumes under a newly authorized holder of the same persona; Partial capture errors and occupied or stale connectors preserve mail and explain recovery |
-| T159 | T145 | Persist concise handoff context with task references | T156 | Crash/provider switch can recover retained summary and message references; Task status comes from authorized CLEO evidence rather than message ACK; Retention and redaction are bounded and explicit |
-| T160 | T145 | Specify drafts and outgoing delivery states | None recorded | Draft creation never sends, wakes or creates delegated authority; Draft, local acceptance, queued remote delivery and completion have distinct states; Privacy, retention and editing/version rules are specified before implementation |
-| T161 | T145 | Add mailbox-scoped durable drafts and explicit send | T160 | Unsent draft survives restart and is visible only to authorized mailbox holder; Explicit send atomically transitions draft and deduplicates retries; Failed or uncertain send leaves inspectable state and never reports remote delivery |
-| T162 | T145 | Verify automatic resume across supported provider sessions | T158, T159, T185, T186, T187, T188, T189 | Claude Codex and OpenCode retain checkpoint context across exact-session restarts; Kimi and Hermes supported integration paths have explicit fixture/live coverage gaps; No rewind, wake or resume action changes owner permission or ACK state |
-| T163 | T145 | Expose bounded own-mailbox delivery and recovery guidance | T156 | Held agents can inspect only their own bounded outgoing delivery state and sanitized failure receipts; Missing or stale connector guidance preserves ownership and never auto-takes over; No message body, credentials or foreign mailbox diagnostics leak through health responses |
-| T164 | T146 | Specify transactional relay persistence and acceptance | T035 | Every successful acceptance is bound to immutable persisted recipients and ciphertext; State transitions distinguish durable acceptance, receiver commit, relay ACK and mailbox ACK; Migration, recovery, quota accounting and storage threat boundaries are reviewed |
-| T165 | T146 | Persist relay queues enrollment and duplicate state | T164, T151, T183 | Process restart preserves queues device enrollment cursors and dedup state; Concurrent retries cannot drift fanout or create duplicate receiver delivery; Acceptance cannot be returned before durable state commit |
-| T166 | T146 | Require durable relay receipts before removing local outbox | T165, T168 | Bare HTTP200 or malformed receipt never deletes local queued mail; Response loss and retry verify the same immutable accepted fanout; Receiver committed position survives restart separately from relay ACK confirmation |
-| T167 | T146 | Verify relay crash recovery backup and retention | T166 | Accepted pending mail survives relay and sender restart at each boundary; Restore, replay dedup and expiry policies cannot silently lose live accepted mail; Operational recovery produces inspectable receipts and rollback procedures |
-| T168 | T146 | Validate relay encryption advertisements and enrollment recovery | T164, T183 | Tampered expired wrong-peer or unsigned encryption ads cannot establish trusted recipient encryption; Relay reset or device state mismatch triggers safe signed re-enrollment rather than plaintext fallback; Key rotation revocation and failed enrollment retain queued mail and expose truthful recovery state |
-| T169 | T147 | Deploy HTTPS relay with monitoring and recovery runbook | T167, T029, T031, T032 | Deployment config validates TLS persistent state and bounded resource usage; Alerts distinguish storage failure queue pressure peer outage and delivery failure; Backup restore and upgrade rollback are exercised before production claim |
-| T170 | T147 | Finish device enrollment and relay configuration workflow | T036, T165, T168, T030 | Fresh device enrolls without relay holding owner private keys; Configuration validates endpoints identity and supported transport capabilities; Lost/removed device revocation and key recovery are explicit and testable |
-| T171 | T147 | Implement cross-owner sharing and consent controls | T037, T170 | Cross-owner collaboration requires explicit consent and bounded delegation; Revocation and expiration deny new actions while preserving audit/history; Relay or account administrators cannot create owner authority |
-| T172 | T147 | Validate physical home-to-work encrypted delivery | T151, T169, T170, T180, T028 | Physical home/work requests and replies have sender receiver and ACK receipts; Outage/restart scenarios preserve accepted mail and eventual duplicate-safe delivery; Encryption tamper revocation and unsupported provider cases are recorded |
-| T173 | T147 | Audit production cloud readiness and publish support boundaries | T172, T171, T038, T039 | Production readiness links actual persistent deployment and physical WAN evidence; Enrollment consent quotas licensing and support ownership are resolved; README and runbooks distinguish self-hosted prototype from supported hosted service |
-| T174 | T148 | Specify project-scoped topic and membership semantics | None recorded | Topic and subscription routing are distinguished from existing tag filters; Membership does not extend owner policies or mailbox lease authority; Project mapping, late arrivals and leave/rejoin duplicate handling have reviewed semantics |
-| T175 | T148 | Implement scoped topic memberships and delivery | T174, T069, T084 | Authorized subscribers receive correctly scoped topics without foreign mailbox leakage; Duplicate and late delivery produce deterministic resumable history; Leave/rejoin behavior and existing direct/group delivery remain compatible |
-| T176 | T148 | Expose topics and validate provider workflows | T175, T128 | Agents can discover and join explicit project topics without hidden delivery changes; Provider workflows validate membership and resume independently of task completion; Search and thread links remain mailbox-authorized and bounded |
-| T177 | T149 | Specify exact-session provider wake capability contract | None recorded | Contract separates not-submitted admitted busy blocked unknown and failed outcomes; Core authority and exact-session checks cannot be delegated to provider adapters; Status-only messages never wake and absent capability has an honest fallback |
-| T178 | T149 | Isolate provider wake admission adapters | T177, T183 | Each provider adapter has independent fixture and version coverage; Permission prompts, busy state and session mismatch preserve existing safety behavior; Submission returns explicit receipt/outcome and never reports task completion |
-| T179 | T149 | Reconcile uncertain wakes and bound retry pressure | T178 | Uncertain admission does not trigger blind duplicate submissions; Reconnect and busy/idle transitions eventually retry within declared policy; Mute, status semantics, rate limits and unresolved evidence prevent wake storms |
-| T180 | T149 | Verify provider wake behavior in real sessions | T179, T091 | Supported native adapter paths have real-session admission receipts; Unsupported external wake paths are labeled and retain hooks or desktop fallback; Regression evidence is recorded per provider version without weakening permission prompts |
-| T181 | T150 | Specify A2A gateway conformance and authority mapping | T064, T068, T132 | Reviewed conformance scope names supported and explicitly unsupported operations; Agent metadata never creates permissions and transport ACK never completes remote work; Malformed expired or unsupported cards and endpoints are denied |
-| T182 | T150 | Implement bounded A2A gateway and conformance tests | T181, T133 | Advertised gateway endpoints pass scoped standards-conformance fixtures; Cross-owner permission identity and task mapping retain native trust boundaries; Timeout cancellation retry and oversized input handling remain bounded |
-| T183 | T004 | Validate same-thread MCP connector update and recovery | T138 | Existing Claude Codex and OpenCode thread identities and mail survive supported reconnect/update paths; Live connector version and advertised tool catalog are observed separately from installed CLI version; A stale pre-update connector receives actionable recovery guidance without forcing mailbox takeover |
-| T184 | T145 | Specify provider startup and resume adapter integration | T156, T183 | Contract declares startup resume and update/reconnect capabilities per provider; Bounded startup context uses held mailbox capture and task references without restoring private reasoning; Permission prompts and unavailable APIs produce explicit manual fallback without forced claim |
-| T185 | T145 | Connect Claude SessionStart hooks to bounded catch-up | T158, T159, T184 | Claude supported fresh-session and resume paths receive concise captured context and next actions; Missing binding, busy state, stale connector and unsupported hooks preserve mail and report honest fallback; Adapter-specific fixtures and real-session evidence preserve provider permission prompts and current identity |
-| T186 | T145 | Restore Codex mailbox context through native session hooks | T158, T159, T184 | Codex supported fresh-session and resume paths receive concise captured context and next actions; Missing binding, busy state, stale connector and unsupported hooks preserve mail and report honest fallback; Adapter-specific fixtures and real-session evidence preserve provider permission prompts and current identity |
-| T187 | T145 | Resume OpenCode conversations through its session adapter | T158, T159, T184 | OpenCode supported fresh-session and resume paths receive concise captured context and next actions; Missing binding, busy state, stale connector and unsupported hooks preserve mail and report honest fallback; Adapter-specific fixtures and real-session evidence preserve provider permission prompts and current identity |
-| T188 | T145 | Add supported Kimi catch-up entry and idle-safe fallback | T158, T159, T184 | Kimi supported fresh-session and resume paths receive concise captured context and next actions; Missing binding, busy state, stale connector and unsupported hooks preserve mail and report honest fallback; Adapter-specific fixtures and real-session evidence preserve provider permission prompts and current identity |
-| T189 | T145 | Bind Hermes startup notices to persistent consumer state | T158, T159, T184 | Hermes supported fresh-session and resume paths receive concise captured context and next actions; Missing binding, busy state, stale connector and unsupported hooks preserve mail and report honest fallback; Adapter-specific fixtures and real-session evidence preserve provider permission prompts and current identity |
+## Verification and recovery
 
-## Existing task reuse and evidence gates
+All cited public implementation commits above were checked as ancestors of npm `gitHead 0d26b5bf`; the extracted artifact reports version 0.5.30. Live platform/provider and production gates are qualified separately. No new product tests, physical probes, deployment or security pentest were run for this documentation reconciliation.
 
-| Existing task | Reused requirement | Current status and limit |
-|---|---|---|
-| T069 / T084 | Attested project/function/rank selectors; owner-managed groups | Pending T062 tasks; topic metadata is not membership consent |
-| T127 / T128 | Scoped signed history and searchable handoff/task/session refs | Pending T122; existing replay filters do not prove broader task completion |
-| T068 / T132 | Verified signed cards/directory; bounded native capability preview | Pending T062; preview has no standard execution endpoint |
-| T064 / T133 | Versioned wire semantics and transport conformance | Existing pending contracts; ACK versus processed/task-complete mapping explicit |
-| T091 / T183 / T151 | Provider/live same-thread and physical two-device evidence | Exact runtime/version/session receipts required; unsupported paths remain open |
-| T119 / T121 | Measured polling/query overhead and sender-index optimization | Existing baseline/index evidence; profile new workloads before changing caches or storage |
-| T028–T032 | Confidentiality, bounds, rotation/revocation, backup and threat review | Production prerequisites retained, not waived by relay encryption |
-| T036 / T170 | Enrollment design and verified device workflow | Pairing/relay registration differs from owner-certified device membership |
-| T037 / T171 | Cross-owner consent and scoped sharing | Both owners explicit consent; current recipient policy remains authoritative |
-| T038 / T039 / T173 | Licensing/business and production go/no-go | Separate readiness gates, not inferred from green unit tests |
-
-Physical evidence correlates message ID, target host/session and lease generation with local acceptance, relay acceptance, remote storage, wake admission, execution, read, reply and ACK independently. Crash/restore tests must account for mail arriving after backup. No body, token, owner key or private provider reasoning belongs in diagnostic receipts. The final 39-task trace includes owner-priority and security links: T164→T035; T169→T167/T029/T031/T032; T170→T036/T165/T168/T030; T172→T151/T169/T170/T180/T028. Refresh current CLEO status before dispatch. The global dependency validator retains known saga-root/cross-epic taxonomy warnings; scoped cycle checks and explicit execution links are the relevant proof, not a claim that every global warning was cleared.
-
-## Recovery and release
-
-Keep normal permission profiles and owner grants in the core. Unknown wake submission waits for receipt reconciliation or operator action; desktop notice/admission does not prove execution. Local console loopback capability/Host/Origin boundary is distinct from arbitrary same-OS-user shell access. Every runtime slice requires focused checks, immutable final-source release checks and actual platform/provider coverage before status moves from planned. Rollback cannot overwrite post-backup mail, restore an old visibility writer into schema3, release a holder unexpectedly or reset ACK to retry work. Preserve historical audits and licensing records; this document introduces no third-party code.
-## Provider startup integration coverage
-
-Guided resume requires explicit provider startup/resume hook surfaces, not only a new MCP method. Filed T184 specifies the integration contract after T156/T183. T185 Claude, T186 Codex, T187 OpenCode, T188 Kimi and T189 Hermes depend on T184/T158/T159; T162 validation depends on all five. Unsupported native hook or execution surfaces remain documented gaps. Do not claim these integrations shipped.
+Preserve mailbox/ACK state and historical evidence when recovering. No wake receipt, capture checkpoint, relay ACK or documentation update grants permissions or completes a CLEO task. Keep scoped task gates and current owner decisions explicit.
