@@ -10,6 +10,7 @@ import { fingerprint } from "./crypto.js";
 import { signHop } from "./http.js";
 import { relayState, ROLLBACK_REASON } from "./relay-v2.js";
 import { kimiHostedServer, kimiInstances } from "./kimi-web.js";
+import { storedPolicies, policySummary } from "./policy.js";
 import { opencodeService } from "./wake.js";
 import { opencodeHostClassifier } from "./opencode-provider.js";
 import { kimiDesktop } from "./kimi-desktop.js";
@@ -260,6 +261,15 @@ export function kimiHookEvidence(node, kimiHome = process.env.KIMI_CODE_HOME || 
             fix: "restart the session from a Kimi desktop/Orca pane, or report to Kimi that this launch path does not dispatch configured hooks" });
     }
     return out;
+}
+/** T639 (owner decision D045): non-expiring yolo grants cannot be created anymore, but records made
+ *  before the rule may still be stored. Report them with the re-sign command; never revoke here. */
+export function nonExpiringYoloPolicies(node) {
+    return storedPolicies(node.store.db).valid
+        .filter((p) => p.currentOwner && !p.revoked && p.rec.level === "yolo" && p.rec.exp === null)
+        .map((p) => ({ level: "warn",
+        label: `yolo policy ${p.rec.id.slice(-6)} never expires: ${policySummary(p.rec)} — D045 refuses new non-expiring yolo policies (they approve their own permission prompts); this stored record still applies and is not revoked`,
+        fix: `re-sign it with an expiry: agentmbx policy renew ${p.rec.id.slice(-6)} --ttl 168h (or revoke: agentmbx policy revoke ${p.rec.id.slice(-6)})` }));
 }
 const STRANDED_MAX = 10;
 /** Mailboxes with unhandled mail no live session will see (T211). Read-only; never claims, forwards or prunes.
@@ -913,6 +923,8 @@ export async function doctor(ctx, mbxHome, opts = {}) {
         for (const c of kimiServerHooks(ctx.home))
             out.push(c);
         for (const c of kimiHookEvidence(node))
+            out.push(c);
+        for (const c of nonExpiringYoloPolicies(node))
             out.push(c);
     }
     const sk = skillStatus(ctx.home);

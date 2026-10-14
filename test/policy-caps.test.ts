@@ -137,7 +137,7 @@ test("depth diagnostics only report a real effective downgrade; mixed grants and
   assert.equal(n.depthSuppressed("worker").length, 0, "ask already could not act before depth bookkeeping");
 });
 
-test("policy CLI signs --ttl never, lists/status display it and renewal preserves or explicitly replaces it", t => {
+test("policy CLI: yolo refuses --ttl never (D045); finite yolo and never-expiring lower levels sign, display and renew as before", t => {
   const { n, owner } = fixture(t), helper = join(n.home, "test-auth.mjs");
   writeFileSync(helper, `#!${process.execPath}\nimport {readFileSync} from 'node:fs'; import {signData} from ${JSON.stringify(resolve("src/crypto.ts"))};
     const [cmd,file]=process.argv.slice(2); if(cmd==='pubkey') console.log(${JSON.stringify(owner.publicKey)});
@@ -148,13 +148,25 @@ test("policy CLI signs --ttl never, lists/status display it and renewal preserve
       env: { ...process.env, MBX_HOME: n.home, AGENTMBX_DEV: "1", MBX_AUTH_HELPER: helper, MBX_NO_DESKTOP: "1", MBX_NO_UPDATE_CHECK: "1" } });
     assert.equal(result.status, 0, result.stderr); return result.stdout;
   };
-  assert.match(cli("policy", "set", "worker", "yolo", "--ttl", "never"), /never expires/);
+  const refused = (...args: string[]) => {
+    const result = spawnSync(process.execPath, ["bin/agentmbx.js", ...args], { encoding: "utf8", timeout: 20000,
+      env: { ...process.env, MBX_HOME: n.home, AGENTMBX_DEV: "1", MBX_AUTH_HELPER: helper, MBX_NO_DESKTOP: "1", MBX_NO_UPDATE_CHECK: "1" } });
+    assert.notEqual(result.status, 0, `expected refusal: ${args.join(" ")}`);
+    return `${result.stdout}${result.stderr}`;
+  };
+  // D045: creation and renewal refuse a non-expiring yolo
+  assert.match(refused("policy", "set", "worker", "yolo", "--ttl", "never"), /yolo policies must expire/);
+  assert.match(cli("policy", "set", "worker", "yolo", "--ttl", "8h"), /expires/);
+  assert.equal(refused("policy", "renew", (JSON.parse(cli("policy", "list", "--json")) as PolicyRecord[])[0].id, "--ttl", "never").match(/yolo policies must expire/) !== null, true);
+  // a finite yolo carries permissions; never-expiring lower levels sign, display and renew as before
+  assert.equal(hasClass(n.store.db, "worker", "alpha", "permissions", {}, new Date("2099-01-01")).exp === null, false);
+  assert.match(cli("policy", "set", "friend", "collaborate", "--ttl", "never"), /never expires/);
   let rows = JSON.parse(cli("policy", "list", "--json")) as PolicyRecord[];
-  assert.equal(rows.length, 1); assert.equal(rows[0].exp, null);
+  const never = rows.find((r) => r.level === "collaborate")!;
+  assert.equal(never.exp, null);
   assert.match(cli("policy", "list"), /never expires/); assert.match(cli("status"), /never expires/);
-  assert.equal(hasClass(n.store.db, "worker", "alpha", "permissions", {}, new Date("2099-01-01")).exp, null);
-  assert.match(cli("policy", "renew", rows[0].id), /never expires/);
-  rows = JSON.parse(cli("policy", "list", "--json")); assert.equal(rows.length, 1); assert.equal(rows[0].exp, null);
-  cli("policy", "renew", rows[0].id, "--ttl", "1h");
-  rows = JSON.parse(cli("policy", "list", "--json")); assert.equal(typeof rows[0].exp, "string");
+  assert.match(cli("policy", "renew", never.id), /never expires/);
+  rows = JSON.parse(cli("policy", "list", "--json")); assert.equal(rows.find((r) => r.level === "collaborate")!.exp, null);
+  cli("policy", "renew", (JSON.parse(cli("policy", "list", "--json")) as PolicyRecord[]).find((r) => r.level === "collaborate")!.id, "--ttl", "1h");
+  rows = JSON.parse(cli("policy", "list", "--json")); assert.equal(typeof rows.find((r) => r.level === "collaborate")!.exp, "string");
 });
