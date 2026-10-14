@@ -10,6 +10,7 @@ Republishes 0.5.31, whose tag was pushed onto the wrong commit; the release buil
 
 The first Codex entry after a restart says the mailbox is resuming and to call mbx_whoami, instead of reporting it disconnected; the bounded resume notice follows on the first bound turn.
 
+- **Hermes guidance moves into the bundled skill, and contributor workflow gets its own page (T623).** `skill/references/hermes.md` (shipped with npm installs; SKILL.md links it and keeps a one-line summary for the single binary) covers the Hermes watcher's edge cases, what a resumed or restarted conversation sees, and hook consent. The skill's kinds section now says how to reply when the sender is waiting and how to follow up on your own message. `docs/contributing/agent-workflow.md` collects the repository rules for agents working a task (worktrees, gates, sequencing, fixtures, mutation checks, reporting), `docs/harness-validation-recipe.md` gains a Hermes evidence appendix, and `scripts/spawn-sampler.py` with `scripts/spawn-summarize.py` measure live process spawns on macOS.
 - **Codex restart hooks now recognize a remembered thread whose mailbox server has not claimed it yet (T614).** The first entry says `Resuming <name>: … Call mbx_whoami`, and the bounded notice follows once on the first bound prompt; sibling threads cannot supply its identity or consume its entry.
 
 ## 0.5.30 (2026-10-13)

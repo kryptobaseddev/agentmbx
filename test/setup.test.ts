@@ -126,6 +126,9 @@ test("setup wires every CLI, backs files up, leaves other hook groups alone, and
   // Skill copied + linked
   assert.match(readFileSync(join(skillDest(home), "SKILL.md"), "utf8"), /^---\nname: agentmbx\n/);
   assert.match(readFileSync(join(skillDest(home), "SKILL.md"), "utf8"), /Ending a session and handing off its mailbox/);
+  // T623: the Hermes reference ships with the skill, and SKILL.md links it
+  assert.equal(readFileSync(join(skillDest(home), "references/hermes.md"), "utf8"), readFileSync(join(import.meta.dirname, "../skill/references/hermes.md"), "utf8"));
+  assert.match(readFileSync(join(skillDest(home), "SKILL.md"), "utf8"), /`references\/hermes\.md`/);
   assert.equal(readFileSync(join(skillDest(home), "scripts/claude-statusline.sh"), "utf8"),
     readFileSync(join(import.meta.dirname, "../skill/scripts/claude-statusline.sh"), "utf8"));
   assert.equal(readFileSync(join(skillDest(home), "scripts/grok-statusline.sh"), "utf8"),

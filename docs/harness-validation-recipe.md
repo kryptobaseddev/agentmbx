@@ -83,3 +83,76 @@ Rules that hold on every surface:
 One note per harness per build (`tNNN-<harness>-validation-v<version>`), the T377 pattern:
 timestamp, host + build, then the seven numbered results with the evidence inline. N/A is allowed
 only with the reason and its evidence (e.g. a harness with no Stop hook names its wiring).
+
+## Appendix: collecting the evidence on Hermes
+
+Hermes-specific ways to get each check's evidence, from the 0.5.27–0.5.30 runs (T527, T606, T610). Hermes has no Stop
+hook and no status line, so checks 3 and 5 are N/A. For an agent doing this as a repository task, the general
+workflow is in [`docs/contributing/agent-workflow.md`](contributing/agent-workflow.md).
+
+**Order.**
+1. Read-only checks (1, 3, 5, 6, 7) first, then an interim report.
+2. Then the wake test (2): end the turn with the `agentmbx watch` watcher armed, so the probe lands while the session is idle.
+3. Then the restart checks (4 and the resume notice). Hooks and MCP wiring are read at session start, so only an
+   owner-approved restart can prove them.
+
+**Where to look.**
+- **Run `agentmbx` through the install the hooks use.** Take it from the `command:` lines under `hooks:` in
+  `~/.hermes/config.yaml`, and run it as `<node> <install>/bin/agentmbx.js`. Grep the file; never print it, it holds
+  secrets.
+- **Hermes's own session id** (`YYYYMMDD_HHMMSS_<6 hex>`) appears as `session=` on the `conversation turn` lines of
+  `~/.hermes/logs/agent.log`. Those lines also show the first characters of each turn's prompt, which is how you prove
+  what started a turn.
+- **The mbx store** is `~/.local/share/agentmbx/mbx.db`. Open it read-only (`sqlite3 -readonly`).
+  - `audit` columns are `at, event, detail`.
+  - `kv` columns are `k, v`.
+- **Hook output is not stored in `~/.hermes/state.db`.** Quote the injected `[mbx]` lines verbatim from your own turn
+  input, and back them with `kv` rows.
+- **Save a read-only collector script in scratch.** It prints `mbx_whoami`, the `sessions` row for `cli='hermes'`, the
+  lease, the hermes `kv` rows, recent audit rows and the doctor rows. Run it at every stage (baseline, after install,
+  after each restart) and diff the outputs.
+
+**Evidence per check.**
+1. **Bind.** The `sessions` row for `cli='hermes'` carries Hermes's id, not `mcp-<pid>`. `kv name:hermes:<sid>` holds the
+   identity, and doctor reports `1 real session ID(s)`.
+   - `kv guided:hermes:<sid>` and `session-hint:hermes:<gateway pid>` are written on the hook's unbound path. They prove
+     the hook ran even when it did not bind.
+2. **Wake.** An audit `wake.attempt` with `via:watcher`, `outcome:admitted`, `receipt:transport` and the real session id,
+   plus a turn whose prompt starts `[IMPORTANT: Background process … agentmbx watch` with no human input.
+   - On an idle session the turn starts about 0.1 s after the row.
+   - A probe that landed mid-turn is not a pass; ask for a resend.
+   - Under a goal loop, a continuation prompt can start the turn instead. Name which one did.
+3. **Stop hook: N/A.** `hooks:` lists only `on_session_start` and `pre_llm_call`. Note that mail arriving mid-turn stayed
+   unseen until the turn ended.
+4. **Resume and rebind.** After the owner restarts (quit, then `hermes --resume <id>`):
+   - Make `mbx_whoami` the first mbx call, with no claim.
+   - `ps -o pid,ppid,lstart,command -p <mcp pid>` shows the new MCP's parent is the new gateway. Find the gateway with
+     `ps -axo pid,ppid,lstart,command | grep tui_gateway`; `pgrep -f` can miss it.
+   - PASS means:
+     - the audit `identity.claim` row carries the real session id (not `mcp-<pid>`);
+     - there was no manual claim;
+     - a marker message kept unacked through every step is still unacked.
+   - The claim lands with your first mbx call, so the audit cannot tell whether your call or the MCP caused it. Say so.
+   - The release-to-claim gap may write one `mailbox.escalated` row for unread needs-reply mail. Report whether one
+     appeared.
+   - An in-place version handover (release, then claim within a second, same parent) is not check 4.
+5. **Statusline: N/A.** `agentmbx statusline hermes` prints the usage text. Hermes's status bar takes no command.
+6. **Doctor.** Expect hermes rows for MCP wired, hooks wired, hooks approved, and the binding count. Cross-check a "hooks
+   not approved" row with `hermes hooks list`, which is read-only. Don't use `hermes hooks doctor` or `hermes hooks test`:
+   they write `kv` rows into the live store.
+7. **Status surfaces.** Compare CLI v1 and v2, the loopback endpoint and `hud/hermes-<sid>.*` for the real id. An unknown
+   id must read `unbound`.
+
+**Resume notice (0.5.28+; restart behaviour 0.5.30+, T189 and T610).** Test each entry kind on its own: `/new`,
+`/resume`, and a full restart. Record `mbx_whoami.version` at each one.
+- **On `/new` and `/resume`,** the first bound turn carries the notice: identity and role, the catch-up hint and the
+  open-thread count. `kv resume-entry:hermes:<gateway pid>` becomes `<pid start> <session id>`.
+- **After a full restart,** the first turn carries `[mbx] Resuming <name>@<host> … Call mbx_whoami`.
+  - Read the `kv` rows before your first mbx call, because that call claims: `session-hint:hermes:<new gateway>` should
+    be present and `resume-entry:hermes:<new gateway>` absent.
+  - The next turn (a watcher wake counts) carries the notice, and `resume-entry` appears.
+- **The entry is consumed when the hook emits the notice,** not when the model receives it. A turn whose model request
+  failed still consumes it.
+
+**Recording.** Record a dated note on the validation task: host, build, and one line per check with its evidence. Failures
+go to the lead as findings with a repro, for the lead to file.
