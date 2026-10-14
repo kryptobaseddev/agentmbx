@@ -9,9 +9,11 @@
 
 import { allowStatus } from "./status-sync.ts";
 
-export const CONTRACT_VERSION = 2;
+export const CONTRACT_VERSION = 3;
 export const PROJECT_PATHS_SINCE = 2;
 export const PROJECT_LEADS_SINCE = 2;
+/** T640: the per-agent repo association (key + worktree count) rides contract 3. */
+export const REPO_SINCE = 3;
 export const CAPS = { agents: 500, threads: 1000, receipts: 2000, policies: 200, approvals: 200, peers: 64, paths: 64, leads: 64 } as const;
 export const PATH_FLAG_PREFIX = "sync.project_path:";
 
@@ -45,6 +47,8 @@ export interface AgentInput {
   project_keys: string[];
   holder: { cli: string; since: string } | null;
   last_seen_at: string | null;
+  /** T640: the agent's primary repository association. Never a path, a raw URL, a branch or a credential. */
+  repo: { key: string; worktrees: number } | null;
 }
 
 export interface ThreadInput {
@@ -105,6 +109,7 @@ export interface SyncSnapshot {
   contract: number;
   contractAllowsProjectPaths: boolean;
   contractAllowsProjectLeads: boolean;
+  contractAllowsRepo: boolean;
   host: HostInput;
   agents: AgentInput[];
   threads: ThreadInput[];
@@ -277,6 +282,9 @@ export function projectSync(input: SyncSnapshot): Projection {
     last_seen_at: a.last_seen_at,
     forwarding_to: null,
     issues: [],
+    ...(input.contractAllowsRepo ? { repo: a.repo && PROJECT_KEY_RE.test(a.repo.key)
+      ? { project_key: a.repo.key, worktree_count: Math.max(0, Math.min(64, Math.floor(a.repo.worktrees))) }
+      : null } : {}),
   }));
   const threads = input.threads.filter((t) => ULID_RE.test(t.thread_id)).map((t) => ({
     thread_id: t.thread_id,

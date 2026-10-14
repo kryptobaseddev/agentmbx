@@ -52,7 +52,7 @@ function enrol(home: string, over: { api?: string; hostId?: string; key?: KeyPai
 function host(): HostInput {
   return { daemon_version: "0.5.10", os: "macos", owner_fp: null, authority_owner: false, relay_enrolled: false, peers: [], findings: [] };
 }
-function body(): Omit<SyncSnapshot, "now" | "seq" | "full" | "contract" | "contractAllowsProjectPaths" | "contractAllowsProjectLeads" | "sentReceipts"> {
+function body(): Omit<SyncSnapshot, "now" | "seq" | "full" | "contract" | "contractAllowsProjectPaths" | "contractAllowsProjectLeads" | "contractAllowsRepo" | "sentReceipts"> {
   return { host: host(), agents: [], threads: [], receipts: [], policies: [], approvals: [], paths: [], leads: [] };
 }
 function ok(seq: number, extra: Record<string, unknown> = {}, status = 200, headers?: Record<string, string>): Response {
@@ -118,9 +118,9 @@ test("a strict 400 retries once without the status snapshot (T423)", async () =>
   assert.equal(bodies[1]!.includes("mbx.status/v2"), false);
 });
 
-test("a contract range above contract 2 makes no network call", async () => {
+test("a contract range above contract 3 makes no network call", async () => {
   const kv = mem();
-  kv.set(LINK_KEY, JSON.stringify(link({ contract: { min: 3, max: 4 } })));
+  kv.set(LINK_KEY, JSON.stringify(link({ contract: { min: 4, max: 5 } })));
   const audits: string[] = [];
   let fetches = 0;
   const result = await syncOnce({ signer: pop,
@@ -421,7 +421,7 @@ test("T446: an ack of {1,1} lowers a max-2 link and the next batch is contract 1
     signer: pop, kv: above, now: 0,
     fetch: async (_url, init) => {
       const batch = JSON.parse(String(init?.body)) as { seq: number };
-      return ok(batch.seq, { contract: { min: 3, max: 4 } });
+      return ok(batch.seq, { contract: { min: 4, max: 5 } });
     },
     source: () => body(),
   });
@@ -620,4 +620,39 @@ test("the daemon tick signs the api origin and sends no bearer", async (t) => {
   });
   assert.equal(message.includes("/ignored-path"), false);
   assert.equal(verifyData(key.publicKey, message, captured.headers["X-MBX-Signature"] ?? ""), true);
+});
+
+test("T640: a {1,3} ack raises the link and the next batch speaks 3 carrying repo; an old cloud keeps contract 2 without it", async () => {
+  const repoAgent = { name: "worker", role: "builder", cli: "claude", state: "live" as const, unread: 0, missed: 0, project_keys: [KEY], holder: null, last_seen_at: null,
+    repo: { key: KEY, worktrees: 2 } };
+  const spoken: number[] = [];
+  const carried: unknown[] = [];
+  const post = async (kv: ReturnType<typeof mem>, now: number, ackMin: number, ackMax: number) => syncOnce({
+    signer: pop, kv, now,
+    fetch: async (_url, init) => {
+      const batch = JSON.parse(String(init?.body)) as { contract: number; seq: number; agents?: { upsert: { repo?: unknown }[] } };
+      spoken.push(batch.contract);
+      carried.push(batch.agents?.upsert?.[0]?.repo);
+      return ok(batch.seq, { contract: { min: ackMin, max: ackMax } });
+    },
+    source: () => ({ ...body(), agents: [repoAgent] }),
+  });
+
+  const kv = mem();
+  kv.set(LINK_KEY, JSON.stringify({ ...link(), token: "keep-me" }));
+  assert.equal((await post(kv, 0, 1, 3)).outcome, "acked");
+  const stored = JSON.parse(kv.raw.get(LINK_KEY)!) as { contract: { min: number; max: number }; token?: unknown };
+  assert.deepEqual(stored.contract, { min: 1, max: 3 });
+  assert.equal(stored.token, "keep-me");
+  assert.equal((await post(kv, 60_000, 1, 3)).outcome, "acked");
+  assert.deepEqual(spoken, [1, 3], "the link starts at contract 1 and the next batch speaks 3");
+  assert.deepEqual(carried, [undefined, { project_key: KEY, worktree_count: 2 }], "repo rides only the contract-3 batch");
+
+  spoken.length = 0; carried.length = 0;
+  const oldKv = mem();
+  oldKv.set(LINK_KEY, JSON.stringify(link({ contract: { min: 1, max: 2 }, project_leads: true })));
+  assert.equal((await post(oldKv, 0, 1, 2)).outcome, "acked");
+  assert.equal((await post(oldKv, 60_000, 1, 2)).outcome, "acked");
+  assert.deepEqual(spoken, [2, 2], "an older cloud keeps receiving contract 2");
+  assert.deepEqual(carried, [undefined, undefined], "repo is never sent below contract 3");
 });

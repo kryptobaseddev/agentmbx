@@ -14,7 +14,7 @@ function host(): HostInput {
 }
 function snap(over: Partial<SyncSnapshot> = {}): SyncSnapshot {
   return {
-    now: "2026-10-05T00:00:00.000Z", seq: 1, full: true, contract: 1, contractAllowsProjectPaths: false, contractAllowsProjectLeads: false,
+    now: "2026-10-05T00:00:00.000Z", seq: 1, full: true, contract: 1, contractAllowsProjectPaths: false, contractAllowsProjectLeads: false, contractAllowsRepo: false,
     host: host(), agents: [], threads: [], receipts: [], policies: [], approvals: [], paths: [], leads: [], sentReceipts: [], ...over,
   };
 }
@@ -22,7 +22,7 @@ function pathOf(absolute: string, over: Partial<PathInput> = {}): PathInput {
   return { project_key: KEY, absolute, home: HOME, username: USER, windows: false, ...over };
 }
 function agent(over: Partial<AgentInput> = {}): AgentInput {
-  return { name: "worker", role: "builder", cli: "claude", state: "live", unread: 1, missed: 0, project_keys: [KEY], holder: { cli: "claude", since: "2026-10-05T00:00:00.000Z" }, last_seen_at: "2026-10-05T00:00:00.000Z", ...over };
+  return { name: "worker", role: "builder", cli: "claude", state: "live", unread: 1, missed: 0, project_keys: [KEY], holder: { cli: "claude", since: "2026-10-05T00:00:00.000Z" }, last_seen_at: "2026-10-05T00:00:00.000Z", repo: null, ...over };
 }
 function thread(over: Partial<ThreadInput> = {}): ThreadInput {
   const id = ulid(1_700_000_000_000);
@@ -243,4 +243,27 @@ test("status keeps counts and names and drops bodies, paths, sessions and tokens
   assert.equal(body.includes("\"directory\""), false);
   const status = (got.batch.host as { status?: { cloud: { account: null } } }).status;
   assert.equal(status?.cloud.account, null);
+});
+
+test("T640: the repo association rides contract 3 only — key plus worktree count, key-validated and clamped", () => {
+  const three = projectSync(snap({ contract: 3, contractAllowsRepo: true, agents: [agent({ repo: { key: KEY, worktrees: 3 } })] }));
+  assert.equal(three.ok, true);
+  if (!three.ok) return;
+  assert.deepEqual((three.batch.agents as { upsert: { repo: unknown }[] }).upsert[0]!.repo, { project_key: KEY, worktree_count: 3 });
+  const two = projectSync(snap({ contract: 2, contractAllowsRepo: false, agents: [agent({ repo: { key: KEY, worktrees: 3 } })] }));
+  assert.equal(two.ok, true);
+  if (!two.ok) return;
+  assert.equal("repo" in (two.batch.agents as { upsert: Record<string, unknown>[] }).upsert[0]!, false, "below contract 3 the field is absent entirely");
+  const none = projectSync(snap({ contract: 3, contractAllowsRepo: true, agents: [agent()] }));
+  assert.equal(none.ok, true);
+  if (!none.ok) return;
+  assert.equal((none.batch.agents as { upsert: { repo: unknown }[] }).upsert[0]!.repo, null, "an agent with no repository reports null, not omission");
+  const bad = projectSync(snap({ contract: 3, contractAllowsRepo: true, agents: [agent({ repo: { key: "/tmp/secret", worktrees: 3 } })] }));
+  assert.equal(bad.ok, true);
+  if (!bad.ok) return;
+  assert.equal((bad.batch.agents as { upsert: { repo: unknown }[] }).upsert[0]!.repo, null, "an invalid key never leaves the host");
+  const clamp = projectSync(snap({ contract: 3, contractAllowsRepo: true, agents: [agent({ repo: { key: KEY, worktrees: 300 } })] }));
+  assert.equal(clamp.ok, true);
+  if (!clamp.ok) return;
+  assert.deepEqual((clamp.batch.agents as { upsert: { repo: unknown }[] }).upsert[0]!.repo, { project_key: KEY, worktree_count: 64 });
 });
