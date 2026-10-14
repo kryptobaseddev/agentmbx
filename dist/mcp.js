@@ -1162,6 +1162,15 @@ async function configureMcp(server, node, startupClosed) {
         state.leaseToken = undefined;
         resume(state, name);
     };
+    // T622: a handover child is told the released name and detectHost's provisional
+    // mcp-<pid>. parentAgent short-circuits rememberedName, so the reclaim claimed
+    // under that provisional id while bindSession and whoami already had the one
+    // hook-bound harness session. Adopt that id before the claim.
+    if (parentAgent && base.sessionId.startsWith("mcp-")) {
+        const real = hookBoundRealSessions(base);
+        if (real?.length === 1)
+            base.sessionId = env.sessionId = real[0];
+    }
     const initial = parentAgent ?? launch ?? rememberedName(base);
     for (;;) {
         try {
