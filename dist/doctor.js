@@ -207,12 +207,15 @@ export function sessionReadiness(node, cli) {
         ...(onlyProvisional ? { fix: "run the provider session-start hook to bind its real session ID" }
             : cli === "claude" && !channels ? { fix: "start Claude with 'agentmbx claude' (adds the mbx channel) so idle sessions wake on mail; others see mail on their next prompt" } : {}) };
 }
+// T624: setup writes the resolved bin path (…/agentmbx.js hook …), not the bare "agentmbx hook" form;
+// both checks that read config.toml for mbx hooks must recognize either.
+const KIMI_HOOKS_WIRED = /agentmbx(\.js)? hook/;
 /** A `kimi web` server reads its hooks once at start: one started before AgentMBX was set up runs none (no bind, no Stop). */
 export function kimiServerHooks(home, kimiHome = process.env.KIMI_CODE_HOME || join(home, ".kimi-code")) {
     let wiredAt;
     try {
         const cfg = join(kimiHome, "config.toml");
-        if (!readFileSync(cfg, "utf8").includes("agentmbx hook"))
+        if (!KIMI_HOOKS_WIRED.test(readFileSync(cfg, "utf8")))
             return [];
         wiredAt = statSync(cfg).mtimeMs;
     }
@@ -230,9 +233,8 @@ export function kimiServerHooks(home, kimiHome = process.env.KIMI_CODE_HOME || j
  *  Kimi fails hook errors open, so nothing surfaces. Read-only advisory; mail still reaches the agent
  *  through the MCP fallback and the watcher wake path. */
 export function kimiHookEvidence(node, kimiHome = process.env.KIMI_CODE_HOME || join(homedir(), ".kimi-code"), now = Date.now()) {
-    // setup writes the resolved bin path (…/agentmbx.js hook …), so match the name, not the literal "agentmbx hook".
     try {
-        if (!/agentmbx(\.js)? hook/.test(readFileSync(join(kimiHome, "config.toml"), "utf8")))
+        if (!KIMI_HOOKS_WIRED.test(readFileSync(join(kimiHome, "config.toml"), "utf8")))
             return [];
     }
     catch {

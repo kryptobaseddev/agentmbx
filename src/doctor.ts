@@ -178,10 +178,14 @@ export function sessionReadiness(node: MbxNode, cli: string): Check {
       : cli === "claude" && !channels ? { fix: "start Claude with 'agentmbx claude' (adds the mbx channel) so idle sessions wake on mail; others see mail on their next prompt" } : {}) };
 }
 
+// T624: setup writes the resolved bin path (…/agentmbx.js hook …), not the bare "agentmbx hook" form;
+// both checks that read config.toml for mbx hooks must recognize either.
+const KIMI_HOOKS_WIRED = /agentmbx(\.js)? hook/;
+
 /** A `kimi web` server reads its hooks once at start: one started before AgentMBX was set up runs none (no bind, no Stop). */
 export function kimiServerHooks(home: string, kimiHome = process.env.KIMI_CODE_HOME || join(home, ".kimi-code")): Check[] {
   let wiredAt: number;
-  try { const cfg = join(kimiHome, "config.toml"); if (!readFileSync(cfg, "utf8").includes("agentmbx hook")) return []; wiredAt = statSync(cfg).mtimeMs; } catch { return []; }
+  try { const cfg = join(kimiHome, "config.toml"); if (!KIMI_HOOKS_WIRED.test(readFileSync(cfg, "utf8"))) return []; wiredAt = statSync(cfg).mtimeMs; } catch { return []; }
   return kimiInstances(kimiHome).filter(i => typeof i.pid === "number" && typeof i.started_at === "number" && i.started_at < wiredAt && kimiHostedServer(i.pid, kimiHome) !== null)
     .map(i => ({ level: "warn" as Level, label: `kimi web server pid ${i.pid} (port ${i.port}) started before its AgentMBX hooks were last written: its sessions get no mbx hooks`,
       fix: "restart that kimi web server (stop it, then run kimi web again)" }));
@@ -194,8 +198,7 @@ export function kimiServerHooks(home: string, kimiHome = process.env.KIMI_CODE_H
  *  Kimi fails hook errors open, so nothing surfaces. Read-only advisory; mail still reaches the agent
  *  through the MCP fallback and the watcher wake path. */
 export function kimiHookEvidence(node: MbxNode, kimiHome = process.env.KIMI_CODE_HOME || join(homedir(), ".kimi-code"), now = Date.now()): Check[] {
-  // setup writes the resolved bin path (…/agentmbx.js hook …), so match the name, not the literal "agentmbx hook".
-  try { if (!/agentmbx(\.js)? hook/.test(readFileSync(join(kimiHome, "config.toml"), "utf8"))) return []; } catch { return []; }
+  try { if (!KIMI_HOOKS_WIRED.test(readFileSync(join(kimiHome, "config.toml"), "utf8"))) return []; } catch { return []; }
   const GRACE_MS = 10 * 60_000;
   const rows = node.store.db.prepare("SELECT pid, pid_start, updated_at, session_id, agent FROM sessions WHERE cli='kimi' AND session_id NOT GLOB 'mcp-*'").all() as
     { pid: number | null; pid_start: string | null; updated_at: string; session_id: string; agent: string }[];

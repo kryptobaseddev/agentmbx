@@ -127,17 +127,22 @@ test("wakeKimiDesktop outcomes: busy, conversation busy error, no conversation, 
   assert.equal((await wakeKimiDesktop(s, "x", { desktop: null })).outcome?.kind, "not_submitted");
 });
 
-test("doctor flags a kimi web server that started before its AgentMBX hooks were written", async t => {
+test("doctor flags a kimi web server that started before its AgentMBX hooks were written (T624: setup's resolved bin path form)", async t => {
   const { kimiServerHooks } = await import("../src/doctor.ts");
   const kimi = mkdtempSync(join(tmpdir(), "mbx-kimi-home-"));
   t.after(() => rmSync(kimi, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   mkdirSync(join(kimi, "server/instances"), { recursive: true });
   writeFileSync(join(kimi, "server.token"), "tok");
-  writeFileSync(join(kimi, "config.toml"), '[[hooks]]\nevent = "UserPromptSubmit"\ncommand = "agentmbx hook prompt --cli kimi"\n');
+  // setup writes the resolved bin path, not the bare "agentmbx hook" form; both must count as wired.
+  writeFileSync(join(kimi, "config.toml"), '[[hooks]]\nevent = "UserPromptSubmit"\ncommand = "/usr/bin/node /home/u/.local/bin/agentmbx.js hook prompt --cli kimi"\n');
   writeFileSync(join(kimi, "server/instances/old.json"), JSON.stringify({ pid: process.pid, port: 5, host: "127.0.0.1", started_at: Date.now() - 86_400_000 }));
   const [c] = kimiServerHooks("/nowhere", kimi);
   assert.equal(c?.level, "warn");
   assert.match(c.label, new RegExp(`kimi web server pid ${process.pid} .*get no mbx hooks`));
   writeFileSync(join(kimi, "server/instances/old.json"), JSON.stringify({ pid: process.pid, port: 5, host: "127.0.0.1", started_at: Date.now() + 60_000 }));
   assert.deepEqual(kimiServerHooks("/nowhere", kimi), [], "a server started after setup is fine");
+  writeFileSync(join(kimi, "config.toml"), '[[hooks]]\nevent = "UserPromptSubmit"\ncommand = "agentmbx hook prompt --cli kimi"\n');
+  writeFileSync(join(kimi, "server/instances/old.json"), JSON.stringify({ pid: process.pid, port: 5, host: "127.0.0.1", started_at: Date.now() - 86_400_000 }));
+  const [bare] = kimiServerHooks("/nowhere", kimi);
+  assert.equal(bare?.level, "warn", "the historical bare form still counts as wired");
 });
