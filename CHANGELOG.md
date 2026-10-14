@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.32 (2026-10-14)
+
+Republishes 0.5.31, whose tag was pushed onto the wrong commit; the release build refused it and 0.5.31 was never published to npm or GitHub. 0.5.32 carries the 0.5.31 changes below unchanged.
+
 ## 0.5.31 (2026-10-14)
 
 The first Codex entry after a restart says the mailbox is resuming and to call mbx_whoami, instead of reporting it disconnected; the bounded resume notice follows on the first bound turn.
