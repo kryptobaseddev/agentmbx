@@ -82,7 +82,7 @@ Cloud ADR 0005 was imported unchanged from `agentmbx-cloud@25c19b28:docs/adr/000
 | R-C10 | Active break-glass lifts content-policy downgrades | Accepted under D11; authentication/target binding remain required, and end/clear behavior must be verified. |
 | R-C11 | High-risk passkey operations depend on console integrity | Accepted under D11; typed step-up does not fix malicious display/code. |
 
-T336's five contract corrections are merged and checked: lower-bound override `iat`; provisional lost-phone resurrection visibility; provisional YOLO lifetime treatment (expiry or explicit owner acceptance); override-hash pins instead of equal-`iat` reuse; and the forgotten-window lifted-add vector. This proves that contract slice, not every CT1–CT18 mitigation in deployed services.
+T336's five contract corrections are merged and checked: lower-bound override `iat`; provisional lost-phone resurrection visibility; provisional YOLO policies voided when their window ends (contract semantics); override-hash pins instead of equal-`iat` reuse; and the forgotten-window lifted-add vector. This proves that contract slice, not every CT1–CT18 mitigation in deployed services.
 
 **Still open:** T273 independent authority-path review; T299 launch-wide authn/authz/CSRF/XSS/SSRF/injection/rate-limit/secrets review; T169 production restore/rollback/monitoring proof; T172 physical WAN qualification; T173 readiness; T078/T351 old-service/credential/redirect closeout. D010 and later HOLD conditions are decisions, not proof that any service or exposed historical credential was retired. No secret files or values were opened for this reconciliation.
 
@@ -90,4 +90,4 @@ T336's five contract corrections are merged and checked: lower-bound override `i
 
 Reviewed 10 source groups above, all 18 T032 findings, all 11 cloud design residuals and all 5 T336 follow-up criteria. Current task records and recorded successors were fetched through CLEO; public source checks confirmed body sealing, unsigned fallback/accept results and pending-pair expiry. Released public evidence was checked against npm gitHead, rather than the misleading later GitHub tag.
 
-No new broad pentest, runtime exploit attempt, physical-host test, production configuration review or deployed-control verification ran. The source symbol graph remains unindexed; direct source/commit inspection has bounded coverage. No task was completed, risk waived or owner authority changed by this report. [Reporting policy](../SECURITY.md) applies to newly discovered vulnerabilities.
+No new broad pentest, runtime exploit attempt, physical-host test, production configuration review or deployed-control verification ran. The source symbol graph remains unindexed; direct source/commit inspection has bounded coverage. No product implementation task was completed, risk waived or owner authority changed by this report. [Reporting policy](../SECURITY.md) applies to newly discovered vulnerabilities.

@@ -1,5 +1,8 @@
 # AgentMBX wake and network production readiness
 
+> **Historical planning audit (2026-09-30, v0.5.0):** The source observations and proposed slices below are preserved at their reviewed revision. Direct LAN sealing, durable relay v2, typed wake outcomes and catch-up/handoff have later shipped successors. See the [current roadmap](native-feature-roadmap.md) and [security status](../security-status.md); production operations and physical WAN gates remain open.
+
+
 ## Question
 
 Which bounded work makes the existing local mailbox dependable across provider sessions, physical LAN devices and home-to-work networks without changing who can authorize work?
