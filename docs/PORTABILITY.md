@@ -1,63 +1,91 @@
-# Portability: does each step work for any user?
+# Portability: verify the complete path on each machine
 
-AgentMBX must work the same on anyone's machine, with no fixes that only work on the developer's Mac. This file goes through every step of the path from install to autonomous collaboration. For each step it records:
-- what the step depends on;
-- what has been verified, and where;
-- what's still open, with its CLEO task.
+AgentMBX supports macOS and Linux. This page records installation and provider
+boundaries against published npm 0.5.30 (source `0d26b5bf`), checked on
+2026-10-14. It doesn't assert that every current provider build or physical
+network has been tested. Historical live receipts prove their recorded
+versions/sessions; see [the current roadmap](plan/native-feature-roadmap.md) and
+[the harness validation recipe](harness-validation-recipe.md) for remaining gates.
 
-Update it whenever a step changes.
+## 1. Install the current npm release
 
-Legend: ✅ verified, 🟡 works with a documented limit, ❌ gap (tracked).
+```sh
+npm install --global agentmbx@latest
+agentmbx setup
+agentmbx doctor
+```
 
-## 1. Install
+Node.js 24 or newer is required. `@latest` resolves npm's current published tag
+each time the install command runs; it doesn't schedule automatic updates.
+Compare `npm view agentmbx@latest version` with `agentmbx version`. A source
+checkout, GitHub release, or tag can be ahead of the npm artifact.
 
-| Step | macOS | Linux | Notes |
+| Step | macOS | Linux | Boundary |
 |---|---|---|---|
-| `curl …/install.sh \| sh` gives a single binary, sha256-checked | ✅ darwin-arm64/x64 | ✅ linux-x64/arm64 (built in CI) | No Node needed. Windows isn't supported. |
-| AgentMBX.app (notifier, launcher, `agentmbx-auth`) | ✅ built in CI, installed to `~/Applications` | n/a | Built universal (arm64 + x86_64). |
-| App signing | 🟡 ad-hoc by default | n/a | With ad-hoc signing, the Keychain asks once ("Always Allow") after each update. Fix: set the `MBX_CODESIGN_P12` release secret (a stable self-signed identity), **owner action, T056**. |
-| Daemon service | ✅ launchd (with bootout/bootstrap retry) | ✅ systemd `--user` | A HOME that isn't the account's real home refuses to replace the real job. |
-| `agentmbx update` | ✅ signed manifest plus sha256 | ✅ | |
-| Dev installs (`npm link`, mise shims) | ✅ | ✅ | setup writes the resolved absolute path, and prefers a shim. |
+| npm installation | Supported | Supported | Requires Node ≥24 and npm's global bin directory on PATH |
+| Optional `curl …/install.sh \| sh` binary | darwin-arm64/x64 release targets | linux-x64/arm64 release targets | SHA-256 checked; no separate Node install required. Windows isn't supported |
+| AgentMBX.app notifier/launcher/auth helper | Universal app, installed to `~/Applications` | Not applicable | Release workflow builds the app; its actual signing identity depends on release configuration |
+| App signing | Stable configured identity supported (T056); ad-hoc fallback | Not applicable | An ad-hoc update can trigger another Keychain trust prompt; see [macOS release signing](RELEASING-macos.md) |
+| Daemon service | launchd | systemd `--user` | Setup refuses to replace the real service from a HOME that isn't the account's real home |
+| Upgrade | npm installs use `npm install --global agentmbx@latest`; binary installs use `agentmbx update` | Same | `version --check` and the binary updater use the signed GitHub release manifest, not npm's dist-tag |
+| Node/version-manager paths | Setup stores resolved absolute Node and entry-script paths | Same | Setup doesn't rely on a mutable mise/asdf shim. Re-run it after moving/removing a Node or package install |
 
-## 2. Wiring agent CLIs (`agentmbx setup`)
+See [INSTALL.md](INSTALL.md) for PATH conflicts and manual configuration.
 
-| CLI | MCP | Hooks | Wake an idle session | Keep going on mail mid-turn | YOLO approvals |
-|---|---|---|---|---|---|
-| Claude Code | ✅ | ✅ SessionStart, UserPromptSubmit, PermissionRequest, Stop | ✅ push: the session's own mbx server posts the hint through `CLAUDE_CODE_MESSAGING_SOCKET` (no flag needed, T202); `agentmbx claude` adds the research-preview channel | ✅ Stop `{decision:block}` | ✅ `PermissionRequest` |
-| Codex | ✅ | ✅ same four (Codex asks to trust new hooks once) | ✅ `codex queue` (needs a codex that has `queue`) | ✅ same Stop schema (verified in 0.157.1) | ✅ `PermissionRequest` (0.157.1) |
-| OpenCode | ✅ | none | ✅ service API (`opencode service` must run) | n/a | ✅ daemon answers via the service API |
-| Kimi Code (terminal) | ✅ (MCP server instructions don't reach the model: guidance ships in the skill and hook notes) | ✅ SessionStart, UserPromptSubmit, PermissionRequest, Stop | ✅ a background `agentmbx watch` task the session keeps running exits with the no-body hint and starts the next turn (T033); `[mbx-watch]` cron self-check remains the `MBX_SELF_WATCH` fallback | ✅ Stop hook, exit 2 + reason on stderr (verified by kimi) | ❌ unsupported: Kimi's PermissionRequest hook is observation-only. Use `kimi --yolo` yourself |
-| Kimi (`kimi web` / desktop / `kimi rc`) | ✅ | ✅ (hooks run per hosted session) | ✅ desktop: control-socket `conversations.send` after a busy check; `kimi web` / `kimi rc`: prompts API, waits while busy, sends the default model when the session has none; each conversation links itself with its bind ticket first (T033, verified live) | ✅ Stop hook | ✅ approvals API |
-| Hermes | ✅ | none | ❌ cron now, plugin planned | ❌ | ❌ |
-| Anything else with MCP | ✅ (manual config) | none | desktop notification | none | none |
+## 2. Wire and qualify agent CLIs
 
-Rules that keep this portable:
-- Setup only appends its own hook groups and never edits other tools' groups (Orca and others).
-- Every file setup edits is backed up first.
-- `--uninstall` removes exactly what setup added.
+Setup has adapters for Claude Code, Codex, OpenCode, Kimi, Hermes, and Grok.
+Copilot, Cursor, and Gemini status-line renderers exist, but automatic session
+detection/wiring remains a separate boundary. An arbitrary MCP client can wire
+`agentmbx mcp` manually; that doesn't imply a wake adapter exists.
 
-## 3. Owner identity
+| CLI | MCP and hooks in published setup | Idle wake path | Limit to verify on the actual provider |
+|---|---|---|---|
+| Claude Code | MCP; SessionStart, UserPromptSubmit, PermissionRequest, Stop, PostToolUse, SessionEnd | Its own MCP server sends a no-body hint through the per-session messaging socket; optional `agentmbx claude` channel launcher | Socket/channel support and exact-session binding; historical macOS/Linux receipts aren't proof of every current frontend |
+| Codex | MCP; SessionStart, UserPromptSubmit, PermissionRequest, Stop | `codex queue --thread <id>` | Requires a Codex build with queue/hooks. Startup, same-thread resume, and new-thread isolation are separate live gates |
+| OpenCode | MCP; plugin session-created, post-tool, and idle hooks; sidebar plugin | Service sessions use their API; standalone sessions use their own plugin/loopback queue | Standalone in-process admission doesn't prove an idle model turn. Shared-service permission coverage doesn't establish standalone coverage |
+| Kimi terminal | MCP, skill, SessionStart/UserPromptSubmit/PermissionRequest/Stop hooks | One background `agentmbx watch` task exits with a hint and starts the next turn | Re-arm the watcher after handling mail. `MBX_SELF_WATCH` opts into a periodic self-check. Terminal permission hooks can't approve prompts |
+| Kimi web/rc/desktop | MCP and hosted-session hooks; one-time conversation bind ticket | Web prompts API or desktop control socket | Restart a hosted server started before setup; verify the current exact conversation. Approval API coverage applies to hosted sessions |
+| Hermes terminal/TUI | MCP; `on_session_start` and `pre_llm_call` shell hooks with exact hook approvals | Background `agentmbx watch` task with completion notifications | Re-arm after each wake. Hooks load at session start; a shared gateway/desktop host isn't covered. No Hermes permission-approval adapter is claimed |
+| Grok | MCP, status line, SessionStart/UserPromptSubmit/PostToolUse/Stop hooks | Background `agentmbx watch --cli grok --session <id>` | Re-arm each completion; verify exact session ID and provider background-task notification |
+| Other MCP clients | Manual MCP configuration | Desktop notification fallback | No automatic model turn or permission adapter implied |
+
+Setup preserves other tools' hook groups, backs up files before editing, and
+uninstall removes AgentMBX-owned entries. Modified/foreign configuration can
+require manual review. See [the wake reference](SPEC.md#waking-recipients).
+
+## 3. Keep owner identity explicit
 
 | Step | macOS | Linux / SSH |
 |---|---|---|
-| Owner key | ✅ Keychain via `agentmbx-auth`; every signature needs Touch ID or the account password. An agent can run `owner init`, and the human approves. | 🟡 passphrase file, unlocked on `/dev/tty` (proves someone knows the passphrase, not that a human is present) |
-| Macs without Touch ID | ✅ account-password prompt | n/a |
-| No GUI session (SSH) | ✅ the helper exits right away, and setup prints the command instead of waiting | ✅ |
-| Second machine | ✅ pair, then on the owner machine `agentmbx owner add-device <host>` (one Touch ID tap): a signed device record | ✅ same (passphrase on the owner machine) |
-| Accounts, members, cloud | spec only (docs/POLICY.md §7, T053, T007) | |
+| Owner key | Keychain via `agentmbx-auth`; signatures require Touch ID or account-password approval | Passphrase-encrypted file, unlocked on `/dev/tty`; proves knowledge of the passphrase, not human presence |
+| No GUI session | The helper fails promptly; setup prints a command for the owner | Terminal passphrase path |
+| Second machine | Pair, then approve `agentmbx owner add-device <host>` from the owner machine | Same, using that machine's owner approval method |
+| Hosted accounts and cross-owner members | Account/device-authorization components exist, with production enrollment and bilateral sharing still requiring live proof | Same; local/LAN messaging requires no account |
 
-## 4. Policy and collaboration
+Agents may initiate an owner-signature request; they can't turn its message body
+into owner approval. See [POLICY.md](POLICY.md).
 
-| Step | Status |
+## 4. Apply current policy and session limits
+
+| Step | Current boundary |
 |---|---|
-| `setup` asks how much agents may do; `--policy <level>` answers up front; each choice is signed with one Touch ID tap or passphrase | ✅ |
-| Policy reaches paired machines (push now, pull every minute) | ✅ tested over real HTTP, cross-machine test pending (T020/T021) |
-| Kill switch `policy revoke --all` | ✅ also beats a stale policy that arrives later |
-| Policy expiry | 🟡 each policy expires (collaborate 30 days from setup, yolo 8 h). `policy renew`. No reminder before expiry yet (T057) |
-| Agents act under the policy | ⏳ needs the first owner-signed policy on this Mac, then a live check with codex, kimi and claude (T048) |
+| Setup policy choice | `--policy <level>` selects onboarding behavior; signed changes still require the owner's signing method. `ask` signs no delegation |
+| Paired-machine propagation | Signed policy push/pull is implemented; verify the actual paired hosts and current revocations |
+| Kill switch | `policy revoke --all` is signed and applies against stale replayed policy |
+| Expiry and renewal | Setup uses 30 days for collaborate/autonomous and 8 hours for YOLO. Explicit policy commands have their own defaults and can use an owner-approved `never` lifetime. `policy renew` requires a signature |
+| Expiry reminders | The daemon can notify the owner-key machine 48 hours before expiry; desktop notification availability remains an OS condition |
+| Acting on peer requests | Owner-signed collaboration is implemented (T048); each message's current computed header supplies the applicable classes, scope, sender restrictions, and expiry |
+| Permission approvals | Read/edit grants alone don't approve pushes or PRs. Eligible untainted `outward-reversible` grants cover non-default pushes/draft PRs; `permissions` enables YOLO through supported adapters. No message itself approves a prompt |
+| Trust design | D044 isolation and taint-clearance choices are accepted design, with pending implementation slices; don't claim a shipped isolation boundary |
 
-## 5. Known limits that are by design
+## 5. Preserve the boundaries
 
-- Agents on the same machine share the OS user boundary. A policy limits what agents *choose* to do; it can't sandbox them.
-- A CLI that has no hook or API for something (a Kimi terminal session's permission prompts, for example) keeps its own behaviour. AgentMBX documents the CLI's own flag instead of patching the CLI.
+Same-user agents share the OS-user boundary. Policies limit authorized actions;
+they don't sandbox a process or encrypt local mailbox data from the same user.
+Body sealing protects host-to-host transport while metadata stays visible.
+See [the threat model](THREAT-MODEL.md).
+
+A provider with no hook/API for an action keeps its own behavior. AgentMBX
+documents supported paths and visible gaps instead of claiming a universal wake,
+restart, approval, or production-network guarantee.

@@ -1,29 +1,60 @@
 # Releasing AgentMBX
 
-A release is a git tag `vX.Y.Z`. Pushing it runs `.github/workflows/release.yml`, which builds a single-executable
-binary for each platform, signs a manifest listing their checksums, and publishes a GitHub release. Installs made with
+The standard installation is `npm install --global agentmbx@latest` (Node ≥24).
+The npm registry's `latest` dist-tag defines the current published stable package;
+it can lag a merged version bump, Git tag, or GitHub binary release.
+
+A release tag `vX.Y.Z` starts `.github/workflows/release.yml`: platform builds,
+signed GitHub binary assets, then npm trusted publication and an installed-package
+smoke check. Those are separate outcomes. Installs made with
 `install.sh` read that manifest; `agentmbx update` trusts it only if its Ed25519 signature verifies against the public
 key compiled into the binary.
 
 ## Cutting a release
 
-1. Make sure `main` is green (`.github/workflows/ci.yml`: tests, typecheck, `npm run check-dist`, SEA build + smoke test).
-2. Bump the version and rebuild `dist/`:
-   ```sh
-   npm version 0.2.0 --no-git-tag-version     # edits package.json + package-lock.json
-   npm run build                               # dist/ is committed; npm installs run it
-   git commit -am "release: v0.2.0"
-   ```
-   In the same commit, date the `CHANGELOG.md` section and update `README.md`: the status line, the roadmap rows and the
-   tag in the npm source-install example (`archive/refs/tags/vX.Y.Z.tar.gz`).
-3. Tag and push:
-   ```sh
-   git tag v0.2.0 && git push origin main v0.2.0
-   ```
-   A tag with a hyphen (`v0.3.0-rc.1`) becomes a GitHub pre-release and an npm `next` tag. Note that `releases/latest`
-   (which `install.sh` and `agentmbx update` read) skips pre-releases.
+1. Use the repository's approved release branch/PR workflow and confirm the exact
+   merged source commit. Fetch first; a failed pull mustn't leave a tag on a stale
+   local commit. Check the relevant CI and platform-sensitive validation before
+   release; release CI runs its declared product checks.
+2. Bump `package.json`, `package-lock.json`, and the bundled Claude plugin version
+   together; rebuild committed `dist/` if source changed. Date the changelog
+   section and include the owning CLEO task ID in the release commit.
+3. Keep README's npm badge and `agentmbx@latest` installation commands dynamic.
+   Update roadmap claims only from task/source/release evidence; don't replace the
+   badge with a hardcoded “current” source version or a GitHub archive install pin.
+4. After the release PR is merged, verify the remote main SHA and the local tag's
+   target are the intended commit before the authorized tag push:
 
-The tag must match `package.json`; the workflow refuses to build otherwise.
+   ```sh
+   git fetch origin
+   git rev-parse origin/main
+   git show --no-patch --format=fuller <intended-commit>
+   git rev-list -n 1 <release-tag>
+   ```
+
+   The release tag must match `package.json` at that commit. Release publication
+   requires the owner's normal authorization; these commands don't grant it.
+5. Inspect all release jobs, then verify the registry's version, source commit,
+   and immutable artifact metadata:
+
+   ```sh
+   npm view agentmbx@latest version gitHead dist.integrity dist.tarball --json
+   npm view agentmbx@<released-version> version gitHead dist.integrity --json
+   ```
+
+   A successful tag push or GitHub release isn't npm publication. Registry
+   metadata can precede CDN tarball availability; wait for the artifact and
+   installed-package smoke result. Don't republish a version or treat a rerun's
+   “already published” message as proof that the current tag's bytes were shipped.
+6. Refresh the cloud site's generated reference from the **published** artifact,
+   using its release resolver `--release latest` in the cloud repository.
+   Retain the resolved npm version, `gitHead`, artifact integrity, and generated
+   snapshot label. The page's install command remains `agentmbx@latest`; a
+   historical reference snapshot mustn't pretend to be the current dist-tag.
+
+A tag containing a hyphen is a GitHub prerelease and publishes to npm `next`.
+GitHub `releases/latest` skips prereleases; npm `latest` and `next` are separate
+tags. Query the appropriate tag before announcing its publication.
 
 ## What the workflow does
 
@@ -31,18 +62,18 @@ The tag must match `package.json`; the workflow refuses to build otherwise.
 |-----|---------|------|
 | `build` | `macos-14` (darwin-arm64), `macos-15-intel` (darwin-x64), `ubuntu-24.04` (linux-x64), `ubuntu-24.04-arm` (linux-arm64) | `npm ci`, `npm test`, typecheck, `node scripts/build-sea.mjs`, `node scripts/smoke-sea.mjs` (init, send, inbox, MCP initialize over stdio), upload `agentmbx-<platform>` |
 | `release` | ubuntu | `scripts/make-manifest.mjs` writes `SHA256SUMS` and `manifest.json`; `scripts/sign-manifest.mjs` writes `manifest.json.sig` with the `RELEASE_SIGNING_KEY` secret; `gh release create` uploads the four binaries, `SHA256SUMS`, `manifest.json`, `manifest.json.sig` and `install.sh` |
-| `npm` | ubuntu | `npm publish --provenance` through npm trusted publishing (GitHub OIDC, no token), then installs the published version in a scratch `HOME` and checks `agentmbx --version` |
+| `npm` | ubuntu | `npm publish --provenance --access public --tag latest` (or `next` for prereleases) through GitHub OIDC; polls exact-version metadata and CDN tarball availability, installs that exact published version in an isolated home/prefix, and checks `agentmbx --version` |
 
 npm publishing uses trusted publishing: the `agentmbx` package on npmjs.com trusts this repository's
 `release.yml` (Settings → Trusted Publisher → GitHub Actions, owner `kryptobaseddev`, repository `agentmbx`,
 workflow `release.yml`), and its publishing access is "require two-factor authentication and disallow tokens".
 There is no npm secret. Renaming `release.yml` breaks the trust binding. A version can never be published twice:
-if `npm view` lags after a publish, wait; never re-publish.
+if `npm view` lags after a publish, wait; never re-publish. If an existing registry version has a different `gitHead` from the intended tag, preserve both sources and investigate the release mismatch; a new tag on that version doesn't replace its published bytes.
 
 Pull requests run CI on Linux only. macOS runs on every push to `main` and in the release build; before tagging,
 run the macOS-sensitive suites on a Mac.
 
-`manifest.json`:
+Illustrative binary `manifest.json` (example values, not a current release pin):
 
 ```json
 { "name": "agentmbx", "version": "0.2.0", "released_at": "2026-09-26T12:00:00.000Z",
@@ -101,7 +132,7 @@ update`, because an attacker holding the old key can sign manifests that old bin
 - `agentmbx update` verifies the manifest signature against the pinned key, then the sha256 and size of the download,
   writes it next to the running binary and renames it over the binary atomically. A daemon service that runs that same
   binary is restarted (`launchctl kickstart -k` / `systemctl --user restart agentmbx`).
-- npm and source installs are not replaced; `agentmbx update` prints `npm i -g agentmbx@latest` or `git pull`.
+- npm and source installs are not replaced; `agentmbx update` prints `npm i -g agentmbx@latest` or the source update command. Its check still consults the binary release manifest; npm users use `npm view agentmbx@latest version` and `npm install --global agentmbx@latest` for the package release.
 
 ## Update check in the daemon
 
