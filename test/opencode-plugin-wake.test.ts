@@ -15,6 +15,7 @@ import {
   completeOpencodeWake, listOpencodeWakeWaiters, opencodeWakeWaiting, pushOpencodeWake, resetOpencodeWakeQueue, waitForOpencodeWake,
 } from "../src/opencode-wake-queue.ts";
 import { version } from "../src/version.ts";
+import { boundAtStart } from "./helpers/opencode-bound.ts";
 
 const noFetch = (async () => { throw new Error("T519: the shared service must not be called"); }) as typeof fetch;
 const noService = async () => { throw new Error("T519: service discovery must not run"); };
@@ -117,6 +118,7 @@ test("wakeOpencode: the plugin in the matching serve admits, and the receipt is 
   const g = globalThis as { __mbxWakePort?: string | null; __mbxSpawn?: unknown };
   const prevPort = g.__mbxWakePort;
   g.__mbxWakePort = String(port);
+  const restoreHome = boundAtStart(["ses_live"]); // T643: a bound session's start note is queued at once
   const notes: Array<{ sessionID: string; id?: string; text: string; resume: boolean; delivery: string }> = [];
   g.__mbxSpawn = (_bin: string[], args: string[], _input: string, cb: (out: string) => void) => {
     cb(args[0] === "hook" ? JSON.stringify({ decision: "block", reason: "[mbx] hook note" }) : "");
@@ -169,6 +171,7 @@ test("wakeOpencode: the plugin in the matching serve admits, and the receipt is 
   } finally {
     g.__mbxWakePort = null;
     delete g.__mbxSpawn;
+    restoreHome();
     await closeServer(server);
     node.close();
     rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });

@@ -1376,14 +1376,31 @@ const watchWake = (ctx: NoteCtx, sid: string): void => {
 const turnSince = new Map<string, number>();
 const markTurn = (sid: string): void => { if (!turnSince.has(sid)) turnSince.set(sid, Date.now()); };
 const endTurn = (sid: string): void => { turnSince.delete(sid); };
-/** The occurrence a post-tool note reports: the marker the daemon bumped for the delivery, else the time. */
-const postToolNonce = (sid: string): string => {
+/** This session's post-tool marker, or null. bindSession bumps it on every bind and the daemon sweep deletes it once the session is
+ *  unbound, so a new session has none until it binds (T643). */
+const readMarker = (sid: string): string | null => {
   try {
     const dir = join(process.env.MBX_HOME || join(homedir(), ".local", "share", "agentmbx"), "posttool");
-    const marker = readFileSync(join(dir, "opencode-" + sid + ".marker"), "utf8").trim();
-    if (marker) return marker;
-  } catch { /* no marker yet */ }
-  return "t" + Date.now();
+    return readFileSync(join(dir, "opencode-" + sid + ".marker"), "utf8").trim() || null;
+  } catch { return null; }
+};
+/** The occurrence a post-tool note reports: the marker the daemon bumped for the delivery, else the time. */
+const postToolNonce = (sid: string): string => readMarker(sid) ?? "t" + Date.now();
+/** T643: session.created fires with the first prompt, so a queued session-start note always lands after the first turn, and an
+ *  unbound one ("no mailbox identity yet") is false by then if that turn claimed or registered. The unbound note is held with the
+ *  marker seen at hold time: the session's next tool result carries it if the marker is unchanged (still unbound), and a changed
+ *  marker (a bind) drops it. A turn that ends with it still held and unbound queues it, so it lands as the next turn starts. */
+const startHeld = new Map<string, { text: string; marker: string | null }>();
+const releaseStartNote = async (ctx: NoteCtx, sid: string, event: string, place?: (text: string) => boolean): Promise<void> => {
+  const held = startHeld.get(sid);
+  if (!held) return;
+  if (readMarker(sid) !== held.marker) { startHeld.delete(sid); return; } // bound since: the note is no longer true
+  if (event === "post-tool") {
+    if (place && place(held.text)) startHeld.delete(sid);
+    return; // an error or non-text result keeps it for the next tool result or the turn's end
+  }
+  startHeld.delete(sid);
+  await inject(ctx, sid, "session-start", held.text);
 };
 /** v1 tool.execute.after(input, output): the model reads output.output as the tool result. */
 const appendV1 = (output: unknown, text: string): boolean => {
@@ -1427,6 +1444,7 @@ const call = async (ctx: NoteCtx, bin: string[], event: string, payload: Record<
     if (sid) watchWake(ctx, sid);
     if (sid && event === "post-tool") markTurn(sid);
     if (sid && event === "stop") endTurn(sid);
+    if (sid && (event === "post-tool" || event === "stop")) await releaseStartNote(ctx, sid, event, place);
     // T187: retry an unadmitted notice on an existing hook, without bypassing the zero-spawn fast path.
     const deliver = async () => {
       if (!sid || sending.has(sid)) return;
@@ -1450,7 +1468,8 @@ const call = async (ctx: NoteCtx, bin: string[], event: string, payload: Record<
     await deliver();
     const reason = hookReason(out);
     // T642: a post-tool notice goes into the tool result, which the model reads within the turn; the queue only as a fallback.
-    if (reason && sid && !(event === "post-tool" && place && place(reason))) await inject(ctx, sid, event, reason, nonce);
+    if (reason && sid && event === "session-start" && readMarker(sid) === null) startHeld.set(sid, { text: reason, marker: null }); // T643
+    else if (reason && sid && !(event === "post-tool" && place && place(reason))) await inject(ctx, sid, event, reason, nonce);
   } catch { /* hook failures must never surface in the host TUI */ }
 };
 

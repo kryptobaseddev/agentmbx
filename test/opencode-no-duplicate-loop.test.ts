@@ -15,6 +15,7 @@ import { opencodeServiceCheck } from "../src/doctor.ts";
 import { OPENCODE_STANDALONE_NO_PUSH, wakeOpencode } from "../src/wake.ts";
 import { isOpencodeServiceArgv, opencodeHostOf } from "../src/opencode-provider.ts";
 import { version } from "../src/version.ts";
+import { boundAtStart } from "./helpers/opencode-bound.ts";
 
 const CMD = ["/opt/bin/agentmbx"];
 const SERVICE = ["/Users/x/.opencode/bin/opencode", "serve", "--service"];
@@ -105,7 +106,8 @@ test("setup rewrites an installed pre-T524 plugin (a body change, not header-onl
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
-test("T518: each hook calls synthetic once, and a retry with the same id is one admission", async () => {
+test("T518: each hook calls synthetic once, and a retry with the same id is one admission", async (t) => {
+  t.after(boundAtStart(["ses_one"])); // T643: a bound session's start note is queued at once
   const { mod, dir } = await loadPlugin();
   const g = globalThis as { __mbxSpawn?: unknown };
   const notes: Array<{ sessionID: string; id: string; text: string; resume: boolean; delivery: string }> = [];
