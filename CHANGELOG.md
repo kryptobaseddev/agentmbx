@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Doctor's kimi-web hook check recognizes the resolved bin path (T624).** `kimiServerHooks` matched the literal `agentmbx hook`, but setup writes the resolved path (`…/agentmbx.js hook …`), so a correctly wired `kimi web` server could be misread as unwired and its missing-hook warning never printed. The wired check now accepts either form, shared with the T611 hook-evidence row.
 - **Codex restart hooks now recognize a remembered thread whose mailbox server has not claimed it yet (T614).** The first entry says `Resuming <name>: … Call mbx_whoami`, and the bounded notice follows once on the first bound prompt; sibling threads cannot supply its identity or consume its entry.
 
 ## 0.5.30 (2026-10-13)
