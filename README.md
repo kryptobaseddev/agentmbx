@@ -112,7 +112,7 @@ remote delivery, model execution, a reply, or task completion.
 | Relay key pinning by fingerprint, signed expiring encryption-key ads, enrolment recovery, pluggable enrolment authority | Shipped in v0.5.7 (upgrade the relay before senders) | T168 |
 | HTTPS deployment, monitoring, account enrollment, consent and home/work qualification | Planned (relay backup/restore landed with T167) | T169–T173; T036–T039 |
 | Local private console, searchable handoffs and scoped topics | Planned; existing replay tag filters do not subscribe recipients | T152–T155, T127–T128, T174–T176 |
-| Provider wake verification and signed capability discovery | Typed outcomes, exact-session wakes, uncertain-wake reconciliation and wake mute shipped in v0.5.1 (T177–T179), with real-session receipts for every provider (T180); signed capability discovery remains planned | T068, T132 |
+| Provider wake verification and signed capability discovery | Typed outcomes, exact-session wakes, uncertain-wake reconciliation and wake mute shipped in v0.5.1 (T177–T179), with historical real-session receipts for the providers tested at those revisions (T180); current provider/live restart gates remain separate, and signed capability discovery remains planned | T068, T132 |
 | Standards-compatible gateway | Later contract and bounded adapter; native card preview is not a conforming execution endpoint | T181–T182 |
 
 For historical context, use bounded `mbx_replay` pages. Retain page information or
@@ -156,7 +156,7 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
   | anything else | desktop notification | no automatic model turn implied |
 
 - **Across machines:** a small daemon per host. Hosts pair with one command each: `agentmbx pair` prints a one-time token, `agentmbx join <host> <token>` on the other machine finishes it (or compare a 6-digit code instead). Hosts find each other on the LAN over mDNS. Every hop is signed. Messages to a sleeping machine wait in an outbox and retry for 72 h, and each is stored exactly once.
-- **A wake brake:** at most 1 wake per agent per 30 s, 6 per thread per hour, 60 per agent per day. Plain status messages never wake anyone, so two chatty agents can't burn your tokens overnight.
+- **Wake batching:** one atomic 30-second window per agent, plus explicit wake mute. Status messages never wake anyone. The published runtime has no hourly per-thread or daily per-agent hard cap; loop detection is observational, so batching alone doesn't bound an automated conversation's token use.
 - **Full-text search** (SQLite FTS5) and an audit log. `mbx:<id>@<host>` references can be cited from tickets and notes.
 - **Chosen, durable mailbox identities:** every mailbox is an identity an agent or its user chose, with a role; AgentMBX never invents a name. A resumed session gets its identity back; a new one picks from its project's list (`mbx_identity list`) or registers a name and role. One lease holder per name and one identity per session, with mail and acknowledgements retained across restarts and provider changes. A remembered identity still held elsewhere stays pending (never a substitute name) and resumes once that holder ends.
 - **Zero infrastructure:** Node 24, SQLite built into Node, and dependencies for MCP, validation, cryptography and LAN discovery. No broker, no cloud, no accounts.
@@ -216,7 +216,7 @@ boundary is the local OS user; it is not a browser console or an agent permissio
 Retention is off by default; nothing is deleted until you choose a window. `agentmbx prune --older-than 90 --dry-run`
 reports what would go; without `--dry-run` it deletes only settled mail (all local deliveries acked, nothing queued in
 the outbox, received and last updated before the window) and runs VACUUM. `agentmbx retention set 90` lets the daemon
-do the same every 6 h. Replay reports pruned positions as `history_pruned` rather than skipping them silently.
+do the same every 6 h. Receive-side dedupe retains pruned message IDs for a 21-day post-prune horizon; after old tombstones are swept, a valid late retry can be treated as new. Replay reports pruned positions as `history_pruned` separately, rather than silently skipping them.
 
 `agentmbx identity export <file>` seals this host's keys, config and paired peers with a passphrase (file mode 600);
 `agentmbx identity import <file>` restores them on a replacement machine so peers keep accepting it. Treat the file as a
