@@ -18,7 +18,8 @@ import { procStart, procTable, provenProcess, sameProcess } from "./proc.js";
 import { bumpPostToolMarker, bumpPostToolMarkersForAgent, POSTTOOL_FAST_CLIS } from "./posttool.js";
 import { privatePath } from "./private-files.js";
 import { TASK_RE } from "./presence.js";
-import { backfillProjectKeys, backfillRegistry } from "./registry.js";
+import { backfillProjectKeys, backfillRegistry, projectOf } from "./registry.js";
+import { ensureRepoTable, recordRepoAssociation } from "./repo-association.js";
 import { resolveLeadRecipients } from "./lead-record.js";
 import { isSlotName } from "./project-slot.js";
 import { projectLabel, projectMailboxBySlot, projectsLedBy, resolveProjectMailbox, rewriteProjectAliases } from "./project-mailbox.js";
@@ -124,6 +125,10 @@ export class MbxNode {
             backfillProjectKeys(this.store);
         }
         catch { /* retried on the next open */ }
+        try {
+            ensureRepoTable(this.store);
+        }
+        catch { /* T330: a read-only store; binds retry, readers check the table exists */ }
     }
     /** Record this host's own owner key (if any) as the principal it takes policies from. */
     syncOwner() {
@@ -277,6 +282,13 @@ export class MbxNode {
         // so the hook's fast path must run the full decision once. After the tx: fs writes never inside it.
         if (POSTTOOL_FAST_CLIS.includes(s.cli) && s.session_id)
             bumpPostToolMarker(this.home, s.cli, s.session_id);
+        // T330: every bind records its folder's repository (file reads only, cached; a write only when something changed).
+        // A folder fact, not a membership: T538's explicit-membership rule is untouched.
+        if (s.cwd)
+            try {
+                recordRepoAssociation(this.store, projectOf(s.cwd));
+            }
+            catch { /* best effort: the bind itself succeeded */ }
         return bound;
     }
     /** The agent name the MCP server of this CLI process uses (fresh binding of a live pid), if any. */
