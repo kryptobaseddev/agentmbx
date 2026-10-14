@@ -2,9 +2,9 @@
 
 ## Goal
 
-Keep shipped behavior, partial implementations, accepted designs and remaining release gates distinct. This snapshot was reconciled on 2026-10-14 against current CLEO records, source baseline `1eda360` (current main `64ee20e` adds release metadata), and the published npm `agentmbx@latest` artifact: **0.5.30**, registry `gitHead 0d26b5bf`. The registry dist-tag is the install authority; [check npm for the current release](https://www.npmjs.com/package/agentmbx). A repository version or GitHub tag alone does not establish what users install.
+Keep shipped behavior, partial implementations, accepted designs and remaining release gates distinct. This snapshot was reconciled on 2026-10-14 against current CLEO records and the published npm `agentmbx@latest` artifact: **0.5.32**, registry `gitHead 64ee20ebb1dd97b64be7dd122a11a5a5ce5eacbf`, integrity `sha512-pPMJGFekrmiSeqh7HsgUSAs5V7qweC4SybDaHAWAN62qRMLv39rrclUXN5HWqavuSR9GMMTlfbOzx4yRIaVAjQ==` (rechecked at 14:10Z). The registry dist-tag is the install authority; [check npm for the current release](https://www.npmjs.com/package/agentmbx). A repository version or GitHub tag alone does not establish what people install.
 
-Main also contains the T614 Codex first-entry restart fix `97718a7` and the 0.5.31/0.5.32 version bumps. Those changes were **merged but unpublished on npm at this snapshot**. Historical v0.5.0 planning and live receipts remain evidence for their recorded revisions, not proof of every current provider or deployment.
+The T614 Codex first-entry restart fix `97718a7` is packaged in npm 0.5.32. T614 remains pending alongside the broader T162/T185–T189 live restart/provider proof. Historical v0.5.0 planning and live receipts remain evidence for their recorded revisions, not proof of every current provider or deployment.
 
 ## Status and evidence
 
@@ -29,7 +29,7 @@ Replay, explicit catch-up checkpoint commits, handoff notes and bounded own-mail
 1. Preserve current mailbox identity, permission and exact-session boundaries while qualifying provider startup/resume. Reuse T162/T185–T189 and later harness regressions; unsupported paths stay explicit.
 2. Finish production relay operations and enrollment before claiming WAN readiness. T172 requires another physical host; a second local daemon is useful transport coverage, not physical home/work proof.
 3. Complete reviewed contracts before new local console, topics, cards or gateway runtime work. Reuse existing tasks rather than treating old proposal labels as new tasks.
-4. Keep trust-design changes separate from current policy behavior. D044 is accepted design for T579/T580; its seven ordered implementation slices are pending, not shipped protections.
+4. Keep trust-design changes separate from current policy behavior. D044 is accepted design for T579/T580; its seven ordered implementation slices are pending. D045's accepted YOLO lifetime correction is pending T639: npm 0.5.32 still permits `--ttl never` at every actual CLI level. The proposed refusal for YOLO and report of existing non-expiring records are not shipped; see [current security status](../security-status.md).
 
 ## Complete task trace
 
@@ -72,7 +72,7 @@ The original 39-task trace now contains **17 done and 22 pending tasks**. Five o
 | T183 | T004 | Done; historical connector proof | Recorded same-conversation Claude adoption; tests/receipts do not establish universal current frontend adoption. | T138, T191 |
 | T184 | T145 | Done; accepted design | D041/canonical provider-resume spec; accepted design is distinct from per-provider runtime/live proof. | T156, T183 |
 | T185 | T145 | Partial; code shipped | Claude startup/resume adapter checks exist; exact live context coverage remains open. | T158, T184 |
-| T186 | T145 | Partial; code shipped | Codex adapter shipped; T614 first-entry correction is merged beyond npm 0.5.30, with post-fix live proof pending. | T158, T184 |
+| T186 | T145 | Partial; code shipped | Codex adapter and T614 first-entry correction are packaged in npm 0.5.32; post-fix live proof remains pending. | T158, T184 |
 | T187 | T145 | Partial; code shipped | OpenCode fresh session supported; no distinguishing native reopen/resume signal proven. | T158, T184 |
 | T188 | T145 | Partial; code shipped | Kimi drops SessionStart stdout; first bound UserPromptSubmit/MCP fallback. | T158, T184 |
 | T189 | T145 | Partial; code shipped | Hermes entry notice code/tests exist; broader live context/restart proof remains open. | T158, T184 |
@@ -85,6 +85,7 @@ The original 39-task trace now contains **17 done and 22 pending tasks**. Five o
 | Cross-network/cloud T002 | T146, T221–T231 | Relay, accounts, console, owner authority, sharing, commercial and operational gates |
 | Identity/conduit follow-up | T586, T587 | T065/T066/T068 signed immutable principals/cards and real CLEO contract integration |
 | Security/trust design | T579, T580; T628→T629→T630→T631→T632→T627→T626 | D044 implementation and proven task isolation; no runtime authority widening yet |
+| Policy lifetime correction | T639 | D045 accepted; YOLO `never` refusal and report-only doctor diagnostic remain pending |
 
 T574 consolidated T007 into T221, T147 into T231, T073 into T002 and T039 into T173 while preserving unmet criteria and historical evidence. T078 retains legacy security/cutover closeout. T073 is no longer a separate active commercial saga. Cancellation or reparenting is not a claim that a service was decommissioned.
 
@@ -98,6 +99,6 @@ T574 consolidated T007 into T221, T147 into T231, T073 into T002 and T039 into T
 
 ## Verification and recovery
 
-All cited public implementation commits above were checked as ancestors of npm `gitHead 0d26b5bf`; the extracted artifact reports version 0.5.30. Live platform/provider and production gates are qualified separately. No new product tests, physical probes, deployment or security pentest were run for this documentation reconciliation.
+All cited public implementation commits above were checked as ancestors of npm `gitHead 64ee20e`; the extracted artifact reports version 0.5.32. Live platform/provider and production gates are qualified separately. No new product tests, physical probes, deployment or security pentest were run for this documentation reconciliation.
 
 Preserve mailbox/ACK state and historical evidence when recovering. No wake receipt, capture checkpoint, relay ACK or documentation update grants permissions or completes a CLEO task. Keep scoped task gates and current owner decisions explicit.
