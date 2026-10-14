@@ -2,9 +2,9 @@
 
 ## Goal
 
-Keep shipped behavior, partial implementations, accepted designs and remaining release gates distinct. This snapshot was reconciled on 2026-10-14 against current CLEO records, public main `1eda360`, and the published npm `agentmbx@latest` artifact: **0.5.30**, registry `gitHead 0d26b5bf`. The registry dist-tag is the install authority; [check npm for the current release](https://www.npmjs.com/package/agentmbx). A repository version or GitHub tag alone does not establish what users install.
+Keep shipped behavior, partial implementations, accepted designs and remaining release gates distinct. This snapshot was reconciled on 2026-10-14 against current CLEO records, source baseline `1eda360` (current main `64ee20e` adds release metadata), and the published npm `agentmbx@latest` artifact: **0.5.30**, registry `gitHead 0d26b5bf`. The registry dist-tag is the install authority; [check npm for the current release](https://www.npmjs.com/package/agentmbx). A repository version or GitHub tag alone does not establish what users install.
 
-Main also contains the T614 Codex first-entry restart fix `97718a7` and the 0.5.31 version bump. Those changes were **merged but unpublished on npm at this snapshot**. Historical v0.5.0 planning and live receipts remain evidence for their recorded revisions, not proof of every current provider or deployment.
+Main also contains the T614 Codex first-entry restart fix `97718a7` and the 0.5.31/0.5.32 version bumps. Those changes were **merged but unpublished on npm at this snapshot**. Historical v0.5.0 planning and live receipts remain evidence for their recorded revisions, not proof of every current provider or deployment.
 
 ## Status and evidence
 
