@@ -1,27 +1,84 @@
 # Installing AgentMBX on a machine
 
+## Install and upgrade from npm
+
+Install [Node.js 24 or newer](https://nodejs.org/en/download), then run:
+
 ```sh
-curl -fsSL https://agentmbx.com/install.sh | sh   # single binary in ~/.local/bin, sha256-verified; no Node needed
-#   fallback: curl -fsSL https://raw.githubusercontent.com/kryptobaseddev/agentmbx/main/install.sh | sh
-#   or with Node >= 24: npm install -g https://github.com/kryptobaseddev/agentmbx/archive/refs/heads/main.tar.gz
-agentmbx setup        # host + daemon + every agent CLI it finds (asks before writing; --yes to skip the prompt)
-agentmbx doctor       # checklist with a one-line fix for anything that isn't working
+npm install --global agentmbx@latest
+agentmbx setup
+agentmbx doctor
 ```
+
+The public npm registry's `latest` dist-tag is the standard release. The same
+install command upgrades an existing npm installation to that tag when you run it;
+it doesn't create an automatic background upgrade.
+
+```sh
+npm view agentmbx@latest version    # published npm version
+agentmbx version                  # installed version, installation kind, Node
+npm install --global agentmbx@latest
+agentmbx setup
+agentmbx doctor
+```
+
+A source checkout or Git tag may be ahead of the published package. Don't use a
+`main.tar.gz` URL or a hardcoded version as the default install path.
+
+If a shell finds an older copy, inspect the active path:
+
+```sh
+command -v agentmbx
+npm prefix --global
+agentmbx version
+```
+
+On macOS and Linux, npm puts its executable in `<global-prefix>/bin`. Make that
+directory available on PATH in the shell that starts your agent CLI; an older
+`~/.local/bin/agentmbx` can otherwise take precedence. A Node version manager
+avoids requiring administrator access for global npm packages. After changing
+Node, the install location, or PATH, run setup again: it records absolute Node and
+entry-script paths for MCP servers and hooks.
+
+`agentmbx version --check`, `agentmbx update --check`, and the daemon's daily
+update notice use the signed GitHub **binary release** manifest. They don't query
+npm's dist-tag. On an npm installation, `agentmbx update` prints
+`npm i -g agentmbx@latest`; it doesn't replace the npm package. Use `npm view`
+and the npm install command above for npm release checks and upgrades.
+
+## Optional standalone binary
+
+For a machine without Node, the alternative installer downloads the platform's
+self-contained binary to `~/.local/bin/agentmbx` and checks its SHA-256 against
+the release manifest:
+
+```sh
+curl -fsSL https://agentmbx.com/install.sh | sh
+agentmbx setup
+agentmbx doctor
+```
+
+Binary upgrades use `agentmbx update`, which verifies the Ed25519-signed release
+manifest and the asset checksum before replacing the binary and restarting its
+daemon service. GitHub binary releases and npm publication are separate steps;
+use the update path for the installation kind shown by `agentmbx version`.
+
+## Configure the detected agent CLIs
 
 Then restart your agent sessions so they load the `mbx` MCP server.
 
 `agentmbx setup`:
 1. Initializes this host if needed (host name: `scutil --get LocalHostName` on macOS, the hostname on Linux; override with `--host <name>`) and creates the host key.
 2. Installs and starts the daemon (launchd on macOS, systemd `--user` on Linux).
-3. Finds the agent CLIs on this machine (Claude Code, Codex, OpenCode, Kimi Code, Hermes) and wires the MCP server and hooks into each.
+3. Finds the agent CLIs on this machine (Claude Code, Codex, OpenCode, Kimi Code, Hermes, and Grok) and wires the MCP server and hooks into each.
 4. Installs the `agentmbx` skill, which teaches any agent the mailbox loop and the trust rules.
 
-It prints a table of every change. Every file it edits is first copied to `<file>.bak-agentmbx-<timestamp>`. Running it again changes nothing. Useful flags:
+It prints a table of every change. Every file it edits is first copied to `<file>.bak-agentmbx-<timestamp>`. Running it again preserves matching entries and refreshes AgentMBX-owned wiring when it has changed. Useful flags:
 
 | Flag | Effect |
 |---|---|
 | `--dry-run` | show what would change, write nothing |
-| `--only claude,codex,opencode,kimi,hermes,skill,owner` | limit it to some CLIs (or just the owner step) |
+| `--only claude,codex,opencode,kimi,hermes,grok,skill,daemon,owner` | limit it to some CLIs (or just the owner step) |
 | `--no-owner` | skip the owner-key step |
 | `--yes` | don't ask before writing |
 | `--uninstall` | remove exactly what setup added (the daemon keeps running; `agentmbx daemon uninstall` stops it) |
@@ -33,7 +90,7 @@ The owner key is how **you**, not an agent, approve grants and policies. It only
 
 `agentmbx owner show` and `agentmbx doctor` show which backend holds the key. Macs without Touch ID (a Mac mini without a Touch ID keyboard, a VM) get the account-password prompt instead. Over SSH no prompt can appear, so the helper fails at once, setup prints the commands instead of waiting, and you can use `--backend file` there. With an ad-hoc signed app (a local build, or a release built without the signing certificate), rebuilding or updating the app changes its signature, and the next owner signature first shows a Keychain dialog asking to let `agentmbx-auth` use the item: choose Always Allow (once per update; denying it just means nothing is signed). To reset a Keychain owner key: `~/Applications/AgentMBX.app/Contents/MacOS/agentmbx-auth delete` (Touch ID), then remove `owner.json` from the mbx home.
 
-### Mailbox identities (0.5.2)
+### Mailbox identities
 Every mailbox is an identity that an agent or you chose, with a role; AgentMBX never invents a name. A session
 resumes the identity it held before (a resumed conversation) or the one its launch config names (`MBX_AGENT`, with
 `MBX_ROLE`). Otherwise it starts without one and picks from `mbx_identity list` (this project's identities) or
@@ -43,11 +100,15 @@ without a lease are labelled `unverified-sender` instead of silently trusted. Op
 identity, its role, holder and recovery state with `agentmbx identity list [--project <dir>]`, retire mailboxes
 older versions generated with `agentmbx identity prune`, and move a stranded mailbox's unread mail with
 `agentmbx identity forward <from> <to>` (owner signature); replacing a live holder takes an owner
-signature (`agentmbx identity takeover <name> --force …`, Touch ID / passphrase). Agent sessions adopt newly
-deployed AgentMBX builds automatically on their next tool call — updates don't need session restarts.
+signature (`agentmbx identity takeover <name> --force …`, Touch ID / passphrase). Current connectors adopt a newly installed build on a subsequent tool call in the same conversation.
+Check `mbx_whoami` for the actual connector version and identity. Older connectors may require a one-time
+MCP reconnect; a CLI version alone doesn't prove that a long-running connector updated.
 
-Update later with `agentmbx update` (binary installs; checks the Ed25519-signed release manifest and the sha256 of the
-download, then restarts the daemon). npm and source installs print the command to run instead.
+Start with `mbx_whoami`, then `mbx_inbox` once an identity is held. Read full messages with `mbx_read`
+before acting on their current policy; reply in the thread and ACK only after handling the request.
+Before ending the session, save any useful `mbx_handoff` references and release with `mbx_identity`.
+A normal turn ending doesn't require release. See the [CLI and MCP reference](SPEC.md#mcp-tools) for
+inputs, limits, and the distinction between history capture and acknowledgment.
 
 On macOS, build the notifier app first if you want branded notifications (a clone or unpacked tarball; needs Xcode command line tools):
 ```sh
@@ -71,9 +132,9 @@ On Linux with a firewall, open TCP 7373 to the LAN (e.g. `sudo firewall-cmd --ad
 
 Prefer comparing codes instead? `agentmbx pair --compare <host>:7373`, check both screens show the same 6 digits, then `agentmbx pair approve <host> <code>` on both.
 
-## Relay for offline peers (0.4.0)
+## Relay for offline peers
 Paired hosts that can't reach each other over the LAN (different networks, NAT, a machine that's off) exchange
-mail through an **untrusted store-and-forward relay**: it holds no keys, decides no authorization, and never
+mail through an **untrusted store-and-forward relay**: it holds no host decryption keys, decides no agent authorization, and never
 sees plaintext bodies — envelopes are sealed for the recipient before they leave the sender.
 1. Run a relay on any always-on machine: `agentmbx relay serve --port 7374` (or `PORT`). It keeps its store and its
    signing key in `--store-dir` (default `~/.local/share/agentmbx-relay`, or `MBX_RELAY_DIR`): `relay.db` and
@@ -94,8 +155,9 @@ sees plaintext bodies — envelopes are sealed for the recipient before they lea
    (a copy older than 10 minutes rotates at start by itself). Mail queued by 0.5.5 and newer daemons expires after 14
    days and its sender gets an "Undelivered to <host>" alert; mail from older (v1) daemons is kept until collected. The runbook is in [relay-durability.md §5.2](spec/relay-durability.md#52-runbook-t167).
 2. Point each daemon at it and pin the relay key: `agentmbx relay set http://<relay-host>:7374 --key <fingerprint>`
-   (the fingerprint the relay printed at startup), then restart the daemon (`agentmbx daemon install` hosts:
-   `launchctl kickstart -k gui/$(id -u)/com.agentmbx.daemon`). With `--key` the daemon uses the relay only while it
+   (the fingerprint the relay printed at startup), then restart the daemon using its service manager:
+   `launchctl kickstart -k gui/$(id -u)/com.agentmbx.daemon` on macOS, or
+   `systemctl --user restart agentmbx` on Linux. With `--key` the daemon uses the relay only while it
    serves exactly that key; a mismatch changes nothing and exits 1. Without `--key` the command pins the key the relay
    serves now and prints its fingerprint for you to compare. If the relay's key later changes, relay use stops and
    `agentmbx doctor` says so until you confirm the new key with `relay set <url> --key <new fingerprint>`.
@@ -103,8 +165,10 @@ sees plaintext bodies — envelopes are sealed for the recipient before they lea
    reports the pinned relay key, enrolment, why relay mail waits (a refused enrolment, a peer without a valid
    encryption key ad) and how many messages are queued. A relay problem never drops queued mail silently: the sender is alerted.
 
-The relay needs no account and no pairing of its own — hosts enrol with their existing host keys, and quotas
-are per owner. See [SPEC.md](SPEC.md#relay-protocol-untrusted-store-and-forward-adr-035) and the threat model
+The self-hosted relay's default authority enrolls hosts through their existing host keys, with per-owner
+quotas; paired-host trust still comes from host pairing. A hosted service can use an account-bound enrollment
+authority. `agentmbx login` runs the device authorization flow against the accounts service; it doesn't pair
+hosts or by itself prove that a particular hosted relay enrollment has completed. See [SPEC.md](SPEC.md#relay-protocol-untrusted-store-and-forward-adr-035) and the threat model
 in [adr-035](adr/adr-035-cloud-architecture-threat-model.md).
 
 Why this is safe: the token never crosses the network. Each side proves it knows the token with an HMAC over both machines' host keys and owner keys, so something in the middle can't swap in its own keys. Five wrong attempts burn the token. Anyone who sees the token before it's used could pair with A, so don't paste it anywhere shared.
@@ -156,14 +220,16 @@ Setup appends its own hook groups and never modifies or removes hook groups that
 "hooks": {
   "SessionStart":     [{ "hooks": [{ "type": "command", "command": "agentmbx hook session-start --cli claude", "timeout": 10 }] }],
   "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "agentmbx hook prompt --cli claude", "timeout": 10 }] }],
-  "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "agentmbx hook permission --cli claude", "timeout": 10 }] }]
+  "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "agentmbx hook permission --cli claude", "timeout": 10 }] }],
+  "Stop":             [{ "hooks": [{ "type": "command", "command": "agentmbx hook stop --cli claude", "timeout": 10 }] }],
+  "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "agentmbx hook post-tool --cli claude", "timeout": 10 }] }],
+  "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "agentmbx hook session-end --cli claude", "timeout": 10 }] }]
 }
 ```
-- The `PermissionRequest` hook is YOLO (see [YOLO](#yolo-auto-approving-permission-prompts) below). Without an active policy it prints nothing and you see the usual prompt.
-- **To let messages wake an idle session**, start Claude with the mbx channel:
-  `claude --dangerously-load-development-channels server:mbx`
-  - Claude asks for confirmation at startup.
-  - This is a research-preview feature. It needs a claude.ai login.
+- The `PermissionRequest` hook evaluates owner-signed policy. The `permissions` class enables YOLO; an eligible untainted `outward-reversible` grant can approve a bounded non-default-branch push or draft PR. Read/edit grants alone don't approve those actions. See [POLICY.md](POLICY.md).
+- A plainly started Claude session wakes through its own MCP server and Claude's per-session inbox socket when supported. No channel flag or cron is required for this path.
+- `agentmbx claude [args]` starts Claude with the optional mbx channel instead. This research-preview channel path requires Claude's own startup confirmation and a claude.ai login.
+- Setup normally uses bundled hook scripts for its fast path. The JSON above shows equivalent direct commands for manual configuration; keep other tools' hook groups intact.
 - Put `MBX_AGENT` and `MBX_ROLE` in the project's `.mcp.json` `env` if you want a fixed identity for every session there (one session at a time holds it).
 
 ### Codex
@@ -172,10 +238,10 @@ In `~/.codex/config.toml`:
 [mcp_servers.mbx]
 command = "agentmbx"
 args = ["mcp"]
-default_tools_approval_mode = "approve"   # mbx tools only send/read mail; otherwise every send asks for approval
+default_tools_approval_mode = "approve"   # applies only to this MCP server's mailbox tools
 startup_timeout_sec = 30                  # codex aborts an MCP whose startup exceeds this
 ```
-In `~/.codex/hooks.json`, a SessionStart group running `agentmbx hook session-start --cli codex`, a UserPromptSubmit group running `agentmbx hook prompt --cli codex`, and a PermissionRequest group running `agentmbx hook permission --cli codex` (same JSON shape as Claude's).
+In `~/.codex/hooks.json`, a SessionStart group running `agentmbx hook session-start --cli codex`, a UserPromptSubmit group running `agentmbx hook prompt --cli codex`, and a PermissionRequest group running `agentmbx hook permission --cli codex`, and a Stop group running `agentmbx hook stop --cli codex` (same JSON shape as Claude's).
 - The SessionStart hook binds the session's thread id, which is what lets the daemon wake an idle Codex session through `codex queue`.
 - Codex may ask you to review and trust new hooks the next time it starts.
 
@@ -187,15 +253,15 @@ In `~/.config/opencode/opencode.jsonc` (or `opencode.json`), under `mcp.servers`
 - OpenCode 2.0 rejects a plain numeric `timeout` and skips the whole `mbx` entry, so its MCP tools disappear. Setup therefore writes the object form above and rewrites a number an older setup wrote in place (T541); `agentmbx doctor` warns, with `agentmbx setup --only opencode`, while the field is still a number. `command` is the absolute node binary plus the absolute `agentmbx` script, as for every CLI (see above).
 - If `opencode service` is running, setup restarts it so it picks up the server.
 - OpenCode 2.x runs sessions two ways: a shared `opencode serve --service` process, or a private `opencode serve --stdio` that every `opencode --standalone` TUI spawns (both share one `opencode.db`). Hook notes go into the session in-process in both modes. A wake reaches a service-hosted session through `POST /api/session/{id}/synthetic` on the shared service, and a standalone session through the plugin inside its own serve, which long-polls the daemon's loopback queue (`/v1/opencode-wake`) and admits the text in-process; AgentMBX never posts to the shared service for a standalone session. Whether a standalone wake starts a turn on an idle session is unproven (T544). See [OPENCODE.md](OPENCODE.md) for what to expect from each mode.
-- If OpenCode asks before each mbx tool call, allow `mbx_*` in its permission settings. See the e2e notes in `docs/TESTING.md`.
+- If OpenCode asks before each mbx tool call, allow `mbx_*` in its permission settings. See the [testing guide](TESTING.md).
 
 **Hooks** are a plugin module, `~/.config/opencode/plugins/agentmbx.ts` (OpenCode has no settings-file hooks), translating OpenCode's `session.created`, `tool.execute.after` and session-idle events onto the shared `agentmbx hook` contract.
 
-**Sidebar** (v0.5.18+): the same setup run installs a packaged TUI plugin that renders this session's AgentMBX status — identity, unread and needs-reply counts — in the OpenCode sidebar, refreshed from the daemon's loopback status endpoint at most every 5 s. It lives in `~/.config/opencode/plugins/agentmbx-sidebar/` (`package.json`, `server.ts`, `tui.ts`) and is registered by one line in `~/.config/opencode/tui.json`:
+**Sidebar** (v0.5.18+): the same setup run installs a packaged TUI plugin that renders this session's AgentMBX status — identity, unread and needs-reply counts — in the OpenCode sidebar, refreshed from the daemon's loopback status endpoint at most every 5 s. It lives in `~/.config/opencode/plugins/agentmbx-sidebar/` (`package.json`, `server.ts`, `status-schema.ts`, `tui.ts`) and is registered by one line in `~/.config/opencode/tui.json`:
 ```jsonc
 { "plugin": ["/Users/you/.config/opencode/plugins/agentmbx-sidebar"] }
 ```
-(the array entry is the absolute directory path). It needs the daemon of v0.5.17 or newer (the `/v1/status` schema the plugin reads); with an older daemon the sidebar shows `mbx ?`. Manual install, if you prefer: create that directory with the three files the npm package generates (`node -e "import('./dist/opencode-sidebar.js')"` exports `opencodeSidebarPackageJson`, `opencodeSidebarServerSource`, `opencodeSidebarSource`), add the `tui.json` entry above, and restart OpenCode. `agentmbx setup --uninstall --only opencode` removes the registration and the three files — never your other plugins or tui.json content. Files whose only difference from the template is the agentmbx release version are left untouched by setup and still count as wired to doctor.
+(the array entry is the absolute directory path). It needs the daemon of v0.5.17 or newer (the `/v1/status` schema the plugin reads); with an older daemon the sidebar shows `mbx ?`. Use `agentmbx setup --dry-run --only opencode` to preview this wiring, then `agentmbx setup --only opencode` to install it. `agentmbx setup --uninstall --only opencode` removes its own registration and files, preserving other plugins and TUI configuration. Files whose only difference from the template is the agentmbx release version are left untouched by setup and still count as wired to doctor.
 
 ### Kimi Code
 Kimi's data directory is `$KIMI_CODE_HOME`, by default `~/.kimi-code`.
@@ -218,6 +284,11 @@ timeout = 10
 event = "PermissionRequest"
 command = "agentmbx hook permission --cli kimi"
 timeout = 10
+# Stop hooks continue handling authorized unread mail before the turn ends.
+[[hooks]]
+event = "Stop"
+command = "agentmbx hook stop --cli kimi"
+timeout = 10
 # <<< agentmbx <<<
 ```
 - Terminal Kimi accepts no push from outside, so the session wakes itself: it keeps one background task running `agentmbx watch` (the prompt hook and the skill ask it to). The task exits with a no-body hint when mail that wants the session arrives, and Kimi starts a turn from the task's completion. `MBX_SELF_WATCH=<minutes>` asks for a `[mbx-watch]` CronCreate self-check instead.
@@ -235,9 +306,24 @@ mcp_servers:
     connect_timeout: 60
 ```
 Restart Hermes to load it. Its tools then appear as `mcp_mbx_*`.
-- For wake-ups, the plan is a small Hermes plugin that calls `ctx.inject_message`. Until that exists, use a Hermes cron job that checks `mbx_inbox`.
+- Setup also writes `on_session_start` and `pre_llm_call` shell hooks in this YAML file and records their exact approvals in `~/.hermes/shell-hooks-allowlist.json`. Hermes loads them for sessions started after setup.
+- Keep one `agentmbx watch` background terminal task running with `background=true, notify=true`. It exits with a no-body inbox hint when mail needs attention; Hermes starts a turn from the completion notification. Handle the mail and start the watcher again. Finishing a turn without re-arming it leaves no idle push path.
+- This covers a terminal/TUI session with an exact session binding. A multi-session Hermes gateway or desktop host isn't covered by that watcher guarantee.
 
-### YOLO: auto-approving permission prompts
+### Grok
+
+Setup recognizes Grok and honors `GROK_HOME` (default `~/.grok`). It maintains
+`[mcp_servers.mbx]`, the optional `[ui.status_line]` segment, and SessionStart,
+UserPromptSubmit, PostToolUse, and Stop hooks in `config.toml`, preserving other
+configuration. The MCP startup timeout is `startup_timeout_sec = 30`.
+
+Keep an `agentmbx watch --cli grok --session <id>` background task armed for idle
+mail, then re-arm it after handling each completion. Exact session IDs prevent a
+sibling conversation's mailbox from being used.
+
+### Owner policy and permission prompts
+A message body never approves a permission prompt. Permission adapters use signed policy and the caller's verified session context. A bounded `outward-reversible` grant can approve a non-default-branch push or a draft PR while the session is untainted; merging, release, deployment, secrets, and spend aren't included. See [POLICY.md](POLICY.md) for restrictions.
+
 When an owner policy gives an agent the `permissions` class ([POLICY.md](POLICY.md) §5), that agent's sessions approve their own permission prompts until the policy expires. With no such policy nothing changes. Every approval is written to the audit log as `yolo_allow`. How each CLI does it (evidence in [RESEARCH.md](RESEARCH.md), "Permission hooks per CLI"):
 - **Claude Code** and **Codex**: the `PermissionRequest` hook above answers `allow`. Deny rules still win. Claude never auto-answers `AskUserQuestion` or `ExitPlanMode`, since those are questions for you. Codex asks you to trust the new hook once.
 - **OpenCode**: no hook; the daemon asks the local `opencode service` for the pending permission requests of each bound session and replies `once`. A session is covered when the mbx MCP server has bound it (an exact provider session id and a live process; a project folder never stands in for it), its agent holds an active `permissions` policy, and the service is running. The daemon does not check which kind of serve hosts the session, and whether the service can see a standalone serve's (`opencode --standalone`) pending requests has not been verified — see [OPENCODE.md](OPENCODE.md).
