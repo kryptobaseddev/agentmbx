@@ -4,7 +4,7 @@
 
 Use the published mailbox tools for identity, message handling, bounded catch-up,
 handoff, and delivery inspection. This workflow was reconciled on 2026-10-14
-against npm `agentmbx@latest` **0.5.30**, source `0d26b5bf`, and the current
+against npm `agentmbx@latest` **0.5.32**, source `64ee20ebb1dd97b64be7dd122a11a5a5ce5eacbf`, and the current
 CLEO task records. That version is a reference snapshot, not an install pin:
 `npm install --global agentmbx@latest` follows the registry's current tag.
 
@@ -95,9 +95,9 @@ the accepted provider-neutral startup/resume contract. T185–T189 have adapter 
 and recorded checks, while broader real-provider live gates remain open. T162's
 cross-provider automatic resume matrix remains pending. These task boundaries
 mustn't be turned into a guarantee that every current frontend recovers without
-operator action. The T614 Codex first-entry restart change is merged in source;
-at this snapshot npm latest is still 0.5.30, so its later version bumps don't
-establish published or live post-update proof.
+operator action. The T614 Codex first-entry restart correction is included in
+published npm 0.5.32. Package inclusion doesn't complete still-open real-provider
+restart validation criteria; record the current conversation/runtime proof separately.
 
 ## Delivery topology and current boundaries
 
@@ -147,7 +147,10 @@ Live validation records exact provider and AgentMBX versions, message IDs, sessi
 bindings, and before/after mail/read/ACK state. Keep unsupported providers and
 physical paths visible, and don't complete pending gates from source presence.
 Preserve historical provenance and license audits. No imported framework or
-runtime implementation is introduced by this documentation update.
+runtime implementation is introduced by this documentation update. The accepted
+D045 policy-expiry change is tracked by pending T639; current 0.5.32 still accepts
+owner-signed nonexpiring YOLO. The decided refusal and doctor warning aren't
+shipped protections yet.
 
 ## Non-Goals
 

@@ -1,6 +1,6 @@
 # Collaboration policy, YOLO mode, and owner identity
 
-Status: implemented under CLEO epic T040 (tasks T048, T051–T054), with uncapped acting grants and optional permanent expiry (T537) and the signed outward class split (T498). This maintained reference was checked against published npm 0.5.30 (`0d26b5bf`) on 2026-10-14. Runtime policy classes, scopes, and expiry come from signed records, not from this prose. Section 7 distinguishes current account/device components from proposed owner-authenticator and member contracts. The original design merged:
+Status: implemented under CLEO epic T040 (tasks T048, T051–T054), with uncapped acting grants and optional permanent expiry (T537) and the signed outward class split (T498). This maintained reference was checked against published npm 0.5.32 (`64ee20ebb1dd97b64be7dd122a11a5a5ce5eacbf`) on 2026-10-14. Runtime policy classes, scopes, and expiry come from signed records, not from this prose. Section 7 distinguishes current account/device components from proposed owner-authenticator and member contracts. The original design merged:
 - Keaton's request: agents should collaborate across sessions and machines without per-message approval, including an opt-in "true YOLO" mode;
 - the reviews from master-dev-setup and codex (2026-09-26): use action classes, default to `ask`, require human presence that an agent can't fake, record provenance, and add a kill switch.
 
@@ -59,8 +59,16 @@ It is stored with `owner_sig`.
 - An explicit expiry field is required:
   - Finite `ask`, `collaborate` and `autonomous` policies default to 7 days, 30 days at most.
   - Finite `yolo` policies default to 8 hours, 7 days at most.
-  - `--ttl never` signs `exp: null`, valid until revoked, for any level. It never means an omitted, empty or malformed expiry.
+  - **Current npm 0.5.32:** `--ttl never` signs `exp: null`, valid until revoked, at all actual CLI levels: `ask`, `collaborate`, `autonomous`, and `yolo`. It never means an omitted, empty, or malformed expiry. `read` is an action class, not a policy level.
   - An expired or unverifiable policy fails closed to `ask`.
+
+**Accepted change, not shipped (D045; T639 pending).** The owner decided to refuse
+`--ttl never` for YOLO while keeping nonexpiring non-YOLO policies available.
+Finite YOLO policies retain their existing default and maximum. Doctor will report
+existing nonexpiring YOLO with a re-sign command, without revoking it. Until T639
+is implemented and published, 0.5.32 still accepts YOLO `never`; the decided refusal
+and doctor finding mustn't be treated as current enforcement.
+
 - **Resolution.** For a message from `S@H` to agent `A` on this host, take every unrevoked, unexpired policy that matches `A` and `S@H`. Each policy's classes apply only within that policy's own projects, so scopes never mix across policies. The header lists each grant separately.
 - **Owner on other machines.** A machine takes policies only from its own owner key, or from the owner key that signed a *device record* for it. You create that record on your owner machine with `agentmbx owner add-device <host>`, which needs one Touch ID / passphrase approval.
   - The record names the host and its host key.

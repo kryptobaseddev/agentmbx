@@ -1,7 +1,7 @@
 # Portability: verify the complete path on each machine
 
 AgentMBX supports macOS and Linux. This page records installation and provider
-boundaries against published npm 0.5.30 (source `0d26b5bf`), checked on
+boundaries against published npm 0.5.32 (source `64ee20ebb1dd97b64be7dd122a11a5a5ce5eacbf`), checked on
 2026-10-14. It doesn't assert that every current provider build or physical
 network has been tested. Historical live receipts prove their recorded
 versions/sessions; see [the current roadmap](plan/native-feature-roadmap.md) and
@@ -73,7 +73,7 @@ into owner approval. See [POLICY.md](POLICY.md).
 | Setup policy choice | `--policy <level>` selects onboarding behavior; signed changes still require the owner's signing method. `ask` signs no delegation |
 | Paired-machine propagation | Signed policy push/pull is implemented; verify the actual paired hosts and current revocations |
 | Kill switch | `policy revoke --all` is signed and applies against stale replayed policy |
-| Expiry and renewal | Setup uses 30 days for collaborate/autonomous and 8 hours for YOLO. Explicit policy commands have their own defaults and can use an owner-approved `never` lifetime. `policy renew` requires a signature |
+| Expiry and renewal | Setup uses 30 days for collaborate/autonomous and 8 hours for YOLO. Published 0.5.32 accepts owner-signed `--ttl never` at all actual levels, including YOLO; finite defaults/maxima apply when expiry is finite. D045 accepts refusing YOLO `never` and reporting existing records without revoking them, but T639 is pending. `policy renew` requires a signature; see [POLICY.md](POLICY.md#3-the-policy-record) |
 | Expiry reminders | The daemon can notify the owner-key machine 48 hours before expiry; desktop notification availability remains an OS condition |
 | Acting on peer requests | Owner-signed collaboration is implemented (T048); each message's current computed header supplies the applicable classes, scope, sender restrictions, and expiry |
 | Permission approvals | Read/edit grants alone don't approve pushes or PRs. Eligible untainted `outward-reversible` grants cover non-default pushes/draft PRs; `permissions` enables YOLO through supported adapters. No message itself approves a prompt |
