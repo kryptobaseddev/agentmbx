@@ -3,12 +3,14 @@
  *  native `msg_` id from `ctx.session.synthetic`. No slot means nothing was submitted: the shared
  *  service is not called, so it starts no turn and takes no snapshot. */
 
-export type OpencodeWakePush = { ok: true; id: string } | { ok: false; handedOff: boolean };
+/** T642: `turnSince` is set when the plugin reported the wake landed behind a turn in progress (delivery "queue" waits for its end). */
+export type OpencodeWakePush = { ok: true; id: string; turnSince: string | null } | { ok: false; handedOff: boolean };
 
 interface Slot {
   pid: number;
   offered: boolean;
   settled: boolean;
+  turnSince: string | null;
   deliver: (text: string) => void;
   cancel: () => void;
   accept: (id: string) => void;
@@ -60,6 +62,7 @@ export function waitForOpencodeWake(sessionID: string, pid: number, waitMs = 20_
     pid,
     offered: false,
     settled: false,
+    turnSince: null,
     deliver(text) {
       if (slot.offered) return;
       slot.offered = true;
@@ -98,13 +101,15 @@ export async function pushOpencodeWake(sessionID: string, pid: number, text: str
   if (timer) clearTimeout(timer);
   if (slots.get(sessionID) === slot) slots.delete(sessionID);
   slot.dropReceipt();
-  return id.startsWith("msg_") ? { ok: true, id } : { ok: false, handedOff: true };
+  return id.startsWith("msg_") ? { ok: true, id, turnSince: slot.turnSince } : { ok: false, handedOff: true };
 }
 
-/** The plugin reports the id `ctx.session.synthetic` actually returned. Anything else is refused. */
-export function completeOpencodeWake(sessionID: string, id: string): boolean {
+/** The plugin reports the id `ctx.session.synthetic` actually returned. Anything else is refused. `turnSince` (T642): the
+ *  session was mid-turn when the wake was admitted, since that ISO time; null when idle or not reported (an older plugin). */
+export function completeOpencodeWake(sessionID: string, id: string, turnSince: string | null = null): boolean {
   const slot = slots.get(sessionID);
   if (!slot || !slot.offered || slot.settled || !id.startsWith("msg_")) return false;
+  slot.turnSince = turnSince;
   slot.accept(id);
   return true;
 }

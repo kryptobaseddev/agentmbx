@@ -416,10 +416,13 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
           return send(200, { text });
         }
         if (req.method === "POST") {
-          const j = JSON.parse(body || "{}") as { sessionID?: unknown; id?: unknown };
+          const j = JSON.parse(body || "{}") as { sessionID?: unknown; id?: unknown; turn_since?: unknown };
           if (typeof j.sessionID !== "string" || typeof j.id !== "string" || !j.sessionID || j.sessionID.length > 256)
             return send(400, { error: "bad receipt" });
-          if (!completeOpencodeWake(j.sessionID, j.id)) return send(409, { error: "no wake is waiting for that receipt" });
+          // T642: an optional, well-formed time only; anything else reads as "not reported".
+          const turnSince = typeof j.turn_since === "string" && j.turn_since.length <= 40 && Number.isFinite(Date.parse(j.turn_since))
+            ? new Date(j.turn_since).toISOString() : null;
+          if (!completeOpencodeWake(j.sessionID, j.id, turnSince)) return send(409, { error: "no wake is waiting for that receipt" });
           return send(200, { ok: true });
         }
         return send(405, { error: "method not allowed" });

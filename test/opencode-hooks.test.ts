@@ -62,7 +62,7 @@ test("T391 generated plugin maps OpenCode events, embeds argv as an array, injec
   assert.ok(src.includes(".quiet()") === false, "no Bun-$ shell dependency left");
   assert.ok(!src.includes("/api/session/") && !src.includes('["service", "status"]'), "T518: no shared-service fetch and no service discovery");
   assert.ok(src.includes("session?.synthetic") && src.includes("session?.prompt"), "in-process synthetic, with prompt as the fallback");
-  assert.ok(src.includes('id: noteId(sid, hook, text), text, resume: false'), "hook notes stay resume:false (T518)");
+  assert.ok(src.includes('id: noteId(sid, hook, text, nonce), text, resume: false'), "hook notes stay resume:false (T518)");
   assert.ok(src.includes('id: noteId(sid, "wake", text), text, resume: true'), "a daemon wake resumes the idle turn (T544)");
   assert.ok(src.includes('delivery: "queue"'), "queue waits for idle");
   assert.ok(src.includes('"msg_"'), "a stable message id so a retry is one admission");

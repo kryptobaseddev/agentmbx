@@ -114,6 +114,37 @@ export async function opencodeService() {
         return null;
     }
 }
+/** T642: an OpenCode wake admitted while the session's turn was running. Delivery "queue" holds it until the turn ends. */
+export const OPENCODE_QUEUED_BEHIND_TURN = "queued-behind-turn";
+const behindTurnKey = (agent) => `wake-behind-turn:${agent}`;
+const BEHIND_TURN_CAP = 100;
+/** Remember which of `agent`'s messages were woken into a running turn, newest last (bounded). */
+export function noteQueuedBehindTurn(store, agent, messageIds, at) {
+    let map = {};
+    try {
+        map = JSON.parse(store.get(behindTurnKey(agent)) ?? "{}");
+    }
+    catch {
+        map = {};
+    }
+    for (const id of messageIds) {
+        delete map[id];
+        map[id] = at;
+    }
+    const ids = Object.keys(map);
+    for (const id of ids.slice(0, Math.max(0, ids.length - BEHIND_TURN_CAP)))
+        delete map[id];
+    store.set(behindTurnKey(agent), JSON.stringify(map));
+}
+/** When this message's wake was admitted behind `agent`'s running turn, else null. */
+export function queuedBehindTurnAt(store, agent, messageId) {
+    try {
+        return JSON.parse(store.get(behindTurnKey(agent)) ?? "{}")[messageId] ?? null;
+    }
+    catch {
+        return null;
+    }
+}
 /** T524: why a session that the shared service does not host is never pushed through it. */
 export const OPENCODE_STANDALONE_NO_PUSH = "session is hosted by a standalone OpenCode serve; the shared service would start a duplicate agent loop (next-prompt delivery only)";
 /** Push a wake into an OpenCode session. A service-hosted binding (its provider pid is
@@ -128,8 +159,10 @@ export async function wakeOpencode(sessionId, text, o = {}) {
     if (host === "standalone") {
         const pid = typeof o.pid === "number" && Number.isInteger(o.pid) && o.pid > 0 ? o.pid : 0;
         const pushed = pid > 0 ? await pushOpencodeWake(sessionId, pid, text) : { ok: false, handedOff: false };
+        // T642: admitted behind a turn in progress waits for that turn to end; the sender's receipt says so.
         if (pushed.ok)
-            return outcome(via, { kind: "admitted", receipt: receipt("native", { nativeId: pushed.id, sessionId, nativeStatus: "queued" }) });
+            return outcome(via, { kind: "admitted", receipt: receipt("native", { nativeId: pushed.id, sessionId,
+                    nativeStatus: pushed.turnSince ? OPENCODE_QUEUED_BEHIND_TURN : "queued" }) });
         // The plugin already has the text. A missing msg_ id is not a reason to POST it to the service.
         if (pushed.handedOff)
             return outcome(via, { kind: "unknown", reason: "lost-response", detail: "standalone plugin took the wake and returned no msg_ receipt" });
@@ -536,6 +569,8 @@ export async function dispatchWakes(node, now = Date.now()) {
                 ...(result.outcome && "reason" in result.outcome ? { reason: result.outcome.reason } : {}),
                 ...(result.outcome?.kind === "admitted" ? { receipt: result.outcome.receipt.strength, native: result.outcome.receipt.nativeId,
                     ...(result.outcome.receipt.nativeStatus ? { nativeStatus: result.outcome.receipt.nativeStatus } : {}) } : {}) });
+            if (result.outcome?.kind === "admitted" && result.outcome.receipt.nativeStatus === OPENCODE_QUEUED_BEHIND_TURN)
+                noteQueuedBehindTurn(node.store, agent, marker.messageIds, marker.at);
             const o = result.outcome, kind = o?.kind;
             if (o?.kind === "not_submitted" && o.reason === "fenced") {
                 fenced = true;
