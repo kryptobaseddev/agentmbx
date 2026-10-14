@@ -5,7 +5,7 @@ import { IdentityLeases, identityLeaseStatus, type IdentityLease } from "./ident
 import type { Envelope } from "./envelope.ts";
 import { GROK_NO_PUSH, type MbxNode, type RouteTarget } from "./node.ts";
 import { type MessageRow, type Store } from "./store.ts";
-import { hasWakeAuthority, liveWatcher, watcherKey } from "./wake.ts";
+import { hasWakeAuthority, liveWatcher, queuedBehindTurnAt, watcherKey } from "./wake.ts";
 import { captureWakeIdentity } from "./wake-identity.ts";
 import { procTable } from "./proc.ts";
 import { activityKey, parseActivity, SHARED_IDLE_MS } from "./identity-availability.ts";
@@ -128,13 +128,17 @@ export function recipientReceipts(node: MbxNode, msgId: string, targets: RouteTa
       state = why ? "live-next-prompt" : "live-wake";
       detail = why ? `${live.detail}; seen on its next prompt: ${why}`
         : rearming && !watcher ? `${live.detail}; eligible for wake (mbx watcher: its exit starts your next turn); watcher re-arm pending, dispatcher admission pending`
-        : `${live.detail}; eligible for wake (${mode}); dispatcher admission pending`;
+        : `${live.detail}; eligible for wake (${mode}); dispatcher admission pending${verified.some((s) => s.cli === "opencode") ? `; ${OPENCODE_MIDTURN_NOTE}` : ""}`;
     }
     if (t.renamed_from) { detail = `${t.renamed_from} was renamed to ${name}; ${state}: ${detail}`; state = "forwarded"; }
     out.push({ to: t.to, address, state, detail });
   }
   return out;
 }
+
+/** T642: what an OpenCode recipient in the middle of a turn sees, and when. */
+export const OPENCODE_MIDTURN_NOTE = "an OpenCode session in the middle of a turn sees it with its next tool result, and the wake itself when that turn ends";
+export const OPENCODE_BEHIND_TURN_NOTE = "wake queued behind the session's running turn: the model sees a notice with its next tool result, the wake when the turn ends";
 
 /** Warning lines for recipients nobody will read soon. */
 export const offlineWarnings = (rs: RecipientReceipt[]): string[] =>
@@ -181,6 +185,8 @@ export function assertKnownRecipients(node: MbxNode, to: string[]): void {
 
 export interface DeliveryReceipt {
   address: string; state: string; updated_at: string | null; note: string | null; did: string | null; liveness: string;
+  /** T642: the wake was admitted into a turn already running, so it waits for that turn (or the session's next tool result). */
+  wake?: string;
   outbox?: { attempts: number; last_error_code: string | null; next_at: string };
 }
 
@@ -190,8 +196,10 @@ export function deliveryReceipts(node: MbxNode, m: MessageRow, now = Date.now())
   const local = (node.store.db.prepare("SELECT agent,state,updated_at,note FROM deliveries WHERE msg_id=? ORDER BY agent").all(m.id) as
     { agent: string; state: string; updated_at: string; note: string | null }[]).map((d) => {
     const live = d.agent === "owner" ? { live: true, detail: "the owner" } : mailboxLiveness(node, d.agent, now);
+    const behind = d.state === "delivered" || d.state === "notified" ? queuedBehindTurnAt(node.store, d.agent, m.id) : null;
     return { address: `${d.agent}@${node.host}`, state: d.state, updated_at: d.updated_at, note: d.note, did: dids.get(d.agent) ?? null,
-      liveness: live.live ? `live: ${live.detail}` : `offline: ${live.detail}` };
+      liveness: live.live ? `live: ${live.detail}` : `offline: ${live.detail}`,
+      ...(behind ? { wake: `${OPENCODE_BEHIND_TURN_NOTE} (admitted ${behind.slice(0, 19)}Z)` } : {}) };
   });
   // Remote recipients: the envelope's addressees on other hosts; a queued outbox row means not yet accepted there.
   const e = JSON.parse(m.envelope) as Envelope;
@@ -220,6 +228,7 @@ export function deliveryReceipts(node: MbxNode, m: MessageRow, now = Date.now())
 /** One line per recipient, for thread views. */
 // "notified" with note "desktop" means only the owner saw a desktop notice: no agent session was told.
 export const receiptLine = (r: DeliveryReceipt) => `  → ${r.address}: ${r.state === "notified" && r.note === "desktop" ? "notified (owner desktop notice only)" : r.state}${r.updated_at ? ` ${r.updated_at.slice(0, 19)}Z` : ""}`
+  + `${r.wake ? ` · ${r.wake}` : ""}`
   + `${r.did ? ` · did: ${r.did}` : ""}${r.note ? ` · note: ${r.note}` : ""}${r.outbox ? ` · attempts ${r.outbox.attempts}${r.outbox.last_error_code ? ` (${r.outbox.last_error_code})` : ""}` : ""} · ${r.liveness}`;
 
 const DELIVERY_RANKS = new Set(["queued", "delivered", "notified", "read", "acked"]);

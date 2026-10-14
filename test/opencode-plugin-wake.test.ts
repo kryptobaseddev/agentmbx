@@ -45,7 +45,7 @@ test("queue: matching pid delivers once; wrong pid, bad id, and a missing receip
     assert.equal(completeOpencodeWake("ses_q", "nope"), false);
     assert.equal(completeOpencodeWake("ses_q", "msg_native"), true);
     assert.equal(completeOpencodeWake("ses_q", "msg_native"), false);
-    assert.deepEqual(await pushed, { ok: true, id: "msg_native" });
+    assert.deepEqual(await pushed, { ok: true, id: "msg_native", turnSince: null });
 
     const held = waitForOpencodeWake("ses_hold", 7, 2_000);
     const late = pushOpencodeWake("ses_hold", 7, "late", 50);
@@ -58,7 +58,7 @@ test("queue: matching pid delivers once; wrong pid, bad id, and a missing receip
     const again = pushOpencodeWake("ses_rep", 7, "second", 500);
     assert.equal(await second, "second");
     assert.equal(completeOpencodeWake("ses_rep", "msg_second"), true);
-    assert.deepEqual(await again, { ok: true, id: "msg_second" });
+    assert.deepEqual(await again, { ok: true, id: "msg_second", turnSince: null });
 
     assert.deepEqual(await pushOpencodeWake("ses_none", 7, "x", 20), { ok: false, handedOff: false });
   } finally { resetOpencodeWakeQueue(); }
@@ -84,7 +84,7 @@ test("GET/POST /v1/opencode-wake holds on loopback and completes only a msg_ rec
     assert.deepEqual(await res.json(), { text: "via-http" });
     const posted = await fetch(base, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionID: "ses_h", id: "msg_http" }) });
     assert.equal(posted.status, 200);
-    assert.deepEqual(await pushed, { ok: true, id: "msg_http" });
+    assert.deepEqual(await pushed, { ok: true, id: "msg_http", turnSince: null });
     assert.equal((await fetch(`http://127.0.0.1:${port}/v1/status`)).status, 200, "the public status route is unchanged");
     assert.equal((await fetch(`http://127.0.0.1:${port}/v1/agents`)).status, 401, "the queue does not authorize a signed route");
     const waitersUrl = `${base}/waiters`;

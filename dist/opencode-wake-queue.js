@@ -43,6 +43,7 @@ export function waitForOpencodeWake(sessionID, pid, waitMs = 20_000) {
         pid,
         offered: false,
         settled: false,
+        turnSince: null,
         deliver(text) {
             if (slot.offered)
                 return;
@@ -85,13 +86,15 @@ export async function pushOpencodeWake(sessionID, pid, text, receiptMs = 5_000) 
     if (slots.get(sessionID) === slot)
         slots.delete(sessionID);
     slot.dropReceipt();
-    return id.startsWith("msg_") ? { ok: true, id } : { ok: false, handedOff: true };
+    return id.startsWith("msg_") ? { ok: true, id, turnSince: slot.turnSince } : { ok: false, handedOff: true };
 }
-/** The plugin reports the id `ctx.session.synthetic` actually returned. Anything else is refused. */
-export function completeOpencodeWake(sessionID, id) {
+/** The plugin reports the id `ctx.session.synthetic` actually returned. Anything else is refused. `turnSince` (T642): the
+ *  session was mid-turn when the wake was admitted, since that ISO time; null when idle or not reported (an older plugin). */
+export function completeOpencodeWake(sessionID, id, turnSince = null) {
     const slot = slots.get(sessionID);
     if (!slot || !slot.offered || slot.settled || !id.startsWith("msg_"))
         return false;
+    slot.turnSince = turnSince;
     slot.accept(id);
     return true;
 }

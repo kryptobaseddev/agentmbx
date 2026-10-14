@@ -1246,11 +1246,14 @@ const spawnCli: Spawn = (bin, args, input, cb) => ((globalThis as { __mbxSpawn?:
  *  "queue" waits for idle instead of steering the current turn. The id is a hash of session,
  *  hook and text, so a retry is the same admission and a different note is a different one. */
 type NoteCtx = { session?: { synthetic?: (body: Record<string, unknown>) => Promise<unknown>; prompt?: (body: Record<string, unknown>) => Promise<unknown> } };
-const noteId = (sid: string, hook: string, text: string): string =>
-  "msg_" + createHash("sha256").update(sid + "\\0" + hook + "\\0" + text).digest("hex").slice(0, 32);
-const inject = async (ctx: NoteCtx, sid: string, hook: string, text: string): Promise<boolean> => {
+const noteId = (sid: string, hook: string, text: string, nonce = ""): string =>
+  "msg_" + createHash("sha256").update(sid + "\\0" + hook + "\\0" + text + (nonce ? "\\0" + nonce : "")).digest("hex").slice(0, 32);
+// T642: a post-tool note repeats its text whenever the unread count repeats ("[mbx] 7 unread ..."), and the host keeps one message
+// per id, so a text-only id silently dropped every repeat for the session's lifetime. The post-tool fallback passes a nonce (the
+// marker of the delivery it reports); a T187 retry of one occurrence still reuses its id.
+const inject = async (ctx: NoteCtx, sid: string, hook: string, text: string, nonce = ""): Promise<boolean> => {
   if (!sid || !text) return false;
-  const body = { sessionID: sid, id: noteId(sid, hook, text), text, resume: false, delivery: "queue" };
+  const body = { sessionID: sid, id: noteId(sid, hook, text, nonce), text, resume: false, delivery: "queue" };
   const session = ctx?.session;
   try {
     if (typeof session?.synthetic === "function") {
@@ -1359,10 +1362,45 @@ const watchWake = (ctx: NoteCtx, sid: string): void => {
       const id = await admitWake(ctx, sid, text);
       if (!id) continue;
       try {
-        await fetch(base, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionID: sid, id }) });
+        // T642: say whether the wake landed behind a turn in progress, so the sender's receipt can tell it waits for that turn.
+        const since = turnSince.get(sid);
+        await fetch(base, { method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ sessionID: sid, id, ...(since ? { turn_since: new Date(since).toISOString() } : {}) }) });
       } catch { /* the receipt wait ends; nothing is sent to the shared service */ }
     }
   })();
+};
+
+/** T642: a session is mid-turn from its first tool call (or execution start) until its turn ends (idle / execution succeeded).
+ *  Delivery "queue" holds a note or a wake until that end, so the post-tool notice rides the tool result instead. */
+const turnSince = new Map<string, number>();
+const markTurn = (sid: string): void => { if (!turnSince.has(sid)) turnSince.set(sid, Date.now()); };
+const endTurn = (sid: string): void => { turnSince.delete(sid); };
+/** The occurrence a post-tool note reports: the marker the daemon bumped for the delivery, else the time. */
+const postToolNonce = (sid: string): string => {
+  try {
+    const dir = join(process.env.MBX_HOME || join(homedir(), ".local", "share", "agentmbx"), "posttool");
+    const marker = readFileSync(join(dir, "opencode-" + sid + ".marker"), "utf8").trim();
+    if (marker) return marker;
+  } catch { /* no marker yet */ }
+  return "t" + Date.now();
+};
+/** v1 tool.execute.after(input, output): the model reads output.output as the tool result. */
+const appendV1 = (output: unknown, text: string): boolean => {
+  const o = output as { output?: unknown } | undefined;
+  if (!o || typeof o !== "object" || typeof o.output !== "string") return false;
+  o.output = o.output + "\\n\\n" + text;
+  return true;
+};
+/** v2 execute.after: a completed result's content is what the model reads; string or Content[] only (T642 D1a). An error
+ *  result, or one with no text content, is left alone and the note falls back to the queue. */
+const appendV2 = (event: unknown, text: string): boolean => {
+  const e = event as { status?: unknown; result?: { content?: unknown } & Record<string, unknown> } | undefined;
+  if (!e || e.status !== "completed" || !e.result || typeof e.result !== "object") return false;
+  const content = e.result.content;
+  if (typeof content === "string") { e.result = { ...e.result, content: content + "\\n\\n" + text }; return true; }
+  if (Array.isArray(content)) { e.result = { ...e.result, content: [...content, { type: "text", text }] }; return true; }
+  return false;
 };
 
 /** T341: the post-tool fast path, the same rule as Claude's sh wrapper (T342). OpenCode runs the
@@ -1382,10 +1420,13 @@ const postToolSteady = (sid: string): boolean => {
 /** One hook call: the JSON payload goes in on stdin; stdout is captured; a reason we recognize is
  *  admitted through the hosting serve's session API. A failure never surfaces. The same call starts
  *  the standalone wake poll once the session id is known. */
-const call = async (ctx: NoteCtx, bin: string[], event: string, payload: Record<string, unknown>, pending: Map<string, string>, sending: Set<string>): Promise<void> => {
+const call = async (ctx: NoteCtx, bin: string[], event: string, payload: Record<string, unknown>, pending: Map<string, string>, sending: Set<string>,
+  place?: (text: string) => boolean): Promise<void> => {
   try {
     const sid = typeof payload.session_id === "string" ? payload.session_id : null;
     if (sid) watchWake(ctx, sid);
+    if (sid && event === "post-tool") markTurn(sid);
+    if (sid && event === "stop") endTurn(sid);
     // T187: retry an unadmitted notice on an existing hook, without bypassing the zero-spawn fast path.
     const deliver = async () => {
       if (!sid || sending.has(sid)) return;
@@ -1397,6 +1438,7 @@ const call = async (ctx: NoteCtx, bin: string[], event: string, payload: Record<
     };
     await deliver();
     if (event === "post-tool" && sid && postToolSteady(sid)) return;
+    const nonce = event === "post-tool" && sid ? postToolNonce(sid) : "";
     const out = await new Promise<string>((resolve) => spawnCli(bin, ["hook", event, "--cli", "opencode"], JSON.stringify(payload), resolve));
     for (const line of out.split("\\n")) {
       try {
@@ -1407,13 +1449,14 @@ const call = async (ctx: NoteCtx, bin: string[], event: string, payload: Record<
     }
     await deliver();
     const reason = hookReason(out);
-    if (reason && sid) await inject(ctx, sid, event, reason);
+    // T642: a post-tool notice goes into the tool result, which the model reads within the turn; the queue only as a fallback.
+    if (reason && sid && !(event === "post-tool" && place && place(reason))) await inject(ctx, sid, event, reason, nonce);
   } catch { /* hook failures must never surface in the host TUI */ }
 };
 
 const runFor = (ctx: NoteCtx, bin: string[], cwd: string | undefined) => {
   const pending = new Map<string, string>(), sending = new Set<string>();
-  return (event: string, payload: Record<string, unknown>) => call(ctx, bin, event, { cwd, ...payload }, pending, sending);
+  return (event: string, payload: Record<string, unknown>, place?: (text: string) => boolean) => call(ctx, bin, event, { cwd, ...payload }, pending, sending, place);
 };
 
 const sidOf = (v: unknown): string | undefined => {
@@ -1444,9 +1487,9 @@ export const AgentMBXHooks = async (ctx: NoteCtx & { $?: unknown; client?: unkno
       if (event?.type === "session.created") return run("session-start", { session_id: sid, cwd: directoryOf(event.properties) ?? directory, mbx_entry: "created" });
       if (event?.type === "session.idle") return run("stop", { session_id: sid });
     },
-    "tool.execute.after": async (input: { sessionID?: unknown; session_id?: unknown }) => {
+    "tool.execute.after": async (input: { sessionID?: unknown; session_id?: unknown }, output?: { output?: unknown }) => {
       const sid = sidOf(input);
-      if (sid) return run("post-tool", { session_id: sid });
+      if (sid) return run("post-tool", { session_id: sid }, (text) => appendV1(output, text));
     },
   };
 };
@@ -1483,10 +1526,12 @@ export default {
           if (ev.type === "session.created") void run("session-start", { session_id: sid, cwd: ev.location?.directory ?? directoryOf(ev.data) ?? dir, mbx_entry: "created" });
           else if (ev.type === "session.idle" || ev.type === "session.execution.succeeded") void run("stop", { session_id: sid });
           else if (ev.type === "session.tool.called" && !ctx?.tool?.hook) void run("post-tool", { session_id: sid });
+          else if (ev.type === "session.execution.started") markTurn(sid);
         }
       } catch { /* aborted or the stream ended: never surface in the host */ }
     })();
-    try { ctx?.tool?.hook?.("execute.after", (input: unknown) => { const sid = sidOf(input); if (sid) void run("post-tool", { session_id: sid }); }); } catch { /* optional */ }
+    // T642: awaited, so a notice can be placed in this tool's result before OpenCode hands it to the model.
+    try { ctx?.tool?.hook?.("execute.after", async (input: unknown) => { const sid = sidOf(input); if (sid) await run("post-tool", { session_id: sid }, (text) => appendV2(input, text)); }); } catch { /* optional */ }
     return () => ctl.abort();
   },
 };
