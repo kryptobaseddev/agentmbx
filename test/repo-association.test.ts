@@ -139,7 +139,7 @@ test("AC4: the synced project key comes from the recorded association, survives 
   // projectKeyOf answers nothing: the key can only come from the stored association.
   const source = loadSyncSnapshot(node, { contractAllowsProjectPaths: false }, () => undefined);
   assert.deepEqual(source.agents.find((a) => a.name === "widget-dev")?.project_keys, ["github.com/acme/widget"]);
-  const projected = projectSync({ ...source, now: new Date().toISOString(), seq: 1, full: true, contract: 2, contractAllowsProjectPaths: false, contractAllowsProjectLeads: false, sentReceipts: [] });
+  const projected = projectSync({ ...source, now: new Date().toISOString(), seq: 1, full: true, contract: 2, contractAllowsProjectPaths: false, contractAllowsProjectLeads: false, contractAllowsRepo: false, sentReceipts: [] });
   assert.ok(projected.ok);
   assert.deepEqual((projected.batch.agents as { upsert: { name: string; project_keys: string[] }[] }).upsert.find((a) => a.name === "widget-dev")?.project_keys, ["github.com/acme/widget"]);
   for (const text of [projected.body, JSON.stringify(source)]) {
@@ -147,4 +147,28 @@ test("AC4: the synced project key comes from the recorded association, survives 
   }
   const dump = JSON.stringify(["project_repos", "identity_projects", "sessions", "audit", "kv"].map((tb) => node.store.db.prepare(`SELECT * FROM ${tb}`).all()));
   assert.ok(!dump.includes(SECRET) && !dump.includes("x-access-token"), "the token is stored nowhere");
+});
+
+test("T640: the sync snapshot counts the recorded worktrees of the agent's repository and sends key + count only, at contract 3", (t) => {
+  const f = fixture(); t.after(() => rmSync(f.root, { recursive: true, force: true }));
+  const home = mkdtempSync(join(tmpdir(), "mbx-t640-")); t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  const node = new MbxNode(home, { host: "alpha" });
+  t.after(() => node.close());
+  recordRepoAssociation(node.store, f.repo);
+  recordRepoAssociation(node.store, f.wt);
+  registerIdentity(node.store, { name: "widget-dev", role: "developer" });
+  registerIdentity(node.store, { name: "plain-dev", role: "developer" });
+  noteProject(node.store, "widget-dev", f.wt, true);
+  noteProject(node.store, "plain-dev", f.plain, true);
+  const source = loadSyncSnapshot(node, { contractAllowsProjectPaths: false }, () => undefined);
+  assert.deepEqual(source.agents.find((a) => a.name === "widget-dev")?.repo, { key: "github.com/acme/widget", worktrees: 2 });
+  assert.equal(source.agents.find((a) => a.name === "plain-dev")?.repo, null);
+  const projected = projectSync({ ...source, now: new Date().toISOString(), seq: 1, full: true, contract: 3,
+    contractAllowsProjectPaths: false, contractAllowsProjectLeads: false, contractAllowsRepo: true, sentReceipts: [] });
+  assert.ok(projected.ok);
+  if (!projected.ok) return;
+  const agent = (projected.batch.agents as { upsert: { name: string; repo: unknown }[] }).upsert.find((a) => a.name === "widget-dev");
+  assert.deepEqual(agent?.repo, { project_key: "github.com/acme/widget", worktree_count: 2 });
+  assert.ok(!projected.body.includes(SECRET) && !projected.body.includes(f.repo) && !projected.body.includes("Widget.git"),
+    "no credential, path, raw URL or branch leaves the host");
 });

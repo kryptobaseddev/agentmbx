@@ -6,7 +6,7 @@
 // project_leads set. A range that does not overlap, such as {3,4}, does not change the link.
 import { createHash, randomBytes } from "node:crypto";
 import {
-  CONTRACT_VERSION, PATH_FLAG_PREFIX, PROJECT_LEADS_SINCE, PROJECT_PATHS_SINCE, projectSync, type Projection, type SyncSnapshot,
+  CONTRACT_VERSION, PATH_FLAG_PREFIX, PROJECT_LEADS_SINCE, PROJECT_PATHS_SINCE, REPO_SINCE, projectSync, type Projection, type SyncSnapshot,
 } from "./sync-projection.ts";
 
 export const LINK_KEY = "sync.link";
@@ -77,7 +77,7 @@ export interface SyncDeps {
   fetch: typeof fetch;
   now: number;
   /** Called only when a new batch will be sent. Not called when unlinked, waiting, or resending. */
-  source: (ctx: { now: string; seq: number; full: boolean; contract: number; contractAllowsProjectPaths: boolean; contractAllowsProjectLeads: boolean; sentReceipts: string[]; lastAck?: string | null }) => Omit<SyncSnapshot, "now" | "seq" | "full" | "contract" | "contractAllowsProjectPaths" | "contractAllowsProjectLeads" | "sentReceipts">;
+  source: (ctx: { now: string; seq: number; full: boolean; contract: number; contractAllowsProjectPaths: boolean; contractAllowsProjectLeads: boolean; contractAllowsRepo: boolean; sentReceipts: string[]; lastAck?: string | null }) => Omit<SyncSnapshot, "now" | "seq" | "full" | "contract" | "contractAllowsProjectPaths" | "contractAllowsProjectLeads" | "contractAllowsRepo" | "sentReceipts">;
   signer?: SyncSigner;
   audit?: (event: string, detail: Record<string, string | number | boolean>) => void;
 }
@@ -180,9 +180,10 @@ export async function syncOnce(o: SyncDeps): Promise<SyncResult> {
     const seq = state.ack_seq + 1;
     const allowsPaths = contract >= PROJECT_PATHS_SINCE && link.project_paths === true;
     const allowsLeads = contract >= PROJECT_LEADS_SINCE && link.project_leads === true;
+    const allowsRepo = contract >= REPO_SINCE;
     const sentAt = new Date(o.now).toISOString();
-    const snap = o.source({ now: sentAt, seq, full: true, contract, contractAllowsProjectPaths: allowsPaths, contractAllowsProjectLeads: allowsLeads, sentReceipts: state.sent_receipts, lastAck: state.acked_at ?? null });
-    const common = { ...snap, now: sentAt, seq, contract, contractAllowsProjectPaths: allowsPaths, contractAllowsProjectLeads: allowsLeads, sentReceipts: state.sent_receipts };
+    const snap = o.source({ now: sentAt, seq, full: true, contract, contractAllowsProjectPaths: allowsPaths, contractAllowsProjectLeads: allowsLeads, contractAllowsRepo: allowsRepo, sentReceipts: state.sent_receipts, lastAck: state.acked_at ?? null });
+    const common = { ...snap, now: sentAt, seq, contract, contractAllowsProjectPaths: allowsPaths, contractAllowsProjectLeads: allowsLeads, contractAllowsRepo: allowsRepo, sentReceipts: state.sent_receipts };
     const fullTry: Projection = projectSync({ ...common, full: true });
     if (!fullTry.ok) {
       state.next_at = o.now + 15_000;

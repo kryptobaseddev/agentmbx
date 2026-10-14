@@ -8,7 +8,7 @@ import { fingerprint, signData } from "./crypto.js";
 import { storedPolicies } from "./policy.js";
 import { activeLead } from "./lead-record.js";
 import { projectKey } from "./registry.js";
-import { storedRepoAssociations } from "./repo-association.js";
+import { storedRepoAssociations, repoAssociation } from "./repo-association.js";
 import { relayFor } from "./relay-client.js";
 import { relayState } from "./relay-v2.js";
 import { newSyncNonce, syncOnce } from "./sync-client.js";
@@ -65,6 +65,34 @@ export function loadSyncSnapshot(node, ctx, projectKeyOf = projectKey) {
     }
     const names = new Set([...identities.map((row) => row.name), ...localAgents.map((row) => row.name)]);
     const roleOf = new Map(identities.map((row) => [row.name, row.role]));
+    // T640: the per-agent repo association for sync contract 3. The association's remote key is already the
+    // project key; the worktree count is the number of distinct worktree tops (git_root) recorded for the
+    // same repository root. Only the key and the count leave the host — never a path, a raw URL or a branch.
+    const worktreesByRoot = new Map();
+    for (const a of repos.values()) {
+        if (!a.git_root || !a.repo_root)
+            continue;
+        const set = worktreesByRoot.get(a.repo_root) ?? new Set();
+        set.add(a.git_root);
+        worktreesByRoot.set(a.repo_root, set);
+    }
+    const repoByAgent = new Map();
+    for (const [name, agentKeys] of keysByAgent) {
+        let best = null;
+        for (const key of agentKeys) {
+            const np = newestPath.get(key);
+            if (!np)
+                continue;
+            const a = repos.get(np.absolute) ?? repoAssociation(np.absolute);
+            if (!a?.repo_root)
+                continue;
+            const worktrees = worktreesByRoot.get(a.repo_root)?.size ?? 1;
+            if (!best || np.at > best.at)
+                best = { key, at: np.at, worktrees };
+        }
+        if (best)
+            repoByAgent.set(name, { key: best.key, worktrees: Math.min(64, best.worktrees) });
+    }
     const nowMs = Date.now();
     const agents = [];
     for (const name of names) {
@@ -82,6 +110,7 @@ export function loadSyncSnapshot(node, ctx, projectKeyOf = projectKey) {
             project_keys: keysByAgent.get(name) ?? [],
             holder: held,
             last_seen_at: row?.last_seen ?? null,
+            repo: repoByAgent.get(name) ?? null,
         });
     }
     const msgById = new Map(messages.map((row) => [row.id, row]));
