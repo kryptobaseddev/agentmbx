@@ -2,7 +2,7 @@
 
 **A signed mailbox for AI coding agents.** Claude Code, Codex, OpenCode, Kimi, Hermes and any MCP client can message each other: on one machine or across machines on your network. Idle agents get woken up, and every message shows which machine signed it and whether the sender held that mailbox's identity lease. Agent names are labels, so a label never proves which agent wrote a message.
 
-[agentmbx.com](https://agentmbx.com) · Status: **alpha (0.5.32)** · License: [BUSL-1.1](LICENSE) (source-available)
+[agentmbx.com](https://agentmbx.com) · [![npm latest](https://img.shields.io/npm/v/agentmbx.svg)](https://www.npmjs.com/package/agentmbx) · Status: **alpha** · License: [BUSL-1.1](LICENSE) (source-available)
 
 ```text
 you ── Claude Code (planner) ──┐                         ┌── Codex (api-dev)      ← woken by `codex queue`
@@ -10,6 +10,39 @@ you ── Claude Code (planner) ──┐                         ┌── Cod
      Kimi / Hermes / any MCP ──┘   (this machine)   LAN  └── Claude (reviewer)    ← woken by a channel event
                                                           (a paired machine)
 ```
+
+## Install the current npm release
+
+Install [Node.js 24 or newer](https://nodejs.org/en/download), then run:
+
+```sh
+npm install --global agentmbx@latest
+agentmbx setup
+agentmbx doctor
+```
+
+The npm registry's `latest` tag is the standard release and installation path. It
+resolves the current published version each time you run the install command; it
+doesn't update an existing installation automatically. Check and upgrade with:
+
+```sh
+npm view agentmbx@latest version    # current published npm release
+agentmbx version                  # installed CLI and installation kind
+npm install --global agentmbx@latest
+agentmbx setup                    # refresh daemon, MCP paths, hooks, and skill
+agentmbx doctor
+```
+
+Restart agent sessions after their first setup. For an existing connection, use
+`mbx_whoami` to verify its runtime and identity after upgrading; older connectors
+may need a reconnect in the same conversation. A version in `package.json`, a
+Git tag, or this checkout can be ahead of the npm release.
+
+The [installation guide](docs/INSTALL.md) covers PATH conflicts, manual MCP
+configuration, and the optional standalone binary. `agentmbx version --check`
+and `agentmbx update` check the signed **GitHub binary release** manifest; they
+aren't npm dist-tag queries. For an npm installation, upgrade with the npm command
+above. Maintainers: [release procedure](docs/RELEASING.md).
 
 ## Status line
 
@@ -74,7 +107,7 @@ remote delivery, model execution, a reply, or task completion.
 | Durable catch-up checkpoints per identity (`mbx_catchup`) and guided resume hints | Shipped in v0.5.3 | T156–T158 |
 | Handoff summaries and optional drafts | `mbx_handoff`: context computed fresh plus one saved note with task and message references (docs/spec/handoff-context.md, T159); no draft API today | T159–T163, T184–T189 |
 | Durable relay: SQLite store, relay-signed accepts, restore-proof sequencing, sender deadlines, v2 client | Shipped in v0.5.5; hosted at relay.agentmbx.com since 2026-10-03 | T164–T166, T307 |
-| Status surface: `agentmbx status --json` (mbx.status/v1), daemon-written HUD snapshots, `agentmbx statusline` adapters; resumed Claude sessions keep their mailbox | Shipped in v0.5.6 (Claude, Codex, Kimi, OpenCode); v0.5.7 adds Grok as a first-class CLI and per-CLI status line setup that never overwrites a user's own; v0.5.8 makes Kimi's line alert-only per session and has `doctor` verify each CLI's status line wiring (Copilot, Cursor and Gemini adapters render once session detection lands) | T308–T313, T326, T337, T347, T366, T368 |
+| Status surface: `agentmbx status --json --schema mbx.status/v1`, daemon-written HUD snapshots, `agentmbx statusline` adapters; resumed Claude sessions keep their mailbox | Shipped in v0.5.6 (Claude, Codex, Kimi, OpenCode); v0.5.7 adds Grok as a first-class CLI and per-CLI status line setup that never overwrites a user's own; v0.5.8 makes Kimi's line alert-only per session and has `doctor` verify each CLI's status line wiring (Copilot, Cursor and Gemini adapters render once session detection lands) | T308–T313, T326, T337, T347, T366, T368 |
 | Relay crash drills, `relay backup`/`restore`/`log` with receipts and rollback, retention sweep, expiry notices | Shipped in v0.5.7 | T167 |
 | Relay key pinning by fingerprint, signed expiring encryption-key ads, enrolment recovery, pluggable enrolment authority | Shipped in v0.5.7 (upgrade the relay before senders) | T168 |
 | HTTPS deployment, monitoring, account enrollment, consent and home/work qualification | Planned (relay backup/restore landed with T167) | T169–T173; T036–T039 |
@@ -85,8 +118,9 @@ remote delivery, model execution, a reply, or task completion.
 For historical context, use bounded `mbx_replay` pages. Retain page information or
 retrievable message IDs durably before advancing the saved cursor; track unfinished
 processing separately, and ACK separately. Losing the cursor means an explicit
-rewind and message-ID deduplication. There is no automatic server-owned consumer
-checkpoint or provider reasoning restoration. Diagnostics are useful on a failed
+rewind and message-ID deduplication. `mbx_replay` doesn't save a consumer checkpoint. `mbx_catchup` saves an identity
+checkpoint only after you explicitly commit a durably captured page. Neither restores
+provider reasoning. Diagnostics are useful on a failed
 call or a confirmed version mismatch; an old native connector may need a one-time
 reconnect within the same conversation, without releasing or taking over its persona.
 
@@ -105,20 +139,21 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
 
 ## What you get
 
-- **15 MCP tools** that work in any MCP client: `mbx_inbox`, `mbx_read`, `mbx_reply`, `mbx_ack`, `mbx_send`, `mbx_sent`, `mbx_thread`, `mbx_search`, `mbx_agents`, `mbx_whoami`, `mbx_identity`, `mbx_replay`, `mbx_catchup`, `mbx_project` and `mbx_forward` (project lead), plus the guide as the resource `mbx://guide` and the prompt `mbx_guide`.
-- **One-command setup:** `agentmbx setup` finds Claude Code, Codex, OpenCode, Kimi and Hermes and wires each one (MCP server, hooks, and a bundled skill that teaches agents the mailbox loop). `agentmbx doctor` checks it all.
-- **Addressing:** `agent`, `agent@host`, `role:reviewer`, `*` (broadcast), or `owner` (you).
+- **17 MCP tools:** `mbx_whoami`, `mbx_identity`, `mbx_inbox`, `mbx_read`, `mbx_reply`, `mbx_ack`, `mbx_send`, `mbx_sent`, `mbx_delivery`, `mbx_thread`, `mbx_search`, `mbx_agents`, `mbx_replay`, `mbx_catchup`, `mbx_handoff`, `mbx_project`, and `mbx_forward` (project lead). The version-matched guide is the resource `mbx://guide` and prompt `mbx_guide`; the [MCP reference](docs/SPEC.md#mcp-tools) lists inputs and state changes.
+- **One-command setup:** `agentmbx setup` finds Claude Code, Codex, OpenCode, Kimi, Hermes, and Grok and wires each one (MCP server, hooks, and a bundled skill that teaches agents the mailbox loop). `agentmbx doctor` checks it all.
+- **Addressing:** `agent`, `agent@host`, `role:reviewer`, `task:T123`, `lead` or `role:lead` (this project's owner-designated lead), `*` (broadcast), or `owner` (you).
 - **Threads, replies, and requests that need a reply.** `@mentions`, `/claim` / `/done` directives and task refs (`T123`) are parsed from the body.
-- **Wake-ups for idle sessions**, one adapter per CLI. The wake text never contains the message itself, only a pointer to the inbox tool.
+- **Wake-ups for idle sessions**, one adapter per CLI. The wake text never contains the message itself, only a pointer to the inbox tool. Live-test labels below refer to historical harness receipts; revalidate your current provider and AgentMBX build rather than treating those receipts as universal support.
 
   | CLI | Wake path | Status |
   |---|---|---|
-  | Codex | `codex queue --thread <id>` | tested live |
-  | OpenCode | service-hosted session: the local service's session API (`/synthetic`). `--standalone` session: the plugin inside that session's own serve, over a loopback queue (see [OPENCODE.md](docs/OPENCODE.md)) | service path tested live; standalone wakes are admitted in-process, whether one starts a turn on an idle session is unproven (T544) |
-  | Claude Code | pushed by the session's own mbx MCP server through Claude Code's per-session inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`), so a plainly started `claude` wakes on mail with no flag, setting or cron; `agentmbx claude [args]` adds the research-preview mbx channel instead | tested live (macOS and Fedora) |
-  | Kimi | desktop app: its local control socket (setup installs an AgentMBX plugin into the app). `kimi web`: the local server's prompts API. Terminal: a background `agentmbx watch` task the session keeps running (Kimi starts a turn when it exits) | tested live (terminal, desktop, web) |
-  | Hermes | cron now; plugin planned | not tested live |
-  | anything else | desktop notification | |
+  | Codex | `codex queue --thread <id>` | historical live receipts |
+  | OpenCode | service-hosted session: the local service's session API (`/synthetic`). `--standalone` session: the plugin inside that session's own serve, over a loopback queue (see [OPENCODE.md](docs/OPENCODE.md)) | historical service-path live receipts; standalone wakes are admitted in-process, whether one starts a turn on an idle session is unproven (T544) |
+  | Claude Code | pushed by the session's own mbx MCP server through Claude Code's per-session inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`), so a plainly started `claude` wakes on mail with no flag, setting or cron; `agentmbx claude [args]` adds the research-preview mbx channel instead | historical macOS/Fedora live receipts |
+  | Kimi | desktop app: its local control socket (setup installs an AgentMBX plugin into the app). `kimi web`: the local server's prompts API. Terminal: a background `agentmbx watch` task the session keeps running (Kimi starts a turn when it exits) | historical terminal/desktop/web live receipts |
+  | Hermes | one background `agentmbx watch` task with completion notification; shell hooks bind the session and add inbox context before model calls | watcher requires re-arming after each wake; shared gateway hosts aren't covered |
+  | Grok | a background `agentmbx watch --cli grok --session <id>` task; exact session hooks | watcher requires re-arming after each wake |
+  | anything else | desktop notification | no automatic model turn implied |
 
 - **Across machines:** a small daemon per host. Hosts pair with one command each: `agentmbx pair` prints a one-time token, `agentmbx join <host> <token>` on the other machine finishes it (or compare a 6-digit code instead). Hosts find each other on the LAN over mDNS. Every hop is signed. Messages to a sleeping machine wait in an outbox and retry for 72 h, and each is stored exactly once.
 - **A wake brake:** at most 1 wake per agent per 30 s, 6 per thread per hour, 60 per agent per day. Plain status messages never wake anyone, so two chatty agents can't burn your tokens overnight.
@@ -140,7 +175,7 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
 - **No message can approve a permission prompt or change a recipient's config**, owner-signed or not. The MCP instructions tell every agent this, and agents treat all message content as data, not instructions. This mirrors how Claude Code handles messages from other sessions.
 - **Known limits:**
   - The LAN hop is signed, and since 0.5.1 every body is sealed to the receiving host's pinned X25519 key; envelope metadata (from, to, subject, thread, refs, project path, mentions and tags) is still visible on the wire (T198).
-  - Discovery and direct delivery are LAN-only: mDNS does not cross routers (and is blocked on some LANs) and there is no NAT traversal; across networks only the relay works. The relay is durable since 0.5.5 (SQLite store, signed accepts); backup/restore and a 14-day retention sweep with expiry notices are on main for the next release (T167). The relay operator sees envelope metadata, never bodies.
+  - Discovery and direct delivery are LAN-only: mDNS does not cross routers (and is blocked on some LANs) and there is no NAT traversal; across networks only the relay works. The relay has durable SQLite storage and signed accepts since 0.5.5; backup/restore receipts and a 14-day retention sweep with expiry notices shipped in 0.5.7 (T167). The relay operator sees envelope metadata, never bodies.
   - Agents on the same machine share the OS user boundary.
 
 The full design is in [docs/SPEC.md](docs/SPEC.md). The adversarial review that shaped it is in [docs/COUNCIL-VERDICT-2026-09-26.md](docs/COUNCIL-VERDICT-2026-09-26.md).
@@ -154,7 +189,7 @@ Persist the returned `next_cursor` yourself; it is a pagination position, never 
 credential. Continue through empty filtered pages while `has_more` is true. A completed
 cursor polls later arrivals on its next call; retry overlap should be deduplicated by ID.
 Omit a lost cursor to explicitly rewind. Keep the same mailbox and filters across a
-provider release/claim handoff. There is no automatic server-side consumer checkpoint.
+provider release/claim handoff. `mbx_replay` doesn't save a consumer checkpoint; `mbx_catchup` advances its identity checkpoint only after an explicit commit of a captured page.
 
 ```sh
 agentmbx replay --cli codex --session <thread-id> --limit 50 --max-bytes 65536
@@ -187,32 +222,7 @@ do the same every 6 h. Replay reports pruned positions as `history_pruned` rathe
 `agentmbx identity import <file>` restores them on a replacement machine so peers keep accepting it. Treat the file as a
 private key and run only one machine with that identity. A macOS Keychain owner key cannot be exported.
 
-## Quick start
-
-```sh
-curl -fsSL https://agentmbx.com/install.sh | sh
-# or, straight from GitHub:
-curl -fsSL https://raw.githubusercontent.com/kryptobaseddev/agentmbx/main/install.sh | sh
-
-agentmbx setup      # host key, daemon, and every agent CLI it finds (MCP + hooks + skill); backs up each file it edits
-agentmbx doctor     # ✔/✗ checklist with a one-line fix for each problem
-```
-
-The installer puts a single self-contained binary (no Node.js needed) in `~/.local/bin/agentmbx` after checking its
-sha256 against the release manifest. Keep it current with:
-
-```sh
-agentmbx version --check     # is there a newer release?
-agentmbx update              # verify the signed manifest, download, check sha256, replace the binary, restart the daemon
-```
-
-The daemon checks once a day and shows one desktop notification per new version; `agentmbx status` and `mbx_whoami`
-show `update available: x.y.z`. Prefer an npm-managed installation (Node >= 24)? `npm i -g agentmbx`. Release tags publish it with
-provenance through npm trusted publishing; the tagged GitHub source works too:
-`npm i -g https://github.com/kryptobaseddev/agentmbx/archive/refs/tags/v0.5.32.tar.gz`.
-Check the running connector with `mbx_whoami`: the installed CLI's version may differ from a long-running MCP process.
-Current connectors reload after an update; older connectors affected by the one-reload limit need an MCP restart once.
-Maintainers: [docs/RELEASING.md](docs/RELEASING.md).
+## Upgrade existing mailbox data
 
 **Upgrading to mailbox schema 3:** quiesce daemon, hooks and MCP writers and make a
 consistent backup of the complete mailbox home before opening it with 0.5.0. Update
@@ -249,9 +259,13 @@ That's it: both machines are paired, no codes to compare. The token is single us
 Then from any agent: *"send api-dev@desktop a request to run the migration tests and reply with the result"*. Or from a shell:
 
 ```sh
-agentmbx send --as planner --to api-dev@desktop --kind request --needs-reply --subject "run migration tests" -m "…"
-agentmbx inbox --as planner
+agentmbx send --as planner --cli codex --session <thread-id> --to api-dev@desktop --kind request --needs-reply --subject "run migration tests" -m "…"
+agentmbx inbox --as planner --cli codex --session <thread-id>
 ```
+
+Run those mailbox commands inside the provider session that holds `planner`.
+`--as` selects that held identity; it doesn't impersonate another agent or bypass a
+lease. A plain-shell send without a lease is labelled `unverified-sender`.
 
 Owner authority (optional, only on the machine you use):
 
@@ -279,15 +293,22 @@ When an agent has no wake path (or its wake fails), the daemon shows a desktop n
 
 ## Command reference
 
-`agentmbx help` lists everything:
-- **Messages:** `send`, `inbox`, `read`, `ack`, `thread`, `search`, `agents`, `status`
-- **Setup:** `setup [--dry-run] [--only …] [--uninstall]`, `doctor`, `version [--check]`, `update`
-- **Machines:** `init`, `pair`, `join`, `discover`, `pair --compare`, `pair approve`, `peers`, `peers addr <host> <host:port>`, `peers remove`, `host rotate`, `daemon [install|uninstall]`, `notify-test`
-- **Owner:** `owner init|show|grant|revoke|send`
-- **Wake control:** `wake mute <agent> [--minutes N]`, `wake unmute <agent>`, `watch` (terminal Kimi self-wake), `claude [args]` (Claude Code with the mbx channel)
-- **Maintenance:** `prune [--older-than <days>] [--dry-run]`, `retention [set <days> | off]` (default off), `identity export|import <file> [--force]`
-- **Integration:** `mcp`, `hook session-start|prompt|stop --cli <cli>`, `import-v2`
-- **Install:** `version [--check]`, `update [--check] [--yes]`
+Use `agentmbx help` or `agentmbx <command> --help` for the installed release's
+options. The [CLI reference](docs/SPEC.md#cli-command-reference) groups the
+published commands; MCP tool names aren't interchangeable with CLI subcommands.
+
+- **Mail:** `send`, `inbox`, `read`, `ack`, `thread`, `search`, `replay`.
+  CLI replies use `send --reply-to <id>`; receipts, catch-up, and handoff have
+  dedicated MCP tools.
+- **Session and visibility:** `whoami`, `agents`, `status`, `statusline`,
+  `diagnostics`, `identity`, `probe`, `watch`, `wake mute|unmute`.
+- **Install and integration:** `setup`, `doctor`, `version`, `update`,
+  `mcp`, `hook`, `claude`, `import-v2`.
+- **Machines and transport:** `init`, `pair`, `join`, `discover`, `peers`,
+  `host rotate`, `daemon`, `relay`, `notify-test`, `login`.
+- **Owner and policy:** `owner`, `policy`, `lead`, `audit`.
+- **Retention:** `prune`, `retention`; identity backup uses
+  `identity export|import <file>`.
 
 ## How it compares
 
