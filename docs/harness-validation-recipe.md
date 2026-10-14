@@ -87,7 +87,8 @@ only with the reason and its evidence (e.g. a harness with no Stop hook names it
 ## Appendix: collecting the evidence on Hermes
 
 Hermes-specific ways to get each check's evidence, from the 0.5.27–0.5.30 runs (T527, T606, T610). Hermes has no Stop
-hook and no status line, so checks 3 and 5 are N/A.
+hook and no status line, so checks 3 and 5 are N/A. For an agent doing this as a repository task, the general
+workflow is in [`docs/contributing/agent-workflow.md`](contributing/agent-workflow.md).
 
 **Order.**
 1. Read-only checks (1, 3, 5, 6, 7) first, then an interim report.
