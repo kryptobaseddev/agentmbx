@@ -189,6 +189,9 @@ nothing for an unbound session, and setup does not overwrite the owner's status 
   Handle the mail, then start the watcher again. It is one-shot: a turn that ends without re-arming it leaves you with no
   push. The `(eval):1: can't change option: zle` lines at the top of its output come from Hermes's own `zsh -lic`
   wrapper and are harmless. A Hermes gateway or desktop host that serves many sessions in one process is not covered.
+  After a full restart the first turn says `Resuming <name>`: call `mbx_whoami` first, never claim or register. Hermes
+  details (the watcher's edge cases, what a resumed or restarted conversation sees, hooks and their consent):
+  `references/hermes.md`.
 - Kimi desktop app and `kimi web`: woken through the app's local API. If an [mbx] note gives you a bind ticket, call
   `mbx_whoami` with `bind` set to it once, before other mbx tools: that links this conversation to its mbx server,
   which then resumes the identity this conversation held, or lets you claim or register one.
@@ -233,6 +236,13 @@ The kind decides whether an idle recipient is woken now or sees the message on i
 If you need the recipient to act or answer now, do not send a `status`: use `request` (or `task`) with
 `needs_reply: true`. Set `needs_reply` only when you will actually wait for the answer. Wakes are rate-limited, and a
 wake only queues a short pointer to the inbox; it never means the recipient read or handled the message.
+
+- `mbx_reply` sends a `reply` without `needs_reply` unless you set them, so the sender sees it on its next prompt. When
+  the sender is waiting on your answer to continue (a commit id, a decision), reply with `kind: "request"` and
+  `needs_reply: true`. A report that asks for decisions goes the same way, never as a `status`.
+- `mbx_reply` always goes to the sender of the message you answer, so replying to a message you sent mails yourself. To
+  follow up on your own message, use `mbx_send` to the recipient with `reply_to` set to it.
+- Check the receipt's `recipients[].state` (`live-wake` or `live-next-prompt`) rather than assuming the send woke anyone.
 Relay depth counts only what you read from agents other than the recipients: answering the agent you heard from never
 adds depth, forwarding to someone else does (ask allows 6, collaborate 20, autonomous/yolo no limit; the policy line shows it).
 
