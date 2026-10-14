@@ -58,8 +58,15 @@ export function makePolicy(o: PolicyOptions): PolicyRecord {
   const bad = classes.filter((c) => !CLASSES.includes(c));
   if (bad.length) throw new Error(`unknown classes: ${bad.join(", ")} (known: ${CLASSES.join(", ")})`);
   if (classes.includes("permissions") && o.level !== "yolo") throw new Error("the permissions class is only granted by the yolo level");
+  // D045: a non-expiring yolo grant (agents approving their own permission prompts, forever) is refused;
+  // read, collaborate and autonomous may still last forever. Stored records made before this rule are
+  // reported by doctor, not revoked.
+  if (o.level === "yolo" && o.ttlMs === null) throw new Error(`yolo policies must expire: they approve their own permission prompts, so the most they can last is ${TTL.max.yolo / H} h (owner decision D045)`);
   const ttl = o.ttlMs === undefined ? TTL.default[o.level] : o.ttlMs;
-  if (ttl !== null && (!(ttl > 0) || ttl > TTL.max[o.level])) throw new Error(`${o.level} policies last at most ${TTL.max[o.level] / H} h (or use --ttl never)`);
+  if (ttl !== null && (!(ttl > 0) || ttl > TTL.max[o.level]))
+    throw new Error(o.level === "yolo"
+      ? `${o.level} policies last at most ${TTL.max[o.level] / H} h`
+      : `${o.level} policies last at most ${TTL.max[o.level] / H} h (or use --ttl never)`);
   if (!o.agents.length || !o.hosts.length) throw new Error("policy needs at least one agent and one host");
   const now = o.now ?? new Date();
   return { v: 1, type: "policy", id: ulid(now.getTime()), level: o.level, classes,

@@ -10,6 +10,7 @@ import { fingerprint } from "./crypto.ts";
 import { signHop } from "./http.ts";
 import { relayState, ROLLBACK_REASON } from "./relay-v2.ts";
 import { kimiHostedServer, kimiInstances } from "./kimi-web.ts";
+import { storedPolicies, policySummary } from "./policy.ts";
 import { opencodeService } from "./wake.ts";
 import { opencodeHostClassifier, type OpencodeHost } from "./opencode-provider.ts";
 import { kimiDesktop } from "./kimi-desktop.ts";
@@ -216,6 +217,16 @@ export function kimiHookEvidence(node: MbxNode, kimiHome = process.env.KIMI_CODE
       fix: "restart the session from a Kimi desktop/Orca pane, or report to Kimi that this launch path does not dispatch configured hooks" });
   }
   return out;
+}
+
+/** T639 (owner decision D045): non-expiring yolo grants cannot be created anymore, but records made
+ *  before the rule may still be stored. Report them with the re-sign command; never revoke here. */
+export function nonExpiringYoloPolicies(node: MbxNode): Check[] {
+  return storedPolicies(node.store.db).valid
+    .filter((p) => p.currentOwner && !p.revoked && p.rec.level === "yolo" && p.rec.exp === null)
+    .map((p) => ({ level: "warn" as Level,
+      label: `yolo policy ${p.rec.id.slice(-6)} never expires: ${policySummary(p.rec)} — D045 refuses new non-expiring yolo policies (they approve their own permission prompts); this stored record still applies and is not revoked`,
+      fix: `re-sign it with an expiry: agentmbx policy renew ${p.rec.id.slice(-6)} --ttl 168h (or revoke: agentmbx policy revoke ${p.rec.id.slice(-6)})` }));
 }
 
 const STRANDED_MAX = 10;
@@ -766,6 +777,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     for (const d of detect(ctx).filter((d) => d.found)) out.push(sessionReadiness(node, d.cli));
     for (const c of kimiServerHooks(ctx.home)) out.push(c);
     for (const c of kimiHookEvidence(node)) out.push(c);
+    for (const c of nonExpiringYoloPolicies(node)) out.push(c);
   }
 
   const sk = skillStatus(ctx.home);
