@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **An in-place MCP handover reclaims the real harness session (T622).** The replacement was told the released name and `detectHost`'s provisional `mcp-<pid>`, so the new lease and `identity.claim` audit kept that id while `sessions` and `whoami.harness_session` already showed the one hook-bound session. The reclaim now adopts that session id before it claims. With no single hook-bound session, the provisional id stays.
+
 - **Codex restart hooks now recognize a remembered thread whose mailbox server has not claimed it yet (T614).** The first entry says `Resuming <name>: … Call mbx_whoami`, and the bounded notice follows once on the first bound prompt; sibling threads cannot supply its identity or consume its entry.
 
 ## 0.5.30 (2026-10-13)
