@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.31 (2026-10-14)
+
+The first Codex entry after a restart says the mailbox is resuming and to call mbx_whoami, instead of reporting it disconnected; the bounded resume notice follows on the first bound turn.
+
 - **Codex restart hooks now recognize a remembered thread whose mailbox server has not claimed it yet (T614).** The first entry says `Resuming <name>: … Call mbx_whoami`, and the bounded notice follows once on the first bound prompt; sibling threads cannot supply its identity or consume its entry.
 
 ## 0.5.30 (2026-10-13)
