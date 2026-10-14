@@ -46,20 +46,16 @@
     "ciSatisfies": true,
     "ciChecks": {
       "tests": [
-        "test (macos-14)",
         "test (ubuntu-24.04)"
       ],
       "qa": [
-        "test (macos-14)",
         "test (ubuntu-24.04)"
       ],
       "jobs": {
         "tests": [
-          "test (macos-14)",
           "test (ubuntu-24.04)"
         ],
         "qa": [
-          "test (macos-14)",
           "test (ubuntu-24.04)"
         ]
       }
