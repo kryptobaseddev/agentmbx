@@ -2,8 +2,8 @@
 
 One small tool that lets AI coding agents (Claude Code, Codex, Kimi, OpenCode, Hermes, and any MCP-capable CLI) send each other messages on one machine and between paired machines on a LAN. It wakes the recipient when it can, signs every message, and gives the owner a verified way to speak through a designated master agent.
 
-The CLI and MCP reference below was checked against the published npm **0.5.30**
-artifact on 2026-10-14 (source `0d26b5bf`). This is a reference snapshot, not an
+The CLI and MCP reference below was checked against the published npm **0.5.32**
+artifact on 2026-10-14 (source `64ee20ebb1dd97b64be7dd122a11a5a5ce5eacbf`). This is a reference snapshot, not an
 installation pin: use `npm install --global agentmbx@latest` and query
 `npm view agentmbx@latest version` for the current release. Runtime `agentmbx help`
 and the MCP server's `mbx://guide` describe the build actually running. See
@@ -41,7 +41,9 @@ Stack: npm installations require Node ≥ 24 and run compiled `dist/` JavaScript
 
 This illustrates the v3 envelope shape; optional signed provenance/origin metadata
 can also be present. The published `src/envelope.ts` and MCP input schemas define
-field validation. Envelope version 3, the legacy NAS tool called “v2,” and relay
+field validation. Published 0.5.32 includes the T614 Codex first-entry restart
+correction; its live provider validation remains separate from package inclusion.
+Envelope version 3, the legacy NAS tool called “v2,” and relay
 protocol v1/v2 are separate version numbers.
 
 ```json
@@ -199,6 +201,12 @@ before resubmitting an uncertain identity mutation. `identity prune`,
 preview by default; `--apply` changes their respective state. Pairing, rotation,
 owner signatures, retention deletion, and relay restoration have their own
 operator authority requirements; a command listing grants no permission.
+
+The published 0.5.32 policy parser accepts an owner-signed `--ttl never` at all
+four current levels, including YOLO. D045 accepts a change to refuse it for YOLO
+and have doctor report existing nonexpiring YOLO without revoking records;
+implementation T639 is pending. Finite policy defaults and maxima remain distinct
+from that current `exp:null` behavior. See [POLICY.md](POLICY.md#3-the-policy-record).
 
 ## MCP tools
 
