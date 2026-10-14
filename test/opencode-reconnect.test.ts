@@ -154,7 +154,8 @@ test("doctor flags more than five claims in ten minutes, with bounded time and p
 test("skill and running MCP instructions forbid process recovery and point to the leased CLI", () => {
   for (const text of [INSTRUCTIONS, readFileSync(new URL("../skill/SKILL.md", import.meta.url), "utf8")]) {
     assert.match(text, /Never kill MBX MCP processes or hand-spawn/);
-    assert.match(text, /inbox\/read\/reply\/ack\/send --as/);
+    assert.match(text, /inbox\/read\/ack\/send --as/);
+    assert.match(text, /send --reply-to/);
     assert.match(text, /retry that tool once: OpenCode respawns the MCP automatically/);
     assert.match(text, /inbox --as <name>, and the same for read and ack/);
     assert.match(text, /eviction or disconnect is recovered by that CLI/);
