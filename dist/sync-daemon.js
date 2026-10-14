@@ -8,6 +8,7 @@ import { fingerprint, signData } from "./crypto.js";
 import { storedPolicies } from "./policy.js";
 import { activeLead } from "./lead-record.js";
 import { projectKey } from "./registry.js";
+import { storedRepoAssociations } from "./repo-association.js";
 import { relayFor } from "./relay-client.js";
 import { relayState } from "./relay-v2.js";
 import { newSyncNonce, syncOnce } from "./sync-client.js";
@@ -40,14 +41,17 @@ export function loadSyncSnapshot(node, ctx, projectKeyOf = projectKey) {
     const unread = new Map(unreadRows.map((row) => [row.agent, Number(row.n) || 0]));
     const keysByAgent = new Map();
     const newestPath = new Map();
+    // T330: the key recorded when the folder was bound comes first, so a removed worktree keeps its project; else read it now.
+    const repos = storedRepoAssociations(db);
     for (const row of projects) {
-        let key;
-        try {
-            key = projectKeyOf(row.project);
-        }
-        catch {
-            key = undefined;
-        }
+        let key = repos.get(row.project)?.remote_key ?? undefined;
+        if (!key)
+            try {
+                key = projectKeyOf(row.project);
+            }
+            catch {
+                key = undefined;
+            }
         if (!key)
             continue;
         const mine = keysByAgent.get(row.name) ?? [];

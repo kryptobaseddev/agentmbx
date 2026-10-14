@@ -6,6 +6,7 @@ import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { resolveProject } from "./project-key.js";
+import { recordRepoAssociation } from "./repo-association.js";
 // The git-origin key and the CLEO project key live in project-key.ts (T543); these names keep working from here.
 export { crossHostKey, normalizeRemote, projectKey, resolveProject } from "./project-key.js";
 /** Roles are short labels ("lead", "reviewer", "lab-staff"), never sentences. */
@@ -63,6 +64,11 @@ export function noteProject(store, name, project, explicit, now = new Date()) {
     store.db.prepare(`INSERT INTO identity_projects (name,project,project_key,first_seen,last_seen) VALUES (?,?,?,?,?)
     ON CONFLICT(name,project) DO UPDATE SET last_seen=excluded.last_seen, project_key=COALESCE(excluded.project_key, identity_projects.project_key)`)
         .run(name, project, id.cleoId, at, at);
+    // T330: the folder's repository (worktree top, shared repo root, credential-free origin) — what the listing groups by.
+    try {
+        recordRepoAssociation(store, project, now.getTime());
+    }
+    catch { /* best effort: the membership itself is written */ }
 }
 /** Identities recorded in identity_projects for this project. A session cwd is not a binding:
  *  a shared host process records its own folder for every persona it serves (T515). The project is the folder or, when

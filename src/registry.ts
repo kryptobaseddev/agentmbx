@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import type { Store } from "./store.ts";
 import { resolveProject } from "./project-key.ts";
+import { recordRepoAssociation } from "./repo-association.ts";
 
 // The git-origin key and the CLEO project key live in project-key.ts (T543); these names keep working from here.
 export { crossHostKey, normalizeRemote, projectKey, resolveProject } from "./project-key.ts";
@@ -66,6 +67,8 @@ export function noteProject(store: Store, name: string, project: string | undefi
   store.db.prepare(`INSERT INTO identity_projects (name,project,project_key,first_seen,last_seen) VALUES (?,?,?,?,?)
     ON CONFLICT(name,project) DO UPDATE SET last_seen=excluded.last_seen, project_key=COALESCE(excluded.project_key, identity_projects.project_key)`)
     .run(name, project, id.cleoId, at, at);
+  // T330: the folder's repository (worktree top, shared repo root, credential-free origin) — what the listing groups by.
+  try { recordRepoAssociation(store, project, now.getTime()); } catch { /* best effort: the membership itself is written */ }
 }
 
 /** Identities recorded in identity_projects for this project. A session cwd is not a binding:

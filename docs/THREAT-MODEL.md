@@ -1,5 +1,8 @@
 # AgentMBX threat model (v0.5.1)
 
+> **Historical review:** T032 assessed the v0.5.1 candidate; later edits are retained below with their original claims and references. Read [current security audit and remediation status](security-status.md) for shipped successors, open findings and changed policy boundaries (including T537). This historical text is not a current deployment or penetration-test report.
+
+
 Task T032. Scope: the whole product at `a977df9` (the v0.5.1 release candidate), with extra attention to what changed
 since `9477942`: direct-LAN body sealing (T028), server limits (T029), host key rotation and unpairing (T030), retention
 and identity backup (T031), relay-depth reset (T104), dead-session pruning (T046), the `agentmbx claude` launcher

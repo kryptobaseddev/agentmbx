@@ -1,5 +1,8 @@
 # Mailbox foundation delivery plan
 
+> **Historical execution plan (2026-09-30):** Staging, release and pending labels below describe the original implementation sequence. Replay foundation T123–T126/T134, catch-up T156–T158 and later handoff/delivery slices have successor evidence. See the [current roadmap](native-feature-roadmap.md) and [security status](../security-status.md) for current shipped, partial and remaining gates; this plan is not a new release receipt.
+
+
 ## Goal
 
 Reviewed delivery plan, updated against CLEO task records on 2026-09-30. Implementation is staged in the isolated feature/mailbox-foundation integration branch and draft PR45; it is not released. Main/live AgentMBX remains schema 2/v0.4.1 until coordinated rollout. T122 under T001 contains filed replay/history tasks T123–T128. T129 contains filed diagnostics tasks T130–T131. T132 capability preview and T133 transport semantic conformance are filed tasks under existing T062, retaining signed-card/principal prerequisites instead of duplicating them. T116 remains research coordination; T117 replay design, T118 diagnostics research, T119 baseline and T120 console research remain sourced inputs. Console C1–C4 are still future proposal labels, not filed implementation IDs.

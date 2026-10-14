@@ -1,6 +1,7 @@
 // Conversation external taint (T345). The CLI reads it when sending. The MCP server
 // persists it on noteRead after #120 merges, and release/claim restore it (T346).
-import { EXTERNAL_TAINT_MS, MAX_RELAY_DEPTH } from "./envelope.js";
+import { EXTERNAL_TAINT_MS, MAX_RELAY_DEPTH, MAX_CONTENT_ROOTS, readContentProvenance, validContentRoot } from "./envelope.js";
+import { canonical } from "./crypto.js";
 const LABEL = /^[^\u0000-\u001f\u007f]{1,300}$/;
 const CAUSE = /^[^\u0000-\u001f\u007f]{1,300}$/;
 const ID = /^[A-Za-z0-9_-]{1,80}$/;
@@ -99,6 +100,109 @@ export function writeSessionTaint(store, record, now = Date.now()) {
     if (!normalized)
         throw Object.assign(new Error("taint record is not a live session exposure"), { code: "TAINT_RECORD" });
     store.set(key, JSON.stringify(normalized));
+}
+const exposureScope = (host, cli, sessionId) => [host, cli, sessionId].every(part => typeof part === "string" && LABEL.test(part) && !/[\u0000-\u001f\u007f]/.test(part));
+const exposureTime = (at, now) => at === null || (typeof at === "number" && Number.isSafeInteger(at) && at >= 0 && at <= now);
+/** Read observation-only history without expiring or declassifying any source. */
+export function readSessionExposure(store, host, cli, sessionId, now = Date.now()) {
+    try {
+        if (!exposureScope(host, cli, sessionId) || !Number.isSafeInteger(now) || now < 0)
+            throw new Error("invalid scope/time");
+        const row = store.db.prepare("SELECT record FROM session_exposures WHERE host=? AND cli=? AND session_id=?").get(host, cli, sessionId);
+        if (!row)
+            return { record: null, reason: "missing exposure history" };
+        const value = JSON.parse(row.record);
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("invalid record");
+        const r = value;
+        if (Object.keys(r).sort().join(",") !== "cli,generation,host,roots,session_id,unknown,v" || r.v !== 2 || r.host !== host || r.cli !== cli || r.session_id !== sessionId
+            || !Number.isSafeInteger(r.generation) || r.generation < 1 || typeof r.unknown !== "boolean" || !Array.isArray(r.roots) || r.roots.length > MAX_CONTENT_ROOTS)
+            throw new Error("invalid record");
+        const ids = new Set();
+        for (const root of r.roots) {
+            if (!root || typeof root !== "object" || Object.keys(root).sort().join(",") !== "derived_at,first_raw_at,last_message_id,last_read_at,raw_at,source"
+                || !validContentRoot(root.source, now) || ids.has(root.source.message_id) || !exposureTime(root.raw_at, now) || !exposureTime(root.derived_at, now)
+                || !exposureTime(root.first_raw_at, now) || (root.first_raw_at === null) !== (root.raw_at === null)
+                || (root.first_raw_at !== null && root.raw_at !== null && root.first_raw_at > root.raw_at)
+                || typeof root.last_message_id !== "string" || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(root.last_message_id)
+                || root.last_read_at === null || !exposureTime(root.last_read_at, now)
+                || (root.raw_at === null && root.derived_at === null)
+                || (root.first_raw_at !== null && root.first_raw_at < Date.parse(root.source.since)) || (root.derived_at !== null && root.derived_at < Date.parse(root.source.since))
+                || root.last_read_at < Math.max(root.raw_at ?? 0, root.derived_at ?? 0))
+                throw new Error("invalid root exposure");
+            ids.add(root.source.message_id);
+        }
+        if (!r.unknown && !r.roots.length)
+            throw new Error("empty history is not clean evidence");
+        return { record: r, reason: r.unknown ? "incomplete exposure history" : null };
+    }
+    catch {
+        return { record: null, reason: "unreadable or invalid exposure history" };
+    }
+}
+/**
+ * Atomically union validated roots and record local disclosures, never evicting roots or clearing unknown history.
+ * This storage API is not wired to send/read/approval paths in S1; the v1 taint key and expiry semantics stay intact.
+ */
+export function recordSessionExposure(store, host, cli, sessionId, input, sources, now = Date.now()) {
+    if (!exposureScope(host, cli, sessionId) || !Number.isSafeInteger(now) || now < 0)
+        throw new Error("invalid exposure scope/time");
+    return store.tx(() => {
+        const current = readSessionExposure(store, host, cli, sessionId, now);
+        if (!current.record && current.reason !== "missing exposure history")
+            return current; // Preserve corrupt bytes for diagnosis.
+        const p = readContentProvenance(input, sources, now);
+        if (p.kind === "agent")
+            return current; // A signed clean label cannot create or clear exposure history.
+        const r = current.record ?? { v: 2, host, cli, session_id: sessionId, generation: 1,
+            unknown: store.get(taintKey(cli, sessionId)) !== undefined, roots: [] };
+        const before = canonical(r);
+        let unrepresentedExposure = p.kind === "unknown";
+        if (p.kind === "unknown")
+            r.unknown = true;
+        for (const source of p.roots) {
+            let root = r.roots.find(old => old.source.message_id === source.message_id);
+            if (root && canonical(root.source) !== canonical(source)) {
+                r.unknown = true;
+                unrepresentedExposure = true;
+                continue;
+            }
+            if (!root) {
+                if (r.roots.length === MAX_CONTENT_ROOTS) {
+                    r.unknown = true;
+                    unrepresentedExposure = true;
+                    continue;
+                }
+                root = { source, first_raw_at: null, raw_at: null, derived_at: null, last_message_id: input.id, last_read_at: now };
+                r.roots.push(root);
+            }
+            if (root.last_message_id !== input.id) {
+                root.last_message_id = input.id;
+                root.last_read_at = now;
+            }
+            if (p.kind === "firsthand-outside") {
+                root.first_raw_at ??= now;
+                if (root.raw_at === null || now - root.raw_at >= EXTERNAL_TAINT_MS) {
+                    root.raw_at = now;
+                    root.last_read_at = now;
+                }
+            }
+            else
+                root.derived_at ??= now;
+        }
+        if (current.record && !unrepresentedExposure && before === canonical(r))
+            return current;
+        if (current.record) {
+            if (r.generation === Number.MAX_SAFE_INTEGER)
+                throw new Error("exposure generation overflow");
+            r.generation++;
+        }
+        store.db.prepare("INSERT INTO session_exposures (host,cli,session_id,record) VALUES (?,?,?,?) ON CONFLICT(host,cli,session_id) DO UPDATE SET record=excluded.record")
+            .run(host, cli, sessionId, JSON.stringify(r));
+        store.audit("provenance.exposure_observed", { host, cli, session_id: sessionId, generation: r.generation, kind: p.kind,
+            message_id: p.kind === "unknown" ? null : input.id, roots: p.roots, unknown: r.unknown });
+        return { record: r, reason: r.unknown ? "incomplete exposure history" : null };
+    });
 }
 const iso = (t) => new Date(t).toISOString();
 /** CLI refusal: `--origin agent` must not send while this conversation is tainted. */

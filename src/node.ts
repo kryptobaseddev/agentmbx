@@ -21,7 +21,8 @@ import { procStart, procTable, provenProcess, sameProcess } from "./proc.ts";
 import { bumpPostToolMarker, bumpPostToolMarkersForAgent, POSTTOOL_FAST_CLIS } from "./posttool.ts";
 import { privatePath } from "./private-files.ts";
 import { TASK_RE } from "./presence.ts";
-import { backfillProjectKeys, backfillRegistry } from "./registry.ts";
+import { backfillProjectKeys, backfillRegistry, projectOf } from "./registry.ts";
+import { ensureRepoTable, recordRepoAssociation } from "./repo-association.ts";
 import { resolveLeadRecipients } from "./lead-record.ts";
 import { isSlotName } from "./project-slot.ts";
 import { projectLabel, projectMailboxBySlot, projectsLedBy, resolveProjectMailbox, rewriteProjectAliases, type ProjectMailbox } from "./project-mailbox.ts";
@@ -139,6 +140,7 @@ export class MbxNode {
     // T543: key the project bindings and lead rows that predate the key column (or were written by an older runtime). Best effort:
     // a read-only or busy store simply leaves them NULL, and every read still matches them by folder.
     try { backfillProjectKeys(this.store); } catch { /* retried on the next open */ }
+    try { ensureRepoTable(this.store); } catch { /* T330: a read-only store; binds retry, readers check the table exists */ }
   }
 
   /** Record this host's own owner key (if any) as the principal it takes policies from. */
@@ -277,6 +279,9 @@ export class MbxNode {
     // T342/T341: a claude or opencode bind can change the session→agent mapping the post-tool hook resolves,
     // so the hook's fast path must run the full decision once. After the tx: fs writes never inside it.
     if (POSTTOOL_FAST_CLIS.includes(s.cli) && s.session_id) bumpPostToolMarker(this.home, s.cli, s.session_id);
+    // T330: every bind records its folder's repository (file reads only, cached; a write only when something changed).
+    // A folder fact, not a membership: T538's explicit-membership rule is untouched.
+    if (s.cwd) try { recordRepoAssociation(this.store, projectOf(s.cwd)); } catch { /* best effort: the bind itself succeeded */ }
     return bound;
   }
 

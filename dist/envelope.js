@@ -179,6 +179,102 @@ export function externalExposure(e, now) {
         return { how: "declared", root: now };
     return { how: "inherited", root: Math.min(Date.parse(m.external_since), now) };
 }
+/** Root and parent reference lists are bounded independently; neither may discard excess references. */
+export const MAX_CONTENT_ROOTS = 64;
+const MESSAGE_ID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
+const DIGEST = /^[a-f0-9]{64}$/;
+const exactKeys = (x, keys) => Object.keys(x).sort().join(",") === keys.sort().join(",");
+const instant = (s, now) => typeof s === "string" && ISO_INSTANT.test(s)
+    && Number.isSafeInteger(Date.parse(s)) && Date.parse(s) >= 0 && Date.parse(s) <= now && new Date(s).toISOString() === s;
+/** Validate a persisted/wire root's shape, not its source authenticity (readContentProvenance does that). */
+export function validContentRoot(x, now) {
+    if (!x || typeof x !== "object" || Array.isArray(x) || !exactKeys(x, ["message_id", "from", "content_sha256", "since"]))
+        return false;
+    const r = x;
+    return typeof r.message_id === "string" && MESSAGE_ID.test(r.message_id) && typeof r.from === "string"
+        && r.from.length <= MAX_FIELD && !CONTROL.test(r.from) && /^[^\s@]+@[^\s@]+$/.test(r.from)
+        && typeof r.content_sha256 === "string" && DIGEST.test(r.content_sha256) && instant(r.since, now);
+}
+/**
+ * Verify signed body, exact parent/root union and first-hand source membership without changing v1 policy.
+ * Old envelopes and unknown versions remain unknown here; their existing origin/expiry readers are untouched.
+ * Sealed messages must be opened first: the signed digest also detects substituted local plaintext.
+ */
+export function readContentProvenance(input, sources, now = Date.now()) {
+    const unknown = (reason) => ({ kind: "unknown", roots: [], parents: [], reason });
+    const cache = new Map(), visiting = new Set();
+    let remaining = 1024; // Bound hostile ancestry walks; ordinary 100-hop relays retain their roots.
+    const read = (value) => {
+        if (--remaining < 0)
+            return unknown("ancestry overflow");
+        if (checkShape(value))
+            return unknown("malformed envelope");
+        const e = value;
+        if (CONTROL.test(e.from) || !/^[^\s@]+@[^\s@]+$/.test(e.from))
+            return unknown("invalid sender");
+        const host = e.from.split("@")[1], key = sources.publicKey(host);
+        if (!key || e.sig?.host !== host || !verifyEnvelope(e, key))
+            return unknown("unverified envelope");
+        if (!instant(e.ts, now))
+            return unknown("invalid message time");
+        const p = e.meta.provenance;
+        if (!p || typeof p !== "object" || Array.isArray(p) || p.v !== 2)
+            return unknown("missing or unsupported provenance");
+        if (!exactKeys(p, ["v", "kind", "content_sha256", "roots", "parents"]) || !["agent", "firsthand-outside", "derived-outside", "unknown"].includes(p.kind)
+            || p.content_sha256 !== sha256(e.body) || !Array.isArray(p.roots) || !Array.isArray(p.parents))
+            return unknown("invalid provenance or body digest");
+        if (p.roots.length > MAX_CONTENT_ROOTS || p.parents.length > MAX_CONTENT_ROOTS)
+            return unknown("reference overflow");
+        if (p.roots.some(r => !validContentRoot(r, Date.parse(e.ts))) || new Set(p.roots.map(r => r.message_id)).size !== p.roots.length
+            || p.parents.some(id => typeof id !== "string" || !MESSAGE_ID.test(id)) || new Set(p.parents).size !== p.parents.length)
+            return unknown("invalid root or parent reference");
+        if (p.kind === "unknown")
+            return unknown("declared unknown");
+        if (visiting.has(e.id))
+            return unknown("cyclic parents");
+        if (p.kind === "firsthand-outside") {
+            if (p.parents.length || p.roots.length !== 1 || canonical(p.roots[0]) !== canonical({ message_id: e.id, from: e.from, content_sha256: p.content_sha256, since: e.ts }))
+                return unknown("first-hand source mismatch");
+        }
+        else {
+            visiting.add(e.id);
+            const inherited = new Map();
+            for (const id of p.parents) {
+                const parent = sources.message(id);
+                if (checkShape(parent) || parent.id !== id || Date.parse(parent.ts) > Date.parse(e.ts))
+                    return unknown("missing or mismatched parent");
+                const bytes = canonical(parent), cached = cache.get(id);
+                if (cached && cached.bytes !== bytes)
+                    return unknown("contradictory parent bytes");
+                const result = cached?.result ?? read(parent);
+                if (!cached)
+                    cache.set(id, { bytes, result });
+                if (result.kind === "unknown")
+                    return unknown(`unknown parent: ${result.reason}`);
+                for (const r of result.roots) {
+                    const old = inherited.get(r.message_id);
+                    if (old && canonical(old) !== canonical(r))
+                        return unknown("contradictory roots");
+                    inherited.set(r.message_id, r);
+                    if (inherited.size > MAX_CONTENT_ROOTS)
+                        return unknown("root union overflow");
+                }
+            }
+            visiting.delete(e.id);
+            if (p.roots.length !== inherited.size || p.roots.some(r => canonical(r) !== canonical(inherited.get(r.message_id))))
+                return unknown("parent root mismatch");
+            if ((p.kind === "agent" && p.roots.length) || (p.kind === "derived-outside" && (!p.parents.length || !p.roots.length)))
+                return unknown("payload kind mismatch");
+        }
+        return { kind: p.kind, roots: p.roots.map(r => ({ ...r })), parents: [...p.parents], reason: null };
+    };
+    try {
+        return read(input);
+    }
+    catch {
+        return unknown("unreadable provenance");
+    }
+}
 // ---- owner grants ----------------------------------------------------------------------------
 export const CAPS = ["task.assign", "decision", "broadcast", "alert"];
 export const MAX_GRANT_HOURS = 24 * 7;
