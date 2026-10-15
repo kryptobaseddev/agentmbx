@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **A fresh OpenCode session no longer opens with "mbx disconnected", and a real OpenCode disconnect names `/mcps` (T655).** An OpenCode serve runs the session-start hook before its mbx server has connected, and the plugin shows that hook's note at the first tool result, so a brand-new session was told "mbx disconnected: reconnect (e.g. /mcp in Claude Code)". A session the serve never bound, with no remembered identity and no connector record of that serve at all, now gets no disconnect note. A session that did lose its connector still does, now with OpenCode's own control: "reconnect it with /mcps in OpenCode (select mbx)". Other harnesses are unchanged.
+
 - **Doctor names every live connector behind the installed build, and a live OpenCode session is told how it switches (T661).** After an update a running session keeps the build its MCP connector loaded, and nothing said so.
   - **Doctor:** for every harness, each live connector (proven by its own report and process birth) that is behind the installed version gets a warning naming its session, agent and both versions, e.g. `grok: session 01a13139 (agentmbx-grok) runs connector 0.5.34; installed 0.5.38`. The fix says its next mbx tool call switches it in place. Unbound old connectors share one row; connectors with no comparable version get an info row and are never called behind.
   - **OpenCode plugin step:** the fix adds what the in-place handover cannot do for the OpenCode plugin: `agentmbx setup --only opencode`, then reopen the tab, when the plugin template itself is stale; reopen the tab when it started before the current plugin file was written.
