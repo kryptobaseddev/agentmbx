@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Doctor no longer calls hooks unwired when only the Node binary differs (T654).** A wired command matches this install by the agentmbx script's real path and package version. Any Node binary that exists and meets `engines.node` (`>=24`) counts. When that binary is not the one running doctor, doctor warns and names both paths, and it does not suggest `agentmbx setup`. Setup keeps that Node. A missing or too-old binary is still not wired, and setup rewrites it.
+
 ## 0.5.36 (2026-10-14)
 
 - **The current mailbox holder can restore its wake endpoint (T648).** A still-running former MCP transport no longer blocks a newer lease generation for that same mailbox from publishing its control endpoint. Codex hook resume and thread metadata share one state/key, and a repeated claim repairs a stale same-process endpoint. Live foreign endpoints from the same generation or another mailbox stay protected; co-using servers never publish for the holder. CLI claim, release and signed owner takeover keep reaching the current endpoint.
