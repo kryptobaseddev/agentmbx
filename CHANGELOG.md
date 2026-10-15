@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.38 (2026-10-15)
+
 - **Doctor names every live connector behind the installed build, and a live OpenCode session is told how it switches (T661).** After an update a running session keeps the build its MCP connector loaded, and nothing said so.
   - **Doctor:** for every harness, each live connector (proven by its own report and process birth) that is behind the installed version gets a warning naming its session, agent and both versions, e.g. `grok: session 01a13139 (agentmbx-grok) runs connector 0.5.34; installed 0.5.38`. The fix says its next mbx tool call switches it in place. Unbound old connectors share one row; connectors with no comparable version get an info row and are never called behind.
   - **OpenCode plugin step:** the fix adds what the in-place handover cannot do for the OpenCode plugin: `agentmbx setup --only opencode`, then reopen the tab, when the plugin template itself is stale; reopen the tab when it started before the current plugin file was written.
