@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { execFileSync, spawn } from "node:child_process";
 import { canonical, fingerprint, generateKeyPair, ulid, verifyData } from "./crypto.js";
-import { buildGrant, CAPS, grantPayload, NAME_RE } from "./envelope.js";
+import { buildGrant, CAPS, fitSubject, grantPayload, MAX_SUBJECT_INPUT, NAME_RE } from "./envelope.js";
 import { advertise, browse, lanIPv4 } from "./discovery.js";
 import { announceRotations, flushOutbox, flushReceipts, addrSignature, healPeerAddr, healStuckPeers, notifyUnpair, sendPresence, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.js";
 import { relayDrainOutbox, relayFor, relayPull } from "./relay-client.js";
@@ -944,12 +944,19 @@ async function run(argv) {
                     die(refuseAgentOrigin(taint));
                 const declared = originArg === "external";
                 const reply = str("reply-to") ? node.read(str("reply-to"), from.split("@")[0]) : undefined;
-                return node.send({ from, to: (str("to") ?? die("--to is required")).split(",").map(s => s.trim()).filter(Boolean),
-                    subject: str("subject") ?? (reply ? (reply.subject.startsWith("Re: ") ? reply.subject : `Re: ${reply.subject}`) : die("--subject is required")),
+                // T649: a long subject is truncated (with a warning), not refused
+                const fit = fitSubject(str("subject") ?? (reply ? (reply.subject.startsWith("Re: ") ? reply.subject : `Re: ${reply.subject}`) : die("--subject is required")));
+                if (fit.truncated && [...(str("subject") ?? "")].length > MAX_SUBJECT_INPUT)
+                    die(`--subject is over ${MAX_SUBJECT_INPUT} characters`);
+                const sent = node.send({ from, to: (str("to") ?? die("--to is required")).split(",").map(s => s.trim()).filter(Boolean),
+                    subject: fit.subject,
                     body, kind: (str("kind") ?? "message"), reply_to: reply?.id ?? null, thread: reply?.thread,
                     needs_reply: !!o["needs-reply"], refs: o.ref ?? [], unverifiedSender: unverified,
                     ...(declared || taint ? { origin: "external" } : {}),
                     ...(!declared && taint ? { external_since: new Date(taint.root).toISOString() } : {}) });
+                if (fit.warning)
+                    sent.warnings.unshift(fit.warning);
+                return sent;
             };
             const noteOrigin = (sent, taint) => {
                 if (originArg === "external")

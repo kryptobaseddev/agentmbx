@@ -236,7 +236,7 @@ advisory hints, not permissions or promises of zero state changes.
 | `mbx_sent` | Optional `cursor`, `limit:20` (1–100) | Sent-message page with per-recipient delivery/read/ACK receipts and `did`; not a task-completion assertion |
 | `mbx_replay` | Optional `cursor`, `limit:50` (1–200), `max_bytes:65536` (2048–262144), `project`, `project_host`, `topic`, `thread`, `project_mailbox` | Bounded acknowledged and unacked history; doesn't mark read, ACK, or save a checkpoint |
 | `mbx_catchup` | Optional `cursor`, `limit`, `max_bytes` (same runtime defaults/ranges as replay), `commit`, `restart:all\|now`, `project_mailbox` | Read from an identity checkpoint; explicitly commit a captured `next_cursor` to advance monotonically. Restart re-anchors after restore/reset. Led project mailboxes use separate checkpoints |
-| `mbx_handoff` | `action:read` by default, or `save`; optional `note`, `task_refs`, `msg_refs` | Fresh context plus one saved note. Runtime note limit is 1000 characters; retains the newest 20 distinct refs of each kind, reports dropped refs, expires after 30 days |
+| `mbx_handoff` | `action:read` by default, or `save`; optional `note`, `task_refs`, `msg_refs` | Fresh context plus one saved note. Runtime note limit is 4000 characters; retains the newest 20 distinct refs of each kind, reports dropped refs, expires after 30 days |
 | `mbx_project` | Optional `cursor`, `limit:20` (1–100), `project` (must be this session's folder) | Project ledger; own message bodies only, except the owner-designated project lead can read all project bodies |
 | `mbx_forward` | Required `id` and local recipient `to` | Project lead re-delivery; audited, with original-sender policy retained |
 

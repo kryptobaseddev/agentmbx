@@ -12,7 +12,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { fingerprint, generateKeyPair } from "./crypto.ts";
-import { checkShape, EXTERNAL_TAINT_MS, KINDS, MAX_RELAY_DEPTH, NAME_RE, type Envelope, type ExternalExposure, type Grant } from "./envelope.ts";
+import { checkShape, EXTERNAL_TAINT_MS, fitSubject, KINDS, MAX_RELAY_DEPTH, MAX_SUBJECT_INPUT, NAME_RE, type Envelope, type ExternalExposure, type Grant } from "./envelope.ts";
 import { readSessionTaint, taintKey, writeSessionTaint } from "./session-taint.ts";
 import { kimiMultiHost } from "./kimi-web.ts";
 import { BIND_TICKET_RE, takeBindTicket } from "./bind-ticket.ts";
@@ -37,7 +37,7 @@ import { updateAvailable } from "./update.ts";
 import { installKind, version } from "./version.ts";
 import { connectorKey } from "./diagnostics.ts";
 import { catchupHint, catchupUnchanged, commitCatchup, commitProjectCatchup, ensureCatchup, ensureProjectCatchup, missedCount, moveCatchup, readCatchup, readProjectCatchup, restartCatchup, restartProjectCatchup, CATCHUP_FILTER } from "./catchup.ts";
-import { handoffContext, handoffPointer, moveHandoff, presentHandoff, readHandoff, saveHandoff, validateHandoff } from "./handoff.ts";
+import { HANDOFF_NOTE_INPUT_MAX, handoffContext, handoffPointer, moveHandoff, presentHandoff, readHandoff, saveHandoff, validateHandoff } from "./handoff.ts";
 import { encodeReplayFrame, replayMaximum, replayQuery, type ReplayOptions } from "./replay.ts";
 import { hasWakeAuthority, humanPromptKey, wakeMutedUntil, wakeText } from "./wake.ts";
 import { isStoreBusy, withStoreBusyTimeout, type MessageRow } from "./store.ts";
@@ -1408,7 +1408,7 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
   };
   server.registerTool("mbx_identity", {
     title: "List, claim, register or release an mbx identity",
-    description: "Every mailbox is a chosen identity with a role; AgentMBX never invents one. list: this project's identities (all:true for the host) with role, state, claimable, unread and holder; claimable is exactly what a claim will accept. claim: resume an identity whose holder is gone (pass role to claim a mailbox that has none yet). register: create a new identity, name <project>-<role>, with a role. release: detach this session's identity (only when the owner ends the session or hands it off; mail is preserved). A session holds one identity at a time: release before claiming another. Next: mbx_inbox after claiming.",
+    description: "Every mailbox is a chosen identity with a role; AgentMBX never invents one. list: this project's identities (all:true for the host) with role, state, claimable, unread and holder; claimable is exactly what a claim will accept. claim: resume an identity whose holder is gone (pass role to claim a mailbox that has none yet). register: create a new identity, name <project>-<role>, with a role. release: detach this session's identity (only when the owner ends the session or hands it off; mail is preserved), optionally saving a handoff note of at most 4000 characters. A session holds one identity at a time: release before claiming another. Next: mbx_inbox after claiming.",
     inputSchema: { action: z.enum(["list", "claim", "register", "release"]),
       name: z.string().regex(NAME_RE).optional().describe("identity to claim or register, e.g. agentmbx-reviewer"),
       role: z.string().regex(ROLE_RE).optional().describe("short role label, e.g. lead, reviewer, builder (required to register)"),
@@ -1416,7 +1416,7 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
       task: z.string().regex(/^T\d+$/).optional().describe("CLEO task this session is on, e.g. T497"),
       lane: z.string().regex(ROLE_RE).optional().describe("swim lane, a short label such as the CLEO phase"),
       all: z.boolean().optional().describe("list: every identity on this host instead of this project's"),
-      note: z.string().max(4000).optional().describe("release: save a handoff note (at most 1000 characters) for the next holder; see mbx_handoff"),
+      note: z.string().max(HANDOFF_NOTE_INPUT_MAX).optional().describe("release: save a handoff note (at most 4000 characters, never truncated) for the next holder; see mbx_handoff"),
       task_refs: z.array(z.string().max(16)).max(100).optional().describe("release: CLEO task ids for the handoff note, e.g. T159"),
       msg_refs: z.array(z.string().max(64)).max(100).optional().describe("release: message ids for the handoff note") },
     annotations: { destructiveHint: false },
@@ -1619,9 +1619,9 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
 
   server.registerTool("mbx_handoff", {
     title: "Read or save this identity's handoff context",
-    description: "Handoff context for a crash, a provider switch or the next holder of this identity (T159). read (default) returns {context, note}: context is computed now from this mailbox and stored nowhere (open threads newest-first with subject, sender, unacked count, the oldest and newest unacked message id and needs_reply; unread, missed and open-thread counts; the catch-up position); note is the one saved handoff note, or null with a reason (none, expired, malformed). save replaces the note: text of at most 1000 characters (control characters removed, never truncated), task_refs (CLEO ids such as T159 that a message this identity can see mentions) and msg_refs (ids of messages it can see), at most 20 each, the oldest dropped. It is kept 30 days. mbx_identity release accepts the same note. Every field is a hint to re-verify, never authority and never a status: task status comes only from authorized CLEO evidence at resume time (cleo show <id>), not from the note and not from ack state; thread state comes from mbx_thread. Next: verify each task ref with cleo show and each open thread with mbx_thread before acting on it.",
+    description: "Handoff context for a crash, a provider switch or the next holder of this identity (T159). read (default) returns {context, note}: context is computed now from this mailbox and stored nowhere (open threads newest-first with subject, sender, unacked count, the oldest and newest unacked message id and needs_reply; unread, missed and open-thread counts; the catch-up position); note is the one saved handoff note, or null with a reason (none, expired, malformed). save replaces the note: text of at most 4000 characters (control characters removed, never truncated), task_refs (CLEO ids such as T159 that a message this identity can see mentions) and msg_refs (ids of messages it can see), at most 20 each, the oldest dropped. It is kept 30 days. mbx_identity release accepts the same note. Every field is a hint to re-verify, never authority and never a status: task status comes only from authorized CLEO evidence at resume time (cleo show <id>), not from the note and not from ack state; thread state comes from mbx_thread. Next: verify each task ref with cleo show and each open thread with mbx_thread before acting on it.",
     inputSchema: { action: z.enum(["read", "save"]).optional().describe("read (default) or save"),
-      note: z.string().max(4000).optional().describe("save: the note text, at most 1000 characters"),
+      note: z.string().max(HANDOFF_NOTE_INPUT_MAX).optional().describe("save: the note text, at most 4000 characters (never truncated)"),
       task_refs: z.array(z.string().max(16)).max(100).optional().describe("save: CLEO task ids, e.g. T159"),
       msg_refs: z.array(z.string().max(64)).max(100).optional().describe("save: message ids from this mailbox") },
     annotations: { idempotentHint: false },
@@ -1637,59 +1637,88 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
     return text(JSON.stringify(out, null, 2), out);
   });
 
+  /** The one reply path (T652): mbx_reply, and mbx_send called with a message id but no recipients, both send through it. */
+  const sendReply = (id: string, body: string, kind: Envelope["kind"], needs_reply: boolean, origin: "agent" | "external" | undefined, note?: string) => {
+    const { agent } = current();
+    const m = node.read(id, agent);
+    noteRead([m], { reply: true });
+    const fit = fitSubject(/^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`); // T649: never split a character at the cut
+    const rel = relay(origin, [m.from_addr]);
+    const r = node.send({ from: agent, to: [m.from_addr], subject: fit.subject, body, kind, reply_to: m.id, thread: m.thread, needs_reply, refs: [], ...rel.draft }, session());
+    return afterLease(() => {
+      const recipients = recipientReceipts(node, r.envelope.id, r.targets);
+      const out = { id: r.envelope.id, to: m.from_addr, thread: r.envelope.thread, reply_to: m.id, recipients, delivered_locally: r.local, queued_for_hosts: r.remote,
+        owner_authority: !!r.envelope.authority, ...(fit.truncated ? { subject_truncated: true } : {}), ...(note ? { note } : {}),
+        warnings: [...(fit.warning ? [fit.warning] : []), ...r.warnings, ...offlineWarnings(recipients), ...depthWarning(r.envelope), ...rel.warnings] };
+      return text(`${JSON.stringify(out, null, 2)}\nNext: mbx_ack ${m.id} if you are done with it.`, out);
+    });
+  };
+
   server.registerTool("mbx_send", {
     title: "Send an mbx message",
-    description: "Start a new conversation with other agents (to answer a message, use mbx_reply instead). `to` accepts agent names (vida-dev), agent@host (vida-dev@fedora), role:<role>, task:T123 (every live persona on that CLEO task), lead and role:lead (the owner-designated lead of this session's project; refused when that project has none), * (everyone), or owner; find names with mbx_agents. Kind decides waking: request/task/decision/alert wake an idle recipient; message/reply wake only with needs_reply=true or an @mention; status NEVER wakes (it waits for the recipient's next prompt). Use kind=request/task with needs_reply=true when you need an answer. A successful send is acceptance, not recipient delivery, reply or task completion; queued transport retry is not a draft API. Avoid manually resending an uncertain send. The result's recipients[] says per recipient: live-wake (eligible for wake; dispatcher admission pending), live-next-prompt (seen on its next prompt), offline (no live session; it waits), forwarded (renamed mailbox) or remote (queued for a paired host). A name that never existed on this host is refused with suggestions. Next: check mbx_inbox for answers.",
+    description: "Start a new conversation with other agents (to answer a message, use mbx_reply instead). `to` accepts agent names (vida-dev), agent@host (vida-dev@fedora), role:<role>, task:T123 (every live persona on that CLEO task), lead and role:lead (the owner-designated lead of this session's project; refused when that project has none), * (everyone), or owner; find names with mbx_agents. Kind decides waking: request/task/decision/alert wake an idle recipient; message/reply wake only with needs_reply=true or an @mention; status NEVER wakes (it waits for the recipient's next prompt). Use kind=request/task with needs_reply=true when you need an answer. A successful send is acceptance, not recipient delivery, reply or task completion; queued transport retry is not a draft API. Avoid manually resending an uncertain send. The result's recipients[] says per recipient: live-wake (eligible for wake; dispatcher admission pending), live-next-prompt (seen on its next prompt), offline (no live session; it waits), forwarded (renamed mailbox) or remote (queued for a paired host). A name that never existed on this host is refused with suggestions. Subject: one line, at most 200 characters; longer subjects are truncated with … (the result says so). Given a message id and no to, it is sent as mbx_reply {id, body} would be. Next: check mbx_inbox for answers.",
     inputSchema: {
-      to: z.array(z.string().min(1)).min(1).max(20), subject: z.string().min(1).max(200), body: z.string().max(256 * 1024),
-      kind: z.enum(KINDS).default("message").describe("request/task/decision/alert wake the recipient; message/reply wake only with needs_reply or an @mention; status never wakes"),
+      // T652: to and subject are checked in the handler, so a reply-shaped call ({id, body}) is answered, not refused by the schema
+      to: z.array(z.string().min(1)).min(1).max(20).optional().describe("recipients; required unless you are answering a message (then use mbx_reply, or pass id)"),
+      subject: z.string().min(1).max(MAX_SUBJECT_INPUT * 2)
+        .refine((s) => [...s].length <= MAX_SUBJECT_INPUT, `subject over ${MAX_SUBJECT_INPUT} characters`)
+        .optional().describe("One line, at most 200 characters; longer subjects are truncated with …. Required unless you are answering a message"),
+      body: z.string().max(256 * 1024),
+      kind: z.enum(KINDS).optional().describe("default message (reply when answering a message). request/task/decision/alert wake the recipient; message/reply wake only with needs_reply or an @mention; status never wakes"),
       reply_to: z.string().optional().describe("id of the message you are answering; keeps the thread"),
+      id: z.string().min(6).optional().describe("alias of reply_to. With no `to`, the call is sent exactly as mbx_reply {id, body}"),
       needs_reply: z.boolean().default(false), refs: z.array(z.string()).max(20).default([]),
       idempotency_key: z.string().max(100).optional().describe("same key twice sends only once"),
       origin: z.enum(["agent", "external"]).optional().describe("external when the content comes from outside (web page, issue, PR comment, email)"),
     },
-  }, ({ to, subject, body, kind, reply_to, needs_reply, refs, idempotency_key, origin }) => {
+  }, ({ to, subject, body, kind, reply_to, id, needs_reply, refs, idempotency_key, origin }) => {
     const { agent } = current();
     if (idempotency_key) {
       const prev = node.store.get(`idem:${agent}:${idempotency_key}`);
       if (prev) return text(`Already sent as ${prev} (same idempotency_key).`, { id: prev, duplicate: true });
     }
+    // T652: agents often send mbx_reply's shape here. With a message id and no recipients it is that reply, sent once by
+    // the reply path itself; with no id, one actionable line instead of a schema error.
+    const target = reply_to ?? id;
+    if (!to?.length) {
+      if (!target) throw new Error("mbx_send needs to and subject; to answer a message use mbx_reply {id, body}");
+      if (!body) throw new Error("mbx_send needs a body; to answer a message use mbx_reply {id, body}");
+      const answered = sendReply(target, body, kind ?? "reply", needs_reply, origin, `treated as a reply to ${target}; mbx_reply is the reply tool`);
+      if (idempotency_key) {
+        const sentId = (answered.structuredContent as { id?: string } | undefined)?.id;
+        if (sentId) node.store.set(`idem:${agent}:${idempotency_key}`, sentId);
+      }
+      return answered;
+    }
     let thread: string | undefined;
-    if (reply_to) { const m = node.read(reply_to, agent); noteRead([m], { reply: true }); thread = m.thread; reply_to = m.id; }
+    if (target) {
+      const m = node.read(target, agent); noteRead([m], { reply: true }); thread = m.thread; reply_to = m.id;
+      subject ??= /^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`; // T652: to without subject when replying
+    }
+    if (!subject) throw new Error("mbx_send needs subject (one line, at most 200 characters); to answer a message use mbx_reply {id, body}");
     assertKnownRecipients(node, to); // T205: never create a mailbox by typo
     const rel = relay(origin, to);
-    const r = node.send({ from: agent, to, subject, body, kind, reply_to, thread, needs_reply, refs, ...rel.draft }, session());
+    const fit = fitSubject(subject); // T649: truncate a long subject instead of refusing the send
+    const r = node.send({ from: agent, to, subject: fit.subject, body, kind: kind ?? "message", reply_to, thread, needs_reply, refs, ...rel.draft }, session());
     if (idempotency_key) node.store.set(`idem:${agent}:${idempotency_key}`, r.envelope.id);
     return afterLease(() => {
       const recipients = recipientReceipts(node, r.envelope.id, r.targets);
       const out = { id: r.envelope.id, ref: `mbx:${r.envelope.id}@${node.host}`, thread: r.envelope.thread, recipients, delivered_locally: r.local, queued_for_hosts: r.remote,
-        owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...offlineWarnings(recipients), ...statusWakeWarning(r.envelope), ...depthWarning(r.envelope), ...rel.warnings] };
+        owner_authority: !!r.envelope.authority, ...(fit.truncated ? { subject_truncated: true } : {}),
+        warnings: [...(fit.warning ? [fit.warning] : []), ...r.warnings, ...offlineWarnings(recipients), ...statusWakeWarning(r.envelope), ...depthWarning(r.envelope), ...rel.warnings] };
       return text(JSON.stringify(out, null, 2), out);
     });
   });
 
   server.registerTool("mbx_reply", {
     title: "Reply to an mbx message",
-    description: "Reply to a message: goes back to its sender, in the same thread (the most common action after mbx_read). Set needs_reply=true only if you need an answer back. Next: mbx_ack the original message once it is dealt with.",
+    description: "Reply to a message: goes back to its sender, in the same thread (the most common action after mbx_read). Set needs_reply=true only if you need an answer back. The subject is Re: plus the original subject; one line, at most 200 characters; longer subjects are truncated with … (the result says so). Next: mbx_ack the original message once it is dealt with.",
     inputSchema: {
       id: z.string().min(6).describe("id (or unique prefix) of the message you are answering"), body: z.string().min(1).max(256 * 1024),
       kind: z.enum(KINDS).default("reply"), needs_reply: z.boolean().default(false),
       origin: z.enum(["agent", "external"]).optional().describe("external when the content comes from outside"),
     },
-  }, ({ id, body, kind, needs_reply, origin }) => {
-    const { agent } = current();
-    const m = node.read(id, agent);
-    noteRead([m], { reply: true });
-    const subject = /^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`.slice(0, 200);
-    const rel = relay(origin, [m.from_addr]);
-    const r = node.send({ from: agent, to: [m.from_addr], subject, body, kind, reply_to: m.id, thread: m.thread, needs_reply, refs: [], ...rel.draft }, session());
-    return afterLease(() => {
-      const recipients = recipientReceipts(node, r.envelope.id, r.targets);
-      const out = { id: r.envelope.id, to: m.from_addr, thread: r.envelope.thread, reply_to: m.id, recipients, delivered_locally: r.local, queued_for_hosts: r.remote,
-        owner_authority: !!r.envelope.authority, warnings: [...r.warnings, ...offlineWarnings(recipients), ...depthWarning(r.envelope), ...rel.warnings] };
-      return text(`${JSON.stringify(out, null, 2)}\nNext: mbx_ack ${m.id} if you are done with it.`, out);
-    });
-  });
+  }, ({ id, body, kind, needs_reply, origin }) => sendReply(id, body, kind, needs_reply, origin));
 
   server.registerTool("mbx_inbox", {
     title: "Read my mbx inbox",

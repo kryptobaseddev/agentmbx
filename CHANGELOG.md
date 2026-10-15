@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **A reply-shaped `mbx_send` is sent as the reply, and handoff notes may be up to 4000 characters (T652).** Agents, OpenCode ones especially, often called `mbx_send` with `mbx_reply`'s arguments (`{id, body, kind}`). The schema refused it with "to: Missing key, subject: Missing key", and the agent spent a turn resending through `mbx_reply`.
+  - **Sent as the reply:** `mbx_send` now treats a message id (`id`, an alias of `reply_to`) with no `to` as that reply. It is sent once through `mbx_reply`'s own path: same recipient, `Re:` subject, thread, kind `reply`, and the same policy and taint handling. The result notes "treated as a reply to <id>; mbx_reply is the reply tool".
+  - **Replying to other recipients:** `to` together with a message id but no subject sends in that thread with the `Re:` subject.
+  - **Actionable error:** a send with neither recipients nor an id gets one line: "mbx_send needs to and subject; to answer a message use mbx_reply {id, body}".
+  - **Handoff notes:** `mbx_handoff` save and `mbx_identity` release accept notes of up to 4000 characters (was 1000), and both descriptions say so. A note over the limit is still refused, never truncated, and the error now says how many characters to cut.
+
+- **A subject over 200 characters is truncated instead of refused (T649).** `mbx_send` rejected a subject over 200 characters at the schema, so the whole send failed and the agent had to retry. The `mbx_send` and `mbx_reply` descriptions and the subject field now state the cap up front: "One line, at most 200 characters; longer subjects are truncated with …". A longer subject is cut to 199 characters plus `…`. The cut falls on a character boundary, so an emoji or a combined sequence is never split, and the result also fits 200 UTF-16 units, so a paired host's receive check accepts it. The send goes through once with the body unchanged, and the result carries `subject_truncated: true` and the warning `subject truncated from N to 200 characters`. `agentmbx send` does the same and prints the warning. A subject over 1,000 characters is still refused as abuse. Receiving is unchanged: a paired host still rejects an envelope whose subject is over 200 characters.
+
 ## 0.5.36 (2026-10-14)
 
 - **The current mailbox holder can restore its wake endpoint (T648).** A still-running former MCP transport no longer blocks a newer lease generation for that same mailbox from publishing its control endpoint. Codex hook resume and thread metadata share one state/key, and a repeated claim repairs a stale same-process endpoint. Live foreign endpoints from the same generation or another mailbox stay protected; co-using servers never publish for the holder. CLI claim, release and signed owner takeover keep reaching the current endpoint.
