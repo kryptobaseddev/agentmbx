@@ -119,14 +119,21 @@ for (const recover of [true, false]) test(`a separate session-start hook ${recov
   assert.equal(mcpStarting(f.home, "codex", process.pid), false, "another provider cannot delay this hook");
   assert.equal(mcpStarting(f.home, "claude", 2_000_000_000), false, "another process tree cannot delay this hook");
   const started = performance.now(), hook = f.hook(id);
-  if (recover) { await pause(600); writeFileSync(release, "ready"); }
+  // whoami is served only after the startup resume publishes the lease. That
+  // loop writes no "resumed identity" line. Release the insert as soon as the
+  // hook is running, and read the hook after whoami. A fixed pause let a slow
+  // runner return unbound before the insert was allowed.
+  const resumed = recover
+    ? (writeFileSync(release, "ready"), server.rpc(2, "tools/call", { name: "mbx_whoami", arguments: {} }))
+    : undefined;
+  if (resumed) assert.equal((await resumed).result?.structuredContent?.agent, "reader", server.stderr());
   const result = await hook;
   assert.equal(result.code, 0, result.stderr);
   assert.ok(performance.now() - started < 3000, "the hook must not wait indefinitely for MCP readiness");
   assert.doesNotMatch(result.stdout, /no mailbox identity|action.*claim|action.*register/);
   if (recover) assert.match(result.stdout, /You are reader@alpha/);
   else { assert.match(result.stdout, /identity is still resuming/); writeFileSync(release, "ready"); }
-  const who = await server.rpc(2, "tools/call", { name: "mbx_whoami", arguments: {} });
+  const who = resumed ? await resumed : await server.rpc(2, "tools/call", { name: "mbx_whoami", arguments: {} });
   assert.equal(who.result?.structuredContent?.agent, "reader");
   assert.equal(existsSync(join(f.home, "mcp-errors.log")), false, "successful startup and transient busy retries are not startup errors");
   assert.equal(mcpStarting(f.home, "claude", process.pid), false, "ready removes the advisory marker");
