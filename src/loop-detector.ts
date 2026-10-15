@@ -4,6 +4,7 @@ import { checkShape, oneLine, verifyEnvelope, type Envelope } from "./envelope.t
 import type { MbxNode } from "./node.ts";
 import { notifyDesktop } from "./wake.ts";
 import { armOpencodeDuplicateLoopAudit } from "./opencode-duplicate-loop.ts";
+import { armConnectorSkewNotes } from "./connector-skew.ts";
 
 export interface LoopDetectorConfig { message_threshold: number; window_minutes: number }
 export const LOOP_DEFAULTS: Readonly<LoopDetectorConfig> = { message_threshold: 50, window_minutes: 10 };
@@ -105,6 +106,8 @@ export async function reportConversationLoops(node: MbxNode, deps: { now?: numbe
 export function armConversationLoopReports(node: MbxNode): void {
   // T522: the daemon already calls this arm. The duplicate-loop audit rides the same start.
   armOpencodeDuplicateLoopAudit(node);
+  // T661: a live OpenCode session whose connector is behind the installed build is told once how it switches.
+  armConnectorSkewNotes(node);
   let busy = false;
   const tick = () => {
     if (busy) return;

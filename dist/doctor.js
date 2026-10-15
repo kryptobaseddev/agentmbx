@@ -32,6 +32,7 @@ import { opencodeDuplicateLoopChecks } from "./opencode-duplicate-loop.js";
 import { mbxProcessInventory, mcpOrphanCheck } from "./mcp-lifecycle.js";
 import { HUD_ALIVE_MAX_MS, hudAlivePath, hudSessionV2Path } from "./hud.js";
 import { recentMcpStartupErrors } from "./logs.js";
+import { connectorSkewChecks } from "./connector-skew.js";
 /** --processes observes only the process inventory; it never initializes or repairs the host. */
 export function processChecks(home) {
     const inventory = mbxProcessInventory(home);
@@ -1007,6 +1008,8 @@ export async function doctor(ctx, mbxHome, opts = {}) {
             catch { /* unreadable mailbox: other checks report it */ }
         }
         out.push(...conversationLoopChecks(node));
+        // T661: every live connector (any harness) behind the installed build, with the step that switches it.
+        out.push(...connectorSkewChecks(node, { ctx }));
         // T211: mailboxes nobody is holding, sessions waiting on a remembered identity, prune weight
         for (const c of strandedMail(node))
             out.push(c);

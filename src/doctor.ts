@@ -32,6 +32,7 @@ import { opencodeDuplicateLoopChecks } from "./opencode-duplicate-loop.ts";
 import { mbxProcessInventory, mcpOrphanCheck } from "./mcp-lifecycle.ts";
 import { HUD_ALIVE_MAX_MS, hudAlivePath, hudSessionV2Path } from "./hud.ts";
 import { recentMcpStartupErrors } from "./logs.ts";
+import { connectorSkewChecks } from "./connector-skew.ts";
 
 export type Level = "ok" | "fail" | "warn" | "info";
 export interface Check { level: Level; label: string; fix?: string }
@@ -847,6 +848,8 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
       } catch { /* unreadable mailbox: other checks report it */ }
     }
     out.push(...conversationLoopChecks(node));
+    // T661: every live connector (any harness) behind the installed build, with the step that switches it.
+    out.push(...connectorSkewChecks(node, { ctx }));
     // T211: mailboxes nobody is holding, sessions waiting on a remembered identity, prune weight
     for (const c of strandedMail(node)) out.push(c);
     for (const c of pendingIdentities(node)) out.push(c);
