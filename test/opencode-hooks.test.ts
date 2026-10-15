@@ -18,6 +18,7 @@ import { opencodeServiceCheck } from "../src/doctor.ts";
 import { version } from "../src/version.ts";
 import { sendLeased } from "./helpers/leased-send.ts";
 import { bindWakeLease } from "./helpers/wake-lease.ts";
+import { boundAtStart } from "./helpers/opencode-bound.ts";
 
 const CMD = ["/opt/bin/agentmbx"];
 const ctxFor = (home: string, cmd = CMD): SetupCtx => ({ home, cmd, which: () => null, useClis: false });
@@ -171,7 +172,8 @@ test("T391 default export satisfies OpenCode v2's plugin schema: id + setup (loa
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("T391 v2 setup: ctx.event.subscribe drives session-start and stop; ctx.tool.hook drives post-tool", async () => {
+test("T391 v2 setup: ctx.event.subscribe drives session-start and stop; ctx.tool.hook drives post-tool", async (t) => {
+  t.after(boundAtStart(["ses_v2a"])); // T643: the stubbed start note is a bound session's
   const { mod, dir } = await loadPlugin();
   const calls: Spawned[] = [], notes: Note[] = [];
   const restoreSpawn = stubSpawn(calls, (c) => (c.args[1] === "stop" ? JSON.stringify({ decision: "block", reason: "[mbx] 1 new message(s) for worker." }) : "[mbx] You are worker@alpha.\\n[mbx] 1 unread mbx message(s): call mbx_inbox."));
@@ -323,7 +325,8 @@ test("T466 OpenCode 2.0.24 turn end is session.execution.succeeded with data.ses
   } finally { restoreSpawn(); restoreFetch(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("T391 B4(a): v1 factory session.created runs session-start with the sid (generated plugin)", async () => {
+test("T391 B4(a): v1 factory session.created runs session-start with the sid (generated plugin)", async (t) => {
+  t.after(boundAtStart(["ses_eval1"])); // T643: the stubbed start note is a bound session's
   const { mod, dir } = await loadPlugin();
   const calls: Spawned[] = [], notes: Note[] = [];
   const restoreSpawn = stubSpawn(calls, () => "[mbx] You are agentmbx-opencode@alpha.\\n[mbx] 2 unread mbx message(s): call mbx_inbox.");
@@ -434,6 +437,7 @@ test("T391 B2b(a): real session-start stdout is plain [mbx] lines and injects as
     assert.ok(!r.stdout.includes("hookSpecificOutput"), "opencode gets plain stdout, not Claude's JSON shape (B2b)");
     assert.match(r.stdout, /\[mbx\] You are worker@alpha/, "held-identity line");
     assert.match(r.stdout, /1 unread mbx message\(s\)/, "unread line");
+    const restoreHome = boundAtStart([], home); // T643: the plugin reads the marker the real bind above wrote
     const { mod, dir } = await loadPlugin();
     const calls: Spawned[] = [], notes: Note[] = [];
     const restoreSpawn = stubSpawn(calls, () => r.stdout);
@@ -448,7 +452,7 @@ test("T391 B2b(a): real session-start stdout is plain [mbx] lines and injects as
       assert.match(notes[0].text, /1 unread mbx message\(s\)/, "unread line in the SAME message (B2b run capture)");
       assert.equal(notes[0].delivery, "queue");
       assert.equal(notes[0].resume, false);
-    } finally { restoreSpawn(); restoreFetch(); rmSync(dir, { recursive: true, force: true }); }
+    } finally { restoreSpawn(); restoreFetch(); restoreHome(); rmSync(dir, { recursive: true, force: true }); }
   } finally { n.close(); rmSync(home, { recursive: true, force: true }); }
 });
 
