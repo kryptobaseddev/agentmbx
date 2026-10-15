@@ -2269,7 +2269,7 @@ async function watch(node, selection) {
                     // otherwise pin the NEW holder and never notice the move.
                     const row = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(agent);
                     if (row && row.released_at === null) {
-                        pinned = { token: row.token, holder_pid: row.holder_pid, holder_start: row.holder_start };
+                        pinned = { token: row.token, holder_pid: row.holder_pid, holder_start: row.holder_start, cli: row.cli, session_id: row.session_id };
                         lastHeartbeatAt = row.heartbeat_at;
                         heartbeatAdvancedMono = performance.now();
                         // Review minor 6: a finite positive integer, clamped between the heartbeat interval and
@@ -2298,7 +2298,7 @@ async function watch(node, selection) {
             }
             releaseRetries = 0;
             if (!pinned) {
-                pinned = { token: lease.token, holder_pid: lease.holder_pid, holder_start: lease.holder_start };
+                pinned = { token: lease.token, holder_pid: lease.holder_pid, holder_start: lease.holder_start, cli: lease.cli, session_id: lease.session_id };
                 lastHeartbeatAt = lease.heartbeat_at;
                 heartbeatAdvancedMono = performance.now();
                 const raw = Number(process.env.MBX_WATCH_STALE_MS);
@@ -2306,6 +2306,10 @@ async function watch(node, selection) {
                     ? Math.min(Math.max(Math.trunc(raw), MCP_HEARTBEAT_MS), lease.idle_ttl)
                     : 3 * MCP_HEARTBEAT_MS;
             }
+            // T653: a new token for the same cli and session is followed; the holder check below still requires the same process
+            // (pid and birth), so only that holder re-keying its own lease keeps this watcher. Any other change is a move.
+            if (lease.token !== pinned.token && lease.cli === pinned.cli && lease.session_id === pinned.session_id)
+                pinned = { ...pinned, token: lease.token };
             if (lease.token !== pinned.token || lease.holder_pid !== pinned.holder_pid || lease.holder_start !== pinned.holder_start)
                 throw leaseLost("the lease this watcher was started for moved to another holder");
             if (lease.heartbeat_at !== lastHeartbeatAt) {
