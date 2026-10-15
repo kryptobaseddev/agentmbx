@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.34 (2026-10-14)
+
+OpenCode sessions see new mail during a long turn: the unread notice rides the tool result the model is reading, a repeated unread count is no longer silently dropped, and a sender's receipt says when a wake is queued behind the recipient's running turn. Run agentmbx setup --only opencode and reopen OpenCode sessions to load the new plugin.
+
 - **Mail that arrives during a long OpenCode turn reaches the model within that turn (T642).** Before, the post-tool notice (`[mbx] N unread … mbx_inbox before continuing.`) went into OpenCode's queue, which holds items until the turn ends. Its message id also came from the text alone, so a notice with an unread count the session had already seen reused an old id and was dropped silently. Now the plugin appends the notice to the tool result the model is about to read: `result.content` for a completed v2 `execute.after` (a string or an array), and `output.output` for v1. The queue remains the fallback for error results and results with no text content, and each new delivery gets its own id there (a retry of the same one keeps its id, per T187). A wake admitted while the session's turn is running is recorded as `queued-behind-turn`. `mbx_sent` and thread receipts show "wake queued behind the session's running turn" until the message is handled, and the send-time detail for an OpenCode recipient says when a session in the middle of a turn will see it. Running OpenCode panes pick up the fix after `agentmbx setup --only opencode` and a reopen.
 
 ## 0.5.33 (2026-10-14)
