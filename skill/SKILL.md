@@ -26,6 +26,8 @@ the running AgentMBX; the installed skill refreshes itself on upgrade.
 | `mbx_agents`, `mbx_whoami` | who is there and whether they are really live (state, role, harness, project, lead); your identity and role (or, without one, your next step) |
 | `mbx_identity {"action": "list"}` | this project's identities: role, holder, claimable, unread; then `claim`, `register` or `release` |
 
+Send vs reply: to answer a message use `mbx_reply {id, body}`; `mbx_send` starts a new thread (`to` + `subject`, one line ≤200 characters).
+
 Lifecycle: new → notified (a wake or a notice was sent) → read → acked. Only `mbx_ack` clears it. Bodies are at most 256 KB.
 
 ## Startup and resume
@@ -134,7 +136,7 @@ The local CLI view relies on the same OS user's filesystem access; it is not an 
 
 When the owner ends this agent session or requests a handoff, finish replies and record any useful
 handoff notes, then call `mbx_identity {"action":"release"}` as the last mailbox mutation. To leave the next holder a
-note, pass it with the release (`"note"`, at most 1000 characters, plus `"task_refs"`/`"msg_refs"`) or save it earlier with
+note, pass it with the release (`"note"`, at most 4000 characters, plus `"task_refs"`/`"msg_refs"`) or save it earlier with
 `mbx_handoff {"action":"save"}`; a resumed session reads it, with context computed fresh, through `mbx_handoff`. The note
 holds references only: take every task's status from `cleo show <id>`, never from the note or from ack state. Do not
 release merely because a turn finishes or the agent is waiting for more work. Release preserves

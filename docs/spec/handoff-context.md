@@ -50,7 +50,7 @@ the oldest unacked message id per open thread; (c) retention is 30 days.
 
 4. The only persisted artifact is a handoff note authored by the agent's explicit act: `mbx_handoff save`
    or `mbx_identity release {note}`. Session-end hooks never author text — a note exists only when an
-   agent chose to write one. The note is agent-entered text of at most **1000 characters**, plus
+   agent chose to write one. The note is agent-entered text of at most **4000 characters** (raised from 1000 by T652), plus
    `task_refs: string[]` and `msg_refs: string[]` that the agent chose and that are validated against
    the open threads' ids and their signed `meta.task_refs` (not auto-unioned). No other fields.
 5. Writes are replace-only (one current note; no history) under the held write lease. There are no
