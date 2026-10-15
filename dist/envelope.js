@@ -296,6 +296,62 @@ export function readContentProvenance(input, sources, now = Date.now()) {
         return unknown("unreadable provenance");
     }
 }
+/** Build signed metadata from daemon-selected inputs, never from caller-supplied root bytes. No authority is granted. */
+export function createContentProvenance(e, inputIds, sources, declared, unknownInputs = false) {
+    const record = { v: 2, kind: "unknown", content_sha256: sha256(e.body), roots: [], parents: [] }, warnings = [];
+    const unknown = (reason) => ({ record, warnings: [...warnings, `payload provenance unknown: ${reason}`] });
+    const now = Date.parse(e.ts);
+    if (!instant(e.ts, now) || !Array.isArray(inputIds) || inputIds.length > MAX_CONTENT_ROOTS
+        || inputIds.some(id => typeof id !== "string" || !MESSAGE_ID.test(id) || id === e.id)
+        || new Set(inputIds).size !== inputIds.length)
+        return unknown("invalid or overflowing inputs");
+    record.parents = [...inputIds];
+    if (unknownInputs)
+        return unknown("incomplete daemon input context");
+    const roots = new Map();
+    for (const id of inputIds) {
+        let parent;
+        try {
+            parent = sources.message(id);
+        }
+        catch {
+            return unknown("unreadable input");
+        }
+        if (checkShape(parent) || parent.id !== id || Date.parse(parent.ts) > now)
+            return unknown("missing or future input");
+        const parsed = readContentProvenance(parent, sources, now);
+        if (parsed.kind === "unknown")
+            return unknown(`unverified input: ${parsed.reason}`);
+        for (const root of parsed.roots) {
+            const old = roots.get(root.message_id);
+            if (old && canonical(old) !== canonical(root))
+                return unknown("contradictory input roots");
+            roots.set(root.message_id, root);
+            if (roots.size > MAX_CONTENT_ROOTS)
+                return unknown("input root union overflow");
+        }
+    }
+    if (declared === "firsthand-outside") {
+        if (roots.size)
+            return unknown("a new raw source cannot replace known outside inputs; reference it as a derived input");
+        record.kind = "firsthand-outside";
+        record.parents = [];
+        record.roots = [{ message_id: e.id, from: e.from, content_sha256: record.content_sha256, since: e.ts }];
+        if (e.kind === "status")
+            warnings.push("status was declared outside and stays outside; own test counts/status may use a separately observed agent context");
+    }
+    else if (roots.size) {
+        record.kind = "derived-outside";
+        record.roots = [...roots.values()];
+        if (declared === "agent")
+            warnings.push("agent payload declaration overridden: daemon-known outside inputs retain their roots");
+    }
+    else if (declared === "derived-outside")
+        return unknown("derived outside payload requires a known outside source");
+    else
+        record.kind = "agent";
+    return { record, warnings };
+}
 // ---- owner grants ----------------------------------------------------------------------------
 export const CAPS = ["task.assign", "decision", "broadcast", "alert"];
 export const MAX_GRANT_HOURS = 24 * 7;
