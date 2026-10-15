@@ -18,6 +18,7 @@ import type { WakeOutcome, WakeReceipt } from "./wake-contract.ts";
 import type { MessageRow, Store } from "./store.ts";
 import { leadAgentOf, projectLabel, projectMailboxBySlot } from "./project-mailbox.ts";
 import { isSlotName } from "./project-slot.ts";
+import { markSkewNoted, wakeSkewNote } from "./connector-skew.ts";
 
 const run = promisify(execFile);
 /** `ok` is true only for an admitted wake or a shown notice. Provider adapters also report the typed `outcome` (T178,
@@ -511,7 +512,12 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
       const marker = { attemptId: ulid(), agent, messageIds: automatic.map((r) => r.id), deliveries: automatic.map((r) => ({ id: r.id, agent: r.agent })), sessionId: s.session_id, at: new Date(now).toISOString() };
       node.store.set(attemptKey(agent), JSON.stringify(marker)); // durable before the native write (WC-14)
       if (s.cli === "codex") result = await wakeCodex(s.session_id, text, { recheck });
-      else if (s.cli === "opencode") result = await wakeOpencode(s.session_id, text, { recheck, pid: s.pid });
+      else if (s.cli === "opencode") {
+        // T661: a session whose live connector is behind the installed build learns how it switches, once, on a real wake.
+        const skew = wakeSkewNote(node, s);
+        result = await wakeOpencode(s.session_id, skew ? `${text}\n${skew.text}` : text, { recheck, pid: s.pid });
+        if (skew && result.outcome?.kind === "admitted") markSkewNoted(node, skew, result.outcome.receipt.nativeId ?? null);
+      }
       else if (s.cli === "kimi") result = kimiDesktop(s.pid) ? await wakeKimiDesktop(s, text, { recheck }) : await wakeKimi(s, text, { recheck });
       else if (s.cli === "grok") result = await wakeGrok(s.session_id, text, { recheck });
       else continue;

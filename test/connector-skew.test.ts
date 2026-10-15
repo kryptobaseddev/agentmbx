@@ -1,5 +1,5 @@
-// T661: doctor names every live connector that is behind the installed build (any harness), and a live standalone OpenCode
-// session is told once per (connector version, installed version) pair how it switches, through the poller queue.
+// T661: doctor names every live connector that is behind the installed build (any harness), and a live OpenCode session is
+// told once per (connector version, installed version) pair how it switches, appended to the next real wake it gets.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -7,9 +7,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MbxNode } from "../src/node.ts";
 import {
-  compareVersions, connectorSkewChecks, liveConnectors, noteConnectorSkew, opencodePluginStep, skewNoteKey, skewNoteText, type OpencodePluginState,
+  compareVersions, connectorSkewChecks, liveConnectors, opencodePluginStep, skewNoteKey, skewNoteText, skewSeams, wakeSkewNote, type OpencodePluginState,
 } from "../src/connector-skew.ts";
 import { completeOpencodeWake, resetOpencodeWakeQueue, waitForOpencodeWake } from "../src/opencode-wake-queue.ts";
+import { opencodeHostSeams } from "../src/opencode-provider.ts";
+import { dispatchWakes } from "../src/wake.ts";
+import { inspectLeaseProcess } from "../src/identity-leases.ts";
+import { ulid } from "../src/crypto.ts";
+import { version } from "../src/version.ts";
+import { sendLeased } from "./helpers/leased-send.ts";
+import { bindWakeLease } from "./helpers/wake-lease.ts";
 
 const START = "ps-utc:Thu Oct 15 13:55:50 2026";
 const CURRENT_PLUGIN: OpencodePluginState = { headerVersion: "0.5.38", mtimeMs: Date.UTC(2026, 9, 15, 13, 0, 0), templateCurrent: true };
@@ -94,62 +101,82 @@ test("T661: the fix names the plugin step: setup when the template is stale, reo
   assert.equal(opencodePluginStep(olderFile, null), null, "no recorded serve start: no claim");
 });
 
-test("T661: a live OpenCode session gets one note per (connector, installed) pair through the poller queue", async (t) => {
-  const { n, connector, inspect } = fixture(t);
-  connector(801, "0.5.36", { agent: "axiom-dev", cli: "opencode", session: "ses_live", servePid: process.pid });
-  const deps = { installed: "0.5.38", inspect, plugin: CURRENT_PLUGIN, live: () => true };
-  // the plugin's long-poll for this exact (session, serve)
-  const poll = waitForOpencodeWake("ses_live", process.pid, 3_000);
-  const pass = noteConnectorSkew(n, deps);
-  const text = await poll;
-  assert.equal(text, skewNoteText("0.5.36", "0.5.38", null));
-  assert.match(text!, /^\[mbx\] AgentMBX 0\.5\.38 is installed; this session's mbx connector still runs 0\.5\.36\. Your next mbx tool call switches it to 0\.5\.38 in place, with no restart\.$/);
-  assert.equal(completeOpencodeWake("ses_live", "msg_note1"), true);
-  assert.deepEqual(await pass, ["ses_live"]);
-  assert.match(n.store.get(skewNoteKey("ses_live", "0.5.36", "0.5.38"))!, /"receipt":"msg_note1"/);
-  assert.match((n.store.db.prepare("SELECT detail FROM audit WHERE event='connector.skew_noted'").get() as { detail: string }).detail, /"connector":"0.5.36","installed":"0.5.38"/);
+// ---- the note rides a real wake (dispatchWakes), never a turn of its own ----
 
-  // the same pair is never noted again, even with the poller waiting
-  let pushes = 0;
-  const counting = { ...deps, push: async () => { pushes++; return { ok: true as const, id: "msg_x", turnSince: null }; } };
-  assert.deepEqual(await noteConnectorSkew(n, counting), []);
-  assert.equal(pushes, 0);
-  // a newer install is a new pair: one more note
-  assert.deepEqual(await noteConnectorSkew(n, { ...counting, installed: "0.5.39" }), ["ses_live"]);
-  assert.equal(pushes, 1);
-  assert.deepEqual(await noteConnectorSkew(n, { ...counting, installed: "0.5.39" }), []);
-  assert.equal(pushes, 1);
+const STANDALONE = ["/Users/x/.opencode/bin/opencode", "serve", "--stdio", "--port", "0"];
+const SESSION = "ses_skew";
+
+/** A leased standalone OpenCode session for this process, whose connector self-report says `connectorVersion`. */
+function wakeable(t: { after: (fn: () => void) => unknown }, connectorVersion: string) {
+  const home = mkdtempSync(join(tmpdir(), "mbx-t661w-")), n = new MbxNode(home, { host: "alpha" });
+  const realArgs = opencodeHostSeams.args, realPlugin = skewSeams.plugin, prevDesk = process.env.MBX_NO_DESKTOP;
+  opencodeHostSeams.args = (pids) => new Map(pids.map(p => [p, STANDALONE]));
+  skewSeams.plugin = () => CURRENT_PLUGIN;
+  process.env.MBX_NO_DESKTOP = "1";
+  t.after(() => { opencodeHostSeams.args = realArgs; skewSeams.plugin = realPlugin;
+    if (prevDesk === undefined) delete process.env.MBX_NO_DESKTOP; else process.env.MBX_NO_DESKTOP = prevDesk;
+    n.close(); resetOpencodeWakeQueue(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  bindWakeLease(n, { agent: "worker", cli: "opencode", session_id: SESSION, pid: process.pid });
+  n.store.set(`connector:${process.pid}`, JSON.stringify({ v: 1, pid: process.pid, start: inspectLeaseProcess(process.pid).start, version: connectorVersion,
+    build: "x", tools: [], cli: "opencode", at: new Date().toISOString() }));
+  /** One wake through the real poller queue; returns the text the plugin received, or null when no wake was offered. */
+  const wakeOnce = async (subject: string | null) => {
+    if (subject) sendLeased(n, { from: "sender", to: ["worker"], subject, body: "b", kind: "request" });
+    const poll = waitForOpencodeWake(SESSION, process.pid, 400);
+    const dispatched = dispatchWakes(n);
+    const text = await poll;
+    if (text) completeOpencodeWake(SESSION, `msg_${ulid()}`);
+    await dispatched;
+    return text;
+  };
+  return { n, wakeOnce };
+}
+
+const noted = (n: MbxNode) => n.store.db.prepare("SELECT count(*) c FROM audit WHERE event='connector.skew_noted'").get() as { c: number };
+
+test("T661: the note rides the next admitted wake once, appended to the wake text, and is not repeated", async (t) => {
+  const { n, wakeOnce } = wakeable(t, "0.0.1");
+  const first = await wakeOnce("first");
+  assert.ok(first, "a real wake was offered");
+  assert.match(first!, /\[mbx\] 1 new message\(s\) for worker/);
+  const line = skewNoteText("0.0.1", version(), null);
+  assert.ok(first!.endsWith(`\n${line}`), "the one-line note is appended to that wake");
+  assert.match(line, /^\[mbx\] AgentMBX .+ is installed; this session's mbx connector still runs 0\.0\.1\. Your next mbx tool call switches it to .+ in place, with no restart\.$/);
+  assert.match(n.store.get(skewNoteKey(SESSION, "0.0.1", version()))!, /"receipt":"msg_/);
+  assert.equal(noted(n).c, 1);
+  n.store.db.prepare("DELETE FROM wakes").run(); // the per-agent batching window has passed
+  const second = await wakeOnce("second");
+  assert.ok(second, "the next mail still wakes");
+  assert.equal(second!.includes("still runs 0.0.1"), false, "the note is not repeated");
+  assert.equal(noted(n).c, 1);
+  assert.ok(wakeSkewNote(n, { agent: "worker", cli: "opencode", session_id: SESSION }, { installed: "999.0.0" }), "a newer install is a new pair");
 });
 
-test("T661: no note for an equal or unknown connector, a session that is not polling, or a refused push (retried later)", async (t) => {
-  const { n, connector, inspect } = fixture(t);
-  connector(901, "0.5.38", { agent: "eq", cli: "opencode", session: "ses_eq", servePid: 9101 });
-  connector(902, "dev", { agent: "unk", cli: "opencode", session: "ses_unk", servePid: 9102 });
-  connector(903, "0.5.36", { agent: "idle", cli: "opencode", session: "ses_nopoll", servePid: 9103 });
-  connector(904, "0.5.36", { agent: "claude-one", cli: "claude", session: "c1" }); // not OpenCode: doctor only
-  // even when an OpenCode row with that agent and session id exists, a Claude connector is never noted through OpenCode
-  n.store.db.prepare("INSERT INTO sessions (agent,cli,session_id,pid,pid_start,updated_at) VALUES ('claude-one','opencode','c1',9104,NULL,?)").run(new Date().toISOString());
-  let pushes = 0;
-  const push = async () => { pushes++; return { ok: false as const, handedOff: false }; };
-  const base = { installed: "0.5.38", inspect, plugin: CURRENT_PLUGIN, push };
-  assert.deepEqual(await noteConnectorSkew(n, { ...base, live: () => false }), []);
-  assert.equal(pushes, 0, "equal, unknown and non-OpenCode are skipped; the behind one is not polling");
-  assert.deepEqual(await noteConnectorSkew(n, { ...base, live: () => true }), []);
-  assert.equal(pushes, 1, "only the behind OpenCode session is offered");
-  assert.equal(n.store.get(skewNoteKey("ses_nopoll", "0.5.36", "0.5.38")), undefined, "a refused push frees the claim");
-  // a push whose receipt never came back still left: it counts as delivered and is not repeated
-  const handed = { ...base, live: () => true, push: async () => { pushes++; return { ok: false as const, handedOff: true }; } };
-  assert.deepEqual(await noteConnectorSkew(n, handed), ["ses_nopoll"]);
-  assert.deepEqual(await noteConnectorSkew(n, handed), []);
-  assert.equal(pushes, 2);
+test("T661: no mail, no wake: an idle session behind the installed build is never woken for the note", async (t) => {
+  const { n, wakeOnce } = wakeable(t, "0.0.1");
+  assert.equal(await wakeOnce(null), null, "nothing offered to the poller");
+  assert.equal(n.store.db.prepare("SELECT count(*) c FROM audit WHERE event LIKE 'wake%'").get()!.c, 0);
+  assert.equal(n.store.get(skewNoteKey(SESSION, "0.0.1", version())), undefined, "and nothing marked");
 });
 
-test("T661: the note carries the plugin step when the tab's plugin cannot switch in place", async (t) => {
-  const { n, connector, inspect } = fixture(t);
-  connector(951, "0.5.36", { agent: "tab", cli: "opencode", session: "ses_stale", servePid: 9501 });
-  let text = "";
-  const push = async (_s: string, _p: number, x: string) => { text = x; return { ok: true as const, id: "msg_s", turnSince: null }; };
-  const stale: OpencodePluginState = { headerVersion: "0.5.36", mtimeMs: 1, templateCurrent: false };
-  await noteConnectorSkew(n, { installed: "0.5.38", inspect, plugin: stale, live: () => true, push });
-  assert.match(text, /in place, with no restart\. The OpenCode plugin is not switched that way: run `agentmbx setup --only opencode`, then reopen the tab\.$/);
+test("T661: a wake that is not admitted does not mark the note; an equal connector gets none", async (t) => {
+  const { n } = wakeable(t, "0.0.1");
+  sendLeased(n, { from: "sender", to: ["worker"], subject: "nobody polling", body: "b", kind: "request" });
+  await dispatchWakes(n); // no poller registered: not submitted
+  assert.equal(n.store.get(skewNoteKey(SESSION, "0.0.1", version())), undefined, "only an admitted wake marks it");
+  assert.equal(noted(n).c, 0);
+  const s = { agent: "worker", cli: "opencode", session_id: SESSION };
+  assert.ok(wakeSkewNote(n, s), "behind and unmarked: the next admitted wake would carry it");
+  assert.equal(wakeSkewNote(n, { ...s, cli: "claude" }), null, "only OpenCode wakes carry it");
+  assert.equal(wakeSkewNote(n, s, { inspect: (pids) => new Map(pids.map(p => [p, { alive: false, start: null }])) }), null, "a dead connector is not that session's build");
+  n.store.set(`connector:${process.pid}`, JSON.stringify({ v: 1, pid: process.pid, start: inspectLeaseProcess(process.pid).start, version: version(),
+    build: "x", tools: [], cli: "opencode", at: new Date().toISOString() }));
+  assert.equal(wakeSkewNote(n, { agent: "worker", cli: "opencode", session_id: SESSION }), null, "an equal connector needs no note");
+});
+
+test("T661: the note names the plugin step when the tab's plugin cannot switch in place", (t) => {
+  const { n } = wakeable(t, "0.0.1");
+  const stale: OpencodePluginState = { headerVersion: "0.0.1", mtimeMs: 1, templateCurrent: false };
+  const note = wakeSkewNote(n, { agent: "worker", cli: "opencode", session_id: SESSION }, { plugin: stale });
+  assert.match(note!.text, /in place, with no restart\. The OpenCode plugin is not switched that way: run `agentmbx setup --only opencode`, then reopen the tab\.$/);
 });

@@ -16,6 +16,7 @@ import { listOpencodeWakeWaiters, pushOpencodeWake } from "./opencode-wake-queue
 import { pollerWakeTargets } from "./opencode-poller.js";
 import { leadAgentOf, projectLabel, projectMailboxBySlot } from "./project-mailbox.js";
 import { isSlotName } from "./project-slot.js";
+import { markSkewNoted, wakeSkewNote } from "./connector-skew.js";
 const run = promisify(execFile);
 const attemptId = () => ulid();
 const receipt = (strength, r = {}) => ({ strength, nativeId: null, sessionId: null, nativeStatus: null, providerVersion: null, ...r });
@@ -586,8 +587,13 @@ export async function dispatchWakes(node, now = Date.now()) {
             node.store.set(attemptKey(agent), JSON.stringify(marker)); // durable before the native write (WC-14)
             if (s.cli === "codex")
                 result = await wakeCodex(s.session_id, text, { recheck });
-            else if (s.cli === "opencode")
-                result = await wakeOpencode(s.session_id, text, { recheck, pid: s.pid });
+            else if (s.cli === "opencode") {
+                // T661: a session whose live connector is behind the installed build learns how it switches, once, on a real wake.
+                const skew = wakeSkewNote(node, s);
+                result = await wakeOpencode(s.session_id, skew ? `${text}\n${skew.text}` : text, { recheck, pid: s.pid });
+                if (skew && result.outcome?.kind === "admitted")
+                    markSkewNoted(node, skew, result.outcome.receipt.nativeId ?? null);
+            }
             else if (s.cli === "kimi")
                 result = kimiDesktop(s.pid) ? await wakeKimiDesktop(s, text, { recheck }) : await wakeKimi(s, text, { recheck });
             else if (s.cli === "grok")

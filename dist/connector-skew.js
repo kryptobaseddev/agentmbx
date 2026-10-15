@@ -4,14 +4,12 @@
 // only reopening the tab loads a newer file, and only `agentmbx setup --only opencode` writes a newer template.
 //
 // Doctor reports every live connector that is behind the installed build, for every harness, from the connector's own
-// self-report (kv `connector:<pid>`, published by that process with its birth). The daemon tells a live standalone OpenCode
-// session once per (connector version, installed version) pair, through the same poller queue a wake uses.
+// self-report (kv `connector:<pid>`, published by that process with its birth). A live OpenCode session is told once per
+// (connector version, installed version) pair, on the next real wake it gets: the note never starts a turn of its own.
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { connectorKey } from "./diagnostics.js";
 import { inspectLeaseProcesses } from "./identity-leases.js";
-import { pollerTargetLive } from "./opencode-poller.js";
-import { pushOpencodeWake } from "./opencode-wake-queue.js";
 import { recordedStartEpochMs, recordedStartMatches } from "./proc.js";
 import { edits, opencodePluginPath, resolveCommand } from "./setup.js";
 import { version } from "./version.js";
@@ -168,79 +166,48 @@ export function skewNoteText(connector, installed, pluginStep) {
         + (pluginStep ? ` The OpenCode plugin is not switched that way: ${pluginStep}.` : "");
 }
 export const skewNoteKey = (sessionId, connector, installed) => `connector-skew-note:opencode:${sessionId}:${connector}->${installed}`;
+/** Test seam: the plugin state the wake note judges (the real one reads the owner's OpenCode config). */
+export const skewSeams = { plugin: () => opencodePluginState() };
 /**
- * One pass: every bound standalone OpenCode session whose connector is behind and whose plugin is polling gets the note
- * once. The key is claimed before the push and kept when the text left (a missing receipt still means it was handed off),
- * so a retry never repeats a delivered note; a refused push frees the claim for the next tick.
- *
- * The poller admits with resume:true (admitWake in the plugin), so the note STARTS A TURN like a wake does; there is no
- * non-turn-starting variant in the poll protocol. On a busy session delivery "queue" holds it until that turn ends.
+ * The one-line note for a wake about to go to this OpenCode session, or null. Only a session whose own leased connector
+ * is alive (same birth) and behind the installed build gets one, and only once per (session, connector, installed): the
+ * caller marks it with markSkewNoted when the wake was admitted. It rides a real wake and never starts a turn of its own.
  */
-export async function noteConnectorSkew(node, deps = {}) {
-    const installed = deps.installed ?? version(), now = deps.now ?? Date.now();
-    const behind = liveConnectors(node, deps).filter(c => c.relation === "behind" && c.cli === "opencode" && c.session_id && c.agent);
-    if (!behind.length)
-        return [];
-    const push = deps.push ?? ((sid, pid, text) => pushOpencodeWake(sid, pid, text));
-    const live = deps.live ?? ((s) => pollerTargetLive(node, s));
-    let plugin = null;
-    const sent = [];
-    for (const c of behind) {
-        const session = node.store.db.prepare("SELECT * FROM sessions WHERE cli='opencode' AND session_id=? AND agent=?").get(c.session_id, c.agent);
-        if (!session?.pid || !live(session))
-            continue;
-        const key = skewNoteKey(c.session_id, c.version, installed);
-        const claim = node.store.tx(() => {
-            const prev = node.store.get(key);
-            if (prev) {
-                try {
-                    if ((JSON.parse(prev).pending_until ?? Infinity) > now)
-                        return null;
-                }
-                catch {
-                    return null;
-                }
-            }
-            const value = JSON.stringify({ pending_until: now + 60_000, at: now });
-            node.store.set(key, value);
-            return value;
-        });
-        if (!claim)
-            continue;
-        plugin ??= deps.plugin ?? opencodePluginState();
-        const text = skewNoteText(c.version, installed, opencodePluginStep(plugin, session.pid_start));
-        let result = { ok: false, handedOff: false };
-        try {
-            result = await push(session.session_id, session.pid, text);
-        }
-        catch { /* retry next tick */ }
-        const delivered = result.ok || result.handedOff;
-        node.store.tx(() => {
-            if (node.store.get(key) !== claim)
-                return;
-            if (delivered)
-                node.store.set(key, JSON.stringify({ noted_at: now, receipt: result.ok ? result.id : null }));
-            else
-                node.store.db.prepare("DELETE FROM kv WHERE k=? AND v=?").run(key, claim);
-        });
-        if (delivered) {
-            node.store.audit("connector.skew_noted", { agent: c.agent, cli: "opencode", session: c.session_id, connector: c.version, installed, receipt: result.ok ? result.id : null });
-            sent.push(c.session_id);
-        }
+export function wakeSkewNote(node, session, opts = {}) {
+    try {
+        if (session.cli !== "opencode")
+            return null;
+        const lease = node.store.db.prepare("SELECT holder_pid, holder_start FROM identity_leases WHERE name=? AND cli='opencode' AND session_id=? AND released_at IS NULL")
+            .get(session.agent, session.session_id);
+        if (!lease)
+            return null; // an evicted MCP restarts on the installed build: nothing to say
+        const raw = node.store.get(connectorKey(lease.holder_pid));
+        if (!raw)
+            return null;
+        const r = JSON.parse(raw);
+        if (r?.v !== 1 || r.pid !== lease.holder_pid || r.start !== lease.holder_start || typeof r.version !== "string")
+            return null;
+        const installed = opts.installed ?? version();
+        if (compareVersions(r.version, installed) !== -1)
+            return null;
+        const e = (opts.inspect ?? inspectLeaseProcesses)([lease.holder_pid]).get(lease.holder_pid);
+        if (e?.alive !== true || !e.start || !recordedStartMatches(lease.holder_start, e.start))
+            return null;
+        const key = skewNoteKey(session.session_id, r.version, installed);
+        if (node.store.get(key))
+            return null;
+        const step = opencodePluginStep(opts.plugin ?? skewSeams.plugin(), session.pid_start);
+        return { key, text: skewNoteText(r.version, installed, step), agent: session.agent, session_id: session.session_id, connector: r.version, installed };
     }
-    return sent;
+    catch {
+        return null;
+    } // never let a diagnostic note cost a wake
 }
-/** Daemon-only, armed from the loop reporter's arm. A slow push cannot overlap its own next tick. */
-export function armConnectorSkewNotes(node) {
-    let busy = false;
-    const tick = () => {
-        if (busy)
-            return;
-        busy = true;
-        void noteConnectorSkew(node).catch(error => {
-            process.stderr.write(`[agentmbx] connector skew notes: ${String(error).replace(/\s+/g, " ").slice(0, 300)}\n`);
-        }).finally(() => { busy = false; });
-    };
-    setInterval(tick, 60_000).unref();
-    setTimeout(tick, 5_000).unref();
+/** Called only after the wake carrying the note was admitted. */
+export function markSkewNoted(node, note, receipt) {
+    try {
+        node.store.set(note.key, JSON.stringify({ noted_at: Date.now(), receipt }));
+        node.store.audit("connector.skew_noted", { agent: note.agent, cli: "opencode", session: note.session_id, connector: note.connector, installed: note.installed, receipt });
+    }
+    catch { /* the wake already happened; a missing mark only means the note can ride one more wake */ }
 }
