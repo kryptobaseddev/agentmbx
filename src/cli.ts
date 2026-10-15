@@ -1828,7 +1828,7 @@ async function watch(node: MbxNode, selection: CliIdentitySelection) {
   // pid or holder start must stop this watcher — by name alone it would keep consuming the new
   // session's wakes. Mono clock (performance.now) so a backward wall step can't hide a crash.
   // `probes` counts probe calls, not ps spawns (ubuntu CI: Linux reads /proc, never spawns ps).
-  let pinned: { token: string; holder_pid: number; holder_start: string } | null = null;
+  let pinned: { token: string; holder_pid: number; holder_start: string; cli: string; session_id: string } | null = null;
   let staleMs = 3 * MCP_HEARTBEAT_MS, heartbeatAdvancedMono = 0, lastHeartbeatAt = 0, lastProbeMono = 0, deadUntilMono = 0, probes = 0;
   const clear = () => { if (watching) try { node.store.db.prepare("DELETE FROM kv WHERE k=?").run(watcherKey(watching)); } catch { /* closing */ } };
   const debugExit = () => { if (process.env.MBX_WATCH_DEBUG) process.stderr.write(`[mbx-watch debug] probes ${probes} evidence spawns: startup ${startupSpawns} total ${processEvidenceSpawns.count}\n`); };
@@ -1846,7 +1846,7 @@ async function watch(node: MbxNode, selection: CliIdentitySelection) {
           // otherwise pin the NEW holder and never notice the move.
           const row = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(agent) as IdentityLease | undefined;
           if (row && row.released_at === null) {
-            pinned = { token: row.token, holder_pid: row.holder_pid, holder_start: row.holder_start };
+            pinned = { token: row.token, holder_pid: row.holder_pid, holder_start: row.holder_start, cli: row.cli, session_id: row.session_id };
             lastHeartbeatAt = row.heartbeat_at; heartbeatAdvancedMono = performance.now();
             // Review minor 6: a finite positive integer, clamped between the heartbeat interval and
             // the lease's idle ttl; anything else takes the default (3 beats).
@@ -1874,13 +1874,16 @@ async function watch(node: MbxNode, selection: CliIdentitySelection) {
       }
       releaseRetries = 0;
       if (!pinned) {
-        pinned = { token: lease.token, holder_pid: lease.holder_pid, holder_start: lease.holder_start };
+        pinned = { token: lease.token, holder_pid: lease.holder_pid, holder_start: lease.holder_start, cli: lease.cli, session_id: lease.session_id };
         lastHeartbeatAt = lease.heartbeat_at; heartbeatAdvancedMono = performance.now();
         const raw = Number(process.env.MBX_WATCH_STALE_MS);
         staleMs = Number.isFinite(raw) && process.env.MBX_WATCH_STALE_MS !== undefined
           ? Math.min(Math.max(Math.trunc(raw), MCP_HEARTBEAT_MS), lease.idle_ttl)
           : 3 * MCP_HEARTBEAT_MS;
       }
+      // T653: a new token for the same cli and session is followed; the holder check below still requires the same process
+      // (pid and birth), so only that holder re-keying its own lease keeps this watcher. Any other change is a move.
+      if (lease.token !== pinned.token && lease.cli === pinned.cli && lease.session_id === pinned.session_id) pinned = { ...pinned, token: lease.token };
       if (lease.token !== pinned.token || lease.holder_pid !== pinned.holder_pid || lease.holder_start !== pinned.holder_start)
         throw leaseLost("the lease this watcher was started for moved to another holder");
       if (lease.heartbeat_at !== lastHeartbeatAt) { lastHeartbeatAt = lease.heartbeat_at; heartbeatAdvancedMono = performance.now(); }

@@ -3,6 +3,7 @@
 ## Unreleased
 
 ## 0.5.39 (2026-10-15)
+- **`agentmbx watch` follows its own session's lease re-key instead of stopping (T653).** After a long idle, an mbx server can release its lease and claim it again with a new key: the same process, birth, CLI and session. Every running watcher then exited with "the lease this watcher was started for moved to another holder", so the session could no longer be woken until it re-armed. The watcher now follows such a re-key, and its record carries the new token so the daemon keeps deferring to it. A lease claimed by another process, or by the same process for a different session, still stops it with the same reason.
 
 - **A fresh OpenCode session no longer opens with "mbx disconnected", and a real OpenCode disconnect names `/mcps` (T655).** An OpenCode serve runs the session-start hook before its mbx server has connected, and the plugin shows that hook's note at the first tool result, so a brand-new session was told "mbx disconnected: reconnect (e.g. /mcp in Claude Code)". A session the serve never bound, with no remembered identity and no connector record of that serve at all, now gets no disconnect note. A session that did lose its connector still does, now with OpenCode's own control: "reconnect it with /mcps in OpenCode (select mbx)". Other harnesses are unchanged.
 

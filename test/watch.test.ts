@@ -9,7 +9,7 @@ import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { MbxNode } from "../src/node.ts";
-import { IdentityLeases } from "../src/identity-leases.ts";
+import { IdentityLeases, inspectLeaseProcess } from "../src/identity-leases.ts";
 import { dispatchWakes, liveWatcher } from "../src/wake.ts";
 import { selfWatchInstruction, WATCHER_INSTRUCTION } from "../src/mcp.ts";
 import { delegateWake } from "./helpers/wake-lease.ts";
@@ -326,6 +326,60 @@ test("T343: a lease that moves to another holder stops the pinned watcher and in
   assert.equal(await w.exited, 1, "the pinned watcher stops when the lease moves");
   assert.match(w.out(), /moved to another holder/, "with the pinning reason");
   assert.equal(liveWatcher(n, "worker"), false, "a token-mismatched watcher record does not count as live");
+});
+
+// T653: Hermes saw its own MCP (same pid, birth and session) release and re-claim its lease with a new key after a long idle,
+// and every running watcher stopped with "moved to another holder". That re-key is the same session: follow it.
+async function rekeyFixture(t: { after: (fn: () => unknown) => unknown }, label: string) {
+  const home = mkdtempSync(join(tmpdir(), `mbx-watch-${label}-`));
+  const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: `watch-${label}`, version: "1" });
+  t.after(async () => { await c.close().catch(() => {}); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const env = { ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "kimi", MBX_AGENT: "worker", MBX_NO_DESKTOP: "1", MBX_DEBUG: "" } as Record<string, string>;
+  await c.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"], env }));
+  delegateWake(n, "worker");
+  const w = spawnDebug(env);
+  t.after(() => { w.child.kill(); });
+  assert.ok(await until(() => liveWatcher(n, "worker")), "the watcher registers");
+  const leases = new IdentityLeases(n.store);
+  const row = n.store.db.prepare("SELECT * FROM identity_leases WHERE name='worker'").get() as
+    { token: string; holder_pid: number; holder_start: string; cli: string; session_id: string };
+  /** The holder releases and claims again with a new key, as the MCP does on its own; `session` may differ. */
+  const rekey = (session = row.session_id, holder = { pid: row.holder_pid, start: row.holder_start }) => {
+    leases.release("worker", row.token);
+    return leases.claim("worker", { pid: holder.pid, start: holder.start, keyFp: label === "rekey" ? "aaaa-bbbb-cccc-dddd" : label === "rekey-proc" ? "cccc-dddd-eeee-ffff" : "eeee-ffff-aaaa-bbbb", cli: row.cli, sessionId: session });
+  };
+  return { n, w, row, rekey };
+}
+
+test("T653: a watcher follows its own holder re-keying the lease (same pid, birth and session) and still wakes", { timeout: 30_000 }, async (t) => {
+  const { n, w, row, rekey } = await rekeyFixture(t, "rekey");
+  const fresh = rekey();
+  assert.notEqual(fresh.token, row.token, "a new token");
+  assert.equal(fresh.holder_pid, row.holder_pid);
+  await new Promise(r => setTimeout(r, 2_500)); // more than the 5-strike stop at a 200 ms interval
+  assert.equal(w.child.exitCode, null, `the watcher keeps running: ${w.out()}`);
+  assert.doesNotMatch(w.out(), /moved to another holder|stopped/);
+  assert.ok(await until(() => liveWatcher(n, "worker")), "its record carries the new token, so the daemon still defers to it");
+  const m = sendLeased(n, { from: "boss", to: ["worker"], subject: "after the re-key", body: "b", kind: "request" }).envelope;
+  assert.equal(await w.exited, 0, w.out());
+  assert.match(w.out(), /^\[mbx\] 1 new message\(s\) for worker/);
+  assert.ok(w.out().includes(m.id));
+});
+
+test("T653: another process claiming the same session is still a move and stops the watcher", { timeout: 30_000 }, async (t) => {
+  const { n, w, rekey } = await rekeyFixture(t, "rekey-proc");
+  rekey(undefined, { pid: process.pid, start: inspectLeaseProcess(process.pid).start! });
+  assert.equal(await w.exited, 1);
+  assert.match(w.out(), /moved to another holder/);
+  assert.equal(liveWatcher(n, "worker"), false);
+});
+
+test("T653: the same process re-claiming for a different session is still a move and stops the watcher", { timeout: 30_000 }, async (t) => {
+  const { n, w, rekey } = await rekeyFixture(t, "rekey-other");
+  rekey("another-session");
+  assert.equal(await w.exited, 1);
+  assert.match(w.out(), /moved to another holder/);
+  assert.equal(liveWatcher(n, "worker"), false);
 });
 
 // T348 review mediums 1-2 + the session-start gate: the CronDelete cleanup is conditional, and it
