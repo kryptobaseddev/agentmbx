@@ -89,7 +89,7 @@ function database(t: { after(fn: () => void): void }) {
   const lease = leases.claim("reader", { pid: process.pid, start: inspectLeaseProcess(process.pid).start!, keyFp: fingerprint(key.publicKey), cli: scope.cli, sessionId: scope.session_id });
   node.registerAgent("reader");
   const input = (kind: "agent" | "firsthand-outside" | "derived-outside", parents: Envelope[] = [], at = now) => {
-    const e = buildEnvelope({ from: "writer@alpha", to: ["reader"], subject: "input", body: "data" }, new Date(at));
+    const e = buildEnvelope({ from: "writer@alpha", to: ["reader"], subject: "input", body: "data", ...(kind === "firsthand-outside" ? { origin: "external" as const } : kind === "derived-outside" ? { origin: "external" as const, external_since: parents[0].meta.provenance!.roots[0].since } : {}) }, new Date(at));
     e.meta.sender_verification = "leased";
     e.meta.provenance = createContentProvenance(e, parents.map(p => p.id), node.provenanceSources(e), kind).record;
     const signed = signEnvelope(e, "alpha", node.key.publicKey, node.key.privateKey);
@@ -197,8 +197,8 @@ test("S3 an explicit raw send records its local source receipt and never silentl
   const sent = f.leases.withHeld("reader", f.lease.token, () => f.node.send({ from: "reader", to: ["writer"], subject: "copied issue", body: "outside text", origin: "external" }, undefined, undefined, undefined, { ...f.scope, payload: "agent" }));
   assert.equal(sent.provenance!.payload.kind, "firsthand-outside");
   assert.equal(sent.provenance!.payload.roots[0].message_id, sent.envelope.id);
-  assert.equal(sent.provenance!.writer_fence.state, "active");
-  assert.ok(readSessionTaint(f.node.store, f.scope.cli, f.scope.session_id));
+  assert.equal(sent.provenance!.writer_fence.state, "clear", "declaring a send is not a new v1 body read");
+  assert.equal(readSessionTaint(f.node.store, f.scope.cli, f.scope.session_id), null);
   assert.match(sent.warnings.join(" "), /outside declaration retained/);
 });
 
@@ -232,7 +232,7 @@ test("S3 an unsupported raw declaration remains unknown on later relabelled send
   assert.equal(f.prepare({ payload: "agent" }).record.kind, "unknown");
   const sent = f.leases.withHeld("reader", f.lease.token, () => f.node.send({ from: "reader", to: ["writer"], subject: "new outside source", body: "fresh raw text", origin: "external" }, undefined, undefined, undefined, f.scope));
   assert.equal(sent.provenance!.payload.kind, "unknown"); assert.equal(sent.provenance!.writer_fence.state, "active");
-  assert.equal(sent.provenance!.writer_fence.message_id, sent.envelope.id);
+  assert.equal(sent.provenance!.writer_fence.message_id, raw.id, "an observed raw send cannot renew the existing v1 read fence");
   assert.equal(sent.envelope.meta.external_source, "declared", "a new raw declaration keeps its conservative first-hand projection even with unknown dependencies");
   assert.equal(sent.envelope.meta.external_since, sent.envelope.ts);
 });
@@ -250,7 +250,7 @@ test("S3 metadata lineage cannot expose a retained source's malformed sender as 
   assert.equal(scoped.lineage.writer_fence.from, null); assert.equal(JSON.stringify(scoped).includes("FILENAME_MARKER"), false);
 });
 
-test("S3 outside owner claims stay data in full and metadata views; legacy signatures retain their behavior", t => {
+test("S3 observation-only lineage preserves existing owner authority in full and metadata views", t => {
   const f = database(t), owner = generateKeyPair();
   writeFileSync(join(f.home, "owner.json"), JSON.stringify({ v: 1, backend: "keychain", public_key: owner.publicKey }), { mode: 0o600 });
   f.node.syncOwner();
@@ -258,7 +258,7 @@ test("S3 outside owner claims stay data in full and metadata views; legacy signa
   const clean = f.leases.withHeld("reader", f.lease.token, () => f.node.send(draft, undefined, { pub: owner.publicKey, priv: owner.privateKey }, undefined, f.scope));
   assert.equal(f.node.authorityFor(f.node.read(clean.envelope.id, "reader"))?.ok, true);
   const outside = f.leases.withHeld("reader", f.lease.token, () => f.node.send({ ...draft, origin: "external" }, undefined, { pub: owner.publicKey, priv: owner.privateKey }, undefined, f.scope));
-  assert.equal(outside.envelope.authority, null); assert.match(outside.warnings.join(" "), /authority not attached/);
+  assert.equal(f.node.authorityFor(f.node.read(outside.envelope.id, "reader"))?.ok, true, "S3 does not change owner-signature authority");
   const legacy = f.node.send(draft, undefined, { pub: owner.publicKey, priv: owner.privateKey });
   assert.equal(f.node.authorityFor(f.node.read(legacy.envelope.id, "reader"))?.ok, true);
   // Simulate an old producer that signed an owner claim over versioned outside data; the receipt stays immutable.
@@ -268,9 +268,9 @@ test("S3 outside owner claims stay data in full and metadata views; legacy signa
   f.node.store.insertMessage(claimed, "local", "local", { ok: true, session: "signed by the owner" });
   const before = f.node.store.db.prepare("SELECT envelope,authority FROM messages WHERE id=?").get(claimed.id);
   const row = f.node.read(claimed.id, "reader");
-  assert.equal(f.node.authorityFor(row)?.ok, false);
-  assert.match(formatFor(f.node, row, "reader"), /authority: none .*rejected/);
-  assert.equal(messageReadView(f.node, row, "reader", "metadata").policy.owner_authority, false);
+  assert.equal(f.node.authorityFor(row)?.ok, true);
+  assert.match(formatFor(f.node, row, "reader"), /authority: OWNER/);
+  assert.equal(messageReadView(f.node, row, "reader", "metadata").policy.owner_authority, true);
   assert.deepEqual(f.node.store.db.prepare("SELECT envelope,authority FROM messages WHERE id=?").get(claimed.id), before);
 });
 
@@ -293,7 +293,7 @@ async function publicHarness(t: { after(fn: () => Promise<void>): void }, provid
     [resolve("bin/agentmbx.js"), command, "--cli", provider, "--session", session, "--as", "reader", ...args],
     { encoding: "utf8", timeout: 30_000, env: { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1", MBX_NO_DESKTOP: "1" } });
   const input = (kind: "agent" | "firsthand-outside", body = "source data", at = Date.now() - 1000, to = ["reader"]) => {
-    const e = buildEnvelope({ from: "writer@alpha", to, subject: "input", body, project: process.cwd() }, new Date(at));
+    const e = buildEnvelope({ from: "writer@alpha", to, subject: "input", body, project: process.cwd(), ...(kind === "firsthand-outside" ? { origin: "external" as const } : {}) }, new Date(at));
     e.meta.sender_verification = "leased";
     e.meta.provenance = createContentProvenance(e, [], node.provenanceSources(e), kind).record;
     const signed = signEnvelope(e, "alpha", node.key.publicKey, node.key.privateKey);
@@ -346,6 +346,21 @@ for (const provider of ["claude", "codex"]) test(`S3 ${provider} CLI/MCP public 
   assert.equal(f.node.search("denied").length, 0);
 });
 
+test("S3 CLI reply retains source lineage without creating a v1 body-read fence", async t => {
+  const f = await publicHarness(t), raw = f.input("firsthand-outside");
+  const result = f.cli("send", ["--to", "writer", "--reply-to", raw.id, "-m", "analysis", "--json"]);
+  assert.equal(result.status, 0, result.stderr);
+  const sent = JSON.parse(result.stdout) as PublicSend;
+  assert.equal(sent.provenance.payload.kind, "derived-outside");
+  assert.deepEqual(sent.provenance.payload.roots.map(r => r.message_id), [raw.id]);
+  assert.equal(sent.provenance.writer_fence.state, "clear");
+  assert.equal(sent.provenance.legacy_projection.external, false);
+  assert.equal(readSessionTaint(f.node.store, "claude", f.sid), null);
+  const envelope = JSON.parse(f.node.message(sent.id, "reader")!.envelope) as Envelope;
+  assert.equal(envelope.meta.origin ?? "agent", "agent");
+  assert.equal(envelope.meta.external_since, undefined);
+});
+
 test("S3 both MCP reply tools and CLI replies retain known sources through omitted labels", async t => {
   const f = await publicHarness(t), raw = f.input("firsthand-outside"), clean = f.input("agent");
   await f.call("mbx_read", { ids: [clean.id] });
@@ -385,7 +400,7 @@ for (const history of ["mbx_replay", "mbx_catchup", "CLI replay"]) test(`S3 ${hi
   for (const e of [large, raw]) assert.equal(f.node.store.db.prepare("SELECT state FROM deliveries WHERE agent='reader' AND msg_id=?").get(e.id)!.state, "delivered");
 });
 
-test("S3 one hundred public MCP exchanges retain expired immutable roots and conservative policy", async t => {
+test("S3 one hundred public MCP exchanges retain immutable roots under the existing live v1 fence", async t => {
   const f = await publicHarness(t), raw = f.input("firsthand-outside", "old source", Date.now() - EXTERNAL_TAINT_MS - 1000);
   const owner = generateKeyPair();
   writeFileSync(join(f.home, "owner.json"), JSON.stringify({ v: 1, backend: "keychain", public_key: owner.publicKey }), { mode: 0o600 });
@@ -401,7 +416,7 @@ test("S3 one hundred public MCP exchanges retain expired immutable roots and con
     assert.deepEqual(sent.provenance.payload.roots.map(({ message_id, since, remaining_ms }) => ({ message_id, since, remaining_ms })),
       [{ message_id: raw.id, since: raw.ts, remaining_ms: 0 }]);
     const row = f.node.read(sent.id, "reader");
-    assert.deepEqual(f.node.policyFor(row, "recipient").classes, ["read"], "expired outside roots still downgrade an otherwise active action policy");
+    assert.deepEqual(f.node.policyFor(row, "recipient").classes, ["read"], "the existing live v1 writer fence still downgrades an action policy");
     await f.call("mbx_read", { ids: [sent.id] });
   }
 });
@@ -436,4 +451,34 @@ test("S3 project ledger records authorized lead-only bodies and excludes withhel
   const sent = await f.call("mbx_send", { to: ["recipient"], subject: "ledger analysis", body: "summary" }) as PublicSend;
   assert.deepEqual(sent.provenance.payload.roots.map(r => r.message_id), [raw.id]);
   assert.equal(sent.provenance.legacy_projection.external, true);
+});
+
+test("S3 retained roots survive writer expiry without activating origin, policy or owner-authority changes", t => {
+  const f = database(t), at = f.now - EXTERNAL_TAINT_MS - 1000, raw = f.input("firsthand-outside", [], at);
+  f.node.observeRead(f.node.read(raw.id, "reader"), f.scope.cli, f.scope.session_id, "full", at + 1);
+  const clean = f.input("agent");
+  f.node.observeRead(f.node.read(clean.id, "reader"), f.scope.cli, f.scope.session_id, "full");
+  const owner = generateKeyPair();
+  writeFileSync(join(f.home, "owner.json"), JSON.stringify({ v: 1, backend: "keychain", public_key: owner.publicKey }), { mode: 0o600 });
+  f.node.syncOwner();
+  const rec = makePolicy({ level: "autonomous", classes: ["read", "edit", "outward"], agents: ["writer"], hosts: ["alpha"], from: ["local"], ownerPub: owner.publicKey });
+  assert.equal(issueSigned(f.node.store.db, { rec, sig: signData(owner.privateKey, canonical(rec)) }, "alpha"), null);
+  const draft = { from: "reader", to: ["writer"], subject: "unrelated test counts", body: "checks pass", origin: "agent" as const };
+  const sent = f.leases.withHeld("reader", f.lease.token, () => f.node.send(draft, undefined, undefined, undefined, f.scope));
+  assert.equal(sent.envelope.meta.origin ?? "agent", "agent");
+  assert.equal(sent.envelope.meta.external_since, undefined);
+  assert.equal(sent.provenance!.payload.kind, "derived-outside");
+  assert.deepEqual(sent.provenance!.payload.roots.map(({ message_id, since, remaining_ms }) => ({ message_id, since, remaining_ms })),
+    [{ message_id: raw.id, since: raw.ts, remaining_ms: 0 }]);
+  assert.equal(sent.provenance!.writer_fence.state, "clear");
+  assert.equal(sent.provenance!.legacy_projection.external, false);
+  assert.equal(sent.provenance!.legacy_projection.downgrade_reason, null);
+  assert.deepEqual(f.node.policyFor(f.node.read(sent.envelope.id, "reader"), "writer").classes, rec.classes);
+  const status = f.node.provenanceStatus(undefined, f.scope);
+  assert.equal(status.payload.kind, "derived-outside"); assert.equal(status.legacy_projection.external, false);
+  const approved = f.leases.withHeld("reader", f.lease.token, () => f.node.send(draft, undefined, { pub: owner.publicKey, priv: owner.privateKey }, undefined, f.scope));
+  const row = f.node.read(approved.envelope.id, "reader");
+  assert.equal(f.node.authorityFor(row)?.ok, true);
+  assert.equal(messageReadView(f.node, row, "reader", "metadata").policy.owner_authority, true);
+  assert.match(formatFor(f.node, row, "reader"), /authority: OWNER/);
 });

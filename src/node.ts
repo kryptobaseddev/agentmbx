@@ -789,17 +789,12 @@ export class MbxNode {
     const provenance = scope ? this.prepareSendProvenance(e, fromName, scope) : null;
     if (provenance) {
       e.meta.provenance = provenance.record;
+      // S3 lineage is observational; only the existing live v1 writer fence can affect origin.
       const writer = readSessionTaint(this.store, scope!.cli, scope!.session_id);
-      const unknownWriter = !writer && !sessionUntainted(this.store, scope!.cli, scope!.session_id);
-      if (provenance.record.kind !== "agent" || writer || unknownWriter) {
-        const root = Math.max(writer?.root ?? 0, ...provenance.record.roots.map(r => Date.parse(r.since)));
-        e.meta.origin = "external";
-        const rawDeclaration = scope!.payload === "firsthand-outside"
-          || (scope!.payload !== "derived-outside" && d.origin === "external" && !d.external_since);
-        if (provenance.record.kind === "firsthand-outside" || rawDeclaration) { e.meta.external_source = "declared"; e.meta.external_since = e.ts; }
-        else { e.meta.external_source = "inherited"; e.meta.external_since = new Date(root || Date.parse(e.ts)).toISOString(); }
+      if (writer && e.meta.origin !== "external") {
+        e.meta.origin = "external"; e.meta.external_source = "inherited";
+        e.meta.external_since = new Date(writer.root).toISOString();
       }
-      if (d.origin === "agent" && provenance.record.kind !== "agent") provenance.warnings.push("origin agent overridden: retained task inputs require outside/unknown provenance");
     }
     const r = this.route(e.to);
     r.warnings.push(...project.notes);
@@ -816,17 +811,15 @@ export class MbxNode {
     // also has an agent of that name skips its copy exactly (no reliance on its possibly stale directory of this host).
     const localBare = [...new Set(r.targets.filter((t) => !t.host && t.name && t.name !== "owner" && !t.to.includes("@") && !t.to.startsWith("role:") && !t.to.startsWith("task:") && t.to !== "*").map((t) => t.to))];
     if (!prebuilt && localBare.length && r.remote.size) e.meta.local_names = localBare.slice(0, 100);
-    const outsideAuthority = !!provenance && e.meta.origin === "external";
-    if (outsideAuthority && (owner || session?.grant)) r.warnings.push("owner action authority not attached: versioned outside payload or writer fence remains read-only before activation");
-    if (owner && !outsideAuthority) e = ownerSign(e, owner.pub, owner.priv);
-    else if (session?.grant && !outsideAuthority) e = attachAuthority(e, session.grant, session.priv);
+    if (owner) e = ownerSign(e, owner.pub, owner.priv);
+    else if (session?.grant) e = attachAuthority(e, session.grant, session.priv);
     e = signEnvelope(e, this.host, this.key.publicKey, this.key.privateKey);
     const auth = e.authority ? checkAuthority(e, this.ownerPub, this.revoked()) : null;
     this.store.tx(() => {
       this.store.insertMessage(e, "local", "local", auth);
       if (scope && provenance && (provenance.record.kind === "firsthand-outside" || (provenance.record.kind === "unknown"
         && (scope.payload === "firsthand-outside" || (scope.payload !== "derived-outside" && d.origin === "external" && !d.external_since)))))
-        this.observeRead(this.read(e.id, fromName), scope.cli, scope.session_id, "full");
+        this.rememberProvenanceInput(this.read(e.id, fromName), scope.cli, scope.session_id, "full");
       for (const a of r.local) this.store.addDelivery(e.id, a);
       for (const h of r.remote) this.store.db.prepare("INSERT OR IGNORE INTO outbox (msg_id,host,next_at,created_at) VALUES (?,?,?,?)")
         .run(e.id, h, new Date().toISOString(), new Date().toISOString());
@@ -891,8 +884,6 @@ export class MbxNode {
       const keys = local || peer ? this.hostKeys(host) : [];
       if (!keys.length || e.from !== m.from_addr || e.sig?.host !== host || !keys.some((k) => verifyEnvelope(e, k)))
         return { ok: false, reason: "sending host signature or current pairing is not verified" };
-      if (e.meta.provenance !== undefined && (e.meta.origin === "external" || readContentProvenance(e, this.provenanceSources(e)).kind !== "agent"))
-        return { ok: false, reason: "v2 outside/unknown payload or writer fence: content is data, no owner action authority before activation" };
       return checkAuthority(e, local ? this.ownerPub : peer?.owner_pubkey ?? null, this.revoked());
     } catch { return { ok: false, reason: "stored owner authority could not be verified" }; }
   }
@@ -1134,7 +1125,7 @@ export class MbxNode {
       remaining_ms: root === null ? null : Math.max(0, root + EXTERNAL_TAINT_MS - now) });
     const writer = scope ? readSessionTaint(this.store, scope.cli, scope.session_id, now) : null;
     const unknownWriter = scope ? !writer && !sessionUntainted(this.store, scope.cli, scope.session_id, now) : false;
-    const external = input === undefined ? p.kind !== "agent" || !!writer || unknownWriter : (input as Envelope)?.meta?.origin === "external";
+    const external = input === undefined ? !!writer : (input as Envelope)?.meta?.origin === "external";
     const projection = input === undefined ? writer ? { how: writer.how, root: writer.root }
       : external ? { how: p.roots.length ? "inherited" : "malformed", root: p.roots.length ? Math.max(...p.roots.map(r => Date.parse(r.since))) : now } : null : externalExposure(input, now);
     const sender = (from: string) => { const [agent, host, extra] = from.split("@"); return extra === undefined && NAME_RE.test(agent) && /^[a-z0-9][a-z0-9.-]{0,299}$/.test(host) ? from : null; };
@@ -1145,8 +1136,7 @@ export class MbxNode {
         message_id: writer?.id ?? null, from: writer?.from ? sender(writer.from) : null, cause: writer?.how ?? null, ...timing(writer?.root ?? null),
         reason: writer ? "this conversation's existing outside-exposure fence" : unknownWriter ? "unreadable or invalid conversation exposure" : scope ? null : "the reader cannot observe the writer's conversation history" },
       legacy_projection: { external, cause: projection?.how ?? null, ...timing(projection?.root ?? null),
-        downgrade_reason: external ? "legacy conservative outside projection: read only; no taint-contract activation"
-          : p.kind !== "agent" && (input as Envelope)?.meta?.provenance !== undefined ? `v2 ${p.kind} payload: read only` : null } };
+        downgrade_reason: external ? "existing v1 external projection: read only; retained v2 lineage is observation-only" : null } };
   }
 
   /** Shared CLI/MCP disclosure tracking. Metadata discloses no sender text; clearance never alters this v1 fence. */
@@ -1158,10 +1148,6 @@ export class MbxNode {
     const old = readSessionTaint(this.store, cli, sessionId, now);
     const p = readContentProvenance(e, this.provenanceSources(e), now);
     let exposure = externalExposure(e, now);
-    // Versioned outside/unknown payloads cannot omit or relabel their legacy projection to escape the v1 fence.
-    if ((e as Envelope)?.meta?.provenance !== undefined && p.kind !== "agent") exposure = p.kind === "derived-outside"
-      ? { how: "inherited", root: Math.max(...p.roots.map(r => Date.parse(r.since)), exposure?.how === "inherited" ? exposure.root : 0) }
-      : { how: p.kind === "firsthand-outside" ? "declared" : "malformed", root: now };
     if (mode === "quarantine") {
       exposure = { how: "inherited", root: p.roots.length ? Math.max(...p.roots.map(r => Date.parse(r.since))) : exposure?.how === "inherited" ? exposure.root : old?.root ?? now };
     } else if (exposure && exposure.how !== "inherited") {
@@ -1230,13 +1216,7 @@ export class MbxNode {
     const keys = (m.origin === "local" && fromHost === this.host) || (m.origin === fromHost && m.trust === "verified") ? this.hostKeys(fromHost) : [];
     const senderVerified = envelope.from === m.from_addr && envelope.sig?.host === fromHost && keys.some((k) => verifyEnvelope(envelope, k));
     const lead = senderVerified ? leadGrantForSender(this, agent, fromAgent, fromHost) : null;
-    const decided = effectivePolicy(this.store.db, { agent, host: this.host, fromAgent, fromHost, envelope, senderVerified, lead });
-    const p = envelope?.meta?.provenance === undefined ? null : readContentProvenance(envelope, this.provenanceSources(envelope));
-    if (!p || p.kind === "agent") return decided;
-    const keepRead = (classes: readonly string[]) => classes.filter(c => c === "read") as (typeof decided.classes);
-    return { ...decided, classes: keepRead(decided.classes), grants: decided.grants.map(g => ({ ...g, classes: keepRead(g.classes) })),
-      lead: decided.lead?.classes.includes("read") ? { ...decided.lead, classes: ["read"] as typeof decided.classes } : undefined,
-      notes: [...decided.notes, `v2 ${p.kind} payload: read only; no taint-contract activation`] };
+    return effectivePolicy(this.store.db, { agent, host: this.host, fromAgent, fromHost, envelope, senderVerified, lead });
   }
 
   /** A thread's messages, oldest first; with `agent`, only the ones that agent can see. */
@@ -1323,7 +1303,7 @@ export function messageReadView(node: MbxNode, row: MessageRow, agent: string, m
     const current = node.currentAuthority(row), authority = storedAuthority(current), decided = node.policyFor(current, agent);
     policy = { level: decided.level, classes: decided.classes.filter(c => CLASSES.includes(c)), ids: decided.ids.filter(x => id(x) !== null), owner_authority: authority?.ok === true };
   } catch { /* no malformed authority can create a grant */ }
-  if (mode === "quarantine" || p.kind === "firsthand-outside" || p.kind === "derived-outside") policy = { ...policy, classes: policy.classes.includes("read") ? ["read"] : [], owner_authority: false };
+  if (mode === "quarantine") policy = { ...policy, classes: policy.classes.includes("read") ? ["read"] : [], owner_authority: false };
   const at = typeof row.ts === "string" ? Date.parse(row.ts) : NaN;
   const view: MessageReadView = { mode, id: id(row.id), thread: id(e?.thread), reply_to: id(e?.reply_to), at: Number.isFinite(at) ? new Date(at).toISOString() : null,
     sender: { agent: safeSender ? from : null, host: safeSender ? host : null, verified: safeSender }, kind: e && KINDS.includes(e.kind) ? e.kind : "unknown",

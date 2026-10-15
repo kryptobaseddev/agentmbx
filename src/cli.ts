@@ -794,7 +794,6 @@ async function run(argv: string[]) {
         if (originArg === "agent" && taint) die(refuseAgentOrigin(taint));
         const declared = originArg === "external";
         const reply = str("reply-to") ? node.read(str("reply-to")!, from.split("@")[0]) : undefined;
-        if (reply && scope) node.observeRead(reply, scope.cli, scope.session_id, "full", Date.now(), true);
         // T649: a long subject is truncated (with a warning), not refused
         const fit = fitSubject(str("subject") ?? (reply ? (reply.subject.startsWith("Re: ") ? reply.subject : `Re: ${reply.subject}`) : die("--subject is required")));
         if (fit.truncated && [...(str("subject") ?? "")].length > MAX_SUBJECT_INPUT) die(`--subject is over ${MAX_SUBJECT_INPUT} characters`);
