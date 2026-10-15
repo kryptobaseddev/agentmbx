@@ -8,7 +8,7 @@ import { canonical, sha256 } from "./crypto.ts";
 import { NAME_RE } from "./envelope.ts";
 import { inspectLeaseProcess, inspectLeaseProcesses, retryUnknown, UNKNOWN_PROCESS, type ProcessEvidence } from "./identity-leases.ts";
 import { opencodeServeRoot } from "./opencode-provider.ts";
-import { procTable } from "./proc.ts";
+import { procTable, recordedStartMatches } from "./proc.ts";
 import type { Store } from "./store.ts";
 import { identityTakeoverApprovalSchema, type IdentityTakeoverApproval } from "./identity-takeover.ts";
 import { SCHEMA_VERSION } from "./store.ts";
@@ -33,7 +33,17 @@ export const identityGeneration = (token?: string) => token ? sha256(token) : nu
 
 export function publishIdentityControl(store: Store, descriptor: IdentityControlDescriptor) {
   const valid = descriptorSchema.parse(descriptor);
-  store.set(identityControlKey(valid.cli, valid.session_id), JSON.stringify(valid));
+  // T656: the published lease_session_id must name the agent's live lease. A kimi hook bind moves the lease to the
+  // hook-bound real session after a descriptor was minted, and every publisher (hook, MCP server, ticket link) then
+  // converges on the row's id here — an in-bindSession rewrite would not stick, because the hook re-publishes its
+  // pre-bind descriptor in the same call. Only the exact holder (mcp_pid/mcp_start match) is normalized; when the row
+  // and the descriptor agree, or no live lease matches, the descriptor publishes as given.
+  const lease = store.db.prepare("SELECT session_id,holder_start FROM identity_leases WHERE name=? AND holder_pid=? AND released_at IS NULL").get(valid.agent, valid.mcp_pid) as
+    { session_id: string; holder_start: string | null } | undefined;
+  const normalized = lease && lease.session_id !== valid.lease_session_id && lease.holder_start !== null
+    && recordedStartMatches(lease.holder_start, valid.mcp_start)
+    ? { ...valid, lease_session_id: lease.session_id } : valid;
+  store.set(identityControlKey(normalized.cli, normalized.session_id), JSON.stringify(normalized));
 }
 export function findIdentityControl(store: Store, cli: string, sessionId: string): IdentityControlDescriptor {
   const raw = store.get(identityControlKey(cli, sessionId));

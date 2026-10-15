@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { inspectLeaseProcess } from "./identity-leases.js";
 import { activityKey, holderProviderView, identityAvailability, parseActivity, parseProviderRecord } from "./identity-availability.js";
-import { procTable } from "./proc.js";
+import { procTable, recordedStartMatches } from "./proc.js";
 import { notSlot } from "./project-slot.js";
 import { resolveProject } from "./project-key.js";
 import { repoAssociation, repoIdentity, storedRepoAssociations } from "./repo-association.js";
@@ -21,6 +21,9 @@ export function listIdentityStatus(home, options = {}) {
     const db = new DatabaseSync(path, { readOnly: true });
     const rows = new Map(), leases = [], conflicts = new Set(), activityByName = new Map();
     const providerByHolder = new Map();
+    // T656: server process start by pid, and the server pids each (cli, real session) binding names — read in the tx below.
+    const serverStartByPid = new Map();
+    const sessionServer = new Map();
     const inProject = new Set(), retired = new Set();
     let schema;
     const row = (name) => {
@@ -78,6 +81,26 @@ export function listIdentityStatus(home, options = {}) {
             if (Number.isSafeInteger(mcpPid) && mcpPid > 0 && recorded)
                 providerByHolder.set(mcpPid, recorded);
         }
+        // T656: read before the connection closes. A provisional mcp-<pid> caller (the MCP server's own in-memory id)
+        // still names its identity when the lease row already carries the hook-bound real session: the binding's server
+        // record (mcp-process:<key>) must name the lease holder for that exact (cli, session) row.
+        for (const r of db.prepare("SELECT cli,session_id,session_key FROM sessions WHERE session_key IS NOT NULL AND session_id NOT GLOB 'mcp-*'").all()) {
+            const kvRow = db.prepare("SELECT v FROM kv WHERE k=?").get(`mcp-process:${r.session_key}`);
+            let owner = null;
+            try {
+                owner = kvRow ? JSON.parse(kvRow.v) : null;
+            }
+            catch {
+                owner = null;
+            }
+            if (!owner || !Number.isSafeInteger(owner.pid) || typeof owner.start !== "string")
+                continue;
+            serverStartByPid.set(owner.pid, owner.start);
+            const pair = `${r.cli}|${r.session_id}`;
+            const set = sessionServer.get(pair) ?? new Set();
+            set.add(owner.pid);
+            sessionServer.set(pair, set);
+        }
         for (const r of db.prepare("SELECT name,role FROM agents WHERE host=? AND role IS NOT NULL").all(config.host))
             row(r.name).role = r.role;
         const has = (table) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table);
@@ -119,8 +142,20 @@ export function listIdentityStatus(home, options = {}) {
     // a claim must recheck the current generation under its own write lock.
     const inspect = options.inspect ?? inspectLeaseProcess;
     // The provider process a same-session holder serves under (T383), read only for a lease of the caller's own session.
+    // T656: a provisional mcp-<pid> caller still matches when the lease carries the hook-bound real session whose
+    // binding names this holder (lease session adopted at the kimi hook bind).
+    const namesCallerSession = (lease, caller) => {
+        if (lease.session_id === caller.sessionId)
+            return true;
+        if (!caller.sessionId.startsWith("mcp-"))
+            return false;
+        const serverStart = serverStartByPid.get(lease.holder_pid);
+        // The kv start is procStart format, the lease start is ps-utc: compare epoch-wise (T337 pattern).
+        return serverStart !== undefined && lease.holder_start !== null && recordedStartMatches(lease.holder_start, serverStart)
+            && (sessionServer.get(`${lease.cli}|${lease.session_id}`)?.has(lease.holder_pid) ?? false);
+    };
     const sameSessionProvider = (lease, caller) => {
-        if (lease.cli !== caller.cli || lease.session_id !== caller.sessionId)
+        if (lease.cli !== caller.cli || !namesCallerSession(lease, caller))
             return {};
         const recorded = providerByHolder.get(lease.holder_pid) ?? null;
         let evidence = null;
@@ -150,7 +185,7 @@ export function listIdentityStatus(home, options = {}) {
         // A shared transport (Codex, OpenCode) serves many conversations from one process, so the process alone is not the
         // caller: the lease must also name this conversation's session.
         const own = options.caller?.pid !== undefined && lease.released_at === null && lease.holder_pid === options.caller.pid
-            && lease.cli === options.caller.cli && lease.session_id === options.caller.sessionId && evidence.alive !== false;
+            && lease.cli === options.caller.cli && namesCallerSession(lease, options.caller) && evidence.alive !== false;
         const a = own ? { state: "live", claimable: false, reason: "held by this session" }
             : identityAvailability({ lease, evidence, activity: activityByName.get(lease.name) ?? null, conflict: conflicts.has(lease.name), now,
                 caller: options.caller && { ...options.caller, ...sameSessionProvider(lease, options.caller) } });

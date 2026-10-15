@@ -18,7 +18,7 @@ import { ownerPublicKey } from "./owner.ts";
 import { auditLeadGrantUse, leadGrantForSender } from "./lead-grants.ts";
 import { CLASSES, effectivePolicy, policyLine } from "./policy.ts";
 import { readSessionExposure, readSessionTaint, recordSessionExposure, sessionUntainted, taintKey, writeSessionTaint } from "./session-taint.ts";
-import { procStart, procTable, provenProcess, sameProcess } from "./proc.ts";
+import { procStart, procTable, provenProcess, recordedStartMatches, sameProcess } from "./proc.ts";
 import { bumpPostToolMarker, bumpPostToolMarkersForAgent, POSTTOOL_FAST_CLIS } from "./posttool.ts";
 import { privatePath } from "./private-files.ts";
 import { TASK_RE } from "./presence.ts";
@@ -276,6 +276,25 @@ export class MbxNode {
           this.keepName(s.cli, row.session_id, agent);
         }
         this.keepName(s.cli, id, agent);
+      }
+      // T656: a kimi lease claimed under the provisional mcp-<pid> id adopts the hook-bound real session id, so the
+      // lease row and the sessions row carry the same id (whoami already reported the real one). The binding's key
+      // must name the recorded MCP server process that actually holds the lease; a hosted or co-used bind rewrites
+      // nothing. identity-status accepts a provisional caller against this adopted state (T316 view unchanged).
+      if (s.cli === "kimi" && !provisional(id) && key) {
+        let owner: { pid?: unknown; start?: unknown } | null = null;
+        try { owner = JSON.parse(this.store.get(`mcp-process:${key}`) ?? "null"); } catch { owner = null; }
+        const pid = owner && Number.isSafeInteger(owner.pid) ? owner.pid as number : null;
+        const serverStart = owner && typeof owner.start === "string" ? owner.start : null;
+        if (pid !== null && serverStart !== null) {
+          const lease = db.prepare("SELECT token,session_id,holder_start FROM identity_leases WHERE name=? AND holder_pid=? AND released_at IS NULL").get(agent, pid) as
+            { token: string; session_id: string; holder_start: string | null } | undefined;
+          // The kv start is procStart format, the lease start is ps-utc: compare epoch-wise (T337 pattern).
+          if (lease && lease.session_id.startsWith("mcp-") && recordedStartMatches(lease.holder_start ?? "", serverStart)) {
+            db.prepare("UPDATE identity_leases SET session_id=? WHERE name=? AND token=? AND released_at IS NULL").run(id, agent, lease.token);
+            this.store.audit("identity.session-moved", { name: agent, from: lease.session_id, to: id, holder: { pid, start: lease.holder_start } });
+          }
+        }
       }
       if (sessionWakeable({ ...s, session_id: id, channel }))
         db.prepare("UPDATE deliveries SET state='delivered', note=NULL WHERE agent=? AND state='notified' AND note='desktop'").run(agent);
