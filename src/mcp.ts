@@ -597,36 +597,45 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
     ...identityControlAliases(node.store, fingerprint(state.key.publicKey)).map(d => d.session_id),
     ...node.store.db.prepare("SELECT session_id FROM sessions WHERE cli=? AND session_key=?").all(env.cli, state.key.publicKey).map(r => r.session_id as string)];
   /** Existing endpoint for `sid`, or null when there is none or it cannot be parsed. */
-  const existingControl = (sid: string): { control_key: string; mcp_pid?: number; mcp_start?: string } | null => {
+  const existingControl = (sid: string): { control_key: string; mcp_pid?: number; mcp_start?: string; agent?: string; generation?: string | null } | null => {
     try {
       const raw = node.store.get(identityControlKey(env.cli, sid));
       if (!raw) return null;
-      const parsed = JSON.parse(raw) as { control_key?: unknown; mcp_pid?: unknown; mcp_start?: unknown };
+      const parsed = JSON.parse(raw) as { control_key?: unknown; mcp_pid?: unknown; mcp_start?: unknown; agent?: unknown; generation?: unknown };
       if (typeof parsed.control_key !== "string") return null;
       return { control_key: parsed.control_key,
         ...(typeof parsed.mcp_pid === "number" && Number.isSafeInteger(parsed.mcp_pid) && parsed.mcp_pid > 0 ? { mcp_pid: parsed.mcp_pid } : {}),
-        ...(typeof parsed.mcp_start === "string" ? { mcp_start: parsed.mcp_start } : {}) };
+        ...(typeof parsed.mcp_start === "string" ? { mcp_start: parsed.mcp_start } : {}),
+        ...(typeof parsed.agent === "string" ? { agent: parsed.agent } : {}),
+        ...(parsed.generation === null || typeof parsed.generation === "string" && /^[a-f0-9]{64}$/.test(parsed.generation) ? { generation: parsed.generation } : {}) };
     } catch { return null; }
   };
   /**
    * T436: do not replace a live foreign control endpoint. Own key always publishes. The handover successor's OS parent
    * is `process.ppid` (detectHost rewrites `env.ppid` to the original provider, so that is not the predecessor).
-   * A dead or reborn pid may be replaced. Unknown liveness fails closed.
+   * A dead/reborn pid or a former generation of our held mailbox may be replaced. Unknown liveness fails closed.
    */
-  const foreignControlLive = (sid: string, ownKey: string): boolean => {
+  const foreignControlLive = (sid: string, ownKey: string, state: State): boolean => {
     const existing = existingControl(sid);
     if (!existing || existing.control_key === ownKey) return false;
     if (existing.mcp_pid === undefined) return true;
     if (existing.mcp_pid === process.pid || existing.mcp_pid === process.ppid) return false;
+    // A live old transport cannot reserve this session after another process has won its mailbox lease.
+    if (bound(state) && !state.coUse && existing.agent === state.agent && existing.generation !== undefined
+      && existing.generation !== identityGeneration(state.leaseToken)
+      && node.store.db.prepare(`SELECT 1 FROM identity_leases WHERE name=? AND token=? AND released_at IS NULL
+        AND key_fp=? AND holder_pid=? AND holder_start=? AND cli=? AND session_id=?`)
+        .get(state.agent, state.leaseToken!, ownKey, process.pid, holderStart() ?? "", env.cli, state.sessionId)) return false;
     const evidence = leases.processEvidence(existing.mcp_pid);
     if (evidence.alive === false) return false;
     if (evidence.alive === true && evidence.start !== null && evidence.start !== existing.mcp_start) return false;
     return true;
   };
   const publishControl = (state: State) => {
+    if (state.coUse) return;
     const ownKey = fingerprint(state.key.publicKey);
     for (const sid of new Set(controlSessionIds(state))) {
-      if (foreignControlLive(sid, ownKey)) continue;
+      if (foreignControlLive(sid, ownKey, state)) continue;
       const descriptor = controlDescriptor(state, sid);
       if (descriptor) publishIdentityControl(node.store, descriptor);
     }
@@ -1037,6 +1046,8 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
     }
     const valid = env.cli === "codex" ? /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i : /^ses_[a-zA-Z0-9]{1,128}$/;
     if (typeof sid !== "string" || !valid.test(sid)) throw new Error(`Invalid ${env.cli} session identity metadata`);
+    // A hook-resumed base already represents this exact conversation; a second State would use a different key.
+    if (sid === base.sessionId) return base;
     let state = states.get(sid);
     if (!state) {
       const priorRelease = detached?.sessions.find(s => s.sessionId === sid);
@@ -1361,6 +1372,7 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
           if (target !== state.agent) throw Object.assign(new Error("release your current identity before claiming another; use mbx_whoami to rename it"), { code: "IDENTITY_RELEASE_REQUIRED" });
           if (role || description) registerIdentity(node.store, { name: target, role: role ?? registration?.role ?? UNSPECIFIED_ROLE, description, by: `${env.cli}:${state.sessionId}` });
           if (task || lane) setSessionPresence(node, { cli: env.cli, sessionId: state.sessionId, ...(task ? { task } : {}), ...(lane ? { lane } : {}) });
+          publishControl(state);
           const result = handoff(state.agent); return text(JSON.stringify(result, null, 2), result);
         });
       } catch (error) { if ((error as { code?: string }).code !== "IDENTITY_LEASE_LOST") throw error; }

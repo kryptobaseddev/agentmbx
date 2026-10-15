@@ -676,7 +676,9 @@ async function configureMcp(server, node, startupClosed) {
                 return null;
             return { control_key: parsed.control_key,
                 ...(typeof parsed.mcp_pid === "number" && Number.isSafeInteger(parsed.mcp_pid) && parsed.mcp_pid > 0 ? { mcp_pid: parsed.mcp_pid } : {}),
-                ...(typeof parsed.mcp_start === "string" ? { mcp_start: parsed.mcp_start } : {}) };
+                ...(typeof parsed.mcp_start === "string" ? { mcp_start: parsed.mcp_start } : {}),
+                ...(typeof parsed.agent === "string" ? { agent: parsed.agent } : {}),
+                ...(parsed.generation === null || typeof parsed.generation === "string" && /^[a-f0-9]{64}$/.test(parsed.generation) ? { generation: parsed.generation } : {}) };
         }
         catch {
             return null;
@@ -685,15 +687,22 @@ async function configureMcp(server, node, startupClosed) {
     /**
      * T436: do not replace a live foreign control endpoint. Own key always publishes. The handover successor's OS parent
      * is `process.ppid` (detectHost rewrites `env.ppid` to the original provider, so that is not the predecessor).
-     * A dead or reborn pid may be replaced. Unknown liveness fails closed.
+     * A dead/reborn pid or a former generation of our held mailbox may be replaced. Unknown liveness fails closed.
      */
-    const foreignControlLive = (sid, ownKey) => {
+    const foreignControlLive = (sid, ownKey, state) => {
         const existing = existingControl(sid);
         if (!existing || existing.control_key === ownKey)
             return false;
         if (existing.mcp_pid === undefined)
             return true;
         if (existing.mcp_pid === process.pid || existing.mcp_pid === process.ppid)
+            return false;
+        // A live old transport cannot reserve this session after another process has won its mailbox lease.
+        if (bound(state) && !state.coUse && existing.agent === state.agent && existing.generation !== undefined
+            && existing.generation !== identityGeneration(state.leaseToken)
+            && node.store.db.prepare(`SELECT 1 FROM identity_leases WHERE name=? AND token=? AND released_at IS NULL
+        AND key_fp=? AND holder_pid=? AND holder_start=? AND cli=? AND session_id=?`)
+                .get(state.agent, state.leaseToken, ownKey, process.pid, holderStart() ?? "", env.cli, state.sessionId))
             return false;
         const evidence = leases.processEvidence(existing.mcp_pid);
         if (evidence.alive === false)
@@ -703,9 +712,11 @@ async function configureMcp(server, node, startupClosed) {
         return true;
     };
     const publishControl = (state) => {
+        if (state.coUse)
+            return;
         const ownKey = fingerprint(state.key.publicKey);
         for (const sid of new Set(controlSessionIds(state))) {
-            if (foreignControlLive(sid, ownKey))
+            if (foreignControlLive(sid, ownKey, state))
                 continue;
             const descriptor = controlDescriptor(state, sid);
             if (descriptor)
@@ -1227,6 +1238,9 @@ async function configureMcp(server, node, startupClosed) {
         const valid = env.cli === "codex" ? /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i : /^ses_[a-zA-Z0-9]{1,128}$/;
         if (typeof sid !== "string" || !valid.test(sid))
             throw new Error(`Invalid ${env.cli} session identity metadata`);
+        // A hook-resumed base already represents this exact conversation; a second State would use a different key.
+        if (sid === base.sessionId)
+            return base;
         let state = states.get(sid);
         if (!state) {
             const priorRelease = detached?.sessions.find(s => s.sessionId === sid);
@@ -1596,6 +1610,7 @@ async function configureMcp(server, node, startupClosed) {
                         registerIdentity(node.store, { name: target, role: role ?? registration?.role ?? UNSPECIFIED_ROLE, description, by: `${env.cli}:${state.sessionId}` });
                     if (task || lane)
                         setSessionPresence(node, { cli: env.cli, sessionId: state.sessionId, ...(task ? { task } : {}), ...(lane ? { lane } : {}) });
+                    publishControl(state);
                     const result = handoff(state.agent);
                     return text(JSON.stringify(result, null, 2), result);
                 });
