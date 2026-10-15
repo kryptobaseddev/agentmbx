@@ -1,14 +1,19 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { canonical, fingerprint, generateKeyPair, sha256 } from "../src/crypto.ts";
+import { join, resolve } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { canonical, fingerprint, generateKeyPair, sha256, signData } from "../src/crypto.ts";
 import { buildEnvelope, createContentProvenance, EXTERNAL_TAINT_MS, ownerSign, readContentProvenance, signEnvelope,
   type Envelope, type ProvenanceSources } from "../src/envelope.ts";
 import { IdentityLeases, inspectLeaseProcess } from "../src/identity-leases.ts";
 import { MbxNode, formatFor, messageReadView, type SendProvenanceScope } from "../src/node.ts";
-import { readSessionTaint } from "../src/session-taint.ts";
+import { readSessionTaint, writeSessionTaint } from "../src/session-taint.ts";
+import { issueSigned, makePolicy } from "../src/policy.ts";
+import { makeLead, storeLead } from "../src/lead-record.ts";
 
 const time = Date.parse("2026-10-15T06:00:00.000Z");
 function world() {
@@ -228,6 +233,8 @@ test("S3 an unsupported raw declaration remains unknown on later relabelled send
   const sent = f.leases.withHeld("reader", f.lease.token, () => f.node.send({ from: "reader", to: ["writer"], subject: "new outside source", body: "fresh raw text", origin: "external" }, undefined, undefined, undefined, f.scope));
   assert.equal(sent.provenance!.payload.kind, "unknown"); assert.equal(sent.provenance!.writer_fence.state, "active");
   assert.equal(sent.provenance!.writer_fence.message_id, sent.envelope.id);
+  assert.equal(sent.envelope.meta.external_source, "declared", "a new raw declaration keeps its conservative first-hand projection even with unknown dependencies");
+  assert.equal(sent.envelope.meta.external_since, sent.envelope.ts);
 });
 
 test("S3 metadata lineage cannot expose a retained source's malformed sender as arbitrary text", t => {
@@ -238,6 +245,9 @@ test("S3 metadata lineage cannot expose a retained source's malformed sender as 
   f.node.store.insertMessage(signed, "local", "local", null); f.node.store.addDelivery(signed.id, "reader");
   const view = messageReadView(f.node, f.node.read(signed.id, "reader"), "reader", "metadata");
   assert.equal(view.lineage.payload.roots[0].from, null); assert.equal(JSON.stringify(view).includes("FILENAME_MARKER"), false);
+  writeSessionTaint(f.node.store, { v: 1, ...f.scope, root: f.now, id: signed.id, from: "writer@alpha@FILENAME_MARKER.json", how: "declared", relay_depth: [] });
+  const scoped = messageReadView(f.node, f.node.read(signed.id, "reader"), "reader", "metadata", Date.now(), f.scope);
+  assert.equal(scoped.lineage.writer_fence.from, null); assert.equal(JSON.stringify(scoped).includes("FILENAME_MARKER"), false);
 });
 
 test("S3 outside owner claims stay data in full and metadata views; legacy signatures retain their behavior", t => {
@@ -262,4 +272,168 @@ test("S3 outside owner claims stay data in full and metadata views; legacy signa
   assert.match(formatFor(f.node, row, "reader"), /authority: none .*rejected/);
   assert.equal(messageReadView(f.node, row, "reader", "metadata").policy.owner_authority, false);
   assert.deepEqual(f.node.store.db.prepare("SELECT envelope,authority FROM messages WHERE id=?").get(claimed.id), before);
+});
+
+async function publicHarness(t: { after(fn: () => Promise<void>): void }, provider = "claude") {
+  const home = mkdtempSync(join(tmpdir(), "mbx-public-provenance-")), node = new MbxNode(home, { host: "alpha" });
+  const client = new Client({ name: "provenance-context", version: "test" });
+  t.after(async () => { await client.close(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  await client.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"],
+    env: { ...process.env, MBX_HOME: home, MBX_AGENT: "reader", MBX_CLI: provider, AGENTMBX_DEV: "1", MBX_NO_DESKTOP: "1", MBX_SESSION_SOCKET: "0" } as Record<string, string> }));
+  const call = async (name: string, args: Record<string, unknown> = {}, meta?: { threadId: string }) => {
+    const result = await client.callTool({ name, arguments: args, ...(meta ? { _meta: meta } : {}) });
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    const text = (result.content as { text: string }[])[0].text;
+    return result.structuredContent ?? (text.trimStart().startsWith("{") ? JSON.parse(text) : result);
+  };
+  const who = await call("mbx_whoami") as { agent: string; harness_session: string };
+  const sid = who.harness_session;
+  node.registerAgent("recipient");
+  const cli = (command: string, args: string[] = [], session = sid) => spawnSync(process.execPath,
+    [resolve("bin/agentmbx.js"), command, "--cli", provider, "--session", session, "--as", "reader", ...args],
+    { encoding: "utf8", timeout: 30_000, env: { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1", MBX_NO_DESKTOP: "1" } });
+  const input = (kind: "agent" | "firsthand-outside", body = "source data", at = Date.now() - 1000, to = ["reader"]) => {
+    const e = buildEnvelope({ from: "writer@alpha", to, subject: "input", body, project: process.cwd() }, new Date(at));
+    e.meta.sender_verification = "leased";
+    e.meta.provenance = createContentProvenance(e, [], node.provenanceSources(e), kind).record;
+    const signed = signEnvelope(e, "alpha", node.key.publicKey, node.key.privateKey);
+    node.store.insertMessage(signed, "local", "local", null);
+    for (const recipient of to) node.store.addDelivery(signed.id, recipient);
+    return signed;
+  };
+  return { home, node, client, call, cli, input, sid };
+}
+type PublicStatus = ReturnType<MbxNode["provenanceStatus"]>;
+type PublicSend = { id: string; thread: string; reply_to?: string; provenance: PublicStatus; warnings: string[] };
+
+for (const provider of ["claude", "codex"]) test(`S3 ${provider} CLI/MCP public inputs, independent contexts and whoami/read visibility agree`, async t => {
+  const f = await publicHarness(t, provider), raw = f.input("firsthand-outside"), clean = f.input("agent");
+  const meta = await f.call("mbx_read", { ids: [raw.id], mode: "metadata" }) as { messages: { lineage: PublicStatus }[] };
+  assert.equal(meta.messages[0].lineage.writer_fence.state, "clear");
+  assert.equal((await f.call("mbx_whoami") as { provenance: PublicStatus }).provenance.payload.kind, "agent");
+  assert.equal((await f.call("mbx_whoami") as { provenance: PublicStatus }).provenance.legacy_projection.cause, null);
+  await f.call("mbx_read", { ids: [raw.id] });
+  await f.call("mbx_thread", { id: clean.id });
+  const who = await f.call("mbx_whoami") as { provenance: PublicStatus };
+  assert.equal(who.provenance.payload.kind, "derived-outside");
+  assert.equal(who.provenance.writer_fence.state, "active");
+  assert.equal(who.provenance.payload.roots[0].since, raw.ts);
+  const cliWho = f.cli("whoami", ["--json"]); assert.equal(cliWho.status, 0, cliWho.stderr);
+  assert.deepEqual(JSON.parse(cliWho.stdout).provenance.payload.roots.map((r: { message_id: string }) => r.message_id), [raw.id]);
+  const args = { to: ["recipient"], subject: "independent counts", body: "19 passed", kind: "status", context: clean.thread, payload: "agent", sources: [] };
+  const mcp = await f.call("mbx_send", args) as PublicSend;
+  assert.equal(mcp.provenance.payload.kind, "agent"); assert.equal(mcp.provenance.writer_fence.state, "active");
+  assert.equal(mcp.provenance.legacy_projection.external, true); assert.equal(mcp.provenance.context_id, clean.thread);
+  const cli = f.cli("send", ["--to", "recipient", "--subject", "CLI counts", "-m", "19 passed", "--kind", "status", "--context", clean.thread, "--payload", "agent", "--json"]);
+  assert.equal(cli.status, 0, cli.stderr);
+  const sent = JSON.parse(cli.stdout) as PublicSend;
+  assert.deepEqual(sent.provenance.payload, mcp.provenance.payload);
+  assert.equal(sent.provenance.writer_fence.message_id, mcp.provenance.writer_fence.message_id);
+  assert.equal(sent.provenance.legacy_projection.external, true);
+  const derived = await f.call("mbx_send", { ...args, sources: [raw.id] }) as PublicSend;
+  assert.equal(derived.provenance.payload.kind, "derived-outside"); assert.match(derived.warnings.join(" "), /overridden/);
+  const cliDerived = f.cli("send", ["--to", "recipient", "--subject", "known inputs", "-m", "analysis", "--context", clean.thread, "--source", raw.id, "--payload", "agent", "--json"]);
+  assert.equal(cliDerived.status, 0, cliDerived.stderr);
+  assert.deepEqual(JSON.parse(cliDerived.stdout).provenance.payload.roots.map((r: { message_id: string }) => r.message_id), [raw.id]);
+  const metadata = f.cli("read", [derived.id, "--mode", "metadata"]);
+  assert.equal(metadata.status, 0, metadata.stderr);
+  assert.equal(JSON.parse(metadata.stdout).lineage.writer_fence.state, "active");
+  for (const options of [["--context", "0".repeat(26)], ["--source", "0".repeat(26)], ["--payload", "bogus"]]) {
+    const denied = f.cli("send", ["--to", "recipient", "--subject", "denied", "-m", "x", ...options, "--json"]);
+    assert.notEqual(denied.status, 0);
+  }
+  assert.notEqual(f.cli("send", ["--to", "recipient", "--subject", "wrong conversation", "-m", "x", "--json"], "sibling-session").status, 0);
+  assert.equal(f.node.search("denied").length, 0);
+});
+
+test("S3 both MCP reply tools and CLI replies retain known sources through omitted labels", async t => {
+  const f = await publicHarness(t), raw = f.input("firsthand-outside"), clean = f.input("agent");
+  await f.call("mbx_read", { ids: [clean.id] });
+  const a = await f.call("mbx_reply", { id: raw.id, body: "analysis", context: clean.thread, payload: "agent" }) as PublicSend;
+  const b = await f.call("mbx_send", { id: raw.id, body: "analysis", context: clean.thread, payload: "agent" }) as PublicSend;
+  for (const out of [a, b]) {
+    assert.equal(out.reply_to, raw.id); assert.equal(out.thread, raw.thread);
+    assert.equal(out.provenance.payload.kind, "derived-outside");
+    assert.deepEqual(out.provenance.payload.roots.map(r => r.message_id), [raw.id]);
+  }
+  const c = f.cli("send", ["--to", "writer", "--reply-to", raw.id, "-m", "analysis", "--context", clean.thread, "--payload", "agent", "--json"]);
+  assert.equal(c.status, 0, c.stderr);
+  assert.deepEqual(JSON.parse(c.stdout).provenance.payload.roots.map((r: { message_id: string }) => r.message_id), [raw.id]);
+  const fresh = await f.call("mbx_send", { to: ["recipient"], subject: "new thread", body: "status", kind: "status", refs: [] }) as PublicSend;
+  assert.equal(fresh.provenance.payload.kind, "derived-outside"); assert.notEqual(fresh.thread, raw.thread);
+  assert.equal(f.node.search("analysis").length, 3, "each reply was sent exactly once");
+});
+
+for (const history of ["mbx_replay", "mbx_catchup", "CLI replay"]) test(`S3 ${history} records returned bodies but skips omitted content and does not mark read`, async t => {
+  const f = await publicHarness(t), large = f.input("firsthand-outside", "outside ".repeat(4000));
+  const historyCall = async (options: Record<string, unknown>) => {
+    if (history !== "CLI replay") return await f.call(history, options) as { messages: { id: string; content_omitted?: boolean }[]; next_cursor: string };
+    const args = Object.entries(options).flatMap(([key, value]) => ["--" + key.replaceAll("_", "-"), String(value)]);
+    const result = f.cli("replay", args); assert.equal(result.status, 0, result.stderr); return JSON.parse(result.stdout);
+  };
+  const omitted = await historyCall({ max_bytes: 2048 });
+  assert.equal(omitted.messages[0].content_omitted, true);
+  assert.equal((await f.call("mbx_whoami") as { provenance: PublicStatus }).provenance.payload.kind, "agent");
+  if (history === "mbx_catchup") await f.call(history, { commit: omitted.next_cursor });
+  const raw = f.input("firsthand-outside", "returned outside data");
+  const page = await historyCall(history === "mbx_catchup" ? { max_bytes: 12000 } : { thread: raw.thread, max_bytes: 12000 });
+  assert.ok(page.messages.some((m: { id: string }) => m.id === raw.id));
+  const status = (await f.call("mbx_whoami") as { provenance: PublicStatus }).provenance;
+  assert.equal(status.payload.kind, "derived-outside"); assert.deepEqual(status.payload.roots.map(r => r.message_id), [raw.id]);
+  const sent = await f.call("mbx_send", { to: ["recipient"], subject: "after history", body: "summary", kind: "status", origin: "agent" }) as PublicSend;
+  assert.equal(sent.provenance.payload.kind, "derived-outside"); assert.equal(sent.provenance.legacy_projection.external, true);
+  for (const e of [large, raw]) assert.equal(f.node.store.db.prepare("SELECT state FROM deliveries WHERE agent='reader' AND msg_id=?").get(e.id)!.state, "delivered");
+});
+
+test("S3 one hundred public MCP exchanges retain expired immutable roots and conservative policy", async t => {
+  const f = await publicHarness(t), raw = f.input("firsthand-outside", "old source", Date.now() - EXTERNAL_TAINT_MS - 1000);
+  const owner = generateKeyPair();
+  writeFileSync(join(f.home, "owner.json"), JSON.stringify({ v: 1, backend: "keychain", public_key: owner.publicKey }), { mode: 0o600 });
+  f.node.syncOwner();
+  const rec = makePolicy({ level: "autonomous", classes: ["read", "edit", "outward"], agents: ["recipient"], hosts: ["alpha"], from: ["local"], ownerPub: owner.publicKey });
+  assert.equal(issueSigned(f.node.store.db, { rec, sig: signData(owner.privateKey, canonical(rec)) }, "alpha"), null);
+  const agent = f.input("agent");
+  assert.ok(f.node.policyFor(f.node.read(agent.id, "reader"), "recipient").classes.includes("outward"), "the fixture grants actual action classes to clean local agent content");
+  await f.call("mbx_read", { ids: [raw.id] });
+  for (let i = 0; i < 100; i++) {
+    const sent = await f.call("mbx_send", { to: ["recipient"], subject: "counts " + i, body: "status", kind: "status", origin: "agent", refs: [] }) as PublicSend;
+    assert.equal(sent.provenance.payload.kind, "derived-outside");
+    assert.deepEqual(sent.provenance.payload.roots.map(({ message_id, since, remaining_ms }) => ({ message_id, since, remaining_ms })),
+      [{ message_id: raw.id, since: raw.ts, remaining_ms: 0 }]);
+    const row = f.node.read(sent.id, "reader");
+    assert.deepEqual(f.node.policyFor(row, "recipient").classes, ["read"], "expired outside roots still downgrade an otherwise active action policy");
+    await f.call("mbx_read", { ids: [sent.id] });
+  }
+});
+
+test("S3 Codex shared transport keeps sibling conversations out of retained inputs", async t => {
+  const f = await publicHarness(t, "codex"), raw = f.input("firsthand-outside");
+  await f.call("mbx_read", { ids: [raw.id] });
+  const meta = { threadId: "11111111-1111-4111-8111-111111111111" };
+  await f.call("mbx_identity", { action: "register", name: "sibling", role: "builder" }, meta);
+  const who = await f.call("mbx_whoami", {}, meta) as { provenance: PublicStatus };
+  assert.equal(who.provenance.payload.kind, "agent"); assert.equal(who.provenance.writer_fence.state, "clear");
+  const sent = await f.call("mbx_send", { to: ["recipient"], subject: "sibling counts", body: "pass", payload: "agent" }, meta) as PublicSend;
+  assert.equal(sent.provenance.payload.kind, "agent"); assert.equal(sent.provenance.legacy_projection.external, false);
+  const denied = await f.client.callTool({ name: "mbx_send", arguments: { to: ["recipient"], subject: "private source", body: "x", sources: [raw.id] }, _meta: meta });
+  assert.equal(denied.isError, true);
+  assert.equal((await f.call("mbx_whoami") as { provenance: PublicStatus }).provenance.payload.kind, "derived-outside");
+});
+
+test("S3 project ledger records authorized lead-only bodies and excludes withheld content", async t => {
+  const f = await publicHarness(t), raw = f.input("firsthand-outside", "private outside data", Date.now() - 1000, ["other"]);
+  const withheld = await f.call("mbx_project") as { messages: { id: string; body: string | null }[] };
+  assert.equal(withheld.messages.find(m => m.id === raw.id)!.body, null);
+  assert.equal((await f.call("mbx_whoami") as { provenance: PublicStatus }).provenance.payload.kind, "agent");
+  const owner = generateKeyPair();
+  writeFileSync(join(f.home, "owner.json"), JSON.stringify({ v: 1, backend: "keychain", public_key: owner.publicKey }), { mode: 0o600 });
+  f.node.syncOwner();
+  const rec = makeLead({ project: process.cwd(), agent: "reader", host: "alpha", ownerPub: owner.publicKey });
+  storeLead(f.node, rec, signData(owner.privateKey, canonical(rec)));
+  const visible = await f.call("mbx_project") as { messages: { id: string; body: string | null }[] };
+  assert.equal(visible.messages.find(m => m.id === raw.id)!.body, raw.body);
+  assert.throws(() => f.node.read(raw.id, "reader"), /no message/, "ledger visibility did not create a personal mailbox grant");
+  const sent = await f.call("mbx_send", { to: ["recipient"], subject: "ledger analysis", body: "summary" }) as PublicSend;
+  assert.deepEqual(sent.provenance.payload.roots.map(r => r.message_id), [raw.id]);
+  assert.equal(sent.provenance.legacy_projection.external, true);
 });

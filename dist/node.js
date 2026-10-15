@@ -866,7 +866,9 @@ export class MbxNode {
             if (provenance.record.kind !== "agent" || writer || unknownWriter) {
                 const root = Math.max(writer?.root ?? 0, ...provenance.record.roots.map(r => Date.parse(r.since)));
                 e.meta.origin = "external";
-                if (provenance.record.kind === "firsthand-outside") {
+                const rawDeclaration = scope.payload === "firsthand-outside"
+                    || (scope.payload !== "derived-outside" && d.origin === "external" && !d.external_since);
+                if (provenance.record.kind === "firsthand-outside" || rawDeclaration) {
                     e.meta.external_source = "declared";
                     e.meta.external_since = e.ts;
                 }
@@ -1270,19 +1272,37 @@ export class MbxNode {
     }
     /** Shared observation for send/read/whoami. Caution may expire; payload roots and v1 restrictions do not disappear. */
     provenanceStatus(input, scope, now = Date.now()) {
-        const p = readContentProvenance(input, this.provenanceSources(input), now);
+        let p = readContentProvenance(input, this.provenanceSources(input), now), contextId = null;
+        if (input === undefined && scope) {
+            const prefix = this.inputContextPrefix(scope.cli, scope.session_id), id = this.store.get(prefix + "active");
+            let context = null, unknown = this.store.get(prefix + "overflow") !== undefined || this.store.get(prefix + "incomplete") !== undefined;
+            try {
+                context = id === undefined ? this.historicalProvenanceInput(scope.cli, scope.session_id, "0".repeat(26), now) : this.inputContext(prefix, id);
+                unknown ||= id !== undefined && !context || id === undefined && !!this.store.db.prepare("SELECT 1 FROM kv WHERE k GLOB ? LIMIT 1").get(prefix + "*");
+            }
+            catch {
+                unknown = true;
+            }
+            // A status query evaluates retained inputs without changing context or signing a message.
+            const query = buildEnvelope({ from: `observer@${this.host}`, to: ["observer"], subject: "context", body: "" }, new Date(now));
+            const built = createContentProvenance(query, context?.parents ?? [], this.provenanceSources(query), undefined, unknown || context?.unknown === true);
+            p = { kind: built.record.kind, roots: built.record.roots, parents: built.record.parents, reason: built.warnings.join("; ") || null };
+            contextId = context?.id === "0".repeat(26) ? null : context?.id ?? null;
+        }
         const timing = (root) => ({ root_time: root === null ? null : new Date(root).toISOString(),
             caution_until: root === null ? null : new Date(root + EXTERNAL_TAINT_MS).toISOString(),
             remaining_ms: root === null ? null : Math.max(0, root + EXTERNAL_TAINT_MS - now) });
         const writer = scope ? readSessionTaint(this.store, scope.cli, scope.session_id, now) : null;
         const unknownWriter = scope ? !writer && !sessionUntainted(this.store, scope.cli, scope.session_id, now) : false;
-        const projection = externalExposure(input, now), external = input?.meta?.origin === "external";
-        const sender = (from) => { const [agent, host] = from.split("@"); return NAME_RE.test(agent) && /^[a-z0-9][a-z0-9.-]{0,299}$/.test(host) ? from : null; };
-        return { activation: "observation-only; v1 policy and approval fences remain",
+        const external = input === undefined ? p.kind !== "agent" || !!writer || unknownWriter : input?.meta?.origin === "external";
+        const projection = input === undefined ? writer ? { how: writer.how, root: writer.root }
+            : external ? { how: p.roots.length ? "inherited" : "malformed", root: p.roots.length ? Math.max(...p.roots.map(r => Date.parse(r.since))) : now } : null : externalExposure(input, now);
+        const sender = (from) => { const [agent, host, extra] = from.split("@"); return extra === undefined && NAME_RE.test(agent) && /^[a-z0-9][a-z0-9.-]{0,299}$/.test(host) ? from : null; };
+        return { activation: "observation-only; v1 policy and approval fences remain", ...(input === undefined ? { context_id: contextId } : {}),
             payload: { kind: p.kind, roots: p.roots.map(root => ({ ...root, from: sender(root.from), ...timing(Date.parse(root.since)) })), parents: p.parents,
                 ...timing(p.roots.length ? Math.max(...p.roots.map(r => Date.parse(r.since))) : null), reason: p.reason },
             writer_fence: { state: writer ? "active" : unknownWriter ? "unknown" : scope ? "clear" : "not-observed",
-                message_id: writer?.id ?? null, from: writer?.from ?? null, cause: writer?.how ?? null, ...timing(writer?.root ?? null),
+                message_id: writer?.id ?? null, from: writer?.from ? sender(writer.from) : null, cause: writer?.how ?? null, ...timing(writer?.root ?? null),
                 reason: writer ? "this conversation's existing outside-exposure fence" : unknownWriter ? "unreadable or invalid conversation exposure" : scope ? null : "the reader cannot observe the writer's conversation history" },
             legacy_projection: { external, cause: projection?.how ?? null, ...timing(projection?.root ?? null),
                 downgrade_reason: external ? "legacy conservative outside projection: read only; no taint-contract activation"
@@ -1449,7 +1469,7 @@ export class MbxNode {
     }
 }
 /** Build the metadata/quarantine DTO without copying subjects, refs, tags, project paths or receipt notes. */
-export function messageReadView(node, row, agent, mode, now = Date.now()) {
+export function messageReadView(node, row, agent, mode, now = Date.now(), scope) {
     const id = (x) => typeof x === "string" && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(x) ? x : null;
     let e = null;
     try {
@@ -1473,7 +1493,7 @@ export function messageReadView(node, row, agent, mode, now = Date.now()) {
         counts: { body_bytes: Buffer.byteLength(row.body), refs: Array.isArray(e?.refs) ? e.refs.length : 0 },
         provenance: { kind: mode === "quarantine" ? "derived-outside" : p.kind, source_kind: p.kind,
             roots: p.roots.map(({ message_id, content_sha256, since }) => ({ message_id, content_sha256, since })), parents: mode === "quarantine" ? [id(row.id)].filter((x) => x !== null) : p.parents },
-        lineage: node.provenanceStatus(e, undefined, now), policy };
+        lineage: node.provenanceStatus(e, scope, now), policy };
     if (mode === "quarantine") {
         view.lineage.payload = { ...view.lineage.payload, kind: "derived-outside", parents: [...view.provenance.parents],
             reason: p.roots.length ? "untrusted extracted summary; inherited source roots" : "untrusted extracted summary; source roots unavailable" };
@@ -1493,7 +1513,7 @@ function auditLeadRead(node, agent, messageId, lead) {
     auditLeadGrantUse(node.store, { grant: { lead: lead.lead, record: lead.record, grants: lead.grant, exp: lead.exp }, agent, cli: "", via: "read" });
 }
 /** A message framed for `agent`, with the policy line computed on this host. */
-export function formatFor(node, m, agent) {
+export function formatFor(node, m, agent, scope) {
     const row = node.currentAuthority(m), a = storedAuthority(row);
     // An owner-signed message is the owner's own task: "policy: ask" beside "authority: OWNER" read as a contradiction (T022).
     let policy;
@@ -1510,10 +1530,10 @@ export function formatFor(node, m, agent) {
     const boxes = JSON.parse(m.envelope).to.flatMap((t) => { const b = projectMailboxBySlot(node.store, t); return b ? [projectLabel(b)] : []; });
     const where = boxes.length ? `\naddressed to the project mailbox ${boxes.join(", ")} (stored once for the project; its lead reads it)` : "";
     const e = JSON.parse(m.envelope);
-    const source = e.meta?.provenance === undefined ? null : node.provenanceStatus(e);
+    const source = e.meta?.provenance === undefined && !scope ? null : node.provenanceStatus(e, scope);
     const lineage = source ? `\npayload provenance: ${source.payload.kind}; roots: ${source.payload.roots.length
         ? source.payload.roots.map(r => `${r.message_id} from ${r.from}, since ${r.since}, caution until ${r.caution_until}, remaining ${r.remaining_ms} ms`).join("; ") : "none"}${source.payload.reason ? `; ${source.payload.reason}` : ""}`
-        + `\nwriter fence: not observed by the reader; legacy projection: ${source.legacy_projection.external ? "external" : "agent"}; ${source.legacy_projection.downgrade_reason ?? "no outside-content downgrade"}` : "";
+        + `\n${scope ? "reader conversation writer fence" : "writer fence"}: ${source.writer_fence.state}; root ${source.writer_fence.root_time ?? "none"}; remaining ${source.writer_fence.remaining_ms ?? "unknown"} ms; legacy projection: ${source.legacy_projection.external ? "external" : "agent"}; ${source.legacy_projection.downgrade_reason ?? "no outside-content downgrade"}` : "";
     return formatMessage(row, (lead ? `${policy}\nforwarded by lead ${lead} (project ledger; this adds no authority)` : policy) + where + lineage);
 }
 /** Structural guard for legacy cached authority; this does not revalidate key revocation or expiry. */
