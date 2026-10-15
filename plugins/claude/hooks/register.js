@@ -127,7 +127,10 @@ function count(value) {
 
 /**
  * The one-line under-prompt indicator (`$.ui.status`). Null when there is
- * nothing worth pinning: unbound, unavailable, or zero unread everywhere.
+ * nothing worth pinning: unbound, unavailable, or zero unread everywhere; the
+ * timer then clears the line (T658). Like the status line and the OpenCode
+ * sidebar (T650), the headline is new mail only and read-but-unacked mail is
+ * its own `M read` segment; a daemon from before T650 sends only `unread`.
  * Pure: renders one fetched snapshot, derives nothing.
  * @param {unknown} snapshot
  * @returns {string | null}
@@ -140,10 +143,14 @@ export function statusLineText(snapshot) {
     ? /** @type {Record<string, unknown>} */ (row.inbox)
     : row;
   const unread = typeof inbox.unread === "number" ? inbox.unread : 0;
+  const fresh = typeof inbox.new === "number" ? inbox.new : unread;
+  const read = typeof inbox.new === "number" && typeof inbox.read === "number" ? inbox.read : 0;
   const needsReply = typeof inbox.needs_reply === "number" ? inbox.needs_reply : 0;
   const fromOwner = typeof inbox.from_owner === "number" ? inbox.from_owner : 0;
-  if (!unread && !needsReply && !fromOwner) return null;
-  const seg = [`${unread}↑`];
+  if (!fresh && !read && !needsReply && !fromOwner) return null;
+  const seg = [];
+  if (fresh || !read) seg.push(`${fresh}↑`);
+  if (read) seg.push(`${read} read`);
   if (needsReply) seg.push(`${needsReply}↺`);
   if (fromOwner) seg.push(`owner:${fromOwner}`);
   return `mbx: ${seg.join(" ")}`;
@@ -406,12 +413,14 @@ export function register(on) {
     });
     // The persistent unread indicator (T415 AC2): poll the same endpoint the band uses and
     // keep one line under the prompt current; the invalidate keeps band and pane fresh. The
-    // callback closes over `$` (documented for timers); a failed poll leaves the old line.
+    // callback closes over `$` (documented for timers). The host keeps a status line until it is
+    // changed, so nothing to show must clear it with `$.ui.status(undefined)`, or the last count
+    // stays forever (T658). Every tick sets it, as before, so a host-side reset is repaired.
     $.clock.every(INDICATOR_MS, async () => {
       try {
         const { snapshot } = await loadStatus($);
-        const line = statusLineText(snapshot);
-        if (line) $.ui.status(line);
+        const line = statusLineText(snapshot) ?? undefined;
+        $.ui.status(line);
         $.ui.invalidate("ui.render");
       } catch { /* next tick */ }
     });
