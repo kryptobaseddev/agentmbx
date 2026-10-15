@@ -18,7 +18,7 @@ import { version } from "./version.ts";
 import { GROK_NO_PUSH, MbxNode, RETRY_HOURS, staleMcpKvCensus } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
 import { claudePluginChecks } from "./claude-plugin.ts";
-import { detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConfigPath, hermesConsent, mcpConfiguredCmd, mcpConfiguredTimeout, skillDest, skillStatus, statuslineConfiguredCommand, statuslineCurrent, statuslineState, wired, type CliId, type SetupCtx } from "./setup.ts";
+import { currentHookNode, detect, edits, grokMcpConfiguredCommand, hermesAllowlistPath, hermesConfigPath, hermesConsent, mcpConfiguredCmd, mcpConfiguredTimeout, NODE_ENGINES_FLOOR, opencodeWiredNode, skillDest, skillStatus, statuslineConfiguredCommand, statuslineCurrent, statuslineState, wired, type CliId, type SetupCtx } from "./setup.ts";
 import { mailboxLiveness } from "./receipts.ts";
 import { liveWatcher } from "./wake.ts";
 import { findIdentityControl, listIdentityControls } from "./identity-control.ts";
@@ -466,8 +466,10 @@ export async function opencodePluginChecks(ctx: SetupCtx, node: MbxNode, options
   now?: number; fetch?: typeof fetch;
 } = {}): Promise<Check[]> {
   const fix = "agentmbx setup --only opencode";
+  let wiredNode: string | null = null;
   const wiring = edits(ctx, "opencode").filter(e => e.kind === "hooks" || e.kind === "sidebar").map(e => {
     const cur = pluginDiagnosticFile(e.path);
+    if (e.kind === "hooks") wiredNode = opencodeWiredNode(cur, version());
     try {
       const state = !existsSync(e.path) ? "missing" : cur === null ? "unknown (unreadable or oversized)"
         : e.blocked?.(cur) ? "foreign or malformed (preserved)"
@@ -476,6 +478,8 @@ export async function opencodePluginChecks(ctx: SetupCtx, node: MbxNode, options
     } catch { return { item: e.item, state: "unknown (malformed)" }; }
   });
   const current = wiring.every(w => w.state === "present/current");
+  // T654: another node that meets the engines floor is still current. Do not suggest setup for it.
+  const interpreterOnly = current && wiredNode !== null && wiredNode !== process.execPath;
   const foreign = wiring.some(w => w.state.startsWith("foreign"));
   const repair = foreign ? `Back up your local plugin edits, then run ${fix}; setup preserves foreign files.` : fix;
   const checks: Check[] = [{ level: current ? "ok" : "warn", label: `opencode: plugin wiring — ${wiring.map(w => `${w.item}: ${w.state}`).join("; ")}`, ...(current ? {} : { fix: repair }) }];
@@ -530,8 +534,11 @@ export async function opencodePluginChecks(ctx: SetupCtx, node: MbxNode, options
     } catch { snapshot = "invalid or mismatched"; }
     const poll = waiting.has(`${row.session_id}\0${row.pid}`) ? "server poll observed" : `server poll unobserved (${pollState === "observed" ? "no matching waiter; service hosts need no standalone waiter" : "waiters endpoint unavailable"})`;
     const healthy = current && heartbeat === "fresh" && snapshot === "exact snapshot available";
+    const sessionFix = interpreterOnly
+      ? (healthy ? undefined : "reopen only the affected OpenCode TUI when the owner permits it.")
+      : (foreign ? repair : `${fix}; reopen only the affected OpenCode TUI when the owner permits it.`);
     checks.push({ level: healthy ? "info" : "warn", label: `opencode: plugin session ${row.session_id} — wiring ${current ? "present/current" : "incomplete"}; ${poll}; producer heartbeat ${heartbeat}; ${snapshot}; TUI load/read/render budget unobserved`,
-      fix: foreign ? repair : `${fix}; reopen only the affected OpenCode TUI when the owner permits it.` });
+      ...(sessionFix ? { fix: sessionFix } : {}) });
   }
   if (rows.length > 20) {
     const total = Number(node.store.db.prepare("SELECT COUNT(*) n FROM sessions WHERE cli='opencode' AND session_id NOT LIKE 'mcp-%'").get()?.n ?? rows.length);
@@ -702,6 +709,40 @@ export function legacyMbxShim(pathEnv: string = process.env.PATH ?? ""): Check |
   };
 }
 
+function commandStrings(text: string): string[] {
+  const out: string[] = [];
+  for (const m of text.matchAll(/"(?:[^"\\]|\\.)*"/g)) {
+    try {
+      const v = JSON.parse(m[0]) as unknown;
+      if (typeof v === "string") out.push(v);
+    } catch { /* not a JSON string */ }
+  }
+  return out;
+}
+
+/** T654: hooks are wired, and the only difference is the node binary. Names both paths. No setup fix. */
+function interpreterDrift(ctx: SetupCtx, cli: CliId): Check | null {
+  const hooks = edits(ctx, cli).filter((e) => e.kind === "hooks");
+  if (!hooks.length || !hooks.every(wired)) return null;
+  const here = process.execPath;
+  const nodes = new Set<string>();
+  for (const e of hooks) {
+    let text: string;
+    try { text = readFileSync(e.path, "utf8"); } catch { continue; }
+    if (cli === "opencode") {
+      const node = opencodeWiredNode(text, version());
+      if (node && node !== here) nodes.add(node);
+      continue;
+    }
+    for (const command of commandStrings(text)) {
+      const node = currentHookNode(command, cli, ctx.home);
+      if (node && node !== here) nodes.add(node);
+    }
+  }
+  if (!nodes.size) return null;
+  return { level: "warn", label: `${cli}: hooks use node ${[...nodes].join(", ")}; this process is ${here}` };
+}
+
 export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeoutMs?: number } = {}): Promise<Check[]> {
   const out: Check[] = [];
   const add = (level: Level, label: string, fix?: string) => out.push({ level, label, fix });
@@ -711,7 +752,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     const errors = recentMcpStartupErrors(mbxHome);
     add(errors.length ? "warn" : "info", `MCP startup errors in the last 24h (${errors.length} shown):${errors.length ? `\n${errors.join("\n")}` : " none"}`);
   } catch (error) { add("warn", `MCP startup error log unavailable: ${(error as Error).message}`); }
-  if (Number(process.versions.node.split(".")[0]) < 24) add("fail", `Node ${process.versions.node} is too old`, "install Node 24 or later");
+  if (Number(process.versions.node.split(".")[0]) < NODE_ENGINES_FLOOR) add("fail", `Node ${process.versions.node} is too old`, "install Node 24 or later");
 
   // T314: stay out of the grok block. OpenCode's own doctor function must not collide with this.
   const legacy = legacyMbxShim();
@@ -736,6 +777,8 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
       const what = kind === "mcp" ? "MCP server" : kind === "sidebar" ? "sidebar plugin" : "hooks";
       add(ok ? "ok" : "fail", `${d.cli}: ${what} ${ok ? "wired" : "not wired"} (${e.map((x) => x.path.replace(ctx.home, "~")).join(", ")})`, ok ? undefined : `agentmbx setup --only ${d.cli}`);
     }
+    const drift = interpreterDrift(ctx, d.cli);
+    if (drift) out.push(drift);
     // The status line is optional and never fails doctor (review minor 7). T368: the checks are
     // static and per-CLI — ours must be a CURRENT form, foreign must be truly foreign.
     for (const c of statuslineChecks(ctx, d.cli)) out.push(c);
