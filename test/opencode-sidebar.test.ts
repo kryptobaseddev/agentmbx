@@ -299,7 +299,7 @@ for (const state of ["bound", "unbound", "cloud-down", "peers-down"]) test(`T413
     assert.ok(compact.includes(fixture.identity.name!));
     assert.match(compact, /2↑ 1↺/);
     assert.match(panel, /Registered: yes.*Lease: verified/s);
-    assert.match(panel, /2 unread · 1 needs reply.*3 pending sends/s);
+    assert.match(panel, /2 new · 0 read · 1 needs reply.*3 pending sends/s, "T650: a pre-T650 snapshot (unread only) reads as new");
     assert.match(panel, /Identity & session.*Inbox.*Cloud & devices.*Project/s);
     assert.ok(panel.includes(`Wake: ${fixture.harness.wake_path}`), "wake path is rendered, not re-derived from the host CLI");
     if (fixture.project) {

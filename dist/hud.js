@@ -36,12 +36,16 @@ const SID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 export function hudStatus(node, o) {
     const name = o.agent;
     const rows = name
-        ? node.store.db.prepare(`SELECT m.* FROM deliveries d JOIN messages m ON m.id = d.msg_id
+        ? node.store.db.prepare(`SELECT m.*, d.state AS delivery_state FROM deliveries d JOIN messages m ON m.id = d.msg_id
         WHERE d.agent = ? AND d.state <> 'acked'`).all(name)
         : [];
-    let unread = 0, needs_reply = 0, from_owner = 0;
+    let unread = 0, fresh = 0, read = 0, needs_reply = 0, from_owner = 0;
     for (const row of rows) {
         unread += 1;
+        if (row.delivery_state === "read")
+            read += 1;
+        else
+            fresh += 1;
         const e = JSON.parse(row.envelope);
         if (e.needs_reply)
             needs_reply += 1;
@@ -58,19 +62,26 @@ export function hudStatus(node, o) {
     return {
         schema: HUD_SCHEMA, mbx_version: version(), update_available: updateAvailable(node.store),
         identity: { name, role, state: o.state, ...(o.candidates ? { candidates: o.candidates } : {}) },
-        unread, needs_reply, from_owner,
+        unread, new: fresh, read, needs_reply, from_owner,
         outbox_unsent: Number(outbox.n),
         policy: policies.map((p) => p.level),
         resolved_by: o.resolvedBy,
     };
 }
+/** New (unread, not yet read) mail; a snapshot from before T650 only has the unacked total. */
+export const newCount = (snap) => snap.new ?? snap.unread;
 /** The pre-rendered statusline segment: the daemon writes it next to each snapshot so the adapter
  *  is one `cat` with no JSON parsing (review: node startup already dominates the render budget). */
 export function hudLine(snap) {
     const tag = snap.identity.name + (snap.identity.role ? `(${snap.identity.role})` : "");
     const seg = [tag];
-    if (snap.unread)
-        seg.push(`${snap.unread}↑`);
+    // T650: the headline is new mail only; read-but-unacked mail is its own segment, so mail already read (and perhaps
+    // replied to) without an ack no longer looks like it came back after a restart. A pre-T650 snapshot has neither field.
+    const fresh = newCount(snap), read = snap.read ?? 0;
+    if (fresh)
+        seg.push(`${fresh}↑`);
+    if (read)
+        seg.push(`${read} read`);
     if (snap.needs_reply)
         seg.push(`${snap.needs_reply}↺`);
     if (snap.from_owner)
@@ -86,7 +97,8 @@ export function hudLine(snap) {
 // (unread == 0) the line is EMPTY and Kimi renders its own footer items untouched; with unread mail
 // the alert takes footer line 1. Every other CLI's command composes with its built-in items and its
 // line is unchanged. Unbound/ambiguous rows never reach this — the writer skips them before render.
-const cliLine = (cli, snap) => cli === "kimi" && !snap.unread ? "" : hudLine(snap);
+// T650: only new mail raises Kimi's alert; read-but-unacked mail alone leaves Kimi's own footer in place.
+const cliLine = (cli, snap) => cli === "kimi" && !newCount(snap) ? "" : hudLine(snap);
 const writeSeg = (path, seg) => writeIfChanged(path, seg ? `${seg}\n` : "");
 const writeIfChanged = (path, content) => {
     try {
@@ -272,7 +284,7 @@ export function hudStatusV2(node, o, cached) {
                 : null,
         },
         inbox: {
-            unread: v1.unread, needs_reply: v1.needs_reply, from_owner: v1.from_owner, outbox_unsent: v1.outbox_unsent,
+            unread: v1.unread, new: newCount(v1), read: v1.read ?? 0, needs_reply: v1.needs_reply, from_owner: v1.from_owner, outbox_unsent: v1.outbox_unsent,
             ...(o.includeInbox ? { recent: name && o.state === "bound" && sessionRow?.agent === name
                     ? node.store.db.prepare(`SELECT m.id, m.from_addr AS sender, m.subject, m.kind, m.ts,
             json_extract(m.envelope, '$.needs_reply') AS needs_reply
