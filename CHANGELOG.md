@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **OpenCode's "no mailbox identity yet" note is no longer delivered to a session that has already bound (T643).** `session.created` fires with the first prompt, so the queued session-start note always arrived after the first turn. If that turn claimed or registered, the note told a bound session it had no identity. Now the plugin holds an unbound session's note and puts it in the next tool result while the session is still unbound. If the session binds first (the bind updates its post-tool marker), the note is dropped. If the turn ends with no tool call, the note is queued for the next turn as long as the session is still unbound. Sessions that are bound when they start still get their note queued as before.
+
 ## 0.5.34 (2026-10-14)
 
 OpenCode sessions see new mail during a long turn: the unread notice rides the tool result the model is reading, a repeated unread count is no longer silently dropped, and a sender's receipt says when a wake is queued behind the recipient's running turn. Run agentmbx setup --only opencode and reopen OpenCode sessions to load the new plugin.
