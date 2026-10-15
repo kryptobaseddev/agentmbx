@@ -13,6 +13,7 @@ import { policyBrief } from "./policy.ts";
 import { ulid } from "./crypto.ts";
 import { opencodeHostOf, type OpencodeHost } from "./opencode-provider.ts";
 import { listOpencodeWakeWaiters, pushOpencodeWake } from "./opencode-wake-queue.ts";
+import { pollerWakeTargets } from "./opencode-poller.ts";
 import type { WakeOutcome, WakeReceipt } from "./wake-contract.ts";
 import type { MessageRow, Store } from "./store.ts";
 import { leadAgentOf, projectLabel, projectMailboxBySlot } from "./project-mailbox.ts";
@@ -458,10 +459,13 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
     });
     // A live exact session of a live lease whose authority was not captured: retry it, never strand its mail (T646).
     const lease = node.store.db.prepare("SELECT cli FROM identity_leases WHERE name=? AND released_at IS NULL").get(agent) as { cli: string } | undefined;
+    // T659: an idle OpenCode session's MCP is evicted about hourly, which releases its lease; with no lease there is no
+    // captureWakeIdentity, but the serve's plugin is still polling. Only when no lease-based holder exists.
+    const pollers = held.length ? [] : pollerWakeTargets(node, agent, bound);
     const unverified = bound.filter(s => !s.session_id.startsWith("mcp-") && !held.some(g => g.session === s)
       && s.cli === lease?.cli && !!s.pid && node.sameSession(s.pid, s));
-    if (!unverified.length) node.store.db.prepare("DELETE FROM kv WHERE k=?").run(`wake-capture-failed:${agent}`);
-    const sessions = held.filter(g => !g.session.session_id.startsWith("mcp-"));
+    if (!unverified.length || pollers.length) node.store.db.prepare("DELETE FROM kv WHERE k=?").run(`wake-capture-failed:${agent}`);
+    const sessions = [...held, ...pollers].filter(g => !g.session.session_id.startsWith("mcp-"));
     // Only the current leased channel may suppress daemon delivery.
     if (held.some(g => g.session.channel)) continue;
     if (liveWatcher(node, agent, now)) continue; // its own watcher reports the mail and marks it notified

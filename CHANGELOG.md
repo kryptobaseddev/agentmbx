@@ -3,6 +3,7 @@
 ## Unreleased
 
 ## 0.5.37 (2026-10-15)
+- **An idle OpenCode session is woken again after OpenCode evicts its MCP (T659).** OpenCode stops an idle session's MCP about hourly, which releases the mailbox lease; a wake target needed a live lease holder, so in that window new mail could only raise a desktop notice and waited for the human to type. The serve itself is still running, and the plugin inside it long-polls the daemon's wake queue, so that poller is now the target: the wake goes only to the standalone serve whose pid the session row names, over the existing loopback queue, and the session claims its identity again on the turn the wake starts. The shared service is never a target, a poller for another pid is ignored, and mail stays delivered until a wake is admitted.
 
 - **A reply-shaped `mbx_send` is sent as the reply, and handoff notes may be up to 4000 characters (T652).** Agents, OpenCode ones especially, often called `mbx_send` with `mbx_reply`'s arguments (`{id, body, kind}`). The schema refused it with "to: Missing key, subject: Missing key", and the agent spent a turn resending through `mbx_reply`.
   - **Sent as the reply:** `mbx_send` now treats a message id (`id`, an alias of `reply_to`) with no `to` as that reply. It is sent once through `mbx_reply`'s own path: same recipient, `Re:` subject, thread, kind `reply`, and the same policy and taint handling. The result notes "treated as a reply to <id>; mbx_reply is the reply tool".
