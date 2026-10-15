@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **A grok post-tool follows the one live provisional MCP when the session file cannot name the conversation (T657).** A half-written or multi-row `active_sessions.json` leaves the connector's lease on `mcp-<pid>`. The post-tool looked up the real session id, missed, and said the session had no mailbox. It now uses that one live provisional control of its own provider while the lease is still held, and it does not claim. Two such controls, or a control already bound to another real session, still get the register prompt. While the connector is still starting, the post-tool can still drop the "still resuming" note; that stays in `src/cli.ts` until T630 merges.
+
 ## 0.5.37 (2026-10-15)
 - **An idle OpenCode session is woken again after OpenCode evicts its MCP (T659).** OpenCode stops an idle session's MCP about hourly, which releases the mailbox lease; a wake target needed a live lease holder, so in that window new mail could only raise a desktop notice and waited for the human to type. The serve itself is still running, and the plugin inside it long-polls the daemon's wake queue, so that poller is now the target: the wake goes only to the standalone serve whose pid the session row names, over the existing loopback queue, and the session claims its identity again on the turn the wake starts. The shared service is never a target, a poller for another pid is ignored, and mail stays delivered until a wake is admitted.
 
