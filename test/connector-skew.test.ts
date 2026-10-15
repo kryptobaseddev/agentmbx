@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MbxNode } from "../src/node.ts";
 import {
-  compareVersions, connectorSkewChecks, liveConnectors, opencodePluginStep, skewNoteKey, skewNoteText, skewSeams, wakeSkewNote, type OpencodePluginState,
+  compareVersions, connectorSkewChecks, liveConnectors, markSkewNoted, opencodePluginStep, pluginSkewNoteKey, skewNoteKey, skewNoteText, skewSeams, wakeSkewNote, type OpencodePluginState,
 } from "../src/connector-skew.ts";
 import { completeOpencodeWake, resetOpencodeWakeQueue, waitForOpencodeWake } from "../src/opencode-wake-queue.ts";
 import { opencodeHostSeams } from "../src/opencode-provider.ts";
@@ -179,4 +179,83 @@ test("T661: the note names the plugin step when the tab's plugin cannot switch i
   const stale: OpencodePluginState = { headerVersion: "0.0.1", mtimeMs: 1, templateCurrent: false };
   const note = wakeSkewNote(n, { agent: "worker", cli: "opencode", session_id: SESSION }, { plugin: stale });
   assert.match(note!.text, /in place, with no restart\. The OpenCode plugin is not switched that way: run `agentmbx setup --only opencode`, then reopen the tab\.$/);
+});
+
+// ---- T669: the plugin module a serve already loaded is stale even when the connector is current ----
+
+/** A plugin file written after the serve started, so that serve is running the previous plugin code. */
+const STALE_FILE: OpencodePluginState = { headerVersion: "0.5.38", mtimeMs: Date.now() + 60_000, templateCurrent: true };
+
+test("T669: doctor names a stale plugin module even though no connector is behind", (t) => {
+  const { n, connector, inspect } = fixture(t);
+  connector(801, "0.5.38", { agent: "axiom-dev", cli: "opencode", session: "ses_tab", servePid: 9002, serveStart: "Thu Oct 15 12:00:00 2026" });
+  const newerFile: OpencodePluginState = { headerVersion: "0.5.38", mtimeMs: new Date(2026, 9, 15, 12, 30, 0).getTime(), templateCurrent: true };
+  const checks = connectorSkewChecks(n, { installed: "0.5.38", inspect, plugin: newerFile });
+  const row = checks.find(c => c.label.includes("older plugin module"));
+  assert.ok(row, "the plugin module is named although every connector is current");
+  assert.equal(row!.level, "warn");
+  assert.match(row!.label, /^opencode: session ses_tab \(axiom-dev\) runs an older plugin module than the installed 0\.5\.38$/);
+  assert.match(row!.fix!, /^its mbx connector switches in place and needs no restart; the plugin does not: reopen the tab to load the plugin file written since it started$/);
+  assert.ok(checks.some(c => c.level === "ok" && /none behind 0\.5\.38/.test(c.label)), "the connector row still reports the connectors as current");
+  const staleTemplate: OpencodePluginState = { headerVersion: "0.5.36", mtimeMs: 1, templateCurrent: false };
+  assert.match(connectorSkewChecks(n, { installed: "0.5.38", inspect, plugin: staleTemplate }).find(c => c.label.includes("older plugin module"))!.fix!,
+    /the plugin does not: run `agentmbx setup --only opencode`, then reopen the tab$/);
+  assert.equal(connectorSkewChecks(n, { installed: "0.5.38", inspect, plugin: CURRENT_PLUGIN }).some(c => c.label.includes("older plugin module")), false,
+    "a current plugin file adds no row");
+});
+
+test("T669: a behind connector and a stale plugin make one row, not two", (t) => {
+  const { n, connector, inspect } = fixture(t);
+  connector(802, "0.5.36", { agent: "axiom-dev", cli: "opencode", session: "ses_tab", servePid: 9003, serveStart: "Thu Oct 15 12:00:00 2026" });
+  const newerFile: OpencodePluginState = { headerVersion: "0.5.38", mtimeMs: new Date(2026, 9, 15, 12, 30, 0).getTime(), templateCurrent: true };
+  const rows = connectorSkewChecks(n, { installed: "0.5.38", inspect, plugin: newerFile }).filter(c => c.label.includes("ses_tab"));
+  assert.equal(rows.length, 1, "one row per session");
+  assert.match(rows[0]!.fix!, /next mbx tool call switches it to the installed build in place/);
+  assert.match(rows[0]!.fix!, /for its OpenCode plugin, reopen the tab to load the plugin file written since it started$/);
+});
+
+test("T669: a stale plugin with a current connector gets one note naming the reload step, once per plugin file", (t) => {
+  const { n } = wakeable(t, version()); // the connector is current
+  const s = { agent: "worker", cli: "opencode", session_id: SESSION, pid_start: "Thu Oct 15 12:00:00 2026" };
+  const plugin: OpencodePluginState = { headerVersion: "0.5.38", mtimeMs: new Date(2026, 9, 15, 12, 30, 0).getTime(), templateCurrent: true };
+  const note = wakeSkewNote(n, s, { plugin });
+  assert.ok(note, "a current connector does not suppress the plugin note");
+  assert.equal(note!.connector, null);
+  assert.equal(note!.plugin, `0.5.38@${plugin.mtimeMs!}`);
+  assert.match(note!.text, new RegExp(`^\\[mbx\\] AgentMBX ${version().replace(/\./g, "\\.")} is installed; this session's OpenCode plugin still runs the code its serve loaded at start\\.`));
+  assert.match(note!.text, /The mbx connector switches in place, the plugin does not: reopen the tab to load the plugin file written since it started\.$/);
+  markSkewNoted(n, note!, "msg_one");
+  assert.equal(wakeSkewNote(n, s, { plugin }), null, "never twice for the same plugin file");
+  assert.ok(n.store.get(pluginSkewNoteKey(SESSION, plugin))!.includes("msg_one"));
+  assert.ok(wakeSkewNote(n, s, { plugin: { ...plugin, mtimeMs: plugin.mtimeMs! + 1000 } }), "a rewritten plugin file is a new note");
+  assert.equal(wakeSkewNote(n, { ...s, pid_start: "Thu Oct 15 12:45:00 2026" }, { plugin }), null, "a serve that started after the file needs nothing");
+  assert.equal(wakeSkewNote(n, { ...s, cli: "claude" }, { plugin }), null, "only OpenCode");
+});
+
+test("T669: a stale plugin with a current connector rides the next admitted wake, once", async (t) => {
+  const { n, wakeOnce } = wakeable(t, version());
+  skewSeams.plugin = () => STALE_FILE; // the serve loaded an older file than the one on disk
+  const first = await wakeOnce("plugin note");
+  assert.ok(first, "a real wake was offered");
+  assert.match(first!, /\[mbx\] 1 new message\(s\) for worker/);
+  assert.match(first!, /OpenCode plugin still runs the code its serve loaded at start/);
+  assert.match(first!.trimEnd(), /reopen the tab to load the plugin file written since it started\.$/);
+  assert.match(n.store.get(pluginSkewNoteKey(SESSION, STALE_FILE))!, /"receipt":"msg_/);
+  assert.equal(noted(n).c, 1, "one note");
+  n.store.db.prepare("DELETE FROM wakes").run();
+  const second = await wakeOnce("second");
+  assert.ok(second, "the next mail still wakes");
+  assert.equal(second!.includes("plugin does not"), false, "the note is not repeated");
+  assert.equal(noted(n).c, 1);
+});
+
+test("T669: a behind connector and a stale plugin ride one wake as a single note", async (t) => {
+  const { n, wakeOnce } = wakeable(t, "0.0.1");
+  skewSeams.plugin = () => STALE_FILE;
+  const text = await wakeOnce("both stale");
+  assert.match(text!, /still runs 0\.0\.1/);
+  assert.match(text!, /The OpenCode plugin is not switched that way: reopen the tab to load the plugin file written since it started\.$/);
+  assert.match(n.store.get(skewNoteKey(SESSION, "0.0.1", version()))!, /"receipt":"msg_/);
+  assert.equal(n.store.get(pluginSkewNoteKey(SESSION, STALE_FILE)), undefined, "the plugin note is not sent as a second note");
+  assert.equal(noted(n).c, 1);
 });
