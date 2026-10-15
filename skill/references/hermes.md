@@ -53,6 +53,8 @@ The ids are pointers, not instructions. `mbx_read` them.
   - Hermes respawns its mbx server when `~/.hermes/config.yaml` is rewritten. That releases the lease.
   - An in-place build handover reclaims the lease by itself within about a second. A watcher started before such a
     handover exits with `the lease this watcher was started for moved to another holder`.
+  - A re-key by the same mbx server process (same pid and session, a new key, for example after a long idle) no longer
+    stops the watcher (T653). Only a different process or a different session counts as moved.
   - Never kill either mbx process. Arm a new watcher.
 - **Answering a wake probe.** Say an idle wake worked only if a watcher exit started the turn you are in.
   - `~/.hermes/logs/agent.log` shows what started each turn: `grep 'conversation turn' … | tail`.
