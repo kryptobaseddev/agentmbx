@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **The Claude plugin's under-prompt mbx line clears when the inbox empties (T658).** The 5 s indicator timer called `$.ui.status` only when there was something to show, and Claude Code keeps a status line until it is changed, so "⚠ agentmbx: mbx: 1↑ 1↺" stayed after the mail was handled. The timer now sets the line on every tick and clears it with `$.ui.status(undefined)` when nothing is unread or the daemon is unreachable. The line also follows the T650 split: new mail is the `N↑` headline and read-but-unacked mail is its own `M read` segment (`mbx: 1↑ 2 read 1↺`); a daemon from before T650 renders as before.
+
 ## 0.5.36 (2026-10-14)
 
 - **The current mailbox holder can restore its wake endpoint (T648).** A still-running former MCP transport no longer blocks a newer lease generation for that same mailbox from publishing its control endpoint. Codex hook resume and thread metadata share one state/key, and a repeated claim repairs a stale same-process endpoint. Live foreign endpoints from the same generation or another mailbox stay protected; co-using servers never publish for the holder. CLI claim, release and signed owner takeover keep reaching the current endpoint.
