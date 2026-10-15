@@ -13,6 +13,7 @@ import { policyBrief } from "./policy.js";
 import { ulid } from "./crypto.js";
 import { opencodeHostOf } from "./opencode-provider.js";
 import { listOpencodeWakeWaiters, pushOpencodeWake } from "./opencode-wake-queue.js";
+import { pollerWakeTargets } from "./opencode-poller.js";
 import { leadAgentOf, projectLabel, projectMailboxBySlot } from "./project-mailbox.js";
 import { isSlotName } from "./project-slot.js";
 const run = promisify(execFile);
@@ -509,11 +510,14 @@ export async function dispatchWakes(node, now = Date.now()) {
         });
         // A live exact session of a live lease whose authority was not captured: retry it, never strand its mail (T646).
         const lease = node.store.db.prepare("SELECT cli FROM identity_leases WHERE name=? AND released_at IS NULL").get(agent);
+        // T659: an idle OpenCode session's MCP is evicted about hourly, which releases its lease; with no lease there is no
+        // captureWakeIdentity, but the serve's plugin is still polling. Only when no lease-based holder exists.
+        const pollers = held.length ? [] : pollerWakeTargets(node, agent, bound);
         const unverified = bound.filter(s => !s.session_id.startsWith("mcp-") && !held.some(g => g.session === s)
             && s.cli === lease?.cli && !!s.pid && node.sameSession(s.pid, s));
-        if (!unverified.length)
+        if (!unverified.length || pollers.length)
             node.store.db.prepare("DELETE FROM kv WHERE k=?").run(`wake-capture-failed:${agent}`);
-        const sessions = held.filter(g => !g.session.session_id.startsWith("mcp-"));
+        const sessions = [...held, ...pollers].filter(g => !g.session.session_id.startsWith("mcp-"));
         // Only the current leased channel may suppress daemon delivery.
         if (held.some(g => g.session.channel))
             continue;
