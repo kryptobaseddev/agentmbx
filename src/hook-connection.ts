@@ -67,10 +67,17 @@ export function hookDisconnectedNote(node: MbxNode, cli: string, session: string
         records.push({ pid: record.pid, start: record.start, parentStart: typeof row?.pid_start === "string" ? row.pid_start : "" });
     } catch { /* malformed records cannot establish a live connection */ }
   }
+  // T655: an OpenCode serve runs session-start before its mbx server has published anything, and the plugin shows that
+  // note at the first tool result. A session this serve never bound, with no remembered identity and no connector record of
+  // this provider at all, has not connected yet: that is not a lost connector. (Other harnesses start their server before
+  // their hooks, so there a never-seen connector keeps the T503 guidance.)
+  if (cli === "opencode" && !row && !name && !records.length) return null;
   const evidence = inspectLeaseProcesses([providerPid, ...records.map(r => r.pid)]);
   const parent = evidence.get(providerPid) ?? UNKNOWN_PROCESS;
   if (records.some(r => (!r.parentStart || !processGone(r.parentStart, parent))
     && !processGone(r.start, evidence.get(r.pid) ?? UNKNOWN_PROCESS))) return null;
   const identity = name ?? exact.find(d => d.agent)?.agent;
-  return `[mbx] mbx disconnected: reconnect (e.g. /mcp in Claude Code)${identity ? `; this session no longer holds ${identity}@${node.host}` : ""}.`;
+  // T655: OpenCode's own control: /mcps opens its MCP servers dialog, where selecting a server connects it again.
+  const advice = cli === "opencode" ? "reconnect it with /mcps in OpenCode (select mbx)" : "reconnect (e.g. /mcp in Claude Code)";
+  return `[mbx] mbx disconnected: ${advice}${identity ? `; this session no longer holds ${identity}@${node.host}` : ""}.`;
 }

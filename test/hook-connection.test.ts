@@ -96,8 +96,10 @@ for (const cli of ["claude", "codex", "kimi", "opencode", "hermes", "grok"]) tes
     if (cli === "hermes" && event === "session-start") { assert.equal(result.stdout, ""); continue; }
     const context = cli === "kimi" || cli === "opencode" ? result.stdout
       : cli === "hermes" ? JSON.parse(result.stdout).context : JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
-    const lines = context.split("\n").filter((line: string) => line.includes(MESSAGE));
-    assert.deepEqual(lines, [`[mbx] ${MESSAGE}; this session no longer holds builder@alpha.`]);
+    // T655: OpenCode names its own reconnect control; every other harness keeps the Claude example.
+    const message = cli === "opencode" ? "mbx disconnected: reconnect it with /mcps in OpenCode (select mbx)" : MESSAGE;
+    const lines = context.split("\n").filter((line: string) => line.includes(message));
+    assert.deepEqual(lines, [`[mbx] ${message}; this session no longer holds builder@alpha.`]);
     assert.doesNotMatch(context, /unrelated/);
   }
   for (const event of ["post-tool", "stop"]) {
@@ -262,4 +264,46 @@ test("T614 a Codex thread resumes independently of sibling rows and controls on 
   assert.equal(hookResumingNote(f.node, "codex", sibling, process.pid), null, "the connected sibling stays connected");
   assert.equal(hookResumingNote(f.node, "codex", "99999999-9999-4999-8999-999999999999", process.pid), null,
     "a new thread cannot borrow the remembered name");
+});
+
+// ---- T655: an OpenCode serve runs session-start before its mbx server connects ----
+
+test("T655 a fresh OpenCode session that never connected is not reported disconnected", t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-t655-")), node = new MbxNode(home, { host: "alpha" });
+  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  assert.equal(hookDisconnectedNote(node, "opencode", "ses_fresh", process.pid), null, "no binding, no remembered name, no connector record yet");
+  // the other harnesses keep the T503 guidance for a connector they never saw: their servers start before their hooks
+  assert.equal(hookDisconnectedNote(node, "grok", "ses_fresh", process.pid), `[mbx] ${MESSAGE}.`);
+  assert.equal(hookDisconnectedNote(node, "hermes", "ses_fresh", process.pid), `[mbx] ${MESSAGE}.`);
+  // a remembered identity is not a fresh session: losing it is still reported, with OpenCode's own control
+  node.store.set("name:opencode:ses_fresh", "builder");
+  assert.equal(hookDisconnectedNote(node, "opencode", "ses_fresh", process.pid),
+    "[mbx] mbx disconnected: reconnect it with /mcps in OpenCode (select mbx); this session no longer holds builder@alpha.");
+});
+
+test("T655 an OpenCode session that lost its connector is told to reconnect with /mcps, never Claude's /mcp", t => {
+  const f = fixture(t, "opencode");
+  assert.equal(f.note(), null, "connected");
+  f.remove();
+  assert.equal(f.note(), "[mbx] mbx disconnected: reconnect it with /mcps in OpenCode (select mbx); this session no longer holds builder@alpha.");
+  assert.doesNotMatch(f.note()!, /Claude Code/);
+});
+
+test("T655 a new OpenCode session on a serve whose connector died is still disconnected", t => {
+  const f = fixture(t, "opencode");
+  assert.equal(hookDisconnectedNote(f.node, "opencode", "ses_new", process.pid), null, "the serve's live connector can still initialize it");
+  publishIdentityControl(f.node.store, { ...f.descriptor, mcp_pid: 2147483647 });
+  assert.equal(hookDisconnectedNote(f.node, "opencode", "ses_new", process.pid), "[mbx] mbx disconnected: reconnect it with /mcps in OpenCode (select mbx).");
+});
+
+test("T655 the real session-start hook of a fresh OpenCode session says nothing about a disconnect", t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-t655-hook-")), node = new MbxNode(home, { host: "alpha" });
+  t.after(() => { node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const out = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", "session-start", "--cli", "opencode"], {
+    input: JSON.stringify({ session_id: "ses_fresh_start", cwd: process.cwd() }), encoding: "utf8", timeout: 10_000,
+    env: { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1", MBX_AGENT: "unrelated" },
+  });
+  assert.equal(out.status, 0, out.stderr);
+  assert.match(out.stdout, /no mailbox identity yet/, "the unbound guidance still runs");
+  assert.doesNotMatch(out.stdout, /disconnected|\/mcp in Claude Code/);
 });
