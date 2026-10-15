@@ -4,7 +4,7 @@ import { constants as osConstants, homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { execFileSync, spawn } from "node:child_process";
-import { canonical, fingerprint, generateKeyPair, ulid, type KeyPair } from "./crypto.ts";
+import { canonical, fingerprint, generateKeyPair, ulid, verifyData, type KeyPair } from "./crypto.ts";
 import { buildGrant, CAPS, grantPayload, NAME_RE, type Envelope, type Grant } from "./envelope.ts";
 import { advertise, browse, lanIPv4 } from "./discovery.ts";
 import { announceRotations, flushOutbox, flushReceipts, addrSignature, healPeerAddr, healStuckPeers, notifyUnpair, sendPresence, pairJoin, pairWith, pullPolicies, pushPolicy, refreshDirectory, refreshPeerEncKeys, startServer, advertisedAddr } from "./http.ts";
@@ -29,11 +29,11 @@ import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./rec
 import { escalateUnheldMail, retirePhantoms, returnNeverClaimed } from "./stranded.ts";
 import { activeLead, leadSummary, makeLead, makeLeadRevocation, projectLeadLine, projectLeadView, revokeLead, storeLead } from "./project-ledger.ts";
 import { leadHistory } from "./lead-record.ts";
-import { DEFAULT_PORT, defaultHome, didWarning, formatFor, MbxNode, summaryLine, trustLabel } from "./node.ts";
+import { DEFAULT_PORT, defaultHome, didWarning, formatFor, messageReadView, MbxNode, summaryLine, trustLabel } from "./node.ts";
 import { sessionStartLeadAudit } from "./lead-grants.ts";
 import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, parsePolicyTtl, policyUnexpired, policySummary,
   type Level, type PolicyClass, type PolicyRecord, type Revocation } from "./policy.ts";
-import { authHelperPath, createKeychainOwner, createOwnerKey, defaultOwnerBackend, ownerInfo, ownerSignCanonical, readPassphraseFromTTY, type OwnerBackend } from "./owner.ts";
+import { authHelperPath, createKeychainOwner, createOwnerKey, defaultOwnerBackend, ownerInfo, ownerSignCanonical, sessionClearanceSummary, readPassphraseFromTTY, type OwnerBackend } from "./owner.ts";
 import { periodicUpdateCheck, updateAvailable, updateCommand } from "./update.ts";
 import { installKind, version } from "./version.ts";
 import { installService, serviceLabel, uninstallService } from "./service.ts";
@@ -53,7 +53,7 @@ import { configuredRetention, prune, retentionDays } from "./retention.ts";
 import { exportIdentity, identityInitialized, importIdentity } from "./identity-backup.ts";
 import { formatUnboundStart, listIdentityStatus } from "./identity-status.ts";
 import { REBINDING_CLIS, withCliIdentity, withHookIdentity, type CliIdentitySelection } from "./cli-identity.ts";
-import { declaredOriginWarning, readSessionTaint, refuseAgentOrigin, taintSendWarning, type SessionTaint } from "./session-taint.ts";
+import { acceptSessionClearance, buildSessionClearance, declaredOriginWarning, readSessionTaint, refuseAgentOrigin, taintSendWarning, type SessionTaint } from "./session-taint.ts";
 import { runProbe, storeProbeIO } from "./probe.ts";
 import { leadGrantsSummary, leadGrantsView, makeLeadGrants, storeLeadGrants, withLeadGrants } from "./lead-grants.ts";
 import { resolveProject } from "./project-key.ts";
@@ -84,6 +84,8 @@ Messages
   agentmbx inbox --as <agent> [--all] [--json] [--needs-reply] [--from <agent>]      agentmbx read <id> --as <agent>      agentmbx ack <id>… | --all | --thread <id>  --as <agent> [--note "…"]
   agentmbx whoami --as <agent> [--role r] [--description "…"]    inspect/describe the identity leased to this caller
   agentmbx thread <id>        agentmbx search "<words>"   agentmbx agents   agentmbx status
+  agentmbx read|thread <id> --mode metadata|quarantine [--cli <provider> --session <id>]
+                  metadata excludes sender text; quarantine returns a labelled untrusted derived summary
     Mailbox reads, acknowledgements and replies require this caller’s current MCP lease.
     Use --cli <provider> --session <id> when multiple sessions share the caller. --as only selects the held name.
     New sends without a lease are marked unverified-sender and grant no delegated authority.
@@ -140,6 +142,9 @@ Owner (each signature needs you: a Touch ID / password prompt on macOS with Agen
   agentmbx owner add-device <paired-host>        certify a paired machine as yours: it then takes the policies you sign
   agentmbx owner grant <agent> [--session <fingerprint>] [--caps ${CAPS.join(",")}] [--ttl 12h]
   agentmbx owner revoke <grant-id>
+  agentmbx owner clear|attest --cli <provider> --session <id> --project <dir> --reason "…" [--ttl 15m]
+                  sign the current session-wide exposure snapshot, at most 1 hour; no future roots or new action class
+  agentmbx owner revoke-clearance <id>             revoke one signed session clearance
   agentmbx owner send --to <agents> --subject "…" -m "…" [--kind task] [--needs-reply]   one message signed by you (OWNER)
 
 Policy (what agents may do for each other; each change needs you, like the owner commands)
@@ -341,7 +346,7 @@ async function run(argv: string[]) {
     "body-file": { type: "string" }, kind: { type: "string" }, origin: { type: "string" }, schema: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" }, "new-mailbox": { type: "boolean" },
     ref: { type: "string", multiple: true }, all: { type: "boolean" }, json: { type: "boolean" }, note: { type: "string" },
     mailbox: { type: "string" }, limit: { type: "string" }, host: { type: "string" }, port: { type: "string" }, cli: { type: "string" }, session: { type: "string" }, caps: { type: "string" },
-    ttl: { type: "string" }, bind: { type: "string" }, role: { type: "string" }, description: { type: "string" }, thread: { type: "string" }, from: { type: "string" }, check: { type: "boolean" }, yes: { type: "boolean", short: "y" },
+    ttl: { type: "string" }, mode: { type: "string" }, reason: { type: "string" }, bind: { type: "string" }, role: { type: "string" }, description: { type: "string" }, thread: { type: "string" }, from: { type: "string" }, check: { type: "boolean" }, yes: { type: "boolean", short: "y" },
     cursor: { type: "string" }, "max-bytes": { type: "string" }, "scan-limit": { type: "string" }, "project-host": { type: "string" }, topic: { type: "string" },
     compare: { type: "string" }, "dry-run": { type: "boolean" }, uninstall: { type: "boolean" }, only: { type: "string" },
     backend: { type: "string" }, "no-owner": { type: "boolean" }, did: { type: "string" }, classes: { type: "string" },
@@ -705,10 +710,12 @@ async function run(argv: string[]) {
   if (cmd === "watch") return watch(node, { as: str("as") ?? (process.env.MBX_AGENT || undefined), cli: str("cli"), session: str("session") });
 
   if (["inbox", "read", "ack", "thread", "search"].includes(cmd)) {
+    const mode = str("mode") ?? "full";
+    if (!["full", "metadata", "quarantine"].includes(mode) || (str("mode") && !["read", "thread"].includes(cmd))) die("--mode full|metadata|quarantine is for read/thread only");
     if ((cmd === "read" || cmd === "thread") && !pos[0]) die(`${cmd} <id>`);
     if (cmd === "ack" && !pos.length && !o.all && !str("thread")) die("ack <id>… | --all | --thread <id>");
     return withCliIdentity(node, { as: str("as") ?? (process.env.MBX_AGENT || undefined), cli: str("cli"), session: str("session"),
-      readOnly: ["inbox", "thread", "search"].includes(cmd) }, me => {
+      readOnly: ["inbox", "search"].includes(cmd) }, (me, descriptor) => {
       switch (cmd) {
         case "inbox": {
           const known = node.agents().filter((a) => a.host === node.host).map((a) => a.name);
@@ -721,7 +728,12 @@ async function run(argv: string[]) {
               needs_reply: e.needs_reply, refs: e.refs, state: m.state, trust: trustLabel(m) }; }), null, 2));
           return rows.forEach((m) => console.log(summaryLine(m)));
         }
-        case "read": { return console.log(formatFor(node, node.read(pos[0] ?? die("read <id>"), me), me)); }
+        case "read": {
+          const row = node.read(pos[0] ?? die("read <id>"), me), readMode = mode as "full" | "metadata" | "quarantine";
+          const view = readMode === "full" ? null : messageReadView(node, row, me, readMode);
+          node.observeRead(row, descriptor.cli, descriptor.session_id, readMode);
+          return console.log(view ? JSON.stringify(view) : formatFor(node, row, me));
+        }
         case "ack": {
           let ids = pos;
           if (o.all) ids = node.inbox(me, { limit: 5000 }).map((m) => m.id);
@@ -739,7 +751,11 @@ async function run(argv: string[]) {
         }
         case "thread": {
           const m = node.message(pos[0] ?? die("thread <id>"), me);
-          return node.thread(m ? m.thread : pos[0], me).forEach((r) => console.log(formatFor(node, r, me) + "\n"));
+          return node.thread(m ? m.thread : pos[0], me).forEach((r) => {
+            const readMode = mode as "full" | "metadata" | "quarantine", view = readMode === "full" ? null : messageReadView(node, r, me, readMode);
+            node.observeRead(r, descriptor.cli, descriptor.session_id, readMode);
+            console.log(view ? JSON.stringify(view) : formatFor(node, r, me) + "\n");
+          });
         }
         case "search": return node.search(pos.join(" "), 20, me).forEach((m) => console.log(summaryLine(m)));
       }
@@ -1264,6 +1280,41 @@ async function lead(node: MbxNode, pos: string[], str: (k: string) => string | u
 
 async function owner(node: MbxNode, pos: string[], str: (k: string) => string | undefined, o: Record<string, unknown>) {
   const sub = pos[0];
+  if (sub === "clear" || sub === "attest") {
+    const cli = str("cli") ?? die("owner clear/attest requires --cli"), session_id = str("session") ?? die("owner clear/attest requires --session");
+    const projects = o.project as string[] | undefined;
+    if (!projects || projects.length !== 1) return die("owner clear/attest requires exactly one --project");
+    const session = node.store.db.prepare("SELECT cwd FROM sessions WHERE cli=? AND session_id=?").get(cli, session_id) as { cwd: string | null } | undefined;
+    const project_key = resolveProject(projects[0]).key;
+    if (!session?.cwd || resolveProject(session.cwd).key !== project_key) die("session is not bound to that local project");
+    const ownerPub = node.ownerPub ?? die("no owner key on this machine: run 'agentmbx owner init'");
+    const ttl = str("ttl") ?? "15m", match = /^(\d+)(m|h)$/.exec(ttl) ?? die("clearance --ttl must be minutes/hours, at most 1h");
+    const scope = { host: node.host, cli, session_id, project_key };
+    const rec = buildSessionClearance(node.store, scope, ownerPub, sub, str("reason") ?? die("--reason is required"), Number(match[1]) * (match[2] === "h" ? 3_600_000 : 60_000));
+    const signed = { rec, sig: (await ownerSignCanonical(node.home, canonical(rec), sessionClearanceSummary(rec))).sig };
+    const accepted = node.store.tx(() => {
+      const after = node.store.db.prepare("SELECT cwd FROM sessions WHERE cli=? AND session_id=?").get(cli, session_id) as { cwd: string | null } | undefined;
+      if (!after?.cwd || resolveProject(after.cwd).key !== project_key) {
+        const reason = "session project changed while signing; review the current session again";
+        node.store.audit("session_clearance.apply_denied", { scope, id: rec.id, reason });
+        return { ok: false, reason };
+      }
+      return acceptSessionClearance(node.store, signed, scope);
+    });
+    if (!accepted.ok) die(accepted.reason);
+    return console.log(`recorded ${rec.effect} ${rec.id}, expires ${rec.exp}; current snapshot only. Automatic approval remains conservative until the fresh v2 contract is activated.`);
+  }
+  if (sub === "revoke-clearance") {
+    const id = pos[1] ?? die("owner revoke-clearance <id>"), raw = node.store.get(`session-clearance:${id}`);
+    if (!raw || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(id)) return die("no session clearance with that id");
+    const ownerPub = node.ownerPub ?? die("no owner key on this machine"), signed = JSON.parse(raw);
+    if (signed.rec?.v !== 2 || signed.rec.type !== "session-clearance" || signed.rec.id !== id
+      || signed.rec.owner_fp !== fingerprint(ownerPub) || !verifyData(ownerPub, canonical(signed.rec), signed.sig)) die("clearance is not signed by this host's owner");
+    const rec = { ...makeRevocation(id, ownerPub), kind: "session-clearance" };
+    const sig = (await ownerSignCanonical(node.home, canonical(rec), `Revoke session clearance ${id}`)).sig;
+    const failed = issueSigned(node.store.db, { rec, sig }, node.host); if (failed) die(failed);
+    return console.log(`revoked session clearance ${id}`);
+  }
   if (sub === "show") {
     const info = ownerInfo(node.home);
     return console.log(info ? `owner key ${fingerprint(info.public_key)} (${info.backend === "keychain" ? "macOS Keychain, Touch ID" : "passphrase file"}: ${info.path})` : "no owner key on this host");
@@ -1328,7 +1379,7 @@ async function owner(node: MbxNode, pos: string[], str: (k: string) => string | 
     node.store.audit("owner.revoke", { id, record: rec, owner_sig: sig });
     return console.log(`revoked ${id} on this host (grants also expire on their own; messages already sent keep their original label)`);
   }
-  die("owner init | show | grant <agent> | revoke <id> | send --to …");
+  die("owner init | show | grant <agent> | revoke <id> | clear|attest --cli <provider> --session <id> --project <dir> --reason <text> [--ttl 15m] | revoke-clearance <id> | send --to …");
 }
 
 // ---- policy ----------------------------------------------------------------------------------

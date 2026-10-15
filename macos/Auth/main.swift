@@ -112,6 +112,7 @@ func list(_ v: Any?, _ empty: String = "(none)") -> String {
 let maxPromptText = 900
 func summarize(_ o: [String: Any]) throws -> String {
   let text = try summarizeRaw(o)
+  if o["type"] as? String == "session-clearance", text.count > maxPromptText { throw Refusal(reason: "the complete current exposure snapshot exceeds the 900-character owner preview limit; use ordinary provider approval until a larger review UI is available") }
   if text.count > maxPromptText { throw Refusal(reason: "too much to show in one approval (\(text.count) characters); split it into smaller requests") }
   return text
 }
@@ -155,6 +156,44 @@ func claimedOwner(_ o: [String: Any]) -> String? {
 /** What the human is asked to approve. Throws Refusal for anything this helper does not understand. */
 func summarizeRaw(_ o: [String: Any]) throws -> String {
   let type = o["type"] as? String
+  if type == "session-clearance" {
+    guard Set(o.keys) == Set(["v", "type", "id", "owner_fp", "project_key", "exposure", "effect", "reason", "iat", "exp"]),
+      o["v"] as? Int == 2, let id = o["id"] as? String, let owner = o["owner_fp"] as? String,
+      let project = o["project_key"] as? String, let effect = o["effect"] as? String, ["clear", "attest"].contains(effect),
+      let reason = o["reason"] as? String, let snapshot = o["exposure"] as? [String: Any],
+      Set(snapshot.keys) == Set(["v", "host", "cli", "session_id", "generation", "unknown", "roots"]),
+      snapshot["v"] as? Int == 2, snapshot["unknown"] as? Bool == false,
+      let host = snapshot["host"] as? String, let cli = snapshot["cli"] as? String, let session = snapshot["session_id"] as? String,
+      let generation = snapshot["generation"] as? Int, generation > 0,
+      let roots = snapshot["roots"] as? [[String: Any]], !roots.isEmpty, roots.count <= 64,
+      let issued = parseDate(o["iat"] as? String), let expires = parseDate(o["exp"] as? String),
+      expires > issued, expires.timeIntervalSince(issued) <= 3600 else { throw Refusal(reason: "incomplete or invalid session clearance") }
+    let strings = [id, owner, project, host, cli, session, reason]
+    guard strings.allSatisfy({ !$0.isEmpty && $0 != "*" && clean($0, Int.max) == $0 }),
+      id.range(of: "^[0-9A-HJKMNP-TV-Z]{26}$", options: .regularExpression) != nil else { throw Refusal(reason: "ambiguous session clearance") }
+    var seen = Set<String>(), descriptions: [String] = []
+    for root in roots {
+      guard Set(root.keys) == Set(["source", "first_raw_at", "raw_at", "derived_at", "last_message_id", "last_read_at"]),
+        let source = root["source"] as? [String: Any], Set(source.keys) == Set(["message_id", "from", "content_sha256", "since"]),
+        let rootId = source["message_id"] as? String, let digest = source["content_sha256"] as? String,
+        let since = source["since"] as? String, let sourceDate = parseDate(since), sourceDate <= issued,
+        let sender = source["from"] as? String, !sender.isEmpty, clean(sender, Int.max) == sender,
+        let lastId = root["last_message_id"] as? String, let lastAt = root["last_read_at"] as? Double,
+        lastAt.isFinite, lastAt.rounded() == lastAt, lastAt >= (sourceDate.timeIntervalSince1970 * 1000).rounded(), lastAt <= (issued.timeIntervalSince1970 * 1000).rounded(),
+        rootId.range(of: "^[0-9A-HJKMNP-TV-Z]{26}$", options: .regularExpression) != nil,
+        lastId.range(of: "^[0-9A-HJKMNP-TV-Z]{26}$", options: .regularExpression) != nil,
+        digest.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil, seen.insert(rootId).inserted
+      else { throw Refusal(reason: "invalid session clearance root") }
+      let raw = root["raw_at"] as? Double, derived = root["derived_at"] as? Double, first = root["first_raw_at"] as? Double
+      guard (raw != nil || derived != nil), (raw == nil) == (first == nil),
+        ["raw_at", "derived_at", "first_raw_at"].allSatisfy({ root[$0] is NSNull || root[$0] is NSNumber }),
+        [raw, derived, first].compactMap({ $0 }).allSatisfy({ $0.isFinite && $0.rounded() == $0 && $0 >= (sourceDate.timeIntervalSince1970 * 1000).rounded() && $0 <= lastAt }),
+        first == nil || first! <= raw! else { throw Refusal(reason: "invalid session clearance disclosure time") }
+      descriptions.append("\(rootId) sha256 \(digest) since \(since)")
+    }
+    // shortcut: larger snapshots need a dedicated review UI; the existing 900-character refusal stays in force.
+    return "\(effect == "clear" ? "Clear" : "Attest") ALL \(roots.count) current exposure roots for \(cli) session \(session) on \(host), project \(project), owner \(owner), generation \(generation). Roots: \(descriptions.joined(separator: "; ")). Expires \(o["exp"] as! String) (at most 1 hour). Reason: \(reason). Session-wide across its tasks; this snapshot only, never future exposures. No action class is granted; history is retained."
+  }
   if type == "identity-takeover" {
     guard o["v"] as? Int == 1, let previous = o["previous"] as? [String: Any],
       let name = o["name"] as? String, let host = o["host"] as? String, let hostKey = o["host_fp"] as? String,
@@ -194,7 +233,7 @@ func summarizeRaw(_ o: [String: Any]) throws -> String {
     var ids: [String] = []
     for k in ["revokes", "ids", "policy_ids", "policy_id", "policy", "grant_ids", "grant_id", "grant", "target"] { ids += strs(o[k]) }
     guard !ids.isEmpty else { throw Refusal(reason: "revocation names nothing to revoke") }
-    let what = o["kind"] as? String == "grant" || o.keys.contains { $0.hasPrefix("grant") } ? "grant" : "policy"
+    let what = o["kind"] as? String == "grant" || o.keys.contains { $0.hasPrefix("grant") } ? "grant" : o["kind"] as? String == "session-clearance" ? "session clearance" : "policy"
     return "Revoke \(what) \(list(ids))"
   }
   if type == "device" {

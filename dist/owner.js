@@ -205,6 +205,13 @@ export function readPassphraseFromTTY(prompt) {
     }
 }
 export const ownerFingerprint = (home) => { const p = ownerPublicKey(home); return p ? fingerprint(p) : null; };
+/** Plain signing preview of the exact current session snapshot; no body, filenames or future-root wildcard. */
+export function sessionClearanceSummary(r) {
+    return `${r.effect === "clear" ? "Clear" : "Attest"} current exposures for ${r.exposure.cli} session ${r.exposure.session_id} on ${r.exposure.host}\n`
+        + `Project ${r.project_key}; owner ${r.owner_fp}; generation ${r.exposure.generation}\n`
+        + `${r.exposure.roots.length} current roots:\n${r.exposure.roots.map(x => `  ${x.source.message_id} sha256 ${x.source.content_sha256} since ${x.source.since}; raw ${x.raw_at === null ? "none" : new Date(x.raw_at).toISOString()}; derived ${x.derived_at === null ? "none" : new Date(x.derived_at).toISOString()}`).join("\n")}\n`
+        + `Reason: ${r.reason}\nExpires ${r.exp}. Session-wide across this session's tasks; covers only this snapshot, never future exposures. No missing action class is granted and historical messages are not changed.`;
+}
 /**
  * The one way to get an owner signature: sign `canonicalJson` (the exact bytes receivers verify) after the human
  * approves. The file backend asks for the passphrase on /dev/tty; the macOS keychain backend shows a Touch ID / password
