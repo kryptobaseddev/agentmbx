@@ -35,7 +35,7 @@ function evicted(t: { after: (fn: () => void) => unknown }, argv: string[] = STA
 }
 
 const delivery = (n: MbxNode, id: string) => n.store.db.prepare("SELECT state,note FROM deliveries WHERE msg_id=? AND agent='worker'").get(id) as { state: string; note: string | null };
-const attempts = (n: MbxNode) => n.store.db.prepare("SELECT count(*) n FROM audit WHERE event='wake.attempt'").get<{ n: number }>()!.n;
+const attempts = (n: MbxNode) => (n.store.db.prepare("SELECT count(*) n FROM audit WHERE event='wake.attempt'").get() as { n: number }).n;
 const pollerTargets = (n: MbxNode) => pollerWakeTargets(n, "worker", n.sessionsFor("worker")).length;
 const releaseLease = (n: MbxNode, agent: string, token: string) => new IdentityLeases(n.store).release(agent, token);
 const stateOf = (n: MbxNode, id: string) => delivery(n, id).state;
@@ -46,6 +46,7 @@ test("T659: an evicted MCP with a live standalone poller is woken, with ids only
   const poll = waitForOpencodeWake(SESSION, process.pid, 2_000);
   const dispatched = dispatchWakes(n);
   const text = await poll;
+  assert.ok(text, "the poller received the wake");
   assert.match(text, /\[mbx\] 1 new message\(s\) for worker/);
   assert.ok(text.includes(sent.envelope.id), "the wake names the ids");
   assert.equal(text.includes("private body"), false, "a wake never carries message content");
