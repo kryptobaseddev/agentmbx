@@ -3,14 +3,21 @@
  *  native `msg_` id from `ctx.session.synthetic`. No slot means nothing was submitted: the shared
  *  service is not called, so it starts no turn and takes no snapshot. */
 
-/** T642: `turnSince` is set when the plugin reported the wake landed behind a turn in progress (delivery "queue" waits for its end). */
-export type OpencodeWakePush = { ok: true; id: string; turnSince: string | null } | { ok: false; handedOff: boolean };
+/** T642: `turnSince` is set when the plugin reported the wake landed behind a turn in progress (delivery "queue" waits for its end).
+ *  T647: `busy` means the plugin declined the offer because its session is mid-turn: nothing was admitted. */
+export type OpencodeWakePush = { ok: true; id: string; turnSince: string | null } | { ok: false; handedOff: boolean; busy?: true };
+
+/** T647: the receipt a plugin posts instead of a `msg_` id when its session is mid-turn. A wake admitted then would sit in
+ *  OpenCode's queue until the turn ends, by which time the agent has often handled that mail already (the post-tool notice
+ *  shows it mid-turn), so the alert arrives stale. Declined, the mail stays delivered and the next pass decides again. */
+export const OPENCODE_WAKE_BUSY = "busy";
 
 interface Slot {
   pid: number;
   offered: boolean;
   settled: boolean;
   turnSince: string | null;
+  busy: boolean;
   deliver: (text: string) => void;
   cancel: () => void;
   accept: (id: string) => void;
@@ -69,6 +76,7 @@ export function waitForOpencodeWake(sessionID: string, pid: number, waitMs = 20_
     offered: false,
     settled: false,
     turnSince: null,
+    busy: false,
     deliver(text) {
       if (slot.offered) return;
       slot.offered = true;
@@ -107,6 +115,7 @@ export async function pushOpencodeWake(sessionID: string, pid: number, text: str
   if (timer) clearTimeout(timer);
   if (slots.get(key) === slot) slots.delete(key);
   slot.dropReceipt();
+  if (slot.busy) return { ok: false, handedOff: false, busy: true }; // declined: the text was not admitted anywhere
   return id.startsWith("msg_") ? { ok: true, id, turnSince: slot.turnSince } : { ok: false, handedOff: true };
 }
 
@@ -114,6 +123,7 @@ export async function pushOpencodeWake(sessionID: string, pid: number, text: str
  *  session was mid-turn when the wake was admitted, since that ISO time; null when idle or not reported (an older plugin). */
 export function completeOpencodeWake(sessionID: string, id: string, turnSince: string | null = null): boolean {
   const slot = [...slots.entries()].find(([key, s]) => sessionOf(key) === sessionID && s.offered && !s.settled)?.[1];
+  if (slot && id === OPENCODE_WAKE_BUSY) { slot.busy = true; slot.accept(id); return true; } // T647
   if (!slot || !id.startsWith("msg_")) return false;
   slot.turnSince = turnSince;
   slot.accept(id);

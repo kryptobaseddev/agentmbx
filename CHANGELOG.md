@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **OpenCode no longer alerts for mail it already handled during a turn (T647).** A wake admitted while an OpenCode session was mid-turn waited in OpenCode's queue (delivery `queue`) until the turn ended, and the agent had often read and acked that mail meanwhile through the post-tool notice, so it got "[mbx] N new message(s)" for mail it had already handled. Nothing in the mailbox reverted, but the alert was stale. The plugin now declines a wake while its session is mid-turn, and the daemon treats that as busy: nothing is admitted, the mail stays delivered, and the usual retry and backoff wake the session after the turn only for mail that is still unhandled. A turn older than 30 minutes is not trusted, so a missed end event cannot hold wakes back. The plugin template changed: run `agentmbx setup --only opencode` and reopen the OpenCode tab to load it. Until then, doctor's connector check reports a running tab's plugin as stale (expected).
+
 ## 0.5.40 (2026-10-15)
 
 - **`agentmbx watch` follows its own session's lease re-key instead of stopping (T653).** After a long idle, an mbx server can release its lease and claim it again with a new key: the same process, birth, CLI and session. Every running watcher then exited with "the lease this watcher was started for moved to another holder", so the session could no longer be woken until it re-armed. The watcher now follows such a re-key, and its record carries the new token so the daemon keeps deferring to it. A lease claimed by another process, or by the same process for a different session, still stops it with the same reason.

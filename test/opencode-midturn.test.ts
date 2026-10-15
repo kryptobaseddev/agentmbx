@@ -1,7 +1,8 @@
 // T642: urgent mail that arrives during a long OpenCode turn must reach the model within the turn. The post-tool notice goes into
 // the tool result (v2 execute.after result.content, v1 output.output), which the model reads with that tool's output; the queue
 // (delivery "queue", held until the turn ends) is only the fallback, and its id no longer repeats when the unread count repeats
-// (a repeated id was silently dropped for the session's lifetime). A wake admitted behind a running turn says so in the receipts.
+// (a repeated id was silently dropped for the session's lifetime). A wake admitted behind a running turn says so in the receipts
+// (T647: a current plugin declines a mid-turn wake instead; the receipt path still covers a plugin that reports turn_since).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -122,8 +123,9 @@ test("AC3: a wake admitted while the session's turn runs is recorded queued-behi
 
   await hooks["tool.execute.after"]({ sessionID: "ses_turn" }, { output: "" }); // a tool call: the turn is running
   assert.equal(await waiting(), true);
+  // T647: mid-turn the plugin declines the wake (it would only queue until the turn ends); the outcome is busy, nothing admitted.
   const busy = await wake("[mbx] 1 new message(s) for worker");
-  assert.equal(busy.outcome?.kind === "admitted" && busy.outcome.receipt.nativeStatus, OPENCODE_QUEUED_BEHIND_TURN);
+  assert.equal(busy.outcome?.kind, "busy", JSON.stringify(busy));
   await hooks.event({ event: { type: "session.idle", properties: { info: { id: "ses_turn" } } } }); // the turn ended
   assert.equal(await waiting(), true);
   const idle = await wake("[mbx] 1 new message(s) for worker again");
