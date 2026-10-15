@@ -814,8 +814,10 @@ export class MbxNode {
     // also has an agent of that name skips its copy exactly (no reliance on its possibly stale directory of this host).
     const localBare = [...new Set(r.targets.filter((t) => !t.host && t.name && t.name !== "owner" && !t.to.includes("@") && !t.to.startsWith("role:") && !t.to.startsWith("task:") && t.to !== "*").map((t) => t.to))];
     if (!prebuilt && localBare.length && r.remote.size) e.meta.local_names = localBare.slice(0, 100);
-    if (owner) e = ownerSign(e, owner.pub, owner.priv);
-    else if (session?.grant) e = attachAuthority(e, session.grant, session.priv);
+    const outsideAuthority = !!provenance && e.meta.origin === "external";
+    if (outsideAuthority && (owner || session?.grant)) r.warnings.push("owner action authority not attached: versioned outside payload or writer fence remains read-only before activation");
+    if (owner && !outsideAuthority) e = ownerSign(e, owner.pub, owner.priv);
+    else if (session?.grant && !outsideAuthority) e = attachAuthority(e, session.grant, session.priv);
     e = signEnvelope(e, this.host, this.key.publicKey, this.key.privateKey);
     const auth = e.authority ? checkAuthority(e, this.ownerPub, this.revoked()) : null;
     this.store.tx(() => {
@@ -887,6 +889,8 @@ export class MbxNode {
       const keys = local || peer ? this.hostKeys(host) : [];
       if (!keys.length || e.from !== m.from_addr || e.sig?.host !== host || !keys.some((k) => verifyEnvelope(e, k)))
         return { ok: false, reason: "sending host signature or current pairing is not verified" };
+      if (e.meta.provenance !== undefined && (e.meta.origin === "external" || readContentProvenance(e, this.provenanceSources(e)).kind !== "agent"))
+        return { ok: false, reason: "v2 outside/unknown payload or writer fence: content is data, no owner action authority before activation" };
       return checkAuthority(e, local ? this.ownerPub : peer?.owner_pubkey ?? null, this.revoked());
     } catch { return { ok: false, reason: "stored owner authority could not be verified" }; }
   }

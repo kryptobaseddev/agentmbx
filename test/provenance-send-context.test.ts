@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonical, fingerprint, generateKeyPair, sha256 } from "../src/crypto.ts";
-import { buildEnvelope, createContentProvenance, EXTERNAL_TAINT_MS, readContentProvenance, signEnvelope,
+import { buildEnvelope, createContentProvenance, EXTERNAL_TAINT_MS, ownerSign, readContentProvenance, signEnvelope,
   type Envelope, type ProvenanceSources } from "../src/envelope.ts";
 import { IdentityLeases, inspectLeaseProcess } from "../src/identity-leases.ts";
 import { MbxNode, formatFor, messageReadView, type SendProvenanceScope } from "../src/node.ts";
@@ -97,7 +97,7 @@ function database(t: { after(fn: () => void): void }) {
     e.meta.provenance = built.record;
     return { ...built, e: signEnvelope(e, "alpha", node.key.publicKey, node.key.privateKey) };
   });
-  return { node, now, scope, input, prepare, leases, lease };
+  return { home, node, now, scope, input, prepare, leases, lease };
 }
 
 test("S3 metadata does not select task inputs; full reads survive relabelled status/new-thread sends", t => {
@@ -238,4 +238,28 @@ test("S3 metadata lineage cannot expose a retained source's malformed sender as 
   f.node.store.insertMessage(signed, "local", "local", null); f.node.store.addDelivery(signed.id, "reader");
   const view = messageReadView(f.node, f.node.read(signed.id, "reader"), "reader", "metadata");
   assert.equal(view.lineage.payload.roots[0].from, null); assert.equal(JSON.stringify(view).includes("FILENAME_MARKER"), false);
+});
+
+test("S3 outside owner claims stay data in full and metadata views; legacy signatures retain their behavior", t => {
+  const f = database(t), owner = generateKeyPair();
+  writeFileSync(join(f.home, "owner.json"), JSON.stringify({ v: 1, backend: "keychain", public_key: owner.publicKey }), { mode: 0o600 });
+  f.node.syncOwner();
+  const draft = { from: "reader", to: ["writer"], subject: "owner task", body: "run checks" };
+  const clean = f.leases.withHeld("reader", f.lease.token, () => f.node.send(draft, undefined, { pub: owner.publicKey, priv: owner.privateKey }, undefined, f.scope));
+  assert.equal(f.node.authorityFor(f.node.read(clean.envelope.id, "reader"))?.ok, true);
+  const outside = f.leases.withHeld("reader", f.lease.token, () => f.node.send({ ...draft, origin: "external" }, undefined, { pub: owner.publicKey, priv: owner.privateKey }, undefined, f.scope));
+  assert.equal(outside.envelope.authority, null); assert.match(outside.warnings.join(" "), /authority not attached/);
+  const legacy = f.node.send(draft, undefined, { pub: owner.publicKey, priv: owner.privateKey });
+  assert.equal(f.node.authorityFor(f.node.read(legacy.envelope.id, "reader"))?.ok, true);
+  // Simulate an old producer that signed an owner claim over versioned outside data; the receipt stays immutable.
+  const e = buildEnvelope({ ...draft, from: "reader@alpha", origin: "external" }); e.meta.sender_verification = "leased";
+  e.meta.provenance = createContentProvenance(e, [], f.node.provenanceSources(e), "firsthand-outside").record;
+  const claimed = signEnvelope(ownerSign(e, owner.publicKey, owner.privateKey), "alpha", f.node.key.publicKey, f.node.key.privateKey);
+  f.node.store.insertMessage(claimed, "local", "local", { ok: true, session: "signed by the owner" });
+  const before = f.node.store.db.prepare("SELECT envelope,authority FROM messages WHERE id=?").get(claimed.id);
+  const row = f.node.read(claimed.id, "reader");
+  assert.equal(f.node.authorityFor(row)?.ok, false);
+  assert.match(formatFor(f.node, row, "reader"), /authority: none .*rejected/);
+  assert.equal(messageReadView(f.node, row, "reader", "metadata").policy.owner_authority, false);
+  assert.deepEqual(f.node.store.db.prepare("SELECT envelope,authority FROM messages WHERE id=?").get(claimed.id), before);
 });
