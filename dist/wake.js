@@ -12,7 +12,7 @@ import { captureWakeIdentity } from "./wake-identity.js";
 import { policyBrief } from "./policy.js";
 import { ulid } from "./crypto.js";
 import { opencodeHostOf } from "./opencode-provider.js";
-import { pushOpencodeWake } from "./opencode-wake-queue.js";
+import { listOpencodeWakeWaiters, pushOpencodeWake } from "./opencode-wake-queue.js";
 import { leadAgentOf, projectLabel, projectMailboxBySlot } from "./project-mailbox.js";
 import { isSlotName } from "./project-slot.js";
 const run = promisify(execFile);
@@ -146,6 +146,8 @@ export function queuedBehindTurnAt(store, agent, messageId) {
     }
 }
 /** T524: why a session that the shared service does not host is never pushed through it. */
+/** T646: the same session is also loaded in a standalone serve whose plugin could not take the wake right now. */
+export const OPENCODE_DUAL_HOST_NO_PUSH = "session is loaded by a standalone OpenCode serve as well as the shared service; not posting to the service, which would start a duplicate agent loop";
 export const OPENCODE_STANDALONE_NO_PUSH = "session is hosted by a standalone OpenCode serve; the shared service would start a duplicate agent loop (next-prompt delivery only)";
 /** Push a wake into an OpenCode session. A service-hosted binding (its provider pid is
  *  `opencode serve --service`) keeps the direct synthetic POST below. A standalone serve
@@ -170,6 +172,23 @@ export async function wakeOpencode(sessionId, text, o = {}) {
     }
     if (host !== "service")
         return outcome(via, { kind: "not_submitted", reason: "no-target", detail: "the OpenCode process hosting this session is unknown; not pushing through the shared service, which could start a duplicate agent loop" });
+    // T646: the binding says service, but a standalone serve's plugin is polling for this same session, so a tab has it loaded too.
+    // A resume:true POST would start a second agent loop in the service (and its restart later resumes that loop on its own). Hand the
+    // wake to the tab's plugin instead; if it can't take it now, nothing is posted to the service.
+    const standalone = (o.waiters ?? listOpencodeWakeWaiters)().filter(w => w.sessionID === sessionId && (o.host ?? opencodeHostOf)(w.pid) === "standalone");
+    if (standalone.length) {
+        for (const w of standalone) {
+            if (o.recheck && !o.recheck())
+                return outcome(via, { kind: "not_submitted", reason: "fenced" }, "wake authority changed");
+            const pushed = await pushOpencodeWake(sessionId, w.pid, text);
+            if (pushed.ok)
+                return outcome(via, { kind: "admitted", receipt: receipt("native", { nativeId: pushed.id, sessionId,
+                        nativeStatus: pushed.turnSince ? OPENCODE_QUEUED_BEHIND_TURN : "queued" }) });
+            if (pushed.handedOff)
+                return outcome(via, { kind: "unknown", reason: "lost-response", detail: "standalone plugin took the wake and returned no msg_ receipt" });
+        }
+        return outcome(via, { kind: "not_submitted", reason: "no-target", detail: OPENCODE_DUAL_HOST_NO_PUSH });
+    }
     const svc = await (o.service ?? opencodeService)();
     if (!svc)
         return outcome(via, { kind: "not_submitted", reason: "unavailable" }, "opencode service not running");
@@ -483,10 +502,17 @@ export async function dispatchWakes(node, now = Date.now()) {
     }
     const out = [];
     for (const [agent, rows] of byAgent) {
-        const held = node.sessionsFor(agent).flatMap(session => {
+        const bound = node.sessionsFor(agent);
+        const held = bound.flatMap(session => {
             const guard = captureWakeIdentity(node, session);
             return guard ? [guard] : [];
         });
+        // A live exact session of a live lease whose authority was not captured: retry it, never strand its mail (T646).
+        const lease = node.store.db.prepare("SELECT cli FROM identity_leases WHERE name=? AND released_at IS NULL").get(agent);
+        const unverified = bound.filter(s => !s.session_id.startsWith("mcp-") && !held.some(g => g.session === s)
+            && s.cli === lease?.cli && !!s.pid && node.sameSession(s.pid, s));
+        if (!unverified.length)
+            node.store.db.prepare("DELETE FROM kv WHERE k=?").run(`wake-capture-failed:${agent}`);
         const sessions = held.filter(g => !g.session.session_id.startsWith("mcp-"));
         // Only the current leased channel may suppress daemon delivery.
         if (held.some(g => g.session.channel))
@@ -639,6 +665,18 @@ export async function dispatchWakes(node, now = Date.now()) {
         // A name with no registered agent or session gets no notice, and notices are rate limited across all names (T196, F6):
         // mail to made-up names cannot flood the desktop or stall the daemon. The mail is still re-woken once a session binds.
         if (!result.ok && !noticeAllowed(node, agent, now)) {
+            // T646: an exact session exists but its wake authority could not be captured this pass. With no notice either,
+            // marking the mail notified would strand it until some later rebind; leave it delivered for the next pass.
+            if (!attempts && unverified.length) {
+                reservation.release?.();
+                const sessionsSeen = unverified.map(s => `${s.cli}:${s.session_id}`), seenKey = `wake-capture-failed:${agent}`;
+                if (node.store.get(seenKey) !== JSON.stringify(sessionsSeen)) {
+                    node.store.set(seenKey, JSON.stringify(sessionsSeen));
+                    node.store.audit("wake.capture_failed", { agent, sessions: sessionsSeen, count: wanted.length });
+                }
+                out.push({ agent, result: { ok: false, via: "lease", error: "wake identity not verified and notice skipped; delivery retained for a later pass" } });
+                continue;
+            }
             node.store.tx(() => ownRows.forEach(r => node.setDelivery(r.id, r.agent, "notified", "desktop")));
             node.store.audit("wake.notice_skipped", { agent, count: wanted.length });
             out.push({ agent, result: { ok: false, via: "desktop", error: "notice skipped (unknown agent or notice rate limit)" } });

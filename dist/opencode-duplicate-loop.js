@@ -5,6 +5,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { sha256 } from "./crypto.js";
+import { opencodeDualHostChecks } from "./opencode-dual-host.js";
 const EVENT = "opencode.duplicate_loop";
 const MESSAGE_CAP = 20;
 export const OPENCODE_OVERLAP_WINDOW_MS = 60 * 60_000;
@@ -147,7 +148,7 @@ export function opencodeDuplicateLoopChecks(node, opts = {}) {
             level: "warn",
             label: `opencode: overlapping assistant messages began within the last hour on bound session ${loop.session_id} (${loop.pairs} pair${loop.pairs === 1 ? "" : "s"} observed${loop.snapshots ? ", with snapshots" : ""})`,
             fix: "inspect the session's recent execution for possible concurrent loops; timestamps do not identify writer processes. Do not stop a serve based on this check alone",
-        }))];
+        })), ...opencodeDualHostChecks(node)];
 }
 /** Started by the daemon's existing loop-report arm. cli.ts is not edited from this task. */
 export function armOpencodeDuplicateLoopAudit(node) {

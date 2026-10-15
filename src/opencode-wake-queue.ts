@@ -18,7 +18,11 @@ interface Slot {
   receipt: Promise<string>;
 }
 
+// T646: one slot per (session, serve). The same session can be loaded by a standalone tab and by the shared service at
+// once; keyed by session alone, each poll cancelled the other's every ~200 ms and a wake for the tab found the service's slot.
 const slots = new Map<string, Slot>();
+const slotKey = (sessionID: string, pid: number) => `${sessionID}\0${pid}`;
+const sessionOf = (key: string) => key.slice(0, key.lastIndexOf("\0"));
 
 const finishReceipt = (slot: Slot, resolve: (id: string) => void, id: string): void => {
   if (slot.settled) return;
@@ -37,21 +41,23 @@ export function resetOpencodeWakeQueue(): void {
 
 /** Unoffered pollers. Doctor reads them through GET /v1/opencode-wake/waiters (T520). */
 export function listOpencodeWakeWaiters(): { sessionID: string; pid: number }[] {
-  return [...slots.entries()].filter(([, slot]) => !slot.offered).map(([sessionID, slot]) => ({ sessionID, pid: slot.pid }));
+  return [...slots.entries()].filter(([, slot]) => !slot.offered).map(([key, slot]) => ({ sessionID: sessionOf(key), pid: slot.pid }));
 }
 
 export function opencodeWakeWaiting(sessionID: string, pid: number): boolean {
-  const slot = slots.get(sessionID);
-  return !!slot && !slot.offered && slot.pid === pid;
+  const slot = slots.get(slotKey(sessionID, pid));
+  return !!slot && !slot.offered;
 }
 
-/** Register the plugin poll for `sessionID`. A new poll replaces one that has not been offered a
- *  wake; an offered slot is left alone and this call resolves null so it cannot steal the text. */
+/** Register the plugin poll for `sessionID` from the serve `pid`. A new poll from that serve replaces its own poll that has not
+ *  been offered a wake; an offered slot is left alone and this call resolves null so it cannot steal the text. Another serve's
+ *  poll for the same session is independent. */
 export function waitForOpencodeWake(sessionID: string, pid: number, waitMs = 20_000): Promise<string | null> {
-  const prev = slots.get(sessionID);
+  const key = slotKey(sessionID, pid);
+  const prev = slots.get(key);
   if (prev?.offered) return Promise.resolve(null);
   if (prev) {
-    slots.delete(sessionID);
+    slots.delete(key);
     prev.cancel();
   }
   let resolveText!: (value: string | null) => void;
@@ -75,10 +81,10 @@ export function waitForOpencodeWake(sessionID: string, pid: number, waitMs = 20_
     dropReceipt() { finishReceipt(slot, resolveReceipt, ""); },
     receipt,
   };
-  slots.set(sessionID, slot);
+  slots.set(key, slot);
   const timer = setTimeout(() => {
-    if (slots.get(sessionID) === slot && !slot.offered) {
-      slots.delete(sessionID);
+    if (slots.get(key) === slot && !slot.offered) {
+      slots.delete(key);
       resolveText(null);
     }
   }, waitMs);
@@ -90,8 +96,8 @@ export function waitForOpencodeWake(sessionID: string, pid: number, waitMs = 20_
  *  `msg_` id. A missing receipt after the handoff is `handedOff`: the text already left, so the
  *  caller must not submit it through the shared service as well. */
 export async function pushOpencodeWake(sessionID: string, pid: number, text: string, receiptMs = 5_000): Promise<OpencodeWakePush> {
-  const slot = slots.get(sessionID);
-  if (!slot || slot.offered || slot.pid !== pid || !text) return { ok: false, handedOff: false };
+  const key = slotKey(sessionID, pid), slot = slots.get(key);
+  if (!slot || slot.offered || !text) return { ok: false, handedOff: false };
   slot.deliver(text);
   let timer: ReturnType<typeof setTimeout> | undefined;
   const id = await Promise.race([
@@ -99,7 +105,7 @@ export async function pushOpencodeWake(sessionID: string, pid: number, text: str
     new Promise<string>((resolve) => { timer = setTimeout(() => resolve(""), receiptMs); timer.unref(); }),
   ]);
   if (timer) clearTimeout(timer);
-  if (slots.get(sessionID) === slot) slots.delete(sessionID);
+  if (slots.get(key) === slot) slots.delete(key);
   slot.dropReceipt();
   return id.startsWith("msg_") ? { ok: true, id, turnSince: slot.turnSince } : { ok: false, handedOff: true };
 }
@@ -107,8 +113,8 @@ export async function pushOpencodeWake(sessionID: string, pid: number, text: str
 /** The plugin reports the id `ctx.session.synthetic` actually returned. Anything else is refused. `turnSince` (T642): the
  *  session was mid-turn when the wake was admitted, since that ISO time; null when idle or not reported (an older plugin). */
 export function completeOpencodeWake(sessionID: string, id: string, turnSince: string | null = null): boolean {
-  const slot = slots.get(sessionID);
-  if (!slot || !slot.offered || slot.settled || !id.startsWith("msg_")) return false;
+  const slot = [...slots.entries()].find(([key, s]) => sessionOf(key) === sessionID && s.offered && !s.settled)?.[1];
+  if (!slot || !id.startsWith("msg_")) return false;
   slot.turnSince = turnSince;
   slot.accept(id);
   return true;
@@ -117,8 +123,8 @@ export function completeOpencodeWake(sessionID: string, id: string, turnSince: s
 /** The poller went away before a wake was offered. An offered wake is not cancelled: its receipt
  *  is still how the daemon learns whether the admission happened. */
 export function cancelOpencodeWake(sessionID: string, pid: number): void {
-  const slot = slots.get(sessionID);
-  if (!slot || slot.offered || slot.pid !== pid) return;
-  slots.delete(sessionID);
+  const key = slotKey(sessionID, pid), slot = slots.get(key);
+  if (!slot || slot.offered) return;
+  slots.delete(key);
   slot.cancel();
 }
