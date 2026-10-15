@@ -2135,19 +2135,25 @@ async function hook(node, event, cli) {
             }
         }, event === "prompt" || event === "session-start"));
     };
+    const stillResuming = "[mbx] Mailbox identity is still resuming. Call mbx_whoami and wait for its result before claiming or registering.";
     const startupDeadline = Date.now() + 1500;
+    // T384: an unbound grok session learns how to register on PostToolUse, the event whose
+    // additionalContext Grok delivers. SessionStart and prompt already record a hint; Grok drops
+    // their stdout. Stop stays off this path (T385). T657: that same post-tool waits with
+    // session-start and prompt while mcp-starting, and says still resuming instead of unbound.
+    const grokUnboundPost = cli === "grok" && event === "post-tool";
     try {
         for (;;) {
             try {
                 return resolveHeld();
             }
             catch (error) {
-                if (entered || !sid || !["session-start", "prompt"].includes(event) || !mcpStarting(node.home, cli, process.ppid))
+                if (entered || !sid || !(["session-start", "prompt"].includes(event) || grokUnboundPost) || !mcpStarting(node.home, cli, process.ppid))
                     throw error;
                 if (Date.now() >= startupDeadline) {
                     // Still starting is different from an unbound result: don't invite duplicate claims or registrations.
                     if (cli !== "hermes" || event !== "session-start")
-                        emit(cli, event === "session-start" ? "SessionStart" : "UserPromptSubmit", "[mbx] Mailbox identity is still resuming. Call mbx_whoami and wait for its result before claiming or registering.");
+                        emit(cli, grokUnboundPost ? "PostToolUse" : event === "session-start" ? "SessionStart" : "UserPromptSubmit", stillResuming);
                     return;
                 }
                 await new Promise(resolve => setTimeout(resolve, 50));
@@ -2158,12 +2164,13 @@ async function hook(node, event, cli) {
         // Missing ownership is a quiet hook result, not a provider failure or an invitation to recreate a binding.
         if (entered)
             throw error;
-        // T384: an unbound grok session learns how to register on PostToolUse, the event whose
-        // additionalContext Grok delivers. SessionStart and prompt already record a hint; Grok drops
-        // their stdout. Stop stays off this path (T385).
-        const grokUnboundPost = cli === "grok" && event === "post-tool";
         if (!sid || (event !== "session-start" && event !== "prompt" && !grokUnboundPost))
             return;
+        // The retry above returns while the marker is live. If it appears between that check and this catch, keep the same sentence and do not record the hint.
+        if (grokUnboundPost && mcpStarting(node.home, cli, process.ppid)) {
+            emit(cli, "PostToolUse", stillResuming);
+            return;
+        }
         const disconnected = grokUnboundPost ? null : hookDisconnectedNote(node, cli, sid, process.ppid);
         const multi = cli === "kimi" && kimiMultiHost(process.ppid);
         // A conversation in a multi-conversation Kimi host can't be matched to its mbx server from here: hand it a bind

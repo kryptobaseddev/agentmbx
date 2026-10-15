@@ -3,7 +3,7 @@
 // the session hint under cli grok; doctor fails when the configured MCP command path is gone.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -266,6 +266,33 @@ test("T657: one live provisional grok control is the post-tool binding; two stay
   const ambiguous = hook(home, "post-tool", sid);
   assert.equal(ambiguous.status, 0, ambiguous.stderr);
   assert.match(ambiguous.stdout, /no mailbox identity yet/, "two live provisional controls stay on the register prompt");
+});
+
+test("T657: a grok post-tool during mcp-starting says the identity is still resuming", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-grok-starting-"));
+  const node = new MbxNode(home, { host: "alpha" });
+  const sleeper = spawn("sleep", ["30"], { stdio: "ignore" });
+  t.after(() => {
+    sleeper.kill();
+    node.close();
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  mkdirSync(join(home, "mcp-starting"), { recursive: true });
+  writeFileSync(join(home, "mcp-starting", `${sleeper.pid}.json`), JSON.stringify({
+    pid: sleeper.pid, parent: process.pid, cli: "grok", createdAt: Date.now(), generation: "t657b",
+  }));
+  const sid = "grok-starting-sid";
+  const ran = hook(home, "post-tool", sid);
+  assert.equal(ran.status, 0, ran.stderr);
+  const parsed = JSON.parse(ran.stdout) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
+  assert.equal(parsed.hookSpecificOutput.hookEventName, "PostToolUse");
+  assert.match(parsed.hookSpecificOutput.additionalContext, /identity is still resuming/);
+  assert.doesNotMatch(parsed.hookSpecificOutput.additionalContext, /no mailbox identity yet/);
+  assert.doesNotMatch(parsed.hookSpecificOutput.additionalContext, /"action":"claim"/);
+  assert.doesNotMatch(parsed.hookSpecificOutput.additionalContext, /"action":"register"/);
+  const start = inspectLeaseProcess(process.pid).start;
+  assert.ok(start, "the test process has birth-time evidence");
+  assert.equal(sessionHint(node.store, "grok", process.pid, start), null, "still resuming does not take the hint");
 });
 
 test("T384 AC4: doctor fails when a wired grok MCP command path does not exist", async () => {
