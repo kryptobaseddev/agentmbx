@@ -229,6 +229,45 @@ test("T384 AC3: a grok post-tool hint rebinds a provisional grok MCP session", a
   assert.equal(sessionHint(node.store, "grok", process.pid, start), sid, "the leased post-tool still records the grok hint");
 });
 
+test("T657: one live provisional grok control is the post-tool binding; two stay unbound", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-grok-provisional-"));
+  const sessions = join(home, "active_sessions.json");
+  writeFileSync(sessions, "{");
+  const node = new MbxNode(home, { host: "alpha" });
+  const first = new Client({ name: "grok-provisional", version: "1" });
+  const second = new Client({ name: "grok-provisional-2", version: "1" });
+  const sid = "t657-real-sid";
+  t.after(async () => {
+    await second.close().catch(() => {});
+    await first.close().catch(() => {});
+    node.close();
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  const envFor = (agent: string): Record<string, string> => {
+    const env: Record<string, string> = { ...process.env, MBX_HOME: home, MBX_CLI: "grok", AGENTMBX_DEV: "1", MBX_AGENT: agent, MBX_ROLE: "grok", MBX_NO_DESKTOP: "1", MBX_GROK_SESSIONS_FILE: sessions };
+    delete env.MBX_DESCRIPTION;
+    return env;
+  };
+  const mcp = (client: Client, agent: string) => client.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"], env: envFor(agent) }));
+  await mcp(first, "worker");
+  const who = (await first.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent?: string | null; harness_session?: string };
+  assert.equal(who.agent, "worker");
+  assert.match(who.harness_session ?? "", /^mcp-\d+$/, "a half-written sessions file leaves the lease provisional");
+  const bound = hook(home, "post-tool", sid);
+  assert.equal(bound.status, 0, bound.stderr);
+  assert.doesNotMatch(bound.stdout, /no mailbox identity yet/, "the one live provisional control is this provider's binding");
+  assert.match(bound.stdout, /No live mbx watcher/);
+  const lease = node.store.db.prepare("SELECT session_id FROM identity_leases WHERE name=?").get("worker") as { session_id: string };
+  assert.match(lease.session_id, /^mcp-\d+$/, "the post-tool does not claim or move the lease");
+  await mcp(second, "scout");
+  const other = (await second.callTool({ name: "mbx_whoami", arguments: {} })).structuredContent as { agent?: string | null; harness_session?: string };
+  assert.equal(other.agent, "scout");
+  assert.match(other.harness_session ?? "", /^mcp-\d+$/);
+  const ambiguous = hook(home, "post-tool", sid);
+  assert.equal(ambiguous.status, 0, ambiguous.stderr);
+  assert.match(ambiguous.stdout, /no mailbox identity yet/, "two live provisional controls stay on the register prompt");
+});
+
 test("T384 AC4: doctor fails when a wired grok MCP command path does not exist", async () => {
   const binDir = mkdtempSync(join(tmpdir(), "mbx-grok-bin-"));
   const bin = join(binDir, "agentmbx");
