@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.40 (2026-10-15)
+
 - **`agentmbx watch` follows its own session's lease re-key instead of stopping (T653).** After a long idle, an mbx server can release its lease and claim it again with a new key: the same process, birth, CLI and session. Every running watcher then exited with "the lease this watcher was started for moved to another holder", so the session could no longer be woken until it re-armed. The watcher now follows such a re-key, and its record carries the new token so the daemon keeps deferring to it. A lease claimed by another process, or by the same process for a different session, still stops it with the same reason.
 
 - **Isolation receipt validation foundation (T631, observation only).** Daemon-captured receipts bind the authenticated request, lead and worker conversations, current leases and exposure roots, sealed input manifest, output artifact, worktree generation and exact action destination. Altered, stale or replayed receipts are refused. Production isolation adapters remain disabled; this adds no automatic approval or action authority.
