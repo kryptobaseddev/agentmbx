@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **A grok post-tool follows the one live provisional MCP when the session file cannot name the conversation (T657).** A half-written or multi-row `active_sessions.json` leaves the connector's lease on `mcp-<pid>`. The post-tool looked up the real session id, missed, and said the session had no mailbox. It now uses that one live provisional control of its own provider while the lease is still held, and it does not claim. Two such controls, or a control already bound to another real session, still get the register prompt. While the connector is still starting, the post-tool can still drop the "still resuming" note; that stays in `src/cli.ts` until T630 merges.
+
 ## 0.5.37 (2026-10-15)
 
 - **A reply-shaped `mbx_send` is sent as the reply, and handoff notes may be up to 4000 characters (T652).** Agents, OpenCode ones especially, often called `mbx_send` with `mbx_reply`'s arguments (`{id, body, kind}`). The schema refused it with "to: Missing key, subject: Missing key", and the agent spent a turn resending through `mbx_reply`.

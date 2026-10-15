@@ -67,6 +67,20 @@ function restoreOpencode(node: MbxNode, session: string): IdentityControlDescrip
   return alias;
 }
 
+/** The one live provisional grok control of this provider. Its lease is still `mcp-*` and held.
+ *  Zero, several, a dead holder, or a live control already bound to another real session is not a match.
+ *  Selecting it does not claim or publish. */
+function heldGrokProvisional(node: MbxNode, all: IdentityControlDescriptor[], session: string): IdentityControlDescriptor | null {
+  const live = all.filter(d => {
+    if (!matches(d, rowFor(node, d.agent))) return false;
+    const evidence = inspectLeaseProcess(d.mcp_pid);
+    return evidence.alive === true && evidence.start === d.mcp_start;
+  });
+  if (live.some(d => !d.session_id.startsWith("mcp-") && d.session_id !== session)) return null;
+  const provisional = live.filter(d => d.session_id.startsWith("mcp-") && d.lease_session_id.startsWith("mcp-"));
+  return provisional.length === 1 ? provisional[0] ?? null : null;
+}
+
 /** Hook bootstrap requires one holder; only Claude and Hermes may change real session IDs within that holder. */
 export function withHookIdentity<T>(node: MbxNode, cli: string, session: string | undefined,
   operation: (agent: string, descriptor: IdentityControlDescriptor, bootstrap: boolean) => T, allowBootstrap = false): T {
@@ -84,17 +98,23 @@ export function withHookIdentity<T>(node: MbxNode, cli: string, session: string 
     descriptors = [live];
   } else if (node.store.get(identityControlKey(cli, session)) !== undefined && !rebindClaude) descriptors = [findIdentityControl(node.store, cli, session)];
   else {
-    // Hosted providers must first publish an exact session binding. Never bootstrap by directory.
-    // Claude's /clear, /resume and compaction replace the session id of the same process, whose MCP holder carries the
-    // id it started with: the provider's own session file naming exactly this session is the proof of that rotation.
-    const rotated = cli === "claude" && claudeSessionId(process.ppid) === session;
-    // Hermes: every alias of the one holder differs only in session_id (the canonical check below), so a real id left by an
-    // earlier conversation of this process is replaced, never mistaken for a second holder.
-    if (!allowBootstrap || ![...REBINDING_CLIS, "kimi"].includes(cli) || (cli === "kimi" && kimiInstances().some(instance => instance.pid === process.ppid)) || new Set(all.map(d => d.control_key)).size !== 1
-      || all.some(d => (!d.lease_session_id.startsWith("mcp-") && !rotated) || (!rebinds && !d.session_id.startsWith("mcp-"))
-        || !matches(d, rowFor(node, d.agent)) || canonical({ ...d, session_id: "" }) !== canonical({ ...all[0], session_id: "" })))
-      throw refused("hook session has no exact current MCP binding");
-    descriptors = all; bootstrap = true;
+    // A grok connector that never published the real session id still holds one live mcp-* lease.
+    // Use that holder. Do not claim, and do not treat any other cli's missing key this way.
+    const provisional = cli === "grok" ? heldGrokProvisional(node, all, session) : null;
+    if (provisional) descriptors = [provisional];
+    else {
+      // Hosted providers must first publish an exact session binding. Never bootstrap by directory.
+      // Claude's /clear, /resume and compaction replace the session id of the same process, whose MCP holder carries the
+      // id it started with: the provider's own session file naming exactly this session is the proof of that rotation.
+      const rotated = cli === "claude" && claudeSessionId(process.ppid) === session;
+      // Hermes: every alias of the one holder differs only in session_id (the canonical check below), so a real id left by an
+      // earlier conversation of this process is replaced, never mistaken for a second holder.
+      if (!allowBootstrap || ![...REBINDING_CLIS, "kimi"].includes(cli) || (cli === "kimi" && kimiInstances().some(instance => instance.pid === process.ppid)) || new Set(all.map(d => d.control_key)).size !== 1
+        || all.some(d => (!d.lease_session_id.startsWith("mcp-") && !rotated) || (!rebinds && !d.session_id.startsWith("mcp-"))
+          || !matches(d, rowFor(node, d.agent)) || canonical({ ...d, session_id: "" }) !== canonical({ ...all[0], session_id: "" })))
+        throw refused("hook session has no exact current MCP binding");
+      descriptors = all; bootstrap = true;
+    }
   }
   if (descriptors.some(d => d.parent_pid !== process.ppid)) throw refused("hook does not belong to this provider process");
   return withIdentity(node, { cli, session }, descriptors, (agent, descriptor) => {
