@@ -73,7 +73,7 @@ test("HC-03: the note is bounded: over-long refused, controls stripped, at most 
   const a = await connect("worker");
   const ids = Array.from({ length: 25 }, (_, i) => `T${101 + i}`);
   send("worker", `tasks ${ids.join(" ")}`);
-  assert.match(errorText(await a.call("mbx_handoff", { action: "save", note: "x".repeat(HANDOFF_NOTE_MAX + 1) })), /1001 characters; the limit is 1000/);
+  assert.match(errorText(await a.call("mbx_handoff", { action: "save", note: "x".repeat(HANDOFF_NOTE_MAX + 1) })), new RegExp(`${HANDOFF_NOTE_MAX + 1} characters; the limit is ${HANDOFF_NOTE_MAX}: cut at least 1 characters`));
   const ok = json(await a.call("mbx_handoff", { action: "save", note: "a\u0007b\nc\u001b[31m", task_refs: ids }));
   assert.equal(ok.saved.note, "ab\nc[31m", "control characters other than tab and newline are removed");
   assert.deepEqual(ok.saved.task_refs.map((r: { id: string }) => r.id), ids.slice(5), `the last ${HANDOFF_REFS_MAX} are kept`);

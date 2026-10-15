@@ -5,7 +5,9 @@
 // its status comes only from authorized CLEO evidence at resume time. Nothing here grants authority or marks anything handled.
 import { missedCount, readCatchup } from "./catchup.js";
 export const handoffKey = (name) => `handoff:${name}`;
-export const HANDOFF_NOTE_MAX = 1000;
+export const HANDOFF_NOTE_MAX = 4000;
+/** T652: the schema bound is wider than the note limit, so an over-long note reaches cleanNote and is told how much to cut. */
+export const HANDOFF_NOTE_INPUT_MAX = 64_000;
 export const HANDOFF_REFS_MAX = 20;
 export const HANDOFF_RETENTION_MS = 30 * 86_400_000;
 export const HANDOFF_CONTEXT_THREADS = 20;
@@ -40,7 +42,7 @@ export function cleanNote(text) {
     // eslint-disable-next-line no-control-regex
     const s = text.normalize("NFC").replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, "");
     if (s.length > HANDOFF_NOTE_MAX)
-        fail("HANDOFF_TOO_LONG", `the handoff note is ${s.length} characters; the limit is ${HANDOFF_NOTE_MAX}. Shorten it; it is never truncated.`);
+        fail("HANDOFF_TOO_LONG", `the handoff note is ${s.length} characters; the limit is ${HANDOFF_NOTE_MAX}: cut at least ${s.length - HANDOFF_NOTE_MAX} characters and save again. It is never truncated.`);
     return s;
 }
 /** Keep the last HANDOFF_REFS_MAX distinct refs; the excess is dropped oldest-first (the earliest given), never cut (R5). */

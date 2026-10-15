@@ -8,7 +8,9 @@ import type { MbxNode } from "./node.ts";
 import type { Store } from "./store.ts";
 
 export const handoffKey = (name: string) => `handoff:${name}`;
-export const HANDOFF_NOTE_MAX = 1000;
+export const HANDOFF_NOTE_MAX = 4000;
+/** T652: the schema bound is wider than the note limit, so an over-long note reaches cleanNote and is told how much to cut. */
+export const HANDOFF_NOTE_INPUT_MAX = 64_000;
 export const HANDOFF_REFS_MAX = 20;
 export const HANDOFF_RETENTION_MS = 30 * 86_400_000;
 export const HANDOFF_CONTEXT_THREADS = 20;
@@ -42,7 +44,7 @@ export function readHandoff(store: Store, name: string, now = Date.now()): Hando
 export function cleanNote(text: string): string {
   // eslint-disable-next-line no-control-regex
   const s = text.normalize("NFC").replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, "");
-  if (s.length > HANDOFF_NOTE_MAX) fail("HANDOFF_TOO_LONG", `the handoff note is ${s.length} characters; the limit is ${HANDOFF_NOTE_MAX}. Shorten it; it is never truncated.`);
+  if (s.length > HANDOFF_NOTE_MAX) fail("HANDOFF_TOO_LONG", `the handoff note is ${s.length} characters; the limit is ${HANDOFF_NOTE_MAX}: cut at least ${s.length - HANDOFF_NOTE_MAX} characters and save again. It is never truncated.`);
   return s;
 }
 
