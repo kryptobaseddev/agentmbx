@@ -54,8 +54,11 @@ try {
     const db = new DatabaseSync(join(home, "mbx.db"), { readOnly: true });
     try {
       db.exec("BEGIN");
-      return JSON.stringify(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(({ name }) =>
-        [name, db.prepare(`SELECT * FROM "${name.replaceAll('"', '""')}"`).all()]));
+      return JSON.stringify(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name<>'session_exposures' ORDER BY name").all().map(({ name }) => {
+        const where = name === "kv" ? " WHERE k NOT GLOB 'provenance-context:*' AND k NOT GLOB 'taint:*' AND k NOT GLOB 'session-firsthand:*'"
+          : name === "audit" ? " WHERE event<>'provenance.exposure_observed'" : "";
+        return [name, db.prepare(`SELECT * FROM "${name.replaceAll('"', '""')}"${where}`).all()];
+      }));
     } finally { db.close(); }
   };
   const beforeReplay = snapshot();
@@ -81,7 +84,12 @@ try {
     "diagnostics reports installed and running connector builds separately");
   check(diagnostic.ownership.state === "held" && diagnostic.messages.unread === 1, "diagnostics observes holder and unread fixture without consuming mail");
   check(!JSON.stringify(diagnostic).includes("smoke test"), "diagnostics omits message subjects and bodies");
-  check(snapshot() === beforeReplay, "replay and diagnostics preserve every temporary database row");
+  check(snapshot() === beforeReplay, "replay and diagnostics preserve delivery, lease, checkpoint and authority rows");
+  const observations = new DatabaseSync(join(home, "mbx.db"), { readOnly: true });
+  try {
+    check(!!observations.prepare("SELECT 1 FROM kv WHERE k GLOB 'provenance-context:*'").get()
+      && !!observations.prepare("SELECT 1 FROM session_exposures").get(), "returned replay bodies record conversation inputs");
+  } finally { observations.close(); }
   check(run("inbox", "--as", "smoker").includes("smoke test"), "leased inbox (node:sqlite inside SEA)");
   check(run("read", id, "--as", "smoker").includes("unverified-sender"), "unleased send is labelled at read time");
   check(run("whoami", "--as", "smoker").includes("smoker@smoke"), "leased CLI whoami");

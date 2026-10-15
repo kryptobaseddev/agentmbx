@@ -76,11 +76,13 @@ Start here
 Messages
   agentmbx send --as <agent> --to <a,b,role:x,*,owner> --subject "…" [-m "body" | --body-file f | stdin]
            [--kind message|request|reply|status|decision|alert|task] [--reply-to <id>] [--needs-reply] [--origin agent|external] [--ref path]… [--new-mailbox]
+           [--context <disclosed-thread-id>] [--payload agent|firsthand-outside|derived-outside] [--source <exact-message-id>]…
+           Payload inputs stay attached when refs/thread/origin change; context selection does not prove isolation or clear the writer fence.
   agentmbx replay [--cursor <token>] [--limit 50] [--max-bytes 65536] [--scan-limit 1000]
                   [--project <id> --project-host <host>] [--topic <tag>] [--thread <id>]
-                  bounded read-only JSON; current provider lease required; bodies are data
+                  bounded JSON; current provider lease required; bodies are data and record disclosure, without marking mail read
   agentmbx inbox --as <agent> [--all] [--json] [--needs-reply] [--from <agent>]      agentmbx read <id> --as <agent>      agentmbx ack <id>… | --all | --thread <id>  --as <agent> [--note "…"]
-  agentmbx whoami --as <agent> [--role r] [--description "…"]    inspect/describe the identity leased to this caller
+  agentmbx whoami --as <agent> [--role r] [--description "…"] [--json]    identity, payload roots and writer fence for this caller
   agentmbx thread <id>        agentmbx search "<words>"   agentmbx agents   agentmbx status
   agentmbx read|thread <id> --mode metadata|quarantine [--cli <provider> --session <id>]
                   metadata excludes sender text; quarantine returns a labelled untrusted derived summary
@@ -383,6 +385,7 @@ async function run(argv) {
             as: { type: "string" }, to: { type: "string" }, subject: { type: "string" }, m: { type: "string", short: "m" },
             "body-file": { type: "string" }, kind: { type: "string" }, origin: { type: "string" }, schema: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" }, "new-mailbox": { type: "boolean" },
             ref: { type: "string", multiple: true }, all: { type: "boolean" }, json: { type: "boolean" }, note: { type: "string" },
+            context: { type: "string" }, payload: { type: "string" }, source: { type: "string", multiple: true },
             mailbox: { type: "string" }, limit: { type: "string" }, host: { type: "string" }, port: { type: "string" }, cli: { type: "string" }, session: { type: "string" }, caps: { type: "string" },
             ttl: { type: "string" }, mode: { type: "string" }, reason: { type: "string" }, bind: { type: "string" }, role: { type: "string" }, description: { type: "string" }, thread: { type: "string" }, from: { type: "string" }, check: { type: "boolean" }, yes: { type: "boolean", short: "y" },
             cursor: { type: "string" }, "max-bytes": { type: "string" }, "scan-limit": { type: "string" }, "project-host": { type: "string" }, topic: { type: "string" },
@@ -846,6 +849,16 @@ async function run(argv) {
         const page = node.replay(identity.agent, identity.token, { cursor: str("cursor"), limit: numberOption("limit"),
             maxBytes: numberOption("max-bytes"), scanLimit: numberOption("scan-limit"), project: o.project?.[0],
             project_host: str("project-host"), topic: str("topic"), thread: str("thread") });
+        if (page.messages.some(m => "envelope" in m))
+            withCliIdentity(node, { as: identity.agent, cli: str("cli"), session: str("session") }, (agent, descriptor) => {
+                if (node.store.db.prepare("SELECT token FROM identity_leases WHERE name=?").get(agent)?.token !== identity.token)
+                    throw new Error("identity changed before replay disclosure");
+                for (const message of page.messages)
+                    if ("envelope" in message) {
+                        node.read(message.id, agent);
+                        node.observeRead(message, descriptor.cli, descriptor.session_id, "full");
+                    }
+            });
         console.log(JSON.stringify(page));
         return;
     }
@@ -881,9 +894,10 @@ async function run(argv) {
                 }
                 case "read": {
                     const row = node.read(pos[0] ?? die("read <id>"), me), readMode = mode;
-                    const view = readMode === "full" ? null : messageReadView(node, row, me, readMode);
                     node.observeRead(row, descriptor.cli, descriptor.session_id, readMode);
-                    return console.log(view ? JSON.stringify(view) : formatFor(node, row, me));
+                    const scope = { cli: descriptor.cli, session_id: descriptor.session_id };
+                    const view = readMode === "full" ? null : messageReadView(node, row, me, readMode, Date.now(), scope);
+                    return console.log(view ? JSON.stringify(view) : formatFor(node, row, me, scope));
                 }
                 case "ack": {
                     let ids = pos;
@@ -914,9 +928,11 @@ async function run(argv) {
                 case "thread": {
                     const m = node.message(pos[0] ?? die("thread <id>"), me);
                     return node.thread(m ? m.thread : pos[0], me).forEach((r) => {
-                        const readMode = mode, view = readMode === "full" ? null : messageReadView(node, r, me, readMode);
+                        const readMode = mode;
                         node.observeRead(r, descriptor.cli, descriptor.session_id, readMode);
-                        console.log(view ? JSON.stringify(view) : formatFor(node, r, me) + "\n");
+                        const scope = { cli: descriptor.cli, session_id: descriptor.session_id };
+                        const view = readMode === "full" ? null : messageReadView(node, r, me, readMode, Date.now(), scope);
+                        console.log(view ? JSON.stringify(view) : formatFor(node, r, me, scope) + "\n");
                     });
                 }
                 case "search": return node.search(pos.join(" "), 20, me).forEach((m) => console.log(summaryLine(m)));
@@ -932,6 +948,9 @@ async function run(argv) {
             const originArg = str("origin");
             if (originArg !== undefined && originArg !== "agent" && originArg !== "external")
                 die("--origin must be agent or external");
+            const payload = str("payload");
+            if (payload !== undefined && !["agent", "firsthand-outside", "derived-outside"].includes(payload))
+                die("--payload must be agent, firsthand-outside or derived-outside");
             // Read external input before acquiring the lease's database lock.
             const body = str("m") ?? (str("body-file") ? readFileSync(str("body-file"), "utf8") : stdinIsTTY() ? "" : readStdin());
             // T205: never create a mailbox by typo; --new-mailbox deliberately leaves mail for an agent that has not started yet
@@ -939,7 +958,7 @@ async function run(argv) {
                 assertKnownRecipients(node, (str("to") ?? "").split(",").map(s => s.trim()).filter(Boolean));
             // T345: a live taint:<cli>:<session_id> record sends as inherited external. --origin external
             // declares this body first-hand. --origin agent does not send while the record is live.
-            const send = (from, unverified = false, taint = null) => {
+            const send = (from, unverified = false, taint = null, scope) => {
                 if (originArg === "agent" && taint)
                     die(refuseAgentOrigin(taint));
                 const declared = originArg === "external";
@@ -952,8 +971,8 @@ async function run(argv) {
                     subject: fit.subject,
                     body, kind: (str("kind") ?? "message"), reply_to: reply?.id ?? null, thread: reply?.thread,
                     needs_reply: !!o["needs-reply"], refs: o.ref ?? [], unverifiedSender: unverified,
-                    ...(declared || taint ? { origin: "external" } : {}),
-                    ...(!declared && taint ? { external_since: new Date(taint.root).toISOString() } : {}) });
+                    ...(declared || taint ? { origin: "external" } : originArg ? { origin: originArg } : {}),
+                    ...(!declared && taint ? { external_since: new Date(taint.root).toISOString() } : {}) }, undefined, undefined, undefined, scope);
                 if (fit.warning)
                     sent.warnings.unshift(fit.warning);
                 return sent;
@@ -970,12 +989,14 @@ async function run(argv) {
                 r = withCliIdentity(node, { as: str("as") ?? (process.env.MBX_AGENT || undefined), cli: str("cli"), session: str("session") }, (me, descriptor) => {
                     entered = true;
                     const taint = readSessionTaint(node.store, descriptor.cli, descriptor.session_id);
-                    return noteOrigin(send(me, false, taint), taint);
+                    return noteOrigin(send(me, false, taint, { cli: descriptor.cli, session_id: descriptor.session_id,
+                        context: str("context"), payload, sources: o.source }), taint);
                 });
             }
             catch (error) {
                 // Never replay a failed operation or downgrade a reply / explicitly selected session.
-                if (entered || str("reply-to") || str("cli") || str("session") || error.code !== "IDENTITY_NO_CALLER_LEASE")
+                if (entered || str("reply-to") || str("cli") || str("session") || str("context") || payload !== undefined || o.source
+                    || error.code !== "IDENTITY_NO_CALLER_LEASE")
                     throw error;
                 const sender = as();
                 r = node.store.tx(() => {
@@ -992,7 +1013,7 @@ async function run(argv) {
             r.warnings.push(...offlineWarnings(recipients));
             r.warnings.forEach((w) => process.stderr.write(`warning: ${w}\n`));
             if (o.json)
-                return console.log(JSON.stringify({ id: r.envelope.id, thread: r.envelope.thread, ref: `mbx:${r.envelope.id}@${node.host}`, recipients, local: r.local, remote: r.remote, warnings: r.warnings }));
+                return console.log(JSON.stringify({ id: r.envelope.id, thread: r.envelope.thread, ref: `mbx:${r.envelope.id}@${node.host}`, recipients, local: r.local, remote: r.remote, warnings: r.warnings, ...(r.provenance ? { provenance: r.provenance } : {}) }));
             console.log(r.envelope.id);
             for (const x of recipients)
                 process.stderr.write(`  ${x.address}: ${x.state} (${x.detail})\n`);
@@ -1000,13 +1021,18 @@ async function run(argv) {
         }
         case "whoami": {
             const edit = str("role") !== undefined || str("description") !== undefined;
-            return withCliIdentity(node, { as: str("as") ?? (process.env.MBX_AGENT || undefined), cli: str("cli"), session: str("session"), readOnly: !edit }, name => {
+            return withCliIdentity(node, { as: str("as") ?? (process.env.MBX_AGENT || undefined), cli: str("cli"), session: str("session"), readOnly: !edit }, (name, descriptor) => {
                 if (edit)
                     node.registerAgent(name, { role: str("role"), description: str("description") });
                 const a = node.agents().find(x => x.name === name && x.host === node.host);
+                const provenance = node.provenanceStatus(undefined, { cli: descriptor.cli, session_id: descriptor.session_id });
+                if (o.json)
+                    return console.log(JSON.stringify({ agent: name, address: `${name}@${node.host}`, cli: descriptor.cli, harness_session: descriptor.session_id,
+                        role: a?.role ?? null, description: a?.description ?? null, unread: node.unreadCount(name), provenance }));
                 console.log(`${name}@${node.host}${a?.role ? `  role:${a.role}` : ""}  (${a?.cli ?? "?"})  unacked: ${node.unreadCount(name)}${a?.description ? `\n${a.description}` : ""}`);
                 console.log(projectLeadLine(projectLeadView(node, identityProjects(node.store, name)[0] ?? projectOf(process.cwd()))));
                 console.log(`delivery: ${node.deliveryMode(name)}`);
+                console.log(`provenance: ${JSON.stringify(provenance)}`);
                 console.log(delegationNote(node.store.db, name, node.host) ?? "policy: none (ask): other agents' requests need your user's OK");
             });
         }

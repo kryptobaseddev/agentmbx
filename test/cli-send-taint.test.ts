@@ -105,6 +105,7 @@ test("CLI send inherits a live session taint and refuses --origin agent (T345)",
   const cleanEnv = JSON.parse(node.message(JSON.parse(clean.stdout).id)!.envelope);
   assert.equal(cleanEnv.meta.origin, undefined);
   assert.equal(cleanEnv.meta.external_since, undefined);
+  assert.equal(cleanEnv.meta.provenance.kind, "unknown");
 
   const bad = send("--subject", "bad-origin", "-m", "body", "--origin", "web");
   assert.equal(bad.status, 2, bad.stderr);
