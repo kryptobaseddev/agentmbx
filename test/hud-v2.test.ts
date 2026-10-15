@@ -69,7 +69,7 @@ test("T405: shared PID sessions keep separate mailboxes and unknown sessions rem
   assert.ok(!readdirSync(hudDir(f.home)).some(p => p.includes("-pid-")));
   const unknown = hudStatusV2(f.node, { cli: "kimi", sessionId: "missing", agent: null, state: "unbound", resolvedBy: "none" });
   assert.equal(unknown.identity.state, "unbound"); assert.equal(unknown.identity.name, null);
-  assert.deepEqual(unknown.inbox, { unread: 0, needs_reply: 0, from_owner: 0, outbox_unsent: 0 });
+  assert.deepEqual(unknown.inbox, { unread: 0, new: 0, read: 0, needs_reply: 0, from_owner: 0, outbox_unsent: 0 }); // T650: new + read added
   assert.equal(unknown.registration.registered, false); assert.equal(unknown.project, null);
   f.node.store.db.prepare("UPDATE sessions SET pid_start='reused'").run(); writeHud(f.node);
   assert.deepEqual(readdirSync(hudDir(f.home)), [".alive"], "reused PID cannot keep either schema's stale mailbox");

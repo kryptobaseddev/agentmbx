@@ -92,7 +92,7 @@ fi
   return `#!/bin/sh
 # AgentMBX status line wrapper (proposed by \`agentmbx statusline suggest\`, T369) — ${cli}: REPLACE-ONLY.
 # ${cli === "kimi" ? "Kimi" : "Grok"} renders ONLY this command's output: while the CALLING SESSION
-# has unread mail the MBX alert takes footer line 1; when nothing waits, your original command's
+# has new mail the MBX alert takes footer line 1; when nothing waits, your original command's
 # output renders — your footer is preserved except when there is mail. (items and command never
 # render together; the segment resolves the calling session's own binding, never another identity's
 # mailbox.) Stdin (the CLI's status JSON) is replayed to both commands.
@@ -179,7 +179,7 @@ export function statuslineSuggest(o: {
   const wrapperCommand = `sh ${shJoin([wrapperPath])}`;
   const wrapper = { path: wrapperPath, content: wrapperScript(cli, configured!, renderCommand) };
   const replaceNote = contract === "replace-only"
-    ? `${cli === "kimi" ? "Kimi" : "Grok"} renders ONLY the command's output — your command is WRAPPED, not accompanied: while this session has unread mail the footer shows the MBX alert; when nothing waits, your command's output renders as it does today. Never "items plus command" — those do not render together.`
+    ? `${cli === "kimi" ? "Kimi" : "Grok"} renders ONLY the command's output — your command is WRAPPED, not accompanied: while this session has new mail the footer shows the MBX alert; when nothing waits, your command's output renders as it does today. Never "items plus command" — those do not render together.`
     : "Claude renders its built-in items plus the command's output — your command's first output line is preserved and the MBX segment is appended to it (true composition).";
   const steps = [
     `Write the wrapper script to ${wrapperPath} (content below; make it executable or invoke it via sh).`,

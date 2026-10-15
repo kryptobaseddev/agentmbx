@@ -86,7 +86,8 @@ export interface StatusV2 {
   mbx_version: string;
   identity: StatusV2Identity;
   registration: { registered: boolean; lease: StatusV2Lease | null };
-  inbox: { unread: number; needs_reply: number; from_owner: number; outbox_unsent: number };
+  // T650: unread = every unacked delivery (unchanged); new = not yet read; read = read but not acked. unread = new + read.
+  inbox: { unread: number; new?: number; read?: number; needs_reply: number; from_owner: number; outbox_unsent: number };
   harness: { cli: string; session_id: string | null; wake_path: string; policy: string[] };
   cloud: StatusV2Cloud;
   devices: StatusV2Device[];
@@ -137,7 +138,10 @@ export const formatStatusV2 = (value: unknown): string => {
   const tag = clean(id.name) + (id.role ? "(" + clean(id.role) + ")" : "");
   const inbox = s.inbox ?? {};
   const seg = ["mbx " + tag];
-  if (inbox.unread) seg.push(inbox.unread + "↑");
+  // T650: the headline is new mail; read-but-unacked is its own segment. A daemon from before T650 sends only unread.
+  const fresh = inbox.new ?? inbox.unread;
+  if (fresh) seg.push(fresh + "↑");
+  if (inbox.read) seg.push(inbox.read + " read");
   if (inbox.needs_reply) seg.push(inbox.needs_reply + "↺");
   if (inbox.from_owner) seg.push("owner:" + inbox.from_owner);
   if (s.registration?.lease && s.registration.lease.verified === false) seg.push("lease-unverified");
@@ -154,7 +158,7 @@ export const statusSections = (value: unknown, project = "project-dev", now = Da
   const age = (ts: string) => { const ms = now - Date.parse(ts); return Number.isFinite(ms) ? (ms < 60000 ? "now" : Math.floor(ms / 60000) + "m ago") : "age unknown"; };
   return [
     { title: "Identity & session", lines: [clean(s.identity?.name) + " · " + clean(s.identity?.role), "Registered: " + (s.registration?.registered ? "yes" : "no"), "Lease: " + (lease ? lease.verified ? "verified" : "unverified" : "not held"), "Holder: " + clean(lease?.holder_cli) + " / " + clean(lease?.holder_session), "Wake: " + clean(s.harness?.wake_path), "Policy: " + clean(s.harness?.policy?.join(", ") || "none")] },
-    { title: "Inbox", lines: [String(s.inbox?.unread ?? 0) + " unread · " + String(s.inbox?.needs_reply ?? 0) + " needs reply", String(s.inbox?.from_owner ?? 0) + " from owner · " + String(s.inbox?.outbox_unsent ?? 0) + " pending sends", ...(s.inbox?.recent === undefined ? ["Message preview unavailable on this daemon."] : s.inbox.recent.length ? s.inbox.recent.slice(0, 3).flatMap(m => [clean(m.sender) + " · " + clean(m.kind) + " · " + age(m.ts) + (m.needs_reply ? " · reply needed" : ""), clean(m.subject, 160)]) : ["No pending messages."])] },
+    { title: "Inbox", lines: [String(s.inbox?.new ?? s.inbox?.unread ?? 0) + " new · " + String(s.inbox?.read ?? 0) + " read · " + String(s.inbox?.needs_reply ?? 0) + " needs reply", String(s.inbox?.from_owner ?? 0) + " from owner · " + String(s.inbox?.outbox_unsent ?? 0) + " pending sends", ...(s.inbox?.recent === undefined ? ["Message preview unavailable on this daemon."] : s.inbox.recent.length ? s.inbox.recent.slice(0, 3).flatMap(m => [clean(m.sender) + " · " + clean(m.kind) + " · " + age(m.ts) + (m.needs_reply ? " · reply needed" : ""), clean(m.subject, 160)]) : ["No pending messages."])] },
     { title: "Cloud & devices", lines: ["Relay: " + clean(s.cloud?.relay?.state), clean(s.cloud?.relay?.url ?? "No relay configured"), "Last acknowledgement: " + clean(s.cloud?.relay?.last_ack), "Key ad expires: " + clean(s.cloud?.key_ad_expiry), "Account: " + clean(s.cloud?.account), ...(s.devices?.length ? s.devices.map(d => clean(d.host) + " · " + clean(d.reachability) + " · " + clean(d.address) + " · presence " + clean(d.last_presence)) : ["No paired devices."])] },
     { title: "Project", lines: s.project ? [clean(s.project.directory, 160), "Lead: " + clean(s.project.lead ?? "none"), "Members: " + clean(s.project.members.join(", ") || "none", 400)] : ["No project binding."] },
   ];

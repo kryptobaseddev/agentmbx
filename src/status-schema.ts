@@ -49,7 +49,8 @@ export interface StatusV2 {
   mbx_version: string;
   identity: StatusV2Identity;
   registration: { registered: boolean; lease: StatusV2Lease | null };
-  inbox: { unread: number; needs_reply: number; from_owner: number; outbox_unsent: number };
+  // T650: unread = every unacked delivery (unchanged); new = not yet read; read = read but not acked. unread = new + read.
+  inbox: { unread: number; new?: number; read?: number; needs_reply: number; from_owner: number; outbox_unsent: number };
   harness: { cli: string; session_id: string | null; wake_path: string; policy: string[] };
   cloud: StatusV2Cloud;
   devices: StatusV2Device[];
