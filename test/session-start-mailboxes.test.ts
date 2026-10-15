@@ -58,8 +58,11 @@ test("T328 session-start lists only this directory's claimable mailboxes, the sa
       const result = start(home, cli, dir, session);
       assert.equal(result.status, 0, result.stderr);
       const context = contextOf(cli, result.stdout);
-      if (!seen) seen = context;
-      else assert.equal(context, seen, cli);
+      // T655: a fresh OpenCode start has never connected, so it gets no "disconnected" line; the mailbox list is the same.
+      if (cli === "opencode") assert.doesNotMatch(context, /mbx disconnected/);
+      const listed = context.replace(/^\[mbx\] mbx disconnected:[^\n]*\n/m, "");
+      if (!seen) seen = listed;
+      else assert.equal(listed, seen, cli);
       assert.match(context, /This session has no mailbox identity yet/);
       assert.match(context, /orbit-grok role=grok last=\d{4}-\d{2}-\d{2}T\S* unread=1/);
       assert.match(context, /mbx_identity \{"action":"claim","name":"<name>"\}/);
