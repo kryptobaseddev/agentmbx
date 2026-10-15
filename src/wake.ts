@@ -436,9 +436,15 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
   }
   const out: { agent: string; result: WakeResult | { ok: false; via: "brake"; error: string } }[] = [];
   for (const [agent, rows] of byAgent) {
-    const held = node.sessionsFor(agent).flatMap(session => {
+    const bound = node.sessionsFor(agent);
+    const held = bound.flatMap(session => {
       const guard = captureWakeIdentity(node, session); return guard ? [guard] : [];
     });
+    // A live exact session of a live lease whose authority was not captured: retry it, never strand its mail (T646).
+    const lease = node.store.db.prepare("SELECT cli FROM identity_leases WHERE name=? AND released_at IS NULL").get(agent) as { cli: string } | undefined;
+    const unverified = bound.filter(s => !s.session_id.startsWith("mcp-") && !held.some(g => g.session === s)
+      && s.cli === lease?.cli && !!s.pid && node.sameSession(s.pid, s));
+    if (!unverified.length) node.store.db.prepare("DELETE FROM kv WHERE k=?").run(`wake-capture-failed:${agent}`);
     const sessions = held.filter(g => !g.session.session_id.startsWith("mcp-"));
     // Only the current leased channel may suppress daemon delivery.
     if (held.some(g => g.session.channel)) continue;
@@ -539,6 +545,18 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
     // A name with no registered agent or session gets no notice, and notices are rate limited across all names (T196, F6):
     // mail to made-up names cannot flood the desktop or stall the daemon. The mail is still re-woken once a session binds.
     if (!result.ok && !noticeAllowed(node, agent, now)) {
+      // T646: an exact session exists but its wake authority could not be captured this pass. With no notice either,
+      // marking the mail notified would strand it until some later rebind; leave it delivered for the next pass.
+      if (!attempts && unverified.length) {
+        reservation.release?.();
+        const sessionsSeen = unverified.map(s => `${s.cli}:${s.session_id}`), seenKey = `wake-capture-failed:${agent}`;
+        if (node.store.get(seenKey) !== JSON.stringify(sessionsSeen)) {
+          node.store.set(seenKey, JSON.stringify(sessionsSeen));
+          node.store.audit("wake.capture_failed", { agent, sessions: sessionsSeen, count: wanted.length });
+        }
+        out.push({ agent, result: { ok: false, via: "lease", error: "wake identity not verified and notice skipped; delivery retained for a later pass" } });
+        continue;
+      }
       node.store.tx(() => ownRows.forEach(r => node.setDelivery(r.id, r.agent, "notified", "desktop")));
       node.store.audit("wake.notice_skipped", { agent, count: wanted.length });
       out.push({ agent, result: { ok: false, via: "desktop", error: "notice skipped (unknown agent or notice rate limit)" } });
