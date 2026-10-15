@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **A revisited OpenCode conversation is entered again, and the resume surface is stated instead of silent (T187).** OpenCode's plugin fires `session.created` only for a new conversation, so a reopened tab or a restarted serve never re-entered the notice path: the conversation had already been noticed, and the gate required the created event. A provider process generation entering a conversation it has not been in is now recorded as an entry (`resume-notice.ts` `takeServeEntry`, one per conversation and serve generation), so the hook emits the same bounded notice for it, and `agentmbx doctor` states the harness fact: OpenCode has no native resume/re-attach event, a revisited conversation is noticed once per serve generation, and the manual fallback is `mbx_whoami` / `mbx_inbox`.
+
 ## 0.5.40 (2026-10-15)
 
 - **`agentmbx watch` follows its own session's lease re-key instead of stopping (T653).** After a long idle, an mbx server can release its lease and claim it again with a new key: the same process, birth, CLI and session. Every running watcher then exited with "the lease this watcher was started for moved to another holder", so the session could no longer be woken until it re-armed. The watcher now follows such a re-key, and its record carries the new token so the daemon keeps deferring to it. A lease claimed by another process, or by the same process for a different session, still stops it with the same reason.
