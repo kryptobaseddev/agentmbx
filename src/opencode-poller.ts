@@ -55,10 +55,13 @@ const isStandalone = (kind: OpencodeHost, pid: number) => kind === "standalone" 
 /**
  * Poller targets for `agent`: bound standalone OpenCode sessions whose MCP is gone but whose plugin still polls.
  * Only exact rows of this agent count, and only when no lease-based holder exists for it (the caller decides that).
+ * A lease that is still current for a DIFFERENT session (the agent moved, or a sibling holds it) excludes every
+ * target: that stale row must not be woken for a mailbox it can no longer claim (T659 review).
  */
 export function pollerWakeTargets(node: MbxNode, agent: string, sessions: readonly WakeSession[], host?: Hosts): PollerTarget[] {
+  const lease = node.store.db.prepare("SELECT session_id FROM identity_leases WHERE name=? AND released_at IS NULL").get(agent) as { session_id: string } | undefined;
   return withProcSnapshot(() => sessions
-    .filter(s => s.agent === agent && pollerTargetLive(node, s, host))
+    .filter(s => s.agent === agent && pollerTargetLive(node, s, host) && (!lease || lease.session_id === s.session_id))
     .map(session => ({
       session,
       run: <T>(operation: () => T, readOnly = true): T => withProcSnapshot(() => {

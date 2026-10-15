@@ -11,6 +11,8 @@ import { dispatchWakes } from "../src/wake.ts";
 import { opencodeHostSeams } from "../src/opencode-provider.ts";
 import { pollerTargetLive, pollerWakeTargets } from "../src/opencode-poller.ts";
 import { completeOpencodeWake, listOpencodeWakeWaiters, resetOpencodeWakeQueue, waitForOpencodeWake } from "../src/opencode-wake-queue.ts";
+import { IdentityLeases, inspectLeaseProcess } from "../src/identity-leases.ts";
+import { fingerprint, generateKeyPair } from "../src/crypto.ts";
 import { delegateWake } from "./helpers/wake-lease.ts";
 
 const STANDALONE = ["/Users/x/.opencode/bin/opencode", "serve", "--stdio", "--port", "0"];
@@ -34,6 +36,9 @@ function evicted(t: { after: (fn: () => void) => unknown }, argv: string[] = STA
 
 const delivery = (n: MbxNode, id: string) => n.store.db.prepare("SELECT state,note FROM deliveries WHERE msg_id=? AND agent='worker'").get(id) as { state: string; note: string | null };
 const attempts = (n: MbxNode) => n.store.db.prepare("SELECT count(*) n FROM audit WHERE event='wake.attempt'").get<{ n: number }>()!.n;
+const pollerTargets = (n: MbxNode) => pollerWakeTargets(n, "worker", n.sessionsFor("worker")).length;
+const releaseLease = (n: MbxNode, agent: string, token: string) => new IdentityLeases(n.store).release(agent, token);
+const stateOf = (n: MbxNode, id: string) => delivery(n, id).state;
 
 test("T659: an evicted MCP with a live standalone poller is woken, with ids only", async t => {
   const n = evicted(t);
@@ -67,6 +72,25 @@ test("T659: a poller for a different pid than the bound row is not a target", as
   assert.deepEqual(listOpencodeWakeWaiters().map(w => w.pid), [process.pid + 1]);
   resetOpencodeWakeQueue();
   await other;
+});
+
+test("T659: a live lease held by another session means no poller wake", async t => {
+  const n = evicted(t);
+  const claim = (sessionId: string) => new IdentityLeases(n.store).claim("worker", { pid: process.pid,
+    start: inspectLeaseProcess(process.pid).start!, keyFp: fingerprint(generateKeyPair().publicKey), cli: "opencode", sessionId });
+  const lease = claim("ses_elsewhere");
+  const poll = waitForOpencodeWake(SESSION, process.pid, 1_000);
+  assert.equal(pollerTargets(n), 0, "the current lease names another session");
+  const sent = sendLeased(n, { from: "sender", to: ["worker"], subject: "urgent", body: "x", kind: "request" });
+  const out = await dispatchWakes(n);
+  assert.equal(attempts(n), 0, "a stale row must not be woken while the agent's lease names another session");
+  assert.equal(out[0]?.result.ok, false);
+  assert.equal(n.unreadCount("worker"), 1, "the mail is untouched");
+  releaseLease(n, "worker", lease.token);
+  assert.equal(pollerTargets(n), 1, "a released lease leaves the poller as the target again");
+  assert.equal(stateOf(n, sent.envelope.id), "notified", "nothing was handed to a serve while the lease named another session");
+  resetOpencodeWakeQueue();
+  await poll;
 });
 
 test("T659: no poller means no wake attempt, and the ordinary notice path applies", async t => {
