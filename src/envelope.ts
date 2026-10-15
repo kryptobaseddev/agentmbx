@@ -71,7 +71,7 @@ export function buildEnvelope(d: Draft, now = new Date()): Envelope {
   const id = ulid(now.getTime());
   return {
     v: 3, id, ts: now.toISOString(), from: d.from, to: d.to, thread: d.thread ?? id, reply_to: d.reply_to ?? null,
-    kind: d.kind ?? "message", subject: oneLine(d.subject).slice(0, 200), body: d.body, needs_reply: d.needs_reply ?? false,
+    kind: d.kind ?? "message", subject: fitSubject(d.subject).subject, body: d.body, needs_reply: d.needs_reply ?? false,
     refs: d.refs ?? [], meta: { ...parseMeta(d.body), ...(d.unverifiedSender ? { sender_verification: "unverified" as const } : {}), ...(d.origin === "external" ? { origin: "external" as const, external_since: d.external_since ?? now.toISOString(), external_source: d.external_since ? "inherited" as const : "declared" as const } : {}), ...(d.hop ? { hop: d.hop } : {}), ...(d.project ? { project: d.project.slice(0, 300) } : {}), ...(d.project_key ? { project_key: d.project_key.slice(0, 300) } : {}) },
     authority: null, enc: null,
   };
@@ -102,6 +102,25 @@ export function verifyEnvelope(e: Envelope, hostPub: string): boolean {
 /** Line breaks and other control characters, which could make sender text look like AgentMBX header lines (T196, F8). */
 const CONTROL = /[\u0000-\u001f\u007f\u0085\u2028\u2029]/;
 export const oneLine = (s: string) => s.replace(new RegExp(CONTROL.source, "g"), " ");
+
+/** T649: input subjects up to this many code points are accepted (and truncated); beyond it is abuse, not a long subject. */
+export const MAX_SUBJECT_INPUT = 1000;
+/** The one-line subject a sender's text becomes: at most MAX_SUBJECT characters, cut at a grapheme boundary (an emoji or a
+ *  combined sequence is never split) to 199 plus "…". The result fits the receive check in both code points and UTF-16 units,
+ *  so a paired host never rejects it. `from` is the input's length in code points. */
+export function fitSubject(raw: string): { subject: string; truncated: boolean; from: number; warning: string | null } {
+  const s = oneLine(raw);
+  const from = [...s].length;
+  if (from <= MAX_SUBJECT && s.length <= MAX_SUBJECT) return { subject: s, truncated: false, from, warning: null };
+  let out = "", points = 0;
+  for (const { segment } of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(s)) {
+    // UTF-16 units are never fewer than code points, so this one bound keeps both within 199 before the "…".
+    if (out.length + segment.length > MAX_SUBJECT - 1) break;
+    out += segment; points += [...segment].length;
+  }
+  const subject = out + "…";
+  return { subject, truncated: true, from, warning: `subject truncated from ${from} to ${points + 1} characters` };
+}
 
 export function checkShape(x: unknown): string | null {
   const e = x as Envelope;
