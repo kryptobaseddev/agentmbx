@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.36 (2026-10-14)
+
 - **The current mailbox holder can restore its wake endpoint (T648).** A still-running former MCP transport no longer blocks a newer lease generation for that same mailbox from publishing its control endpoint. Codex hook resume and thread metadata share one state/key, and a repeated claim repairs a stale same-process endpoint. Live foreign endpoints from the same generation or another mailbox stay protected; co-using servers never publish for the holder. CLI claim, release and signed owner takeover keep reaching the current endpoint.
 
 - **Read modes and signed current-session clearance (T629).** `mbx_read`/`mbx_thread` and CLI `read`/`thread` accept `metadata` (identifiers/counts/computed policy only, no sender text or exposure) and `quarantine` (a labelled untrusted extracted summary with source roots and explicit truncation). Full reads remain the default. CLI and MCP disclosures share durable conversation history. `owner clear|attest --cli … --session … --project … --reason … [--ttl 15m]` signs the complete current exposure snapshot for at most one hour; new exposures, scope changes, expiry and revocation invalidate it. `owner revoke-clearance <id>` revokes a record. The native preview refuses snapshots too large to show completely. Clearance records preserve history and grant no action class; automatic approval remains conservative until the later v2 activation slice.
