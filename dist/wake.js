@@ -12,7 +12,7 @@ import { captureWakeIdentity } from "./wake-identity.js";
 import { policyBrief } from "./policy.js";
 import { ulid } from "./crypto.js";
 import { opencodeHostOf } from "./opencode-provider.js";
-import { pushOpencodeWake } from "./opencode-wake-queue.js";
+import { listOpencodeWakeWaiters, pushOpencodeWake } from "./opencode-wake-queue.js";
 import { leadAgentOf, projectLabel, projectMailboxBySlot } from "./project-mailbox.js";
 import { isSlotName } from "./project-slot.js";
 const run = promisify(execFile);
@@ -146,6 +146,8 @@ export function queuedBehindTurnAt(store, agent, messageId) {
     }
 }
 /** T524: why a session that the shared service does not host is never pushed through it. */
+/** T646: the same session is also loaded in a standalone serve whose plugin could not take the wake right now. */
+export const OPENCODE_DUAL_HOST_NO_PUSH = "session is loaded by a standalone OpenCode serve as well as the shared service; not posting to the service, which would start a duplicate agent loop";
 export const OPENCODE_STANDALONE_NO_PUSH = "session is hosted by a standalone OpenCode serve; the shared service would start a duplicate agent loop (next-prompt delivery only)";
 /** Push a wake into an OpenCode session. A service-hosted binding (its provider pid is
  *  `opencode serve --service`) keeps the direct synthetic POST below. A standalone serve
@@ -170,6 +172,23 @@ export async function wakeOpencode(sessionId, text, o = {}) {
     }
     if (host !== "service")
         return outcome(via, { kind: "not_submitted", reason: "no-target", detail: "the OpenCode process hosting this session is unknown; not pushing through the shared service, which could start a duplicate agent loop" });
+    // T646: the binding says service, but a standalone serve's plugin is polling for this same session, so a tab has it loaded too.
+    // A resume:true POST would start a second agent loop in the service (and its restart later resumes that loop on its own). Hand the
+    // wake to the tab's plugin instead; if it can't take it now, nothing is posted to the service.
+    const standalone = (o.waiters ?? listOpencodeWakeWaiters)().filter(w => w.sessionID === sessionId && (o.host ?? opencodeHostOf)(w.pid) === "standalone");
+    if (standalone.length) {
+        for (const w of standalone) {
+            if (o.recheck && !o.recheck())
+                return outcome(via, { kind: "not_submitted", reason: "fenced" }, "wake authority changed");
+            const pushed = await pushOpencodeWake(sessionId, w.pid, text);
+            if (pushed.ok)
+                return outcome(via, { kind: "admitted", receipt: receipt("native", { nativeId: pushed.id, sessionId,
+                        nativeStatus: pushed.turnSince ? OPENCODE_QUEUED_BEHIND_TURN : "queued" }) });
+            if (pushed.handedOff)
+                return outcome(via, { kind: "unknown", reason: "lost-response", detail: "standalone plugin took the wake and returned no msg_ receipt" });
+        }
+        return outcome(via, { kind: "not_submitted", reason: "no-target", detail: OPENCODE_DUAL_HOST_NO_PUSH });
+    }
     const svc = await (o.service ?? opencodeService)();
     if (!svc)
         return outcome(via, { kind: "not_submitted", reason: "unavailable" }, "opencode service not running");

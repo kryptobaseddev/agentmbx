@@ -1339,7 +1339,8 @@ const pause = (ms: number) => new Promise<void>((r) => { const t = setTimeout(r,
 /** One long-poll per session, started once the session id is known, so both plugin generations share it.
  *  The poll admits through the serve we are already inside. It never posts to the shared service. */
 const watchWake = (ctx: NoteCtx, sid: string): void => {
-  if (!sid || wakeWatching.has(sid) || wakePort() === null) return;
+  // T646: the shared service is woken by the daemon's direct POST; its poll only competed with a tab's poll for the same session.
+  if (!sid || wakeWatching.has(sid) || wakePort() === null || !standaloneServe()) return;
   wakeWatching.add(sid);
   void (async () => {
     while (wakeWatching.has(sid)) {
