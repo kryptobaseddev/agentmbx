@@ -95,7 +95,7 @@ export function installedEntry() {
 }
 /** T533: an [anyNode, script] MCP/hook pair wired by ANOTHER shell's node still names this install
  *  when the script realpaths to the installed entry. Whether it stays "current" additionally
- *  depends on the node existing (see callers); the script alone decides what it names. */
+ *  depends on the node (see callers); the script alone decides what it names. */
 export function namesInstalledEntry(script) {
     const entry = installedEntry();
     if (!entry)
@@ -106,6 +106,65 @@ export function namesInstalledEntry(script) {
     catch {
         return false;
     }
+}
+/** package.json `engines.node` is `>=24`. A wired interpreter below this is too old. */
+export const NODE_ENGINES_FLOOR = 24;
+const nodeMajorCache = new Map();
+function nodeMajor(bin) {
+    const cached = nodeMajorCache.get(bin);
+    if (cached !== undefined)
+        return cached;
+    let major = null;
+    try {
+        const out = execFileSync(bin, ["-p", "process.versions.node"], {
+            encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "pipe"],
+        }).trim().replace(/^v/, "");
+        const n = Number(out.split(".")[0]);
+        major = Number.isInteger(n) && n > 0 ? n : null;
+    }
+    catch {
+        major = null;
+    }
+    nodeMajorCache.set(bin, major);
+    return major;
+}
+/** T654: the binary exists and its major version meets the engines floor. */
+export function nodeMeetsEnginesFloor(bin) {
+    if (!bin || !existsSync(bin))
+        return false;
+    const major = nodeMajor(bin);
+    return major !== null && major >= NODE_ENGINES_FLOOR;
+}
+function packageVersionOf(script) {
+    let dir;
+    try {
+        dir = dirname(realpathSync(script));
+    }
+    catch {
+        return null;
+    }
+    for (;;) {
+        const p = join(dir, "package.json");
+        if (existsSync(p)) {
+            try {
+                const v = JSON.parse(readFileSync(p, "utf8")).version;
+                return typeof v === "string" ? v : null;
+            }
+            catch {
+                return null;
+            }
+        }
+        const parent = dirname(dir);
+        if (parent === dir)
+            return null;
+        dir = parent;
+    }
+}
+/** T654: the script realpaths to this install and its package version is this build. */
+export function scriptNamesThisInstall(script) {
+    if (!namesInstalledEntry(script))
+        return false;
+    return packageVersionOf(script) === version();
 }
 /** T526/T532/T533: does `bin` run agentmbx? One token ending in agentmbx (bare, mise/asdf shim,
  *  SEA binary); or two tokens — a node-like runtime plus the agentmbx entry script (T504's
@@ -119,26 +178,26 @@ export function runsAgentmbx(bin) {
         return /(^|\/)agentmbx(\.exe)?$/.test(t[0]);
     return t.length === 2 && /(^|\/)(node|nodejs|bun|deno)[\w.]*(\.exe)?$/.test(t[0]) && /(^|\/)agentmbx\.js$/.test(t[1]);
 }
-/** T533: a configured [node, script, "mcp"] entry wired by ANOTHER shell's node names this install
- *  (script realpaths to the installed entry) and its node binary still exists — wired-and-current
- *  from any node, so neither doctor nor setup rewrites it. A missing node or a script that
- *  resolves elsewhere stays "ours but stale" and is rewritten in place by the writers. */
+/** T533/T654: a configured [node, script, "mcp"] entry wired by ANOTHER shell's node is current
+ *  when the script is this install (realpath and package version) and the node exists and meets
+ *  the engines floor. A missing or too-old node, or a script that resolves elsewhere, stays stale
+ *  and is rewritten in place by the writers. */
 export function mcpNodeScriptCurrent(entry) {
     if (typeof entry.command !== "string" || !Array.isArray(entry.args))
         return false;
     const [script, ...rest] = entry.args;
-    return rest.length === 1 && rest[0] === "mcp" && typeof script === "string" && existsSync(entry.command) && namesInstalledEntry(script);
+    return rest.length === 1 && rest[0] === "mcp" && typeof script === "string"
+        && nodeMeetsEnginesFloor(entry.command) && scriptNamesThisInstall(script);
 }
-/** T533: the hooks twin of mcpNodeScriptCurrent — one of OUR hook commands naming [another
- *  existing node, this install's entry] is current; setup leaves the bytes alone instead of
- *  rewriting them to this shell's node path. A missing node or a script that resolves elsewhere
- *  is rewritten (the stale-entry rules of each writer). */
+/** T533/T654: the hooks twin of mcpNodeScriptCurrent. [another node, this install's entry] is
+ *  current when that node meets the engines floor, so setup leaves the bytes alone. A missing or
+ *  too-old node, or a script that resolves elsewhere, is rewritten. */
 export function hookNamesInstalledEntry(command, sub, cli) {
     const tail = ` hook ${sub} --cli ${cli}`;
     if (!command.endsWith(tail))
         return false;
     const t = shellTokens(command.slice(0, -tail.length));
-    return !!t && t.length === 2 && existsSync(t[0]) && namesInstalledEntry(t[1]);
+    return !!t && t.length === 2 && nodeMeetsEnginesFloor(t[0]) && scriptNamesThisInstall(t[1]);
 }
 // T347: setup wires one status line per CLI — never overwrites a user's existing one. A foreign
 // status line is left alone and reported (runSetup adds a manual row with the snippet); uninstall
@@ -899,6 +958,44 @@ const posttoolFastPath = (home, cmd) => (sub) => {
     const script = join(skillDest(home), "scripts", "claude-posttool.sh");
     return existsSync(script) ? `sh ${shJoin([script])} ${shJoin(cmd)}` : null;
 };
+/** T654: `sh <this home's claude-posttool.sh> <node> <entry>` stays current when that node meets
+ *  the engines floor and the entry is this install. The wrapper does not end in `hook post-tool`,
+ *  so hookNamesInstalledEntry cannot see it; without this, a different node is rewritten. */
+function posttoolFastPathCurrent(command, home) {
+    const tokens = shellTokens(command);
+    if (!tokens || tokens.length !== 4 || !/(^|\/)sh$/.test(tokens[0]))
+        return false;
+    const script = join(skillDest(home), "scripts", "claude-posttool.sh");
+    try {
+        if (!existsSync(script) || realpathSync(tokens[1]) !== realpathSync(script))
+            return false;
+    }
+    catch {
+        return false;
+    }
+    return nodeMeetsEnginesFloor(tokens[2]) && scriptNamesThisInstall(tokens[3]);
+}
+const HOOK_SUBS = ["session-start", "session-end", "prompt", "permission", "post-tool", "stop"];
+/** T654: the node binary of a hook command that is current for this install, else null. */
+export function currentHookNode(command, cli, home) {
+    for (const sub of HOOK_SUBS) {
+        if (!hookNamesInstalledEntry(command, sub, cli))
+            continue;
+        const tail = ` hook ${sub} --cli ${cli}`;
+        const tokens = shellTokens(command.slice(0, -tail.length));
+        return tokens?.[0] ?? null;
+    }
+    if (cli === "claude" && posttoolFastPathCurrent(command, home)) {
+        const tokens = shellTokens(command);
+        return tokens?.[2] ?? null;
+    }
+    return null;
+}
+function hookCommandCurrent(command, sub, cli, home) {
+    if (hookNamesInstalledEntry(command, sub, cli))
+        return true;
+    return sub === "post-tool" && cli === "claude" && !!home && posttoolFastPathCurrent(command, home);
+}
 const read = (p) => existsSync(p) ? readFileSync(p, "utf8") : null;
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 export function defaultWhich(bin) {
@@ -960,7 +1057,7 @@ const STOP_EVENTS = [...HOOK_EVENTS, ["Stop", "stop"]];
 /** Hooks in the Claude/Codex shape: { hooks: { Event: [ { hooks: [ {type, command} ] } ] } }. Appends groups; never edits others.
  *  `commandFor` overrides the command for an event (T342: PostToolUse runs the bundled sh fast
  *  path when the skill script is installed; absent, the event keeps the direct `agentmbx hook`. */
-function jsonHooks(events, cli, cmd, commandFor) {
+function jsonHooks(events, cli, cmd, commandFor, home) {
     const install = (cur) => {
         const obj = parseObj(cur);
         let changed = false;
@@ -974,8 +1071,9 @@ function jsonHooks(events, cli, cmd, commandFor) {
                 changed = true;
                 continue;
             }
-            // T533: [another existing node, this install's entry] is current — never rewritten to this shell's node path.
-            if (ours[0].command !== want && !hookNamesInstalledEntry(ours[0].command ?? "", sub, cli)) {
+            // T533/T654: [another node that meets the engines floor, this install's entry] is current,
+            // including Claude's post-tool sh wrapper. Never rewritten to this shell's node path.
+            if (ours[0].command !== want && !hookCommandCurrent(ours[0].command ?? "", sub, cli, home)) {
                 ours[0].command = want;
                 changed = true;
             }
@@ -1582,19 +1680,54 @@ export const versionOnlyPackageDiff = (cur, content) => {
         return false;
     }
 };
+/** The argv embedded by opencodePluginSource: `runFor(ctx, <json string[]>, ...)`, twice. Both
+ *  copies must agree. The template text is not a `const bin =` assignment. */
+function embeddedPluginCommand(cur) {
+    const found = [];
+    for (const m of cur.matchAll(/runFor\(ctx, (\[[^\n]*\]),/g)) {
+        try {
+            const v = JSON.parse(m[1]);
+            if (!Array.isArray(v) || !v.every((x) => typeof x === "string"))
+                return null;
+            found.push(v);
+        }
+        catch {
+            return null;
+        }
+    }
+    if (!found.length)
+        return null;
+    const first = JSON.stringify(found[0]);
+    return found.every((v) => JSON.stringify(v) === first) ? found[0] : null;
+}
+/** T654: the node embedded in an OpenCode plugin that is current for this install, else null.
+ *  The template text is unchanged; only the comparison treats another good node as the same file. */
+export function opencodeWiredNode(cur, ver) {
+    if (cur === null || !isOpencodePluginOurs(cur))
+        return null;
+    const embedded = embeddedPluginCommand(cur);
+    if (!embedded || embedded.length < 2 || !nodeMeetsEnginesFloor(embedded[0]) || !scriptNamesThisInstall(embedded[1]))
+        return null;
+    const alt = opencodePluginSource(embedded, ver);
+    if (cur !== alt && !headerOnlyDiff(cur, alt))
+        return null;
+    return embedded[0];
+}
 /** The OpenCode hooks edit: one whole file we own. Foreign content is left alone and reported.
  *  T486: a header-only (release-version) difference is ours and wired — install leaves the file
- *  byte-for-byte alone, so no backup row, no rewrite, and no OpenCode service restart. */
+ *  byte-for-byte alone, so no backup row, no rewrite, and no OpenCode service restart.
+ *  T654: a plugin whose only difference is a node that meets the engines floor is also current. */
 export function opencodeHooks(cmd, ver) {
     const content = opencodePluginSource(cmd, ver);
+    const current = (cur) => cur === content || headerOnlyDiff(cur, content) || opencodeWiredNode(cur, ver) !== null;
     return {
         install: (cur) => {
-            if (headerOnlyDiff(cur, content))
+            if (current(cur))
                 return cur;
             return (cur === null || isOpencodePluginOurs(cur)) && cur !== content ? content : cur;
         },
         uninstall: (cur) => (cur === null || isOpencodePluginOurs(cur)) ? null : cur,
-        isWired: (cur) => cur === content || headerOnlyDiff(cur, content),
+        isWired: (cur) => current(cur),
     };
 }
 // ---- OpenCode sidebar plugin (T411) ------------------------------------------------------------
@@ -2422,7 +2555,7 @@ export function edits(ctx, cli) {
                         }
                     } },
                 { cli, kind: "hooks", item: "hooks SessionStart + SessionEnd + UserPromptSubmit + PostToolUse + PermissionRequest + Stop", path: join(home, ".claude/settings.json"),
-                    ...jsonHooks([...STOP_EVENTS, ["PostToolUse", "post-tool"], ["SessionEnd", "session-end"]], "claude", cmd, posttoolFastPath(home, cmd)),
+                    ...jsonHooks([...STOP_EVENTS, ["PostToolUse", "post-tool"], ["SessionEnd", "session-end"]], "claude", cmd, posttoolFastPath(home, cmd), home),
                     isWired: (cur) => {
                         try {
                             const hooks = (JSON.parse(cur ?? "null")?.hooks ?? {});
