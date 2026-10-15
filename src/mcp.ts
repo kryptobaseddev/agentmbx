@@ -998,6 +998,12 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
     state.leaseToken = undefined;
     resume(state, name);
   };
+  // T665: exec keeps the holder's pid and birth; its released lease identifies the exact thread even without a hook.
+  if (env.cli === "codex" && parentAgent && !base.released && base.sessionId.startsWith("mcp-")) {
+    const prior = node.store.db.prepare("SELECT session_id FROM identity_leases WHERE name=? AND cli=? AND holder_pid=? AND holder_start=? AND released_at IS NOT NULL")
+      .get(parentAgent, env.cli, process.pid, holderStart()) as { session_id: string } | undefined;
+    if (prior) base.sessionId = env.sessionId = prior.session_id;
+  }
   // T622: a handover child is told the released name and detectHost's provisional
   // mcp-<pid>. parentAgent short-circuits rememberedName, so the reclaim claimed
   // under that provisional id while bindSession and whoami already had the one
