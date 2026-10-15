@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.37 (2026-10-15)
+
 - **A reply-shaped `mbx_send` is sent as the reply, and handoff notes may be up to 4000 characters (T652).** Agents, OpenCode ones especially, often called `mbx_send` with `mbx_reply`'s arguments (`{id, body, kind}`). The schema refused it with "to: Missing key, subject: Missing key", and the agent spent a turn resending through `mbx_reply`.
   - **Sent as the reply:** `mbx_send` now treats a message id (`id`, an alias of `reply_to`) with no `to` as that reply. It is sent once through `mbx_reply`'s own path: same recipient, `Re:` subject, thread, kind `reply`, and the same policy and taint handling. The result notes "treated as a reply to <id>; mbx_reply is the reply tool".
   - **Replying to other recipients:** `to` together with a message id but no subject sends in that thread with the `Re:` subject.
