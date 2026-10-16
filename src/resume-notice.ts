@@ -38,6 +38,19 @@ export function resumeNotice(store: Store, agent: string, identityLine: string):
 }
 
 /**
+ * T187: true once per (conversation, provider process generation) this harness has not been entered through yet.
+ * OpenCode has no resume/re-attach event — session.created fires only for a new conversation — so a reopened tab or a
+ * restarted serve re-enters through this signal, which is the same R8 entry every other adapter uses ("a new process
+ * resuming the same id"). The caller keeps the notice bounded and silent when there is nothing to catch up on.
+ */
+export function takeServeEntry(store: Store, cli: string, session: string, pid: number, pidStart: string | null): boolean {
+  const key = `resume-serve:${cli}:${session}`, value = `${pid} ${pidStart ?? "?"}`;
+  if (store.get(key) === value) return false;
+  store.set(key, value);
+  return true;
+}
+
+/**
  * True once per entry of one provider process into a conversation (R8): the first call for a session id this process (pid
  * plus its recorded start) has not been in, and every switch after that (/new, /resume, back to an earlier conversation, a
  * compression's new id, a new process resuming the same id). Records the entry; one key per pid, so it stays bounded.

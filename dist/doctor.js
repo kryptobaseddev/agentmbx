@@ -755,6 +755,16 @@ export function mcpCommandChecks(ctx, cli) {
         return [{ level: "fail", label: `${cli}: MCP command resolves agentmbx ${v}, but this install is ${VERSION} (${script})`, fix }];
     return [];
 }
+/**
+ * T187: OpenCode's plugin has no resume or re-attach event to consume — session.created fires only for a new
+ * conversation — so a revisited conversation is entered through the provider-process generation instead
+ * (resume-notice.ts takeServeEntry) and noticed once per generation; the manual fallback is the mailbox itself.
+ * A harness fact, like the grok push-path row: info only, and it never fails doctor (T435).
+ */
+export function opencodeResumeSurfaceChecks() {
+    return [{ level: "info", label: "opencode: no native resume/re-attach event (session.created fires only for a new conversation); "
+                + "a revisited conversation is noticed once per serve generation, and the manual fallback is mbx_whoami / mbx_inbox" }];
+}
 export function statuslineChecks(ctx, cli) {
     if (cli === "opencode")
         return [{ level: "info", label: "opencode: no custom status line feature (built-in segments only: anomalyco/opencode#30295); nothing to verify" }];
@@ -963,6 +973,10 @@ export async function doctor(ctx, mbxHome, opts = {}) {
                 out.push(c);
         if (d.cli === "opencode" && node)
             out.push(...await opencodePluginChecks(ctx, node));
+        // T187: the harness fact that OpenCode has no resume/re-attach event, and what the fallback is (info, non-fatal).
+        if (d.cli === "opencode")
+            for (const c of opencodeResumeSurfaceChecks())
+                out.push(c);
         // T460: its own function too (the T435 rule): a refused hooks layout and the not-approved state are Hermes facts.
         if (d.cli === "hermes")
             for (const c of hermesHooksChecks(ctx))

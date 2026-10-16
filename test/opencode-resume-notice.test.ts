@@ -125,3 +125,46 @@ test("T187: the compiled hook emits the same exact-session bounded entry envelop
   assert.match(notices[0].text, /compiled-worker@alpha/); assert.match(notices[0].text, /mbx_catchup/);
   assert.equal(f.protectedState(), before);
 });
+
+// T187: OpenCode fires session.created only for a new conversation, so a reopened tab or a restarted serve enters
+// through its serve generation. post-tool does not rebind, so the row stands for whatever serve wrote it last.
+test("T187: a conversation already noticed is entered once more by a new serve generation", t => {
+  const f = fixture(t), sid = "ses_revisit", agent = "revisit-worker";
+  f.bind(agent, sid);
+  f.n.send({ from: "sender", to: [agent], subject: "PRIVATE SUBJECT", body: "PRIVATE BODY" });
+  const before = f.protectedState();
+  const fresh = f.hook(sid, "session-start", true).notices;
+  assert.equal(fresh.length, 1, "the fresh entry notices first");
+  assert.deepEqual(f.hook(sid, "post-tool").notices, [], "the same serve generation is never noticed twice");
+  // a new serve generation for the same conversation (a reopened tab, or a restarted serve)
+  f.n.store.db.prepare("UPDATE sessions SET pid=?, pid_start=? WHERE cli='opencode' AND session_id=?").run(4242, "ps-utc:Thu Oct 16 00:20:00 2026", sid);
+  const again = f.hook(sid, "post-tool").notices;
+  assert.equal(again.length, 1, "the new generation is entered once");
+  assert.equal(again[0].session_id, sid);
+  assert.match(again[0].text, /revisit-worker@alpha \(role: builder\)/);
+  assert.match(again[0].text, /not caught up on/);
+  assert.ok(again[0].text.length <= 1200 && again[0].text.split("\n").length <= 8, "bounded like the fresh entry");
+  assert.doesNotMatch(again[0].text, /PRIVATE SUBJECT|PRIVATE BODY/);
+  assert.equal(f.protectedState(), before, "no mail, lease or checkpoint change");
+  assert.deepEqual(f.hook(sid, "post-tool").notices, [], "and then it is silent too");
+});
+
+test("T187: a conversation that was never noticed is not a resume, whatever its serve generation", t => {
+  const f = fixture(t), sid = "ses_unnoticed", agent = "unnoticed-worker";
+  f.bind(agent, sid);
+  f.n.send({ from: "sender", to: [agent], subject: "private", body: "private" });
+  const before = f.protectedState();
+  assert.deepEqual(f.hook(sid, "post-tool").notices, [], "ordinary activity is not an entry");
+  f.n.store.db.prepare("UPDATE sessions SET pid=?, pid_start=? WHERE cli='opencode' AND session_id=?").run(5252, "ps-utc:Thu Oct 16 00:25:00 2026", sid);
+  assert.deepEqual(f.hook(sid, "post-tool").notices, [], "and a new generation alone does not make it one");
+  assert.equal(f.protectedState(), before);
+});
+
+test("T187 D7: a revisit with nothing to catch up on stays silent and records no notice", t => {
+  const f = fixture(t);
+  f.bind("quiet-worker", "ses_quiet");
+  const before = f.protectedState();
+  assert.deepEqual(f.hook("ses_quiet", "session-start", true).notices, []);
+  assert.deepEqual(f.hook("ses_quiet", "post-tool").notices, []);
+  assert.equal(f.protectedState(), before);
+});

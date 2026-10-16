@@ -18,7 +18,7 @@ import { HUD_ALIVE_MAX_MS, HUD_SCHEMA, hudAlivePath, hudDir, hudPidLinePath, hud
 import { STATUS_V2_SCHEMA } from "./status-schema.js";
 import { detectHost, HERMES_WATCHER_INSTRUCTION, HERMES_WATCHER_REMINDER, MCP_HEARTBEAT_MS, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
 import { HERMES_NAG_MS, hermesHookInput, hermesHookOutput } from "./hermes-hook.js";
-import { resumeNotice, takeResumeEntry } from "./resume-notice.js";
+import { resumeNotice, takeResumeEntry, takeServeEntry } from "./resume-notice.js";
 import { missedCount } from "./catchup.js";
 import { ancestors, processEvidenceSpawns, withProcSnapshot } from "./proc.js";
 import { bumpPostToolMarkersForAgent, readPostToolMarker, writePostToolLast } from "./posttool.js";
@@ -1920,8 +1920,10 @@ async function hook(node, event, cli) {
         node.store.set(ocEntry, "created");
     // T189/T185: record this provider process's entry into the session (src/resume-notice.ts); true for a new entry. pid and its
     // start time come from the sessions row bindSession just wrote, so this spawns nothing.
+    /** T187: this conversation's current serve generation, as the sessions row recorded it. */
+    const sessionPid = (session) => node.store.db.prepare("SELECT pid,pid_start FROM sessions WHERE cli=? AND session_id=?").get(cli, session);
     const enteredNow = (session) => {
-        const at = node.store.db.prepare("SELECT pid,pid_start FROM sessions WHERE cli=? AND session_id=?").get(cli, session);
+        const at = sessionPid(session);
         return !!at?.pid && takeResumeEntry(node.store, cli, at.pid, at.pid_start, session);
     };
     // Inspect provider capabilities and processes before the lease transaction. No directory-based session discovery.
@@ -1968,6 +1970,25 @@ async function hook(node, event, cli) {
                         console.log(JSON.stringify({ mbx_resume: { session_id: sid, text: resumeNotice(node.store, agent, identity) } }));
                     }
                     node.store.set(noticed, "created"); // emitted or deliberately silent (D7), not a read/ACK or delivery receipt
+                    // T187: record the serve generation this fresh entry belongs to, so the revisit block below cannot repeat it.
+                    const gen = sessionPid(sid);
+                    if (gen?.pid)
+                        takeServeEntry(node.store, cli, sid, gen.pid, gen.pid_start);
+                }
+            }
+            // T187: OpenCode has no resume/re-attach event. A serve generation entering a conversation that was ALREADY
+            // noticed (so a reopened tab or a restarted serve) is the entry it does support (T184 R8): the same bounded
+            // notice, once per (conversation, serve generation). A conversation we never noticed is not a resume, and
+            // ordinary shared-serve activity is never an entry.
+            if (cli === "opencode" && sid && ["session-start", "prompt", "post-tool"].includes(event)
+                && node.store.get(`resume-noticed:opencode:${sid}:${agent}`)) {
+                const gen = sessionPid(sid);
+                if (gen?.pid && takeServeEntry(node.store, cli, sid, gen.pid, gen.pid_start)) {
+                    const unread = node.unreadCount(agent), missed = missedCount(node.store, agent).missed;
+                    if (unread || missed) {
+                        const identity = held(agent) + (unread ? `\n[mbx] ${unread} unread mbx message(s): call mbx_inbox.` : "");
+                        console.log(JSON.stringify({ mbx_resume: { session_id: sid, text: resumeNotice(node.store, agent, identity) } }));
+                    }
                 }
             }
             if (event === "session-start") {
