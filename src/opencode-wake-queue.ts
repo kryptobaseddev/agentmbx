@@ -119,10 +119,17 @@ export async function pushOpencodeWake(sessionID: string, pid: number, text: str
   return id.startsWith("msg_") ? { ok: true, id, turnSince: slot.turnSince } : { ok: false, handedOff: true };
 }
 
-/** The plugin reports the id `ctx.session.synthetic` actually returned. Anything else is refused. `turnSince` (T642): the
- *  session was mid-turn when the wake was admitted, since that ISO time; null when idle or not reported (an older plugin). */
-export function completeOpencodeWake(sessionID: string, id: string, turnSince: string | null = null): boolean {
-  const slot = [...slots.entries()].find(([key, s]) => sessionOf(key) === sessionID && s.offered && !s.settled)?.[1];
+/**
+ * The plugin reports the id `ctx.session.synthetic` actually returned. Anything else is refused. `turnSince` (T642):
+ * the session was mid-turn when the wake was admitted, since that ISO time; null when idle or not reported (an older
+ * plugin). T672: slots are per (session, pid), so a receipt with `pid` settles only that serve's offer. Without a pid
+ * the offer is settled only when exactly one is outstanding for the session: with two (two serves polling one session)
+ * the receipt names no serve, and settling the wrong one would credit an admission that never happened.
+ */
+export function completeOpencodeWake(sessionID: string, id: string, turnSince: string | null = null, pid?: number): boolean {
+  const offered = [...slots.entries()].filter(([key, s]) => sessionOf(key) === sessionID && s.offered && !s.settled);
+  const slot = pid === undefined ? (offered.length === 1 ? offered[0][1] : undefined)
+    : offered.find(([key]) => key === slotKey(sessionID, pid))?.[1];
   if (slot && id === OPENCODE_WAKE_BUSY) { slot.busy = true; slot.accept(id); return true; } // T647
   if (!slot || !id.startsWith("msg_")) return false;
   slot.turnSince = turnSince;
