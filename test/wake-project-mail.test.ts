@@ -1,3 +1,4 @@
+import { writeCodexQueueStub } from "./helpers/codex-queue.ts";
 // T557: the daemon wake dispatcher keys project-mailbox mail to the project's current lead.
 // A slot has no session of its own. Mail delivered to it wakes the owner-signed, unrevoked, unexpired lead designated on this host, through that
 // lead's own verified session, and nobody else; a lead change or a released lease is honoured at the last moment; with no lead to wake, the mail waits.
@@ -25,16 +26,8 @@ function fixture(t: TestContext) {
   const home = mkdtempSync(join(tmpdir(), "mbx-t557-")), root = mkdtempSync(join(tmpdir(), "mbx-t557-root-"));
   const n = new MbxNode(home, { host: "alpha" });
   const log = join(home, "calls"), bin = join(home, "codex");
-  // A fake codex: it records every argument of every invocation (unit-separated), one line per call, and the in-flight attempt marker as the
-  // dispatcher had durably written it before this native write (WC-14). No real session exists.
   const markers = join(home, "markers");
-  writeFileSync(bin, `#!/usr/bin/env node
-const fs = require("node:fs"), { DatabaseSync } = require("node:sqlite");
-fs.appendFileSync(process.env.MBX_TEST_WAKE_LOG, process.argv.slice(2).map((a) => a + "\\x1f").join("") + "\\n");
-const db = new DatabaseSync(process.env.MBX_TEST_DB, { readOnly: true });
-for (const r of db.prepare("SELECT v FROM kv WHERE k LIKE 'wake-attempt:%'").all()) fs.appendFileSync(process.env.MBX_TEST_MARKERS, r.v + "\\n");
-if (process.env.MBX_TEST_KILL) process.kill(process.pid, "SIGKILL"); // killed after the write: the adapter cannot know whether it landed
-`, { mode: 0o700 });
+  writeCodexQueueStub(bin, { format: "args" });
   const old = { MBX_CODEX_BIN: process.env.MBX_CODEX_BIN, MBX_TEST_WAKE_LOG: process.env.MBX_TEST_WAKE_LOG, MBX_NO_DESKTOP: process.env.MBX_NO_DESKTOP, MBX_TEST_DB: process.env.MBX_TEST_DB, MBX_TEST_MARKERS: process.env.MBX_TEST_MARKERS, MBX_TEST_KILL: process.env.MBX_TEST_KILL };
   Object.assign(process.env, { MBX_CODEX_BIN: bin, MBX_TEST_WAKE_LOG: log, MBX_NO_DESKTOP: "1", MBX_TEST_DB: join(home, "mbx.db"), MBX_TEST_MARKERS: markers });
   t.after(() => {

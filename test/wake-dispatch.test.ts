@@ -1,7 +1,8 @@
+import { writeCodexQueueStub } from "./helpers/codex-queue.ts";
 import { sendLeased } from "./helpers/leased-send.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -19,7 +20,7 @@ import { recipientReceipts, receiptLine, sentPage } from "../src/receipts.ts";
 for (const defect of ["generation", "parent"] as const) test(`T376: rejected control ${defect} never promises a native wake`, async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-receipt-fence-")), n = new MbxNode(home, { host: "alpha" });
   const log = join(home, "calls"), bin = join(home, "codex");
-  writeFileSync(bin, '#!/bin/sh\nprintf called >> "$MBX_TEST_WAKE_LOG"\n', { mode: 0o700 });
+  writeCodexQueueStub(bin);
   const old = { MBX_CODEX_BIN: process.env.MBX_CODEX_BIN, MBX_TEST_WAKE_LOG: process.env.MBX_TEST_WAKE_LOG, MBX_NO_DESKTOP: process.env.MBX_NO_DESKTOP };
   Object.assign(process.env, { MBX_CODEX_BIN: bin, MBX_TEST_WAKE_LOG: log, MBX_NO_DESKTOP: "1" });
   t.after(() => { for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
@@ -50,7 +51,7 @@ for (const invalid of ["dead-pid", "reused-pid", "missing-birth", "expired", "no
     const home = mkdtempSync(join(tmpdir(), "mbx-wake-target-"));
     const n = new MbxNode(home, { host: "alpha" });
     const log = join(home, "calls"), bin = join(home, "codex");
-    writeFileSync(bin, '#!/bin/sh\nprintf "%s\\n" "$3" >> "$MBX_TEST_WAKE_LOG"\n', { mode: 0o700 });
+  writeCodexQueueStub(bin);
     const old = { MBX_CODEX_BIN: process.env.MBX_CODEX_BIN, MBX_TEST_WAKE_LOG: process.env.MBX_TEST_WAKE_LOG, MBX_NO_DESKTOP: process.env.MBX_NO_DESKTOP };
     Object.assign(process.env, { MBX_CODEX_BIN: bin, MBX_TEST_WAKE_LOG: log, MBX_NO_DESKTOP: "1" });
     t.after(() => { for (const [k,v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
@@ -96,7 +97,7 @@ for (const defect of ["released", "generation", "key", "parent", "missing-contro
   if (defect === "missing-control") n.store.db.prepare("DELETE FROM kv WHERE k GLOB 'identity-control:*'").run();
   if (defect === "legacy") n.store.db.prepare("DELETE FROM identity_leases").run();
   const log = join(home, "calls"), bin = join(home, "codex");
-  writeFileSync(bin, '#!/bin/sh\nprintf called >> "$MBX_TEST_WAKE_LOG"\n', { mode: 0o700 });
+  writeCodexQueueStub(bin);
   const old = { MBX_CODEX_BIN: process.env.MBX_CODEX_BIN, MBX_TEST_WAKE_LOG: process.env.MBX_TEST_WAKE_LOG, MBX_NO_DESKTOP: process.env.MBX_NO_DESKTOP };
   Object.assign(process.env, { MBX_CODEX_BIN: bin, MBX_TEST_WAKE_LOG: log, MBX_NO_DESKTOP: "1" });
   t.after(() => { for (const [k,v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
@@ -124,7 +125,7 @@ test("daemon routes an actual MCP holder and refuses its stale binding after rel
   const home = mkdtempSync(join(tmpdir(), "mbx-wake-mcp-")), n = new MbxNode(home, { host: "alpha" });
   const client = new Client({ name: "wake-test", version: "1" });
   const log = join(home, "calls"), bin = join(home, "codex");
-  writeFileSync(bin, '#!/bin/sh\nprintf "%s\n" "$3" >> "$MBX_TEST_WAKE_LOG"\n', { mode: 0o700 });
+  writeCodexQueueStub(bin);
   const old = { MBX_CODEX_BIN: process.env.MBX_CODEX_BIN, MBX_TEST_WAKE_LOG: process.env.MBX_TEST_WAKE_LOG, MBX_NO_DESKTOP: process.env.MBX_NO_DESKTOP };
   Object.assign(process.env, { MBX_CODEX_BIN: bin, MBX_TEST_WAKE_LOG: log, MBX_NO_DESKTOP: "1" });
   t.after(async () => { await client.close(); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
