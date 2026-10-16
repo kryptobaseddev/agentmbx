@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { BACKUP_KEEP, pruneAgentmbxBackups, pruneSidebarBackups, runSetup, opencodeSidebarDir, type SetupCtx } from "../src/setup.ts";
+import { BACKUP_KEEP, pruneAgentmbxBackups, pruneSidebarBackups, pruneSidebarFileBackups, runSetup, opencodeSidebarDir, type SetupCtx } from "../src/setup.ts";
 import { opencodeSidebarSource, OPENCODE_SIDEBAR_MARKER } from "../src/opencode-sidebar.ts";
 import { version } from "../src/version.ts";
 
@@ -21,6 +21,40 @@ const put = (home: string, rel: string, body: string) => { mkdirSync(dirname(joi
 const backupsOf = (dir: string, base: string) => readdirSync(dir).filter((n) => n.startsWith(`${base}.bak-agentmbx-`)).sort();
 /** Five stamps in time order, as `agentmbx setup` writes them (YYYYMMDD-HHMMSS). */
 const STAMPS = ["20261010-220333", "20261011-084250", "20261013-013022", "20261015-064245", "20261016-000000"];
+
+test("T671: a user config's AgentMBX backups are never pruned, while the sidebar still bounds its own", (t) => {
+  const home = homeOf();
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  put(home, ".claude/settings.json", "{}\n");
+  for (const s of STAMPS) put(home, `.claude/settings.json.bak-agentmbx-${s}`, `recovery image ${s}\n`);
+  runSetup(ctxFor(home), { mode: "install", only: ["opencode"], stamp: STAMPS[0] });
+  const dir = opencodeSidebarDir(home);
+  for (const s of STAMPS.slice(1, 4)) writeFileSync(join(dir, `tui.ts.bak-agentmbx-${s}`), `stale ${s}\n`);
+  const rows = runSetup(ctxFor(home), { mode: "install", stamp: STAMPS[4] });
+  const claudeRows = rows.filter((r) => r.cli === "claude" && r.action === "added" || r.action === "updated");
+  assert.ok(claudeRows.length, `claude wiring ran: ${JSON.stringify(rows.filter((r) => r.cli === "claude"))}`);
+  const claudeBackups = backupsOf(join(home, ".claude"), "settings.json");
+  assert.equal(claudeBackups.length, 5, "four recovery images survive, plus the one this run wrote");
+  assert.ok(claudeBackups.includes(`settings.json.bak-agentmbx-${STAMPS[0]}`), "the oldest recovery image is still there");
+  assert.equal(readFileSync(join(home, `.claude/settings.json.bak-agentmbx-${STAMPS[0]}`), "utf8"), `recovery image ${STAMPS[0]}\n`);
+  assert.deepEqual(backupsOf(dir, "tui.ts"), [`tui.ts.bak-agentmbx-${STAMPS[2]}`, `tui.ts.bak-agentmbx-${STAMPS[3]}`],
+    "the sidebar package is still bounded in the same run");
+});
+
+test("T671: the write-time prune ignores everything outside the sidebar package directory", (t) => {
+  const home = homeOf();
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  const outside = join(home, ".config/opencode/tui.json"), inside = join(opencodeSidebarDir(home), "tui.ts");
+  mkdirSync(dirname(inside), { recursive: true });
+  for (const p of [outside, inside]) {
+    writeFileSync(p, "live\n");
+    for (const s of STAMPS) writeFileSync(`${p}.bak-agentmbx-${s}`, `image ${s}\n`);
+  }
+  assert.deepEqual(pruneSidebarFileBackups(home, outside), [], "a user config file outside the package is untouched");
+  assert.equal(backupsOf(dirname(outside), "tui.json").length, 5);
+  assert.equal(pruneSidebarFileBackups(home, inside).length, 3, "the package's own file is bounded");
+  assert.deepEqual(backupsOf(dirname(inside), "tui.ts"), [`tui.ts.bak-agentmbx-${STAMPS[3]}`, `tui.ts.bak-agentmbx-${STAMPS[4]}`]);
+});
 
 test("T671: pruning keeps the newest two of our own backups per file and touches nothing else", (t) => {
   const home = homeOf();

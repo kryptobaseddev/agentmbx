@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **Setup no longer accumulates OpenCode sidebar pre-edit images (T671).** Every setup run wrote a new `<file>.bak-agentmbx-<stamp>` image of whatever it changed, and nothing ever removed the older ones: the sidebar package, rebuilt on every release, had collected eight. Setup now keeps the newest two images per file and removes the older ones it wrote itself — never the live file and never a differently named backup — both where a backup is written and, for the sidebar package, on every install. A dry run still changes nothing.
+- **Setup no longer accumulates OpenCode sidebar pre-edit images (T671).** Every setup run wrote a new `<file>.bak-agentmbx-<stamp>` image of whatever it changed, and nothing ever removed the older ones: the sidebar package, rebuilt on every release, had collected eight. Setup now keeps the newest two images per file for the OpenCode sidebar package and removes the older ones it wrote itself — never the live file and never a differently named backup — both where a backup is written and on every install. The images it keeps of other managed files (the owner's claude settings, codex hooks, and so on) are recovery points of files we edit, so they are left alone. A dry run still changes nothing.
 
 ## 0.5.40 (2026-10-15)
 

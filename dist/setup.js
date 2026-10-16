@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 import { accessSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync, } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir, hostname } from "node:os";
-import { basename, delimiter, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { insertMember, member, parseJsonc, removeMember, replaceValue, valueOf } from "./jsonc.js";
 import { parse as parseToml } from "smol-toml";
@@ -1803,6 +1803,13 @@ export function pruneSidebarBackups(home, keep = BACKUP_KEEP) {
     }
     return [...bases].flatMap((base) => pruneAgentmbxBackups(join(dir, base), keep));
 }
+/** T671: the write-time prune, gated to the sidebar package directory. The images AgentMBX keeps of other managed
+ *  files (the owner's claude settings, codex hooks, …) are recovery points of files we edit, so they are never
+ *  dropped here — only the OpenCode sidebar package is bounded. */
+export function pruneSidebarFileBackups(home, path, keep = BACKUP_KEEP) {
+    const dir = opencodeSidebarDir(home);
+    return path !== dir && path.startsWith(`${dir}${sep}`) ? pruneAgentmbxBackups(path, keep) : [];
+}
 /** The package.json edit: same ownership rule through the package name, with the version field as
  *  its managed version header (T486). */
 function opencodeSidebarPackage(content) {
@@ -2912,7 +2919,7 @@ export function runSetup(ctx, o) {
                         row.backup = `${e.path}.bak-agentmbx-${stamp}`;
                         if (!existsSync(row.backup))
                             writeFileSync(row.backup, cur, { mode: 0o600 });
-                        pruneAgentmbxBackups(e.path);
+                        pruneSidebarFileBackups(ctx.home, e.path);
                     }
                     if (!e.viaCli?.(ctx, o.mode, cur)) {
                         if (next === null)
