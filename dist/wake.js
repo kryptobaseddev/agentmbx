@@ -473,8 +473,17 @@ function reconcileWakes(node, now) {
         });
         node.store.audit("wake.unknown", { agent: a.agent, attempt: a.attemptId, reason: "killed", count: pairs.length });
     }
-    node.store.db.prepare("UPDATE deliveries SET state='delivered', note=NULL WHERE state='notified' AND note='unknown' AND updated_at<?")
-        .run(new Date(now - UNKNOWN_HOLD_MS).toISOString());
+    // One statement for both restores (an optional mailbox filter), so mail held as unknown goes back to delivered:
+    const restore = node.store.db.prepare("UPDATE deliveries SET state='delivered', note=NULL WHERE state='notified' AND note='unknown' AND updated_at<=? AND (? IS NULL OR agent=?)");
+    restore.run(new Date(now - UNKNOWN_HOLD_MS).toISOString(), null, null); // everywhere, once its hold has passed
+    // T681: an OpenCode session that reported its turn ended (T675 "idle") is past any wake a lost receipt may have hidden. Mail
+    // held as unknown from before that report is wakeable again now, not after UNKNOWN_HOLD_MS: T675 skips the stop note for that
+    // turn end, so otherwise nothing surfaces it. The next pass applies every usual check and only finds mail still unread.
+    for (const s of node.store.db.prepare("SELECT DISTINCT agent, session_id FROM sessions WHERE cli='opencode'").all()) {
+        const idle = opencodeIdleAt(s.session_id);
+        if (idle !== undefined)
+            restore.run(new Date(idle).toISOString(), s.agent, s.agent);
+    }
 }
 /** A live `agentmbx watch` process for this agent (T033): the session wakes itself when it exits, so the daemon defers. */
 export const watcherKey = (agent) => `watcher:${agent}`;
