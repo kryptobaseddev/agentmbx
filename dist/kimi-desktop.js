@@ -80,6 +80,21 @@ export async function desktopRpc(d, calls, opts = {}) {
         };
     });
 }
+/** Read the running app's plugin inventory, not setup's generated plugin copy. */
+export async function readDesktopPlugin(d, rpc = desktopRpc) {
+    const [rows] = await rpc(d, [["kimiPlugin.listPlugins", {}]], { timeoutMs: 2_000 });
+    if (!Array.isArray(rows) || rows.some(p => !p || typeof p.id !== "string"))
+        throw new Error("invalid desktop plugin inventory");
+    const matches = rows.filter(p => p.id === "agentmbx");
+    if (!matches.length)
+        return null;
+    const p = matches[0];
+    if (matches.length !== 1 || typeof p.version !== "string" || !/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(p.version)
+        || typeof p.enabled !== "boolean" || typeof p.state !== "string" || typeof p.hasErrors !== "boolean"
+        || !Number.isSafeInteger(p.enabledMcpServerCount) || p.enabledMcpServerCount < 0 || !Number.isSafeInteger(p.hookCount) || p.hookCount < 0)
+        throw new Error("invalid AgentMBX desktop plugin record");
+    return { version: p.version, enabled: p.enabled, state: p.state, enabledMcpServerCount: p.enabledMcpServerCount, hookCount: p.hookCount, hasErrors: p.hasErrors };
+}
 /** The desktop plugin that gives each desktop conversation the mbx MCP server and the AgentMBX hooks. */
 /** `agentmbx` is the shell-quoted command that runs the CLI (setup's shJoin of its command). */
 export function writeDesktopPlugin(dir, agentmbx, version) {
