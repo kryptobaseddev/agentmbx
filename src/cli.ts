@@ -1766,6 +1766,11 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
       }
     }
   } catch (error) {
+    // Codex lifecycle context is advisory: preserve the turn without exposing exception text.
+    if (entered && cli === "codex" && (event === "session-start" || event === "prompt")) {
+      emit(cli, event === "session-start" ? "SessionStart" : "UserPromptSubmit", "[mbx] Mailbox context could not be restored. Call mbx_whoami, then mbx_catchup.");
+      return;
+    }
     // Missing ownership is a quiet hook result, not a provider failure or an invitation to recreate a binding.
     if (entered) throw error;
     if (!sid || (event !== "session-start" && event !== "prompt" && !grokUnboundPost)) return;
