@@ -396,8 +396,13 @@ test("hermes hooks: on_session_start binds the real session id silently; the sam
   assert.match(c1, /^\[mbx\] 1 unread for worker@alpha: mbx_inbox\./); assert.match(c1, /Policies \(separate grants/);
   assert.ok(c1.includes(HERMES_WATCHER_INSTRUCTION), "the watcher instruction rides in the first prompt of the session");
   assert.doesNotMatch(c1, /PRIVATE SUBJECT|SECRET BODY/, "no mail content, only counts");
-  const c2 = ctx(hook("prompt", "hermes-sess-A", { user_message: "and now?", platform: "tui" }).stdout);
-  assert.equal(c2, "[mbx] 1 unread for worker@alpha: mbx_inbox.", "the policy recap and the watcher text are not repeated every turn");
+  const second = hook("prompt", "hermes-sess-A", { user_message: "and now?", platform: "tui" });
+  assert.equal(second.stdout, "", "the same unread id is not named again, and the watcher stays inside its window");
+  sendLeased(n, { from: "boss", to: [agent], subject: "next", body: "b", kind: "request" });
+  const c3 = ctx(hook("prompt", "hermes-sess-A", { user_message: "new mail", platform: "tui" }).stdout);
+  assert.match(c3, /\[mbx\] 2 unread for worker@alpha: mbx_inbox\./);
+  assert.doesNotMatch(c3, /Policies/);
+  assert.ok(!c3.includes(HERMES_WATCHER_INSTRUCTION));
 });
 
 test("hermes hooks: the watcher reminder is one line, bounded, and silent while a watcher runs", async t => {
@@ -423,7 +428,8 @@ test("hermes hooks: a Hermes watcher wake is not announced twice and is not a hu
   assert.match(ctx(r.stdout), /^\[mbx\] You are worker@alpha/, "T189: only the entry's resume notice rides the first turn");
   assert.equal(hook("prompt", "s1", { user_message: wake, platform: "tui" }).stdout, "", "a second wake in the same entry adds nothing");
   assert.equal(n.store.get(`human-prompt:${agent}`), undefined, "and it did not reset the relay chain as if the owner typed");
-  assert.ok(ctx(hook("prompt", "s1", { user_message: "a real person typing", platform: "tui" }).stdout));
+  const person = hook("prompt", "s1", { user_message: "a real person typing", platform: "tui" });
+  assert.equal(person.stdout, "", "the wake already recorded this unread id");
   assert.ok(n.store.get(`human-prompt:${agent}`), "a person's prompt does");
 });
 
@@ -482,8 +488,9 @@ test("hermes hooks: a /new gives the same holder a new session id (one live row)
   assert.equal(sub.status, 0, sub.stderr); assert.equal(sub.stdout, "", "a subagent turn gets nothing injected");
   assert.deepEqual(rows(), ["hermes:hermes-sess-B"], "and never replaced the conversation");
   assert.equal(n.store.get(`activity:${agent}`), activity, "or counted as this session's activity");
+  sendLeased(n, { from: "boss", to: [agent], subject: "again", body: "b", kind: "request" });
   const multi = hook("prompt", "hermes-sess-B", { user_message: [{ type: "text", text: "look" }, { type: "image_url", image_url: { url: "x" } }], platform: "tui" });
-  assert.match(ctx(multi.stdout), /1 unread/, "a multimodal turn is read like any other");
+  assert.match(ctx(multi.stdout), /2 unread/, "a multimodal turn is read like any other");
 });
 
 test("hermes hooks: a missing, empty or non-string session id binds nothing and prints nothing; a provisional one binds nothing", async t => {

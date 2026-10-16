@@ -388,7 +388,10 @@ test("grok hooks (T599): SessionStart then the first bound PostToolUse carries t
   const second = hookCli("grok", "post-tool", "grok-A");
   assert.equal(second.status, 0, second.stderr);
   assert.equal(noticeLines(ctx(second.stdout)).length, 0, "the same entry is not told again");
-  assert.match(ctx(second.stdout), /No live mbx watcher/, "the watcher reminder still rides a later PostToolUse");
+  assert.doesNotMatch(ctx(second.stdout), /No live mbx watcher/, "the watcher reminder waits");
+  n.store.set("watchnag:grok:grok-A", new Date(Date.now() - 11 * 60_000).toISOString());
+  const third = hookCli("grok", "post-tool", "grok-A");
+  assert.match(ctx(third.stdout), /No live mbx watcher/, "after 10 minutes the reminder returns");
   assert.equal(state(), before, "no delivery state, checkpoint or lease moved");
 });
 

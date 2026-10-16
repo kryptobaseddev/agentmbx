@@ -8,6 +8,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { MbxNode } from "../src/node.ts";
 import { canonical, generateKeyPair, signData } from "../src/crypto.ts";
 import { acceptSigned, delegationNote, makePolicy } from "../src/policy.ts";
+import { sendLeased } from "./helpers/leased-send.ts";
 
 const resultText = (r: unknown) => (r as { content: { type: string; text?: string }[] }).content.map(c => c.text ?? "").join("\n");
 
@@ -38,6 +39,40 @@ for (const cli of ["codex", "opencode", "claude", "kimi"]) test(`${cli} initiali
     assert.ok(resultText(ready).includes(banner), "first ready whoami must retain the exact signed policy banner");
     const inbox = await c.callTool({ name: "mbx_inbox", arguments: {} });
     assert.ok(resultText(inbox).includes(banner), "first ready inbox must retain the exact signed policy banner");
+    const again = await c.callTool({ name: "mbx_inbox", arguments: {} });
+    assert.equal(resultText(again).includes(banner), false, "the same grant is not repeated");
+    if (cli === "claude") {
+      assert.match(resultText(ready), /cron "\*\/15/);
+      assert.doesNotMatch(resultText(inbox), /\[mbx-watch\]/);
+      assert.doesNotMatch(resultText(again), /\[mbx-watch\]/);
+    } else {
+      assert.doesNotMatch(resultText(ready) + resultText(inbox), /cron "\*\/15|start one now with your shell tool/);
+    }
+    const extra = grant("provisional", "collaborate");
+    const changed = delegationNote(n.store.db, "provisional", "alpha")!;
+    assert.ok(changed.includes(extra.slice(-6)));
+    const afterInbox = await c.callTool({ name: "mbx_inbox", arguments: {} });
+    assert.ok(resultText(afterInbox).includes(changed), "a changed grant is shown again on inbox");
+    const afterWho = await c.callTool({ name: "mbx_whoami", arguments: {} });
+    assert.ok(resultText(afterWho).includes(changed), "whoami shows the grant again because its own copy changed");
+    const quiet = await c.callTool({ name: "mbx_whoami", arguments: {} });
+    assert.equal(resultText(quiet).includes(changed), false, "the same grant text is not repeated");
+    if (cli === "claude") {
+      sendLeased(n, { from: "sender", to: ["provisional"], subject: "s", body: "b", kind: "request" });
+      const hinted = await c.callTool({ name: "mbx_inbox", arguments: {} });
+      assert.match(resultText(hinted), /not caught up on; call mbx_catchup/);
+      const held = await c.callTool({ name: "mbx_inbox", arguments: {} });
+      assert.doesNotMatch(resultText(held), /not caught up on/);
+      const rec = JSON.parse(n.store.get("catchup:provisional")!);
+      const max = n.store.db.prepare("SELECT MAX(seq) seq FROM mailbox_visibility WHERE mailbox=?").get("provisional") as { seq: number | null };
+      rec.position = Number(max.seq ?? 0);
+      n.store.set("catchup:provisional", JSON.stringify(rec));
+      const zero = await c.callTool({ name: "mbx_inbox", arguments: {} });
+      assert.doesNotMatch(resultText(zero), /not caught up on/);
+      sendLeased(n, { from: "sender", to: ["provisional"], subject: "s2", body: "b", kind: "request" });
+      const againHint = await c.callTool({ name: "mbx_inbox", arguments: {} });
+      assert.match(resultText(againHint), /not caught up on; call mbx_catchup/, "a later gap shows the hint again");
+    }
     return;
   }
   const meta = cli === "codex" ? { threadId: "01a0e578-d883-7e93-92e3-fbef626be300" } : { sessionID: "ses_scoped" };
