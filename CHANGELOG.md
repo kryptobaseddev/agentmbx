@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Published docs match current setup and wakes (T684).** The npm package includes the linked security policy. README and portability docs describe Codex's experimental app-server queue API and owned-notice withdrawal, setup help includes Grok and daemon selectors, and README scopes doctor's checks and explains how to confirm mbx in a Kimi desktop conversation.
+
 ## 0.5.44 (2026-10-16)
 
 - **Opt-in Stop digest (T584).** `MBX_STOP_DIGEST=1` (also `on` or `true`) makes Stop continue only for request, task, decision, and alert. A message or reply waits for the next prompt, including when it needs a reply or mentions the agent. Status stays excluded either way. Unset, `0`, `off`, or any other value keeps today's Stop behavior. The variable must be in the harness's hook environment, for example the shell that launches the CLI. The watcher wake path is unchanged.
