@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.44 (2026-10-16)
+
 - **Opt-in Stop digest (T584).** `MBX_STOP_DIGEST=1` (also `on` or `true`) makes Stop continue only for request, task, decision, and alert. A message or reply waits for the next prompt, including when it needs a reply or mentions the agent. Status stays excluded either way. Unset, `0`, `off`, or any other value keeps today's Stop behavior. The variable must be in the harness's hook environment, for example the shell that launches the CLI. The watcher wake path is unchanged.
 
 - **OpenCode: a wake whose receipt was lost mid-turn no longer leaves the mail silent after the turn (T681).** When an offered wake got no receipt back within 5 s (outcome `unknown`, reason `lost-response`), its mail was held as notified for 10 minutes so the possibly-admitted hint wouldn't be resubmitted. Since T675 a turn end skips the stop note when the session reports idle, so after such a turn nothing surfaced that mail until the hold ran out. The daemon now treats an OpenCode session's idle report as the end of any wake a lost receipt may have hidden: mail held as unknown from before that report goes back to delivered, and the next normal pass (with every usual check) wakes once, only for mail still unread. The plugin also logs each failed wake HTTP call (poll, busy, receipt, idle, or an admission with no `msg_` id) to `MBX_HOME/logs/opencode-plugin.log`, at most once per kind every 10 s and capped at 64 KB, so the cause of a lost receipt can be diagnosed. The plugin template changed: run `agentmbx setup --only opencode` and reopen OpenCode tabs to load it.
