@@ -3,8 +3,13 @@
 ## Unreleased
 
 - **A mailbox can record which sub-agent it is fronting (T582).** Optional `meta.on_behalf_of` is a name such as `agent-6` (the same shape as a mailbox name), not an address and not a second mailbox. `from` stays the leased mailbox, and the host signature covers the label. `mbx_send`, `mbx_reply` and `agentmbx send --on-behalf-of` set it. A reply that omits the label copies it from the message it answers and still delivers to the fronting mailbox. The read header and the inbox line show `on behalf of <name>`. A blank, an address, or any other shape is refused before anything is stored.
+## 0.5.45 (2026-10-16)
+
+- **Readable agent messages (T585).** The AgentMBX skill asks for concise sentences with normal word spacing and punctuation, separate paragraphs or bullets for multiple points, and exact code, commands, URLs, paths and IDs.
 
 - **Urgent sends and explicit won't-wake warnings (T583).** `mbx_send`, `mbx_reply` and `agentmbx send` take `urgent` (`--urgent` on the CLI). An urgent send mentions every named recipient it resolved to (including `lead`, `role:` and `task:` targets) in the signed envelope's `meta.mentions`, so message and reply mail wakes them like an @mention would. The envelope schema is unchanged. Urgent is refused before anything is stored with `kind=status` (status never wakes; use `kind=request` with `needs_reply=true`) and with `*` (urgent needs named recipients). A send that asks for attention (`needs_reply` or `urgent`) now gets one `warnings[]` line for each recipient that still won't be woken, with the reason (no push path, an unverified binding, no wake policy) and, with `needs_reply`, a note that the answer waits until that recipient's next prompt. Plain FYI mail stays quiet; `recipients[]` still shows each state. A `role:`/`task:` target on a paired host can't be named, and the sender is told it wakes only if the kind does. `mbx_reply` now also carries the status-never-wakes warning, and its description and parameters say which replies wake.
+
+- **Skill: Kimi reference page (T683).** `skill/references/kimi.md` documents the three Kimi hosts (terminal `kimi-code`, `kimi web`, the Kimi desktop app), how to tell which one a conversation runs in, the `agentmbx doctor` rows for each, and wake troubleshooting (`no-target` means no hosted server or no desktop plugin). Linked from the Kimi bullets in `SKILL.md`.
 
 ## 0.5.44 (2026-10-16)
 

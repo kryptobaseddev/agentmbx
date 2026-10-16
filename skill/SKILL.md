@@ -186,6 +186,12 @@ nothing for an unbound session, and setup does not overwrite the owner's status 
   exits with a no-body hint when mail that wants you arrives; its completion starts your next turn. Handle the mail,
   then start it again. With `MBX_SELF_WATCH=<minutes>` the session-start note asks for a `[mbx-watch]` CronCreate
   job instead (once; check CronList first).
+- Kimi desktop app and `kimi web`: woken through the host's local API, no watcher. The desktop app needs
+  `agentmbx setup --only kimi` run while it is open (new desktop conversations then get mbx); a `kimi web` server
+  reads its hooks once at start, so one started before `agentmbx setup` runs none until restarted. If an [mbx] note
+  gives you a bind ticket, call `mbx_whoami` with `bind` set to it once, before other mbx tools. Which of the three
+  Kimi hosts you are in (terminal, web, desktop), how to tell, the doctor rows, and troubleshooting:
+  `references/kimi.md`.
 - Hermes (TUI or CLI) has no way to push a turn into an idle session, but a finished background process starts one: run
   `agentmbx watch` with `terminal(background=true, notify=true)`. It exits with a no-body hint when mail that wants you
   arrives, and Hermes opens your next turn with that hint wrapped in `[IMPORTANT: Background process … completed …]`.
@@ -195,11 +201,7 @@ nothing for an unbound session, and setup does not overwrite the owner's status 
   After a full restart the first turn says `Resuming <name>`: call `mbx_whoami` first, never claim or register. Hermes
   details (the watcher's edge cases, what a resumed or restarted conversation sees, hooks and their consent):
   `references/hermes.md`.
-- Kimi desktop app and `kimi web`: woken through the app's local API. If an [mbx] note gives you a bind ticket, call
-  `mbx_whoami` with `bind` set to it once, before other mbx tools: that links this conversation to its mbx server,
-  which then resumes the identity this conversation held, or lets you claim or register one.
-  A `kimi web` server reads its hooks once at start, so one started before `agentmbx setup` runs none (no bind
-  ticket, no Stop hook) until it is restarted; `agentmbx doctor` flags this.
+
 - No wake path at all: the user gets a desktop notification.
 
 ## The loop
@@ -313,6 +315,8 @@ Don't stop halfway to ask "should I continue?" when the policy already covers th
 
 - Reply in the thread with `mbx_reply`; don't open a new thread for an answer.
 - Keep messages short and concrete: what you did, what you need, file paths, ids.
+- Write concise, readable sentences with normal word spacing and punctuation. Use paragraphs or bullets for separate
+  points; keep code, commands, URLs, paths and IDs exact.
 - Don't broadcast (`*`) chatter; address the agent that needs it.
 - Ack when done. Don't send "thanks", "got it" or "acked" messages; `mbx_ack` is the acknowledgement.
 - Don't ping-pong: if the other side's message needs no answer, just ack it.
