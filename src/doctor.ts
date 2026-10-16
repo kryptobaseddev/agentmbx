@@ -6,6 +6,7 @@ import { projectLabel, projectMailboxBySlot } from "./project-mailbox.ts";
 import { escalatedCount, phantomMailboxes, returnDays } from "./stranded.ts";
 import { delimiter, dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { parse as parseToml } from "smol-toml";
 import { fingerprint } from "./crypto.ts";
 import { signHop } from "./http.ts";
 import { relayState, ROLLBACK_REASON } from "./relay-v2.ts";
@@ -548,6 +549,21 @@ export async function opencodePluginChecks(ctx: SetupCtx, node: MbxNode, options
   return checks;
 }
 
+/** Wiring proves neither Codex runtime hook support nor consent; doctor never changes either. */
+export function codexHooksChecks(ctx: SetupCtx): Check[] {
+  const hooks = edits(ctx, "codex").find((e) => e.kind === "hooks");
+  if (!hooks || !wired(hooks)) return [];
+  const fix = "Review Codex's native hook settings and normal trust prompts; if hooks are unavailable, use MCP mbx_whoami then mbx_catchup";
+  let features: unknown;
+  try { features = parseToml(readFileSync(join(ctx.home, ".codex", "config.toml"), "utf8")).features; }
+  catch {
+    return [{ level: "warn", label: "codex: hooks are wired but ~/.codex/config.toml is unreadable or invalid; native hook support and consent are unverified", fix }];
+  }
+  if (features && typeof features === "object" && "hooks" in features && features.hooks === false)
+    return [{ level: "warn", label: "codex: hooks are wired but disabled in ~/.codex/config.toml (features.hooks=false); runtime overrides and consent are unverified", fix }];
+  return [{ level: "info", label: "codex: hooks are wired; native hook support and consent are unverified from configuration alone", fix }];
+}
+
 /** T460: Hermes runs a shell hook only after its (event, command) pair was approved, and in the TUI (no tty) it silently skips an
  *  unapproved one: hooks that are wired but not approved look installed and do nothing. Reads the same state setup writes. A warn
  *  never fails doctor. Silent until the hooks are wired, because the generic hooks row already says so then. */
@@ -784,6 +800,7 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     // static and per-CLI — ours must be a CURRENT form, foreign must be truly foreign.
     for (const c of statuslineChecks(ctx, d.cli)) out.push(c);
     if (d.cli === "claude") for (const c of claudePluginChecks(ctx.home, ctx)) out.push(c);
+    if (d.cli === "codex") out.push(...codexHooksChecks(ctx));
     // T391: the opencode service check is its own function (never a new top-level grok/opencode
     // collision — see the T435 note above) and runs only when an opencode mailbox is bound.
     if (d.cli === "opencode" && node) { const c = await opencodeServiceCheck(node); if (c) out.push(c); }
