@@ -113,7 +113,7 @@ async function nativeQueue(binary, operation) {
     }
     finally {
         child.stdin.end();
-        const stop = setTimeout(() => child.kill(), 1000);
+        const stop = setTimeout(() => child.kill("SIGKILL"), 1000); // only our helper: ignored EOF/SIGTERM cannot stall the daemon
         await exited;
         clearTimeout(stop);
         clearTimeout(timer);

@@ -90,6 +90,12 @@ test("failure audit retains an exit code and stderr class without copying stderr
   assert.equal(String(row.detail).includes("private diagnostic"), false); assert.equal(f.pending().length, 0);
 });
 
+test("a helper ignoring EOF and SIGTERM cannot hang a completed queue operation", { timeout: 5000 }, async t => {
+  const f = fixture(t, { beforeInitialize: "process.on('SIGTERM',()=>{}); process.stdin.on('end',()=>setInterval(()=>{},1000));" });
+  f.send(); assert.equal((await dispatchWakes(f.n))[0].result.ok, true);
+  assert.equal(f.items().length, 1); assert.equal(f.pending()[0].settled, true);
+});
+
 test("withdrawal precedes a new-holder wake and an unavailable provider blocks that wake", async t => {
   const f = fixture(t); f.send(); await dispatchWakes(f.n); f.held.release();
   // A new captured lease generation for the same mailbox, with a new native thread.
