@@ -46,6 +46,7 @@ hosts, and almost everything that surprises you follows from which one you are i
   agentmbx setup --only kimi`). Re-run setup after an AgentMBX upgrade to update the plugin.
 - Wakes are push: the daemon talks to the daimon's loopback control socket, so no watcher.
 - Computer use and browser extensions are unrelated to the mailbox.
+- `kimi web` needs no `--host`: the daemon reaches it on 127.0.0.1. `--host` exposes the server and its token to the network and adds nothing for wakes.
 
 ## How to tell which host you are in
 
