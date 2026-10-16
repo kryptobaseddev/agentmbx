@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Hook notices no longer call read mail "unread" (T670, the other half of T647).** The prompt, session-start and post-tool notices counted every unacked message as unread. Mail an agent had read (and maybe answered) but not acked therefore came back as "N unread … mbx_inbox" on every prompt, after a restart, and in a reopened session, where a fresh session key re-alerted it "before continuing". "Unread" now means not read yet. Read-but-unacked mail is named apart as "N read, not acked: mbx_ack each when done.", once per session and again only when that set changes. The post-tool alert fires only for mail not read yet. whoami, handoff and the agents list still count every unacked message.
+
 ## 0.5.40 (2026-10-15)
 
 - **`agentmbx watch` follows its own session's lease re-key instead of stopping (T653).** After a long idle, an mbx server can release its lease and claim it again with a new key: the same process, birth, CLI and session. Every running watcher then exited with "the lease this watcher was started for moved to another holder", so the session could no longer be woken until it re-armed. The watcher now follows such a re-key, and its record carries the new token so the daemon keeps deferring to it. A lease claimed by another process, or by the same process for a different session, still stops it with the same reason.

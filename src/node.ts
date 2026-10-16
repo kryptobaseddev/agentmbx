@@ -953,8 +953,21 @@ export class MbxNode {
     }
   }
 
+  /** Every unacked delivery, read or not (whoami, handoff and the agents list count this). */
   unreadCount(agent: string): number {
-    return (this.store.db.prepare("SELECT count(*) n FROM deliveries WHERE agent=? AND state <> 'acked'").get(agent) as { n: number }).n;
+    return this.deliveryCounts(agent).unacked;
+  }
+
+  /** T670: unacked deliveries not read yet. Hook notices say "unread" only for these; read-but-unacked mail is named apart. */
+  newCount(agent: string): number {
+    const c = this.deliveryCounts(agent);
+    return c.unacked - c.read;
+  }
+
+  private deliveryCounts(agent: string): { unacked: number; read: number } {
+    const row = this.store.db.prepare("SELECT count(*) n, coalesce(sum(state = 'read'), 0) r FROM deliveries WHERE agent=? AND state <> 'acked'")
+      .get(agent) as { n: number; r: number };
+    return { unacked: row.n, read: row.r };
   }
 
   message(id: string, agent?: string): MessageRow | undefined {

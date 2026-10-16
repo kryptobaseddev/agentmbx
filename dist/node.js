@@ -1064,8 +1064,19 @@ export class MbxNode {
                 this.setDelivery(r.id, slot, "read");
         }
     }
+    /** Every unacked delivery, read or not (whoami, handoff and the agents list count this). */
     unreadCount(agent) {
-        return this.store.db.prepare("SELECT count(*) n FROM deliveries WHERE agent=? AND state <> 'acked'").get(agent).n;
+        return this.deliveryCounts(agent).unacked;
+    }
+    /** T670: unacked deliveries not read yet. Hook notices say "unread" only for these; read-but-unacked mail is named apart. */
+    newCount(agent) {
+        const c = this.deliveryCounts(agent);
+        return c.unacked - c.read;
+    }
+    deliveryCounts(agent) {
+        const row = this.store.db.prepare("SELECT count(*) n, coalesce(sum(state = 'read'), 0) r FROM deliveries WHERE agent=? AND state <> 'acked'")
+            .get(agent);
+        return { unacked: row.n, read: row.r };
     }
     message(id, agent) {
         // Resolve ambiguity only among visible messages. Filtering after LIMIT can leak hidden IDs
