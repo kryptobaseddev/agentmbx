@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Stop no longer continues a turn for mail the agent already read (T673).** The stop hook's check for mail that "arrived while you worked" never looked at whether a message had been read. A request read (and answered) during the turn but not acked therefore blocked the first stop of that session, which cost an extra turn for handled mail. After a restart or reopen, the new session id blocked again within its 10-minute fallback window. Stop now continues only for wake-worthy mail not read yet; unread mail still continues it, including in a new session that hasn't seen it. Trade-off: a request the agent read but didn't answer no longer blocks stop. It surfaces through T670's "N read, not acked" prompt line instead. This applies to every CLI with a stop hook (Claude, Codex, Kimi, Grok, OpenCode).
+
 ## 0.5.40 (2026-10-15)
 
 - **`agentmbx watch` follows its own session's lease re-key instead of stopping (T653).** After a long idle, an mbx server can release its lease and claim it again with a new key: the same process, birth, CLI and session. Every running watcher then exited with "the lease this watcher was started for moved to another holder", so the session could no longer be woken until it re-armed. The watcher now follows such a re-key, and its record carries the new token so the daemon keeps deferring to it. A lease claimed by another process, or by the same process for a different session, still stops it with the same reason.

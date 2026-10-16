@@ -1701,8 +1701,10 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
         if (!["claude", "codex", "kimi", "grok", "opencode"].includes(cli)) return;
         if (cli === "grok" && typeof input.reason === "string" && input.reason !== "end_turn") return;
         const mark = `stopseen:${cli}:${sid ?? process.ppid}`, seen = node.store.get(mark) ?? new Date(Date.now() - 10 * 60_000).toISOString();
+        // T673: only mail not read yet. Read mail was seen (and often answered) already: continuing for it cost a turn in the same
+        // session and again in a new one (restart, reopen) within the fallback window; read-but-unacked mail rides T670's prompt line.
         const fresh = node.inbox(agent, { limit: 50 })
-          .filter(m => m.received_at > seen && m.from_addr !== `${agent}@${node.host}` && node.wantsWake(agent, m) && hasWakeAuthority(node, agent, m));
+          .filter(m => m.state !== "read" && m.received_at > seen && m.from_addr !== `${agent}@${node.host}` && node.wantsWake(agent, m) && hasWakeAuthority(node, agent, m));
         // T435: mail stays first. After it is consumed, one continuation re-arms a down watcher.
         // Mail that arrives after the watcher exits and before the next tool or Stop still only
         // gets a desktop notice — compaction does not fire Stop, and this gate cannot close that gap.
