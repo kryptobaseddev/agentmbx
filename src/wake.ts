@@ -12,7 +12,7 @@ import { captureWakeIdentity } from "./wake-identity.ts";
 import { policyBrief } from "./policy.ts";
 import { ulid } from "./crypto.ts";
 import { opencodeHostOf, type OpencodeHost } from "./opencode-provider.ts";
-import { listOpencodeWakeWaiters, pushOpencodeWake } from "./opencode-wake-queue.ts";
+import { listOpencodeWakeWaiters, opencodeIdleAt, pushOpencodeWake } from "./opencode-wake-queue.ts";
 import { pollerWakeTargets } from "./opencode-poller.ts";
 import type { WakeOutcome, WakeReceipt } from "./wake-contract.ts";
 import type { MessageRow, Store } from "./store.ts";
@@ -479,8 +479,12 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
     const markAll = () => rows.forEach((r) => node.setDelivery(r.id, r.agent, "notified"));
     if (!wanted.length) { markAll(); continue; }
     if (wakeMutedUntil(node, agent, now)) continue; // muted: no hint and no notice; the mail stays delivered and unread
-    const busy = JSON.parse(node.store.get(busyKey(agent)) ?? "null") as { n: number; next: number } | null;
-    if (busy && busy.next > now) continue; // a busy session is asked again with backoff, not every pass
+    const busy = JSON.parse(node.store.get(busyKey(agent)) ?? "null") as { n: number; next: number; at?: number } | null;
+    // T675: an OpenCode session whose turn ended after the last busy answer is asked on this pass, not after the backoff. The idle
+    // report admits nothing itself; this pass applies every usual check. A record without `at` (older daemon) keeps its backoff.
+    const idleSinceBusy = busy?.at !== undefined
+      && sessions.some((g) => g.session.cli === "opencode" && (opencodeIdleAt(g.session.session_id) ?? 0) > busy.at!);
+    if (busy && busy.next > now && !idleSinceBusy) continue; // a busy session is asked again with backoff, not every pass
     // a hosted kimi session that is mid-turn is working already: leave the mail queued (its Stop hook also
     // surfaces new mail) and retry on the next pass, without spending any of the wake brake below
     // T557: project mail alone, and no verified session to wake: nothing to attempt. It waits, delivered, with no budget spent and no notice; the next pass
@@ -489,7 +493,7 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
     if (!ownRows.length && !sessions.length) continue;
     const automatic = wanted.filter(r => hasWakeAuthority(node, agent, r));
     if (automatic.length && await kimiBusyNow(sessions.map(g => g.session), fetch)) {
-      node.store.set(busyKey(agent), JSON.stringify({ n: (busy?.n ?? 0) + 1, next: now + Math.min(2_000 * 2 ** (busy?.n ?? 0), BUSY_BACKOFF_MAX_MS) }));
+      node.store.set(busyKey(agent), JSON.stringify({ n: (busy?.n ?? 0) + 1, next: now + Math.min(2_000 * 2 ** (busy?.n ?? 0), BUSY_BACKOFF_MAX_MS), at: now }));
       node.store.audit("wake", { agent, via: "kimi web", ok: false, busy: true, count: wanted.length });
       out.push({ agent, result: { ok: false, via: "kimi web", error: "session busy (retrying next pass)" } });
       continue;
@@ -543,7 +547,7 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
     }
     const clearAttempt = () => node.store.db.prepare("DELETE FROM kv WHERE k=?").run(attemptKey(agent));
     if (result.outcome?.kind !== "unknown") clearAttempt();
-    if (isRetry(result)) node.store.set(busyKey(agent), JSON.stringify({ n: (busy?.n ?? 0) + 1, next: now + Math.min(2_000 * 2 ** (busy?.n ?? 0), BUSY_BACKOFF_MAX_MS) }));
+    if (isRetry(result)) node.store.set(busyKey(agent), JSON.stringify({ n: (busy?.n ?? 0) + 1, next: now + Math.min(2_000 * 2 ** (busy?.n ?? 0), BUSY_BACKOFF_MAX_MS), at: now }));
     else if (busy) node.store.db.prepare("DELETE FROM kv WHERE k=?").run(busyKey(agent));
     if (fenced) {
       // refund only when nothing may have reached a provider in this pass
