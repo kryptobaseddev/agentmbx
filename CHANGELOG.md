@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **A revisited OpenCode conversation is entered again, and the resume surface is stated instead of silent (T187).** OpenCode's plugin fires `session.created` only for a new conversation, so a reopened tab or a restarted serve never re-entered the notice path: the conversation had already been noticed, and the gate required the created event. A provider process generation entering a conversation it has not been in is now recorded as an entry (`resume-notice.ts` `takeServeEntry`, one per conversation and serve generation), so the hook emits the same bounded notice for it, and `agentmbx doctor` states the harness fact: OpenCode has no native resume/re-attach event, a revisited conversation is noticed once per serve generation, and the manual fallback is `mbx_whoami` / `mbx_inbox`.
+- **A revisited OpenCode conversation is entered again, and the resume surface is stated instead of silent (T187).** OpenCode's plugin fires `session.created` only for a new conversation, so a reopened tab or a restarted serve never re-entered the notice path: the conversation had already been noticed, and the gate required the created event. A serve generation entering a conversation that was already noticed is now recorded as an entry (`resume-notice.ts` `takeServeEntry`, one per conversation and serve generation), so a reopened tab or a restarted serve emits the same bounded notice once more — ordinary shared-serve activity still is not a resume — and `agentmbx doctor` states the harness fact: OpenCode has no native resume/re-attach event, a revisited conversation is noticed once per serve generation, and the manual fallback is `mbx_whoami` / `mbx_inbox`.
 
 ## 0.5.40 (2026-10-15)
 
