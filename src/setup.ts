@@ -1489,6 +1489,9 @@ export default {
           else if (ev.type === "session.idle" || ev.type === "session.execution.succeeded") void run("stop", { session_id: sid });
           else if (ev.type === "session.tool.called" && !ctx?.tool?.hook) void run("post-tool", { session_id: sid });
           else if (ev.type === "session.execution.started") markTurn(sid);
+          // T647: Esc ends a turn with interrupted, an error with failed; neither emits succeeded or idle, so end the turn here
+          // too, or a mid-turn wake decline would hold every wake back for this session until TURN_STALE_MS.
+          else if (ev.type === "session.execution.interrupted" || ev.type === "session.execution.failed") endTurn(sid);
         }
       } catch { /* aborted or the stream ended: never surface in the host */ }
     })();

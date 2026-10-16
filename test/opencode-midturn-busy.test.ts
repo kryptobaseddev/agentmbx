@@ -47,11 +47,26 @@ async function rig(t: { after: (fn: () => unknown) => void }) {
   writeFileSync(join(dir, "agentmbx.ts"), opencodePluginSource(["/opt/bin/agentmbx"], version()));
   const mod = await import(join(dir, "agentmbx.ts")) as { AgentMBXHooks: (ctx: unknown) => Promise<Record<string, (...a: unknown[]) => Promise<void>>> };
   const admitted: Note[] = [];
-  const hooks = await mod.AgentMBXHooks({ directory: "/work", session: { synthetic: async (b: Note) => { if (b.resume) admitted.push(b); return { id: b.id }; } } });
+  const session = { synthetic: async (b: Note) => { if (b.resume) admitted.push(b); return { id: b.id }; } };
+  const hooks = await mod.AgentMBXHooks({ directory: "/work", session });
+  // The v2 entry point with a hand-fed event stream (OpenCode 2.x turn events: started, then succeeded | interrupted | failed).
+  const queue: { type: string; data: unknown }[] = [];
+  let wakeStream: (() => void) | null = null;
+  const v2 = mod as unknown as { default: { setup: (ctx: unknown) => Promise<() => void> } };
+  const stop = await v2.default.setup({ session, location: { directory: "/work" }, tool: { hook: () => undefined },
+    event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) {
+      while (!signal.aborted) {
+        const next = queue.shift();
+        if (next) { yield next; continue; }
+        await new Promise<void>((r) => { wakeStream = r; setTimeout(r, 50); });
+      }
+    } } });
+  t.after(() => stop());
+  const emit = async (type: string, sid: string) => { queue.push({ type, data: { sessionID: sid } }); wakeStream?.(); await until(() => queue.length === 0); await new Promise((r) => setTimeout(r, 20)); };
   const polling = (sid: string) => until(() => listOpencodeWakeWaiters().some((w) => w.sessionID === sid && w.pid === process.pid));
   const midTurn = (sid: string) => hooks["tool.execute.after"]({ sessionID: sid }, { output: "" });
   const turnEnds = (sid: string) => hooks.event({ event: { type: "session.idle", properties: { info: { id: sid } } } });
-  return { node, admitted, polling, midTurn, turnEnds };
+  return { node, admitted, polling, midTurn, turnEnds, emit };
 }
 
 test("T647: mid-turn the plugin declines the offered wake as busy, admits nothing, and takes the next one after the turn", async (t) => {
@@ -114,6 +129,22 @@ test("T647: mail acked during the turn is not alerted after it; mail still unhan
   await offered;
   assert.equal(state(pending.id), "notified");
 });
+
+for (const end of ["session.execution.interrupted", "session.execution.failed"]) {
+  test(`T647: a turn that ends with ${end} (no succeeded, no idle) ends the decline; the next wake is admitted`, async (t) => {
+    const r = await rig(t), sid = `ses_${end.split(".").pop()}`; // a session per case: an earlier rig's poll loop may outlive its test
+    const wake = (text: string) => wakeOpencode(sid, text, { pid: process.pid, host: () => "standalone", service: noService, fetch: noFetch });
+    await r.emit("session.execution.started", sid);
+    await r.midTurn(sid); // the first tool call also starts the session's wake poll
+    assert.equal(await r.polling(sid), true);
+    assert.equal((await wake("[mbx] 1 new message(s) for worker (ids A)")).outcome?.kind, "busy", "mid-turn: declined");
+    await r.emit(end, sid); // Esc or an error: OpenCode 2.x sends only this
+    assert.equal(await r.polling(sid), true);
+    const after = await wake("[mbx] 1 new message(s) for worker (ids B)");
+    assert.equal(after.outcome?.kind, "admitted", JSON.stringify(after));
+    assert.deepEqual(r.admitted.map((n) => n.text), ["[mbx] 1 new message(s) for worker (ids B)"]);
+  });
+}
 
 test("T647 queue: a busy receipt settles the offer without admission; it needs an offered slot", async () => {
   resetOpencodeWakeQueue();
