@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Setup no longer accumulates OpenCode sidebar pre-edit images (T671).** Every setup run wrote a new `<file>.bak-agentmbx-<stamp>` image of whatever it changed, and nothing ever removed the older ones: the sidebar package, rebuilt on every release, had collected eight. Setup now keeps the newest two images per file and removes the older ones it wrote itself — never the live file and never a differently named backup — both where a backup is written and, for the sidebar package, on every install. A dry run still changes nothing.
+
 ## 0.5.40 (2026-10-15)
 
 - **`agentmbx watch` follows its own session's lease re-key instead of stopping (T653).** After a long idle, an mbx server can release its lease and claim it again with a new key: the same process, birth, CLI and session. Every running watcher then exited with "the lease this watcher was started for moved to another holder", so the session could no longer be woken until it re-armed. The watcher now follows such a re-key, and its record carries the new token so the daemon keeps deferring to it. A lease claimed by another process, or by the same process for a different session, still stops it with the same reason.
