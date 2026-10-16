@@ -11,7 +11,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { MbxNode } from "../src/node.ts";
 import { IdentityLeases, inspectLeaseProcess } from "../src/identity-leases.ts";
 import { dispatchWakes, liveWatcher } from "../src/wake.ts";
-import { selfWatchInstruction, WATCHER_INSTRUCTION } from "../src/mcp.ts";
+import { KIMI_WATCHER_REMINDER, selfWatchInstruction, WATCHER_INSTRUCTION } from "../src/mcp.ts";
 import { delegateWake } from "./helpers/wake-lease.ts";
 import { sendLeased } from "./helpers/leased-send.ts";
 import { findIdentityControl, publishIdentityControl } from "../src/identity-control.ts";
@@ -232,6 +232,9 @@ test("a terminal Kimi prompt carries the watcher instruction until a watcher run
   const prompt = () => spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", "prompt", "--cli", "kimi"],
     { input: JSON.stringify({ session_id: "kimi-term-1", cwd: process.cwd(), prompt: "hi" }), encoding: "utf8", env }).stdout;
   assert.match(prompt(), /start one now with your shell tool: command "agentmbx watch"/);
+  assert.equal(prompt(), "", "the full instruction is not repeated inside 10 minutes");
+  n.store.set("kiminag:kimi-term-1:worker", new Date(Date.now() - 11 * 60_000).toISOString());
+  assert.equal(prompt().trim(), KIMI_WATCHER_REMINDER, "after the window: the one-line reminder, not the full text");
   n.store.set("watcher:worker", JSON.stringify({ pid: process.pid, at: Date.now() }));
   assert.doesNotMatch(prompt(), /agentmbx watch/, "no nagging while a watcher is live");
 });

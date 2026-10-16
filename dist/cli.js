@@ -16,7 +16,7 @@ import { backupStore, readOps, restoredFrom, restoreStore, rotateEpochOp, STORE_
 import { daemonReadiness, doctor, failed, formatChecks, processChecks } from "./doctor.js";
 import { HUD_ALIVE_MAX_MS, HUD_SCHEMA, hudAlivePath, hudDir, hudPidLinePath, hudPidPath, hudSessionLinePath, hudSessionPath, hudStatus, hudStatusV2, writeHud } from "./hud.js";
 import { STATUS_V2_SCHEMA } from "./status-schema.js";
-import { detectHost, HERMES_WATCHER_INSTRUCTION, HERMES_WATCHER_REMINDER, MCP_HEARTBEAT_MS, noPush, runMcp, selfWatchInstruction } from "./mcp.js";
+import { detectHost, HERMES_WATCHER_INSTRUCTION, HERMES_WATCHER_REMINDER, KIMI_WATCHER_REMINDER, MCP_HEARTBEAT_MS, noPush, runMcp, selfWatchInstruction, WATCHER_INSTRUCTION } from "./mcp.js";
 import { HERMES_NAG_MS, hermesHookInput, hermesHookOutput } from "./hermes-hook.js";
 import { resumeNotice, takeResumeEntry, takeServeEntry } from "./resume-notice.js";
 import { missedCount } from "./catchup.js";
@@ -1832,6 +1832,8 @@ function grokWatchReminder(sid) {
  * flight, so that field cannot bound the next turn's Stop. The marker does.
  */
 const KIMI_STOP_NAG_MS = 10 * 60_000;
+/** T584: the Grok post-tool watcher paragraph, at most once per this window. Stop is not gated by it. */
+const GROK_WATCH_NAG_MS = 10 * 60_000;
 /** True when a shell background task is already the Grok watcher for this session. */
 function grokWatchArmed(input, sid) {
     const tasks = input.backgroundTasks ?? input.background_tasks;
@@ -2039,8 +2041,14 @@ async function hook(node, event, cli) {
                         if (at?.pid && takeResumeEntry(node.store, cli, at.pid, at.pid_start, sid))
                             lines.push(resumeNotice(node.store, agent, held(agent)));
                     }
-                    if (!liveWatcher(node, agent))
-                        lines.push(grokWatchReminder(sid));
+                    if (!liveWatcher(node, agent)) {
+                        const nagKey = `watchnag:grok:${sid ?? process.ppid}`;
+                        const at = Date.parse(node.store.get(nagKey) ?? "");
+                        if (!Number.isFinite(at) || Date.now() - at >= GROK_WATCH_NAG_MS) {
+                            lines.push(grokWatchReminder(sid));
+                            node.store.set(nagKey, new Date().toISOString());
+                        }
+                    }
                     if (lines.length)
                         emit(cli, "PostToolUse", lines.join("\n"));
                     return;
@@ -2076,8 +2084,23 @@ async function hook(node, event, cli) {
                 // The policy recap is sent once per session, and again only when the policies change.
                 const brief = policyBrief(node.store.db, agent, node.host), briefKey = `policy-noticed:${cli}:${sid ?? process.ppid}:${agent}`;
                 const newBrief = brief && node.store.get(briefKey) !== brief;
-                if (n && !wakePrompt) {
-                    lines.push(`[mbx] ${n} unread for ${agent}@${node.host}: mbx_inbox${event === "post-tool" ? " before continuing" : ""}.${newBrief ? brief : ""}`);
+                // T584: a prompt names an unread id once. Post-tool keeps its own toolseen gate above.
+                // The snapshot is recorded on a wake prompt too, so the next human prompt does not repeat those ids.
+                if (event === "prompt") {
+                    const promptKey = `promptseen:${cli}:${sid ?? process.ppid}:${agent}`;
+                    const previous = new Set(JSON.parse(node.store.get(promptKey) ?? "[]"));
+                    const ids = unackedDeliveries(node, agent).filter((r) => r.state !== "read").map(r => `${agent}:${r.msg_id}`);
+                    const snapshot = JSON.stringify(ids);
+                    if (snapshot !== (node.store.get(promptKey) ?? "[]"))
+                        node.store.set(promptKey, snapshot);
+                    if (n && !wakePrompt && ids.some((id) => !previous.has(id))) {
+                        lines.push(`[mbx] ${n} unread for ${agent}@${node.host}: mbx_inbox.${newBrief ? brief : ""}`);
+                        if (newBrief)
+                            node.store.set(briefKey, brief);
+                    }
+                }
+                else if (n && !wakePrompt) {
+                    lines.push(`[mbx] ${n} unread for ${agent}@${node.host}: mbx_inbox before continuing.${newBrief ? brief : ""}`);
                     if (newBrief)
                         node.store.set(briefKey, brief);
                 }
@@ -2106,10 +2129,10 @@ async function hook(node, event, cli) {
                     if (w)
                         lines.push(w);
                 }
-                // Kimi drops SessionStart output and MCP server instructions: a terminal session learns to start its watcher here,
-                // on every prompt until one is running (T033).
-                if (event === "prompt" && cli === "kimi" && !kimiMultiHost(process.ppid) && !liveWatcher(node, agent)) {
-                    const w = selfWatchInstruction({ delegated: !!delegationNote(node.store.db, agent, node.host), cli });
+                // Kimi drops SessionStart output and MCP server instructions. The full watcher instruction is once;
+                // later prompts get a one-line reminder at most every 10 minutes, and nothing while a watcher runs (T584).
+                if (event === "prompt" && cli === "kimi") {
+                    const w = kimiWatcherNote(node, agent, sid ?? process.ppid, !!delegationNote(node.store.db, agent, node.host));
                     if (w)
                         lines.push(w);
                 }
@@ -2481,6 +2504,21 @@ function hermesWatcherNote(node, agent, session, delegated) {
         return null;
     node.store.set(key, new Date().toISOString());
     return Number.isFinite(last) ? HERMES_WATCHER_REMINDER : full;
+}
+/** The Kimi watcher note for one prompt: the full instruction once, then a one-line reminder at most every
+ *  KIMI_STOP_NAG_MS while no watcher runs. An explicit MBX_SELF_WATCH choice is the full text once and is not
+ *  repeated as the short reminder. Stop keeps its own nag. */
+function kimiWatcherNote(node, agent, session, delegated) {
+    if (kimiMultiHost(process.ppid) || liveWatcher(node, agent))
+        return null;
+    const full = selfWatchInstruction({ delegated, cli: "kimi" });
+    if (!full)
+        return null;
+    const key = `kiminag:${session}:${agent}`, last = Date.parse(node.store.get(key) ?? "");
+    if (Number.isFinite(last) && (full !== WATCHER_INSTRUCTION || Date.now() - last < KIMI_STOP_NAG_MS))
+        return null;
+    node.store.set(key, new Date().toISOString());
+    return Number.isFinite(last) ? KIMI_WATCHER_REMINDER : full;
 }
 /** T670: the agent's unacked deliveries with their state, for the hook notices (one query for both of their uses). */
 function unackedDeliveries(node, agent) {

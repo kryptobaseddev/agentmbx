@@ -313,7 +313,9 @@ test("Claude clear changes only the session alias of one current holder", async 
     const rows = n.sessionsFor(agent); assert.equal(rows.length, 1); assert.equal(rows[0].session_id, sid);
     assert.equal(rows[0].session_key, original.session_key); assert.equal(rows[0].channel, original.channel);
     assert.equal(n.store.db.prepare("SELECT token FROM identity_leases WHERE name=?").get(agent)?.token, lease?.token);
-    assert.match(run("prompt", sid).stdout, /1 unread/);
+    const prompted = run("prompt", sid);
+    if (sid === originalSid) assert.equal(prompted.stdout, "", "this session already named that unread id");
+    else assert.match(prompted.stdout, /1 unread/);
     assert.notEqual((await call("mbx_inbox")).isError, true);
   }
   await call("mbx_identity", { action: "release" });
@@ -383,9 +385,15 @@ test("lean notices: a wake prompt adds no second notice, and the policy recap is
   const first = run("prompt", "real-hook-session", "claude", {}, { prompt: "please continue" });
   assert.match(first.stdout, /1 unread for .*: mbx_inbox\. Policies \(separate grants; each message.s mbx_read header applies\): autonomous/);
   const second = run("prompt", "real-hook-session", "claude", {}, { prompt: "and now?" });
-  assert.match(second.stdout, /1 unread for .*: mbx_inbox\./); assert.doesNotMatch(second.stdout, /Policies/, "recap only once per session");
+  assert.equal(second.stdout, "", "the same unread id is not named on the next prompt");
   const wake = run("prompt", "real-hook-session", "claude", {}, { prompt: `[mbx] 1 new message(s) for ${agent} from sender@alpha [local] (ids X). mbx_read, reply, ack.` });
   assert.doesNotMatch(wake.stdout, /unread for/, "the wake prompt is the notice");
+  const afterWake = run("prompt", "real-hook-session", "claude", {}, { prompt: "still the same mail" });
+  assert.equal(afterWake.stdout, "", "a wake prompt records the unread ids, so the next prompt does not repeat them");
+  send();
+  const third = run("prompt", "real-hook-session", "claude", {}, { prompt: "new mail" });
+  assert.match(third.stdout, /2 unread for .*: mbx_inbox\./);
+  assert.doesNotMatch(third.stdout, /Policies/, "recap only once per session");
   void n;
 });
 

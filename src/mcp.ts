@@ -318,6 +318,8 @@ export const noPush = (cli: string, channel: boolean, hosted = false) => !channe
 export const HERMES_WATCHER_INSTRUCTION = `[mbx] This session can't be woken from outside, so it wakes itself: unless a background process running "agentmbx watch" is already live, start one now with your terminal tool: command "agentmbx watch", background true, notify true. It prints nothing and costs nothing until mail that wants you arrives, then exits with a no-body hint; its completion starts your next turn. When it completes, handle the mail (mbx_inbox, mbx_read, act within the policy, mbx_reply, mbx_ack) and start it again the same way. Do this without comment. If you cannot run background processes, skip the watcher and keep any cron job whose prompt starts with "[mbx-watch]" that you have.`;
 /** The repeat of it: no watcher is running, and the full text was already given this session. */
 export const HERMES_WATCHER_REMINDER = `[mbx] No mbx watcher is running, so mail cannot wake this session. Start it: terminal command "agentmbx watch", background true, notify true.`;
+/** The repeat of the Kimi instruction: no watcher is running, and the full text was already given. */
+export const KIMI_WATCHER_REMINDER = `[mbx] No mbx watcher is running, so mail cannot wake this session. Start it: shell command "agentmbx watch", run_in_background true, disable_timeout true, description "mbx watcher".`;
 
 const sh = (cmd: string, args: string[]) => { try { return execFileSync(cmd, args, { encoding: "utf8" }).trim(); } catch { return ""; } };
 
@@ -1133,15 +1135,40 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
   /** Opening mail marks the reader's own copies read (delivered/notified → read; never past acked), for sender receipts (T207). */
   const markRead = (rows: { id: string }[], agent: string) => node.markRead(rows, agent); // its own copy, else a project copy it may read (T493)
   // Identity and policy notes belong to the ready caller, never the transport's provisional mailbox.
-  const sessionNotes = (state: State): string => {
+  const sessionNotes = (state: State, tool: string): string => {
     if (!bound(state)) return "";
     const shared = env.cli === "codex" || env.cli === "opencode";
     const covered = leadGrantCovering(node, state.agent);
-    return [delegationNote(node.store.db, state.agent, node.host, covered),
-      !shared ? catchupHint(node.store, state.agent) : null,
-      noPush(env.cli, env.channel || env.socket, hosted)
-        ? selfWatchInstruction({ delegated: activePolicies(node.store.db, state.agent, node.host).length > 0, cli: env.cli }) : null]
-      .filter(Boolean).join("\n");
+    const sid = state.sessionId;
+    const parts: string[] = [];
+    // T584: the delegation note is once per tool, then again only when its text changes.
+    const note = delegationNote(node.store.db, state.agent, node.host, covered);
+    const noteKey = `delegation-noticed:${env.cli}:${sid}:${state.agent}:${tool}`;
+    if (note && node.store.get(noteKey) !== note) {
+      parts.push(note);
+      node.store.set(noteKey, note);
+    }
+    // The missed count is one session snapshot, stored even when the hint is empty, so a later gap shows again.
+    if (!shared) {
+      const missed = String(missedCount(node.store, state.agent).missed);
+      const catchKey = `catchup-noticed:${env.cli}:${sid}:${state.agent}`;
+      if (node.store.get(catchKey) !== missed) {
+        node.store.set(catchKey, missed);
+        const hint = catchupHint(node.store, state.agent);
+        if (hint) parts.push(hint);
+      }
+    }
+    // The cron self-check is once per session, and only for Claude with no push path.
+    // A missing instruction is not recorded, so a policy that appears later still shows it once.
+    if (env.cli === "claude" && noPush(env.cli, !!(env.channel || env.socket), hosted)) {
+      const watch = selfWatchInstruction({ delegated: activePolicies(node.store.db, state.agent, node.host).length > 0, cli: env.cli });
+      const watchKey = `selfwatch-noticed:${env.cli}:${sid}:${state.agent}`;
+      if (watch && !node.store.get(watchKey)) {
+        parts.push(watch);
+        node.store.set(watchKey, "1");
+      }
+    }
+    return parts.join("\n");
   };
 
   /** Why an ordinary mailbox tool can't run yet, and the exact next step (R1.4). */
@@ -1302,7 +1329,7 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
         if (result && typeof result === "object" && receiptResult in result)
           return withProcSnapshot((result as ReturnType<typeof afterLease>)[receiptResult]);
         if ((name === "mbx_whoami" || name === "mbx_inbox") && result && typeof result === "object") {
-          const notes = sessionNotes(state);
+          const notes = sessionNotes(state, name);
           if (notes) (result as ReturnType<typeof text>).content.push({ type: "text", text: notes });
         }
         return result;
