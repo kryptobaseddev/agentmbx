@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **Reopening a rootless quarantine summary no longer renews its caution window (T579).** The first summary disclosure is retained per provider conversation and message. A different unknown summary still cautions, and real outside roots, raw reads and approval guards keep their existing behavior. This narrows repeated-summary taint; scoped collaboration still awaits the signed v2 opt-in path.
+- **An OpenCode wake receipt now settles its own serve's offer (T672).** Wake offers are held per (session, serve pid), but a receipt was matched by session alone: with two serves polling one session a receipt could settle the other one's offer and credit an admission that never happened. `completeOpencodeWake` now takes the serve's pid and settles exactly that offer; without a pid it settles only when a single offer is outstanding and otherwise refuses. The OpenCode plugin template posts its pid with every receipt (and with a mid-turn busy decline), and the loopback route validates and forwards it. **The plugin template changed, so run `agentmbx setup --only opencode` and reopen the OpenCode tab for a session to send it.**
 
 ## 0.5.41 (2026-10-15)
 
