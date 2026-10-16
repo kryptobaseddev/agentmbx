@@ -29,7 +29,7 @@ import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./rec
 import { escalateUnheldMail, retirePhantoms, returnNeverClaimed } from "./stranded.js";
 import { activeLead, leadSummary, makeLead, makeLeadRevocation, projectLeadLine, projectLeadView, revokeLead, storeLead } from "./project-ledger.js";
 import { leadHistory } from "./lead-record.js";
-import { DEFAULT_PORT, defaultHome, didWarning, formatFor, messageReadView, MbxNode, summaryLine, trustLabel } from "./node.js";
+import { DEFAULT_PORT, defaultHome, didWarning, formatFor, messageReadView, MbxNode, summaryLine, trustLabel, WAKE_KINDS } from "./node.js";
 import { sessionStartLeadAudit } from "./lead-grants.js";
 import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, parsePolicyTtl, policyUnexpired, policySummary } from "./policy.js";
 import { authHelperPath, createKeychainOwner, createOwnerKey, defaultOwnerBackend, ownerInfo, ownerSignCanonical, sessionClearanceSummary, readPassphraseFromTTY } from "./owner.js";
@@ -170,7 +170,8 @@ Agent integration
   agentmbx import-v2 <MAILBOX/v2 dir>           import this caller's leased mailbox as unsigned 'legacy' messages
 
 Env: MBX_HOME (default ~/.local/share/agentmbx), MBX_AGENT (agent name for mcp/hooks), MBX_ADVERTISE (host:port others use),
-     MBX_UPDATE_URL (release download base), MBX_NO_UPDATE_CHECK (daemon skips its daily update check)`;
+     MBX_UPDATE_URL (release download base), MBX_NO_UPDATE_CHECK (daemon skips its daily update check),
+     MBX_STOP_DIGEST (1, on, or true: Stop continues only for request, task, decision, and alert; set it in the harness's hook environment)`;
 const die = (msg) => { throw Object.assign(new Error(msg), { code: "USAGE_ERROR" }); };
 const EXIT = { USAGE: 2, NOT_FOUND: 3, AMBIGUOUS: 4 };
 // T313: every CLI with a statusline adapter. Session files are namespaced by these names, so a
@@ -1834,6 +1835,11 @@ function grokWatchReminder(sid) {
 const KIMI_STOP_NAG_MS = 10 * 60_000;
 /** T584: the Grok post-tool watcher paragraph, at most once per this window. Stop is not gated by it. */
 const GROK_WATCH_NAG_MS = 10 * 60_000;
+/** T584 AC3: opt-in. Only 1, on, or true narrows Stop. Unset and every other value keep wantsWake. */
+function stopDigest() {
+    const v = process.env.MBX_STOP_DIGEST?.trim().toLowerCase();
+    return v === "1" || v === "on" || v === "true";
+}
 /** True when a shell background task is already the Grok watcher for this session. */
 function grokWatchArmed(input, sid) {
     const tasks = input.backgroundTasks ?? input.background_tasks;
@@ -2160,8 +2166,11 @@ async function hook(node, event, cli) {
                 const mark = `stopseen:${cli}:${sid ?? process.ppid}`, seen = node.store.get(mark) ?? new Date(Date.now() - 10 * 60_000).toISOString();
                 // T673: only mail not read yet. Read mail was seen (and often answered) already: continuing for it cost a turn in the same
                 // session and again in a new one (restart, reopen) within the fallback window; read-but-unacked mail rides T670's prompt line.
+                // T584 AC3: MBX_STOP_DIGEST narrows this filter only. The watcher keeps wantsWake, so a
+                // message or reply can still wake an idle session while it no longer continues Stop.
+                const digest = stopDigest();
                 const fresh = node.inbox(agent, { limit: 50 })
-                    .filter(m => m.state !== "read" && m.received_at > seen && m.from_addr !== `${agent}@${node.host}` && node.wantsWake(agent, m) && hasWakeAuthority(node, agent, m));
+                    .filter(m => m.state !== "read" && m.received_at > seen && m.from_addr !== `${agent}@${node.host}` && node.wantsWake(agent, m) && hasWakeAuthority(node, agent, m) && (!digest || WAKE_KINDS.has(m.kind)));
                 // T435: mail stays first. After it is consumed, one continuation re-arms a down watcher.
                 // Mail that arrives after the watcher exits and before the next tool or Stop still only
                 // gets a desktop notice — compaction does not fire Stop, and this gate cannot close that gap.

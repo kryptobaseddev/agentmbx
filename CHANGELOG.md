@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Opt-in Stop digest (T584).** `MBX_STOP_DIGEST=1` (also `on` or `true`) makes Stop continue only for request, task, decision, and alert. A message or reply waits for the next prompt, including when it needs a reply or mentions the agent. Status stays excluded either way. Unset, `0`, `off`, or any other value keeps today's Stop behavior. The variable must be in the harness's hook environment, for example the shell that launches the CLI. The watcher wake path is unchanged.
+
 ## 0.5.42 (2026-10-15)
 
 - **Reopening a rootless quarantine summary no longer renews its caution window (T579).** The first summary disclosure is retained per provider conversation and message. A different unknown summary still cautions, and real outside roots, raw reads and approval guards keep their existing behavior. This narrows repeated-summary taint; scoped collaboration still awaits the signed v2 opt-in path.

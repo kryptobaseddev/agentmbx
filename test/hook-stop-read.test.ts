@@ -33,9 +33,10 @@ for (const cli of Object.keys(SIDS)) test(`T673 ${cli}: stop does not continue f
   const rec = makePolicy({ level: "autonomous", agents: ["worker"], hosts: ["alpha"], ownerPub: owner.publicKey });
   assert.equal(acceptSigned(n.store.db, { rec, sig: signData(owner.privateKey, canonical(rec)) }, "alpha"), null);
   const stop = (sid: string): string => {
+    const env = { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1", MBX_AGENT: "unrelated" };
+    delete env.MBX_STOP_DIGEST;
     const r = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", "stop", "--cli", cli], {
-      input: JSON.stringify({ session_id: sid, cwd: process.cwd() }), encoding: "utf8", timeout: 30_000,
-      env: { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1", MBX_AGENT: "unrelated" } });
+      input: JSON.stringify({ session_id: sid, cwd: process.cwd() }), encoding: "utf8", timeout: 30_000, env });
     return r.stdout + r.stderr; // kimi continues with exit 2 on stderr; the others print a block decision
   };
   const send = (subject: string) => sendLeased(n, { from: "boss", to: ["worker"], subject, body: "b", kind: "request", needs_reply: true }).envelope;
@@ -54,4 +55,85 @@ for (const cli of Object.keys(SIDS)) test(`T673 ${cli}: stop does not continue f
   assert.match(stop(s2), CONTINUES, "unread mail continues the turn");
   bindWakeLease(n, { agent: "worker", cli, session_id: s3, pid: process.pid });
   assert.match(stop(s3), CONTINUES, "a new session has not seen unread mail: it continues");
+});
+
+const DIGEST_CLIS: Record<string, string> = {
+  claude: "sess-digest",
+  codex: "44444444-4444-4444-8444-444444444444",
+  opencode: "ses_digest",
+  kimi: "kimi-digest",
+  grok: "grok-digest-sid",
+};
+
+for (const [cli, sid] of Object.entries(DIGEST_CLIS)) test(`T584 ${cli}: MBX_STOP_DIGEST narrows Stop to request, task, decision, and alert`, { timeout: 180_000 }, (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-t584-digest-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }); });
+  bindWakeLease(n, { agent: "worker", cli, session_id: sid, pid: process.pid });
+  const read: string[] = [];
+  const stop = (digest: string | undefined, armed: boolean) => {
+    const env = { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1", MBX_AGENT: "unrelated" };
+    delete env.MBX_STOP_DIGEST;
+    if (digest !== undefined) env.MBX_STOP_DIGEST = digest;
+    const input: Record<string, unknown> = { session_id: sid, cwd: process.cwd() };
+    if (cli === "grok") {
+      input.reason = "end_turn";
+      if (armed) input.backgroundTasks = [{ type: "shell", command: `agentmbx watch --cli grok --session ${sid}` }];
+    }
+    return spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", "stop", "--cli", cli], {
+      input: JSON.stringify(input), encoding: "utf8", timeout: 30_000, env,
+    });
+  };
+  const send = (kind: "message" | "reply" | "status" | "request" | "task" | "decision" | "alert", body: string, needs_reply = false) => {
+    for (const id of read) n.setDelivery(id, "worker", "read");
+    n.store.set(`stopseen:${cli}:${sid}`, new Date(Date.now() - 60_000).toISOString());
+    const id = sendLeased(n, { from: "boss", to: ["worker"], subject: kind, body, kind, needs_reply }).envelope.id;
+    read.push(id);
+    const row = n.inbox("worker", { limit: 20 }).find((m) => m.id === id);
+    assert.ok(row, `${kind} is in the inbox`);
+    return row;
+  };
+  const text = (digest: string | undefined, armed: boolean) => {
+    const r = stop(digest, armed);
+    return { r, out: r.stdout + r.stderr };
+  };
+  const waits = (digest: string | undefined, label: string) => {
+    const { r, out } = text(digest, true);
+    assert.doesNotMatch(out, CONTINUES, label);
+    if (cli === "grok") assert.equal(r.stdout, "", `${label}: an armed grok watcher stays silent`);
+  };
+  const blocks = (digest: string | undefined, label: string) => {
+    assert.match(text(digest, false).out, CONTINUES, label);
+  };
+
+  const status = send("status", "sitting", true);
+  assert.equal(n.wantsWake("worker", status), false, "status is not wake-worthy");
+  waits(undefined, "status does not continue while the digest is off");
+
+  const note = send("message", "need you", true);
+  assert.equal(n.wantsWake("worker", note), true, "needs_reply is wake-worthy before the digest");
+  blocks(undefined, "digest off: a message that needs a reply still continues");
+  const odd = send("message", "still need you", true);
+  assert.equal(n.wantsWake("worker", odd), true);
+  blocks("maybe", "an unrecognized value stays off");
+  const held = send("message", "held for the prompt", true);
+  assert.equal(n.wantsWake("worker", held), true);
+  waits("1", "digest on: a message that needs a reply waits");
+  waits("on", "on is the same switch");
+  waits("true", "true is the same switch");
+
+  const mention = send("reply", "@worker please");
+  assert.equal(n.wantsWake("worker", mention), true, "an @mention is wake-worthy before the digest");
+  waits("1", "digest on: a reply with an @mention waits");
+
+  const later = send("status", "still sitting", true);
+  assert.equal(n.wantsWake("worker", later), false);
+  waits("1", "status still does not continue while the digest is on");
+
+  for (const kind of ["request", "task", "decision", "alert"] as const) {
+    const row = send(kind, "go", true);
+    assert.equal(row.kind, kind);
+    assert.equal(n.wantsWake("worker", row), true);
+    blocks("1", `${kind} still continues`);
+  }
 });

@@ -180,6 +180,7 @@ nothing for an unbound session, and setup does not overwrite the owner's status 
 - Every CLI with hooks also gets "[mbx] N unread" when a session starts and on each user prompt.
 - Under an owner policy, mail that arrives while you work keeps your turn going (Stop hook: Claude, Codex, Kimi):
   handle it before you stop.
+- `MBX_STOP_DIGEST=1` (also `on` or `true`) must be set in the shell that launches the harness, so the Stop hook sees it. Stop then continues only for request, task, decision, and alert; a message or reply waits for the next prompt, even with needs_reply or an @mention. Unset, Stop is unchanged, and status never continues a turn.
 - Kimi Code in a terminal can't be woken from outside, so it wakes itself: keep one background task running
   `agentmbx watch` (run_in_background, disable_timeout, description "mbx watcher"). It costs nothing while idle and
   exits with a no-body hint when mail that wants you arrives; its completion starts your next turn. Handle the mail,
