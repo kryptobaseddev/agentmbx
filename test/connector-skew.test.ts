@@ -200,7 +200,11 @@ test("T669: doctor names a stale plugin module even though no connector is behin
   const staleTemplate: OpencodePluginState = { headerVersion: "0.5.36", mtimeMs: 1, templateCurrent: false };
   assert.match(connectorSkewChecks(n, { installed: "0.5.38", inspect, plugin: staleTemplate }).find(c => c.label.includes("older plugin module"))!.fix!,
     /the plugin does not: run `agentmbx setup --only opencode`, then reopen the tab$/);
-  assert.equal(connectorSkewChecks(n, { installed: "0.5.38", inspect, plugin: CURRENT_PLUGIN }).some(c => c.label.includes("older plugin module")), false,
+  // The serve start is a LOCAL lstart string, so the file's mtime must be built in local time too: an epoch constant
+  // (Date.UTC) is earlier than that local instant west of UTC and later east of it, which made this case pass locally
+  // and fail on a UTC runner. Written before the serve started = the tab already loaded the current file.
+  const alreadyLoaded: OpencodePluginState = { headerVersion: "0.5.38", mtimeMs: new Date(2026, 9, 15, 11, 0, 0).getTime(), templateCurrent: true };
+  assert.equal(connectorSkewChecks(n, { installed: "0.5.38", inspect, plugin: alreadyLoaded }).some(c => c.label.includes("older plugin module")), false,
     "a current plugin file adds no row");
 });
 
