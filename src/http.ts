@@ -416,13 +416,17 @@ export function startServer(node: MbxNode, port = node.config.port, bind = node.
           return send(200, { text });
         }
         if (req.method === "POST") {
-          const j = JSON.parse(body || "{}") as { sessionID?: unknown; id?: unknown; turn_since?: unknown };
+          const j = JSON.parse(body || "{}") as { sessionID?: unknown; id?: unknown; turn_since?: unknown; pid?: unknown };
           if (typeof j.sessionID !== "string" || typeof j.id !== "string" || !j.sessionID || j.sessionID.length > 256)
             return send(400, { error: "bad receipt" });
           // T642: an optional, well-formed time only; anything else reads as "not reported".
           const turnSince = typeof j.turn_since === "string" && j.turn_since.length <= 40 && Number.isFinite(Date.parse(j.turn_since))
             ? new Date(j.turn_since).toISOString() : null;
-          if (!completeOpencodeWake(j.sessionID, j.id, turnSince)) return send(409, { error: "no wake is waiting for that receipt" });
+          // T672: the serve that was offered the wake, validated the way the poll's pid is. Absent or malformed is
+          // simply "not named": the receipt then settles only an unambiguous single offer.
+          const receiptPid = typeof j.pid === "number" && Number.isSafeInteger(j.pid) && j.pid > 1 ? j.pid
+            : typeof j.pid === "string" && /^[1-9]\d{0,9}$/.test(j.pid) ? Number(j.pid) : undefined;
+          if (!completeOpencodeWake(j.sessionID, j.id, turnSince, receiptPid)) return send(409, { error: "no wake is waiting for that receipt" });
           return send(200, { ok: true });
         }
         return send(405, { error: "method not allowed" });
