@@ -19,11 +19,15 @@ import type { MessageRow, Store } from "./store.ts";
 import { leadAgentOf, projectLabel, projectMailboxBySlot } from "./project-mailbox.ts";
 import { isSlotName } from "./project-slot.ts";
 import { markSkewNoted, wakeSkewNote } from "./connector-skew.ts";
+import { codexFailureClass, enqueueCodexQueue, reconcileCodexQueue, type CodexPending, type CodexQueueContext } from "./codex-queue.ts";
+import { identityGeneration } from "./identity-control.ts";
 
 const run = promisify(execFile);
 /** `ok` is true only for an admitted wake or a shown notice. Provider adapters also report the typed `outcome` (T178,
  *  docs/spec/provider-wake-contract.md); the dispatcher decides from the outcome, never from error text. */
-export type WakeResult = ({ ok: true; via: string } | { ok: false; via: string; error: string; retry?: boolean }) & { outcome?: WakeOutcome };
+export type WakeResult = ({ ok: true; via: string } | { ok: false; via: string; error: string; retry?: boolean }) & {
+  outcome?: WakeOutcome; failure?: { exitCode: number | null; stderrClass: string; rpcCode?: number };
+};
 const attemptId = () => ulid();
 const receipt = (strength: WakeReceipt["strength"], r: Partial<WakeReceipt> = {}): WakeReceipt =>
   ({ strength, nativeId: null, sessionId: null, nativeStatus: null, providerVersion: null, ...r });
@@ -95,21 +99,36 @@ export async function wakeGrok(_sessionId: string, _text: string, o: { recheck?:
   return outcome(via, { kind: "not_submitted", reason: "unsupported", detail: GROK_NO_PUSH }, GROK_NO_PUSH);
 }
 
-export async function wakeCodex(threadId: string, text: string, o: { recheck?: () => boolean } = {}): Promise<WakeResult> {
+export async function wakeCodex(threadId: string, text: string, o: { recheck?: () => boolean; queue?: CodexQueueContext } = {}): Promise<WakeResult> {
   const via = "codex queue";
   if (o.recheck && !o.recheck()) return outcome(via, { kind: "not_submitted", reason: "fenced" }, "wake authority changed");
+  if (!o.queue) return outcome(via, { kind: "not_submitted", reason: "no-target" }, "Codex queue requires a captured identity lease");
   try {
-    await run(CODEX(), ["queue", "--thread", threadId, "--message", text], { timeout: 20_000 });
-    return outcome(via, { kind: "admitted", receipt: receipt("exit-status", { sessionId: threadId }) });
+    const id = await enqueueCodexQueue(CODEX(), threadId, text, o.queue, o.recheck ?? (() => true));
+    return outcome(via, { kind: "admitted", receipt: receipt("native", { sessionId: threadId, nativeId: id, nativeStatus: "queued" }) });
   } catch (e) {
-    const err = e as Error & { code?: number | string; killed?: boolean; signal?: string | null };
-    const detail = err.message.slice(0, 300);
-    if (err.code === "ENOENT" || err.code === "EACCES") return outcome(via, { kind: "not_submitted", reason: "unavailable", detail });
-    // Killed by the timeout or a signal: the queue write may already have landed.
-    if (err.killed || err.signal) return outcome(via, { kind: "unknown", reason: err.killed ? "timeout" : "killed", detail });
-    return outcome(via, { kind: "failed", status: typeof err.code === "number" ? err.code : null, detail });
+    const err = e as Error & { code?: string; exitCode?: number | null; signal?: string | null; stderrClass?: string; rpcCode?: number };
+    const detail = err.message.slice(0, 300), diagnostic = { exitCode: err.exitCode ?? null, stderrClass: err.stderrClass ?? codexFailureClass(detail), ...(err.rpcCode === undefined ? {} : { rpcCode: err.rpcCode }) };
+    const result = err.code === "CODEX_QUEUE_PENDING" ? outcome(via, { kind: "busy" }, detail)
+      : err.code === "CODEX_QUEUE_FENCED" ? outcome(via, { kind: "not_submitted", reason: "fenced" }, detail)
+      : err.code === "ENOENT" || err.code === "EACCES" ? outcome(via, { kind: "not_submitted", reason: "unavailable", detail })
+      : err.code === "ETIMEDOUT" || err.signal || err.code === "CODEX_QUEUE_PROTOCOL" || err.code === "CODEX_QUEUE_CLOSED" || err.code === "CODEX_QUEUE_STATE"
+        ? outcome(via, { kind: "unknown", reason: err.code === "ETIMEDOUT" ? "timeout" : "lost-response", detail })
+        : outcome(via, { kind: "failed", status: err.exitCode ?? err.rpcCode ?? null, detail });
+    return { ...result, failure: diagnostic };
   }
 }
+
+const keepCodexNotice = (node: MbxNode, p: CodexPending): boolean => {
+  const lease = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(p.agent);
+  if (!lease || lease.released_at !== null || lease.cli !== "codex" || lease.session_id !== p.thread
+    || identityGeneration(String(lease.token)) !== p.generation || lease.holder_pid !== p.holder.pid || lease.holder_start !== p.holder.start) return false;
+  return p.deliveries.every(pair => {
+    const row = node.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=? AND agent=?").get(pair.id, pair.agent), message = node.message(pair.id);
+    return (row?.state === "delivered" || row?.state === "notified") && !!message && hasWakeAuthority(node, p.agent, message)
+      && (!isSlotName(pair.agent) || leadAgentOf(node, pair.agent) === p.agent);
+  });
+};
 
 export async function opencodeService(): Promise<{ url: string; auth: string } | null> {
   try {
@@ -446,6 +465,7 @@ function noticeAllowed(node: MbxNode, agent: string, now: number): boolean {
 
 /** One pass of the wake dispatcher: every delivered-but-not-notified message is either woken, batched or skipped. */
 export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ agent: string; result: WakeResult | { ok: false; via: "brake"; error: string } }[]> {
+  const codexBlocked = await reconcileCodexQueue(node.store, CODEX(), p => keepCodexNotice(node, p));
   reconcileWakes(node, now);
   // T557: a project mailbox slot has no session of its own. Its mail is woken for the project's CURRENT lead on this host (the subject: whose
   // session, policy, mute and batching window apply) while every delivery operation stays on the slot (the row's own mailbox, r.agent).
@@ -510,6 +530,9 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
     // session, so it gets the notice fallback instead of a guessed sibling session in the same directory.
     for (const guard of automatic.length ? sessions : []) {
       const s = guard.session;
+      if (s.cli === "codex" && (codexBlocked.has(agent) || codexBlocked.has("*"))) {
+        result = outcome("codex queue", { kind: "busy" }, "previous Codex notice withdrawal is unresolved"); break;
+      }
       const recheck = () => {
         try { return guard.run(() => automatic.every(r => {
           const delivery = node.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=? AND agent=?").get(r.id, r.agent);
@@ -520,7 +543,8 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
       if (!recheck()) { fenced = true; break; }
       const marker = { attemptId: ulid(), agent, messageIds: automatic.map((r) => r.id), deliveries: automatic.map((r) => ({ id: r.id, agent: r.agent })), sessionId: s.session_id, at: new Date(now).toISOString() };
       node.store.set(attemptKey(agent), JSON.stringify(marker)); // durable before the native write (WC-14)
-      if (s.cli === "codex") result = await wakeCodex(s.session_id, text, { recheck });
+      if (s.cli === "codex") result = await wakeCodex(s.session_id, text, { recheck,
+        queue: { store: node.store, agent, deliveries: marker.deliveries, run: guard.run, keep: p => keepCodexNotice(node, p) } });
       else if (s.cli === "opencode") {
         // T661: a session whose live connector is behind the installed build learns how it switches, once, on a real wake.
         const skew = wakeSkewNote(node, s);
@@ -532,6 +556,7 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
       else continue;
       attempts++;
       node.store.audit("wake.attempt", { agent, attempt: marker.attemptId, session: `${s.cli}:${s.session_id}`, outcome: result.outcome?.kind ?? null,
+        ...(result.failure ? { failure: result.failure } : {}),
         ...(result.outcome && "reason" in result.outcome ? { reason: result.outcome.reason } : {}),
         ...(result.outcome?.kind === "admitted" ? { receipt: result.outcome.receipt.strength, native: result.outcome.receipt.nativeId,
           ...(result.outcome.receipt.nativeStatus ? { nativeStatus: result.outcome.receipt.nativeStatus } : {}) } : {}) });

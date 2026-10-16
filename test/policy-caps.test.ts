@@ -1,3 +1,4 @@
+import { writeCodexQueueStub } from "./helpers/codex-queue.ts";
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -105,10 +106,12 @@ test("legacy NOT NULL expiry migration preserves all evidence and current reopen
 for (const level of ["collaborate", "autonomous"] as const) test(`${level}: 500-hop mail stays actionable and reaches the recipient wake adapter after 500 actions`, async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-deep-wake-")), n = new MbxNode(home, { host: "alpha" });
   t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
-  const wakeLog = join(home, "wake.log"), wakeBin = join(home, "test-codex.mjs"), oldBin = process.env.MBX_CODEX_BIN;
-  writeFileSync(wakeBin, `#!${process.execPath}\nimport {writeFileSync} from 'node:fs'; writeFileSync(${JSON.stringify(wakeLog)}, process.argv.join(' '));\n`, { mode: 0o700 });
+  const wakeLog = join(home, "wake.log"), wakeBin = join(home, "test-codex.mjs"), oldBin = process.env.MBX_CODEX_BIN, oldLog = process.env.MBX_TEST_WAKE_LOG;
+  writeCodexQueueStub(wakeBin, { format: "argv" });
   process.env.MBX_CODEX_BIN = wakeBin;
-  t.after(() => { if (oldBin === undefined) delete process.env.MBX_CODEX_BIN; else process.env.MBX_CODEX_BIN = oldBin; });
+  process.env.MBX_TEST_WAKE_LOG = wakeLog;
+  t.after(() => { if (oldBin === undefined) delete process.env.MBX_CODEX_BIN; else process.env.MBX_CODEX_BIN = oldBin;
+    if (oldLog === undefined) delete process.env.MBX_TEST_WAKE_LOG; else process.env.MBX_TEST_WAKE_LOG = oldLog; });
   bindWakeLease(n, { agent: "worker", cli: "codex", session_id: "deep-worker", pid: process.pid });
   if (level === "collaborate") {
     n.store.db.prepare("UPDATE policies SET revoked=1").run();

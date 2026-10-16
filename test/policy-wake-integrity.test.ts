@@ -1,6 +1,7 @@
+import { writeCodexQueueStub } from "./helpers/codex-queue.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { MbxNode } from "../src/node.ts";
@@ -11,7 +12,7 @@ import { sendLeased } from "./helpers/leased-send.ts";
 for (const defect of ["json", "signature", "expiry-cache"]) test(`valid lease cannot wake through a policy with corrupt ${defect}`, async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-policy-wake-")), n = new MbxNode(home, { host: "alpha" });
   const log = join(home, "calls"), bin = join(home, "codex");
-  writeFileSync(bin, '#!/bin/sh\nprintf "%s\\n" "$3" >> "$MBX_TEST_WAKE_LOG"\n', { mode: 0o700 });
+  writeCodexQueueStub(bin);
   const old = { MBX_CODEX_BIN: process.env.MBX_CODEX_BIN, MBX_TEST_WAKE_LOG: process.env.MBX_TEST_WAKE_LOG, MBX_NO_DESKTOP: process.env.MBX_NO_DESKTOP };
   Object.assign(process.env, { MBX_CODEX_BIN: bin, MBX_TEST_WAKE_LOG: log, MBX_NO_DESKTOP: "1" });
   t.after(() => {

@@ -1,3 +1,4 @@
+import { writeCodexQueueStub } from "./helpers/codex-queue.ts";
 // T178: provider adapters report typed outcomes (docs/spec/provider-wake-contract.md WC-06..WC-10) and the dispatcher
 // decides from them: status never wakes, an uncertain submission is never repeated, receipts keep their strength.
 import { sendLeased } from "./helpers/leased-send.ts";
@@ -14,12 +15,14 @@ import { dispatchWakes, muteWakes, UNKNOWN_HOLD_MS, wakeCodex, wakeOpencode, wak
 import { opencodeHostSeams } from "../src/opencode-provider.ts";
 import type { WakeOutcome } from "../src/wake-contract.ts";
 import { statusWakeWarning, type Envelope } from "../src/mcp.ts";
+import { captureWakeIdentity } from "../src/wake-identity.ts";
+import type { CodexQueueContext } from "../src/codex-queue.ts";
 
-function fixture(t: { after: (fn: () => void | Promise<void>) => unknown }, codexScript = 'printf "%s\\n" "$3" >> "$MBX_TEST_WAKE_LOG"') {
+function fixture(t: { after: (fn: () => void | Promise<void>) => unknown }) {
   const home = mkdtempSync(join(tmpdir(), "mbx-wake-outcome-"));
   const n = new MbxNode(home, { host: "alpha" });
   const log = join(home, "calls"), bin = join(home, "codex");
-  writeFileSync(bin, `#!/bin/sh\n${codexScript}\n`, { mode: 0o700 });
+  writeCodexQueueStub(bin);
   const keys = ["MBX_CODEX_BIN", "MBX_TEST_WAKE_LOG", "MBX_NO_DESKTOP", "MBX_OPENCODE_URL"] as const;
   const old = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
   Object.assign(process.env, { MBX_CODEX_BIN: bin, MBX_TEST_WAKE_LOG: log, MBX_NO_DESKTOP: "1" });
@@ -41,19 +44,23 @@ test("a status message never wakes, even with a mention and needs_reply; it stay
   assert.equal(calls().length, 1);
 });
 
-test("codex exit 0 is admitted with exit-status strength; a missing binary is not_submitted; a failing exit is failed (WC-10)", async (t) => {
-  const { calls } = fixture(t);
-  const ok = await wakeCodex("22222222-2222-4222-8222-222222222222", "[mbx] hint");
+test("codex returns a native queue id; missing binaries are not_submitted; failed initialization records exit status (WC-10)", async (t) => {
+  const { n, calls } = fixture(t), sid = "22222222-2222-4222-8222-222222222222";
+  bindWakeLease(n, { agent: "worker", cli: "codex", session_id: sid, pid: process.pid });
+  const guard = captureWakeIdentity(n, n.sessionsFor("worker")[0])!;
+  const queue: CodexQueueContext = { store: n.store, agent: "worker", deliveries: [{ id: "test", agent: "worker" }], run: guard.run, keep: () => false };
+  const ok = await wakeCodex(sid, "[mbx] hint", { queue });
   assert.equal(ok.outcome?.kind, "admitted");
-  assert.equal(ok.outcome?.kind === "admitted" && ok.outcome.receipt.strength, "exit-status");
+  assert.equal(ok.outcome?.kind === "admitted" && ok.outcome.receipt.strength, "native");
+  assert.ok(ok.outcome?.kind === "admitted" && ok.outcome.receipt.nativeId);
   assert.equal(calls().length, 1);
   process.env.MBX_CODEX_BIN = "/nonexistent/codex";
-  const missing = await wakeCodex("22222222-2222-4222-8222-222222222222", "[mbx] hint");
+  const missing = await wakeCodex(sid, "[mbx] hint", { queue });
   assert.equal(missing.outcome?.kind === "not_submitted" && missing.outcome.reason, "unavailable");
   const dir = mkdtempSync(join(tmpdir(), "mbx-codex-fail-")), bad = join(dir, "codex");
   writeFileSync(bad, "#!/bin/sh\nexit 2\n", { mode: 0o700 });
   process.env.MBX_CODEX_BIN = bad;
-  const failed = await wakeCodex("22222222-2222-4222-8222-222222222222", "[mbx] hint");
+  const failed = await wakeCodex(sid, "[mbx] hint", { queue });
   assert.equal(failed.outcome?.kind === "failed" && failed.outcome.status, 2);
   rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   let fenced = false;
