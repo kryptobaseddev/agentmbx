@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Skill: Kimi reference page (T683).** `skill/references/kimi.md` documents the three Kimi hosts (terminal `kimi-code`, `kimi web`, the Kimi desktop app), how to tell which one a conversation runs in, the `agentmbx doctor` rows for each, and wake troubleshooting (`no-target` means no hosted server or no desktop plugin). Linked from the Kimi bullets in `SKILL.md`.
+
 ## 0.5.44 (2026-10-16)
 
 - **Opt-in Stop digest (T584).** `MBX_STOP_DIGEST=1` (also `on` or `true`) makes Stop continue only for request, task, decision, and alert. A message or reply waits for the next prompt, including when it needs a reply or mentions the agent. Status stays excluded either way. Unset, `0`, `off`, or any other value keeps today's Stop behavior. The variable must be in the harness's hook environment, for example the shell that launches the CLI. The watcher wake path is unchanged.
