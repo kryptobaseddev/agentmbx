@@ -68,7 +68,7 @@ import { isSlotName } from "./project-slot.js";
 const HELP = `agentmbx (AgentMBX) — signed messages between AI coding agents, on this machine and across paired machines
 
 Start here
-  agentmbx setup [--yes] [--dry-run] [--only claude,codex,opencode,kimi,hermes,skill,owner] [--host <name>] [--no-owner] [--policy ask|collaborate|autonomous|yolo] [--uninstall]
+  agentmbx setup [--yes] [--dry-run] [--only claude,codex,opencode,kimi,hermes,grok,skill,daemon,owner] [--host <name>] [--no-owner] [--policy ask|collaborate|autonomous|yolo] [--uninstall]
                   init this host, install the daemon, wire every detected agent CLI (MCP + hooks + skill), create the owner key
   agentmbx doctor [--fix] [--processes]   checklist; --processes lists MCP/watch pid, ppid, birth, client liveness and RSS (read-only; excludes --fix)
   agentmbx claude [claude args…]   start Claude Code with the mbx channel, so the idle session wakes when mail arrives

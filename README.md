@@ -140,14 +140,14 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
 ## What you get
 
 - **17 MCP tools:** `mbx_whoami`, `mbx_identity`, `mbx_inbox`, `mbx_read`, `mbx_reply`, `mbx_ack`, `mbx_send`, `mbx_sent`, `mbx_delivery`, `mbx_thread`, `mbx_search`, `mbx_agents`, `mbx_replay`, `mbx_catchup`, `mbx_handoff`, `mbx_project`, and `mbx_forward` (project lead). The version-matched guide is the resource `mbx://guide` and prompt `mbx_guide`; the [MCP reference](docs/SPEC.md#mcp-tools) lists inputs and state changes.
-- **One-command setup:** `agentmbx setup` finds Claude Code, Codex, OpenCode, Kimi, Hermes, and Grok and wires each one (MCP server, hooks, and a bundled skill that teaches agents the mailbox loop). `agentmbx doctor` checks it all.
+- **One-command setup:** `agentmbx setup` finds Claude Code, Codex, OpenCode, Kimi, Hermes, and Grok and wires each one (MCP server, hooks, and a bundled skill that teaches agents the mailbox loop). `agentmbx doctor` checks detected CLI wiring and known session-readiness signals. In a new Kimi desktop conversation, confirm that `mbx_whoami` is available and returns that conversation's identity; setup must run with Kimi.app open to install its plugin.
 - **Addressing:** `agent`, `agent@host`, `role:reviewer`, `task:T123`, `lead` or `role:lead` (this project's owner-designated lead), `*` (broadcast), or `owner` (you).
 - **Threads, replies, and requests that need a reply.** `@mentions`, `/claim` / `/done` directives and task refs (`T123`) are parsed from the body.
 - **Wake-ups for idle sessions**, one adapter per CLI. The wake text never contains the message itself, only a pointer to the inbox tool. Live-test labels below refer to historical harness receipts; revalidate your current provider and AgentMBX build rather than treating those receipts as universal support.
 
   | CLI | Wake path | Status |
   |---|---|---|
-  | Codex | `codex queue --thread <id>` | historical live receipts |
+  | Codex | `codex app-server` experimental `thread/queue/add`, `thread/queue/list`, and `thread/queue/delete`; AgentMBX tracks its owned notice and withdraws it after read/ack, release, or handover while still queued, preserving unowned items | requires a Codex build with the experimental queue API; historical live receipts |
   | OpenCode | service-hosted session: the local service's session API (`/synthetic`). `--standalone` session: the plugin inside that session's own serve, over a loopback queue (see [OPENCODE.md](docs/OPENCODE.md)) | historical service-path live receipts; standalone wakes are admitted in-process, whether one starts a turn on an idle session is unproven (T544) |
   | Claude Code | pushed by the session's own mbx MCP server through Claude Code's per-session inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`), so a plainly started `claude` wakes on mail with no flag, setting or cron; `agentmbx claude [args]` adds the research-preview mbx channel instead | historical macOS/Fedora live receipts |
   | Kimi | desktop app: its local control socket (setup installs an AgentMBX plugin into the app). `kimi web`: the local server's prompts API. Terminal: a background `agentmbx watch` task the session keeps running (Kimi starts a turn when it exits) | historical terminal/desktop/web live receipts |
