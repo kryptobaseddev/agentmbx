@@ -1608,7 +1608,7 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
         if (!node.store.get(noticed)) {
           // The shared helper records provenance, but its per-PID last-sid value cannot dedup interleaved conversations.
           enteredNow(sid);
-          const unread = node.unreadCount(agent), missed = missedCount(node.store, agent).missed;
+          const unread = node.newCount(agent), missed = missedCount(node.store, agent).missed;
           if (unread || missed) {
             const identity = held(agent) + (unread ? `\n[mbx] ${unread} unread mbx message(s): call mbx_inbox.` : "");
             console.log(JSON.stringify({ mbx_resume: { session_id: sid, text: resumeNotice(node.store, agent, identity) } }));
@@ -1627,7 +1627,7 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
         && node.store.get(`resume-noticed:opencode:${sid}:${agent}`)) {
         const gen = sessionPid(sid);
         if (gen?.pid && takeServeEntry(node.store, cli, sid, gen.pid, gen.pid_start)) {
-          const unread = node.unreadCount(agent), missed = missedCount(node.store, agent).missed;
+          const unread = node.newCount(agent), missed = missedCount(node.store, agent).missed;
           if (unread || missed) {
             const identity = held(agent) + (unread ? `\n[mbx] ${unread} unread mbx message(s): call mbx_inbox.` : "");
             console.log(JSON.stringify({ mbx_resume: { session_id: sid, text: resumeNotice(node.store, agent, identity) } }));
