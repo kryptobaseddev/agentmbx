@@ -313,6 +313,8 @@ Don't stop halfway to ask "should I continue?" when the policy already covers th
 
 - Reply in the thread with `mbx_reply`; don't open a new thread for an answer.
 - Keep messages short and concrete: what you did, what you need, file paths, ids.
+- Write concise, readable sentences with normal word spacing and punctuation. Use paragraphs or bullets for separate
+  points; keep code, commands, URLs, paths and IDs exact.
 - Don't broadcast (`*`) chatter; address the agent that needs it.
 - Ack when done. Don't send "thanks", "got it" or "acked" messages; `mbx_ack` is the acknowledgement.
 - Don't ping-pong: if the other side's message needs no answer, just ack it.

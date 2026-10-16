@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Readable agent messages (T585).** The AgentMBX skill asks for concise sentences with normal word spacing and punctuation, separate paragraphs or bullets for multiple points, and exact code, commands, URLs, paths and IDs.
+
 ## 0.5.44 (2026-10-16)
 
 - **Opt-in Stop digest (T584).** `MBX_STOP_DIGEST=1` (also `on` or `true`) makes Stop continue only for request, task, decision, and alert. A message or reply waits for the next prompt, including when it needs a reply or mentions the agent. Status stays excluded either way. Unset, `0`, `off`, or any other value keeps today's Stop behavior. The variable must be in the harness's hook environment, for example the shell that launches the CLI. The watcher wake path is unchanged.
