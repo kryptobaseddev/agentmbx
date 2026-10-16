@@ -422,7 +422,7 @@ const isoAt = (t: number) => new Date(t).toISOString();
 /** Which read caused a taint, in words for the sender's warning and mbx_whoami. */
 export const taintCause = (t: Taint): string => `you read ${t.id} from ${t.from}, ${{
   declared: "which its sender declared external: first-hand outside content, so the root is when you read it",
-  inherited: "whose sender inherited the taint from that earlier exposure",
+  inherited: "an untrusted derived read (inherited message or quarantine summary)",
   legacy: "external mail from an older AgentMBX without a root time: counted as first-hand outside content, from when you read it",
   malformed: "a malformed message: unknown provenance counts as first-hand outside content",
 }[t.how]}`;
