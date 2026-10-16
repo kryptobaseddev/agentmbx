@@ -15,6 +15,8 @@ import { STATUS_V2_SCHEMA } from "./status-schema.js";
 import { notifyDesktop } from "./wake.js";
 import { cancelOpencodeWake, completeOpencodeWake, listOpencodeWakeWaiters, waitForOpencodeWake } from "./opencode-wake-queue.js";
 import { opencodePermissionDecision } from "./opencode-permission.js";
+import { serveBindingLive } from "./opencode-poller.js";
+import { activityKey, parseActivity } from "./identity-availability.js";
 import { version } from "./version.js";
 import { rotationLog, saveRotationLog } from "./key-rotation.js";
 import { storedPolicies, acceptSigned, policyUnexpired } from "./policy.js";
@@ -23,6 +25,42 @@ import { listIdentityStatus } from "./identity-status.js";
 import { projectKey } from "./registry.js";
 import { acceptPeerProjects, signedProjects } from "./project-directory.js";
 export const HOP_SKEW_MS = 5 * 60_000;
+/** T676: how often one (session, serve) poll may refresh its agent's lease activity. */
+export const POLL_ACTIVITY_MS = 60_000;
+const pollActivityAt = new Map();
+/**
+ * T676: a standalone OpenCode tab's plugin long-polls the wake queue for its session every 20 s or less while the tab lives,
+ * which is the one per-conversation heartbeat a shared OpenCode process has. Its tool calls take a zero-spawn fast path,
+ * so without this a working conversation looked idle after SHARED_IDLE_MS and an explicit claim could take its identity.
+ * The poll counts as activity only with the T659 proof: the session row still names this agent, session and serve pid with
+ * its recorded birth (a standalone serve), and the agent's current lease is held for this same session. A stray or stale
+ * poll proves nothing. Throttled per (session, pid); `shared` is kept, and activity never moves backwards.
+ */
+export function recordPollActivity(node, sessionID, pid, now = Date.now()) {
+    const key = `${sessionID}\0${pid}`;
+    const last = pollActivityAt.get(key);
+    if (last !== undefined && now - last < POLL_ACTIVITY_MS)
+        return false;
+    pollActivityAt.set(key, now);
+    if (pollActivityAt.size > 1024)
+        pollActivityAt.delete(pollActivityAt.keys().next().value);
+    try {
+        const row = node.store.db.prepare("SELECT * FROM sessions WHERE cli='opencode' AND session_id=?").get(sessionID);
+        if (!row || row.pid !== pid || !serveBindingLive(node, row))
+            return false;
+        const lease = node.store.db.prepare("SELECT session_id FROM identity_leases WHERE name=? AND released_at IS NULL").get(row.agent);
+        if (!lease || lease.session_id !== sessionID)
+            return false;
+        const prior = parseActivity(node.store.get(activityKey(row.agent)));
+        if (prior && prior.at >= now)
+            return false;
+        node.store.set(activityKey(row.agent), JSON.stringify({ at: now, shared: prior?.shared ?? true }));
+        return true;
+    }
+    catch {
+        return false;
+    } // advisory: a busy store or an unreadable process table never fails the poll
+}
 const HELLO_TTL_MS = 2 * 60_000;
 const TOKEN_REQS_PER_MIN = 30;
 const hopPayload = (method, path, ts, body) => `${method}\n${path}\n${ts}\n${sha256(body)}`;
@@ -440,6 +478,7 @@ export function startServer(node, port = node.config.port, bind = node.config.bi
                     if (!sessionID || sessionID.length > 256 || !/^[1-9]\d{0,9}$/.test(pidRaw))
                         return send(400, { error: "bad session or pid" });
                     const pid = Number(pidRaw);
+                    recordPollActivity(node, sessionID, pid); // T676
                     let gone = false;
                     const onClose = () => { if (!res.writableEnded) {
                         gone = true;

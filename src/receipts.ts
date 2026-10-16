@@ -56,7 +56,7 @@ export function mailboxLiveness(node: MbxNode, name: string, now = Date.now()): 
   if (state === "live" || state === "unknown") {
     const activity = parseActivity(node.store.get(activityKey(name)));
     const quiet = activity?.shared && now - activity.at >= SHARED_IDLE_MS
-      ? `; its conversation has made no mbx call for ${Math.round((now - activity.at) / 60_000)} min and may have ended` : "";
+      ? `; its conversation has made no mbx call for ${Math.round((now - activity.at) / 60_000)} min and may have ended (no hook or wake-poll activity either)` : "";
     return { live: true, detail: state === "live" ? `held by ${holder}${quiet}`
       : `held by ${holder} (process unconfirmed, heartbeat ${Math.round((now - row.heartbeat_at) / 1000)} s ago)${quiet}` };
   }
@@ -137,7 +137,7 @@ export function recipientReceipts(node: MbxNode, msgId: string, targets: RouteTa
 }
 
 /** T642: what an OpenCode recipient in the middle of a turn sees, and when. */
-export const OPENCODE_MIDTURN_NOTE = "an OpenCode session in the middle of a turn sees it with its next tool result, and the wake itself when that turn ends";
+export const OPENCODE_MIDTURN_NOTE = "an OpenCode session in the middle of a turn sees it with its next tool result; the wake follows once that turn ends, if the mail is still unhandled";
 export const OPENCODE_BEHIND_TURN_NOTE = "wake queued behind the session's running turn: the model sees a notice with its next tool result, the wake when the turn ends";
 
 /** Warning lines for recipients nobody will read soon. */
