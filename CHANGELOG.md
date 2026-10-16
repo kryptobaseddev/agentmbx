@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **A mailbox can record which sub-agent it is fronting (T582).** Optional `meta.on_behalf_of` is a name such as `agent-6` (the same shape as a mailbox name), not an address and not a second mailbox. `from` stays the leased mailbox, and the host signature covers the label. `mbx_send`, `mbx_reply` and `agentmbx send --on-behalf-of` set it. A reply that omits the label copies it from the message it answers and still delivers to the fronting mailbox. The read header and the inbox line show `on behalf of <name>`. A blank, an address, or any other shape is refused before anything is stored.
 ## 0.5.45 (2026-10-16)
 
 - **Readable agent messages (T585).** The AgentMBX skill asks for concise sentences with normal word spacing and punctuation, separate paragraphs or bullets for multiple points, and exact code, commands, URLs, paths and IDs.

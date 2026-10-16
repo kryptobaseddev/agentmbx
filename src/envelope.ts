@@ -18,7 +18,7 @@ export const NAME_RE = /^[a-z0-9][a-z0-9-]{1,39}$/;
  *  On external mail (T344), `external_since` is the ROOT exposure time (ISO) and `external_source` says whether the sender
  *  declared the content external itself ("declared", root = its send time) or only inherited the taint of outside
  *  content it read earlier ("inherited", root = when that first-hand content was read). */
-export interface Meta { mentions: string[]; directives: string[]; tags: string[]; task_refs: string[]; origin?: "agent" | "external"; hop?: number; project?: string; project_key?: string; local_names?: string[]; sender_verification?: "unverified" | "leased"; external_since?: string; external_source?: "declared" | "inherited"; provenance?: ContentProvenance }
+export interface Meta { mentions: string[]; directives: string[]; tags: string[]; task_refs: string[]; origin?: "agent" | "external"; hop?: number; project?: string; project_key?: string; local_names?: string[]; sender_verification?: "unverified" | "leased"; external_since?: string; external_source?: "declared" | "inherited"; provenance?: ContentProvenance; on_behalf_of?: string }
 
 /** How long outside content a session read keeps that session's own sends external, counted from the root exposure (T104, T344). */
 export const EXTERNAL_TAINT_MS = 3_600_000;
@@ -64,6 +64,15 @@ export interface Draft {
   unverifiedSender?: boolean;
   /** T583: mention every resolved named recipient in the signed meta, so message and reply mail wakes them. */
   urgent?: boolean;
+  /** T582: the sub-agent this mailbox is fronting. A name such as agent-6, not an address. */
+  onBehalfOf?: string;
+}
+
+/** T582: the signed label is a mailbox name. An address, a blank, or anything else is refused. */
+export function onBehalfOfLabel(raw: string): string {
+  const s = raw.trim().toLowerCase();
+  if (!NAME_RE.test(s)) throw new Error("on_behalf_of must be a name like agent-6, not an address");
+  return s;
 }
 
 export function buildEnvelope(d: Draft, now = new Date()): Envelope {
@@ -74,7 +83,7 @@ export function buildEnvelope(d: Draft, now = new Date()): Envelope {
   return {
     v: 3, id, ts: now.toISOString(), from: d.from, to: d.to, thread: d.thread ?? id, reply_to: d.reply_to ?? null,
     kind: d.kind ?? "message", subject: fitSubject(d.subject).subject, body: d.body, needs_reply: d.needs_reply ?? false,
-    refs: d.refs ?? [], meta: { ...parseMeta(d.body), ...(d.unverifiedSender ? { sender_verification: "unverified" as const } : {}), ...(d.origin === "external" ? { origin: "external" as const, external_since: d.external_since ?? now.toISOString(), external_source: d.external_since ? "inherited" as const : "declared" as const } : {}), ...(d.hop ? { hop: d.hop } : {}), ...(d.project ? { project: d.project.slice(0, 300) } : {}), ...(d.project_key ? { project_key: d.project_key.slice(0, 300) } : {}) },
+    refs: d.refs ?? [], meta: { ...parseMeta(d.body), ...(d.unverifiedSender ? { sender_verification: "unverified" as const } : {}), ...(d.origin === "external" ? { origin: "external" as const, external_since: d.external_since ?? now.toISOString(), external_source: d.external_since ? "inherited" as const : "declared" as const } : {}), ...(d.hop ? { hop: d.hop } : {}), ...(d.project ? { project: d.project.slice(0, 300) } : {}), ...(d.project_key ? { project_key: d.project_key.slice(0, 300) } : {}), ...(d.onBehalfOf ? { on_behalf_of: onBehalfOfLabel(d.onBehalfOf) } : {}) },
     authority: null, enc: null,
   };
 }
@@ -183,6 +192,7 @@ export function checkShape(x: unknown): string | null {
   if (m?.project_key !== undefined && (typeof m.project_key !== "string" || m.project_key.length > 300)) return "bad project key";
   // bare `to` entries the sending host delivered to its own agents; receivers skip exactly these (S2 follow-up)
   if (m?.local_names !== undefined && (!Array.isArray(m.local_names) || m.local_names.length > 100 || m.local_names.some((n: unknown) => typeof n !== "string" || !NAME_RE.test(n)))) return "bad local names";
+  if (m?.on_behalf_of !== undefined && (typeof m.on_behalf_of !== "string" || !NAME_RE.test(m.on_behalf_of))) return "bad on_behalf_of";
   return null;
 }
 

@@ -77,7 +77,7 @@ Start here
 
 Messages
   agentmbx send --as <agent> --to <a,b,role:x,*,owner> --subject "…" [-m "body" | --body-file f | stdin]
-           [--kind message|request|reply|status|decision|alert|task] [--reply-to <id>] [--needs-reply] [--urgent] [--origin agent|external] [--ref path]… [--new-mailbox]
+           [--kind message|request|reply|status|decision|alert|task] [--reply-to <id>] [--needs-reply] [--urgent] [--on-behalf-of <name>] [--origin agent|external] [--ref path]… [--new-mailbox]
            [--context <disclosed-thread-id>] [--payload agent|firsthand-outside|derived-outside] [--source <exact-message-id>]…
            Payload inputs stay attached when refs/thread/origin change; context selection does not prove isolation or clear the writer fence.
   agentmbx replay [--cursor <token>] [--limit 50] [--max-bytes 65536] [--scan-limit 1000]
@@ -346,7 +346,7 @@ async function run(argv: string[]) {
   const { values: o, positionals: pos } = parseArgs({ args: rest, allowPositionals: true, strict: cmd !== "hook" && cmd !== "mcp", options: {
     help: { type: "boolean", short: "h" }, force: { type: "boolean" },
     as: { type: "string" }, to: { type: "string" }, subject: { type: "string" }, m: { type: "string", short: "m" },
-    "body-file": { type: "string" }, kind: { type: "string" }, origin: { type: "string" }, schema: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" }, urgent: { type: "boolean" }, "new-mailbox": { type: "boolean" },
+    "body-file": { type: "string" }, kind: { type: "string" }, origin: { type: "string" }, schema: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" }, urgent: { type: "boolean" }, "on-behalf-of": { type: "string" }, "new-mailbox": { type: "boolean" },
     ref: { type: "string", multiple: true }, all: { type: "boolean" }, json: { type: "boolean" }, note: { type: "string" },
     context: { type: "string" }, payload: { type: "string" }, source: { type: "string", multiple: true },
     mailbox: { type: "string" }, limit: { type: "string" }, host: { type: "string" }, port: { type: "string" }, cli: { type: "string" }, session: { type: "string" }, caps: { type: "string" },
@@ -803,7 +803,7 @@ async function run(argv: string[]) {
         const sent = node.send({ from, to: (str("to") ?? die("--to is required")).split(",").map(s => s.trim()).filter(Boolean),
           subject: fit.subject,
           body, kind: (str("kind") ?? "message") as Envelope["kind"], reply_to: reply?.id ?? null, thread: reply?.thread,
-          needs_reply: !!o["needs-reply"], urgent: !!o.urgent, refs: (o.ref as string[] | undefined) ?? [], unverifiedSender: unverified,
+          needs_reply: !!o["needs-reply"], urgent: !!o.urgent, ...(str("on-behalf-of") ? { onBehalfOf: str("on-behalf-of") } : {}), refs: (o.ref as string[] | undefined) ?? [], unverifiedSender: unverified,
           ...(declared || taint ? { origin: "external" as const } : originArg ? { origin: originArg } : {}),
           ...(!declared && taint ? { external_since: new Date(taint.root).toISOString() } : {}) }, undefined, undefined, undefined, scope);
         if (fit.warning) sent.warnings.unshift(fit.warning);

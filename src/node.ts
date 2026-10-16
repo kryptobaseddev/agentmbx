@@ -836,6 +836,14 @@ export class MbxNode {
     // also has an agent of that name skips its copy exactly (no reliance on its possibly stale directory of this host).
     const localBare = [...new Set(r.targets.filter((t) => !t.host && t.name && t.name !== "owner" && !t.to.includes("@") && !t.to.startsWith("role:") && !t.to.startsWith("task:") && t.to !== "*").map((t) => t.to))];
     if (!prebuilt && localBare.length && r.remote.size) e.meta.local_names = localBare.slice(0, 100);
+    // T582: a reply that names no sub-agent keeps the one on the message it answers. An explicit label already won in buildEnvelope.
+    if (!prebuilt && e.meta.on_behalf_of === undefined && d.reply_to) {
+      try {
+        const parent = this.message(d.reply_to);
+        const label = parent ? (JSON.parse(parent.envelope) as Envelope).meta.on_behalf_of : undefined;
+        if (typeof label === "string" && NAME_RE.test(label)) e.meta.on_behalf_of = label;
+      } catch { /* a missing or unreadable parent does not invent a label */ }
+    }
     if (owner) e = ownerSign(e, owner.pub, owner.priv);
     else if (session?.grant) e = attachAuthority(e, session.grant, session.priv);
     e = signEnvelope(e, this.host, this.key.publicKey, this.key.privateKey);
@@ -1447,7 +1455,7 @@ export function formatMessage(m: MessageRow, policy?: string): string {
   return [
     `# ${oneLine(m.subject)}`,
     `id: ${m.id}  ref: mbx:${m.id}@${e.sig?.host ?? "?"}  thread: ${oneLine(m.thread)}${m.reply_to ? `  reply_to: ${oneLine(m.reply_to)}` : ""}`,
-    `from: ${oneLine(m.from_addr)}  to: ${oneLine(e.to.join(", "))}  kind: ${oneLine(m.kind)}${e.needs_reply ? " (needs reply)" : ""}  at: ${oneLine(m.ts)}${e.meta?.project && typeof e.meta.project === "string" ? `  project: ${oneLine(e.meta.project)}` : ""}`,
+    `from: ${oneLine(m.from_addr)}${typeof e.meta?.on_behalf_of === "string" && NAME_RE.test(e.meta.on_behalf_of) ? ` on behalf of ${oneLine(e.meta.on_behalf_of)}` : ""}  to: ${oneLine(e.to.join(", "))}  kind: ${oneLine(m.kind)}${e.needs_reply ? " (needs reply)" : ""}  at: ${oneLine(m.ts)}${e.meta?.project && typeof e.meta.project === "string" ? `  project: ${oneLine(e.meta.project)}` : ""}`,
     `trust: ${trustLabel(m)}`,
     policy ?? "",
     externalLine(e) ?? "",
@@ -1462,7 +1470,8 @@ export function formatMessage(m: MessageRow, policy?: string): string {
 export function summaryLine(m: MessageRow): string {
   const e = JSON.parse(m.envelope) as Envelope;
   const flags = [m.kind, e.needs_reply ? "needs reply" : "", storedAuthority(m)?.ok ? "OWNER" : "", m.state ?? ""].filter(Boolean).join(", ");
-  return `${m.id}  ${m.ts.slice(0, 16)}Z  ${m.from_addr} → ${e.to.join(",")}  [${flags}]  ${m.subject}`;
+  const behalf = typeof e.meta?.on_behalf_of === "string" && NAME_RE.test(e.meta.on_behalf_of) ? ` on behalf of ${e.meta.on_behalf_of}` : "";
+  return `${m.id}  ${m.ts.slice(0, 16)}Z  ${m.from_addr}${behalf} → ${e.to.join(",")}  [${flags}]  ${m.subject}`;
 }
 
 // ---- T507: stale-row sweep (dead MCP processes never run their cleanup) -----------------------
