@@ -1294,7 +1294,7 @@ export function opencodePluginSource(cmd, ver) {
 // Uninstall with: agentmbx setup --uninstall --only opencode
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -1433,6 +1433,23 @@ const watchPermission = (ctx: NoteCtx & { permission?: { hook?: (name: string, f
   } catch { permissionWatching.on = false; }
 };
 const wakeWatching = new Set<string>();
+/** T681: a wake HTTP call that failed (a lost receipt leaves the daemon's attempt unknown) is written to
+ *  MBX_HOME/logs/opencode-plugin.log, never to the TUI: at most one line per kind every 10 s, the file kept under 64 KB. */
+const WAKE_LOG_EVERY_MS = 10_000, WAKE_LOG_MAX = 64 * 1024;
+const wakeLogged = new Map<string, number>();
+const logWake = (kind: string, sid: string, detail: string): void => {
+  const now = Date.now(), last = wakeLogged.get(kind);
+  if (last !== undefined && now - last < WAKE_LOG_EVERY_MS) return;
+  wakeLogged.set(kind, now);
+  try {
+    const dir = join(process.env.MBX_HOME || join(homedir(), ".local", "share", "agentmbx"), "logs");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const file = join(dir, "opencode-plugin.log");
+    try { if (statSync(file).size > WAKE_LOG_MAX) writeFileSync(file, ""); } catch { /* not there yet */ }
+    appendFileSync(file, new Date(now).toISOString() + " " + kind + " session=" + sid + " pid=" + process.pid + " " + detail.slice(0, 300) + "\\n", { mode: 0o600 });
+  } catch { /* logging never surfaces in the host */ }
+};
+const failure = (e: unknown): string => e instanceof Error ? e.name + ": " + e.message : String(e);
 const pause = (ms: number) => new Promise<void>((r) => { const t = setTimeout(r, ms); t.unref(); });
 /** One long-poll per session, started once the session id is known, so both plugin generations share it.
  *  The poll admits through the serve we are already inside. It never posts to the shared service. */
@@ -1449,11 +1466,12 @@ const watchWake = (ctx: NoteCtx, sid: string): void => {
       try {
         const res = await fetch(base + "?session=" + encodeURIComponent(sid) + "&pid=" + String(process.pid));
         if (res.status === 204) { await pause(200); continue; }
-        if (!res.ok) { await pause(1000); continue; }
+        if (!res.ok) { logWake("poll", sid, "status " + res.status); await pause(1000); continue; }
         const j = await res.json() as { text?: unknown };
         text = typeof j.text === "string" && j.text ? j.text : null;
-      } catch {
+      } catch (e) {
         if (wakePort() === null) { wakeWatching.delete(sid); return; }
+        logWake("poll", sid, failure(e)); // an offer whose response never arrived ends as an unknown attempt
         await pause(1000);
         continue;
       }
@@ -1464,19 +1482,21 @@ const watchWake = (ctx: NoteCtx, sid: string): void => {
       const since = turnSince.get(sid);
       if (since !== undefined && Date.now() - since < TURN_STALE_MS) {
         try {
-          await fetch(base, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionID: sid, id: "busy", pid: process.pid }) });
-        } catch { /* the daemon's receipt wait ends; it retries on its own */ }
+          const res = await fetch(base, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionID: sid, id: "busy", pid: process.pid }) });
+          if (!res.ok) logWake("busy", sid, "status " + res.status);
+        } catch (e) { logWake("busy", sid, failure(e)); /* the daemon's receipt wait ends as unknown */ }
         continue;
       }
       const id = await admitWake(ctx, sid, text);
-      if (!id) continue;
+      if (!id) { logWake("admit", sid, "the session API returned no msg_ id; no receipt is posted"); continue; }
       try {
         // T642: say whether the wake landed behind a turn in progress, so the sender's receipt can tell it waits for that turn.
         // T672: name this serve so the receipt settles its own offer, not a sibling serve's for the same session.
         const since = turnSince.get(sid);
-        await fetch(base, { method: "POST", headers: { "content-type": "application/json" },
+        const res = await fetch(base, { method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify({ sessionID: sid, id, pid: process.pid, ...(since ? { turn_since: new Date(since).toISOString() } : {}) }) });
-      } catch { /* the receipt wait ends; nothing is sent to the shared service */ }
+        if (!res.ok) logWake("receipt", sid, "status " + res.status);
+      } catch (e) { logWake("receipt", sid, failure(e)); /* the receipt wait ends; nothing is sent to the shared service */ }
     }
   })();
 };
@@ -1497,8 +1517,9 @@ const turnEnded = async (sid: string): Promise<boolean> => {
   try {
     const res = await fetch("http://127.0.0.1:" + port + "/v1/opencode-wake", { method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ sessionID: sid, id: "idle", pid: process.pid }) });
+    if (!res.ok) logWake("idle", sid, "status " + res.status);
     return res.ok;
-  } catch { return false; }
+  } catch (e) { logWake("idle", sid, failure(e)); return false; }
 };
 /** This session's post-tool marker, or null. bindSession bumps it on every bind and the daemon sweep deletes it once the session is
  *  unbound, so a new session has none until it binds (T643). */
