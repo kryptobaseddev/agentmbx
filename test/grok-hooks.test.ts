@@ -450,3 +450,67 @@ test("grok hooks (T599): the Claude compatibility PostToolUse emits no notice an
   assert.match(ctx(grok.stdout), /You are worker@alpha/);
   assert.equal(entries(), 1);
 });
+
+test("grok hooks (T668): a released mailbox is invited by name and stays unclaimed", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-grok-t668-"));
+  const sid = "grok-t668";
+  const sessions = join(home, "active_sessions.json");
+  writeFileSync(sessions, JSON.stringify([{ session_id: sid, pid: process.pid, cwd: "/work", opened_at: new Date().toISOString() }]));
+  const n = new MbxNode(home, { host: "alpha" });
+  const first = new Client({ name: "t668", version: "1" });
+  const env: Record<string, string> = {
+    ...process.env, AGENTMBX_DEV: "1", MBX_HOME: home, MBX_CLI: "grok", MBX_AGENT: "worker", MBX_ROLE: "grok",
+    MBX_NO_DESKTOP: "1", MBX_GROK_SESSIONS_FILE: sessions,
+  };
+  delete env.MBX_DESCRIPTION;
+  const second = new Client({ name: "t668-next", version: "1" });
+  t.after(async () => {
+    await second.close();
+    await first.close();
+    n.close();
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  await first.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"], env }));
+  await first.callTool({ name: "mbx_whoami", arguments: {} });
+  const held = n.store.db.prepare("SELECT session_id, released_at FROM identity_leases WHERE name='worker'").get() as { session_id: string; released_at: number | null };
+  assert.equal(held.session_id, sid);
+  assert.equal(held.released_at, null);
+  await first.callTool({ name: "mbx_identity", arguments: { action: "release" } });
+  await first.close();
+  const released = n.store.db.prepare("SELECT session_id, release_reason, released_at FROM identity_leases WHERE name='worker'").get() as { session_id: string; release_reason: string; released_at: number | null };
+  assert.equal(released.session_id, sid);
+  assert.equal(released.release_reason, "released");
+  assert.ok(released.released_at);
+  assert.equal(n.store.get(`name:grok:${sid}`) ?? null, null);
+  assert.deepEqual(n.store.db.prepare("SELECT name FROM identity_projects").all(), []);
+
+  const expectInvite = (out: { status: number | null; stderr: string; stdout: string }, event: string) => {
+    assert.equal(out.status, 0, out.stderr);
+    const ctx = (JSON.parse(out.stdout) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } }).hookSpecificOutput;
+    assert.equal(ctx.hookEventName, event);
+    assert.match(ctx.additionalContext, /no mailbox identity yet/);
+    assert.match(ctx.additionalContext, /worker was released by this session/);
+    assert.match(ctx.additionalContext, /"action":"claim","name":"worker"/);
+    assert.doesNotMatch(ctx.additionalContext, /"action":"register"/);
+  };
+  expectInvite(hook(home, "session-start", sid), "SessionStart");
+
+  const nextEnv = { ...env };
+  delete nextEnv.MBX_AGENT;
+  delete nextEnv.MBX_ROLE;
+  await second.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("bin/agentmbx.js"), "mcp"], env: nextEnv }));
+  const body = (result: unknown) => {
+    const content = (result as { content?: { type?: string; text?: string }[] }).content ?? [];
+    return content.find((part) => part.type === "text")?.text ?? "";
+  };
+  const who = JSON.parse(body(await second.callTool({ name: "mbx_whoami", arguments: {} }))) as { agent: string | null; unbound?: boolean };
+  assert.equal(who.agent, null);
+  assert.equal(who.unbound, true);
+  expectInvite(hook(home, "post-tool", sid), "PostToolUse");
+  const whoAfter = JSON.parse(body(await second.callTool({ name: "mbx_whoami", arguments: {} }))) as { agent: string | null; unbound?: boolean };
+  assert.equal(whoAfter.agent, null);
+  assert.equal(whoAfter.unbound, true);
+  const still = n.store.db.prepare("SELECT release_reason, released_at FROM identity_leases WHERE name='worker'").get() as { release_reason: string; released_at: number | null };
+  assert.equal(still.release_reason, "released");
+  assert.ok(still.released_at);
+});

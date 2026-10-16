@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **A released grok mailbox is invited by name (T668).** An explicit release keeps the lease and deletes the name binding, so session-start left the session unbound and offered a new register. Grok drops SessionStart stdout, and the same text arrived on PostToolUse. When this session's lease has release reason `released`, both events name that mailbox and invite `mbx_identity` claim. They do not offer a new register, and they do not claim it.
+
 ## 0.5.40 (2026-10-15)
 
 - **`agentmbx watch` follows its own session's lease re-key instead of stopping (T653).** After a long idle, an mbx server can release its lease and claim it again with a new key: the same process, birth, CLI and session. Every running watcher then exited with "the lease this watcher was started for moved to another holder", so the session could no longer be woken until it re-armed. The watcher now follows such a re-key, and its record carries the new token so the daemon keeps deferring to it. A lease claimed by another process, or by the same process for a different session, still stops it with the same reason.
