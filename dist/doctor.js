@@ -14,7 +14,7 @@ import { kimiHostedServer, kimiInstances } from "./kimi-web.js";
 import { storedPolicies, policySummary } from "./policy.js";
 import { opencodeService } from "./wake.js";
 import { opencodeHostClassifier } from "./opencode-provider.js";
-import { kimiDesktop } from "./kimi-desktop.js";
+import { kimiDesktop, readDesktopPlugin } from "./kimi-desktop.js";
 import { version } from "./version.js";
 import { GROK_NO_PUSH, MbxNode, RETRY_HOURS, staleMcpKvCensus } from "./node.js";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.js";
@@ -34,6 +34,24 @@ import { mbxProcessInventory, mcpOrphanCheck } from "./mcp-lifecycle.js";
 import { HUD_ALIVE_MAX_MS, hudAlivePath, hudSessionV2Path } from "./hud.js";
 import { recentMcpStartupErrors } from "./logs.js";
 import { connectorSkewChecks } from "./connector-skew.js";
+export async function kimiDesktopPluginChecks(desktop = kimiDesktop(), readPlugin = readDesktopPlugin) {
+    if (!desktop)
+        return [{ level: "info", label: "kimi desktop: app not running; plugin status unverified" }];
+    const fix = "run agentmbx setup --only kimi with Kimi.app open; confirm mbx_whoami in a new desktop conversation";
+    try {
+        const plugin = await readPlugin(desktop);
+        if (!plugin)
+            return [{ level: "warn", label: "kimi desktop: AgentMBX plugin missing", fix }];
+        if (!plugin.enabled || plugin.state !== "ok" || plugin.hasErrors || plugin.enabledMcpServerCount < 1 || plugin.hookCount < 3)
+            return [{ level: "warn", label: "kimi desktop: AgentMBX plugin disabled or incomplete", fix }];
+        if (plugin.version !== version())
+            return [{ level: "warn", label: `kimi desktop: AgentMBX plugin ${plugin.version} differs from CLI ${version()}`, fix }];
+        return [{ level: "ok", label: `kimi desktop: AgentMBX plugin installed and current (${plugin.version}); conversation tools and hooks still need confirmation` }];
+    }
+    catch {
+        return [{ level: "warn", label: "kimi desktop: plugin inventory unavailable; installation unverified", fix }];
+    }
+}
 /** --processes observes only the process inventory; it never initializes or repairs the host. */
 export function processChecks(home) {
     const inventory = mbxProcessInventory(home);
@@ -1016,6 +1034,7 @@ export async function doctor(ctx, mbxHome, opts = {}) {
         for (const c of nonExpiringYoloPolicies(node))
             out.push(c);
     }
+    out.push(...await kimiDesktopPluginChecks());
     const sk = skillStatus(ctx.home);
     // S1: an outdated copy AgentMBX wrote is refreshed by the next session or daemon start, so it is info, not a warning
     add(sk.installed ? "ok" : sk.state === "outdated" ? "info" : "warn", `skill ${sk.detail} (~/.agents/skills/agentmbx)`, sk.installed || sk.state === "outdated" ? undefined : sk.state === "missing" ? "agentmbx setup --only skill (or: npx skills add kryptobaseddev/agentmbx -g)" : "agentmbx setup --only skill");

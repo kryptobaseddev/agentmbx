@@ -14,7 +14,7 @@ import { kimiHostedServer, kimiInstances } from "./kimi-web.ts";
 import { storedPolicies, policySummary } from "./policy.ts";
 import { opencodeService } from "./wake.ts";
 import { opencodeHostClassifier, type OpencodeHost } from "./opencode-provider.ts";
-import { kimiDesktop } from "./kimi-desktop.ts";
+import { kimiDesktop, readDesktopPlugin } from "./kimi-desktop.ts";
 import { version } from "./version.ts";
 import { GROK_NO_PUSH, MbxNode, RETRY_HOURS, staleMcpKvCensus } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
@@ -37,6 +37,22 @@ import { connectorSkewChecks } from "./connector-skew.ts";
 
 export type Level = "ok" | "fail" | "warn" | "info";
 export interface Check { level: Level; label: string; fix?: string }
+
+export async function kimiDesktopPluginChecks(desktop = kimiDesktop(), readPlugin = readDesktopPlugin): Promise<Check[]> {
+  if (!desktop) return [{ level: "info", label: "kimi desktop: app not running; plugin status unverified" }];
+  const fix = "run agentmbx setup --only kimi with Kimi.app open; confirm mbx_whoami in a new desktop conversation";
+  try {
+    const plugin = await readPlugin(desktop);
+    if (!plugin) return [{ level: "warn", label: "kimi desktop: AgentMBX plugin missing", fix }];
+    if (!plugin.enabled || plugin.state !== "ok" || plugin.hasErrors || plugin.enabledMcpServerCount < 1 || plugin.hookCount < 3)
+      return [{ level: "warn", label: "kimi desktop: AgentMBX plugin disabled or incomplete", fix }];
+    if (plugin.version !== version())
+      return [{ level: "warn", label: `kimi desktop: AgentMBX plugin ${plugin.version} differs from CLI ${version()}`, fix }];
+    return [{ level: "ok", label: `kimi desktop: AgentMBX plugin installed and current (${plugin.version}); conversation tools and hooks still need confirmation` }];
+  } catch {
+    return [{ level: "warn", label: "kimi desktop: plugin inventory unavailable; installation unverified", fix }];
+  }
+}
 
 /** --processes observes only the process inventory; it never initializes or repairs the host. */
 export function processChecks(home: string): Check[] {
@@ -852,6 +868,8 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     for (const c of kimiHookEvidence(node)) out.push(c);
     for (const c of nonExpiringYoloPolicies(node)) out.push(c);
   }
+
+  out.push(...await kimiDesktopPluginChecks());
 
   const sk = skillStatus(ctx.home);
   // S1: an outdated copy AgentMBX wrote is refreshed by the next session or daemon start, so it is info, not a warning
