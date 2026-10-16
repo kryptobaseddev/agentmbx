@@ -24,6 +24,13 @@ export function parseMeta(body) {
         task_refs: all(/\b(T\d{2,6})\b/g),
     };
 }
+/** T582: the signed label is a mailbox name. An address, a blank, or anything else is refused. */
+export function onBehalfOfLabel(raw) {
+    const s = raw.trim().toLowerCase();
+    if (!NAME_RE.test(s))
+        throw new Error("on_behalf_of must be a name like agent-6, not an address");
+    return s;
+}
 export function buildEnvelope(d, now = new Date()) {
     if (!d.subject.trim())
         throw new Error("subject is required");
@@ -35,7 +42,7 @@ export function buildEnvelope(d, now = new Date()) {
     return {
         v: 3, id, ts: now.toISOString(), from: d.from, to: d.to, thread: d.thread ?? id, reply_to: d.reply_to ?? null,
         kind: d.kind ?? "message", subject: fitSubject(d.subject).subject, body: d.body, needs_reply: d.needs_reply ?? false,
-        refs: d.refs ?? [], meta: { ...parseMeta(d.body), ...(d.unverifiedSender ? { sender_verification: "unverified" } : {}), ...(d.origin === "external" ? { origin: "external", external_since: d.external_since ?? now.toISOString(), external_source: d.external_since ? "inherited" : "declared" } : {}), ...(d.hop ? { hop: d.hop } : {}), ...(d.project ? { project: d.project.slice(0, 300) } : {}), ...(d.project_key ? { project_key: d.project_key.slice(0, 300) } : {}) },
+        refs: d.refs ?? [], meta: { ...parseMeta(d.body), ...(d.unverifiedSender ? { sender_verification: "unverified" } : {}), ...(d.origin === "external" ? { origin: "external", external_since: d.external_since ?? now.toISOString(), external_source: d.external_since ? "inherited" : "declared" } : {}), ...(d.hop ? { hop: d.hop } : {}), ...(d.project ? { project: d.project.slice(0, 300) } : {}), ...(d.project_key ? { project_key: d.project_key.slice(0, 300) } : {}), ...(d.onBehalfOf ? { on_behalf_of: onBehalfOfLabel(d.onBehalfOf) } : {}) },
         authority: null, enc: null,
     };
 }
@@ -178,6 +185,8 @@ export function checkShape(x) {
     // bare `to` entries the sending host delivered to its own agents; receivers skip exactly these (S2 follow-up)
     if (m?.local_names !== undefined && (!Array.isArray(m.local_names) || m.local_names.length > 100 || m.local_names.some((n) => typeof n !== "string" || !NAME_RE.test(n))))
         return "bad local names";
+    if (m?.on_behalf_of !== undefined && (typeof m.on_behalf_of !== "string" || !NAME_RE.test(m.on_behalf_of)))
+        return "bad on_behalf_of";
     return null;
 }
 /**
