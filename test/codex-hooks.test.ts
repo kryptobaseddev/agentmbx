@@ -4,7 +4,7 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -218,4 +218,39 @@ test("T186: two Codex threads on one app-server each get only their own identity
   assert.doesNotMatch(left, /thread-b|PRIVATE SUBJECT|SECRET BODY/);
   assert.match(right, /You are thread-b@alpha \(role: beta\)/);
   assert.doesNotMatch(right, /thread-a|not caught up on|PRIVATE SUBJECT|SECRET BODY/);
+});
+
+test("T186: a bound Codex lifecycle-entry error exits zero with a fixed fallback and preserves mail and trust", t => {
+  const root = mkdtempSync(join(tmpdir(), "mbx-codex-entry-error-")), home = join(root, "mbx"), provider = join(root, "provider");
+  const n = new MbxNode(home, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const sid = "77777777-7777-4777-8777-777777777777";
+  bindWakeLease(n, { agent: "builder", cli: "codex", session_id: sid, pid: process.pid });
+  sendLeased(n, { from: "sender", to: ["builder"], subject: "PRIVATE SUBJECT", body: "SECRET BODY", kind: "request" });
+  mkdirSync(join(provider, ".codex"), { recursive: true });
+  const config = join(provider, ".codex", "config.toml"), trust = join(provider, ".codex", "hooks.state");
+  writeFileSync(config, "[features]\nhooks = true\n");
+  writeFileSync(trust, "owner trust state: leave untouched\n");
+  const preload = join(root, "entry-error.mjs");
+  writeFileSync(preload, `import { MbxNode } from ${JSON.stringify(new URL("../src/node.ts", import.meta.url).href)};\nMbxNode.prototype.bindSession = () => { throw new Error("PRIVATE ENTRY ERROR"); };\n`);
+  const state = () => JSON.stringify([
+    n.store.db.prepare("SELECT * FROM identity_leases ORDER BY name").all(),
+    n.store.db.prepare("SELECT * FROM sessions ORDER BY cli,session_id").all(),
+    n.store.db.prepare("SELECT msg_id,agent,state FROM deliveries ORDER BY msg_id,agent").all(),
+    n.store.db.prepare("SELECT * FROM kv WHERE k LIKE 'resume-entry:%' OR k LIKE 'catchup:%' ORDER BY k").all(),
+    readFileSync(config, "utf8"), readFileSync(trust, "utf8"),
+  ]);
+  const before = state();
+  for (const [event, source] of [["session-start", "startup"], ["session-start", "resume"], ["session-start", "clear"], ["session-start", "compact"], ["prompt", "resume"]]) {
+    const r = spawnSync(process.execPath, ["--import", preload, BIN, "hook", event, "--cli", "codex"], {
+      input: JSON.stringify({ session_id: sid, cwd: process.cwd(), source, prompt: "continue" }), encoding: "utf8", timeout: 10_000,
+      env: { ...process.env, HOME: provider, MBX_HOME: home, MBX_AGENT: "unrelated", AGENTMBX_DEV: "1" } });
+    assert.equal(r.status, 0, `${event}/${source}: ${r.stderr}`);
+    assert.equal(r.stderr, "");
+    const parsed = JSON.parse(r.stdout) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
+    assert.equal(parsed.hookSpecificOutput.hookEventName, event === "session-start" ? "SessionStart" : "UserPromptSubmit");
+    assert.equal(parsed.hookSpecificOutput.additionalContext, "[mbx] Mailbox context could not be restored. Call mbx_whoami, then mbx_catchup.");
+    assert.doesNotMatch(r.stdout, /PRIVATE ENTRY ERROR|PRIVATE SUBJECT|SECRET BODY|claim|register/);
+    assert.equal(state(), before, "no lease, binding, mail, entry, checkpoint, config or trust state moved");
+  }
 });
