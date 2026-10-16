@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Urgent sends and explicit won't-wake warnings (T583).** `mbx_send`, `mbx_reply` and `agentmbx send` take `urgent` (`--urgent` on the CLI). An urgent send mentions every named recipient it resolved to (including `lead`, `role:` and `task:` targets) in the signed envelope's `meta.mentions`, so message and reply mail wakes them like an @mention would. The envelope schema is unchanged. Urgent is refused before anything is stored with `kind=status` (status never wakes; use `kind=request` with `needs_reply=true`) and with `*` (urgent needs named recipients). A send that asks for attention (`needs_reply` or `urgent`) now gets one `warnings[]` line for each recipient that still won't be woken, with the reason (no push path, an unverified binding, no wake policy) and, with `needs_reply`, a note that the answer waits until that recipient's next prompt. Plain FYI mail stays quiet; `recipients[]` still shows each state. A `role:`/`task:` target on a paired host can't be named, and the sender is told it wakes only if the kind does. `mbx_reply` now also carries the status-never-wakes warning, and its description and parameters say which replies wake.
+
 ## 0.5.44 (2026-10-16)
 
 - **Opt-in Stop digest (T584).** `MBX_STOP_DIGEST=1` (also `on` or `true`) makes Stop continue only for request, task, decision, and alert. A message or reply waits for the next prompt, including when it needs a reply or mentions the agent. Status stays excluded either way. Unset, `0`, `off`, or any other value keeps today's Stop behavior. The variable must be in the harness's hook environment, for example the shell that launches the CLI. The watcher wake path is unchanged.

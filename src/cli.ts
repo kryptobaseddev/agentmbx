@@ -16,7 +16,7 @@ import { backupStore, readOps, restoredFrom, restoreStore, rotateEpochOp, STORE_
 import { daemonReadiness, doctor, failed, formatChecks, processChecks } from "./doctor.ts";
 import { HUD_ALIVE_MAX_MS, HUD_SCHEMA, hudAlivePath, hudDir, hudPidLinePath, hudPidPath, hudSessionLinePath, hudSessionPath, hudStatus, hudStatusV2, writeHud, type HudStatus } from "./hud.ts";
 import { STATUS_V2_SCHEMA } from "./status-schema.ts";
-import { detectHost, HERMES_WATCHER_INSTRUCTION, HERMES_WATCHER_REMINDER, KIMI_WATCHER_REMINDER, MCP_HEARTBEAT_MS, noPush, runMcp, selfWatchInstruction, WATCHER_INSTRUCTION } from "./mcp.ts";
+import { assertUrgent, detectHost, HERMES_WATCHER_INSTRUCTION, HERMES_WATCHER_REMINDER, KIMI_WATCHER_REMINDER, MCP_HEARTBEAT_MS, noPush, runMcp, selfWatchInstruction, urgentWarnings, wakeWarnings, WATCHER_INSTRUCTION } from "./mcp.ts";
 import { HERMES_NAG_MS, hermesHookInput, hermesHookOutput } from "./hermes-hook.ts";
 import { resumeNotice, takeResumeEntry, takeServeEntry } from "./resume-notice.ts";
 import { missedCount } from "./catchup.ts";
@@ -77,7 +77,7 @@ Start here
 
 Messages
   agentmbx send --as <agent> --to <a,b,role:x,*,owner> --subject "…" [-m "body" | --body-file f | stdin]
-           [--kind message|request|reply|status|decision|alert|task] [--reply-to <id>] [--needs-reply] [--origin agent|external] [--ref path]… [--new-mailbox]
+           [--kind message|request|reply|status|decision|alert|task] [--reply-to <id>] [--needs-reply] [--urgent] [--origin agent|external] [--ref path]… [--new-mailbox]
            [--context <disclosed-thread-id>] [--payload agent|firsthand-outside|derived-outside] [--source <exact-message-id>]…
            Payload inputs stay attached when refs/thread/origin change; context selection does not prove isolation or clear the writer fence.
   agentmbx replay [--cursor <token>] [--limit 50] [--max-bytes 65536] [--scan-limit 1000]
@@ -346,7 +346,7 @@ async function run(argv: string[]) {
   const { values: o, positionals: pos } = parseArgs({ args: rest, allowPositionals: true, strict: cmd !== "hook" && cmd !== "mcp", options: {
     help: { type: "boolean", short: "h" }, force: { type: "boolean" },
     as: { type: "string" }, to: { type: "string" }, subject: { type: "string" }, m: { type: "string", short: "m" },
-    "body-file": { type: "string" }, kind: { type: "string" }, origin: { type: "string" }, schema: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" }, "new-mailbox": { type: "boolean" },
+    "body-file": { type: "string" }, kind: { type: "string" }, origin: { type: "string" }, schema: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" }, urgent: { type: "boolean" }, "new-mailbox": { type: "boolean" },
     ref: { type: "string", multiple: true }, all: { type: "boolean" }, json: { type: "boolean" }, note: { type: "string" },
     context: { type: "string" }, payload: { type: "string" }, source: { type: "string", multiple: true },
     mailbox: { type: "string" }, limit: { type: "string" }, host: { type: "string" }, port: { type: "string" }, cli: { type: "string" }, session: { type: "string" }, caps: { type: "string" },
@@ -787,6 +787,8 @@ async function run(argv: string[]) {
       if (payload !== undefined && !["agent", "firsthand-outside", "derived-outside"].includes(payload)) die("--payload must be agent, firsthand-outside or derived-outside");
       // Read external input before acquiring the lease's database lock.
       const body = str("m") ?? (str("body-file") ? readFileSync(str("body-file")!, "utf8") : stdinIsTTY() ? "" : readStdin());
+      // T583: --urgent mentions the resolved recipients so message/reply mail wakes them; refused with status or * before any write
+      assertUrgent(!!o.urgent, (str("kind") ?? "message") as Envelope["kind"], (str("to") ?? "").split(",").map(s => s.trim()).filter(Boolean));
       // T205: never create a mailbox by typo; --new-mailbox deliberately leaves mail for an agent that has not started yet
       if (!str("reply-to") && !o["new-mailbox"]) assertKnownRecipients(node, (str("to") ?? "").split(",").map(s => s.trim()).filter(Boolean));
       // T345: a live taint:<cli>:<session_id> record sends as inherited external. --origin external
@@ -801,7 +803,7 @@ async function run(argv: string[]) {
         const sent = node.send({ from, to: (str("to") ?? die("--to is required")).split(",").map(s => s.trim()).filter(Boolean),
           subject: fit.subject,
           body, kind: (str("kind") ?? "message") as Envelope["kind"], reply_to: reply?.id ?? null, thread: reply?.thread,
-          needs_reply: !!o["needs-reply"], refs: (o.ref as string[] | undefined) ?? [], unverifiedSender: unverified,
+          needs_reply: !!o["needs-reply"], urgent: !!o.urgent, refs: (o.ref as string[] | undefined) ?? [], unverifiedSender: unverified,
           ...(declared || taint ? { origin: "external" as const } : originArg ? { origin: originArg } : {}),
           ...(!declared && taint ? { external_since: new Date(taint.root).toISOString() } : {}) }, undefined, undefined, undefined, scope);
         if (fit.warning) sent.warnings.unshift(fit.warning);
@@ -835,7 +837,7 @@ async function run(argv: string[]) {
         r.warnings.push("unverified-sender: no current identity lease; recipients must not treat the claimed name as delegated authority");
       }
       const recipients = recipientReceipts(node, r.envelope.id, r.targets);
-      r.warnings.push(...offlineWarnings(recipients));
+      r.warnings.push(...offlineWarnings(recipients), ...wakeWarnings(recipients, r.envelope, !!o.urgent), ...urgentWarnings(r.targets, !!o.urgent));
       r.warnings.forEach((w) => process.stderr.write(`warning: ${w}\n`));
       if (o.json) return console.log(JSON.stringify({ id: r.envelope.id, thread: r.envelope.thread, ref: `mbx:${r.envelope.id}@${node.host}`, recipients, local: r.local, remote: r.remote, warnings: r.warnings, ...(r.provenance ? { provenance: r.provenance } : {}) }));
       console.log(r.envelope.id);
