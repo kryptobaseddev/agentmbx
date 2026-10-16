@@ -1291,6 +1291,16 @@ const watchWake = (ctx: NoteCtx, sid: string): void => {
         continue;
       }
       if (!text) continue;
+      // T647: mid-turn, a wake would queue until the turn ends and then alert for mail the turn may already have handled (the
+      // post-tool notice shows new mail mid-turn). Decline it: the daemon keeps the mail delivered and offers again afterwards.
+      // A turn older than TURN_STALE_MS is not trusted (a missed end event must not hold wakes back for good).
+      const since = turnSince.get(sid);
+      if (since !== undefined && Date.now() - since < TURN_STALE_MS) {
+        try {
+          await fetch(base, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionID: sid, id: "busy" }) });
+        } catch { /* the daemon's receipt wait ends; it retries on its own */ }
+        continue;
+      }
       const id = await admitWake(ctx, sid, text);
       if (!id) continue;
       try {
@@ -1306,6 +1316,7 @@ const watchWake = (ctx: NoteCtx, sid: string): void => {
 /** T642: a session is mid-turn from its first tool call (or execution start) until its turn ends (idle / execution succeeded).
  *  Delivery "queue" holds a note or a wake until that end, so the post-tool notice rides the tool result instead. */
 const turnSince = new Map<string, number>();
+const TURN_STALE_MS = 30 * 60_000;
 const markTurn = (sid: string): void => { if (!turnSince.has(sid)) turnSince.set(sid, Date.now()); };
 const endTurn = (sid: string): void => { turnSince.delete(sid); };
 /** This session's post-tool marker, or null. bindSession bumps it on every bind and the daemon sweep deletes it once the session is
@@ -1478,6 +1489,9 @@ export default {
           else if (ev.type === "session.idle" || ev.type === "session.execution.succeeded") void run("stop", { session_id: sid });
           else if (ev.type === "session.tool.called" && !ctx?.tool?.hook) void run("post-tool", { session_id: sid });
           else if (ev.type === "session.execution.started") markTurn(sid);
+          // T647: Esc ends a turn with interrupted, an error with failed; neither emits succeeded or idle, so end the turn here
+          // too, or a mid-turn wake decline would hold every wake back for this session until TURN_STALE_MS.
+          else if (ev.type === "session.execution.interrupted" || ev.type === "session.execution.failed") endTurn(sid);
         }
       } catch { /* aborted or the stream ended: never surface in the host */ }
     })();

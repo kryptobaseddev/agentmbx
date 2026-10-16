@@ -118,6 +118,8 @@ export async function opencodeService() {
 }
 /** T642: an OpenCode wake admitted while the session's turn was running. Delivery "queue" holds it until the turn ends. */
 export const OPENCODE_QUEUED_BEHIND_TURN = "queued-behind-turn";
+/** T647: the standalone plugin declined the wake because its session is mid-turn; the mail stays delivered for a later pass. */
+export const OPENCODE_MIDTURN_BUSY = "session is mid-turn; the wake waits for the turn to end (mail handled meanwhile is not re-alerted)";
 const behindTurnKey = (agent) => `wake-behind-turn:${agent}`;
 const BEHIND_TURN_CAP = 100;
 /** Remember which of `agent`'s messages were woken into a running turn, newest last (bounded). */
@@ -163,6 +165,9 @@ export async function wakeOpencode(sessionId, text, o = {}) {
     if (host === "standalone") {
         const pid = typeof o.pid === "number" && Number.isInteger(o.pid) && o.pid > 0 ? o.pid : 0;
         const pushed = pid > 0 ? await pushOpencodeWake(sessionId, pid, text) : { ok: false, handedOff: false };
+        // T647: the plugin declined because its session is mid-turn. Nothing was admitted: busy keeps the mail delivered and retries.
+        if (!pushed.ok && pushed.busy)
+            return outcome(via, { kind: "busy" }, OPENCODE_MIDTURN_BUSY);
         // T642: admitted behind a turn in progress waits for that turn to end; the sender's receipt says so.
         if (pushed.ok)
             return outcome(via, { kind: "admitted", receipt: receipt("native", { nativeId: pushed.id, sessionId,
@@ -183,6 +188,8 @@ export async function wakeOpencode(sessionId, text, o = {}) {
             if (o.recheck && !o.recheck())
                 return outcome(via, { kind: "not_submitted", reason: "fenced" }, "wake authority changed");
             const pushed = await pushOpencodeWake(sessionId, w.pid, text);
+            if (!pushed.ok && pushed.busy)
+                return outcome(via, { kind: "busy" }, OPENCODE_MIDTURN_BUSY); // T647
             if (pushed.ok)
                 return outcome(via, { kind: "admitted", receipt: receipt("native", { nativeId: pushed.id, sessionId,
                         nativeStatus: pushed.turnSince ? OPENCODE_QUEUED_BEHIND_TURN : "queued" }) });

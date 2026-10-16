@@ -2,6 +2,10 @@
  *  The plugin inside that serve long-polls one slot. The daemon offers one wake and waits for the
  *  native `msg_` id from `ctx.session.synthetic`. No slot means nothing was submitted: the shared
  *  service is not called, so it starts no turn and takes no snapshot. */
+/** T647: the receipt a plugin posts instead of a `msg_` id when its session is mid-turn. A wake admitted then would sit in
+ *  OpenCode's queue until the turn ends, by which time the agent has often handled that mail already (the post-tool notice
+ *  shows it mid-turn), so the alert arrives stale. Declined, the mail stays delivered and the next pass decides again. */
+export const OPENCODE_WAKE_BUSY = "busy";
 // T646: one slot per (session, serve). The same session can be loaded by a standalone tab and by the shared service at
 // once; keyed by session alone, each poll cancelled the other's every ~200 ms and a wake for the tab found the service's slot.
 const slots = new Map();
@@ -50,6 +54,7 @@ export function waitForOpencodeWake(sessionID, pid, waitMs = 20_000) {
         offered: false,
         settled: false,
         turnSince: null,
+        busy: false,
         deliver(text) {
             if (slot.offered)
                 return;
@@ -92,12 +97,19 @@ export async function pushOpencodeWake(sessionID, pid, text, receiptMs = 5_000) 
     if (slots.get(key) === slot)
         slots.delete(key);
     slot.dropReceipt();
+    if (slot.busy)
+        return { ok: false, handedOff: false, busy: true }; // declined: the text was not admitted anywhere
     return id.startsWith("msg_") ? { ok: true, id, turnSince: slot.turnSince } : { ok: false, handedOff: true };
 }
 /** The plugin reports the id `ctx.session.synthetic` actually returned. Anything else is refused. `turnSince` (T642): the
  *  session was mid-turn when the wake was admitted, since that ISO time; null when idle or not reported (an older plugin). */
 export function completeOpencodeWake(sessionID, id, turnSince = null) {
     const slot = [...slots.entries()].find(([key, s]) => sessionOf(key) === sessionID && s.offered && !s.settled)?.[1];
+    if (slot && id === OPENCODE_WAKE_BUSY) {
+        slot.busy = true;
+        slot.accept(id);
+        return true;
+    } // T647
     if (!slot || !id.startsWith("msg_"))
         return false;
     slot.turnSince = turnSince;
