@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Doctor no longer reports Codex hooks as simply wired when Codex has them off (T186).** Wiring proves neither runtime support nor consent. Doctor now warns when `~/.codex/config.toml` sets `features.hooks=false`, or when that file is unreadable, and otherwise says support and consent are unverified from configuration alone, with the fallback (`mbx_whoami`, then `mbx_catchup`). It reads only; it never changes trust, approvals or config.
+
 ## 0.5.40 (2026-10-15)
 
 - **`agentmbx watch` follows its own session's lease re-key instead of stopping (T653).** After a long idle, an mbx server can release its lease and claim it again with a new key: the same process, birth, CLI and session. Every running watcher then exited with "the lease this watcher was started for moved to another holder", so the session could no longer be woken until it re-armed. The watcher now follows such a re-key, and its record carries the new token so the daemon keeps deferring to it. A lease claimed by another process, or by the same process for a different session, still stops it with the same reason.
