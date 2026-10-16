@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir, hostname } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { insertMember, member, parseJsonc, removeMember, replaceValue, valueOf, type JNode } from "./jsonc.ts";
 import { parse as parseToml } from "smol-toml";
@@ -1601,6 +1601,47 @@ function opencodeSidebarFile(content: string, versioned: boolean) {
   };
 }
 
+/** T671: how many of AgentMBX's own pre-edit images to keep per file. */
+export const BACKUP_KEEP = 2;
+
+/**
+ * T671: `<file>.bak-agentmbx-<stamp>` images accumulate one per release, because each setup run writes a new one and
+ * nothing ever removes the old ones. Keep the newest `keep` for this exact file and remove the rest. Only names we
+ * wrote are considered (`<basename>.bak-agentmbx-`, whose stamp sorts as time), so a user's own file or their own
+ * backup name is never touched. Returns the removed paths; a backup that cannot be removed is not a setup failure.
+ */
+export function pruneAgentmbxBackups(path: string, keep = BACKUP_KEEP): string[] {
+  const dir = dirname(path), prefix = `${basename(path)}.bak-agentmbx-`;
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return []; }
+  const ours = names.filter((n) => n.startsWith(prefix)).sort().reverse();
+  const removed: string[] = [];
+  for (const n of ours.slice(keep)) {
+    const p = join(dir, n);
+    try { rmSync(p, { force: true }); removed.push(p); } catch { /* keep going: the next run tries again */ }
+  }
+  return removed;
+}
+
+/** T671: the OpenCode sidebar package's pre-edit images, per managed file. The package is rewritten on every release,
+ *  which is where its accumulation comes from; only our own backup names inside that directory are considered. */
+export function pruneSidebarBackups(home: string, keep = BACKUP_KEEP): string[] {
+  const dir = opencodeSidebarDir(home);
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return []; }
+  const bases = new Set<string>();
+  for (const n of names) { const at = n.indexOf(".bak-agentmbx-"); if (at > 0) bases.add(n.slice(0, at)); }
+  return [...bases].flatMap((base) => pruneAgentmbxBackups(join(dir, base), keep));
+}
+
+/** T671: the write-time prune, gated to the sidebar package directory. The images AgentMBX keeps of other managed
+ *  files (the owner's claude settings, codex hooks, …) are recovery points of files we edit, so they are never
+ *  dropped here — only the OpenCode sidebar package is bounded. */
+export function pruneSidebarFileBackups(home: string, path: string, keep = BACKUP_KEEP): string[] {
+  const dir = opencodeSidebarDir(home);
+  return path !== dir && path.startsWith(`${dir}${sep}`) ? pruneAgentmbxBackups(path, keep) : [];
+}
+
 /** The package.json edit: same ownership rule through the package name, with the version field as
  *  its managed version header (T486). */
 function opencodeSidebarPackage(content: string) {
@@ -2490,7 +2531,7 @@ export function runSetup(ctx: SetupCtx, o: RunOpts): Row[] {
         if (next === cur) { rows.push(row); continue; }
         row.action = o.mode === "uninstall" ? "removed" : cur !== null && e.uninstall(cur) !== cur ? "updated" : "added";
         if (!o.dryRun) {
-          if (cur !== null) { row.backup = `${e.path}.bak-agentmbx-${stamp}`; if (!existsSync(row.backup)) writeFileSync(row.backup, cur, { mode: 0o600 }); }
+          if (cur !== null) { row.backup = `${e.path}.bak-agentmbx-${stamp}`; if (!existsSync(row.backup)) writeFileSync(row.backup, cur, { mode: 0o600 }); pruneSidebarFileBackups(ctx.home, e.path); }
           if (!e.viaCli?.(ctx, o.mode, cur)) {
             if (next === null) rmSync(e.path, { force: true });
             else { mkdirSync(dirname(e.path), { recursive: true }); writeFileSync(e.path, next, e.mode !== undefined ? { mode: e.mode } : undefined); }
@@ -2528,6 +2569,9 @@ export function runSetup(ctx: SetupCtx, o: RunOpts): Row[] {
       if (/https?:\/\//.test(status)) { execFileSync("opencode", ["service", "restart"], { stdio: "ignore", timeout: 30_000 }); oc.note = "opencode service restarted"; }
     } catch { /* not running */ }
   }
+  // T671: the OpenCode sidebar package is rebuilt on every release, so its pre-edit images are pruned per file here,
+  // including any that an older install left behind.
+  if (!o.dryRun && o.mode === "install" && (o.only === undefined || o.only.includes("opencode"))) pruneSidebarBackups(ctx.home);
   return rows;
 }
 
