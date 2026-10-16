@@ -18,6 +18,7 @@ import { kimiMultiHost } from "./kimi-web.js";
 import { BIND_TICKET_RE, takeBindTicket } from "./bind-ticket.js";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess } from "./identity-leases.js";
 import { activityKey, holderProviderView, identityAvailability, parseActivity, parseProviderRecord, providerRecordKey } from "./identity-availability.js";
+import { CodexActivity } from "./codex-activity.js";
 import { reviveMailbox } from "./identity-cleanup.js";
 import { AUTO_NAME_RE, crossHostKey, linkedKey, noteProject, projectOf, registeredIdentity, registerIdentity, renameRegistration, ROLE_RE, sessionHint, UNSPECIFIED_ROLE } from "./registry.js";
 import { applyIdentityTakeover } from "./identity-takeover.js";
@@ -633,6 +634,7 @@ async function configureMcp(server, node, startupClosed) {
     const launch = process.env.MBX_AGENT ? agentName(process.cwd()) : null;
     const parentAgent = process.env[REEXEC_PARENT_AGENT] || null;
     const leases = new IdentityLeases(node.store, { idleTtlMs: process.env.MBX_IDENTITY_IDLE_TTL_MS === undefined ? undefined : Number(process.env.MBX_IDENTITY_IDLE_TTL_MS) });
+    const codexActivity = env.cli === "codex" ? new CodexActivity() : null;
     // T434: the birth time is a fixed property of this process — only the READ can fail (a ps starved
     // at boot by dozens of concurrent starts, the x64 release runner). Caching a null here would poison
     // every later claim with IDENTITY_LEASE_CONFIG for the server's whole life, so re-read lazily.
@@ -2370,6 +2372,8 @@ async function configureMcp(server, node, startupClosed) {
                 continue; // T439: the holder heartbeats its own lease; each co-used call re-checks it (ensureLease)
             try {
                 bind(state);
+                codexActivity?.record(node.store, leases, { name: state.agent, token: state.leaseToken,
+                    holder_pid: process.pid, holder_start: holderStart() ?? "", session_id: state.sessionId, shared: sharedState(state) });
             }
             catch (e) {
                 if (e.code === "IDENTITY_LEASE_LOST")

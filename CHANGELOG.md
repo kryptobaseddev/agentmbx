@@ -5,6 +5,7 @@
 ## 0.5.43 (2026-10-16)
 
 - **Codex queue notices are tracked and withdrawn when stale (T679).** A durable operation records the exact thread and lease generation before native submission, and another notice is held while its owned item is still queued. The daemon withdraws only exact owned queued IDs after read/ack, release or handover and before waking a new holder; lost replies are reconciled before retry. Legacy items without ownership receipts are preserved. An already-consumed item cannot be withdrawn. This path uses the installed Codex experimental queue API; unavailable or uncertain operations stay pending. Wake failure audits retain the exit status and stderr class without copying private diagnostic text.
+- **Codex rollout writes count as conversation activity (T677, partial).** The existing 60 s MCP heartbeat samples only the exact leased thread's rollout file metadata and records an actual newer modification timestamp under its current lease generation, PID birth and thread fence. It never reads rollout contents or substitutes the observation time. Missing or unreachable evidence and unchanged files record nothing. Idle takeover and T608 stale recovery are unchanged; a silent working turn without rollout writes remains an open gap.
 
 ## 0.5.42 (2026-10-15)
 

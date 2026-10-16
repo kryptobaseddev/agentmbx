@@ -18,6 +18,7 @@ import { kimiMultiHost } from "./kimi-web.ts";
 import { BIND_TICKET_RE, takeBindTicket } from "./bind-ticket.ts";
 import { DEFAULT_IDENTITY_IDLE_TTL_MS, IdentityLeases, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
 import { activityKey, holderProviderView, identityAvailability, parseActivity, parseProviderRecord, providerRecordKey } from "./identity-availability.ts";
+import { CodexActivity } from "./codex-activity.ts";
 import { reviveMailbox } from "./identity-cleanup.ts";
 import { AUTO_NAME_RE, crossHostKey, linkedKey, noteProject, projectOf, registeredIdentity, registerIdentity, renameRegistration, ROLE_RE, sessionHint, UNSPECIFIED_ROLE } from "./registry.ts";
 import { applyIdentityTakeover, type IdentityTakeoverApproval } from "./identity-takeover.ts";
@@ -552,6 +553,7 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
   const launch = process.env.MBX_AGENT ? agentName(process.cwd()) : null;
   const parentAgent = process.env[REEXEC_PARENT_AGENT] || null;
   const leases = new IdentityLeases(node.store, { idleTtlMs: process.env.MBX_IDENTITY_IDLE_TTL_MS === undefined ? undefined : Number(process.env.MBX_IDENTITY_IDLE_TTL_MS) });
+  const codexActivity = env.cli === "codex" ? new CodexActivity() : null;
   // T434: the birth time is a fixed property of this process — only the READ can fail (a ps starved
   // at boot by dozens of concurrent starts, the x64 release runner). Caching a null here would poison
   // every later claim with IDENTITY_LEASE_CONFIG for the server's whole life, so re-read lazily.
@@ -2066,7 +2068,11 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
       // An unbound session retries its pending identity (or learns it from a later hook); it never takes another name.
       if (!state.leaseToken) { retryResume(state); continue; }
       if (state.coUse) continue; // T439: the holder heartbeats its own lease; each co-used call re-checks it (ensureLease)
-      try { bind(state); } catch (e) {
+      try {
+        bind(state);
+        codexActivity?.record(node.store, leases, { name: state.agent, token: state.leaseToken,
+          holder_pid: process.pid, holder_start: holderStart() ?? "", session_id: state.sessionId, shared: sharedState(state) });
+      } catch (e) {
         if ((e as { code?: string }).code === "IDENTITY_LEASE_LOST") try { withProcSnapshot(() => ensureLease(state)); continue; } catch { /* reported below */ }
         process.stderr.write(`[mbx] heartbeat for ${state.agent} failed: ${(e as Error).message}\n`);
       }
