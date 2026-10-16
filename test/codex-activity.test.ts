@@ -1,12 +1,15 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { CodexActivity } from "../src/codex-activity.ts";
 import { activityKey, identityAvailability, parseActivity, SHARED_IDLE_MS } from "../src/identity-availability.ts";
 import { IdentityLeases, type IdentityLease, type ProcessEvidence } from "../src/identity-leases.ts";
 import { Store } from "../src/store.ts";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { MbxNode } from "../src/node.ts";
 
 const THREAD = "44444444-4444-4444-8444-444444444444", SIBLING = "55555555-5555-4555-8555-555555555555";
 function fixture(t: TestContext) {
@@ -97,4 +100,29 @@ test("unknown process evidence writes no activity and performs no synthetic rene
   assert.deepEqual(f.activity(), { at: f.claimed, shared: true });
   const lease = f.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(f.lease.name) as unknown as IdentityLease;
   assert.equal(lease.token, f.lease.token); assert.equal(lease.heartbeat_at, f.claimed); assert.equal(lease.released_at, null);
+});
+
+test("the existing MCP heartbeat records exact-thread mtime without another mbx call", async t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-codex-heartbeat-")), node = new MbxNode(home, { host: "alpha" });
+  const client = new Client({ name: "codex-activity", version: "1" }), preload = join(home, "heartbeat.mjs");
+  writeFileSync(preload, "const interval=globalThis.setInterval; globalThis.setInterval=(fn,ms,...args)=>interval(fn,ms===60000?50:ms,...args);");
+  const transport = new StdioClientTransport({ command: process.execPath, args: ["--import", preload, resolve("bin/agentmbx.js"), "mcp"],
+    env: { ...process.env, MBX_HOME: home, CODEX_HOME: home, MBX_AGENT: "transport", MBX_CLI: "codex", AGENTMBX_DEV: "1" } as Record<string, string> });
+  t.after(async () => { await client.close(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  await client.connect(transport);
+  assert.notEqual((await client.callTool({ name: "mbx_identity", arguments: { action: "register", name: "active-thread", role: "test" }, _meta: { threadId: THREAD } })).isError, true);
+  const lease = node.store.db.prepare("SELECT * FROM identity_leases WHERE name='active-thread'").get() as unknown as IdentityLease;
+  node.store.set(activityKey(lease.name), JSON.stringify({ at: Date.now() - SHARED_IDLE_MS - 1000, shared: true }));
+  const dir = join(home, "sessions", "2026", "10", "16"); mkdirSync(dir, { recursive: true });
+  const path = join(dir, `rollout-2026-10-16T12-00-00-${THREAD}.jsonl`);
+  writeFileSync(path, "unreadable rollout contents", { mode: 0o000 });
+  const at = Math.floor(lstatSync(path).mtimeMs);
+  assert.ok(at > lease.claimed_at);
+  let activity = parseActivity(node.store.get(activityKey(lease.name)));
+  for (let i = 0; i < 40 && activity?.at !== at; i++) {
+    await new Promise(resolve => setTimeout(resolve, 50)); activity = parseActivity(node.store.get(activityKey(lease.name)));
+  }
+  assert.deepEqual(activity, { at, shared: true });
+  await new Promise(resolve => setTimeout(resolve, 200));
+  assert.equal(parseActivity(node.store.get(activityKey(lease.name)))?.at, at, "an idle heartbeat does not substitute now");
 });

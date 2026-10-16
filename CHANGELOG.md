@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Codex rollout writes count as conversation activity (T677, partial).** The existing 60 s MCP heartbeat samples only the exact leased thread's rollout file metadata and records an actual newer modification timestamp under its current lease generation, PID birth and thread fence. It never reads rollout contents or substitutes the observation time. Missing or unreachable evidence and unchanged files record nothing. Idle takeover and T608 stale recovery are unchanged; a silent working turn without rollout writes remains an open gap.
+
 ## 0.5.42 (2026-10-15)
 
 - **Reopening a rootless quarantine summary no longer renews its caution window (T579).** The first summary disclosure is retained per provider conversation and message. A different unknown summary still cautions, and real outside roots, raw reads and approval guards keep their existing behavior. This narrows repeated-summary taint; scoped collaboration still awaits the signed v2 opt-in path.
