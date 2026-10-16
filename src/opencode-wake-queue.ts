@@ -12,6 +12,16 @@ export type OpencodeWakePush = { ok: true; id: string; turnSince: string | null 
  *  shows it mid-turn), so the alert arrives stale. Declined, the mail stays delivered and the next pass decides again. */
 export const OPENCODE_WAKE_BUSY = "busy";
 
+/** T675: the receipt a plugin posts when its session's turn ended. It admits nothing: the dispatcher only lets the next normal
+ *  pass skip that session's busy backoff (wantsWake and authority checks unchanged). A session with no lease or poll is harmless. */
+export const OPENCODE_WAKE_IDLE = "idle";
+const IDLE_MAX = 512;
+const idleAt = new Map<string, number>();
+/** When this session last reported its turn ended, or undefined. */
+export function opencodeIdleAt(sessionID: string): number | undefined {
+  return idleAt.get(sessionID);
+}
+
 interface Slot {
   pid: number;
   offered: boolean;
@@ -44,6 +54,7 @@ export function resetOpencodeWakeQueue(): void {
     slot.dropReceipt();
   }
   slots.clear();
+  idleAt.clear();
 }
 
 /** Unoffered pollers. Doctor reads them through GET /v1/opencode-wake/waiters (T520). */
@@ -127,6 +138,12 @@ export async function pushOpencodeWake(sessionID: string, pid: number, text: str
  * the receipt names no serve, and settling the wrong one would credit an admission that never happened.
  */
 export function completeOpencodeWake(sessionID: string, id: string, turnSince: string | null = null, pid?: number): boolean {
+  if (id === OPENCODE_WAKE_IDLE) { // T675: needs no offered slot and settles none
+    idleAt.delete(sessionID);
+    idleAt.set(sessionID, Date.now());
+    if (idleAt.size > IDLE_MAX) idleAt.delete(idleAt.keys().next().value!);
+    return true;
+  }
   const offered = [...slots.entries()].filter(([key, s]) => sessionOf(key) === sessionID && s.offered && !s.settled);
   const slot = pid === undefined ? (offered.length === 1 ? offered[0][1] : undefined)
     : offered.find(([key]) => key === slotKey(sessionID, pid))?.[1];

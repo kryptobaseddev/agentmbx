@@ -1487,6 +1487,19 @@ const turnSince = new Map<string, number>();
 const TURN_STALE_MS = 30 * 60_000;
 const markTurn = (sid: string): void => { if (!turnSince.has(sid)) turnSince.set(sid, Date.now()); };
 const endTurn = (sid: string): void => { turnSince.delete(sid); };
+/** T675: the turn ended. Tell the daemon (receipt id "idle"), so its next normal pass may wake this session for mail still
+ *  unhandled instead of waiting out the busy backoff. It admits nothing. True only when the daemon took it, which means the
+ *  wake path owns the post-turn alert for this session; false keeps the stop hook as the fallback. */
+const turnEnded = async (sid: string): Promise<boolean> => {
+  endTurn(sid);
+  const port = wakePort();
+  if (!port || !wakeWatching.has(sid)) return false;
+  try {
+    const res = await fetch("http://127.0.0.1:" + port + "/v1/opencode-wake", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionID: sid, id: "idle", pid: process.pid }) });
+    return res.ok;
+  } catch { return false; }
+};
 /** This session's post-tool marker, or null. bindSession bumps it on every bind and the daemon sweep deletes it once the session is
  *  unbound, so a new session has none until it binds (T643). */
 const readMarker = (sid: string): string | null => {
@@ -1566,6 +1579,9 @@ const call = async (ctx: NoteCtx, bin: string[], event: string, payload: Record<
       finally { sending.delete(sid); }
     };
     await deliver();
+    // T675: with this session's wake poll live, the daemon's wake is the one post-turn alert: it starts a turn and offers only
+    // mail still unhandled. The stop note is resume:false (T518), so it only queued behind that wake and showed after it.
+    if (event === "stop" && sid && await turnEnded(sid)) return;
     if (event === "post-tool" && sid && postToolSteady(sid)) return;
     const nonce = event === "post-tool" && sid ? postToolNonce(sid) : "";
     const out = await new Promise<string>((resolve) => spawnCli(bin, ["hook", event, "--cli", "opencode"], JSON.stringify(payload), resolve));
@@ -1659,7 +1675,7 @@ export default {
           else if (ev.type === "session.execution.started") markTurn(sid);
           // T647: Esc ends a turn with interrupted, an error with failed; neither emits succeeded or idle, so end the turn here
           // too, or a mid-turn wake decline would hold every wake back for this session until TURN_STALE_MS.
-          else if (ev.type === "session.execution.interrupted" || ev.type === "session.execution.failed") endTurn(sid);
+          else if (ev.type === "session.execution.interrupted" || ev.type === "session.execution.failed") void turnEnded(sid);
         }
       } catch { /* aborted or the stream ended: never surface in the host */ }
     })();

@@ -6,6 +6,15 @@
  *  OpenCode's queue until the turn ends, by which time the agent has often handled that mail already (the post-tool notice
  *  shows it mid-turn), so the alert arrives stale. Declined, the mail stays delivered and the next pass decides again. */
 export const OPENCODE_WAKE_BUSY = "busy";
+/** T675: the receipt a plugin posts when its session's turn ended. It admits nothing: the dispatcher only lets the next normal
+ *  pass skip that session's busy backoff (wantsWake and authority checks unchanged). A session with no lease or poll is harmless. */
+export const OPENCODE_WAKE_IDLE = "idle";
+const IDLE_MAX = 512;
+const idleAt = new Map();
+/** When this session last reported its turn ended, or undefined. */
+export function opencodeIdleAt(sessionID) {
+    return idleAt.get(sessionID);
+}
 // T646: one slot per (session, serve). The same session can be loaded by a standalone tab and by the shared service at
 // once; keyed by session alone, each poll cancelled the other's every ~200 ms and a wake for the tab found the service's slot.
 const slots = new Map();
@@ -24,6 +33,7 @@ export function resetOpencodeWakeQueue() {
         slot.dropReceipt();
     }
     slots.clear();
+    idleAt.clear();
 }
 /** Unoffered pollers. Doctor reads them through GET /v1/opencode-wake/waiters (T520). */
 export function listOpencodeWakeWaiters() {
@@ -109,6 +119,13 @@ export async function pushOpencodeWake(sessionID, pid, text, receiptMs = 5_000) 
  * the receipt names no serve, and settling the wrong one would credit an admission that never happened.
  */
 export function completeOpencodeWake(sessionID, id, turnSince = null, pid) {
+    if (id === OPENCODE_WAKE_IDLE) { // T675: needs no offered slot and settles none
+        idleAt.delete(sessionID);
+        idleAt.set(sessionID, Date.now());
+        if (idleAt.size > IDLE_MAX)
+            idleAt.delete(idleAt.keys().next().value);
+        return true;
+    }
     const offered = [...slots.entries()].filter(([key, s]) => sessionOf(key) === sessionID && s.offered && !s.settled);
     const slot = pid === undefined ? (offered.length === 1 ? offered[0][1] : undefined)
         : offered.find(([key]) => key === slotKey(sessionID, pid))?.[1];
