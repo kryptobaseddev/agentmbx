@@ -1478,6 +1478,20 @@ function grokWatchCommand(sid?: string): string {
   return sid ? `agentmbx watch --cli grok --session ${sid}` : "agentmbx watch --cli grok";
 }
 
+/** T668: an explicit release keeps this session's lease and deletes its name binding. Invite that name. Do not claim it. */
+function grokReleasedInvite(node: MbxNode, session: string | undefined): string | null {
+  if (!session) return null;
+  const names = (node.store.db.prepare(
+    "SELECT name FROM identity_leases WHERE cli='grok' AND session_id=? AND released_at IS NOT NULL AND release_reason='released' ORDER BY name",
+  ).all(session) as { name: string }[]).map(row => row.name).filter(name => NAME_RE.test(name));
+  if (!names.length) return null;
+  return [
+    "[mbx] This session has no mailbox identity yet.",
+    ...names.map(name => `[mbx] ${name} was released by this session. Claim it with mbx_identity {"action":"claim","name":"${name}"}. The session stays unbound until you claim it.`),
+    "[mbx] When the owner ends this session or hands it off, call mbx_identity release after your final mailbox work.",
+  ].join("\n");
+}
+
 /** Post-tool and Stop reminder. A hook cannot start the tracked task; the session has to.
  *  Mail that arrives after the watcher exits and before the next tool or Stop still only gets a desktop notice. */
 function grokWatchReminder(sid?: string): string {
@@ -1547,6 +1561,7 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
   // Chosen identities (T204): a session either holds the identity it chose, or is told how to resume or register one.
   // Every line starts with [mbx] so OpenCode's plugin keeps the whole list (it drops a run at the first other line).
   const unbound = `${formatUnboundStart(node.home, projectOf(cwd) ?? undefined).split("\n").map(line => `[mbx] ${line}`).join("\n")}\n[mbx] When the owner ends this session or hands it off, call mbx_identity release after your final mailbox work.`;
+  const grokUnbound = (cli === "grok" ? grokReleasedInvite(node, sid) : null) ?? unbound;
   const held = (agent: string) => `[mbx] You are ${agent}@${node.host}${((r) => r ? ` (role: ${r.role})` : "")(registeredIdentity(node.store, agent))}. When the owner ends this session or hands it off, call mbx_identity release after your final mailbox work; finishing a turn is not ending a session.`;
   // T187: only native session.created establishes an entry. Ordinary shared-serve activity is NOT resume.
   const ocEntry = cli === "opencode" && sid && /^[A-Za-z0-9_-]{1,128}$/.test(sid) ? `resume-pending:opencode:${sid}` : null;
@@ -1791,8 +1806,8 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
     // Guidance on session start; Kimi drops SessionStart context, so a Kimi session gets it once on its first prompt.
     // Kimi and Hermes drop SessionStart output, so their first prompt carries the guidance (Hermes: pre_llm_call context).
     const guided = `guided:${cli}:${sid}`, first = (cli === "kimi" || cli === "hermes") && !node.store.get(guided);
-    if (event === "session-start") { if (cli !== "hermes") { node.store.set(guided, new Date().toISOString()); emit(cli, "SessionStart", [disconnected, unbound, link].filter(Boolean).join("\n")); } }
-    else if (grokUnboundPost) emit(cli, "PostToolUse", link ? `${unbound}\n${link}` : unbound);
+    if (event === "session-start") { if (cli !== "hermes") { node.store.set(guided, new Date().toISOString()); emit(cli, "SessionStart", [disconnected, cli === "grok" ? grokUnbound : unbound, link].filter(Boolean).join("\n")); } }
+    else if (grokUnboundPost) emit(cli, "PostToolUse", link ? `${grokUnbound}\n${link}` : grokUnbound);
     else if (disconnected || link || first) { node.store.set(guided, new Date().toISOString()); emit(cli, "UserPromptSubmit", [disconnected, first ? unbound : null, link].filter(Boolean).join("\n")); }
   }
 }
