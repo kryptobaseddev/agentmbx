@@ -71,9 +71,8 @@ export function liveConnectors(node, opts = {}) {
     return out;
 }
 const HEADER_RE = /^\/\/ agentmbx-plugin v1 \(T391\) — managed by `agentmbx setup --only opencode` \(agentmbx ([^)\s]{1,60})\)/;
-/** The OpenCode plugin file setup manages, judged the way doctor's wiring row judges it. */
-export function opencodePluginState(ctx, read = readSmall) {
-    const home = ctx?.home ?? homedir();
+/** The managed file's header and mtime only: cheap enough for the wake path, which must not read config. */
+export function opencodePluginFile(home = homedir(), read = readSmall) {
     const path = opencodePluginPath(home);
     const cur = read(path);
     if (cur === null)
@@ -84,16 +83,26 @@ export function opencodePluginState(ctx, read = readSmall) {
     }
     catch { /* unknown */ }
     const header = HEADER_RE.exec(cur);
+    return { headerVersion: header ? header[1] : null, mtimeMs, templateCurrent: null };
+}
+/** The OpenCode plugin file setup manages, judged the way doctor's wiring row judges it. */
+export function opencodePluginState(ctx, read = readSmall) {
+    const home = ctx?.home ?? homedir();
+    const state = opencodePluginFile(home, read);
+    if (state.mtimeMs === null && state.headerVersion === null)
+        return state;
+    const path = opencodePluginPath(home);
     let templateCurrent = null;
     try {
         const e = edits(ctx ?? { home, cmd: resolveCommand(home), which: () => null, useClis: false }, "opencode").find(x => x.kind === "hooks");
-        if (e && header)
+        const cur = read(path);
+        if (e && cur !== null && HEADER_RE.test(cur))
             templateCurrent = !!e.isWired?.(cur) || e.install(cur) === cur;
     }
     catch {
         templateCurrent = null;
     }
-    return { headerVersion: header ? header[1] : null, mtimeMs, templateCurrent };
+    return { ...state, templateCurrent };
 }
 function readSmall(path) {
     try {
@@ -122,33 +131,43 @@ export function opencodePluginStep(plugin, serveStart) {
 const DOCTOR_LIMIT = 20;
 /** Doctor rows: one warn per live connector behind the installed build, naming its session and both versions. */
 export function connectorSkewChecks(node, opts = {}) {
-    let live;
+    let live = [];
     try {
         live = liveConnectors(node, opts);
     }
     catch (error) {
         return [{ level: "info", label: `connectors: version skew not assessed (${error.message.slice(0, 120)})` }];
     }
-    if (!live.length)
-        return [];
     const installed = opts.installed ?? version();
     const behind = live.filter(c => c.relation === "behind" && c.session_id), unknown = live.filter(c => c.relation === "unknown");
     // An unbound connector names no session; many old idle ones would bury the sessions, so they share one row.
     const unbound = live.filter(c => c.relation === "behind" && !c.session_id);
     const checks = [];
     let plugin = null;
+    const pluginOf = () => (plugin ??= opts.plugin ?? opencodePluginState(opts.ctx));
     const serveStart = node.store.db.prepare("SELECT pid_start FROM sessions WHERE cli='opencode' AND session_id=? AND pid IS NOT NULL ORDER BY updated_at DESC LIMIT 1");
     for (const c of behind.slice(0, DOCTOR_LIMIT)) {
         const who = `session ${c.session_id} (${c.agent})`;
         let fix = "its next mbx tool call switches it to the installed build in place; if it stays behind, restart that session";
         if (c.cli === "opencode" && c.session_id) {
-            plugin ??= opts.plugin ?? opencodePluginState(opts.ctx);
-            const step = opencodePluginStep(plugin, serveStart.get(c.session_id)?.pid_start);
+            const step = opencodePluginStep(pluginOf(), serveStart.get(c.session_id)?.pid_start);
             if (step)
                 fix += `; for its OpenCode plugin, ${step}`;
         }
         checks.push({ level: "warn", label: `${c.cli ?? "unknown cli"}: ${who} runs connector ${c.version}; installed ${installed}`, fix });
     }
+    // T669: a current connector says nothing about the plugin module a running serve already loaded. The in-place handover
+    // switches the MCP, and nothing hands the plugin over, so a session can run an older plugin with a current connector.
+    // A behind row above already carries that session's plugin step, so only the rest get a row here.
+    const covered = new Set(behind.filter(c => c.cli === "opencode" && c.session_id).map(c => c.session_id));
+    const stalePlugin = opencodeSessions(node).filter(s => !covered.has(s.session_id) && opencodePluginStep(pluginOf(), s.pid_start));
+    for (const s of stalePlugin.slice(0, DOCTOR_LIMIT)) {
+        const step = opencodePluginStep(pluginOf(), s.pid_start);
+        checks.push({ level: "warn", label: `opencode: session ${s.session_id} (${s.agent}) runs an older plugin module than the installed ${installed}`,
+            fix: `its mbx connector switches in place and needs no restart; the plugin does not: ${step}` });
+    }
+    if (stalePlugin.length > DOCTOR_LIMIT)
+        checks.push({ level: "info", label: `opencode: ${stalePlugin.length - DOCTOR_LIMIT} more session(s) with a stale plugin module not listed` });
     if (unbound.length)
         checks.push({ level: "warn", label: `connectors: ${unbound.length} unbound connector(s) behind ${installed}: ${unbound.slice(0, 8).map(c => `${c.cli ?? "?"} pid ${c.pid} on ${c.version}`).join(", ")}${unbound.length > 8 ? ", …" : ""}`,
             fix: "an unbound connector holds no mailbox; it switches on its next mbx tool call, or ends with its session" });
@@ -156,7 +175,7 @@ export function connectorSkewChecks(node, opts = {}) {
         checks.push({ level: "info", label: `connectors: ${behind.length - DOCTOR_LIMIT} more behind ${installed} not listed` });
     if (unknown.length)
         checks.push({ level: "info", label: `connectors: ${unknown.length} live connector(s) report no comparable version (pid ${unknown.slice(0, 5).map(c => c.pid).join(", ")})` });
-    if (!behind.length && !unbound.length)
+    if (!behind.length && !unbound.length && live.length)
         checks.push({ level: "ok", label: `connectors: ${live.length - unknown.length} live connector(s), none behind ${installed}` });
     return checks;
 }
@@ -166,38 +185,70 @@ export function skewNoteText(connector, installed, pluginStep) {
         + (pluginStep ? ` The OpenCode plugin is not switched that way: ${pluginStep}.` : "");
 }
 export const skewNoteKey = (sessionId, connector, installed) => `connector-skew-note:opencode:${sessionId}:${connector}->${installed}`;
-/** Test seam: the plugin state the wake note judges (the real one reads the owner's OpenCode config). */
-export const skewSeams = { plugin: () => opencodePluginState() };
 /**
- * The one-line note for a wake about to go to this OpenCode session, or null. Only a session whose own leased connector
- * is alive (same birth) and behind the installed build gets one, and only once per (session, connector, installed): the
- * caller marks it with markSkewNoted when the wake was admitted. It rides a real wake and never starts a turn of its own.
+ * T669: a session whose connector is already current can still run an older plugin module, because nothing hands the
+ * plugin over in place. Once per stale plugin file (its header version and mtime identify it), the session is told the
+ * exact reload step on its next real wake, exactly the way a connector-behind note rides one.
+ */
+export function pluginSkewNoteText(installed, step) {
+    return `[mbx] AgentMBX ${installed} is installed; this session's OpenCode plugin still runs the code its serve loaded at start.`
+        + ` The mbx connector switches in place, the plugin does not: ${step}.`;
+}
+export const pluginSkewNoteKey = (sessionId, plugin) => `connector-skew-note:opencode:${sessionId}:plugin:${plugin.headerVersion ?? "unknown"}@${plugin.mtimeMs ?? 0}`;
+/** Live OpenCode sessions doctor judges a running plugin for: one exact row per session, newest first. */
+function opencodeSessions(node) {
+    return node.store.db.prepare("SELECT agent, session_id, pid_start FROM sessions WHERE cli='opencode' AND session_id NOT LIKE 'mcp-%' AND pid IS NOT NULL ORDER BY updated_at DESC")
+        .all();
+}
+/** Test seam: the plugin state the wake note judges (the cheap file read; doctor uses the full state). */
+export const skewSeams = { plugin: () => opencodePluginFile() };
+/** This session's own live, behind connector, or null: the report must be from the holder's process birth. */
+function behindConnector(node, session, installed, inspect) {
+    const lease = node.store.db.prepare("SELECT holder_pid, holder_start FROM identity_leases WHERE name=? AND cli='opencode' AND session_id=? AND released_at IS NULL")
+        .get(session.agent, session.session_id);
+    if (!lease)
+        return null; // an evicted MCP restarts on the installed build: nothing to say about the connector
+    const raw = node.store.get(connectorKey(lease.holder_pid));
+    if (!raw)
+        return null;
+    const r = JSON.parse(raw);
+    if (r?.v !== 1 || r.pid !== lease.holder_pid || r.start !== lease.holder_start || typeof r.version !== "string")
+        return null;
+    if (compareVersions(r.version, installed) !== -1)
+        return null;
+    const e = (inspect ?? inspectLeaseProcesses)([lease.holder_pid]).get(lease.holder_pid);
+    if (e?.alive !== true || !e.start || !recordedStartMatches(lease.holder_start, e.start))
+        return null;
+    return r.version;
+}
+/**
+ * The one-line note for a wake about to go to this OpenCode session, or null. It covers what is actually stale:
+ * the connector (once per session, connector version and installed version), the plugin module the serve already
+ * loaded (once per stale plugin file), or both in one note — a single wake never carries two notes. The caller marks
+ * it with markSkewNoted when the wake was admitted. It rides a real wake and never starts a turn of its own.
  */
 export function wakeSkewNote(node, session, opts = {}) {
     try {
         if (session.cli !== "opencode")
             return null;
-        const lease = node.store.db.prepare("SELECT holder_pid, holder_start FROM identity_leases WHERE name=? AND cli='opencode' AND session_id=? AND released_at IS NULL")
-            .get(session.agent, session.session_id);
-        if (!lease)
-            return null; // an evicted MCP restarts on the installed build: nothing to say
-        const raw = node.store.get(connectorKey(lease.holder_pid));
-        if (!raw)
-            return null;
-        const r = JSON.parse(raw);
-        if (r?.v !== 1 || r.pid !== lease.holder_pid || r.start !== lease.holder_start || typeof r.version !== "string")
-            return null;
         const installed = opts.installed ?? version();
-        if (compareVersions(r.version, installed) !== -1)
+        const plugin = opts.plugin ?? skewSeams.plugin();
+        const step = opencodePluginStep(plugin, session.pid_start);
+        const connector = behindConnector(node, session, installed, opts.inspect);
+        if (connector) {
+            const key = skewNoteKey(session.session_id, connector, installed);
+            if (node.store.get(key))
+                return null;
+            return { key, text: skewNoteText(connector, installed, step), agent: session.agent, session_id: session.session_id, connector, plugin: null, installed };
+        }
+        // T669: the connector is current, but this serve loaded an older plugin file than the one on disk.
+        if (!step)
             return null;
-        const e = (opts.inspect ?? inspectLeaseProcesses)([lease.holder_pid]).get(lease.holder_pid);
-        if (e?.alive !== true || !e.start || !recordedStartMatches(lease.holder_start, e.start))
-            return null;
-        const key = skewNoteKey(session.session_id, r.version, installed);
+        const key = pluginSkewNoteKey(session.session_id, plugin);
         if (node.store.get(key))
             return null;
-        const step = opencodePluginStep(opts.plugin ?? skewSeams.plugin(), session.pid_start);
-        return { key, text: skewNoteText(r.version, installed, step), agent: session.agent, session_id: session.session_id, connector: r.version, installed };
+        return { key, text: pluginSkewNoteText(installed, step), agent: session.agent, session_id: session.session_id, connector: null,
+            plugin: `${plugin.headerVersion ?? "unknown"}@${plugin.mtimeMs ?? 0}`, installed };
     }
     catch {
         return null;
@@ -207,7 +258,8 @@ export function wakeSkewNote(node, session, opts = {}) {
 export function markSkewNoted(node, note, receipt) {
     try {
         node.store.set(note.key, JSON.stringify({ noted_at: Date.now(), receipt }));
-        node.store.audit("connector.skew_noted", { agent: note.agent, cli: "opencode", session: note.session_id, connector: note.connector, installed: note.installed, receipt });
+        node.store.audit("connector.skew_noted", { agent: note.agent, cli: "opencode", session: note.session_id, connector: note.connector,
+            plugin: note.plugin, installed: note.installed, receipt });
     }
     catch { /* the wake already happened; a missing mark only means the note can ride one more wake */ }
 }

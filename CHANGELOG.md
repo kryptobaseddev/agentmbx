@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **A stale OpenCode plugin module is named instead of passing silently (T669).** The in-place handover switches a session's MCP to the installed build, but nothing hands over the plugin file an `opencode serve` already loaded: only reopening the tab loads a newer file, and only `agentmbx setup --only opencode` writes a newer template. Doctor named the plugin step only when the connector was also behind, so after an update the common case — current connector, older plugin — produced no warning at all, and the session note never fired. Doctor now reports one row per live OpenCode session whose plugin is older than the file on disk (naming the session and the exact step) even when every connector is current, and a first note per stale plugin file rides the session's next admitted wake, exactly once per plugin file instead of once per connector version. A session that is behind on both still gets one row and one note, never two.
+
 ## 0.5.40 (2026-10-15)
 
 - **`agentmbx watch` follows its own session's lease re-key instead of stopping (T653).** After a long idle, an mbx server can release its lease and claim it again with a new key: the same process, birth, CLI and session. Every running watcher then exited with "the lease this watcher was started for moved to another holder", so the session could no longer be woken until it re-armed. The watcher now follows such a re-key, and its record carries the new token so the daemon keeps deferring to it. A lease claimed by another process, or by the same process for a different session, still stops it with the same reason.
