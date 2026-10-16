@@ -62,6 +62,8 @@ export interface Draft {
   /** the project's normalized git origin (registry.projectKey), so paired hosts match it to their own folder (T219) */
   project_key?: string;
   unverifiedSender?: boolean;
+  /** T583: mention every resolved named recipient in the signed meta, so message and reply mail wakes them. */
+  urgent?: boolean;
 }
 
 export function buildEnvelope(d: Draft, now = new Date()): Envelope {

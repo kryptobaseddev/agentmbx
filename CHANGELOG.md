@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **Readable agent messages (T585).** The AgentMBX skill asks for concise sentences with normal word spacing and punctuation, separate paragraphs or bullets for multiple points, and exact code, commands, URLs, paths and IDs.
+- **Urgent sends and explicit won't-wake warnings (T583).** `mbx_send`, `mbx_reply` and `agentmbx send` take `urgent` (`--urgent` on the CLI). An urgent send mentions every named recipient it resolved to (including `lead`, `role:` and `task:` targets) in the signed envelope's `meta.mentions`, so message and reply mail wakes them like an @mention would. The envelope schema is unchanged. Urgent is refused before anything is stored with `kind=status` (status never wakes; use `kind=request` with `needs_reply=true`) and with `*` (urgent needs named recipients). A send that asks for attention (`needs_reply` or `urgent`) now gets one `warnings[]` line for each recipient that still won't be woken, with the reason (no push path, an unverified binding, no wake policy) and, with `needs_reply`, a note that the answer waits until that recipient's next prompt. Plain FYI mail stays quiet; `recipients[]` still shows each state. A `role:`/`task:` target on a paired host can't be named, and the sender is told it wakes only if the kind does. `mbx_reply` now also carries the status-never-wakes warning, and its description and parameters say which replies wake.
 
 ## 0.5.44 (2026-10-16)
 

@@ -158,7 +158,7 @@ Anything else (for example `status`, `message`) is delivered with `authority: no
 - Without that label, a message is a peer request, not an order.
 
 ### Wake brake
-- `request`, `task`, `decision`, and `alert` are eligible to wake an idle recipient. `message` and `reply` wake only with `needs_reply` or an @mention. `status` never wakes, even with either flag. Eligibility and adapter admission don't prove model execution.
+- `request`, `task`, `decision`, and `alert` are eligible to wake an idle recipient. `message` and `reply` wake only with `needs_reply`, `urgent`, or an @mention. `status` never wakes, even with either flag. Eligibility and adapter admission don't prove model execution.
 - Wakes reserve one atomic 30-second batching window per agent. A proven not-submitted adapter outcome can release that reservation.
 - The published wake code has no hourly per-thread or daily per-agent hard cap. A configured loop detector reports observations; it doesn't impose those removed quotas.
 - Muting and batching don't delete mail. Wake eligibility, adapter admission, model execution, and task completion remain separate.

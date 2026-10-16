@@ -816,6 +816,12 @@ export class MbxNode {
       }
     }
     const r = this.route(e.to);
+    // T583: an urgent send mentions the agents its recipients resolved to (lead, role:, task: and project aliases included),
+    // before signing, so wantsWake treats message and reply mail as wake-worthy for them. A nameless remote target can't be named.
+    if (d.urgent && !prebuilt) {
+      const named = r.targets.filter((t) => t.name && t.name !== "owner" && !t.unknown).map((t) => t.host ? `${t.name}@${t.host}` : t.name!);
+      e.meta.mentions = [...new Set([...e.meta.mentions, ...named.map((n) => n.toLowerCase())])].slice(0, 100);
+    }
     r.warnings.push(...project.notes);
     if (provenance) r.warnings.push(...provenance.warnings);
     // T491: mark exactly the targets the lead tokens resolved to (a fan-out or broadcast that happens to
