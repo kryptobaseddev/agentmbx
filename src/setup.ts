@@ -1297,7 +1297,7 @@ const watchWake = (ctx: NoteCtx, sid: string): void => {
       const since = turnSince.get(sid);
       if (since !== undefined && Date.now() - since < TURN_STALE_MS) {
         try {
-          await fetch(base, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionID: sid, id: "busy" }) });
+          await fetch(base, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionID: sid, id: "busy", pid: process.pid }) });
         } catch { /* the daemon's receipt wait ends; it retries on its own */ }
         continue;
       }
@@ -1305,9 +1305,10 @@ const watchWake = (ctx: NoteCtx, sid: string): void => {
       if (!id) continue;
       try {
         // T642: say whether the wake landed behind a turn in progress, so the sender's receipt can tell it waits for that turn.
+        // T672: name this serve so the receipt settles its own offer, not a sibling serve's for the same session.
         const since = turnSince.get(sid);
         await fetch(base, { method: "POST", headers: { "content-type": "application/json" },
-          body: JSON.stringify({ sessionID: sid, id, ...(since ? { turn_since: new Date(since).toISOString() } : {}) }) });
+          body: JSON.stringify({ sessionID: sid, id, pid: process.pid, ...(since ? { turn_since: new Date(since).toISOString() } : {}) }) });
       } catch { /* the receipt wait ends; nothing is sent to the shared service */ }
     }
   })();
