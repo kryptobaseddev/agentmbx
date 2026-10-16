@@ -12,6 +12,10 @@ import {
 } from "../src/opencode-wake-queue.ts";
 import { opencodeHostSeams } from "../src/opencode-provider.ts";
 import { dispatchWakes } from "../src/wake.ts";
+import { startServer } from "../src/http.ts";
+import { opencodePluginSource } from "../src/setup.ts";
+import { version } from "../src/version.ts";
+import type { AddressInfo } from "node:net";
 import { sendLeased } from "./helpers/leased-send.ts";
 import { delegateWake } from "./helpers/wake-lease.ts";
 
@@ -53,6 +57,33 @@ test("T672: a pid-less receipt settles nothing while two serves have offers outs
     assert.equal(completeOpencodeWake(SESSION, "msg_from_b", null, B), true);
     assert.deepEqual(await pushB, { ok: true, id: "msg_from_b", turnSince: null });
   } finally { resetOpencodeWakeQueue(); }
+});
+
+test("T672: the receipt's pid reaches completeOpencodeWake through the real route", async (t) => {
+  resetOpencodeWakeQueue();
+  const home = mkdtempSync(join(tmpdir(), "mbx-t672-http-")), n = new MbxNode(home, { host: "alpha" });
+  const server = await startServer(n, 0, "127.0.0.1");
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/opencode-wake`;
+  const post = (body: Record<string, unknown>) => fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  t.after(async () => { resetOpencodeWakeQueue(); await new Promise<void>((r) => { server.closeAllConnections?.(); server.close(() => r()); });
+    n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  // The generated plugin names its own serve on every receipt.
+  assert.match(opencodePluginSource(["/opt/bin/agentmbx"], version()), /id, pid: process\.pid,/);
+  assert.match(opencodePluginSource(["/opt/bin/agentmbx"], version()), /id: "busy", pid: process\.pid/);
+  // Two serves poll one session and both are offered a wake; A's receipt names A, so B's offer survives and vice versa.
+  const pollA = waitForOpencodeWake(SESSION, A, 2_000), pollB = waitForOpencodeWake(SESSION, B, 2_000);
+  const pushA = pushOpencodeWake(SESSION, A, "for A", 2_000), pushB = pushOpencodeWake(SESSION, B, "for B", 2_000);
+  assert.equal(await pollA, "for A");
+  assert.equal(await pollB, "for B");
+  const wrong = await post({ sessionID: SESSION, id: "msg_from_a", pid: A + 99 });
+  assert.equal(wrong.status, 409, "an unnamed offer is refused instead of settling someone else's");
+  const since = new Date().toISOString();
+  const right = await post({ sessionID: SESSION, id: "msg_from_a", pid: A, turn_since: since });
+  assert.equal(right.status, 200);
+  assert.deepEqual(await pushA, { ok: true, id: "msg_from_a", turnSince: since }, "A settles with the id and the turn time it posted");
+  const decline = await post({ sessionID: SESSION, id: OPENCODE_WAKE_BUSY, pid: B });
+  assert.equal(decline.status, 200);
+  assert.deepEqual(await pushB, { ok: false, handedOff: false, busy: true }, "and B's decline settles B's own offer");
 });
 
 test("T672: the poller-target path (no lease) keeps the mail delivered when the plugin declines mid-turn", async (t) => {

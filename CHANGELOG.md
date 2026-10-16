@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **An OpenCode wake receipt now settles its own serve's offer (T672).** Wake offers are held per (session, serve pid), but a receipt was matched by session alone: with two serves polling one session a receipt could settle the other one's offer and credit an admission that never happened. `completeOpencodeWake` now takes the serve's pid and settles exactly that offer; without a pid it settles only when a single offer is outstanding and otherwise refuses. The OpenCode plugin template posts its pid with every receipt (and with a mid-turn busy decline), and the loopback route validates and forwards it. **The plugin template changed, so run `agentmbx setup --only opencode` and reopen the OpenCode tab for a session to send it.**
+
 ## 0.5.41 (2026-10-15)
 
 - **A stale OpenCode plugin module is named instead of passing silently (T669).** The in-place handover switches a session's MCP to the installed build, but nothing hands over the plugin file an `opencode serve` already loaded: only reopening the tab loads a newer file, and only `agentmbx setup --only opencode` writes a newer template. Doctor named the plugin step only when the connector was also behind, so after an update the common case — current connector, older plugin — produced no warning at all, and the session note never fired. Doctor now reports one row per live OpenCode session whose plugin is older than the file on disk (naming the session and the exact step) even when every connector is current, and a first note per stale plugin file rides the session's next admitted wake, exactly once per plugin file instead of once per connector version. A session that is behind on both still gets one row and one note, never two.
