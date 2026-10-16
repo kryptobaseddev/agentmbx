@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Reopening a rootless quarantine summary no longer renews its caution window (T579).** The first summary disclosure is retained per provider conversation and message. A different unknown summary still cautions, and real outside roots, raw reads and approval guards keep their existing behavior. This narrows repeated-summary taint; scoped collaboration still awaits the signed v2 opt-in path.
+
 ## 0.5.41 (2026-10-15)
 
 - **A stale OpenCode plugin module is named instead of passing silently (T669).** The in-place handover switches a session's MCP to the installed build, but nothing hands over the plugin file an `opencode serve` already loaded: only reopening the tab loads a newer file, and only `agentmbx setup --only opencode` writes a newer template. Doctor named the plugin step only when the connector was also behind, so after an update the common case — current connector, older plugin — produced no warning at all, and the session note never fired. Doctor now reports one row per live OpenCode session whose plugin is older than the file on disk (naming the session and the exact step) even when every connector is current, and a first note per stale plugin file rides the session's next admitted wake, exactly once per plugin file instead of once per connector version. A session that is behind on both still gets one row and one note, never two.

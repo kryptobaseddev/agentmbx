@@ -29,9 +29,17 @@ function fixture(t: { after(fn: () => void | Promise<void>): void }) {
     node.store.insertMessage(signed, "local", "local", null); node.store.addDelivery(signed.id, "reader"); return signed;
   };
   const expose = (e: Envelope, now = NOW) => recordSessionExposure(node.store, "alpha", scope.cli, scope.session_id, e, node.provenanceSources(e), now);
+  const status = (kind?: "agent" | "unknown") => {
+    const e = buildEnvelope({ from: "sender@alpha", to: ["reader"], subject: "test counts", body: "12 passed", kind: "status" }, new Date(NOW));
+    e.meta.sender_verification = "leased";
+    if (kind) e.meta.provenance = { v: 2, kind, content_sha256: sha256(e.body), roots: [], parents: [] };
+    const signed = signEnvelope(e, "alpha", node.key.publicKey, node.key.privateKey);
+    node.store.insertMessage(signed, "local", "local", null); node.store.addDelivery(signed.id, "reader");
+    return node.read(signed.id, "reader");
+  };
   const sign = (rec: SessionClearance): Signed<SessionClearance> => ({ rec, sig: signData(owner.privateKey, canonical(rec)) });
   const prepare = () => { const e = raw(); expose(e); return sign(buildSessionClearance(node.store, scope, owner.publicKey, "clear", "reviewed current inputs", 15 * 60_000, NOW)); };
-  return { home, node, owner, scope, raw, expose, sign, prepare };
+  return { home, node, owner, scope, raw, status, expose, sign, prepare };
 }
 
 test("metadata exposes identifiers/counts/policy and root digests without sender text or exposure", t => {
@@ -72,6 +80,35 @@ test("quarantine inherits old source time without declassification or a renewed 
   assert.equal(readSessionExposure(f.node.store, "alpha", f.scope.cli, f.scope.session_id, NOW).record!.roots[0].source.since, e.ts);
   assert.equal(messageReadView(f.node, row, "reader", "quarantine", NOW).provenance.kind, "derived-outside");
   assert.equal(readSessionTaint(f.node.store, f.scope.cli, f.scope.session_id, NOW), null);
+});
+for (const kind of ["agent", "unknown", undefined] as const) test(`rootless ${kind ?? "legacy"} quarantine keeps its first receipt after expiry`, t => {
+  const f = fixture(t), row = f.status(kind), later = NOW + EXTERNAL_TAINT_MS + 1;
+  f.node.observeRead(row, f.scope.cli, f.scope.session_id, "quarantine", NOW);
+  assert.equal(readSessionTaint(f.node.store, f.scope.cli, f.scope.session_id, NOW)!.root, NOW);
+  f.node.observeRead(row, f.scope.cli, f.scope.session_id, "quarantine", later);
+  assert.equal(readSessionTaint(f.node.store, f.scope.cli, f.scope.session_id, later), null, "repeated summary is not a new source");
+  assert.equal(readSessionExposure(f.node.store, "alpha", f.scope.cli, f.scope.session_id, later).record!.unknown, true);
+  assert.equal(messageReadView(f.node, row, "reader", "quarantine", later).policy.classes.every(c => c === "read"), true);
+  f.node.observeRead(row, f.scope.cli, "another-session", "quarantine", later);
+  assert.equal(readSessionTaint(f.node.store, f.scope.cli, "another-session", later)!.root, later, "receipts are conversation-scoped");
+  f.node.observeRead(row, "codex", f.scope.session_id, "quarantine", later);
+  assert.equal(readSessionTaint(f.node.store, "codex", f.scope.session_id, later)!.root, later, "providers do not share receipts");
+  f.node.observeRead(f.status(kind), f.scope.cli, f.scope.session_id, "quarantine", later);
+  assert.equal(readSessionTaint(f.node.store, f.scope.cli, f.scope.session_id, later)!.root, later, "a distinct unknown summary still cautions");
+});
+test("rootless summary adopts its existing live fence and rejects corrupt first-summary receipts", t => {
+  const f = fixture(t), row = f.status("unknown"), key = `session-summary:${canonical([f.scope.cli, f.scope.session_id, row.id])}`;
+  const old = { v: 1 as const, cli: f.scope.cli, session_id: f.scope.session_id, root: NOW, from: row.from_addr, id: row.id, how: "inherited" as const, relay_depth: [] };
+  writeSessionTaint(f.node.store, old, NOW);
+  f.node.observeRead(row, f.scope.cli, f.scope.session_id, "quarantine", NOW + 10);
+  assert.equal(readSessionTaint(f.node.store, f.scope.cli, f.scope.session_id, NOW + 10)!.root, NOW, "upgrade adoption cannot renew a live same-message root");
+  const before = f.node.store.get(taintKey(f.scope.cli, f.scope.session_id));
+  for (const value of ["{bad", "null", "[]", "-1", JSON.stringify(NOW + 100)]) {
+    f.node.store.set(key, value);
+    assert.throws(() => f.node.observeRead(row, f.scope.cli, f.scope.session_id, "quarantine", NOW + 20), /invalid first-summary disclosure receipt/);
+    assert.equal(f.node.store.get(key), value, "corrupt evidence is preserved");
+    assert.equal(f.node.store.get(taintKey(f.scope.cli, f.scope.session_id)), before);
+  }
 });
 test("v1 repeated raw reads A/B/A keep each first local disclosure inside the hour", t => {
   const f = fixture(t), a = f.raw("A"), b = f.raw("B", NOW + 10);

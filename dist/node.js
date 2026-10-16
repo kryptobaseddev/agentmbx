@@ -1336,7 +1336,24 @@ export class MbxNode {
         const p = readContentProvenance(e, this.provenanceSources(e), now);
         let exposure = externalExposure(e, now);
         if (mode === "quarantine") {
-            exposure = { how: "inherited", root: p.roots.length ? Math.max(...p.roots.map(r => Date.parse(r.since))) : exposure?.how === "inherited" ? exposure.root : old?.root ?? now };
+            const root = p.roots.length ? Math.max(...p.roots.map(r => Date.parse(r.since))) : exposure?.how === "inherited" ? exposure.root : this.store.tx(() => {
+                // A rootless summary is one derived disclosure, even when reopened after its caution window.
+                const key = `session-summary:${canonical([cli, sessionId, row.id])}`, saved = this.store.get(key);
+                if (saved !== undefined) {
+                    let first;
+                    try {
+                        first = JSON.parse(saved);
+                    }
+                    catch { /* Invalid receipts cannot establish an earlier disclosure. */ }
+                    if (typeof first !== "number" || !Number.isSafeInteger(first) || first < 0 || first > now)
+                        throw new Error("invalid first-summary disclosure receipt");
+                    return first;
+                }
+                const first = old?.id === row.id ? old.root : now;
+                this.store.set(key, JSON.stringify(first));
+                return first;
+            });
+            exposure = { how: "inherited", root };
         }
         else if (exposure && exposure.how !== "inherited") {
             const raw = observed.record?.roots.find(r => r.source.message_id === row.id)?.raw_at;

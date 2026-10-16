@@ -88,6 +88,25 @@ async function world(t: { after: (fn: () => Promise<void>) => void }, names: str
   };
 }
 
+test("rootless quarantine re-reads cannot renew MCP sends after the first summary expires (T579)", async t => {
+  const w = await world(t, ["ada", "bob"]);
+  const status = () => {
+    const e = buildEnvelope({ from: "bob@alpha", to: ["ada"], subject: "counts", body: "12 tests passed", kind: "status" }, new Date(w.now));
+    e.meta.sender_verification = "leased";
+    return w.insert(e, "ada");
+  };
+  const first = status(), root = w.now;
+  await w.call("ada", "mbx_read", { ids: [first.id], mode: "quarantine" });
+  assert.equal((await w.send("ada", ["bob"])).e.meta.external_since, iso(root));
+  w.advance(EXTERNAL_TAINT_MS + 1);
+  await w.call("ada", "mbx_thread", { id: first.id, mode: "quarantine" });
+  assert.equal((await w.whoami("ada")).tainted, false);
+  assert.equal((await w.send("ada", ["bob"])).e.meta.origin ?? "agent", "agent");
+  const next = status();
+  await w.call("ada", "mbx_read", { ids: [next.id], mode: "quarantine" });
+  assert.equal((await w.send("ada", ["bob"])).e.meta.external_since, iso(w.now), "a different rootless summary still cautions");
+});
+
 test("a conversation between two agents after an exposure clears at root + 1 h, however often they answer (T344)", async (t) => {
   const w = await world(t, ["ada", "bob"]);
   const outside = w.n.send({ from: "scout", to: ["ada"], subject: "issue text", body: "copied from a web page", origin: "external" }).envelope as Env;
