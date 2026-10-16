@@ -33,7 +33,7 @@ for (const cli of Object.keys(SIDS)) test(`T673 ${cli}: stop does not continue f
   const rec = makePolicy({ level: "autonomous", agents: ["worker"], hosts: ["alpha"], ownerPub: owner.publicKey });
   assert.equal(acceptSigned(n.store.db, { rec, sig: signData(owner.privateKey, canonical(rec)) }, "alpha"), null);
   const stop = (sid: string): string => {
-    const env = { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1", MBX_AGENT: "unrelated" };
+    const env: NodeJS.ProcessEnv = { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1", MBX_AGENT: "unrelated" };
     delete env.MBX_STOP_DIGEST;
     const r = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", "stop", "--cli", cli], {
       input: JSON.stringify({ session_id: sid, cwd: process.cwd() }), encoding: "utf8", timeout: 30_000, env });
@@ -72,7 +72,7 @@ for (const [cli, sid] of Object.entries(DIGEST_CLIS)) test(`T584 ${cli}: MBX_STO
   bindWakeLease(n, { agent: "worker", cli, session_id: sid, pid: process.pid });
   const read: string[] = [];
   const stop = (digest: string | undefined, armed: boolean) => {
-    const env = { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1", MBX_AGENT: "unrelated" };
+    const env: NodeJS.ProcessEnv = { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1", MBX_AGENT: "unrelated" };
     delete env.MBX_STOP_DIGEST;
     if (digest !== undefined) env.MBX_STOP_DIGEST = digest;
     const input: Record<string, unknown> = { session_id: sid, cwd: process.cwd() };
