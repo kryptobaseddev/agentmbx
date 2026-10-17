@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **A watcher-exit wake dropped mid-turn is not lost with its hint (T667).** A terminal Kimi session wakes itself: `agentmbx watch` exits when mail that wants it arrives, and the harness turns that background-task completion into the next turn. A completion that lands while a turn is running is dropped, not queued, and mail the watcher already reported sat `notified` and invisible to the dispatcher — after an exit-2 Stop continuation (Kimi runs one Stop per turn) nothing surfaced it until the next owner prompt. The exiting watcher now records which message ids its hint named, and the Stop hook reconciles that marker for mail the turn surfaces, so the two never double-fire. A marked delivery still unread once the batching window has passed is requeued to `delivered` exactly once — no requeue while a live watcher, a mute, or the brake would handle it — so it rides the next watcher report, prompt notice or notice fallback instead of stranding. Mail read or acked before the turn ends is never re-driven. Sessions whose hooks do not dispatch at all (T611) keep their documented MCP fallback.
+
 ## 0.5.47 (2026-10-16)
 
 - **Service-hosted OpenCode sessions stay wakeable after MCP eviction (T688).** OpenCode stops an idle session's MCP about hourly, which releases its lease. T659 kept standalone sessions wakeable through their plugin's poll; a session hosted by the shared `opencode serve --service` is now a wake target too while that service process (same pid and birth) lives, and the wake posts to the service with `resume: true` and a verified receipt. A lease held by another session of the agent still blocks it. docs/OPENCODE.md recommends plain `opencode` (one service per machine, every project) for long-lived agents.
