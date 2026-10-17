@@ -1,5 +1,5 @@
 // T659: an OpenCode session whose MCP was evicted (about hourly, upstream) has no lease holder, so no wake target.
-// The plugin poller inside its standalone serve is the target; the shared service, a wrong pid or a dead serve get none.
+// The plugin poller inside its standalone serve is the target, or (T688) the shared service that hosts it; a wrong pid or a dead serve get none.
 import { sendLeased } from "./helpers/leased-send.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -60,10 +60,40 @@ test("T659: an evicted MCP with a live standalone poller is woken, with ids only
   assert.match(attempt.detail, /ses_idle/);
 });
 
-test("T659: the shared service is never a poller target", t => {
+test("T688: an evicted MCP on the shared service is woken through the service, with no poller", async t => {
   const n = evicted(t, SERVICE);
-  assert.deepEqual(pollerWakeTargets(n, "worker", n.sessionsFor("worker")), []);
-  assert.equal(pollerTargetLive(n, n.sessionsFor("worker")[0]), false);
+  assert.equal(pollerTargetLive(n, n.sessionsFor("worker")[0]), false, "the service has no loopback poller");
+  assert.equal(pollerTargets(n), 1, "the live service still hosts the session");
+  const realFetch = globalThis.fetch, realUrl = process.env.MBX_OPENCODE_URL;
+  const posts: Array<{ url: string; body: { text: string; delivery: string; resume: boolean } }> = [];
+  process.env.MBX_OPENCODE_URL = "http://127.0.0.1:9";
+  globalThis.fetch = (async (url: string, init: { body: string }) => {
+    const body = JSON.parse(init.body); posts.push({ url, body });
+    return new Response(JSON.stringify({ data: { id: "msg_svc", sessionID: SESSION, type: "synthetic", delivery: "queue", payload: { text: body.text }, time: { created: Date.now() } } }));
+  }) as unknown as typeof fetch;
+  t.after(() => { globalThis.fetch = realFetch; if (realUrl === undefined) delete process.env.MBX_OPENCODE_URL; else process.env.MBX_OPENCODE_URL = realUrl; });
+  const sent = sendLeased(n, { from: "sender", to: ["worker"], subject: "subject here", body: "private body", kind: "request" });
+  const out = await dispatchWakes(n);
+  assert.equal(out[0]?.result.ok, true);
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, `http://127.0.0.1:9/api/session/${SESSION}/synthetic`);
+  assert.equal(posts[0].body.resume, true, "a service wake starts the idle session's turn");
+  assert.ok(posts[0].body.text.includes(sent.envelope.id) && !posts[0].body.text.includes("private body"), "ids only");
+  assert.equal(stateOf(n, sent.envelope.id), "notified");
+  assert.match((n.store.db.prepare("SELECT detail FROM audit WHERE event='wake.attempt'").get() as { detail: string }).detail, /"native":"msg_svc"/);
+});
+
+test("T688: a service row whose process birth changed (service restarted, pid reused) is not a target", t => {
+  const n = evicted(t, SERVICE);
+  n.store.db.prepare("UPDATE sessions SET pid_start='not-this-process' WHERE session_id=?").run(SESSION);
+  assert.equal(pollerTargets(n), 0);
+});
+
+test("T688: a service row is not a target while the agent's lease names another session", t => {
+  const n = evicted(t, SERVICE);
+  new IdentityLeases(n.store).claim("worker", { pid: process.pid, start: inspectLeaseProcess(process.pid).start!,
+    keyFp: fingerprint(generateKeyPair().publicKey), cli: "opencode", sessionId: "ses_elsewhere" });
+  assert.equal(pollerTargets(n), 0);
 });
 
 test("T659: a poller for a different pid than the bound row is not a target", async t => {

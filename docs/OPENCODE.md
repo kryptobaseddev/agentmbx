@@ -75,7 +75,7 @@ There is no endpoint to post to, so the plugin inside the serve comes to the dae
    The plugin keeps polling for as long as its serve process lives.
 3. When a wake is due, the daemon offers the text to the poll whose `pid` equals the binding's pid.
    A poll from any other pid, or none, receives nothing.
-4. The plugin admits the text with `ctx.session.synthetic` (`resume: false`, `delivery: "queue"`)
+4. The plugin admits the text with `ctx.session.synthetic` (`resume: true`, `delivery: "queue"`, T544)
    and posts the `msg_` id the host returned back to `POST /v1/opencode-wake`. The daemon accepts
    only a `msg_` receipt, and only for a wake it has offered.
 5. The daemon records the wake as admitted with that native id, state `queued`.
@@ -113,6 +113,10 @@ that the model ran or handled it.
 
 ## Which mode should I run?
 
+- **You run long-lived agents, in one project or many.** Run plain `opencode` (no `--standalone`)
+  so the tab attaches to the shared service. There is one service per machine, not per project:
+  each session records its own folder, and the AgentMBX daemon (also one per machine) wakes by
+  session id. Start it once with `opencode service start`; `opencode service status` shows it.
 - **You need an idle session to wake on mail, and want the strongest evidence.** Run OpenCode
   against the shared service. That is the path the live end-to-end script
   (`scripts/e2e/wake-opencode.py`) and [RESEARCH.md](RESEARCH.md) record as waking an idle session
@@ -121,10 +125,21 @@ that the model ran or handled it.
 - **You run `--standalone`.** Mail still reaches the session, through hook notes and through wakes
   admitted in-process with a native receipt. Two limits apply. The wake poll only starts after the
   plugin has seen a hook event for that session, and it needs the AgentMBX daemon running on the
-  same machine. And because an in-process wake is admitted with `resume: false`, AgentMBX has
-  verified that OpenCode accepted and queued it, but no test or live check shows that an idle
-  standalone session starts a turn because of it. Treat a standalone wake as delivery to the
-  session's queue, not as a guaranteed turn.
+  same machine. A daemon wake is admitted with `resume: true` (T544), which started a turn on an
+  idle standalone TUI in a live check; hook notes stay `resume: false`.
+
+### After OpenCode evicts the session's MCP
+
+OpenCode stops an idle session's MCP server about once an hour, which releases its mailbox lease
+(T450). The session's binding row stays, and the daemon still wakes it without a lease:
+
+- **Standalone (T659):** while the plugin in that serve polls the wake queue for the session, and the
+  row still names that serve's pid and process birth.
+- **Service-hosted (T688):** while the shared service process the row names (same pid and birth)
+  is alive; the wake posts to the service as usual.
+
+Either way, a lease now held by a different session of that agent means no wake for the old row,
+and the session claims its identity again on the turn the wake starts.
 
 ## What doctor reports
 
