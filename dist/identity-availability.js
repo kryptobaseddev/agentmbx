@@ -1,6 +1,10 @@
 // One answer to "can this identity be claimed now?", used by both mbx_identity list and the claim itself (T204, R4.3), so
 // a name the list calls available is never refused by the claim for a reason the list didn't show.
+import { globSync, lstatSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { identityLeaseStatus } from "./identity-leases.js";
+import { procStartEpochMs } from "./proc.js";
 /**
  * A conversation of a shared provider process (Codex or OpenCode transport, hosted Kimi) that made no mbx call and fired
  * no hook for this long can be taken over by an explicit claim: closing such a conversation does not end its process, so
@@ -20,6 +24,77 @@ export function parseActivity(raw) {
     }
 }
 const minutes = (ms) => `${Math.max(1, Math.round(ms / 60_000))} min`;
+const CODEX_THREAD = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
+/** A stamp counts only when it is a real past moment from this holder's lease, never a future or pre-lease mtime. */
+function usableStamp(at, now, claimedAt) {
+    return Number.isSafeInteger(at) && at >= 0 && at <= now && at > claimedAt ? at : null;
+}
+function fileMtime(path) {
+    try {
+        const stat = lstatSync(path);
+        return stat.isFile() ? Math.floor(stat.mtimeMs) : null;
+    }
+    catch {
+        return null;
+    }
+}
+function pidAlive(pid) {
+    if (!Number.isSafeInteger(pid) || pid <= 0)
+        return false;
+    try {
+        process.kill(pid, 0);
+        return true;
+    }
+    catch (e) {
+        return e.code === "EPERM";
+    }
+}
+/** Exact-thread rollout mtime. Metadata only: the same one-file rule as CodexActivity, and the body is never opened. */
+function codexRolloutActivity(sessionId, home, now, claimedAt) {
+    if (!CODEX_THREAD.test(sessionId))
+        return null;
+    try {
+        const found = globSync(`sessions/*/*/*/rollout-*-${sessionId.toLowerCase()}.jsonl`, { cwd: home });
+        if (found.length !== 1)
+            return null;
+        const at = usableStamp(fileMtime(join(home, found[0])) ?? -1, now, claimedAt);
+        return at === null ? null : { at, source: "codex rollout" };
+    }
+    catch {
+        return null;
+    }
+}
+/** A live row in Grok's active_sessions.json is a heartbeat at decision time. A dead or reused pid is not activity. */
+function grokSessionActivity(sessionId, file, now, claimedAt) {
+    try {
+        const rows = JSON.parse(readFileSync(file, "utf8"));
+        if (!Array.isArray(rows))
+            return null;
+        const matches = rows.filter((r) => !!r && typeof r === "object" && r.session_id === sessionId
+            && Number.isSafeInteger(r.pid) && (r.pid) > 0);
+        if (matches.length !== 1 || !pidAlive(matches[0].pid))
+            return null;
+        const opened = typeof matches[0].opened_at === "string" ? Date.parse(matches[0].opened_at) : NaN;
+        const startMs = procStartEpochMs(matches[0].pid);
+        if (Number.isFinite(opened) && startMs !== null && opened < startMs)
+            return null;
+        const at = usableStamp(now, now, claimedAt);
+        return at === null ? null : { at, source: "grok session" };
+    }
+    catch {
+        return null;
+    }
+}
+function harnessActivity(lease, now, homes) {
+    if (lease.cli === "codex")
+        return codexRolloutActivity(lease.session_id, homes?.codexHome ?? (process.env.CODEX_HOME || join(homedir(), ".codex")), now, lease.claimed_at);
+    if (lease.cli === "grok") {
+        const file = homes?.grokSessionsFile ?? (process.env.MBX_GROK_SESSIONS_FILE
+            || join(process.env.GROK_HOME || join(homedir(), ".grok"), "active_sessions.json"));
+        return grokSessionActivity(lease.session_id, file, now, lease.claimed_at);
+    }
+    return null;
+}
 export const providerRecordKey = (mcpPid) => `mcp-provider:${mcpPid}`;
 /** A kv value is a provider record only when both fields are present and bounded. Anything else is "no record". */
 export function parseProviderRecord(raw) {
@@ -105,6 +180,9 @@ export function identityAvailability(o) {
     const holder = `${lease.cli} session ${lease.session_id}`;
     if (status.state === "unknown")
         return { claimable: false, state: "unknown", reason: `held by ${holder}, whose process could not be verified right now; retry shortly` };
+    const harness = harnessActivity(lease, o.now, o.homes);
+    const mbxAt = o.activity?.at ?? null;
+    const effectiveAt = Math.max(mbxAt ?? 0, harness?.at ?? 0);
     if (o.caller && lease.cli === o.caller.cli && lease.session_id === o.caller.sessionId && !o.caller.sessionId.startsWith("mcp-")) {
         // T383: a provider may start a second, short-lived MCP server for a session whose own server is still live and serving
         // (Codex did). T439: a server under the caller's own provider co-uses the lease. T440: a different parent is takeover
@@ -114,7 +192,7 @@ export function identityAvailability(o) {
         // T608: the same conversation's other server, quiet for the stale threshold (D039), is stuck, not serving: this
         // session takes its own identity back without the owner. A holder still in use keeps it, so two live servers do not
         // trade the lease.
-        const sessionQuiet = o.now - (o.activity?.at ?? lease.claimed_at);
+        const sessionQuiet = o.now - Math.max(o.activity?.at ?? lease.claimed_at, harness?.at ?? 0);
         if (holderProvider !== providerPid && sessionQuiet >= SHARED_IDLE_MS)
             return { claimable: true, state: "idle", reason: `held by an idle MCP server of this same ${lease.cli} session (pid ${lease.holder_pid}, no mbx activity for ${minutes(sessionQuiet)})`, takeover: "same-session" };
         if (providerPid !== undefined && holderProvider != null && holderProvider !== providerPid) {
@@ -128,8 +206,11 @@ export function identityAvailability(o) {
                     + "a sibling server of this session co-uses it: it acts as that identity under the holder's lease, without taking or releasing it" };
         return { claimable: false, state: "live", reason: `held by a live process of this same ${lease.cli} session (pid ${lease.holder_pid}) whose provider process could not be verified; retry shortly` };
     }
-    const quiet = o.activity ? o.now - o.activity.at : null;
-    if (o.activity?.shared && quiet !== null && quiet >= SHARED_IDLE_MS)
+    const quiet = mbxAt !== null ? o.now - mbxAt : null;
+    const effectiveQuiet = mbxAt !== null || harness ? o.now - effectiveAt : null;
+    if (o.activity?.shared && quiet !== null && quiet >= SHARED_IDLE_MS && (effectiveQuiet ?? quiet) >= SHARED_IDLE_MS)
         return { claimable: true, state: "idle", reason: `held by ${holder} in a shared ${lease.cli} process with no mbx activity for ${minutes(quiet)} (that conversation has probably ended)`, takeover: "idle-conversation" };
-    return { claimable: false, state: "live", reason: `held by live ${holder}${quiet !== null ? `, last mbx activity ${minutes(quiet)} ago` : ""}` };
+    const showHarness = harness !== null && (mbxAt === null || harness.at >= mbxAt);
+    const suffix = showHarness ? `, last activity ${minutes(o.now - harness.at)} ago (${harness.source})` : quiet !== null ? `, last mbx activity ${minutes(quiet)} ago` : "";
+    return { claimable: false, state: "live", reason: `held by live ${holder}${suffix}` };
 }

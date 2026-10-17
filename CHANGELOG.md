@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Liveness follows the harness when the mailbox has gone quiet (T583).** `mbx_agents` and `agentmbx agents` timed a live holder by its last mbx call, so a session that was busy in its harness looked stale. A Codex lease now also uses that thread's rollout mtime (file metadata only, the same one-file rule as T677). A Grok lease uses `active_sessions.json`: a live row is a heartbeat, and a dead or reused pid is not. When that stamp is the newer one the reason says `last activity N min ago (codex rollout)` or `(grok session)`; otherwise it still says `last mbx activity`. A shared conversation becomes claimable only once both are quiet.
+
 ## 0.5.47 (2026-10-16)
 
 - **Service-hosted OpenCode sessions stay wakeable after MCP eviction (T688).** OpenCode stops an idle session's MCP about hourly, which releases its lease. T659 kept standalone sessions wakeable through their plugin's poll; a session hosted by the shared `opencode serve --service` is now a wake target too while that service process (same pid and birth) lives, and the wake posts to the service with `resume: true` and a verified receipt. A lease held by another session of the agent still blocks it. docs/OPENCODE.md recommends plain `opencode` (one service per machine, every project) for long-lived agents.
