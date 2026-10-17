@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +8,8 @@ import { identityAvailability, SHARED_IDLE_MS } from "../src/identity-availabili
 import type { IdentityLease } from "../src/identity-leases.ts";
 
 const THREAD = "44444444-4444-4444-8444-444444444444";
+/** A pid the OS has already reaped: the Grok dead-harness check must not depend on a fabricated pid being free. */
+const exitedPid = (): number => spawnSync(process.execPath, ["-e", ""]).pid!;
 const live = { alive: true as const, start: "birth" };
 
 function lease(cli: string, sessionId: string, now: number): IdentityLease {
@@ -58,7 +61,7 @@ test("a live Grok session with a stale mbx call reads as active", () => {
 test("a dead harness still reads as stale", () => {
   const now = Date.now(), home = dir();
   const file = join(home, "active_sessions.json");
-  writeFileSync(file, JSON.stringify([{ session_id: "grok-t583", pid: 2_147_483_646, cwd: home, opened_at: new Date(now).toISOString() }]));
+  writeFileSync(file, JSON.stringify([{ session_id: "grok-t583", pid: exitedPid(), cwd: home, opened_at: new Date(now).toISOString() }]));
   const day = join(home, "sessions", "2026", "10", "17");
   mkdirSync(day, { recursive: true });
   const path = join(day, `rollout-2026-10-17T12-00-00-${THREAD}.jsonl`);
