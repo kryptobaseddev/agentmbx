@@ -454,7 +454,7 @@ const RATCHET: Record<string, { max: number; category: Category; why: string }> 
   "src/store.ts": { max: 3, category: "schema", why: "triggers and the legacy visibility backfill" },
   "src/stranded.ts": { max: 3, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "established-name gated; a slot is recognised, not claimed" },
   "src/sync-daemon.ts": { max: 2, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "cloud read model" },
-  "src/wake.ts": { max: 5, category: "slot-aware (maps a project slot to its lead; test/wake-project-mail.test.ts)", why: "the dispatcher keys a slot row to the project's current lead (T557) and operates on the row's own mailbox; reconcile works per (message, mailbox) pair; T679 keepCodexNotice reads one row by (msg_id, agent) to decide whether an owned Codex queue notice is still due" },
+  "src/wake.ts": { max: 8, category: "slot-aware (maps a project slot to its lead; test/wake-project-mail.test.ts)", why: "the dispatcher keys a slot row to the project's current lead (T557) and operates on the row's own mailbox; reconcile works per (message, mailbox) pair; T679 keepCodexNotice reads one row by (msg_id, agent) to decide whether an owned Codex queue notice is still due; T667 noteWatchReported/requeueWatchReported read and requeue one row by (msg_id, agent), never enumerate names" },
 };
 
 test("T493 ratchet: every query over deliveries is classified, so a new one cannot silently list a project mailbox slot", () => {
