@@ -1416,18 +1416,34 @@ const postToolSteady = (sid: string): boolean => {
  *  admitted through the hosting serve's session API. A failure never surfaces. The same call starts
  *  the standalone wake poll once the session id is known. */
 const call = async (ctx: NoteCtx, bin: string[], event: string, payload: Record<string, unknown>, pending: Map<string, string>, sending: Set<string>,
-  place?: (text: string) => boolean): Promise<void> => {
+  resumeTold: Set<string>, place?: (text: string) => boolean): Promise<void> => {
   try {
     const sid = typeof payload.session_id === "string" ? payload.session_id : null;
+    // Captured before this hook marks or ends the turn, so the first tool of a turn can still admit
+    // and a turn that is already running cannot.
+    const since = sid ? turnSince.get(sid) : undefined;
+    const turnOpen = since !== undefined && Date.now() - since < TURN_STALE_MS;
     if (sid) watchWake(ctx, sid);
     if (sid && event === "post-tool") markTurn(sid);
     if (sid && event === "stop") endTurn(sid);
     if (sid && (event === "post-tool" || event === "stop")) await releaseStartNote(ctx, sid, event, place);
     // T187: retry an unadmitted notice on an existing hook, without bypassing the zero-spawn fast path.
+    // A turn already running, or a host with no session note API, keeps the note and says so once.
+    const sayResumeFallback = (session: string, text: string) => {
+      const key = session + "\\0" + text;
+      if (resumeTold.has(key)) return;
+      resumeTold.add(key);
+      const line = "[mbx] Resume note was not admitted. Call mbx_whoami, then mbx_inbox. Mail is unchanged.";
+      if (!(place && place(line))) logWake("resume", session, "not admitted; mail unchanged");
+    };
     const deliver = async () => {
       if (!sid || sending.has(sid)) return;
       const text = pending.get(sid);
       if (!text) return;
+      if (turnOpen && event !== "stop") { sayResumeFallback(sid, text); return; }
+      if (event === "post-tool" && place && place(text)) { if (pending.get(sid) === text) pending.delete(sid); return; }
+      const api = typeof ctx?.session?.synthetic === "function" || typeof ctx?.session?.prompt === "function";
+      if (!api) { sayResumeFallback(sid, text); return; }
       sending.add(sid);
       try { if (await inject(ctx, sid, "resume-entry", text) && pending.get(sid) === text) pending.delete(sid); }
       finally { sending.delete(sid); }
@@ -1455,8 +1471,8 @@ const call = async (ctx: NoteCtx, bin: string[], event: string, payload: Record<
 };
 
 const runFor = (ctx: NoteCtx, bin: string[], cwd: string | undefined) => {
-  const pending = new Map<string, string>(), sending = new Set<string>();
-  return (event: string, payload: Record<string, unknown>, place?: (text: string) => boolean) => call(ctx, bin, event, { cwd, ...payload }, pending, sending, place);
+  const pending = new Map<string, string>(), sending = new Set<string>(), resumeTold = new Set<string>();
+  return (event: string, payload: Record<string, unknown>, place?: (text: string) => boolean) => call(ctx, bin, event, { cwd, ...payload }, pending, sending, resumeTold, place);
 };
 
 const sidOf = (v: unknown): string | undefined => {
