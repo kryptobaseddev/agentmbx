@@ -43,12 +43,19 @@ detection/wiring remains a separate boundary. An arbitrary MCP client can wire
 |---|---|---|---|
 | Claude Code | MCP; SessionStart, UserPromptSubmit, PermissionRequest, Stop, PostToolUse, SessionEnd | Its own MCP server sends a no-body hint through the per-session messaging socket; optional `agentmbx claude` channel launcher | Socket/channel support and exact-session binding; historical macOS/Linux receipts aren't proof of every current frontend |
 | Codex | MCP; SessionStart, UserPromptSubmit, PermissionRequest, Stop | `codex app-server` experimental `thread/queue/add`, `thread/queue/list`, and `thread/queue/delete`; tracks owned notices and withdraws them after read/ack, release, or handover while still queued; unowned items are preserved | Requires a Codex build with the experimental queue API and hooks. Consumed notices cannot be recalled. Startup, same-thread resume, and new-thread isolation are separate live gates |
-| OpenCode | MCP; plugin session-created, post-tool, and idle hooks; sidebar plugin | Service sessions use their API; standalone sessions use their own plugin/loopback queue | Standalone in-process admission doesn't prove an idle model turn. Shared-service permission coverage doesn't establish standalone coverage |
+| OpenCode | MCP; plugin session-created, post-tool, and idle hooks; sidebar plugin | Service sessions use their API; standalone sessions use their own plugin/loopback queue. Both daemon wake paths use `resume: true` (T544) | An idle standalone turn was observed with T544; a receipt alone still doesn't prove model execution. Shared-service permission coverage doesn't establish standalone coverage |
 | Kimi terminal | MCP, skill, SessionStart/UserPromptSubmit/PermissionRequest/Stop hooks | One background `agentmbx watch` task exits with a hint and starts the next turn | Re-arm the watcher after handling mail. `MBX_SELF_WATCH` opts into a periodic self-check. Terminal permission hooks can't approve prompts |
 | Kimi web/rc/desktop | MCP and hosted-session hooks; one-time conversation bind ticket | Web prompts API or desktop control socket | Restart a hosted server started before setup; verify the current exact conversation. Approval API coverage applies to hosted sessions |
 | Hermes terminal/TUI | MCP; `on_session_start` and `pre_llm_call` shell hooks with exact hook approvals | Background `agentmbx watch` task with completion notifications | Re-arm after each wake. Hooks load at session start; a shared gateway/desktop host isn't covered. No Hermes permission-approval adapter is claimed |
 | Grok | MCP, status line, SessionStart/UserPromptSubmit/PostToolUse/Stop hooks | Background `agentmbx watch --cli grok --session <id>` | Re-arm each completion; verify exact session ID and provider background-task notification |
 | Other MCP clients | Manual MCP configuration | Desktop notification fallback | No automatic model turn or permission adapter implied |
+
+For long-lived OpenCode agents, prefer plain `opencode` against the shared service, started once with
+`opencode service start`: one service per machine, not per project. After MCP eviction, standalone
+bindings remain wakeable while their plugin polls the local daemon (T659); service-hosted bindings
+remain wakeable while their recorded service process lives (T688). Both paths verify the recorded PID
+and process birth, and refuse an old binding when a different session holds the mailbox lease.
+See [OpenCode run modes and eviction recovery](OPENCODE.md#after-opencode-evicts-the-sessions-mcp).
 
 Setup preserves other tools' hook groups, backs up files before editing, and
 uninstall removes AgentMBX-owned entries. Modified/foreign configuration can
