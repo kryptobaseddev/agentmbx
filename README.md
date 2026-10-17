@@ -148,12 +148,19 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
   | CLI | Wake path | Status |
   |---|---|---|
   | Codex | `codex app-server` experimental `thread/queue/add`, `thread/queue/list`, and `thread/queue/delete`; AgentMBX tracks its owned notice and withdraws it after read/ack, release, or handover while still queued, preserving unowned items | requires a Codex build with the experimental queue API; historical live receipts |
-  | OpenCode | service-hosted session: the local service's session API (`/synthetic`). `--standalone` session: the plugin inside that session's own serve, over a loopback queue (see [OPENCODE.md](docs/OPENCODE.md)) | historical service-path live receipts; standalone wakes are admitted in-process, whether one starts a turn on an idle session is unproven (T544) |
+  | OpenCode | service-hosted session: the local service's session API (`/synthetic`, `resume: true`). `--standalone` session: its own plugin/loopback queue, also `resume: true` (T544; see [OPENCODE.md](docs/OPENCODE.md)) | recorded service-path live receipts and an idle standalone turn (T544); admission alone does not prove model execution |
   | Claude Code | pushed by the session's own mbx MCP server through Claude Code's per-session inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`), so a plainly started `claude` wakes on mail with no flag, setting or cron; `agentmbx claude [args]` adds the research-preview mbx channel instead | historical macOS/Fedora live receipts |
   | Kimi | desktop app: its local control socket (setup installs an AgentMBX plugin into the app). `kimi web`: the local server's prompts API. Terminal: a background `agentmbx watch` task the session keeps running (Kimi starts a turn when it exits) | historical terminal/desktop/web live receipts |
   | Hermes | one background `agentmbx watch` task with completion notification; shell hooks bind the session and add inbox context before model calls | watcher requires re-arming after each wake; shared gateway hosts aren't covered |
   | Grok | a background `agentmbx watch --cli grok --session <id>` task; exact session hooks | watcher requires re-arming after each wake |
   | anything else | desktop notification | no automatic model turn implied |
+
+  For long-lived OpenCode agents, run plain `opencode` against the shared service, started once with
+  `opencode service start`: one service per machine, with each session keeping its own project folder.
+  After OpenCode evicts an idle session's MCP, standalone wakes remain available while that serve's plugin
+  polls the local daemon (T659); service-hosted wakes remain available while the recorded service process
+  is alive (T688). Both paths require the recorded PID and process birth, and a lease held by a different
+  session blocks the old binding. See [the run-mode and eviction guide](docs/OPENCODE.md#after-opencode-evicts-the-sessions-mcp).
 
 - **Across machines:** a small daemon per host. Hosts pair with one command each: `agentmbx pair` prints a one-time token, `agentmbx join <host> <token>` on the other machine finishes it (or compare a 6-digit code instead). Hosts find each other on the LAN over mDNS. Every hop is signed. Messages to a sleeping machine wait in an outbox and retry for 72 h, and each is stored exactly once.
 - **Wake batching:** one atomic 30-second window per agent, plus explicit wake mute. Status messages never wake anyone. The published runtime has no hourly per-thread or daily per-agent hard cap; loop detection is observational, so batching alone doesn't bound an automated conversation's token use.

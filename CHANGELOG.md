@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **Skill relay-depth guidance matches policy enforcement (T696).** The skill now says ask allows 6 hops and collaborate, autonomous and yolo have no limit. A regression test checks the documented limits against `LEVEL_MAX_HOP`.
+- **OpenCode wake documentation matches the shipped adapters (T697).** README and portability guidance describe standalone `resume: true` wakes, one shared service per machine for long-lived agents, and standalone/service-hosted recovery after MCP eviction (T659/T688).
 
 ## 0.5.47 (2026-10-16)
 
