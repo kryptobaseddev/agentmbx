@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { kimiHostedServer, type KimiServer } from "./kimi-web.ts";
 import { desktopRpc, kimiDesktop, RpcError, type KimiDesktop } from "./kimi-desktop.ts";
-import { GROK_NO_PUSH, MbxNode, trustLabel } from "./node.ts";
+import { GROK_NO_PUSH, MbxNode, trustLabel, WAKE_LIMITS } from "./node.ts";
 import { captureWakeIdentity } from "./wake-identity.ts";
 import { policyBrief } from "./policy.ts";
 import { ulid } from "./crypto.ts";
@@ -158,6 +158,69 @@ export function noteQueuedBehindTurn(store: Store, agent: string, messageIds: re
 /** When this message's wake was admitted behind `agent`'s running turn, else null. */
 export function queuedBehindTurnAt(store: Store, agent: string, messageId: string): string | null {
   try { return (JSON.parse(store.get(behindTurnKey(agent)) ?? "{}") as Record<string, string>)[messageId] ?? null; } catch { return null; }
+}
+
+// ---- T667: a watcher-exit hint dropped mid-turn --------------------------------------------------
+/** T667: the watcher printed a wake hint naming these deliveries. Observation is unconfirmed: the harness
+ *  drops a background-task completion that lands mid-turn. If nothing ever surfaces the mail, the daemon
+ *  requeues it once (requeueWatchReported); the Stop hook reconciles the marker for mail a turn surfaced. */
+export const watchReportedKey = (mailbox: string) => `watch-reported:${mailbox}`;
+const WATCH_REPORTED_CAP = 100;
+export function noteWatchReported(store: Store, mailbox: string, ids: readonly string[], at = new Date().toISOString()): void {
+  let map: Record<string, string> = {};
+  try { map = JSON.parse(store.get(watchReportedKey(mailbox)) ?? "{}") as Record<string, string>; } catch { map = {}; }
+  for (const id of ids) { delete map[id]; map[id] = at; }
+  const keys = Object.keys(map);
+  for (const id of keys.slice(0, Math.max(0, keys.length - WATCH_REPORTED_CAP))) delete map[id];
+  store.set(watchReportedKey(mailbox), JSON.stringify(map));
+}
+/** Drop marker ids a turn surfaced (the Stop continuation takes them) or that are no longer unread. */
+export function reconcileWatchReported(node: MbxNode, agent: string, surfacedIds: readonly string[]): void {
+  const key = watchReportedKey(agent), drop = new Set(surfacedIds);
+  let map: Record<string, string> = {};
+  try { map = JSON.parse(node.store.get(key) ?? "{}") as Record<string, string>; } catch { return; }
+  const state = node.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=? AND agent=?");
+  let changed = false;
+  for (const id of Object.keys(map)) {
+    const row = state.get(id, agent) as { state: string } | undefined;
+    if (drop.has(id) || !row || row.state === "read" || row.state === "acked" || row.state === "delivered") { delete map[id]; changed = true; }
+  }
+  if (!changed) return;
+  if (Object.keys(map).length) node.store.set(key, JSON.stringify(map));
+  else node.store.db.prepare("DELETE FROM kv WHERE k=?").run(key);
+}
+/** One re-drive per message: a watcher-reported delivery nothing surfaced goes back to 'delivered' once,
+ *  so the normal dispatch checks (brake, mute, liveWatcher, wantsWake) drive it again instead of leaving it
+ *  stranded as 'notified' after the dropped exit. Gated so the usual surfaces never double-fire: a live
+ *  watcher re-reports delivered mail itself, a mute forbids hints and notices, and the wake brake paces the
+ *  requeue past the batching window the watcher's own exit spent. Exactly once: the id leaves the marker
+ *  with the requeue, so a handled (read/acked) message is never woken again. */
+export function requeueWatchReported(node: MbxNode, now = Date.now()): void {
+  const since = new Date(now - WAKE_LIMITS.perAgentSeconds * 1000).toISOString();
+  for (const { k, v } of node.store.db.prepare("SELECT k, v FROM kv WHERE k GLOB 'watch-reported:*'").all() as { k: string; v: string }[]) {
+    const mailbox = k.slice(watchReportedKey("").length);
+    let map: Record<string, string> = {};
+    try { map = JSON.parse(v) as Record<string, string>; } catch { node.store.db.prepare("DELETE FROM kv WHERE k=?").run(k); continue; }
+    if (liveWatcher(node, mailbox, now)) continue; // the watcher chain re-reports delivered mail itself
+    if (wakeMutedUntil(node, mailbox, now)) continue; // no hint and no notice until the mute ends; stays marked
+    if ((node.store.db.prepare("SELECT count(*) n FROM wakes WHERE agent=? AND at>?").get(mailbox, since) as { n: number }).n) continue; // the brake paces the requeue
+    const delivery = node.store.db.prepare("SELECT state, note FROM deliveries WHERE msg_id=? AND agent=?");
+    const requeued: string[] = [];
+    node.store.tx(() => {
+      for (const id of Object.keys(map)) {
+        const d = delivery.get(id, mailbox) as { state: string; note: string | null } | undefined;
+        if (!d || d.state === "read" || d.state === "acked" || d.state === "delivered") { delete map[id]; continue; }
+        if (d.state === "notified" && d.note === null) {
+          node.store.db.prepare("UPDATE deliveries SET state='delivered', note=NULL, updated_at=? WHERE msg_id=? AND agent=?").run(new Date(now).toISOString(), id, mailbox);
+          requeued.push(id);
+          delete map[id];
+        }
+      }
+      if (Object.keys(map).length) node.store.set(k, JSON.stringify(map));
+      else node.store.db.prepare("DELETE FROM kv WHERE k=?").run(k);
+    });
+    if (requeued.length) node.store.audit("wake.reenqueue", { agent: mailbox, ids: requeued.join(","), count: requeued.length });
+  }
 }
 
 /** T524: why a session that the shared service does not host is never pushed through it. */
@@ -475,6 +538,7 @@ function noticeAllowed(node: MbxNode, agent: string, now: number): boolean {
 export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ agent: string; result: WakeResult | { ok: false; via: "brake"; error: string } }[]> {
   const codexBlocked = await reconcileCodexQueue(node.store, CODEX(), p => keepCodexNotice(node, p));
   reconcileWakes(node, now);
+  requeueWatchReported(node, now); // T667: a watcher-exit hint dropped mid-turn leaves mail 'notified'; requeue it once
   // T557: a project mailbox slot has no session of its own. Its mail is woken for the project's CURRENT lead on this host (the subject: whose
   // session, policy, mute and batching window apply) while every delivery operation stays on the slot (the row's own mailbox, r.agent).
   // A slot with no such lead (unallocated, none designated, designated elsewhere, expired, revoked) is left alone: it stays delivered.
