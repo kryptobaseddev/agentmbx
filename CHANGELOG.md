@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **An OpenCode v2 resume note reaches the model instead of being silently dropped (T700).** OpenCode 2.x drives the plugin's default `setup(ctx)` path. It marks a turn at `session.execution.started`, before the first tool, so the busy-turn guard treated every tool as mid-turn and the revisit notice could only fall back; at the turn's end the plugin admitted it with `resume:false`, whose `msg_` receipt can arrive without any `session_message` (T544), and then discarded the pending copy. The first tool of a turn now places the note even after the v2 start event, and a kept note is only dropped after it actually lands in a tool result: a stop no longer acknowledges a receipt as delivery, and `resume:true` is not used because starting a turn on an idle TUI is not a resume note's job. A fresh conversation's start note keeps its queued admission, which the host materialises as the conversation begins.
+
 ## 0.5.48 (2026-10-17)
 
 - **Claude SessionStart fork keeps the parent row, and a live holder is named without a takeover suggestion (T185).** A `source: fork` start skips bind and the parent-row delete and prints only the mailbox-context fallback. A session whose name is held live by another session prints that `held by live` reason and does not suggest takeover.

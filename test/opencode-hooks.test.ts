@@ -244,16 +244,19 @@ test("T187: failed admission retries on the next hook without another node spawn
   try {
     const hooks = await mod.AgentMBXHooks({ directory: "/work", session: { synthetic: async (body: Note) => {
       notes.push(body); if (!ready) throw new Error("not admitted"); return body;
-    } } }) as { event: (event: unknown) => Promise<void>; "tool.execute.after": (event: unknown) => Promise<void> };
+    } } }) as { event: (event: unknown) => Promise<void>; "tool.execute.after": (event: unknown, output?: { output?: string }) => Promise<void> };
     await hooks.event({ event: { type: "session.created", properties: { info: { id: "ses_retry" } } } });
     assert.equal(notes.length, 1); ready = true;
     await hooks["tool.execute.after"]({ sessionID: "ses_sibling" });
     assert.equal(notes.length, 1, "sibling never receives or drains another entry");
-    await hooks["tool.execute.after"]({ sessionID: "ses_retry" });
-    assert.equal(notes.length, 2); assert.equal(notes[0].id, notes[1].id);
-    assert.ok(notes.every(note => note.sessionID === "ses_retry" && note.resume === false));
-    await hooks["tool.execute.after"]({ sessionID: "ses_retry" });
-    assert.equal(notes.length, 2, "admitted entry is removed from pending");
+    // T700: a failed admission is not retried through the session API. The kept note rides the next turn's first
+    // tool result, which is the only admission the model can be proven to have seen.
+    const first = { output: "tool ok" };
+    await hooks["tool.execute.after"]({ sessionID: "ses_retry" }, first);
+    assert.match(first.output, /worker@alpha: mbx_catchup/);
+    assert.equal(notes.length, 1, "the tool result is the admission; no second synthetic attempt");
+    await hooks["tool.execute.after"]({ sessionID: "ses_retry" }, { output: "next" });
+    assert.equal(notes.length, 1, "a placed entry is removed from pending");
     assert.equal(calls.filter(c => c.args[1] === "session-start").length, 1);
     assert.equal(calls.filter(c => c.args[1] === "post-tool" && c.input.session_id === "ses_retry").length, 0, "steady retries don't spawn node");
   } finally {
@@ -286,12 +289,16 @@ test("T187: a resolved native call with no receipt remains pending instead of cl
   try {
     const hooks = await mod.AgentMBXHooks({ directory: "/work", session: { synthetic: async (body: Note) => {
       notes.push(body); return ++attempts === 1 ? {} : { data: { id: body.id } };
-    } } }) as { event: (event: unknown) => Promise<void>; "tool.execute.after": (event: unknown) => Promise<void> };
+    } } }) as { event: (event: unknown) => Promise<void>; "tool.execute.after": (event: unknown, output?: { output?: string }) => Promise<void> };
     await hooks.event({ event: { type: "session.created", properties: { info: { id: "ses_no_receipt" } } } });
-    await hooks["tool.execute.after"]({ sessionID: "ses_no_receipt" });
-    assert.equal(notes.length, 2); assert.equal(notes[0].id, notes[1].id);
-    await hooks["tool.execute.after"]({ sessionID: "ses_no_receipt" });
-    assert.equal(notes.length, 2, "recognized data.id closes only the pending admission, not work completion");
+    // T700: the no-receipt call did not prove admission, so the note stays pending; the next turn's first tool
+    // result carries it, and no further synthetic attempt is made.
+    const first = { output: "tool ok" };
+    await hooks["tool.execute.after"]({ sessionID: "ses_no_receipt" }, first);
+    assert.match(first.output, /worker@alpha: mbx_catchup/);
+    assert.equal(notes.length, 1, "the session API was not asked again");
+    await hooks["tool.execute.after"]({ sessionID: "ses_no_receipt" }, { output: "next" });
+    assert.equal(notes.length, 1, "a placed entry is removed from pending");
   } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
 });
 
