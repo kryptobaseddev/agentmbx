@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Service-hosted OpenCode sessions stay wakeable after MCP eviction (T688).** OpenCode stops an idle session's MCP about hourly, which releases its lease. T659 kept standalone sessions wakeable through their plugin's poll; a session hosted by the shared `opencode serve --service` is now a wake target too while that service process (same pid and birth) lives, and the wake posts to the service with `resume: true` and a verified receipt. A lease held by another session of the agent still blocks it. docs/OPENCODE.md recommends plain `opencode` (one service per machine, every project) for long-lived agents.
+
 ## 0.5.46 (2026-10-16)
 
 - **Published docs match current setup and wakes (T684).** The npm package includes the linked security policy. README and portability docs describe Codex's experimental app-server queue API and owned-notice withdrawal, setup help includes Grok and daemon selectors, and README scopes doctor's checks and explains how to confirm mbx in a Kimi desktop conversation.
