@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Silent Codex turns keep their mailbox identity (T677).** The existing MCP heartbeat records activity while the exact thread's rollout has an unmatched turn start, even when it has no new writes or mbx calls. Matching completion or turn-end records stop that protection; missing, unreadable or rotated evidence falls back to rollout mtime. Lease token, thread and process-birth fences remain in force. An abandoned open turn can conservatively retain a live holder until recovery.
+
 ## 0.5.47 (2026-10-16)
 
 - **Service-hosted OpenCode sessions stay wakeable after MCP eviction (T688).** OpenCode stops an idle session's MCP about hourly, which releases its lease. T659 kept standalone sessions wakeable through their plugin's poll; a session hosted by the shared `opencode serve --service` is now a wake target too while that service process (same pid and birth) lives, and the wake posts to the service with `resume: true` and a verified receipt. A lease held by another session of the agent still blocks it. docs/OPENCODE.md recommends plain `opencode` (one service per machine, every project) for long-lived agents.
