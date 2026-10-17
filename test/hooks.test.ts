@@ -1,7 +1,7 @@
 import { sendLeased } from "./helpers/leased-send.ts";
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -16,6 +16,7 @@ import { MbxNode } from "../src/node.ts";
 import { IdentityLeases } from "../src/identity-leases.ts";
 import { applyForward, buildForward } from "../src/identity-cleanup.ts";
 import { RESUME_NOTICE_MAX_CHARS, RESUME_NOTICE_MAX_LINES } from "../src/resume-notice.ts";
+import { bindWakeLease } from "./helpers/wake-lease.ts";
 
 for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli} startup offers recovery choices without claiming historical mail`, t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-startup-choice-")), node = new MbxNode(home, { host: "alpha" });
@@ -400,6 +401,7 @@ test("lean notices: a wake prompt adds no second notice, and the policy recap is
 // ---- T185: Claude SessionStart carries the bounded resume notice (spec t184-provider-resume-adapters, Claude section) ----
 const additional = (stdout: string): string => stdout ? (JSON.parse(stdout) as { hookSpecificOutput: { additionalContext: string } }).hookSpecificOutput.additionalContext : "";
 const hinted = (s: string) => (s.match(/not caught up on; call mbx_catchup/g) ?? []).length;
+const FORK_FALLBACK = "[mbx] Mailbox context could not be restored. Call mbx_whoami, then mbx_catchup.";
 
 test("T185: every Claude SessionStart source but fork is an entry with one bounded notice; prompts after it add none; nothing moves", async t => {
   const { n, agent, run, send } = await holder(t, "claude");
@@ -428,9 +430,55 @@ test("T185: every Claude SessionStart source but fork is an entry with one bound
   assert.equal(hinted(prompt("after-clear")), 0);
   assert.equal(hinted(start("first", "resume")), 1, "/resume back to an earlier conversation");
   const fork = start("forked", "fork");
-  assert.equal(hinted(fork), 0, "fork is unsupported (D4/C2): no notice"); assert.match(fork, /You are builder@alpha/);
+  assert.equal(fork, FORK_FALLBACK, "fork prints silence plus the MCP fallback");
+  assert.equal(hinted(fork), 0);
+  assert.doesNotMatch(fork, /You are |takeover/i);
   assert.equal(hinted(prompt("forked")), 0, "and none is deferred to its first prompt");
   assert.equal(state(), before, "no delivery state, checkpoint or lease moved");
+});
+
+test("T185: a Claude fork leaves the parent session row and prints the MCP fallback", async t => {
+  const { n, run } = await holder(t, "claude");
+  assert.equal(run("prompt", "parent", "claude", {}, { prompt: "bind the parent" }).status, 0);
+  const rows = () => n.store.db.prepare("SELECT agent,cli,session_id,pid,session_key FROM sessions ORDER BY cli,session_id").all() as { agent: string; cli: string; session_id: string; pid: number | null; session_key: string | null }[];
+  const leases = () => n.store.db.prepare("SELECT name,cli,session_id,released_at,token FROM identity_leases ORDER BY name").all();
+  const before = rows(), leaseBefore = leases();
+  assert.deepEqual(before.map((r) => r.session_id), ["parent"]);
+  const r = run("session-start", "child", "claude", {}, { source: "fork" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(rows(), before, "fork leaves the sessions table and the parent row untouched");
+  assert.deepEqual(leases(), leaseBefore);
+  const context = additional(r.stdout);
+  assert.equal(context, FORK_FALLBACK);
+  assert.equal(hinted(context), 0);
+  assert.doesNotMatch(context, /You are |takeover/i);
+  assert.equal(hinted(additional(run("prompt", "child", "claude", {}, { prompt: "go on" }).stdout)), 0);
+});
+
+test("T185: a Claude SessionStart held live by another session names that holder and does not suggest takeover", t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-t185-busy-"));
+  const n = new MbxNode(home, { host: "alpha" });
+  const holderProc = spawn("sleep", ["600"], { stdio: "ignore" });
+  t.after(() => { holderProc.kill("SIGKILL"); n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  assert.ok(holderProc.pid);
+  bindWakeLease(n, { agent: "builder", cli: "claude", session_id: "holder-session", pid: holderProc.pid });
+  n.keepName("claude", "busy-session", "builder");
+  sendLeased(n, { from: "sender", to: ["builder"], subject: "PRIVATE SUBJECT", body: "SECRET BODY", kind: "request" });
+  const rows = () => n.store.db.prepare("SELECT agent,cli,session_id,pid,session_key FROM sessions ORDER BY cli,session_id").all();
+  const leases = () => n.store.db.prepare("SELECT name,cli,session_id,released_at,token FROM identity_leases ORDER BY name").all();
+  const deliveries = () => n.store.db.prepare("SELECT msg_id,agent,state FROM deliveries ORDER BY msg_id").all();
+  const before = { rows: rows(), leases: leases(), deliveries: deliveries() };
+  const r = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", "session-start", "--cli", "claude"], {
+    input: JSON.stringify({ session_id: "busy-session", cwd: process.cwd(), source: "startup" }), encoding: "utf8", timeout: 10_000,
+    env: { ...process.env, MBX_HOME: home, MBX_AGENT: "unrelated", AGENTMBX_DEV: "1" },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual({ rows: rows(), leases: leases(), deliveries: deliveries() }, before);
+  const context = additional(r.stdout);
+  assert.match(context, /held by live claude session holder-session/);
+  assert.doesNotMatch(context, /takeover/i);
+  assert.equal(hinted(context), 0);
+  assert.doesNotMatch(context, /You are |PRIVATE SUBJECT|SECRET BODY|no mailbox identity yet/);
 });
 
 test("T185: an unbound Claude SessionStart defers the notice to the first bound prompt, once; Codex SessionStart is unchanged", async t => {
