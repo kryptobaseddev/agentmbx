@@ -250,7 +250,7 @@ wake only queues a short pointer to the inbox; it never means the recipient read
 - Check the receipt's `recipients[].state` (`live-wake` or `live-next-prompt`) rather than assuming the send woke anyone.
 
 Relay depth counts only what you read from agents other than the recipients: answering the agent you heard from never
-adds depth, forwarding to someone else does (ask allows 6, collaborate 20, autonomous/yolo no limit; the policy line shows it).
+adds depth, forwarding to someone else does (ask 6, collaborate no limit, autonomous no limit, yolo no limit; the policy line shows it).
 
 ## Autonomy probes (`[mbx-probe]`)
 
