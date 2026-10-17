@@ -1,77 +1,64 @@
 // Send-time recipient truth (T205): who a message actually reached, decided when it is sent, so a sender never mistakes
-// "stored in a mailbox" for "an agent will see it". Liveness comes from the identity lease and its existing process
-// evidence. Native push eligibility uses the dispatcher's exact lease/binding guard.
-import { IdentityLeases, identityLeaseStatus } from "./identity-leases.js";
+// "stored in a mailbox" for "an agent will see it". Liveness is one answer from liveness.ts (T699): the lease, the
+// session binding and the serve kind together. Native push eligibility uses the dispatcher's exact lease/binding guard.
+import { identityLeaseStatus, inspectLeaseProcess } from "./identity-leases.js";
+import { agentLiveness } from "./liveness.js";
 import { GROK_NO_PUSH } from "./node.js";
 import {} from "./store.js";
 import { hasWakeAuthority, liveWatcher, queuedBehindTurnAt, watcherKey } from "./wake.js";
 import { captureWakeIdentity } from "./wake-identity.js";
-import { procTable } from "./proc.js";
 import { activityKey, parseActivity, SHARED_IDLE_MS } from "./identity-availability.js";
 import { connectorKey, retryErrorClass } from "./diagnostics.js";
 import { remoteReceipts } from "./remote-receipts.js";
 import { isSlotName } from "./project-slot.js";
 import { projectLabel, projectMailboxBySlot, projectReader } from "./project-mailbox.js";
 import { peerProjectBySlot } from "./project-directory.js";
-/** A holder renews its lease every minute; three missed beats mean its session is suspended or gone. */
-const STALE_HEARTBEAT_MS = 3 * 60_000;
 const iso = (ms) => new Date(ms).toISOString();
-/** Is a session holding `name` right now? Unknown process evidence with a fresh heartbeat counts as live (it is the
- *  lease's own rule for "unknown"); everything else says since when and who held it last. */
-export function mailboxLiveness(node, name, now = Date.now()) {
+/** A holder renews its lease every minute; three missed beats mean its session is suspended or gone. Receipts are
+ *  stricter than the 30-minute lease idle TTL: mail nobody is polling should read as undelivered sooner (T204). */
+const STALE_HEARTBEAT_MS = 3 * 60_000;
+/** Is a session holding `name` right now — or still there with its lease released? One answer from liveness.ts
+ *  (T699), so a receipt cannot call a wakeable session "offline" while the agent list calls it "live". */
+export function mailboxLiveness(node, name, now = Date.now(), o = {}) {
     if (isSlotName(name)) {
         // T493: a project mailbox has no holder of its own. Its reader is the project's current lead, so it is live exactly when that lead is.
         const reader = projectReader(node, name, new Date(now));
         if (!reader)
-            return { live: false, detail: "this project mailbox is not allocated on this host" };
+            return { live: false, state: "offline", reason: "this project mailbox is not allocated on this host", detail: "this project mailbox is not allocated on this host" };
         const label = `project mailbox ${projectLabel(reader.mailbox)}`;
-        if (!reader.lead)
-            return { live: false, detail: `${label}: no owner-designated lead on ${node.host} to read it` };
-        const lead = mailboxLiveness(node, reader.lead.agent, now);
-        return { live: lead.live, detail: `${label}, read by its lead ${reader.lead.agent}: ${lead.detail}` };
+        if (!reader.lead) {
+            const reason = `${label}: no owner-designated lead on ${node.host} to read it`;
+            return { live: false, state: "offline", reason, detail: reason };
+        }
+        const lead = mailboxLiveness(node, reader.lead.agent, now, o);
+        return { ...lead, detail: `${label}, read by its lead ${reader.lead.agent}: ${lead.detail}` };
     }
+    const l = agentLiveness(node, name, { now, ...(o.inspect ? { inspect: o.inspect } : {}) });
     const row = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(name);
+    if (l.state === "conflict")
+        return { live: false, state: "conflict", reason: l.reason, detail: l.reason };
     if (!row)
-        return { live: false, detail: "no session has ever held this mailbox; it is read when an agent claims it" };
-    let state = "unknown", reason = null;
-    try {
-        ({ state, reason } = identityLeaseStatus(row, now, new IdentityLeases(node.store).processEvidence(row.holder_pid)));
-    }
-    catch {
-        // Evidence can't be inspected inside a transaction: judge by the lease row, the process table snapshot taken before
-        // it (a vanished holder is gone) and the heartbeat, which a live holder renews every minute (T204 review).
-        const table = procTable();
-        if (row.released_at !== null || now - row.heartbeat_at >= row.idle_ttl) {
-            state = "expired";
-            reason = row.released_at !== null ? null : "idle";
-        }
-        else if (table.size && !table.has(row.holder_pid)) {
-            state = "expired";
-            reason = "dead";
-        }
-        else if (now - row.heartbeat_at >= STALE_HEARTBEAT_MS) {
-            state = "expired";
-            reason = `no heartbeat for ${Math.round((now - row.heartbeat_at) / 60_000)} min`;
-        }
-        // Its pid is running and it renewed within three minutes: as live as an advisory receipt can tell.
-        else if (table.has(row.holder_pid))
-            state = "live";
-    }
-    if ((state === "live" || state === "unknown") && now - row.heartbeat_at >= STALE_HEARTBEAT_MS) {
-        state = "expired";
-        reason = `no heartbeat for ${Math.round((now - row.heartbeat_at) / 60_000)} min`;
-    }
+        return { live: false, state: "offline", reason: l.reason, detail: "no session has ever held this mailbox; it is read when an agent claims it" };
     const holder = `${row.cli} session ${row.session_id.slice(0, 12)}`;
-    if (state === "live" || state === "unknown") {
-        const activity = parseActivity(node.store.get(activityKey(name)));
-        const quiet = activity?.shared && now - activity.at >= SHARED_IDLE_MS
-            ? `; its conversation has made no mbx call for ${Math.round((now - activity.at) / 60_000)} min and may have ended (no hook or wake-poll activity either)` : "";
-        return { live: true, detail: state === "live" ? `held by ${holder}${quiet}`
-                : `held by ${holder} (process unconfirmed, heartbeat ${Math.round((now - row.heartbeat_at) / 1000)} s ago)${quiet}` };
+    const silent = row.released_at === null && now - row.heartbeat_at >= STALE_HEARTBEAT_MS;
+    if (l.state === "offline" || silent) {
+        const status = row.released_at === null ? identityLeaseStatus(row, now, inspectLeaseProcess(row.holder_pid)) : null;
+        const why = row.release_reason ?? (silent ? `no heartbeat for ${Math.round((now - row.heartbeat_at) / 60_000)} min` : status?.reason ?? "released");
+        return { live: false, state: "offline", reason: l.reason,
+            detail: `no live session since ${iso(row.released_at ?? row.heartbeat_at)} (last holder ${holder}, ${why})` };
     }
-    const since = row.released_at ?? row.heartbeat_at;
-    const why = row.release_reason ?? reason ?? "released";
-    return { live: false, detail: `no live session since ${iso(since)} (last holder ${holder}, ${why})` };
+    const activity = parseActivity(node.store.get(activityKey(name)));
+    const quiet = activity?.shared ? now - activity.at : null;
+    const note = quiet !== null && quiet >= SHARED_IDLE_MS && (l.state === "live" || (l.state === "idle" && l.idleKind === "held"))
+        ? `; its conversation has made no mbx call for ${Math.round(quiet / 60_000)} min and may have ended (no hook or wake-poll activity either)` : "";
+    const detail = l.idleKind === "released" ? l.reason
+        : l.state === "unknown" ? `held by ${holder} (process unconfirmed, heartbeat ${Math.round((now - row.heartbeat_at) / 1000)} s ago)${note}`
+            : `held by ${holder}${note}`;
+    return {
+        live: true, state: l.state, reason: l.reason, detail,
+        ...(l.idleKind === "released" ? { released: true } : {}),
+        ...(l.wakeable !== undefined ? { wakeable: l.wakeable } : {}),
+    };
 }
 /** "addressed to the project mailbox X; " when `name` is a project slot that `host` advertises, else nothing (T493). */
 const projectBoxNote = (node, name, host) => {
@@ -117,6 +104,17 @@ export function recipientReceipts(node, msgId, targets, now = Date.now()) {
         else if (!live.live) {
             state = "offline";
             detail = live.detail;
+        }
+        else if (live.released) {
+            // T699: the lease was released (or expired) but the session still runs. That is idle, not offline: mail waits
+            // for its next turn, and a proven wake path (a shared service, or a registered poller) can start that turn.
+            const mode = node.deliveryMode(name);
+            const why = !m ? "message not found" : !node.wantsWake(name, m) ? "this kind does not wake (status, or no needs_reply/mention)"
+                : !live.wakeable ? "the session is running without a wake path proven from this process"
+                    : !hasWakeAuthority(node, name, m) ? "no owner policy lets this sender wake it" : null;
+            state = why ? "live-next-prompt" : "live-wake";
+            detail = why ? `${live.detail}; seen on its next prompt: ${why}`
+                : `${live.detail}; eligible for wake (${mode}); the turn re-claims the mailbox; dispatcher admission pending`;
         }
         else {
             const sessions = node.sessionsFor(name);
@@ -196,10 +194,10 @@ export function deliveryReceipts(node, m, now = Date.now()) {
     const dids = new Map(node.store.db.prepare("SELECT json_extract(detail,'$.recipient') r, json_extract(detail,'$.did') d FROM audit WHERE event='peer_action' AND json_extract(detail,'$.msg')=? ORDER BY at")
         .all(m.id).map((x) => [x.r, x.d]));
     const local = node.store.db.prepare("SELECT agent,state,updated_at,note FROM deliveries WHERE msg_id=? ORDER BY agent").all(m.id).map((d) => {
-        const live = d.agent === "owner" ? { live: true, detail: "the owner" } : mailboxLiveness(node, d.agent, now);
+        const live = d.agent === "owner" ? { live: true, state: "live", detail: "the owner" } : mailboxLiveness(node, d.agent, now);
         const behind = d.state === "delivered" || d.state === "notified" ? queuedBehindTurnAt(node.store, d.agent, m.id) : null;
         return { address: `${d.agent}@${node.host}`, state: d.state, updated_at: d.updated_at, note: d.note, did: dids.get(d.agent) ?? null,
-            liveness: live.live ? `live: ${live.detail}` : `offline: ${live.detail}`,
+            liveness: `${live.state}: ${live.detail}`,
             ...(behind ? { wake: `${OPENCODE_BEHIND_TURN_NOTE} (admitted ${behind.slice(0, 19)}Z)` } : {}) };
     });
     // Remote recipients: the envelope's addressees on other hosts; a queued outbox row means not yet accepted there.

@@ -114,8 +114,10 @@ export function rosterText(r) {
     const lines = r.agents.map((a) => {
         const led = a.lead_of.length ? `  LEAD of ${a.lead_of.map((p) => basename(p) || p).join(", ")}` : "";
         const cli = a.harness ?? a.cli;
+        // T699: an idle row now also covers a released lease whose session still runs; its reason is the point.
+        const reason = a.state === "idle" || a.state === "unknown" ? `  reason: ${oneLine(a.reason)}` : "";
         return `${a.address}  ${a.state}${led}${a.self ? "  (you)" : ""}${a.seen_here ? "  seen here (not a member)" : ""}${a.role ? `  role:${a.role}` : ""}${a.task ? `  task:${a.task}` : ""}${a.lane ? `  lane:${a.lane}` : ""}${cli ? `  (${cli})` : ""}`
-            + `  last seen ${a.last_seen ?? "never"}${a.description ? `  — ${oneLine(a.description)}` : ""}`;
+            + `  last seen ${a.last_seen ?? "never"}${a.description ? `  — ${oneLine(a.description)}` : ""}${reason}`;
     });
     const leadLine = !r.scope.project ? "lead: no project" : r.lead ? `lead: ${r.lead.address} until ${r.lead.exp}` : "lead: none";
     const hidden = r.scope.hidden ? `\n${r.scope.hidden} retired or generated name(s) hidden; pass all:true to list them.` : "";

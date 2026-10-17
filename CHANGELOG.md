@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **One liveness answer: a released lease whose session still runs is idle, not live and not offline (T699).** `agentmbx agents` read the session binding while `mbx_agents` and the send receipt read the identity lease, so an OpenCode MCP eviction released the lease and the surfaces disagreed for hours: the CLI said `live`, the receipt said `offline (released)`. A single `agentLiveness` answer (src/liveness.ts) now composes the lease, the live session row and the serve kind, and every surface uses it. A released or expired lease whose session still runs reads as `idle` with its reason (claimable, and wakeable when the T688 shared service or a registered T659 poller can start its next turn, which re-claims the mailbox). `agentmbx agents` prints that state plus a trailing reason column and keeps shell senders visible as `live`; `mbx_agents` and `mbx_identity list` follow; a send reports `live-next-prompt`/`live-wake` instead of `offline`. The 30-minute lease idle TTL and the receipt's 3-minute heartbeat rule are unchanged.
+
 ## 0.5.48 (2026-10-17)
 
 - **Claude SessionStart fork keeps the parent row, and a live holder is named without a takeover suggestion (T185).** A `source: fork` start skips bind and the parent-row delete and prints only the mailbox-context fallback. A session whose name is held live by another session prints that `held by live` reason and does not suggest takeover.
