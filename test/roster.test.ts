@@ -2,6 +2,7 @@
 // council set (no counts on a row, a role label is not the lead, a remote row is never presented as verified).
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,6 +21,9 @@ import { AGENTS_V1_SCHEMA, validateAgentsV1, type AgentsV1 } from "../src/status
 const PASS = "test-only-passphrase";
 const FIXTURE = JSON.parse(readFileSync(join(import.meta.dirname, "fixtures", "agents-v1.json"), "utf8")) as AgentsV1;
 const A = "/work/proj-a", B = "/work/proj-b", C = "/work/proj-c";
+/** A pid the OS has already reaped. T699 reads the real process table for a session row, so a low fabricated pid
+ *  can be EPERM-alive on CI; a reaped pid is deterministically dead. */
+const exitedPid = (): number => spawnSync(process.execPath, ["-e", ""]).pid!;
 
 function world(t: { after: (fn: () => unknown) => void }) {
   const home = mkdtempSync(join(tmpdir(), "mbx-roster-"));
@@ -257,6 +261,9 @@ test("T497: a live local row shows the session task and lane; a remote row leave
   w.hold("plain", { project: A, cwd: A });
   const gone = w.hold("was-on-task", { project: A, cwd: A });
   w.evidence.set(gone, { alive: false, start: null });
+  // T699: an expired holder whose session row still names a live process is idle (the T688 eviction case), so this
+  // fixture's session binding must be dead too for the row to be genuinely offline.
+  w.node.store.db.prepare("UPDATE sessions SET pid=? WHERE agent='was-on-task'").run(exitedPid());
   setSessionPresence(w.node, { cli: "claude", sessionId: "s-on-task", task: "T497", lane: "implementation" });
   setSessionPresence(w.node, { cli: "claude", sessionId: "s-was-on-task", task: "T497", lane: "implementation" });
   w.node.store.db.prepare("INSERT INTO agents (name,host,role) VALUES ('far-dev','beta','builder')").run();

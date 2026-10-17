@@ -42,6 +42,7 @@ import { dispatchWakes, hasWakeAuthority, humanPromptKey, inboxCommand, isHumanP
 import { kimiMultiHost } from "./kimi-web.ts";
 import { bindInstruction, issueBindTicket } from "./bind-ticket.ts";
 import { activityKey, identityAvailability, parseActivity } from "./identity-availability.ts";
+import { agentDirectoryStates } from "./liveness.ts";
 import { fillCleoPresence } from "./cleo-presence.ts";
 import { identityLeaseStatus, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
 import { AUTO_NAME_RE, identityProjects, linkedKey, projectOf, recordSessionHint, registeredIdentity, removeStaleProjectBindings, staleProjectBindings } from "./registry.ts";
@@ -860,8 +861,12 @@ async function run(argv: string[]) {
       });
     }
     case "agents": {
-      const live = node.liveAgents();
-      return node.agents().forEach((a) => console.log(`${a.name}@${a.host}\t${a.host === node.host ? (live.has(a.name) ? "live" : "offline") : "remote"}\t${a.role ?? ""}\t${a.cli ?? ""}\t${a.last_seen ?? ""}\t${a.description ?? ""}`));
+      // T699: the same liveness answer as mbx_agents and the send receipt, with its reason as a trailing column.
+      const states = agentDirectoryStates(node);
+      return node.agents().forEach((a) => {
+        const local = states.get(a.name);
+        return console.log(`${a.name}@${a.host}\t${a.host === node.host ? local?.state ?? "offline" : "remote"}\t${a.role ?? ""}\t${a.cli ?? ""}\t${a.last_seen ?? ""}\t${a.description ?? ""}\t${a.host === node.host ? local?.reason ?? "" : ""}`);
+      });
     }
     case "status": {
       if (o.json && str("schema") === STATUS_V2_SCHEMA) {

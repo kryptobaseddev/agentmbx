@@ -10,7 +10,7 @@
 // the service itself still hosts the session; wakeOpencode posts to it (and keeps T646's dual-host refusal). Nothing here reads or changes
 // mail: a wake carries ids only, and the session claims its identity again on the turn the wake starts.
 import { provenProcess, withProcSnapshot } from "./proc.ts";
-import { opencodeHostOf, type OpencodeHost } from "./opencode-provider.ts";
+import { opencodeHostClassifier, opencodeHostOf, type OpencodeHost } from "./opencode-provider.ts";
 import { opencodeWakeWaiting } from "./opencode-wake-queue.ts";
 import type { MbxNode } from "./node.ts";
 
@@ -56,6 +56,60 @@ const serviceBindingLive = (node: MbxNode, session: WakeSession, host: Hosts = o
  */
 export function pollerTargetLive(node: MbxNode, session: WakeSession, host: Hosts = opencodeHostOf): boolean {
   return serveBindingLive(node, session, host) && opencodeWakeWaiting(session.session_id, session.pid!);
+}
+
+/**
+ * T699: one bound session the dispatcher can still wake with no lease held. `kind` is the serve that hosts it;
+ * `wakeable` says a wake path is proven (a shared service needs no poller, T688; a standalone serve needs its
+ * plugin poll registered in THIS process, T659).
+ */
+export interface WakeBinding {
+  cli: string;
+  session_id: string;
+  pid: number;
+  kind: "service" | "standalone";
+  wakeable: boolean;
+  via: "service" | "standalone-poller" | null;
+}
+
+/** The session fields wake classification needs; a full session row is assignable to this. */
+export interface WakeRow {
+  agent: string; cli: string; session_id: string; pid: number | null; pid_start: string | null;
+}
+
+/**
+ * T699: the wake bindings behind many agents from one process snapshot (and one argv read with the batched host
+ * classifier), for the liveness surfaces. This is the same evidence `pollerWakeTargets` uses, without its run
+ * closures: display never takes mail or leases. A standalone poller registration is per-process, so a caller
+ * outside the daemon sees the binding (`kind`, `wakeable: false`) but cannot claim the wake path.
+ */
+export function wakeBindingsByAgent(
+  sessionsByAgent: ReadonlyMap<string, readonly WakeRow[]>,
+  host: Hosts = opencodeHostClassifier(),
+  waiting: (sessionID: string, pid: number) => boolean = opencodeWakeWaiting,
+): Map<string, WakeBinding> {
+  return withProcSnapshot(() => {
+    const out = new Map<string, WakeBinding>();
+    for (const [agent, sessions] of sessionsByAgent) {
+      let best: WakeBinding | null = null;
+      for (const s of sessions) {
+        if (s.agent !== agent || s.cli !== "opencode" || !s.pid || s.pid <= 1 || s.session_id.startsWith("mcp-")) continue;
+        // The recorded birth must still be that process: a reused pid must not inherit a row it never wrote.
+        if (!provenProcess(s.pid, s.pid_start)) continue;
+        const kind = host(s.pid);
+        if (kind !== "service" && kind !== "standalone") continue;
+        const polling = kind === "standalone" && waiting(s.session_id, s.pid);
+        const candidate: WakeBinding = kind === "service"
+          ? { cli: s.cli, session_id: s.session_id, pid: s.pid, kind, wakeable: true, via: "service" }
+          : { cli: s.cli, session_id: s.session_id, pid: s.pid, kind, wakeable: polling, via: polling ? "standalone-poller" : null };
+        // A service binding hosts every session of the service; prefer it over a standalone row of the same agent.
+        if (!best || candidate.kind === "service" || (candidate.wakeable && !best.wakeable)) best = candidate;
+        if (best.kind === "service") break;
+      }
+      if (best) out.set(agent, best);
+    }
+    return out;
+  });
 }
 
 /**

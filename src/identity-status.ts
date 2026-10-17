@@ -3,7 +3,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { inspectLeaseProcess, type IdentityLease, type ProcessEvidence } from "./identity-leases.ts";
-import { activityKey, holderProviderView, identityAvailability, parseActivity, parseProviderRecord, type LeaseActivity, type RecordedProvider } from "./identity-availability.ts";
+import { activityKey, holderProviderView, parseActivity, parseProviderRecord, type LeaseActivity, type RecordedProvider } from "./identity-availability.ts";
+import { livenessSnapshot, type AgentLiveness, type SessionRow } from "./liveness.ts";
 import { procTable, recordedStartMatches } from "./proc.ts";
 import { notSlot } from "./project-slot.ts";
 import { resolveProject } from "./project-key.ts";
@@ -43,6 +44,7 @@ export function listIdentityStatus(home: string, options: { now?: number; inspec
   if (typeof config.host !== "string" || !config.host) throw new Error("mailbox host configuration is invalid");
   const db = new DatabaseSync(path, { readOnly: true });
   const rows = new Map<string, IdentityStatus>(), leases: IdentityLease[] = [], conflicts = new Set<string>(), activityByName = new Map<string, LeaseActivity>();
+  const sessionRows: SessionRow[] = [];
   const providerByHolder = new Map<number, RecordedProvider>();
   // T656: server process start by pid, and the server pids each (cli, real session) binding names — read in the tx below.
   const serverStartByPid = new Map<number, string>();
@@ -122,6 +124,8 @@ export function listIdentityStatus(home: string, options: { now?: number; inspec
       }
     }
     if (schema >= 2) leases.push(...db.prepare("SELECT * FROM identity_leases").all() as unknown as IdentityLease[]);
+    for (const r of db.prepare("SELECT agent,cli,session_id,pid,pid_start,updated_at FROM sessions ORDER BY updated_at DESC").all() as unknown as SessionRow[])
+      sessionRows.push(r);
     db.exec("COMMIT");
   } finally { db.close(); }
   // Process discovery happens after releasing the read transaction. Listing is advisory;
@@ -145,21 +149,32 @@ export function listIdentityStatus(home: string, options: { now?: number; inspec
     if (recorded) { try { evidence = inspect(recorded.pid); } catch { evidence = { alive: null, start: null }; } }
     return holderProviderView((options.processTable ?? procTable)(), lease.holder_pid, caller.providerPid, recorded, evidence, caller.canonicalHarness);
   };
+  // T699: one liveness answer for the whole inventory, from this snapshot: the caller's own lease is held by it,
+  // every other name gets the shared answer (a released lease whose session still runs is idle, not held or absent).
+  const evidenceByPid = new Map<number, ProcessEvidence>();
+  for (const lease of leases) {
+    if (lease.released_at !== null || now - lease.heartbeat_at >= lease.idle_ttl) continue;
+    try { evidenceByPid.set(lease.holder_pid, inspect(lease.holder_pid)); } catch { /* failed inspection is unknown */ }
+  }
+  const evidenceOf = (pid: number): ProcessEvidence => evidenceByPid.get(pid) ?? { alive: null, start: null };
+  const callerLease = options.caller ? leases.find((l) => l.cli === options.caller!.cli && namesCallerSession(l, options.caller!)) : undefined;
+  const caller = options.caller ? { ...options.caller, ...(callerLease ? sameSessionProvider(callerLease, options.caller) : {}) } : undefined;
+  const liveness = livenessSnapshot({
+    names: leases.map((l) => l.name), leases, sessions: sessionRows, now,
+    activity: (name) => activityByName.get(name) ?? null, conflicts, evidence: evidenceOf,
+    ...(caller ? { caller } : {}), scope: home,
+  });
   for (const lease of leases) {
     const item = row(lease.name); activity(item, lease.heartbeat_at); activity(item, lease.released_at);
-    let evidence: ProcessEvidence = { alive: null, start: null };
-    if (lease.released_at === null && now - lease.heartbeat_at < lease.idle_ttl) {
-      try { evidence = inspect(lease.holder_pid); } catch { /* failed inspection is unknown */ }
-    }
+    const evidence = evidenceOf(lease.holder_pid);
     // The caller's own lease (its MCP server is the holder process) is simply held by it: not "an older process of this
     // same session", and not something it should claim again (T316).
     // A shared transport (Codex, OpenCode) serves many conversations from one process, so the process alone is not the
     // caller: the lease must also name this conversation's session.
     const own = options.caller?.pid !== undefined && lease.released_at === null && lease.holder_pid === options.caller.pid
       && lease.cli === options.caller.cli && namesCallerSession(lease, options.caller) && evidence.alive !== false;
-    const a = own ? { state: "live" as const, claimable: false, reason: "held by this session" }
-      : identityAvailability({ lease, evidence, activity: activityByName.get(lease.name) ?? null, conflict: conflicts.has(lease.name), now,
-        caller: options.caller && { ...options.caller, ...sameSessionProvider(lease, options.caller) } });
+    const a: AgentLiveness = own ? { state: "live", claimable: false, reason: "held by this session" }
+      : liveness.get(lease.name) ?? { state: "offline", claimable: true, reason: "no session has held it under a lease" };
     item.state = a.state === "live" ? (a.claimable ? "idle" : "held") : a.state === "idle" ? "idle" : a.state === "unknown" ? "unknown" : a.state === "conflict" ? "conflict" : "available";
     item.claimable = a.claimable;
     item.reason = a.reason;

@@ -10,7 +10,7 @@
 // the service itself still hosts the session; wakeOpencode posts to it (and keeps T646's dual-host refusal). Nothing here reads or changes
 // mail: a wake carries ids only, and the session claims its identity again on the turn the wake starts.
 import { provenProcess, withProcSnapshot } from "./proc.js";
-import { opencodeHostOf } from "./opencode-provider.js";
+import { opencodeHostClassifier, opencodeHostOf } from "./opencode-provider.js";
 import { opencodeWakeWaiting } from "./opencode-wake-queue.js";
 const refused = () => Object.assign(new Error("opencode serve poller or session binding changed"), { code: "WAKE_IDENTITY_LOST" });
 const binding = (s) => JSON.stringify([s.agent, s.cli, s.session_id, s.pid, s.pid_start, s.session_key, s.channel]);
@@ -41,6 +41,42 @@ const serviceBindingLive = (node, session, host = opencodeHostOf) => bindingLive
  */
 export function pollerTargetLive(node, session, host = opencodeHostOf) {
     return serveBindingLive(node, session, host) && opencodeWakeWaiting(session.session_id, session.pid);
+}
+/**
+ * T699: the wake bindings behind many agents from one process snapshot (and one argv read with the batched host
+ * classifier), for the liveness surfaces. This is the same evidence `pollerWakeTargets` uses, without its run
+ * closures: display never takes mail or leases. A standalone poller registration is per-process, so a caller
+ * outside the daemon sees the binding (`kind`, `wakeable: false`) but cannot claim the wake path.
+ */
+export function wakeBindingsByAgent(sessionsByAgent, host = opencodeHostClassifier(), waiting = opencodeWakeWaiting) {
+    return withProcSnapshot(() => {
+        const out = new Map();
+        for (const [agent, sessions] of sessionsByAgent) {
+            let best = null;
+            for (const s of sessions) {
+                if (s.agent !== agent || s.cli !== "opencode" || !s.pid || s.pid <= 1 || s.session_id.startsWith("mcp-"))
+                    continue;
+                // The recorded birth must still be that process: a reused pid must not inherit a row it never wrote.
+                if (!provenProcess(s.pid, s.pid_start))
+                    continue;
+                const kind = host(s.pid);
+                if (kind !== "service" && kind !== "standalone")
+                    continue;
+                const polling = kind === "standalone" && waiting(s.session_id, s.pid);
+                const candidate = kind === "service"
+                    ? { cli: s.cli, session_id: s.session_id, pid: s.pid, kind, wakeable: true, via: "service" }
+                    : { cli: s.cli, session_id: s.session_id, pid: s.pid, kind, wakeable: polling, via: polling ? "standalone-poller" : null };
+                // A service binding hosts every session of the service; prefer it over a standalone row of the same agent.
+                if (!best || candidate.kind === "service" || (candidate.wakeable && !best.wakeable))
+                    best = candidate;
+                if (best.kind === "service")
+                    break;
+            }
+            if (best)
+                out.set(agent, best);
+        }
+        return out;
+    });
 }
 /**
  * Poller targets for `agent`: bound standalone OpenCode sessions whose MCP is gone but whose plugin still polls, and (T688)

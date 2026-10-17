@@ -57,6 +57,20 @@ export const alive = (pid) => { if (!pid)
 catch (e) {
     return e.code === "EPERM";
 } };
+/**
+ * T699: a session row still belongs to the live process it was recorded for — the same display rule `sameSession`
+ * uses without `proof`. A row with a recorded birth must match it exactly; an older row counts only while fresh and
+ * alive. Liveness only: authorization still uses provenProcess (sameSession with `{proof: true}`).
+ */
+export function sessionRowLive(r, now = Date.now()) {
+    if (!r.pid || !Number.isSafeInteger(r.pid) || r.pid <= 0)
+        return false;
+    if (now - Date.parse(r.updated_at) > LIVE_AGENT_MS)
+        return false;
+    if (r.pid_start)
+        return sameProcess(r.pid, r.pid_start);
+    return now - Date.parse(r.updated_at) < SESSION_FRESH_MS && alive(r.pid);
+}
 const WAKEABLE = new Set(["codex", "opencode"]);
 /** Idle Grok has no first-party inject (T385). `grok --help` has no queue command. `~/.grok/leader.sock`
  *  is the leader for config and MCP watches, not a prompt socket (user-guide 26-config-reference.md).
@@ -335,9 +349,7 @@ export class MbxNode {
             return false; // live sessions rebind every minute
         if (o.proof)
             return provenProcess(pid, r.pid_start);
-        if (r.pid_start)
-            return sameProcess(pid, r.pid_start);
-        return Date.now() - Date.parse(r.updated_at) < SESSION_FRESH_MS && alive(pid);
+        return sessionRowLive({ pid, pid_start: r.pid_start, updated_at: r.updated_at });
     }
     /** The agent of the session this process runs inside (walks up the process tree), if any. */
     callerAgent(ancestors) {
@@ -457,21 +469,6 @@ export class MbxNode {
         for (const r of this.store.db.prepare("SELECT agent, pid, pid_start, updated_at FROM sessions").all())
             if (r.pid && this.sameSession(r.pid, r))
                 out.add(r.agent);
-        return out;
-    }
-    /** For display: agents with a live session, plus shell senders (--as, no session) active in the last 2 h. */
-    liveAgents() {
-        const out = new Set(), bound = new Set();
-        for (const r of this.store.db.prepare("SELECT agent, pid, pid_start, updated_at FROM sessions").all()) {
-            bound.add(r.agent);
-            if (r.pid && this.sameSession(r.pid, r))
-                out.add(r.agent);
-        }
-        // shell participants (no session binding ever) count while they are active
-        const since = new Date(Date.now() - SHELL_AGENT_MS).toISOString();
-        for (const r of this.store.db.prepare("SELECT name FROM agents WHERE host=? AND last_seen > ?").all(this.host, since))
-            if (!bound.has(r.name))
-                out.add(r.name);
         return out;
     }
     /** How mail reaches this agent when its session is idle. */
