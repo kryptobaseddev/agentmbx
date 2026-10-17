@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.46 (2026-10-16)
+
 - **Published docs match current setup and wakes (T684).** The npm package includes the linked security policy. README and portability docs describe Codex's experimental app-server queue API and owned-notice withdrawal, setup help includes Grok and daemon selectors, and README scopes doctor's checks and explains how to confirm mbx in a Kimi desktop conversation.
 
 - **Doctor checks the Kimi desktop plugin (T685).** `agentmbx doctor` reports whether the AgentMBX plugin is installed and current in the running Kimi desktop app, or missing, stale, disabled or incomplete, with the fix `agentmbx setup --only kimi` (Kimi.app open). The check is read-only; whether a given conversation is bound stays an `mbx_whoami` question.
