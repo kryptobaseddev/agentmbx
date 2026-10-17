@@ -1,6 +1,6 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { CodexActivity } from "../src/codex-activity.ts";
@@ -12,6 +12,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { MbxNode } from "../src/node.ts";
 
 const THREAD = "44444444-4444-4444-8444-444444444444", SIBLING = "55555555-5555-4555-8555-555555555555";
+const event = (type: string, turn_id = "turn") => `${JSON.stringify({ type: "event_msg", payload: { type, turn_id } })}\n`;
 function fixture(t: TestContext) {
   const home = mkdtempSync(join(tmpdir(), "mbx-codex-activity-")), store = new Store(home);
   t.after(() => { store.close(); rmSync(home, { recursive: true, force: true }); });
@@ -21,10 +22,10 @@ function fixture(t: TestContext) {
   const lease = leases.claim("reader", { pid: 10, start: "birth", keyFp: "aaaa-aaaa-aaaa-aaaa", cli: "codex", sessionId: THREAD });
   store.set(activityKey(lease.name), JSON.stringify({ at: claimed, shared: true }));
   const sampler = new CodexActivity(home), holder = { ...lease, shared: true };
-  const rollout = (thread: string, at: number, day = "09") => {
+  const rollout = (thread: string, at: number, day = "09", body = "not JSON; use metadata fallback") => {
     const dir = join(home, "sessions", "2026", "10", day); mkdirSync(dir, { recursive: true });
     const path = join(dir, `rollout-2026-10-${day}T12-00-00-${thread}.jsonl`);
-    writeFileSync(path, "not JSON; the rollout body must never be read", { mode: 0o000 });
+    writeFileSync(path, body, { mode: body.startsWith("{") ? 0o600 : 0o000 });
     utimesSync(path, at / 1000, at / 1000);
     return path;
   };
@@ -45,7 +46,67 @@ test("exact-thread rollout activity keeps a writing thread live after >10 min wi
   assert.equal(f.record(), false, "an unchanged rollout must not synthesize another heartbeat");
 });
 
-test("quiet rollout and missing evidence preserve idle recovery and the silent-turn gap", t => {
+test("a silent open turn stays unclaimable after >10 min without mbx calls or rollout writes", t => {
+  const f = fixture(t), path = f.rollout(THREAD, f.claimed - 1000, "09", event("task_started"));
+  const writtenAt = lstatSync(path).mtimeMs;
+  assert.equal(f.record(), true);
+  const later = f.now + SHARED_IDLE_MS + 1000;
+  t.mock.method(Date, "now", () => later);
+  assert.equal(f.record(), true, "the same open turn remains active without a new write");
+  assert.equal(f.activity().at, later);
+  assert.equal(lstatSync(path).mtimeMs, writtenAt);
+  assert.equal(identityAvailability({ lease: f.lease, activity: f.activity(), evidence: { alive: true, start: "birth" }, now: later }).claimable, false);
+});
+
+test("a completed turn past the idle threshold remains claimable", t => {
+  const f = fixture(t);
+  f.rollout(THREAD, f.claimed - 1000, "09", event("task_started") + event("task_complete"));
+  assert.equal(f.record(), false);
+  assert.deepEqual(f.activity(), { at: f.claimed, shared: true });
+  assert.equal(identityAvailability({ lease: f.lease, activity: f.activity(), evidence: { alive: true, start: "birth" }, now: f.now }).claimable, true);
+});
+
+for (const end of ["task_complete", "turn_end", "turn_aborted"])
+  test(`${end} closes only its matching open turn and restores quiet recovery`, t => {
+    const f = fixture(t), path = f.rollout(THREAD, f.claimed - 1000, "09", event("task_started", "working") + event(end, "other"));
+    assert.equal(f.record(), true, "an unrelated turn end must not close this turn");
+    appendFileSync(path, event(end, "working"));
+    utimesSync(path, f.claimed / 1000, f.claimed / 1000);
+    const later = f.now + SHARED_IDLE_MS + 1000;
+    t.mock.method(Date, "now", () => later);
+    assert.equal(f.record(), false, "a completed quiet turn must not refresh observation time");
+    assert.equal(identityAvailability({ lease: f.lease, activity: f.activity(), evidence: { alive: true, start: "birth" }, now: later }).claimable, true);
+  });
+
+for (const change of ["missing", "unreadable", "rotated", "truncated"])
+  test(`${change} rollout discards cached open-turn protection and falls back to mtime`, t => {
+    const f = fixture(t), path = f.rollout(THREAD, f.claimed - 1000, "09", event("task_started"));
+    assert.equal(f.record(), true);
+    if (change === "missing") rmSync(path);
+    else if (change === "unreadable") chmodSync(path, 0o000);
+    else {
+      if (change === "rotated") renameSync(path, `${path}.old`);
+      writeFileSync(path, event("task_started"), { mode: 0o600 });
+      if (change === "truncated") writeFileSync(path, "");
+      utimesSync(path, (f.claimed - 1000) / 1000, (f.claimed - 1000) / 1000);
+    }
+    const later = f.now + SHARED_IDLE_MS + 1000;
+    t.mock.method(Date, "now", () => later);
+    assert.equal(f.record(), false);
+    assert.equal(identityAvailability({ lease: f.lease, activity: f.activity(), evidence: { alive: true, start: "birth" }, now: later }).claimable, true);
+  });
+
+test("non-event payloads and malformed rollouts cannot manufacture an open turn", t => {
+  const f = fixture(t), path = f.rollout(THREAD, f.claimed - 1000, "09",
+    JSON.stringify({ type: "response_item", payload: { type: "task_started", turn_id: "fake" } }));
+  assert.equal(f.record(), false);
+  writeFileSync(path, `${event("task_started")}not JSON\n`);
+  utimesSync(path, (f.claimed - 1000) / 1000, (f.claimed - 1000) / 1000);
+  assert.equal(f.record(), false);
+  assert.deepEqual(f.activity(), { at: f.claimed, shared: true });
+});
+
+test("quiet rollout and missing evidence preserve idle recovery", t => {
   const f = fixture(t);
   f.rollout(SIBLING, f.now - 1000);
   assert.equal(f.record(), false, "a sibling's rollout is not this thread's activity");
@@ -82,7 +143,7 @@ test("future, ambiguous, non-file, missing and provisional evidence writes nothi
 
 for (const changed of ["token", "holder_pid", "holder_start", "session_id", "cli", "released_at"] as const)
   test(`rollout evidence is fenced against a changed lease ${changed}`, t => {
-    const f = fixture(t); f.rollout(THREAD, f.now - 1000);
+    const f = fixture(t); f.rollout(THREAD, f.now - 1000, "09", event("task_started"));
     const value = changed === "holder_pid" ? 20 : changed === "released_at" ? f.now : changed === "session_id" ? SIBLING : "changed";
     f.store.db.prepare(`UPDATE identity_leases SET ${changed}=? WHERE name=?`).run(value, f.lease.name);
     assert.equal(f.record(), false); assert.deepEqual(f.activity(), { at: f.claimed, shared: true });
@@ -102,7 +163,7 @@ test("unknown process evidence writes no activity and performs no synthetic rene
   assert.equal(lease.token, f.lease.token); assert.equal(lease.heartbeat_at, f.claimed); assert.equal(lease.released_at, null);
 });
 
-test("the existing MCP heartbeat records exact-thread mtime without another mbx call", async t => {
+for (const open of [false, true]) test(`the existing MCP heartbeat records ${open ? "a silent open turn" : "exact-thread mtime"} without another mbx call`, async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-codex-heartbeat-")), node = new MbxNode(home, { host: "alpha" });
   const client = new Client({ name: "codex-activity", version: "1" }), preload = join(home, "heartbeat.mjs");
   writeFileSync(preload, "const interval=globalThis.setInterval; globalThis.setInterval=(fn,ms,...args)=>interval(fn,ms===60000?50:ms,...args);");
@@ -115,14 +176,19 @@ test("the existing MCP heartbeat records exact-thread mtime without another mbx 
   node.store.set(activityKey(lease.name), JSON.stringify({ at: Date.now() - SHARED_IDLE_MS - 1000, shared: true }));
   const dir = join(home, "sessions", "2026", "10", "16"); mkdirSync(dir, { recursive: true });
   const path = join(dir, `rollout-2026-10-16T12-00-00-${THREAD}.jsonl`);
-  writeFileSync(path, "unreadable rollout contents", { mode: 0o000 });
+  writeFileSync(path, open ? event("task_started") : "unreadable rollout contents", { mode: open ? 0o600 : 0o000 });
+  if (open) utimesSync(path, (lease.claimed_at - SHARED_IDLE_MS - 1000) / 1000, (lease.claimed_at - SHARED_IDLE_MS - 1000) / 1000);
   const at = Math.floor(lstatSync(path).mtimeMs);
-  assert.ok(at > lease.claimed_at);
+  assert.equal(at > lease.claimed_at, !open);
   let activity = parseActivity(node.store.get(activityKey(lease.name)));
-  for (let i = 0; i < 40 && activity?.at !== at; i++) {
+  for (let i = 0; i < 40 && !(open ? (activity?.at ?? 0) > lease.claimed_at : activity?.at === at); i++) {
     await new Promise(resolve => setTimeout(resolve, 50)); activity = parseActivity(node.store.get(activityKey(lease.name)));
   }
-  assert.deepEqual(activity, { at, shared: true });
+  if (open) assert.ok(activity!.at > lease.claimed_at);
+  else assert.deepEqual(activity, { at, shared: true });
+  const first = activity!.at;
   await new Promise(resolve => setTimeout(resolve, 200));
-  assert.equal(parseActivity(node.store.get(activityKey(lease.name)))?.at, at, "an idle heartbeat does not substitute now");
+  if (open) assert.ok(parseActivity(node.store.get(activityKey(lease.name)))!.at > first);
+  else assert.equal(parseActivity(node.store.get(activityKey(lease.name)))?.at, at, "an idle heartbeat does not substitute now");
+  assert.equal(Math.floor(lstatSync(path).mtimeMs), at, "heartbeats do not write the rollout");
 });
