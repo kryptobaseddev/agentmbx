@@ -1504,9 +1504,12 @@ const watchWake = (ctx: NoteCtx, sid: string): void => {
 /** T642: a session is mid-turn from its first tool call (or execution start) until its turn ends (idle / execution succeeded).
  *  Delivery "queue" holds a note or a wake until that end, so the post-tool notice rides the tool result instead. */
 const turnSince = new Map<string, number>();
+/** T700: tools this turn has already run. The first tool of a turn may place a resume note even on the v2 path,
+ *  where session.execution.started marks the turn before any tool runs; later tools in that same turn are mid-turn. */
+const turnTools = new Map<string, number>();
 const TURN_STALE_MS = 30 * 60_000;
-const markTurn = (sid: string): void => { if (!turnSince.has(sid)) turnSince.set(sid, Date.now()); };
-const endTurn = (sid: string): void => { turnSince.delete(sid); };
+const markTurn = (sid: string): void => { if (!turnSince.has(sid)) { turnSince.set(sid, Date.now()); turnTools.set(sid, 0); } };
+const endTurn = (sid: string): void => { turnSince.delete(sid); turnTools.delete(sid); };
 /** T675: the turn ended. Tell the daemon (receipt id "idle"), so its next normal pass may wake this session for mail still
  *  unhandled instead of waiting out the busy backoff. It admits nothing. True only when the daemon took it, which means the
  *  wake path owns the post-turn alert for this session; false keeps the stop hook as the fallback. */
@@ -1582,16 +1585,17 @@ const postToolSteady = (sid: string): boolean => {
 /** One hook call: the JSON payload goes in on stdin; stdout is captured; a reason we recognize is
  *  admitted through the hosting serve's session API. A failure never surfaces. The same call starts
  *  the standalone wake poll once the session id is known. */
-const call = async (ctx: NoteCtx, bin: string[], event: string, payload: Record<string, unknown>, pending: Map<string, string>, sending: Set<string>,
+const call = async (ctx: NoteCtx, bin: string[], event: string, payload: Record<string, unknown>, pending: Map<string, string>,
   resumeTold: Set<string>, place?: (text: string) => boolean): Promise<void> => {
   try {
     const sid = typeof payload.session_id === "string" ? payload.session_id : null;
-    // Captured before this hook marks or ends the turn, so the first tool of a turn can still admit
-    // and a turn that is already running cannot.
+    // Captured before this hook marks or ends the turn. T700: the v2 event loop marks the turn at
+    // session.execution.started, before its first tool, so "turn open" is not the same as "a tool already ran".
     const since = sid ? turnSince.get(sid) : undefined;
     const turnOpen = since !== undefined && Date.now() - since < TURN_STALE_MS;
+    const firstTool = event === "post-tool" && (turnTools.get(sid ?? "") ?? 0) === 0;
     if (sid) watchWake(ctx, sid);
-    if (sid && event === "post-tool") markTurn(sid);
+    if (sid && event === "post-tool") { markTurn(sid); turnTools.set(sid, (turnTools.get(sid) ?? 0) + 1); }
     if (sid && event === "stop") endTurn(sid);
     if (sid && (event === "post-tool" || event === "stop")) await releaseStartNote(ctx, sid, event, place);
     // T187: retry an unadmitted notice on an existing hook, without bypassing the zero-spawn fast path.
@@ -1603,17 +1607,25 @@ const call = async (ctx: NoteCtx, bin: string[], event: string, payload: Record<
       const line = "[mbx] Resume note was not admitted. Call mbx_whoami, then mbx_inbox. Mail is unchanged.";
       if (!(place && place(line))) logWake("resume", session, "not admitted; mail unchanged");
     };
+    let placed: string | null = null;
     const deliver = async () => {
-      if (!sid || sending.has(sid)) return;
+      if (!sid) return;
       const text = pending.get(sid);
       if (!text) return;
+      // T700: the first tool of a turn is where a resume notice belongs, even when the v2 path marked the turn
+      // at execution.started. A successful placement is the only proof that the note reached the model, so only
+      // then is the pending copy dropped.
+      if (text === placed) { pending.delete(sid); return; }
+      if (event === "post-tool" && firstTool && place && place(text)) { placed = text; if (pending.get(sid) === text) pending.delete(sid); return; }
       if (turnOpen && event !== "stop") { sayResumeFallback(sid, text); return; }
-      if (event === "post-tool" && place && place(text)) { if (pending.get(sid) === text) pending.delete(sid); return; }
+      // T700: a note kept across a turn is never acknowledged-and-dropped on a receipt. resume:false can return a
+      // msg_ id without writing a session_message (T544), and resume:true would start a turn on an idle TUI, so the
+      // next turn's first tool places it. A fresh conversation's start note keeps its queued admission, which the
+      // host materialises as the conversation begins; only that event may admit without a tool result.
+      if (event !== "session-start") return;
       const api = typeof ctx?.session?.synthetic === "function" || typeof ctx?.session?.prompt === "function";
       if (!api) { sayResumeFallback(sid, text); return; }
-      sending.add(sid);
-      try { if (await inject(ctx, sid, "resume-entry", text) && pending.get(sid) === text) pending.delete(sid); }
-      finally { sending.delete(sid); }
+      if (await inject(ctx, sid, "resume-entry", text) && pending.get(sid) === text) pending.delete(sid);
     };
     await deliver();
     // T675: with this session's wake poll live, the daemon's wake is the one post-turn alert: it starts a turn and offers only
@@ -1638,8 +1650,8 @@ const call = async (ctx: NoteCtx, bin: string[], event: string, payload: Record<
 };
 
 const runFor = (ctx: NoteCtx, bin: string[], cwd: string | undefined) => {
-  const pending = new Map<string, string>(), sending = new Set<string>(), resumeTold = new Set<string>();
-  return (event: string, payload: Record<string, unknown>, place?: (text: string) => boolean) => call(ctx, bin, event, { cwd, ...payload }, pending, sending, resumeTold, place);
+  const pending = new Map<string, string>(), resumeTold = new Set<string>();
+  return (event: string, payload: Record<string, unknown>, place?: (text: string) => boolean) => call(ctx, bin, event, { cwd, ...payload }, pending, resumeTold, place);
 };
 
 const sidOf = (v: unknown): string | undefined => {

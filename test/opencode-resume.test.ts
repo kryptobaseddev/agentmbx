@@ -100,7 +100,7 @@ test("T187: a quiet resume places the same notice in that tool result and does n
   } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("T187: a busy turn keeps the resume note, reports the fallback once, and admits it when the turn ends", async () => {
+test("T187: a busy turn keeps the resume note, reports the fallback once, and places it on the next turn's first tool", async () => {
   const { mod, dir } = await loadPlugin(), notes: Note[] = [];
   let tools = 0;
   const restore = stubSpawn([], c => {
@@ -119,10 +119,13 @@ test("T187: a busy turn keeps the resume note, reports the fallback once, and ad
     await hooks["tool.execute.after"]({ sessionID: "ses_busy" }, third);
     assert.equal(third.output, "third", "the fallback is once per pending note");
     await hooks.event({ event: { type: "session.idle", properties: { info: { id: "ses_busy" } } } });
-    assert.equal(notes.length, 1);
-    assert.equal(notes[0].sessionID, "ses_busy");
-    assert.equal(notes[0].text, NOTICE);
-    assert.equal(notes[0].resume, false, "ending the turn admits the note; it does not start a wake");
+    assert.equal(notes.length, 0, "T700: ending the turn does not acknowledge a note the host never materialised");
+    const next = { output: "next turn" };
+    await hooks["tool.execute.after"]({ sessionID: "ses_busy" }, next);
+    assert.match(next.output, /You are worker@alpha/, "the next turn's first tool result carries the kept note");
+    assert.doesNotMatch(next.output, /Resume note was not admitted/);
+    assert.equal(next.output.split(NOTICE).length - 1, 1, "exactly one copy");
+    assert.equal(notes.length, 0);
   } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -185,6 +188,110 @@ test("T187: a host with no session note API keeps the note and a later tool resu
     await hooks.event({ event: { type: "session.idle", properties: { info: { id: "ses_noapi" } } } });
     assert.equal(output.output.includes(NOTICE), true);
   } finally {
+    if (home === undefined) delete process.env.MBX_HOME; else process.env.MBX_HOME = home;
+    restore(); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- T700: the v2 plugin path. OpenCode 2.x validates the default export and dispatches through
+// setup(ctx): ctx.event.subscribe() marks a turn at session.execution.started, and ctx.tool.hook is
+// the only place a note can ride a tool result. The v1 hooks object is never consumed there.
+
+type V2Tool = (input: unknown) => unknown;
+type V2Module = { default: { setup: (ctx: unknown) => Promise<() => void> } };
+
+async function loadPluginV2() {
+  (globalThis as { __mbxWakePort?: string | null }).__mbxWakePort = null;
+  const dir = mkdtempSync(join(tmpdir(), "mbx-oc-v2-"));
+  const file = join(dir, "agentmbx.ts");
+  writeFileSync(file, opencodePluginSource(CMD, version()));
+  return { mod: await import(file) as V2Module, dir };
+}
+
+function eventStream() {
+  const queue: unknown[] = [];
+  let wake: (() => void) | null = null, open = true;
+  const nudge = () => { const w = wake; wake = null; w?.(); };
+  return {
+    iterable: {
+      [Symbol.asyncIterator]: () => ({
+        next: async () => {
+          while (!queue.length && open) await new Promise<void>((resolve) => { wake = resolve; });
+          return queue.length ? { done: false, value: queue.shift() } : { done: true, value: undefined };
+        },
+      }),
+    },
+    push(event: unknown) { queue.push(event); nudge(); },
+    close() { open = false; nudge(); },
+  };
+}
+
+const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 30));
+const at = (sid: string) => ({ location: { directory: "/work" }, data: { sessionID: sid } });
+
+test("T700 v2: execution.started does not block the first tool of the turn from placing the resume note", async () => {
+  const { mod, dir } = await loadPluginV2();
+  const notes: Note[] = [];
+  const home = process.env.MBX_HOME;
+  process.env.MBX_HOME = dir;
+  const restore = stubSpawn([], (c) => c.args[1] === "post-tool" ? envelope("ses_v2a", NOTICE) : "");
+  const stream = eventStream();
+  let tool: V2Tool | null = null;
+  const dispose = await mod.default.setup({
+    location: { directory: "/work" }, event: { subscribe: () => stream.iterable },
+    tool: { hook: (_name: string, fn: V2Tool) => { tool = fn; } }, session: stubSession(notes),
+  });
+  try {
+    stream.push({ type: "session.execution.started", ...at("ses_v2a") });
+    await tick();
+    const result = { sessionID: "ses_v2a", status: "completed", result: { content: "tool output" } };
+    await tool!(result);
+    assert.match(result.result.content, /You are worker@alpha/, "the first tool result carries the bounded notice");
+    assert.doesNotMatch(result.result.content, /Resume note was not admitted/);
+    assert.equal(notes.length, 0, "placing it in the tool result starts no turn and queues no copy");
+  } finally {
+    dispose(); stream.close();
+    if (home === undefined) delete process.env.MBX_HOME; else process.env.MBX_HOME = home;
+    restore(); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("T700 v2: a stop never acknowledges-and-drops a note; the next turn's first tool result places it once", async () => {
+  const { mod, dir } = await loadPluginV2();
+  const notes: Note[] = [];
+  const home = process.env.MBX_HOME;
+  process.env.MBX_HOME = dir;
+  const restore = stubSpawn([], (c) => c.args[1] === "post-tool" ? envelope("ses_v2b", NOTICE) : "");
+  const stream = eventStream();
+  let tool: V2Tool | null = null;
+  const dispose = await mod.default.setup({
+    location: { directory: "/work" }, event: { subscribe: () => stream.iterable },
+    tool: { hook: (_name: string, fn: V2Tool) => { tool = fn; } }, session: stubSession(notes),
+  });
+  try {
+    stream.push({ type: "session.execution.started", ...at("ses_v2b") });
+    await tick();
+    // An error result cannot carry a note, so the note stays pending and only the fallback is attempted.
+    const first = { sessionID: "ses_v2b", status: "error", result: { content: "boom" } };
+    await tool!(first);
+    assert.doesNotMatch(first.result.content, /You are worker@alpha/);
+
+    // The host may return a msg_ receipt without writing a session_message (T544). A stop must not treat that
+    // as delivered: the note stays pending for the next turn instead of being acknowledged and dropped.
+    stream.push({ type: "session.execution.succeeded", ...at("ses_v2b") });
+    await tick();
+    assert.equal(notes.length, 0, "no synthetic admission, and no unwanted turn on an idle session");
+
+    stream.push({ type: "session.execution.started", ...at("ses_v2b") });
+    await tick();
+    const second = { sessionID: "ses_v2b", status: "completed", result: { content: "next turn" } };
+    await tool!(second);
+    assert.match(second.result.content, /You are worker@alpha/, "the kept note rides the next turn's first tool result");
+    assert.doesNotMatch(second.result.content, /Resume note was not admitted/);
+    assert.equal(second.result.content.split(NOTICE).length - 1, 1, "exactly one copy");
+    assert.equal(notes.length, 0);
+  } finally {
+    dispose(); stream.close();
     if (home === undefined) delete process.env.MBX_HOME; else process.env.MBX_HOME = home;
     restore(); rmSync(dir, { recursive: true, force: true });
   }
