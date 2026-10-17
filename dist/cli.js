@@ -37,7 +37,7 @@ import { periodicUpdateCheck, updateAvailable, updateCommand } from "./update.js
 import { installKind, version } from "./version.js";
 import { installService, serviceLabel, uninstallService } from "./service.js";
 import { CLIS, defaultHostName, defaultWhich, formatRows, ownerStep, resolveCommand, runSetup, selfHealSkill, shJoin } from "./setup.js";
-import { dispatchWakes, hasWakeAuthority, humanPromptKey, inboxCommand, isHumanPrompt, macNotifierPath, muteWakes, notifyDesktop, opencodeService, liveWatcher, wakeMutedUntil, wakeText, watcherKey, which } from "./wake.js";
+import { dispatchWakes, hasWakeAuthority, humanPromptKey, inboxCommand, isHumanPrompt, macNotifierPath, muteWakes, notifyDesktop, opencodeService, liveWatcher, wakeMutedUntil, wakeText, watcherKey, which, noteWatchReported, reconcileWatchReported } from "./wake.js";
 import { kimiMultiHost } from "./kimi-web.js";
 import { bindInstruction, issueBindTicket } from "./bind-ticket.js";
 import { activityKey } from "./identity-availability.js";
@@ -2173,6 +2173,9 @@ async function hook(node, event, cli) {
                 const digest = stopDigest();
                 const fresh = node.inbox(agent, { limit: 50 })
                     .filter(m => m.state !== "read" && m.received_at > seen && m.from_addr !== `${agent}@${node.host}` && node.wantsWake(agent, m) && hasWakeAuthority(node, agent, m) && (!digest || WAKE_KINDS.has(m.kind)));
+                // T667: this turn ended. The mail this Stop surfaces rides the continuation, and read/acked mail is
+                // handled: both leave the dropped-exit marker so the daemon's one re-drive never double-fires.
+                reconcileWatchReported(node, agent, fresh.map(m => m.id));
                 // T435: mail stays first. After it is consumed, one continuation re-arms a down watcher.
                 // Mail that arrives after the watcher exits and before the next tool or Stop still only
                 // gets a desktop notice — compaction does not fire Stop, and this gate cannot close that gap.
@@ -2457,6 +2460,10 @@ async function watch(node, selection) {
                         : mailbox === agent ? "" : ` This is your linked mailbox: use agentmbx inbox --as ${mailbox} and agentmbx ack --as ${mailbox} <id>.`;
                     if (!reservation.brake)
                         lines.push(wakeText(subject, wanted, box ? projectLabel(box) : undefined) + linked);
+                    // T667: the printed hint may be dropped mid-turn (the harness does not queue the completion).
+                    // Mark the ids so the daemon requeues the mail once if nothing ever surfaces it.
+                    if (!reservation.brake)
+                        noteWatchReported(node.store, mailbox, wanted.map(r => r.id));
                 }
                 for (const r of rows) {
                     node.setDelivery(r.id, mailbox, "notified");
