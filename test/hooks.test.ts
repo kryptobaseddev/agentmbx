@@ -440,10 +440,10 @@ test("T185: every Claude SessionStart source but fork is an entry with one bound
 test("T185: a Claude fork leaves the parent session row and prints the MCP fallback", async t => {
   const { n, run } = await holder(t, "claude");
   assert.equal(run("prompt", "parent", "claude", {}, { prompt: "bind the parent" }).status, 0);
-  const rows = () => n.store.db.prepare("SELECT agent,cli,session_id,pid,session_key FROM sessions ORDER BY cli,session_id").all();
+  const rows = () => n.store.db.prepare("SELECT agent,cli,session_id,pid,session_key FROM sessions ORDER BY cli,session_id").all() as { agent: string; cli: string; session_id: string; pid: number | null; session_key: string | null }[];
   const leases = () => n.store.db.prepare("SELECT name,cli,session_id,released_at,token FROM identity_leases ORDER BY name").all();
   const before = rows(), leaseBefore = leases();
-  assert.deepEqual(before.map((r: { session_id: string }) => r.session_id), ["parent"]);
+  assert.deepEqual(before.map((r) => r.session_id), ["parent"]);
   const r = run("session-start", "child", "claude", {}, { source: "fork" });
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(rows(), before, "fork leaves the sessions table and the parent row untouched");

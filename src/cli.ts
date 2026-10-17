@@ -41,7 +41,7 @@ import { CLIS, defaultHostName, defaultWhich, formatRows, ownerStep, resolveComm
 import { dispatchWakes, hasWakeAuthority, humanPromptKey, inboxCommand, isHumanPrompt, macNotifierPath, muteWakes, notifyDesktop, opencodeService, liveWatcher, wakeMutedUntil, wakeText, watcherKey, which, noteWatchReported, reconcileWatchReported } from "./wake.ts";
 import { kimiMultiHost } from "./kimi-web.ts";
 import { bindInstruction, issueBindTicket } from "./bind-ticket.ts";
-import { activityKey } from "./identity-availability.ts";
+import { activityKey, identityAvailability, parseActivity } from "./identity-availability.ts";
 import { fillCleoPresence } from "./cleo-presence.ts";
 import { identityLeaseStatus, inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
 import { AUTO_NAME_RE, identityProjects, linkedKey, projectOf, recordSessionHint, registeredIdentity, removeStaleProjectBindings, staleProjectBindings } from "./registry.ts";
@@ -1586,6 +1586,14 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
     const at = sessionPid(session);
     return !!at?.pid && takeResumeEntry(node.store, cli, at.pid, at.pid_start, session);
   };
+  // T185: a Claude fork is a different conversation. Skip bindSession and the parent-row delete.
+  // Record the entry on the parent row's pid so the fork's first prompt does not add a catch-up hint.
+  if (event === "session-start" && cli === "claude" && sid && input.source === "fork") {
+    const parent = node.store.db.prepare("SELECT pid,pid_start FROM sessions WHERE cli=? AND pid=? AND session_id NOT GLOB 'mcp-*'").get(cli, process.ppid) as { pid: number | null; pid_start: string | null } | undefined;
+    if (parent?.pid) takeResumeEntry(node.store, cli, parent.pid, parent.pid_start, sid);
+    emit(cli, "SessionStart", "[mbx] Mailbox context could not be restored. Call mbx_whoami, then mbx_catchup.");
+    return;
+  }
   // Inspect provider capabilities and processes before the lease transaction. No directory-based session discovery.
   const host = cli === "claude" ? detectHost(process.ppid) : null;
   const watch = event === "session-start" && noPush(cli, !!host && (host.channel || host.socket),
@@ -1647,8 +1655,8 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
       }
       if (event === "session-start") {
         // T185: a bound Claude SessionStart is itself the entry (startup, resume, clear, compact; T184 spec C1): it carries the
-        // resume notice even on an unchanged id, because /clear and /compact do not re-send the MCP instructions. A fork only
-        // records the entry (D4/C2), so no notice is deferred to its first prompt either. T186: a bound Codex SessionStart is
+        // resume notice even on an unchanged id, because /clear and /compact do not re-send the MCP instructions. A fork
+        // returned before this bind. T186: a bound Codex SessionStart is
         // the entry too (a missing source counts as startup); its payload has no event id, so clear/compact re-inject on the
         // same thread id and enteredNow only stops the following prompt from adding a second copy.
         const hookSource = typeof input.source === "string" && input.source ? input.source : "startup";
@@ -1866,6 +1874,25 @@ async function hook(node: MbxNode, event: string | undefined, cli: string) {
       emit(cli, "PostToolUse", stillResuming);
       return;
     }
+    // T185: a name held live by another session is a conflict, not an invitation to claim. Same-session and released
+    // leases fall through so T573 resuming and T503 disconnect stay as they are. Nothing here writes.
+    const busyHeld = (): string | null => {
+      if (cli !== "claude" || !sid || (event !== "session-start" && event !== "prompt")) return null;
+      const name = node.store.get(`name:${cli}:${sid}`);
+      if (!name || !NAME_RE.test(name) || node.store.get(`identity-conflict:${name}`) !== undefined) return null;
+      const lease = node.store.db.prepare("SELECT * FROM identity_leases WHERE name=?").get(name) as IdentityLease | undefined;
+      if (!lease || lease.released_at !== null || (lease.cli === cli && lease.session_id === sid)) return null;
+      const availability = identityAvailability({
+        lease, evidence: inspectLeaseProcess(lease.holder_pid),
+        activity: parseActivity(node.store.get(activityKey(name))), now: Date.now(),
+      });
+      if (availability.claimable || availability.takeover || availability.coUse || !availability.reason.startsWith("held by live ")) return null;
+      return `[mbx] ${availability.reason}.`;
+    };
+    try {
+      const busy = busyHeld();
+      if (busy) { emit(cli, event === "session-start" ? "SessionStart" : "UserPromptSubmit", busy); return; }
+    } catch { /* a lookup failure keeps the existing unbound guidance */ }
     const disconnected = grokUnboundPost ? null : hookDisconnectedNote(node, cli, sid, process.ppid);
     const multi = cli === "kimi" && kimiMultiHost(process.ppid);
     // A conversation in a multi-conversation Kimi host can't be matched to its mbx server from here: hand it a bind

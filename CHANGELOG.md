@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Claude SessionStart fork keeps the parent row, and a live holder is named without a takeover suggestion (T185).** A `source: fork` start skips bind and the parent-row delete and prints only the mailbox-context fallback. A session whose name is held live by another session prints that `held by live` reason and does not suggest takeover.
+
 - **Skill relay-depth guidance matches policy enforcement (T696).** The skill now says ask allows 6 hops and collaborate, autonomous and yolo have no limit. A regression test checks the documented limits against `LEVEL_MAX_HOP`.
 
 - **OpenCode wake documentation matches the shipped adapters (T697).** README and portability guidance describe standalone `resume: true` wakes, one shared service per machine for long-lived agents, and standalone/service-hosted recovery after MCP eviction (T659/T688).
