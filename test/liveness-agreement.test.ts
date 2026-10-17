@@ -1,6 +1,7 @@
 // T699: one liveness answer on every surface. A released lease whose session still runs is idle (claimable,
 // wakeable, seen on its next turn) — never "live" and never "offline". The same rows must produce the same
 // token and the same reason in `agentmbx agents`, `mbx_agents` (the roster) and the send receipt.
+import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -18,8 +19,10 @@ import { mailboxLiveness, recipientReceipts } from "../src/receipts.ts";
 const MIN = 60_000;
 const SERVICE_PID = process.pid;
 const POLLER_PID = process.ppid;
-const DEAD_PID = 2 ** 22 + 4242;
-const UNKNOWN_PID = 2 ** 22 + 9999;
+/** Reaped pids: deterministic on every host (a fabricated low pid can be alive on CI). */
+const exitedPid = (): number => spawnSync(process.execPath, ["-e", ""]).pid!;
+const DEAD_PID = exitedPid();
+const UNKNOWN_PID = exitedPid();
 
 interface Fixture {
   name: string;

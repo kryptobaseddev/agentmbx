@@ -40,10 +40,9 @@ function world(t: { after: (fn: () => unknown) => void }) {
     return e ?? { alive: true, start: `birth-${pid}` };
   };
   const leases = new IdentityLeases(node.store, { clock: () => NOW, idleTtlMs: 3_600_000, inspect });
-  let nextPid = 1000;
   /** A persona with a lease held by a process: registered (unless told otherwise), bound to a project, in the directory. */
   const hold = (name: string, o: { cli?: string; role?: string; project?: string; registered?: boolean; pid?: number; description?: string; cwd?: string } = {}) => {
-    const pid = o.pid ?? nextPid++;
+    const pid = o.pid ?? exitedPid();
     leases.claim(name, { pid, start: `birth-${pid}`, cli: o.cli ?? "claude", sessionId: `s-${name}`, keyFp: "aaaa-bbbb-cccc-dddd" });
     if (o.registered !== false) registerIdentity(node.store, { name, role: o.role ?? "builder", description: o.description ?? null });
     node.registerAgent(name, { cli: o.cli ?? "claude", ...(o.role ? { role: o.role } : {}), ...(o.description ? { description: o.description } : {}) });
@@ -261,9 +260,8 @@ test("T497: a live local row shows the session task and lane; a remote row leave
   w.hold("plain", { project: A, cwd: A });
   const gone = w.hold("was-on-task", { project: A, cwd: A });
   w.evidence.set(gone, { alive: false, start: null });
-  // T699: an expired holder whose session row still names a live process is idle (the T688 eviction case), so this
-  // fixture's session binding must be dead too for the row to be genuinely offline.
-  w.node.store.db.prepare("UPDATE sessions SET pid=? WHERE agent='was-on-task'").run(exitedPid());
+  // T699: the helper's reaped pid makes the session binding dead too, so this row is genuinely offline (an expired
+  // holder whose session row still named a live process would be idle, the T688 eviction case).
   setSessionPresence(w.node, { cli: "claude", sessionId: "s-on-task", task: "T497", lane: "implementation" });
   setSessionPresence(w.node, { cli: "claude", sessionId: "s-was-on-task", task: "T497", lane: "implementation" });
   w.node.store.db.prepare("INSERT INTO agents (name,host,role) VALUES ('far-dev','beta','builder')").run();
