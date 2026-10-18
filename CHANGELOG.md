@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **`agentmbx login` keeps polling when the token endpoint answers 429 or 503 (T707).** A rate-limit body is not an OAuth error, so the client printed "unexpected token response" and dropped an approval that was still in progress. It now waits `Retry-After` or `X-Retry-After` when that value is a positive number of seconds that still fits in the code's life, and otherwise waits the current interval plus 5 seconds, the same step as RFC 8628 `slow_down`. A wait that would outlive the code stops with the existing expiry message. The access token is still never logged.
+
 ## 0.5.49 (2026-10-17)
 
 - **One liveness answer: a released lease whose session still runs is idle, not live and not offline (T699).** `agentmbx agents` read the session binding while `mbx_agents` and the send receipt read the identity lease, so an OpenCode MCP eviction released the lease and the surfaces disagreed for hours: the CLI said `live`, the receipt said `offline (released)`. A single `agentLiveness` answer (src/liveness.ts) now composes the lease, the live session row and the serve kind, and every surface uses it. A released or expired lease whose session still runs reads as `idle` with its reason (claimable, and wakeable when the T688 shared service or a registered T659 poller can start its next turn, which re-claims the mailbox). `agentmbx agents` prints that state plus a trailing reason column and keeps shell senders visible as `live`; `mbx_agents` and `mbx_identity list` follow; a send reports `live-next-prompt`/`live-wake` instead of `offline`. The 30-minute lease idle TTL and the receipt's 3-minute heartbeat rule are unchanged.

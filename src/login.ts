@@ -18,7 +18,7 @@ export const DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code";
 const USAGE = "USAGE_ERROR";
 
 export type LoginPostResult =
-  | { kind: "json"; status: number; body: unknown }
+  | { kind: "json"; status: number; body: unknown; retryAfter?: string }
   | { kind: "network"; message: string };
 
 export interface LoginIO {
@@ -106,6 +106,21 @@ async function readLimited(res: Response, max: number): Promise<string | null> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+/** Prefer Retry-After, then X-Retry-After. Anything too long to be a delay is ignored. */
+function retryAfterHeader(res: Response): string | undefined {
+  for (const name of ["retry-after", "x-retry-after"]) {
+    const value = res.headers.get(name);
+    if (value && value.length <= 64) return value;
+  }
+  return undefined;
+}
+
+function jsonResult(status: number, body: unknown, retryAfter: string | undefined): LoginPostResult {
+  return retryAfter === undefined
+    ? { kind: "json", status, body }
+    : { kind: "json", status, body, retryAfter };
+}
+
 /** RFC 8628 form POST. Redirects are not followed. The body is capped so a token response cannot be huge. */
 export async function postForm(url: string, body: Record<string, string>): Promise<LoginPostResult> {
   try {
@@ -117,14 +132,15 @@ export async function postForm(url: string, body: Record<string, string>): Promi
       cache: "no-store",
       signal: AbortSignal.timeout(15_000),
     });
+    const retryAfter = retryAfterHeader(res);
     if (res.status >= 300 && res.status < 400) {
       await res.body?.cancel();
-      return { kind: "json", status: res.status, body: null };
+      return jsonResult(res.status, null, retryAfter);
     }
     const text = await readLimited(res, 65_536);
-    if (text === null || !text) return { kind: "json", status: res.status, body: null };
-    try { return { kind: "json", status: res.status, body: JSON.parse(text) as unknown }; }
-    catch { return { kind: "json", status: res.status, body: null }; }
+    if (text === null || !text) return jsonResult(res.status, null, retryAfter);
+    try { return jsonResult(res.status, JSON.parse(text) as unknown, retryAfter); }
+    catch { return jsonResult(res.status, null, retryAfter); }
   } catch (e) {
     return { kind: "network", message: e instanceof Error ? e.message : "network error" };
   }
@@ -212,6 +228,17 @@ function expired(io: LoginIO): void {
 }
 
 /**
+ * Seconds to wait after 429 or 503. A positive delay that still fits in the code's life is used;
+ * anything else (missing, non-numeric, huge) waits interval+5, the same step as slow_down.
+ */
+function rateLimitSeconds(header: string | undefined, remainingMs: number, interval: number): number {
+  const parsed = header === undefined ? Number.NaN : Number(header.trim());
+  const remainingSec = remainingMs / 1000;
+  if (Number.isFinite(parsed) && parsed > 0 && parsed <= remainingSec) return parsed;
+  return interval + 5;
+}
+
+/**
  * Run the device flow. Prints the user code, the host-key fingerprint, and the verification URL.
  * Opens the page when a browser is available. Polls until approval, denial, expiry, or a network failure.
  * The access token is not returned or logged. With home and hostKey it is exchanged and revoked.
@@ -243,10 +270,12 @@ export async function runLogin(opts: LoginOptions, io: LoginIO): Promise<{ ok: b
   else io.log("Could not open a browser. Open the URL above and enter the user code.");
 
   // RFC 8628 §3.5: slow_down adds 5 seconds to the interval. The token is not stored.
+  // 429/503 use one pause (the retry header, or interval+5), then the same +5 for later polls.
   let interval = device.interval;
+  let pause = interval;
   const deadline = io.now() + device.expires_in * 1000;
   for (;;) {
-    await io.sleep(interval * 1000);
+    await io.sleep(pause * 1000);
     if (io.now() >= deadline) { expired(io); return { ok: false }; }
     const polled = await io.post(`${base}${DEVICE_TOKEN_PATH}`, {
       grant_type: DEVICE_GRANT_TYPE,
@@ -259,8 +288,8 @@ export async function runLogin(opts: LoginOptions, io: LoginIO): Promise<{ ok: b
       return { ok: false };
     }
     const error = oauthError(polled.body);
-    if (error === "authorization_pending") continue;
-    if (error === "slow_down") { interval += 5; continue; }
+    if (error === "authorization_pending") { pause = interval; continue; }
+    if (error === "slow_down") { interval += 5; pause = interval; continue; }
     if (error === "access_denied") {
       io.log("Sign-in was denied.");
       io.log("Run `agentmbx login` again if you still want to sign this host in.");
@@ -271,6 +300,14 @@ export async function runLogin(opts: LoginOptions, io: LoginIO): Promise<{ ok: b
       io.log(`Sign-in stopped: ${error}.`);
       io.log("Run `agentmbx login` again.");
       return { ok: false };
+    }
+    if (polled.status === 429 || polled.status === 503) {
+      const remaining = deadline - io.now();
+      const wait = rateLimitSeconds(polled.retryAfter, remaining, interval);
+      if (wait * 1000 > remaining) { expired(io); return { ok: false }; }
+      pause = wait;
+      interval += 5;
+      continue;
     }
     if (polled.status === 200 && accessToken(polled.body)) {
       const token = readAccessToken(polled.body);

@@ -64,9 +64,19 @@ async function fakeAuth(script: {
 function answer(res: ServerResponse, step: Step | undefined): void {
   if (step === undefined) { res.statusCode = 404; res.end(); return; }
   if (step === "drop") { res.destroy(); return; }
-  res.statusCode = typeof step.error === "string" ? 400 : 200;
+  const status = typeof step.status === "number" ? step.status : typeof step.error === "string" ? 400 : 200;
+  const headers = step.headers;
+  const body = { ...step };
+  delete body.status;
+  delete body.headers;
+  res.statusCode = status;
   res.setHeader("content-type", "application/json");
-  res.end(JSON.stringify(step));
+  if (headers && typeof headers === "object") {
+    for (const [name, value] of Object.entries(headers as Record<string, unknown>)) {
+      if (typeof value === "string") res.setHeader(name, value);
+    }
+  }
+  res.end(JSON.stringify(body));
 }
 
 function deviceBody(over: Record<string, unknown> = {}): Record<string, unknown> {
@@ -400,4 +410,85 @@ test("agentmbx login exchanges the device session and fails closed", async () =>
   assert.match(help.out, /host-key fingerprint/);
   assert.match(help.out, /accounts\.agentmbx\.com\/api\/auth/);
   assert.equal(existsSync(fresh), false);
+});
+
+const LIMITED = { message: "Too many requests" };
+const APPROVED = { access_token: TOKEN, token_type: "Bearer" };
+
+test("429 and 503 wait out a retry header, then keep polling", async () => {
+  const auth = await fakeAuth({
+    polls: [
+      { status: 429, headers: { "X-Retry-After": "8" }, ...LIMITED },
+      { status: 503, headers: { "Retry-After": "3", "X-Retry-After": "30" }, ...LIMITED },
+      APPROVED,
+    ],
+  });
+  try {
+    const run = harness();
+    const outcome = await runLogin({ baseUrl: auth.base, host: "macbook", fingerprint: FP, openBrowser: false }, run.io);
+    assert.equal(outcome.ok, true);
+    // interval 5, then X-Retry-After 8, then Retry-After 3 (it wins over the paired X-Retry-After).
+    assert.deepEqual(run.sleeps, [5000, 8000, 3000]);
+    assert.equal(run.lines.join("\n").includes(TOKEN), false);
+    assert.equal(run.lines.join("\n").includes("unexpected token response"), false);
+    assert.equal(auth.requests().filter((r) => r.url === DEVICE_TOKEN_PATH).length, 3);
+  } finally { await auth.close(); }
+});
+
+test("a 429 without a retry header waits interval plus 5 seconds", async () => {
+  const auth = await fakeAuth({ polls: [{ status: 429, ...LIMITED }, APPROVED] });
+  try {
+    const run = harness();
+    const outcome = await runLogin({ baseUrl: auth.base, host: "macbook", fingerprint: FP, openBrowser: false }, run.io);
+    assert.equal(outcome.ok, true);
+    assert.deepEqual(run.sleeps, [5000, 10_000]);
+    assert.equal(run.lines.join("\n").includes(TOKEN), false);
+  } finally { await auth.close(); }
+});
+
+test("an absurd retry header falls back to interval plus 5 seconds", async () => {
+  const auth = await fakeAuth({
+    polls: [{ status: 429, headers: { "X-Retry-After": "1.8e14" }, ...LIMITED }, APPROVED],
+  });
+  try {
+    const run = harness();
+    const outcome = await runLogin({ baseUrl: auth.base, host: "macbook", fingerprint: FP, openBrowser: false }, run.io);
+    assert.equal(outcome.ok, true);
+    assert.deepEqual(run.sleeps, [5000, 10_000]);
+    assert.equal(run.sleeps.some((ms) => ms > 60_000), false);
+    assert.equal(run.lines.join("\n").includes(TOKEN), false);
+  } finally { await auth.close(); }
+});
+
+test("a rate-limit wait that would outlive the code expires instead of polling again", async () => {
+  let t = 0;
+  const auth = await fakeAuth({
+    device: deviceBody({ expires_in: 12, interval: 5 }),
+    polls: [{ status: 429, headers: { "Retry-After": "1.8e14" }, ...LIMITED }, APPROVED],
+  });
+  try {
+    const run = harness({
+      now: () => t,
+      sleep: async (ms) => { run.sleeps.push(ms); t += ms; },
+    });
+    const outcome = await runLogin({ baseUrl: auth.base, host: "macbook", fingerprint: FP, openBrowser: false }, run.io);
+    assert.equal(outcome.ok, false);
+    assert.deepEqual(run.sleeps, [5000]);
+    assert.equal(auth.requests().filter((r) => r.url === DEVICE_TOKEN_PATH).length, 1);
+    assert.ok(run.lines.includes("This sign-in code expired."));
+    assert.ok(run.lines.includes("Run `agentmbx login` again to get a new code."));
+    assert.equal(run.lines.join("\n").includes("unexpected token response"), false);
+    assert.equal(run.lines.join("\n").includes(TOKEN), false);
+  } finally { await auth.close(); }
+});
+
+test("a non-OAuth token answer still stops", async () => {
+  const auth = await fakeAuth({ polls: [{ status: 400, message: "nope" }] });
+  try {
+    const run = harness();
+    const outcome = await runLogin({ baseUrl: auth.base, host: "macbook", fingerprint: FP, openBrowser: false }, run.io);
+    assert.equal(outcome.ok, false);
+    assert.ok(run.lines.includes(`The sign-in server at ${auth.base} sent an unexpected token response.`));
+    assert.equal(auth.requests().filter((r) => r.url === DEVICE_TOKEN_PATH).length, 1);
+  } finally { await auth.close(); }
 });
