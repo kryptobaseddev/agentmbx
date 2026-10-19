@@ -185,8 +185,17 @@ export function listIdentityStatus(home, options = {}) {
         catch { /* failed inspection is unknown */ }
     }
     const evidenceOf = (pid) => evidenceByPid.get(pid) ?? { alive: null, start: null };
+    // The caller's own lease (its MCP server is the holder process) is simply held by it: not "an older process of this
+    // same session", and not something it should claim again (T316).
+    // A shared transport (Codex, OpenCode) serves many conversations from one process, so the process alone is not the
+    // caller: the lease must also name this conversation's session.
+    const ownLease = (lease) => options.caller?.pid !== undefined && lease.released_at === null
+        && lease.holder_pid === options.caller.pid && lease.cli === options.caller.cli && namesCallerSession(lease, options.caller)
+        && evidenceOf(lease.holder_pid).alive !== false;
     const callerLease = options.caller ? leases.find((l) => l.cli === options.caller.cli && namesCallerSession(l, options.caller)) : undefined;
-    const caller = options.caller ? { ...options.caller, ...(callerLease ? sameSessionProvider(callerLease, options.caller) : {}) } : undefined;
+    // T709: the provider view reads the process table (ps on macOS). An own lease is answered without it, as before T699,
+    // so a steady-state tool call spawns nothing.
+    const caller = options.caller ? { ...options.caller, ...(callerLease && !ownLease(callerLease) ? sameSessionProvider(callerLease, options.caller) : {}) } : undefined;
     const liveness = livenessSnapshot({
         names: leases.map((l) => l.name), leases, sessions: sessionRows, now,
         activity: (name) => activityByName.get(name) ?? null, conflicts, evidence: evidenceOf,
@@ -196,14 +205,7 @@ export function listIdentityStatus(home, options = {}) {
         const item = row(lease.name);
         activity(item, lease.heartbeat_at);
         activity(item, lease.released_at);
-        const evidence = evidenceOf(lease.holder_pid);
-        // The caller's own lease (its MCP server is the holder process) is simply held by it: not "an older process of this
-        // same session", and not something it should claim again (T316).
-        // A shared transport (Codex, OpenCode) serves many conversations from one process, so the process alone is not the
-        // caller: the lease must also name this conversation's session.
-        const own = options.caller?.pid !== undefined && lease.released_at === null && lease.holder_pid === options.caller.pid
-            && lease.cli === options.caller.cli && namesCallerSession(lease, options.caller) && evidence.alive !== false;
-        const a = own ? { state: "live", claimable: false, reason: "held by this session" }
+        const a = ownLease(lease) ? { state: "live", claimable: false, reason: "held by this session" }
             : liveness.get(lease.name) ?? { state: "offline", claimable: true, reason: "no session has held it under a lease" };
         item.state = a.state === "live" ? (a.claimable ? "idle" : "held") : a.state === "idle" ? "idle" : a.state === "unknown" ? "unknown" : a.state === "conflict" ? "conflict" : "available";
         item.claimable = a.claimable;
