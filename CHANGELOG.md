@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **`agentmbx login` keeps polling when the token endpoint answers 429 or 503 (T707).** A rate-limit body is not an OAuth error, so the client printed "unexpected token response" and dropped an approval that was still in progress. It now waits `Retry-After` or `X-Retry-After` when that value is a positive number of seconds that still fits in the code's life, and otherwise waits the current interval plus 5 seconds, the same step as RFC 8628 `slow_down`. A wait that would outlive the code stops with the existing expiry message. The access token is still never logged.
+
 - **Steady-state MCP tool calls start no process on macOS again (T709).** Since T699 the identity inventory built the caller's provider view even for the caller's own lease, which reads the process table: `ps` on macOS every 2 s cache window. That broke the T341 spawn budget and the v0.5.49 darwin-arm64 build. The caller's own lease is answered without that read, as before T699; a sibling server of the same session still gets the provider view. A test fakes darwin so Linux CI checks the rule.
 
 ## 0.5.49 (2026-10-17)
