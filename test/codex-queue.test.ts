@@ -1,6 +1,6 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { MbxNode } from "../src/node.ts";
@@ -11,15 +11,16 @@ import { sendLeased } from "./helpers/leased-send.ts";
 import { writeCodexQueueStub } from "./helpers/codex-queue.ts";
 import { enqueueCodexQueue, reconcileCodexQueue, type CodexQueueContext } from "../src/codex-queue.ts";
 import { captureWakeIdentity } from "../src/wake-identity.ts";
+import { codexHomeFor, recordCodexHome } from "../src/codex-home.ts";
 
-function fixture(t: TestContext, options: Parameters<typeof writeCodexQueueStub>[1] = {}) {
+function fixture(t: TestContext, options: Parameters<typeof writeCodexQueueStub>[1] = {}, thread = "exact-thread") {
   const home = mkdtempSync(join(tmpdir(), "mbx-codex-queue-")), n = new MbxNode(home, { host: "alpha" }), bin = join(home, "codex");
   writeCodexQueueStub(bin, options);
   const saved = { MBX_CODEX_BIN: process.env.MBX_CODEX_BIN, MBX_NO_DESKTOP: process.env.MBX_NO_DESKTOP };
   Object.assign(process.env, { MBX_CODEX_BIN: bin, MBX_NO_DESKTOP: "1" });
   t.after(() => { n.close(); rmSync(home, { recursive: true, force: true });
     for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v; });
-  const held = bindWakeLease(n, { agent: "reader", cli: "codex", session_id: "exact-thread", pid: process.pid });
+  const held = bindWakeLease(n, { agent: "reader", cli: "codex", session_id: thread, pid: process.pid });
   const send = () => sendLeased(n, { from: "sender", to: ["reader"], kind: "request", body: "private body", subject: "work" }).envelope.id;
   const items = () => { try { return JSON.parse(readFileSync(bin + ".queue.json", "utf8")) as { id: string; threadId: string; clientUserMessageId: string }[]; } catch { return []; } };
   const pending = () => (n.store.db.prepare("SELECT v FROM kv WHERE k GLOB 'codex-queue:*'").all() as { v: string }[]).map(r => JSON.parse(r.v) as CodexPending);
@@ -146,4 +147,35 @@ test("paged lookup deletes only the owned id beyond the first page", async t => 
   writeCodexQueueStub(f.bin, { onList: `result = p.cursor ? {data:load(),nextCursor:null} : {data:[${JSON.stringify(foreign)}],nextCursor:'page-2'};` });
   f.held.release(); await dispatchWakes(f.n);
   assert.equal(f.items().some(x => x.id === own.id), false); assert.equal(f.pending().length, 0);
+});
+
+test("T722: a withdrawal in another CODEX_HOME backs off as thread-missing, then succeeds once the home is recorded", async t => {
+  const thread = "01a156ee-bea3-74c3-959a-0ac2478e9e26", base = mkdtempSync(join(tmpdir(), "mbx-t722-"));
+  const codexHome = join(base, "orca-home"), calls = join(base, "list-calls");
+  mkdirSync(join(codexHome, "sessions", "2026", "10", "20"), { recursive: true });
+  writeFileSync(join(codexHome, "sessions", "2026", "10", "20", `rollout-2026-10-20T01-30-49-${thread}.jsonl`), "");
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const f = fixture(t, {}, thread);
+  // Codex answers "thread not found" unless the helper runs in the thread's own home.
+  writeCodexQueueStub(f.bin, { onList: `fs.appendFileSync(${JSON.stringify(calls)}, "x");
+    if (process.env.CODEX_HOME !== ${JSON.stringify(codexHome)}) {
+      process.stdout.write(JSON.stringify({ id: request.id, error: { code: -32603, message: "thread not found: " + p.threadId } }) + "\\n"); return;
+    }` });
+  const id = f.send();
+  const first = (await dispatchWakes(f.n))[0].result;
+  assert.equal(first.ok, true, JSON.stringify(first));
+  assert.equal(f.items().length, 1);
+  f.n.ack(id, "reader");
+  const listCalls = () => { try { return readFileSync(calls, "utf8").length; } catch { return 0; } };
+
+  assert.equal((await reconcileCodexQueue(f.n.store, f.bin, () => false)).get("reader"), "thread-missing");
+  assert.equal(listCalls(), 1);
+  assert.equal((await reconcileCodexQueue(f.n.store, f.bin, () => false)).get("reader"), "thread-missing", "still blocked inside the backoff");
+  assert.equal(listCalls(), 1, "no helper is started again inside the backoff");
+  assert.equal(f.pending().length, 1);
+
+  recordCodexHome(f.n.store, thread, codexHome);
+  assert.equal(codexHomeFor(f.n.store, thread), codexHome);
+  assert.equal((await reconcileCodexQueue(f.n.store, f.bin, () => false, Date.now() + 10 * 60_000)).size, 0);
+  assert.equal(f.pending().length, 0); assert.equal(f.items().length, 0, "the owned notice was withdrawn in the right home");
 });

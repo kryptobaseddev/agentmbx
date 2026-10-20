@@ -1,6 +1,7 @@
 // Codex's experimental queue API; no thread is started or resumed by this client.
 import { spawn } from "node:child_process";
 import { ulid } from "./crypto.ts";
+import { codexHomeFor } from "./codex-home.ts";
 import { identityGeneration } from "./identity-control.ts";
 import { inspectLeaseProcess, type IdentityLease } from "./identity-leases.ts";
 import type { Store } from "./store.ts";
@@ -51,8 +52,9 @@ const finished = (p: CodexPending) => {
 };
 
 /** One bounded helper for a batch, only when queue I/O is needed; no per-tool child or direct Codex database writes. */
-async function nativeQueue<T>(binary: string, operation: (call: (method: string, params: unknown) => Promise<any>, worker: Process) => Promise<T>): Promise<T> {
-  const child = spawn(binary, ["app-server", "--listen", "stdio://"], { stdio: ["pipe", "pipe", "pipe"] });
+async function nativeQueue<T>(binary: string, home: string, operation: (call: (method: string, params: unknown) => Promise<any>, worker: Process) => Promise<T>): Promise<T> {
+  // T722: the helper must open the thread's own CODEX_HOME, or Codex answers "thread not found".
+  const child = spawn(binary, ["app-server", "--listen", "stdio://"], { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, CODEX_HOME: home } });
   child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
   let buffer = "", stderr = "", nextId = 0, ended = false;
   const waiting = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
@@ -117,7 +119,7 @@ async function owned(call: (method: string, params: unknown) => Promise<any>, p:
 }
 
 async function reconcileOne(store: Store, binary: string, p: CodexPending, keep: (p: CodexPending) => boolean): Promise<boolean> {
-  return nativeQueue(binary, async call => {
+  return nativeQueue(binary, codexHomeFor(store, p.thread), async call => {
     const ids = await owned(call, p);
     if (keep(p) && ids.length) return false;
     for (const id of ids) {
@@ -130,16 +132,29 @@ async function reconcileOne(store: Store, binary: string, p: CodexPending, keep:
   });
 }
 
-export async function reconcileCodexQueue(store: Store, binary: string, keep: (p: CodexPending) => boolean): Promise<Set<string>> {
-  const blocked = new Set<string>();
+/** T722: a withdrawal that failed with thread-missing is retried on this backoff, not every daemon pass; the agent stays blocked meanwhile. */
+const CLEANUP_RETRY_MAX_MS = 5 * 60_000;
+const cleanupRetryKey = (p: CodexPending) => `codex-queue-retry:${codexPendingKey(p)}`;
+
+/** Agents whose Codex notice withdrawal is unresolved, each with the failure class that keeps it blocked. */
+export async function reconcileCodexQueue(store: Store, binary: string, keep: (p: CodexPending) => boolean, now = Date.now()): Promise<Map<string, string>> {
+  const blocked = new Map<string, string>();
   let pending: CodexPending[];
-  try { pending = records(store); } catch { return new Set(["*"]); } // preserve corrupt receipts; never guess ownership
+  try { pending = records(store); } catch { return new Map([["*", "invalid-receipt"]]); } // preserve corrupt receipts; never guess ownership
   for (const p of pending) if (!keep(p)) {
-    try { if (!await reconcileOne(store, binary, p, keep)) blocked.add(p.agent); }
-    catch (error) {
-      blocked.add(p.agent);
+    let retry: { n: number; next: number; reason: string } | null = null;
+    try { retry = JSON.parse(store.get(cleanupRetryKey(p)) ?? "null"); } catch { /* unreadable: retry now */ }
+    if (retry && now < retry.next) { blocked.set(p.agent, retry.reason); continue; }
+    try {
+      if (!await reconcileOne(store, binary, p, keep)) blocked.set(p.agent, "pending");
+      else store.db.prepare("DELETE FROM kv WHERE k=?").run(cleanupRetryKey(p));
+    } catch (error) {
       const e = error as Error & { exitCode?: number; stderrClass?: string; rpcCode?: number };
-      store.audit("codex.queue.cleanup_failed", { agent: p.agent, thread: p.thread, exitCode: e.exitCode ?? null, rpcCode: e.rpcCode ?? null, stderrClass: e.stderrClass ?? codexFailureClass(e.message) });
+      const reason = e.stderrClass ?? codexFailureClass(e.message), n = (retry?.n ?? 0) + 1;
+      blocked.set(p.agent, reason);
+      // Only a missing thread backs off: it will not heal between passes, while an unavailable provider can.
+      if (reason === "thread-missing") store.set(cleanupRetryKey(p), JSON.stringify({ n, next: now + Math.min(2_000 * 2 ** n, CLEANUP_RETRY_MAX_MS), reason }));
+      store.audit("codex.queue.cleanup_failed", { agent: p.agent, thread: p.thread, exitCode: e.exitCode ?? null, rpcCode: e.rpcCode ?? null, stderrClass: reason, retry: n });
     }
   }
   return blocked;
@@ -166,7 +181,7 @@ export async function enqueueCodexQueue(binary: string, thread: string, message:
   }, false);
   let submitted = false;
   try {
-    return await nativeQueue(binary, async (call, worker) => {
+    return await nativeQueue(binary, codexHomeFor(store, thread), async (call, worker) => {
       context.run(() => {
         if (!sameRecord(store, pending) || !recheck()) throw fail("CODEX_QUEUE_FENCED", "Codex wake authority changed");
         pending.worker = worker; store.set(codexPendingKey(pending), JSON.stringify(pending));

@@ -603,7 +603,8 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
     for (const guard of automatic.length ? sessions : []) {
       const s = guard.session;
       if (s.cli === "codex" && (codexBlocked.has(agent) || codexBlocked.has("*"))) {
-        result = outcome("codex queue", { kind: "busy" }, "previous Codex notice withdrawal is unresolved"); break;
+        const why = codexBlocked.get(agent) ?? codexBlocked.get("*");
+        result = outcome("codex queue", { kind: "busy" }, `previous Codex notice withdrawal is unresolved (${why})`); break;
       }
       const recheck = () => {
         try { return guard.run(() => automatic.every(r => {
@@ -657,7 +658,7 @@ export async function dispatchWakes(node: MbxNode, now = Date.now()): Promise<{ 
       // A previous adapter failure could have submitted a wake before losing its response. Retain
       // that budget; only refund the known-unsent first attempt, by its own reservation identity.
       if (attempts === 1) reservation.release?.();
-      node.store.audit("wake", { agent, via: result.via, ok: false, busy: true, count: wanted.length });
+      node.store.audit("wake", { agent, via: result.via, ok: false, busy: true, count: wanted.length, ...(!result.ok && result.error ? { reason: result.error.slice(0, 200) } : {}) });
       out.push({ agent, result });
       continue;
     }
