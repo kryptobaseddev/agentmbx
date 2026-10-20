@@ -47,6 +47,7 @@ import { recordMcpGeneration, startMcpLifecycle } from "./mcp-lifecycle.ts";
 import { projectLabel, projectMailboxBySlot, projectsLedBy, resolveProjectMailbox } from "./project-mailbox.ts";
 import { isSlotName } from "./project-slot.ts";
 import { recordMcpStartupError } from "./logs.ts";
+import { recordCodexHome } from "./codex-home.ts";
 
 let lifecycle: ReturnType<typeof startMcpLifecycle> | undefined;
 
@@ -1062,6 +1063,9 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
   node.store.db.exec("PRAGMA busy_timeout=5000");
   // An unbound session stays reachable for the owner's CLI (identity claim/takeover --cli --session).
   if (!bound(base) && !base.released) try { prepareState(base, undefined, () => publishControl(base)); } catch { /* evidence unavailable: retried by later binds */ }
+  // T722: the daemon's Codex queue helper must open each thread's own CODEX_HOME (Orca runs Codex with its own).
+  const codexHomes = new Set<string>();
+  if (env.cli === "codex" && !base.sessionId.startsWith("mcp-")) { codexHomes.add(base.sessionId); try { recordCodexHome(node.store, base.sessionId); } catch { /* best effort */ } }
   const contextFor = (extra: unknown): State => {
     if (env.cli !== "opencode" && env.cli !== "codex") return base;
     const meta = (extra as { _meta?: Record<string, unknown> } | undefined)?._meta;
@@ -1080,6 +1084,7 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
     }
     const valid = env.cli === "codex" ? /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i : /^ses_[a-zA-Z0-9]{1,128}$/;
     if (typeof sid !== "string" || !valid.test(sid)) throw new Error(`Invalid ${env.cli} session identity metadata`);
+    if (env.cli === "codex" && !codexHomes.has(sid)) { codexHomes.add(sid); try { recordCodexHome(node.store, sid); } catch { /* retried on the next process */ } }
     // A hook-resumed base already represents this exact conversation; a second State would use a different key.
     if (sid === base.sessionId) return base;
     let state = states.get(sid);

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Codex queue wakes reach sessions launched with their own CODEX_HOME (T722).** Orca runs Codex with a per-account `CODEX_HOME`, but the daemon's queue helper started `codex app-server` in the default `~/.codex`, so Codex answered "thread not found" for the thread. A queued notice could then never be withdrawn, and every later automatic wake for that mailbox was reported as `busy`, indefinitely. The MCP server now records the CODEX_HOME of each Codex thread it serves, and the helper runs in that home. Sessions started before this release are found by locating their rollout under the default or Orca account homes. A withdrawal that still fails with `thread-missing` backs off (up to 5 minutes) instead of retrying every pass, and the wake audit gives the reason instead of a bare `busy`.
+
 ## 0.5.50 (2026-10-19)
 
 - **`agentmbx login` keeps polling when the token endpoint answers 429 or 503 (T707).** A rate-limit body is not an OAuth error, so the client printed "unexpected token response" and dropped an approval that was still in progress. It now waits `Retry-After` or `X-Retry-After` when that value is a positive number of seconds that still fits in the code's life, and otherwise waits the current interval plus 5 seconds, the same step as RFC 8628 `slow_down`. A wait that would outlive the code stops with the existing expiry message. The access token is still never logged.

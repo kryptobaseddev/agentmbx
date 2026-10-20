@@ -47,6 +47,7 @@ import { recordMcpGeneration, startMcpLifecycle } from "./mcp-lifecycle.js";
 import { projectLabel, projectMailboxBySlot, projectsLedBy, resolveProjectMailbox } from "./project-mailbox.js";
 import { isSlotName } from "./project-slot.js";
 import { recordMcpStartupError } from "./logs.js";
+import { recordCodexHome } from "./codex-home.js";
 let lifecycle;
 /** Scripted mailbox access. `reply` is not a CLI command; an answer is `send --reply-to`. */
 export const CLI_MAILBOX_RECOVERY = "agentmbx inbox/read/ack/send --as <name> (answer with send --reply-to)";
@@ -1254,6 +1255,15 @@ async function configureMcp(server, node, startupClosed) {
             prepareState(base, undefined, () => publishControl(base));
         }
         catch { /* evidence unavailable: retried by later binds */ }
+    // T722: the daemon's Codex queue helper must open each thread's own CODEX_HOME (Orca runs Codex with its own).
+    const codexHomes = new Set();
+    if (env.cli === "codex" && !base.sessionId.startsWith("mcp-")) {
+        codexHomes.add(base.sessionId);
+        try {
+            recordCodexHome(node.store, base.sessionId);
+        }
+        catch { /* best effort */ }
+    }
     const contextFor = (extra) => {
         if (env.cli !== "opencode" && env.cli !== "codex")
             return base;
@@ -1274,6 +1284,13 @@ async function configureMcp(server, node, startupClosed) {
         const valid = env.cli === "codex" ? /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i : /^ses_[a-zA-Z0-9]{1,128}$/;
         if (typeof sid !== "string" || !valid.test(sid))
             throw new Error(`Invalid ${env.cli} session identity metadata`);
+        if (env.cli === "codex" && !codexHomes.has(sid)) {
+            codexHomes.add(sid);
+            try {
+                recordCodexHome(node.store, sid);
+            }
+            catch { /* retried on the next process */ }
+        }
         // A hook-resumed base already represents this exact conversation; a second State would use a different key.
         if (sid === base.sessionId)
             return base;
