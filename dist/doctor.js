@@ -1105,6 +1105,23 @@ export async function doctor(ctx, mbxHome, opts = {}) {
         }));
         for (const p of peers.filter((x) => x.state === "pending"))
             add("warn", `pairing with ${p.host} pending (code ${p.code})`, `if ${p.host} shows the same code: agentmbx pair approve ${p.host} ${p.code}`);
+        // T722: a Codex notice the daemon cannot withdraw blocks every automatic Codex wake for that mailbox.
+        for (const r of node.store.db.prepare("SELECT k, v FROM kv WHERE k GLOB 'codex-queue-retry:*'").all()) {
+            let retry = {};
+            try {
+                retry = JSON.parse(r.v);
+            }
+            catch { /* shown without detail */ }
+            const pending = (() => { try {
+                return JSON.parse(node.store.get(r.k.slice("codex-queue-retry:".length)) ?? "null");
+            }
+            catch {
+                return null;
+            } })();
+            if (!pending)
+                continue; // the notice was withdrawn since
+            add("warn", `codex: notice withdrawal unresolved (${retry.reason ?? "unknown"}) for ${pending.agent} thread ${pending.thread}, after ${retry.n ?? 0} attempt(s); automatic Codex wakes for it are held until it clears`, "the daemon retries with backoff; thread-missing usually means the thread's CODEX_HOME is not known to this host (T722)");
+        }
         const relay = process.env.MBX_RELAY_URL ?? node.config.relay ?? null;
         if (relay) {
             // G13, T168: the client keys its enrolment by host key (v1) or by host key, relay key and epoch (v2). Only the flag

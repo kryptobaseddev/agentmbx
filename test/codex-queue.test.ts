@@ -12,6 +12,7 @@ import { writeCodexQueueStub } from "./helpers/codex-queue.ts";
 import { enqueueCodexQueue, reconcileCodexQueue, type CodexQueueContext } from "../src/codex-queue.ts";
 import { captureWakeIdentity } from "../src/wake-identity.ts";
 import { codexHomeFor, recordCodexHome } from "../src/codex-home.ts";
+import { doctor } from "../src/doctor.ts";
 
 function fixture(t: TestContext, options: Parameters<typeof writeCodexQueueStub>[1] = {}, thread = "exact-thread") {
   const home = mkdtempSync(join(tmpdir(), "mbx-codex-queue-")), n = new MbxNode(home, { host: "alpha" }), bin = join(home, "codex");
@@ -173,9 +174,14 @@ test("T722: a withdrawal in another CODEX_HOME backs off as thread-missing, then
   assert.equal((await reconcileCodexQueue(f.n.store, f.bin, () => false)).get("reader"), "thread-missing", "still blocked inside the backoff");
   assert.equal(listCalls(), 1, "no helper is started again inside the backoff");
   assert.equal(f.pending().length, 1);
+  const withdrawal = async () => (await doctor({ home: base, cmd: ["agentmbx"], which: () => null, useClis: false }, f.n.home, { peerTimeoutMs: 100 }))
+    .filter(c => c.label.includes("notice withdrawal unresolved"));
+  const shown = await withdrawal();
+  assert.equal(shown.length, 1); assert.match(shown[0].label, /\(thread-missing\) for reader thread 01a156ee/);
 
   recordCodexHome(f.n.store, thread, codexHome);
   assert.equal(codexHomeFor(f.n.store, thread), codexHome);
   assert.equal((await reconcileCodexQueue(f.n.store, f.bin, () => false, Date.now() + 10 * 60_000)).size, 0);
   assert.equal(f.pending().length, 0); assert.equal(f.items().length, 0, "the owned notice was withdrawn in the right home");
+  assert.deepEqual(await withdrawal(), [], "doctor stops reporting once the notice is withdrawn");
 });

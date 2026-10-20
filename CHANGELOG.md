@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **`agentmbx doctor` names a Codex notice the daemon cannot withdraw (T722).** While a withdrawal keeps failing (for example `thread-missing`), doctor warns with the mailbox, thread, failure class and attempt count, and says automatic Codex wakes for it are held. The warning clears once the notice is withdrawn.
+
 ## 0.5.51 (2026-10-19)
 
 - **Codex queue wakes reach sessions launched with their own CODEX_HOME (T722).** Orca runs Codex with a per-account `CODEX_HOME`, but the daemon's queue helper started `codex app-server` in the default `~/.codex`, so Codex answered "thread not found" for the thread. A queued notice could then never be withdrawn, and every later automatic wake for that mailbox was reported as `busy`, indefinitely. The MCP server now records the CODEX_HOME of each Codex thread it serves, and the helper runs in that home. Sessions started before this release are found by locating their rollout under the default or Orca account homes. A withdrawal that still fails with `thread-missing` backs off (up to 5 minutes) instead of retrying every pass, and the wake audit gives the reason instead of a bare `busy`.
