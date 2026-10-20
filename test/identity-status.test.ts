@@ -8,6 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import { MbxNode } from "../src/node.ts";
 import { IdentityLeases } from "../src/identity-leases.ts";
 import { listIdentityStatus } from "../src/identity-status.ts";
+import { _resetProcCache, procSeams } from "../src/proc.ts";
 
 const cli = (home: string, ...args: string[]) => spawnSync(process.execPath, [resolve("bin/agentmbx.js"), ...args], {
   encoding: "utf8", env: { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1" }, timeout: 20_000,
@@ -83,4 +84,27 @@ test("identity inventory refuses future schemas without modifying them", t => {
   const before = readFileSync(join(home, "mbx.db"));
   assert.throws(() => listIdentityStatus(home), { code: "STALE_SERVER" });
   assert.deepEqual(readFileSync(join(home, "mbx.db")), before);
+});
+
+test("T709: listing the caller's own lease reads no process table, even on macOS", t => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-t709-")), node = new MbxNode(home, { host: "alpha" });
+  const saved = { platform: procSeams.platform, ps: procSeams.ps };
+  let spawns = 0;
+  // Fake darwin on every CI platform: the table read becomes a counted ps call instead of /proc.
+  procSeams.platform = "darwin";
+  procSeams.ps = () => { spawns += 1; return ""; };
+  _resetProcCache();
+  t.after(() => { procSeams.platform = saved.platform; procSeams.ps = saved.ps; _resetProcCache(); node.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const now = Date.now();
+  const leases = new IdentityLeases(node.store, { clock: () => now, inspect: pid => ({ alive: true, start: `birth-${pid}` }) });
+  leases.claim("worker", { pid: 4242, start: "birth-4242", cli: "claude", sessionId: "s-own", keyFp: "aaaa-bbbb-cccc-dddd" });
+  const inspect = (pid: number) => ({ alive: true, start: `birth-${pid}` });
+
+  const own = listIdentityStatus(home, { now, inspect, caller: { cli: "claude", sessionId: "s-own", pid: 4242, providerPid: 4000 } });
+  assert.equal(own.identities.find(i => i.name === "worker")?.state, "held");
+  assert.equal(spawns, 0, "the caller's own lease is answered without ps");
+
+  // Control: another server of the same session still needs the provider view, so the seam is really exercised.
+  listIdentityStatus(home, { now, inspect, caller: { cli: "claude", sessionId: "s-own", pid: 5151, providerPid: 5000 } });
+  assert.equal(spawns, 1, "a sibling server of the same session reads the table once");
 });
