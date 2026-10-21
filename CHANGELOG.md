@@ -2,7 +2,10 @@
 
 ## Unreleased
 
+## 0.5.52 (2026-10-21)
+
 - **A message with an empty body is refused, not stored (T726).** An Antigravity agent ran `agentmbx send … --subject "…" "the text"` from its shell tool. The positional text was silently ignored, and stdin at `/dev/null` became an empty body, so three messages were signed and delivered with only a subject. `agentmbx send` now refuses a positional argument, and every send path (`mbx_send`, `mbx_reply`, `agentmbx send`, owner sends) refuses an empty or whitespace-only body with `EMPTY_BODY` and stores nothing.
+
 - **An OpenCode conversation that lost its mailbox no longer keeps it held for the conversation that took it (T723).** On a shared OpenCode serve, every prompt and tool call in a conversation whose mailbox another conversation had claimed ran an mbx hook that borrowed the holder's control entry. That marked the holder active forever, so the quiet holder could never be claimed back, and it pointed the conversation's owner takeover (`identity takeover --force`) and its CLI claim at the holder, which refused the takeover as "your own live session" and completed the claim without moving the lease. Hooks now borrow a holder only when its lease is for this same conversation. The holder's MCP withdraws aliases an older hook borrowed. Only the holder's own key normalizes a control entry's lease session. The OpenCode sidebar and `agentmbx status --schema mbx.status/v2` show `mbx lost <name> — held by <cli> <session>` instead of the name as if it were held.
 
 - **`agentmbx doctor` names a Codex notice the daemon cannot withdraw (T722).** While a withdrawal keeps failing (for example `thread-missing`), doctor warns with the mailbox, thread, failure class and attempt count, and says automatic Codex wakes for it are held. The warning clears once the notice is withdrawn.
