@@ -863,6 +863,9 @@ export class MbxNode {
         const fromName = d.from.includes("@") ? d.from.split("@")[0] : d.from;
         if (!NAME_RE.test(fromName) && fromName !== "owner")
             throw new Error(`invalid sender name "${fromName}"`);
+        // T726: an empty body is a client that dropped its text (agy did), never a message; refuse it rather than store it.
+        if (!(prebuilt?.body ?? d.body ?? "").trim() && !prebuilt?.enc)
+            throw Object.assign(new Error("message body is empty: pass the text in `body` (nothing was sent)"), { code: "EMPTY_BODY" });
         // A prebuilt envelope is already signed, so its `to` stays. Callers that build one (sendAsOwner)
         // resolve lead tokens before that signature.
         const lead = prebuilt ? { to: d.to, leadAddress: null } : resolveLeadRecipients(this, fromName, d.to, d.project);
