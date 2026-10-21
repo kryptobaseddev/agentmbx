@@ -787,6 +787,8 @@ async function run(argv: string[]) {
       const payload = str("payload") as SendProvenanceScope["payload"];
       if (payload !== undefined && !["agent", "firsthand-outside", "derived-outside"].includes(payload)) die("--payload must be agent, firsthand-outside or derived-outside");
       // Read external input before acquiring the lease's database lock.
+      // T726: a positional argument is not the body (it was silently dropped, and stdin from /dev/null sent an empty message).
+      if (pos.length) die(`unexpected argument ${JSON.stringify(pos[0])}: pass the body with -m "...", --body-file <f> or stdin`);
       const body = str("m") ?? (str("body-file") ? readFileSync(str("body-file")!, "utf8") : stdinIsTTY() ? "" : readStdin());
       // T583: --urgent mentions the resolved recipients so message/reply mail wakes them; refused with status or * before any write
       assertUrgent(!!o.urgent, (str("kind") ?? "message") as Envelope["kind"], (str("to") ?? "").split(",").map(s => s.trim()).filter(Boolean));
