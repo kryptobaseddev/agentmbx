@@ -48,6 +48,8 @@ export interface StatusV2Identity {
   role: string | null;
   state: "bound" | "unbound" | "ambiguous";
   candidates?: string[];
+  /** T723 (additive): this session's binding names a mailbox another holder's live lease now has. */
+  lost_to?: { name: string; cli: string; session: string };
 }
 
 /** The identity lease this (cli, session) holds, when it holds one. \`verified\` means process evidence
@@ -129,6 +131,8 @@ export const formatStatusV2 = (value: unknown): string => {
   const s = snapshot(value);
   if (!s) return "mbx disconnected — check agentmbx doctor";
   const id = s.identity ?? {};
+  // T723: a binding whose mailbox another conversation now holds is not this session's; never show it as held.
+  if (!bound(s) && id.lost_to) return "mbx lost " + clean(id.lost_to.name) + " — held by " + clean(id.lost_to.cli) + " " + clean(id.lost_to.session, 16);
   if (!bound(s)) return id.state === "ambiguous" ? "mbx ambiguous — check mbx_whoami" : "mbx unbound — claim or register a persona";
   const tag = clean(id.name) + (id.role ? "(" + clean(id.role) + ")" : "");
   const inbox = s.inbox ?? {};
@@ -146,6 +150,9 @@ export const formatStatusV2 = (value: unknown): string => {
 export const statusSections = (value: unknown, project = "project-dev", now = Date.now()): { title: string; lines: string[] }[] => {
   const s = snapshot(value);
   if (!s) return [{ title: "Disconnected", lines: ["Status daemon unavailable.", "Check agentmbx doctor; no cached mailbox data shown."] }];
+  const lost = s.identity?.lost_to;
+  if (!bound(s) && lost) return [{ title: "Mailbox lost", lines: [clean(lost.name) + " is held by " + clean(lost.cli) + " session " + clean(lost.session) + ", not this session.",
+    "Ask its holder to call mbx_identity release, then claim it here.", "Mailbox data is hidden."] }];
   if (!bound(s)) return [{ title: s.identity?.state === "ambiguous" ? "Ambiguous binding" : "No persona", lines: s.identity?.state === "ambiguous"
     ? ["Check mbx_whoami and ask the owner to resolve the binding.", "Mailbox data is hidden."]
     : ["Ask this agent: mbx_identity list, then claim your persona", "or register " + clean(project) + ". No identity is chosen automatically."] }];

@@ -1,11 +1,21 @@
+// Which mailbox a status display (statusline, HUD, `agentmbx status`) belongs to (T310). Read-only and display-only:
+// it never grants anything. Resolution is exact: the provider's current session id, then that provider process's own
+// bindings (one live holder under that pid), else unbound. It never guesses from a directory or a shared default name,
+// because in a folder used by several agents that name belongs to whoever registered it first (owner report 2026-10-02).
+import { fingerprint } from "./crypto.js";
 import { claudeSessionId } from "./proc.js";
 export function resolveStatusIdentity(node, cli, o = {}) {
     const db = node.store.db;
     const sid = o.sessionId ?? (cli === "claude" && o.pid ? claudeSessionId(o.pid) : null);
     if (sid) {
-        const row = db.prepare("SELECT agent FROM sessions WHERE cli=? AND session_id=?").get(cli, sid);
-        if (row)
+        const row = db.prepare("SELECT agent,session_key FROM sessions WHERE cli=? AND session_id=?").get(cli, sid);
+        if (row) {
+            const lease = db.prepare("SELECT cli,session_id,key_fp FROM identity_leases WHERE name=? AND released_at IS NULL").get(row.agent);
+            // T723: on a shared OpenCode serve, a conversation whose mailbox another conversation took keeps its binding row.
+            if (cli === "opencode" && lease && (lease.cli !== cli || lease.session_id !== sid) && row.session_key && fingerprint(row.session_key) !== lease.key_fp)
+                return { name: null, state: "unbound", resolved_by: null, lost_to: { name: row.agent, cli: lease.cli, session: lease.session_id } };
             return { name: row.agent, state: "bound", resolved_by: "session_id" };
+        }
     }
     if (o.pid) {
         // The provider process's own bindings, held by a live lease: after /clear the session row may still carry the
