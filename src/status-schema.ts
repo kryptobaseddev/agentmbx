@@ -15,6 +15,8 @@ export interface StatusV2Identity {
   role: string | null;
   state: "bound" | "unbound" | "ambiguous";
   candidates?: string[];
+  /** T723 (additive): this session's binding names a mailbox another holder's live lease now has. */
+  lost_to?: { name: string; cli: string; session: string };
 }
 
 /** The identity lease this (cli, session) holds, when it holds one. `verified` means process evidence

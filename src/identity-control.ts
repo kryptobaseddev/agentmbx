@@ -38,7 +38,8 @@ export function publishIdentityControl(store: Store, descriptor: IdentityControl
   // converges on the row's id here — an in-bindSession rewrite would not stick, because the hook re-publishes its
   // pre-bind descriptor in the same call. Only the exact holder (mcp_pid/mcp_start match) is normalized; when the row
   // and the descriptor agree, or no live lease matches, the descriptor publishes as given.
-  const lease = store.db.prepare("SELECT session_id,holder_start FROM identity_leases WHERE name=? AND holder_pid=? AND released_at IS NULL").get(valid.agent, valid.mcp_pid) as
+  // T723: a shared OpenCode MCP serves many conversations from one pid; only the holder's own key is the holder.
+  const lease = store.db.prepare("SELECT session_id,holder_start FROM identity_leases WHERE name=? AND holder_pid=? AND key_fp=? AND released_at IS NULL").get(valid.agent, valid.mcp_pid, valid.control_key) as
     { session_id: string; holder_start: string | null } | undefined;
   const normalized = lease && lease.session_id !== valid.lease_session_id && lease.holder_start !== null
     && recordedStartMatches(lease.holder_start, valid.mcp_start)

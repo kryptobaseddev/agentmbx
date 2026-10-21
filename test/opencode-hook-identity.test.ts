@@ -66,3 +66,34 @@ test("T466 one OpenCode control is not this session without a name or --session"
     assert.equal(withCliIdentity(w.n, { cli: "opencode", session: "mcp-a" }, (agent) => agent), "agent-a");
   } finally { w.close(); }
 });
+
+test("T723 a conversation whose name another real conversation holds never borrows that holder", () => {
+  const w = world();
+  try {
+    bindWakeLease(w.n, { agent: "agent-a", cli: "opencode", session_id: "ses_holder", pid: process.ppid });
+    const holder = findIdentityControl(w.n.store, "opencode", "ses_holder");
+    // The victim lost agent-a to ses_holder; its own (released) state published an endpoint under its own key.
+    w.n.store.set("name:opencode:ses_victim", "agent-a");
+    assert.throws(() => withHookIdentity(w.n, "opencode", "ses_victim", () => {}), /no exact current MCP binding/);
+    assert.throws(() => findIdentityControl(w.n.store, "opencode", "ses_victim"), /no running MCP control endpoint/, "no alias of the holder was published");
+    const victim = { ...holder, session_id: "ses_victim", lease_session_id: "ses_victim", control_key: "aaaa-bbbb-cccc-dddd", generation: null };
+    publishIdentityControl(w.n.store, victim);
+    assert.equal(findIdentityControl(w.n.store, "opencode", "ses_victim").lease_session_id, "ses_victim",
+      "a sibling in the same shared MCP keeps its own lease session: only the holder's key is the holder");
+    publishIdentityControl(w.n.store, { ...holder, lease_session_id: "ses_old" });
+    assert.equal(findIdentityControl(w.n.store, "opencode", "ses_holder").lease_session_id, "ses_holder", "the exact holder is still normalized (T656)");
+  } finally { w.close(); }
+});
+
+test("T723 status for a conversation that lost its mailbox to another conversation reports the loss, not the name", async () => {
+  const { resolveStatusIdentity } = await import("../src/status-identity.ts");
+  const w = world();
+  try {
+    bindWakeLease(w.n, { agent: "agent-a", cli: "opencode", session_id: "ses_holder", pid: process.ppid });
+    // the victim's binding row survives with its own (old) key after the holder took agent-a
+    w.n.bindSession({ agent: "agent-a", cli: "opencode", session_id: "ses_victim", pid: process.ppid, session_key: "dmljdGltLWtleQ==" });
+    assert.deepEqual(resolveStatusIdentity(w.n, "opencode", { sessionId: "ses_victim" }),
+      { name: null, state: "unbound", resolved_by: null, lost_to: { name: "agent-a", cli: "opencode", session: "ses_holder" } });
+    assert.equal(resolveStatusIdentity(w.n, "opencode", { sessionId: "ses_holder" }).state, "bound");
+  } finally { w.close(); }
+});

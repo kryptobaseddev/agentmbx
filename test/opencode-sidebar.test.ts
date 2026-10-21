@@ -316,3 +316,13 @@ for (const state of ["bound", "unbound", "cloud-down", "peers-down"]) test(`T413
   assert.equal(JSON.stringify(fixture), before, "renderer never changes shared fixture inputs");
   assert.equal(ui.toasts.length, 0, "loading a fixture backlog never emits a new-mail toast");
 });
+
+test("T723: a conversation whose mailbox another conversation now holds shows the loss, never the name as held", async (t) => {
+  const { mod, dir } = await loadPlugin();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const lost = { ...FIXTURE_UNBOUND, identity: { name: null, role: null, state: "unbound", lost_to: { name: "axiom-lab-dev", cli: "opencode", session: "ses_eb054f813ffeln2D4EWV1oNkeu" } } };
+  assert.equal(mod.formatStatusV2(lost), "mbx lost axiom-lab-dev — held by opencode ses_eb054f813ffe");
+  const [section] = mod.statusSections(lost);
+  assert.equal(section?.title, "Mailbox lost");
+  assert.match(section?.lines[0] ?? "", /axiom-lab-dev is held by opencode session ses_eb054f813ffeln2D4EWV1oNkeu, not this session/);
+});

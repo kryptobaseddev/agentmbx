@@ -59,7 +59,7 @@ test("critical: a pid shared by several sessions gets NO pid file — an unknown
   // two opencode sessions under one live pid (the owner's probe): the resolver is ambiguous on the pid
   n.bindSession({ agent: "one", cli: "opencode", session_id: "oc-1", pid: process.pid, session_key: "k1" });
   n.bindSession({ agent: "other", cli: "opencode", session_id: "oc-2", pid: process.pid, session_key: "k2" });
-  claim(n, "one", "oc-1"); claim(n, "other", "oc-2");
+  claim(n, "one", "oc-1", "opencode"); claim(n, "other", "oc-2", "opencode");
   writeHud(n);
   assert.ok(existsSync(hudSessionPath(h, "opencode", "oc-1")), "each session keeps its own namespaced file");
   assert.equal(readdirSync(hudDir(h)).filter(f => f.includes("-pid-")).length, 0, "no pid file while the resolver is ambiguous");
