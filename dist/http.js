@@ -443,12 +443,12 @@ export function startServer(node, port = node.config.port, bind = node.config.bi
                     if (url.searchParams.get("schema") === STATUS_V2_SCHEMA)
                         return send(200, hudStatusV2(node, {
                             cli, sessionId: session, agent: resolved.name, state: resolved.state,
-                            resolvedBy: resolved.resolved_by ?? "none", candidates: resolved.candidates,
+                            resolvedBy: resolved.resolved_by ?? "none", candidates: resolved.candidates, lostTo: resolved.lost_to,
                             includeInbox: url.searchParams.get("include") === "inbox",
                         }));
                     return send(200, hudStatus(node, {
                         agent: resolved.name, state: resolved.state,
-                        resolvedBy: resolved.resolved_by ?? "none", candidates: resolved.candidates,
+                        resolvedBy: resolved.resolved_by ?? "none", candidates: resolved.candidates, lostTo: resolved.lost_to,
                     }));
                 }
                 const challenge = url.searchParams.get("challenge");
