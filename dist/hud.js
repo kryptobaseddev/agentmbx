@@ -61,7 +61,7 @@ export function hudStatus(node, o) {
     const policies = name ? activePolicies(node.store.db, name, node.host) : [];
     return {
         schema: HUD_SCHEMA, mbx_version: version(), update_available: updateAvailable(node.store),
-        identity: { name, role, state: o.state, ...(o.candidates ? { candidates: o.candidates } : {}) },
+        identity: { name, role, state: o.state, ...(o.candidates ? { candidates: o.candidates } : {}), ...(o.lostTo ? { lost_to: o.lostTo } : {}) },
         unread, new: fresh, read, needs_reply, from_owner,
         outbox_unsent: Number(outbox.n),
         policy: policies.map((p) => p.level),
@@ -257,7 +257,7 @@ const WAKE_PATH = {
  * lease/session-row lookups that need a session id.
  */
 export function hudStatusV2(node, o, cached) {
-    const v1 = cached?.v1 ?? hudStatus(node, { agent: o.agent, state: o.state, resolvedBy: o.resolvedBy, candidates: o.candidates });
+    const v1 = cached?.v1 ?? hudStatus(node, { agent: o.agent, state: o.state, resolvedBy: o.resolvedBy, candidates: o.candidates, lostTo: o.lostTo });
     const name = o.agent;
     const sessionRow = o.sessionId
         ? node.store.db.prepare("SELECT agent, cwd, channel FROM sessions WHERE cli=? AND session_id=?").get(o.cli, o.sessionId)

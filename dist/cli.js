@@ -1062,7 +1062,7 @@ async function run(argv) {
                     : resolveStatusIdentity(node, cli, { pid: process.ppid });
                 return console.log(JSON.stringify(hudStatusV2(node, {
                     cli, sessionId: sid, agent: resolved.name, state: resolved.state,
-                    resolvedBy: resolved.resolved_by ?? "none", candidates: resolved.candidates,
+                    resolvedBy: resolved.resolved_by ?? "none", candidates: resolved.candidates, lostTo: resolved.lost_to,
                 }), null, 2));
             }
             if (o.json && str("schema") === HUD_SCHEMA) {
@@ -1075,7 +1075,7 @@ async function run(argv) {
                 const resolved = sid
                     ? resolveStatusIdentity(node, str("cli") ?? "", { sessionId: sid })
                     : resolveStatusIdentity(node, str("cli") ?? "", { pid: process.ppid });
-                return console.log(JSON.stringify(hudStatus(node, { agent: resolved.name, state: resolved.state, resolvedBy: resolved.resolved_by ?? "none", candidates: resolved.candidates }), null, 2));
+                return console.log(JSON.stringify(hudStatus(node, { agent: resolved.name, state: resolved.state, resolvedBy: resolved.resolved_by ?? "none", candidates: resolved.candidates, lostTo: resolved.lost_to }), null, 2));
             }
             const sid = str("session");
             if (sid) {

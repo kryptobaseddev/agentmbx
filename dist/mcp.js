@@ -746,6 +746,17 @@ async function configureMcp(server, node, startupClosed) {
             return;
         const ownKey = fingerprint(state.key.publicKey);
         for (const sid of new Set(controlSessionIds(state))) {
+            // T723: an OpenCode conversation's state answers only for itself. An alias of another real conversation (one an older
+            // hook borrowed) is withdrawn, so that conversation's own state, the owner's takeover and its claims reach it again.
+            if (env.cli === "opencode" && sid !== state.sessionId && !state.sessionId.startsWith("mcp-")) {
+                const k = identityControlKey(env.cli, sid);
+                try {
+                    if (JSON.parse(node.store.get(k) ?? "null")?.control_key === ownKey)
+                        node.store.db.prepare("DELETE FROM kv WHERE k=?").run(k);
+                }
+                catch { /* malformed: leave it to the endpoint parser */ }
+                continue;
+            }
             if (foreignControlLive(sid, ownKey, state))
                 continue;
             const descriptor = controlDescriptor(state, sid);
