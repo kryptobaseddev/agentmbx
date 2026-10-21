@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **A message with an empty body is refused, not stored (T726).** An Antigravity session's `mbx_send` calls reached the daemon with `body: ""`, and the messages were signed and delivered with no text, so the recipient saw only a subject. Every send path (`mbx_send`, `mbx_reply`, `agentmbx send`, owner sends) now refuses an empty or whitespace-only body with `EMPTY_BODY` and stores nothing.
+
 - **`agentmbx doctor` names a Codex notice the daemon cannot withdraw (T722).** While a withdrawal keeps failing (for example `thread-missing`), doctor warns with the mailbox, thread, failure class and attempt count, and says automatic Codex wakes for it are held. The warning clears once the notice is withdrawn.
 
 ## 0.5.51 (2026-10-19)
