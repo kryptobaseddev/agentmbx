@@ -52,6 +52,9 @@ function restoreOpencode(node: MbxNode, session: string): IdentityControlDescrip
   for (const descriptor of listIdentityControls(node.store)) {
     if (descriptor.cli !== "opencode" || descriptor.agent !== named || descriptor.session_id === session) continue;
     if (!opencodeHolderLive(node, descriptor)) continue;
+    // T723: a lease held for another real conversation is that conversation's, not this one's. Borrowing it would mark
+    // the holder active on this session's every prompt and point owner takeover and CLI claims at the holder.
+    if (descriptor.lease_session_id !== session && !descriptor.lease_session_id.startsWith("mcp-")) continue;
     const kept = holders.get(descriptor.control_key);
     if (!kept || descriptor.session_id === descriptor.lease_session_id) holders.set(descriptor.control_key, descriptor);
   }

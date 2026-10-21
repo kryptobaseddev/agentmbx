@@ -11,7 +11,7 @@ import { projectLeadView } from "./lead-record.ts";
 import { identityLeaseStatus, inspectLeaseProcess, inspectLeaseProcesses, type IdentityLease, type ProcessEvidence } from "./identity-leases.ts";
 import { relayFor } from "./relay-client.ts";
 import { relayState } from "./relay-v2.ts";
-import { resolveStatusIdentity } from "./status-identity.ts";
+import { resolveStatusIdentity, type StatusLostTo } from "./status-identity.ts";
 import { STATUS_V2_SCHEMA } from "./status-schema.ts";
 import type { StatusV2WithInbox } from "./status-inbox.ts";
 import { sweepPostToolMarkers } from "./posttool.ts";
@@ -29,7 +29,7 @@ export interface HudStatus {
   schema: typeof HUD_SCHEMA;
   mbx_version: string;
   update_available: string | null;
-  identity: { name: string | null; role: string | null; state: "bound" | "unbound" | "ambiguous"; candidates?: string[] };
+  identity: { name: string | null; role: string | null; state: "bound" | "unbound" | "ambiguous"; candidates?: string[]; lost_to?: StatusLostTo };
   /** Every unacked delivery (new + read). Kept with this meaning so existing readers do not change (T650). */
   unread: number;
   /** T650: not yet read (queued, delivered, notified): the status line's headline. Absent in snapshots written before T650. */
@@ -64,7 +64,7 @@ const CLI_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const SID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
 /** Build one mbx.status/v1 snapshot. `from_owner` re-checks authority now, so a revoked grant drops out. */
-export function hudStatus(node: MbxNode, o: { agent: string | null; state: HudStatus["identity"]["state"]; resolvedBy: HudResolvedBy; candidates?: string[] }): HudStatus {
+export function hudStatus(node: MbxNode, o: { agent: string | null; state: HudStatus["identity"]["state"]; resolvedBy: HudResolvedBy; candidates?: string[]; lostTo?: StatusLostTo }): HudStatus {
   const name = o.agent;
   const rows = name
     ? node.store.db.prepare(`SELECT m.*, d.state AS delivery_state FROM deliveries d JOIN messages m ON m.id = d.msg_id
@@ -87,7 +87,7 @@ export function hudStatus(node: MbxNode, o: { agent: string | null; state: HudSt
   const policies = name ? activePolicies(node.store.db, name, node.host) : [];
   return {
     schema: HUD_SCHEMA, mbx_version: version(), update_available: updateAvailable(node.store),
-    identity: { name, role, state: o.state, ...(o.candidates ? { candidates: o.candidates } : {}) },
+    identity: { name, role, state: o.state, ...(o.candidates ? { candidates: o.candidates } : {}), ...(o.lostTo ? { lost_to: o.lostTo } : {}) },
     unread, new: fresh, read, needs_reply, from_owner,
     outbox_unsent: Number(outbox.n),
     policy: policies.map((p) => p.level),
@@ -267,9 +267,10 @@ export function hudStatusV2(node: MbxNode, o: {
   state: HudStatus["identity"]["state"];
   resolvedBy: HudResolvedBy;
   candidates?: string[];
+  lostTo?: StatusLostTo;
   includeInbox?: boolean;
 }, cached?: { v1: HudStatus; processes: ReadonlyMap<number, ProcessEvidence>; now: number }): StatusV2WithInbox {
-  const v1 = cached?.v1 ?? hudStatus(node, { agent: o.agent, state: o.state, resolvedBy: o.resolvedBy, candidates: o.candidates });
+  const v1 = cached?.v1 ?? hudStatus(node, { agent: o.agent, state: o.state, resolvedBy: o.resolvedBy, candidates: o.candidates, lostTo: o.lostTo });
   const name = o.agent;
   const sessionRow = o.sessionId
     ? node.store.db.prepare("SELECT agent, cwd, channel FROM sessions WHERE cli=? AND session_id=?").get(o.cli, o.sessionId) as { agent: string; cwd: string | null; channel: number } | undefined
