@@ -183,12 +183,21 @@ export function identityAvailability(o) {
     const harness = harnessActivity(lease, o.now, o.homes);
     const mbxAt = o.activity?.at ?? null;
     const effectiveAt = Math.max(mbxAt ?? 0, harness?.at ?? 0);
-    if (o.caller && lease.cli === o.caller.cli && lease.session_id === o.caller.sessionId && !o.caller.sessionId.startsWith("mcp-")) {
+    const isDirectCaller = o.caller && lease.cli === o.caller.cli && lease.session_id === o.caller.sessionId && !o.caller.sessionId.startsWith("mcp-");
+    const isSubagentOfHolder = o.caller && lease.cli === o.caller.cli && o.caller.rootSessionId !== undefined
+        && lease.session_id === o.caller.rootSessionId && !o.caller.rootSessionId.startsWith("mcp-");
+    if (isDirectCaller || isSubagentOfHolder) {
         // T383: a provider may start a second, short-lived MCP server for a session whose own server is still live and serving
         // (Codex did). T439: a server under the caller's own provider co-uses the lease. T440: a different parent is takeover
         // only when the holder's provider is confirmed dead — a shell-launched server must not evict a live one. Unknown
         // parentage never evicts a live holder and never co-uses it.
         const { providerPid, holderProviderPid: holderProvider, holderProviderAlive } = o.caller;
+        if (isSubagentOfHolder) {
+            if (providerPid !== undefined && holderProvider === providerPid)
+                return { claimable: false, state: "live", coUse: true, reason: `held by the live MCP server of this same ${lease.cli} root conversation (pid ${lease.holder_pid}, same provider process); `
+                        + "a subagent conversation co-uses it: it acts as that identity under the holder's lease, without taking or releasing it" };
+            return { claimable: false, state: "live", reason: `held by live ${holder}` };
+        }
         // T608: the same conversation's other server, quiet for the stale threshold (D039), is stuck, not serving: this
         // session takes its own identity back without the owner. A holder still in use keeps it, so two live servers do not
         // trade the lease.

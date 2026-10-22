@@ -244,6 +244,7 @@ const WAKE_PATH = {
     kimi: "watcher", // terminal Kimi wakes through `agentmbx watch`; the desktop app has its own socket
     hermes: "watcher", // the Hermes bg-process watcher is the wake path (T460)
     grok: "watcher", // Grok wakes through `agentmbx watch` (T435)
+    agy: "watcher", // Antigravity wakes through `agentmbx watch` run via run_command
     copilot: "none",
     cursor: "none",
     gemini: "none",

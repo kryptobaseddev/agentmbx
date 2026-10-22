@@ -20,7 +20,7 @@ import { version } from "./version.ts";
 import { opencodeSidebarPackageJson, opencodeSidebarSchemaSource, opencodeSidebarServerSource, opencodeSidebarSource, OPENCODE_SIDEBAR_MARKER } from "./opencode-sidebar.ts";
 import { authHelperPath, canPrompt, createKeychainOwner, ownerInfo } from "./owner.ts";
 
-export const CLIS = ["claude", "codex", "opencode", "kimi", "hermes", "grok"] as const;
+export const CLIS = ["claude", "codex", "opencode", "kimi", "hermes", "grok", "agy"] as const;
 export type CliId = (typeof CLIS)[number];
 export type Action = "added" | "updated" | "removed" | "unchanged" | "skipped" | "manual" | "error";
 
@@ -197,11 +197,15 @@ export function hookNamesInstalledEntry(command: string, sub: string, cli: strin
   return !!t && t.length === 2 && nodeMeetsEnginesFloor(t[0]) && scriptNamesThisInstall(t[1]);
 }
 
+export const agyMcpConfigPath = (home: string) => join(home, ".gemini/config/mcp_config.json");
+export const agyHooksConfigPath = (home: string) => join(home, ".gemini/config/hooks.json");
+export const agySettingsPath = (home: string) => join(home, ".gemini/antigravity-cli/settings.json");
+
 // T347: setup wires one status line per CLI — never overwrites a user's existing one. A foreign
 // status line is left alone and reported (runSetup adds a manual row with the snippet); uninstall
 // removes only what setup wrote. "Ours" is an EXACT match against a command setup itself writes
 // (review blocker: the absolute script-path form or the shJoin(cmd) form — nothing else).
-export const statuslineCommand = (home: string, cli: "claude" | "kimi" | "grok", cmd: string[]): string => {
+export const statuslineCommand = (home: string, cli: "claude" | "kimi" | "grok" | "agy", cmd: string[]): string => {
   // The bundled pure-sh adapter when the skill ships it (SEA bundles SKILL.md only: the node form).
   // Grok uses the same rule (T613): sh plus grok-statusline.sh when present, otherwise the node form.
   const script = join(skillDest(home), "scripts", `${cli}-statusline.sh`);
@@ -209,36 +213,44 @@ export const statuslineCommand = (home: string, cli: "claude" | "kimi" | "grok",
 };
 /** The command forms a CURRENT setup writes and recognizes as up to date (T368: doctor warns on
  *  an older recognized form — isOurStatusline also matches those so they upgrade, never read foreign). */
-export const statuslineForms = (home: string, cli: "claude" | "kimi" | "grok", cmd: string[]): Set<string> => new Set([
+export const statuslineForms = (home: string, cli: "claude" | "kimi" | "grok" | "agy", cmd: string[]): Set<string> => new Set([
   `sh ${shJoin([join(skillDest(home), "scripts", `${cli}-statusline.sh`)])}`,
   `${shJoin(cmd)} statusline ${cli}`,
 ]);
 /** T536: a status line is current when setup would write it, or when it is any existing node
  *  plus this install's entry (the T533 matcher). A mise shim or bare `agentmbx` is ours but not
  *  current, so setup rewrites it and doctor warns — the two never disagree. */
-export function statuslineCurrent(home: string, cli: "claude" | "kimi" | "grok", cmd: string[], command: string): boolean {
+export function statuslineCurrent(home: string, cli: "claude" | "kimi" | "grok" | "agy", cmd: string[], command: string): boolean {
   // T613: once the skill ships the grok adapter, only that exact sh command is current. The node
   // form stays in statuslineForms, so it is still ours (setup upgrades it once; uninstall removes
   // it) and doctor warns until the upgrade. No script (SEA) keeps today's node-form fallback.
   const grokScript = join(skillDest(home), "scripts", "grok-statusline.sh");
   if (cli === "grok" && existsSync(grokScript)) return command === `sh ${shJoin([grokScript])}`;
+  const agyScript = join(skillDest(home), "scripts", "agy-statusline.sh");
+  if (cli === "agy" && existsSync(agyScript)) return command === `sh ${shJoin([agyScript])}`;
   if (statuslineForms(home, cli, cmd).has(command)) return true;
   const tail = ` statusline ${cli}`;
   if (!command.endsWith(tail)) return false;
   const tokens = shellTokens(command.slice(0, -tail.length));
   return !!tokens && tokens.length === 2 && existsSync(tokens[0]) && namesInstalledEntry(tokens[1]);
 }
-const isOurStatusline = (home: string, cli: "claude" | "kimi" | "grok", cmd: string[], command: string | undefined): boolean =>
+const isOurStatusline = (home: string, cli: "claude" | "kimi" | "grok" | "agy", cmd: string[], command: string | undefined): boolean =>
   !!command && (statuslineForms(home, cli, cmd).has(command)
     // Re-review minor: also recognise the exact forms older setups wrote — the bare command and any
     // absolute agentmbx path — so those get upgraded and uninstalled rather than left as "foreign".
     || new RegExp(`^(?:agentmbx|\\S+/agentmbx) statusline ${cli}$`).test(command));
 /** "absent" = nothing there, "ours" = an exact setup-written command, "foreign" = anything else.
  *  A malformed file is foreign, never a thrown runSetup (review major 2). */
-export const statuslineState = (home: string, cli: "claude" | "kimi" | "grok", cmd: string[]): "absent" | "ours" | "foreign" => {
+export const statuslineState = (home: string, cli: "claude" | "kimi" | "grok" | "agy", cmd: string[]): "absent" | "ours" | "foreign" => {
   try {
     if (cli === "claude") {
       const cur = read(join(home, ".claude/settings.json"));
+      if (cur === null) return "absent";
+      const command = (parseObj(cur).statusLine as { command?: string } | undefined)?.command;
+      return command === undefined ? "absent" : isOurStatusline(home, cli, cmd, command) ? "ours" : "foreign";
+    }
+    if (cli === "agy") {
+      const cur = read(agySettingsPath(home));
       if (cur === null) return "absent";
       const command = (parseObj(cur).statusLine as { command?: string } | undefined)?.command;
       return command === undefined ? "absent" : isOurStatusline(home, cli, cmd, command) ? "ours" : "foreign";
@@ -297,9 +309,10 @@ const kimiCommandValue = (body: string): string | null => tomlStringValue(body, 
  *  checks the configured command, never the one setup would write). Read from the status line
  *  SECTION: grok's config.toml also holds [mcp_servers.mbx] with its own `command = `, and a whole-
  *  file scan would return that one; a status_line key in a non-section form has no command here. */
-export const statuslineConfiguredCommand = (home: string, cli: "claude" | "kimi" | "grok"): string | null => {
+export const statuslineConfiguredCommand = (home: string, cli: "claude" | "kimi" | "grok" | "agy"): string | null => {
   try {
     if (cli === "claude") return (parseObj(read(join(home, ".claude/settings.json"))).statusLine as { command?: string } | undefined)?.command ?? null;
+    if (cli === "agy") return (parseObj(read(agySettingsPath(home))).statusLine as { command?: string } | undefined)?.command ?? null;
     if (cli === "grok") {
       const dir = (home === homedir() && process.env.GROK_HOME) || join(home, ".grok");
       const cur = read(join(dir, "config.toml"));
@@ -314,6 +327,67 @@ export const statuslineConfiguredCommand = (home: string, cli: "claude" | "kimi"
     return st.form === "section" ? kimiCommandValue(st.body) : null;
   } catch { return null; }
 };
+
+function agyStatusLine(home: string, cmd: string[]) {
+  const want = () => statuslineCommand(home, "agy", cmd);
+  return {
+    install: (cur: string | null) => {
+      const obj = parseObj(cur);
+      const existing = obj.statusLine as Record<string, unknown> | undefined;
+      if (existing && !isOurStatusline(home, "agy", cmd, existing.command as string | undefined)) return cur; // foreign: reported, never overwritten
+      if (existing?.type === "command" && existing.command === want() && existing.stack_with_default === true) return cur;
+      obj.statusLine = { ...existing, type: "command", command: want(), stack_with_default: true };
+      return jsonOut(obj, cur);
+    },
+    uninstall: (cur: string | null) => {
+      if (cur === null) return cur;
+      const obj = parseObj(cur);
+      const existing = obj.statusLine as Record<string, unknown> | undefined;
+      if (!isOurStatusline(home, "agy", cmd, existing?.command as string | undefined)) return cur;
+      delete obj.statusLine;
+      return jsonOut(obj, cur);
+    },
+  };
+}
+
+function agyHooks(home: string, cmd: string[]) {
+  const want = () => ({
+    SessionStart: [{ type: "command", command: shJoin([...cmd, "hook", "session-start", "--cli", "agy"]), timeout: 10 }],
+    PreInvocation: [{ type: "command", command: shJoin([...cmd, "hook", "prompt", "--cli", "agy"]), timeout: 10 }],
+    PostToolUse: [{ matcher: "*", hooks: [{ type: "command", command: shJoin([...cmd, "hook", "post-tool", "--cli", "agy"]), timeout: 10 }] }],
+    Stop: [{ type: "command", command: shJoin([...cmd, "hook", "stop", "--cli", "agy"]), timeout: 10 }],
+  });
+  return {
+    install: (cur: string | null) => {
+      const obj = parseObj(cur);
+      obj.agentmbx = want();
+      return jsonOut(obj, cur);
+    },
+    uninstall: (cur: string | null) => {
+      if (cur === null) return cur;
+      const obj = parseObj(cur);
+      if (!obj.agentmbx) return cur;
+      delete obj.agentmbx;
+      return jsonOut(obj, cur);
+    },
+  };
+}
+
+function agyHooksStatus(cur: string | null, home: string, cmd: string[]): "current" | "stale" | "absent" {
+  if (cur === null) return "absent";
+  const obj = parseObj(cur);
+  const ambx = obj.agentmbx as Record<string, unknown> | undefined;
+  if (!ambx) return "absent";
+  const ss = Array.isArray(ambx.SessionStart) && (ambx.SessionStart[0] as { command?: string })?.command;
+  const pi = Array.isArray(ambx.PreInvocation) && (ambx.PreInvocation[0] as { command?: string })?.command;
+  const ptu = Array.isArray(ambx.PostToolUse) && ((ambx.PostToolUse[0] as { hooks?: { command?: string }[] })?.hooks?.[0])?.command;
+  const st = Array.isArray(ambx.Stop) && (ambx.Stop[0] as { command?: string })?.command;
+  const wantSS = shJoin([...cmd, "hook", "session-start", "--cli", "agy"]);
+  const wantPI = shJoin([...cmd, "hook", "prompt", "--cli", "agy"]);
+  const wantPTU = shJoin([...cmd, "hook", "post-tool", "--cli", "agy"]);
+  const wantST = shJoin([...cmd, "hook", "stop", "--cli", "agy"]);
+  return ss === wantSS && pi === wantPI && ptu === wantPTU && st === wantST ? "current" : "stale";
+}
 
 function claudeStatusLine(home: string, cmd: string[]) {
   const want = () => statuslineCommand(home, "claude", cmd);
@@ -661,6 +735,13 @@ export function mcpConfiguredCmd(home: string, cli: CliId): string[] | null {
         if (cur === null) return null;
         const e = hermesMcpParse(cur);
         return e && e.command !== null ? [e.command, ...(e.args ?? [])] : null;
+      }
+      if (cli === "agy") {
+        const cur = read(agyMcpConfigPath(home));
+        if (cur === null) return null;
+        let obj: unknown;
+        try { obj = JSON.parse(cur); } catch { return null; }
+        return entryArgv((obj as Record<string, unknown> | null)?.mcpServers ? (obj as Record<string, Record<string, unknown>>).mcpServers.mbx : null);
       }
     } catch { return null; }
     return null;
@@ -2325,8 +2406,11 @@ export function detect(ctx: SetupCtx): Detected[] {
     return { cli, found: !!onPath || existsSync(join(h, dir)), why: onPath ? `${bin} on PATH` : existsSync(join(h, dir)) ? `~/${dir} exists` : "not found" };
   };
   const hermesCfg = existsSync(join(h, ".hermes/config.yaml"));
+  const agyOnPath = ctx.which("agy");
+  const agyDir = existsSync(join(h, ".gemini"));
   return [d("claude", "claude", ".claude"), d("codex", "codex", ".codex"), d("opencode", "opencode", ".config/opencode"), d("kimi", "kimi", ".kimi-code"), d("grok", "grok", ".grok"),
-    { cli: "hermes", found: hermesCfg, why: hermesCfg ? "~/.hermes/config.yaml exists" : ctx.which("hermes") || existsSync(join(h, ".hermes")) ? "no ~/.hermes/config.yaml yet" : "not found" }];
+    { cli: "hermes", found: hermesCfg, why: hermesCfg ? "~/.hermes/config.yaml exists" : ctx.which("hermes") || existsSync(join(h, ".hermes")) ? "no ~/.hermes/config.yaml yet" : "not found" },
+    { cli: "agy", found: !!agyOnPath || agyDir, why: agyOnPath ? "agy on PATH" : agyDir ? "~/.gemini exists" : "not found" }];
 }
 
 export const opencodeConfig = (home: string) => {
@@ -2428,6 +2512,16 @@ export function edits(ctx: SetupCtx, cli: CliId): Edit[] {
         { cli, kind: "consent", item: "shell-hooks-allowlist.json approvals", path: hermesAllowlistPath(home), mode: 0o600, ...ap },
       ];
     }
+    case "agy": {
+      const entry = { command: cmd[0], args: mcpArgs };
+      const srv = jsonServer("mcpServers", entry, (e) => (e.command === cmd[0] && same(e.args ?? [], mcpArgs)) || mcpNodeScriptCurrent(e), true);
+      return [
+        { cli, kind: "mcp", item: "mcpServers.mbx", path: agyMcpConfigPath(home), ...srv },
+        { cli, kind: "hooks", item: "lifecycle hooks", path: agyHooksConfigPath(home), ...agyHooks(home, cmd),
+          isWired: (cur) => agyHooksStatus(cur, home, cmd) === "current" },
+        { cli, kind: "statusline", item: "statusLine (MBX segment)", path: agySettingsPath(home), ...agyStatusLine(home, cmd) },
+      ];
+    }
   }
 }
 
@@ -2465,6 +2559,7 @@ const skillLinks = (home: string): { cli: CliId; path: string }[] => {
     { cli: "opencode", dir: join(home, ".config/opencode/skills") },
     { cli: "kimi", dir: fromEnv("KIMI_CODE_HOME", ".kimi-code") },
     { cli: "grok", dir: fromEnv("GROK_HOME", ".grok") },
+    { cli: "agy", dir: join(home, ".gemini/config/skills") },
   ];
   return candidates.filter((c) => existsSync(c.dir)).map((c) => ({ cli: c.cli, path: join(c.dir, "agentmbx") }));
 };
@@ -2612,10 +2707,12 @@ export function runSetup(ctx: SetupCtx, o: RunOpts): Row[] {
     if (d.cli === "hermes" && o.mode === "install" && rows.some((r) => r.cli === "hermes" && r.item.startsWith("hooks") && (r.action === "added" || r.action === "updated")))
       rows.push({ cli: "hermes", item: "note", path: "-", action: "manual", note: "Hermes reads hooks when a session starts: they apply to sessions started after this" });
     // T347: a user's own status line is never overwritten — report it and print the snippet instead.
-    if (o.mode === "install" && (d.cli === "claude" || d.cli === "kimi" || d.cli === "grok") && statuslineState(ctx.home, d.cli, ctx.cmd) === "foreign")
+    if (o.mode === "install" && (d.cli === "claude" || d.cli === "kimi" || d.cli === "grok" || d.cli === "agy") && statuslineState(ctx.home, d.cli, ctx.cmd) === "foreign")
       rows.push({ cli: d.cli, item: "statusLine", path: "-", action: "manual",
         note: `an existing status line was left alone; add the MBX segment yourself: ${d.cli === "claude"
           ? `"statusLine": { "type": "command", "command": ${JSON.stringify(statuslineCommand(ctx.home, "claude", ctx.cmd))} }`
+          : d.cli === "agy"
+          ? `"statusLine": { "type": "command", "command": ${JSON.stringify(statuslineCommand(ctx.home, "agy", ctx.cmd))}, "stack_with_default": true }`
           : d.cli === "grok"
           ? `[ui.status_line]\ntype = "command"\ncommand = ${JSON.stringify(statuslineCommand(ctx.home, "grok", ctx.cmd))}`
           : `[status_line]\ncommand = ${JSON.stringify(statuslineCommand(ctx.home, "kimi", ctx.cmd))}` }` });
@@ -2656,6 +2753,7 @@ export const MANUAL_HINTS: Record<CliId, string> = {
   kimi: "add {\"mcpServers\":{\"mbx\":{\"command\":\"agentmbx\",\"args\":[\"mcp\"]}}} to ~/.kimi-code/mcp.json",
   grok: "grok mcp add mbx --scope user -- agentmbx mcp",
   hermes: "add mcp_servers: { mbx: { command: agentmbx, args: [mcp] } } to ~/.hermes/config.yaml",
+  agy: "add {\"mcpServers\":{\"mbx\":{\"command\":\"agentmbx\",\"args\":[\"mcp\"]}}} to ~/.gemini/config/mcp_config.json",
 };
 
 // ---- owner step ------------------------------------------------------------------------------
