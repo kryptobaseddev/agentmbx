@@ -36,7 +36,8 @@ import { authHelperPath, createKeychainOwner, createOwnerKey, defaultOwnerBacken
 import { periodicUpdateCheck, updateAvailable, updateCommand } from "./update.js";
 import { installKind, version } from "./version.js";
 import { installService, serviceLabel, uninstallService } from "./service.js";
-import { CLIS, defaultHostName, defaultWhich, formatRows, ownerStep, resolveCommand, runSetup, selfHealSkill, shJoin } from "./setup.js";
+import { CLIS, defaultHostName, defaultWhich, formatRows, isSea, ownerStep, resolveCommand, runSetup, selfHealSkill, shJoin } from "./setup.js";
+import { currentLauncherTarget, healLauncher, installLauncher, launcherPath, launcherSupported } from "./launcher.js";
 import { dispatchWakes, hasWakeAuthority, humanPromptKey, inboxCommand, isHumanPrompt, macNotifierPath, muteWakes, notifyDesktop, opencodeService, liveWatcher, wakeMutedUntil, wakeText, watcherKey, which, noteWatchReported, reconcileWatchReported } from "./wake.js";
 import { kimiMultiHost } from "./kimi-web.js";
 import { bindInstruction, issueBindTicket } from "./bind-ticket.js";
@@ -1278,6 +1279,10 @@ If the codes differ, do not approve: someone is in the middle.`);
             };
             await startServer(node, node.config.port, node.config.bind, () => void tick());
             selfHealSkill(homedir()); // S1: an upgrade restarts the daemon, which refreshes our own skill copy
+            try {
+                healLauncher(isSea());
+            }
+            catch { /* T728: best effort; doctor reports a launcher whose install is gone */ }
             console.log(`[agentmbx] daemon for ${node.host} listening on ${node.config.bind}:${node.config.port}`);
             if (!process.env.MBX_NO_MDNS && node.config.bind !== "127.0.0.1") {
                 let warned = false;
@@ -2652,6 +2657,17 @@ async function setup(o, str) {
     const bad = only?.filter((c) => ![...CLIS, "skill", "daemon", "owner"].includes(c));
     if (bad?.length)
         die(`--only: unknown ${bad.join(", ")} (use ${[...CLIS, "skill", "daemon", "owner"].join(",")})`);
+    // T728: the launcher first, so every config below names it instead of this Node's install directory.
+    if (!uninstall && !dryRun && launcherSupported()) {
+        try {
+            const target = currentLauncherTarget(isSea());
+            if (installLauncher(target))
+                console.log(`launcher: ${launcherPath()} runs ${shJoin("sea" in target ? [target.sea] : [target.node, target.entry])}`);
+        }
+        catch (e) {
+            console.log(`launcher: could not write ${launcherPath()} (${e.message}); configs keep the direct command`);
+        }
+    }
     const ctx = setupCtx();
     console.log(`agents will run: ${shJoin(ctx.cmd)} mcp`);
     const wantDaemon = !only || only.includes("daemon");

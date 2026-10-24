@@ -8,6 +8,7 @@ import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { activeLauncher } from "./launcher.js";
 export const APP_BUNDLE_ID = "com.agentmbx.app";
 export const APP_NAME = "AgentMBX.app";
 export const serviceLabel = (env = process.env) => env.MBX_SERVICE_LABEL || "com.agentmbx.daemon";
@@ -96,8 +97,10 @@ export function installService(mbxHome) {
         sea = createRequire(import.meta.url)("node:sea").isSea();
     }
     catch { /* older node */ }
-    const bin = sea ? "" : realpathSync(process.argv[1]);
-    const nodeBin = sea ? realpathSync(process.execPath) : stableNode();
+    // T728: the service runs the agentmbx launcher, so a Node upgrade or reinstall never leaves it pointing at a deleted path.
+    const launcher = activeLauncher();
+    const bin = launcher || sea ? "" : realpathSync(process.argv[1]);
+    const nodeBin = launcher ?? (sea ? realpathSync(process.execPath) : stableNode());
     const home = homedir();
     if (process.platform === "darwin") {
         const label = serviceLabel();
