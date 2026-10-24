@@ -16,6 +16,7 @@ import { opencodeService } from "./wake.ts";
 import { opencodeHostClassifier, type OpencodeHost } from "./opencode-provider.ts";
 import { kimiDesktop, readDesktopPlugin } from "./kimi-desktop.ts";
 import { version } from "./version.ts";
+import { activeLauncher, readLauncherTarget } from "./launcher.ts";
 import { GROK_NO_PUSH, MbxNode, RETRY_HOURS, staleMcpKvCensus } from "./node.ts";
 import { authHelperPath, keychainOwnerStatus, ownerInfo } from "./owner.ts";
 import { claudePluginChecks } from "./claude-plugin.ts";
@@ -796,6 +797,15 @@ export async function doctor(ctx: SetupCtx, mbxHome: string, opts: { peerTimeout
     add(errors.length ? "warn" : "info", `MCP startup errors in the last 24h (${errors.length} shown):${errors.length ? `\n${errors.join("\n")}` : " none"}`);
   } catch (error) { add("warn", `MCP startup error log unavailable: ${(error as Error).message}`); }
   if (Number(process.versions.node.split(".")[0]) < NODE_ENGINES_FLOOR) add("fail", `Node ${process.versions.node} is too old`, "install Node 24 or later");
+  // T728: the launcher every config runs, and whether the install it records is still there.
+  const launcher = activeLauncher(ctx.home);
+  if (launcher) {
+    const t = readLauncherTarget(launcher)!;
+    const paths = "sea" in t ? [t.sea] : [t.node, t.entry];
+    const gone = paths.filter((p) => !existsSync(p));
+    if (gone.length) add("warn", `launcher ${launcher} records ${gone.join(", ")}, which no longer exists; it falls back to node on PATH`, "run: agentmbx setup");
+    else add("ok", `launcher ${launcher} runs ${paths.join(" ")}`);
+  }
 
   // T314: stay out of the grok block. OpenCode's own doctor function must not collide with this.
   const legacy = legacyMbxShim();
