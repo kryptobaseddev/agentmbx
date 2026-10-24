@@ -135,7 +135,21 @@ function marketplaceSlot(text, root) {
     if (!all || typeof all !== "object" || Array.isArray(all) || !(CLAUDE_MARKETPLACE in all))
         return "absent";
     const hit = pathField(all[CLAUDE_MARKETPLACE]);
-    return hit !== null && samePath(hit, root) ? "ours" : "foreign";
+    if (hit !== null && samePath(hit, root))
+        return "ours";
+    // T728: another agentmbx install (a different Node's global node_modules) is ours but stale: re-point it here, so
+    // removing that Node never breaks the plugin. A marketplace from anywhere else stays foreign.
+    return hit !== null && isAgentmbxPackageDir(hit) ? "stale" : "foreign";
+}
+function isAgentmbxPackageDir(dir) {
+    if (!/(^|[\\/])node_modules[\\/]agentmbx[\\/]?$/.test(dir))
+        return false;
+    try {
+        return JSON.parse(readFileSync(join(dir, "package.json"), "utf8")).name === "agentmbx";
+    }
+    catch {
+        return !existsSync(dir);
+    } // a deleted install directory under node_modules/agentmbx is still ours
 }
 function enabledSlot(text) {
     const all = jsonValue(text, ["enabledPlugins"]);
@@ -184,6 +198,8 @@ export function classifyClaudePlugin(home, root = packageRoot()) {
     const slots = [market, enabled, installed];
     if (slots.includes("foreign"))
         return { kind: "foreign", note: "a Claude plugin or marketplace named agentmbx points somewhere else and was left alone" };
+    if (market === "stale")
+        return { kind: "stale", note: "the agentmbx plugin marketplace points at another agentmbx install" };
     if (slots.every((s) => s === "ours"))
         return { kind: "ours" };
     if (slots.every((s) => s === "absent"))
@@ -210,6 +226,8 @@ export function claudePluginStep(home, mode, dryRun, runner, root = packageRoot(
     const state = classifyClaudePlugin(home, root);
     if (state.kind === "foreign")
         return { action: "manual", path, note: state.note };
+    if (mode === "install" && state.kind === "stale" && dryRun)
+        return { action: "updated", path, note: "dry run: re-point the plugin marketplace at this install" };
     if (mode === "install" && state.kind === "ours") {
         const have = installedClaudePluginVersion(home);
         if (have === version())
@@ -234,6 +252,8 @@ export function claudePluginStep(home, mode, dryRun, runner, root = packageRoot(
     const snapshots = new Map(FILES(home).map((f) => [f.path, readText(f.path)]));
     const calls = mode === "install"
         ? [
+            // --json: without a terminal, a bare `marketplace remove` exits non-zero on this Claude Code (2026-10-24)
+            ...(state.kind === "stale" ? [["plugin", "marketplace", "remove", CLAUDE_MARKETPLACE, "--json"]] : []),
             ...(state.kind === "partial" && marketplaceSlot(snapshots.get(join(home, ".claude", "plugins", "known_marketplaces.json")) ?? null, root) === "ours"
                 ? []
                 : [["plugin", "marketplace", "add", root, "--scope", "user"]]),
@@ -273,6 +293,8 @@ export function claudePluginChecks(home, opts, root = packageRoot()) {
         return [{ level: "info", label: `claude: plugin not installed (${NOT_SHIPPED})` }];
     if (state.kind === "absent" || state.kind === "partial")
         return [{ level: "warn", label: "claude: plugin not installed", fix }];
+    if (state.kind === "stale")
+        return [{ level: "warn", label: "claude: plugin marketplace points at another agentmbx install", fix }];
     const dir = pluginDir(root);
     const hooks = existsSync(join(dir, "hooks", "hooks.json")) && existsSync(join(dir, "hooks", "register.js"));
     let pluginVersion = "";
