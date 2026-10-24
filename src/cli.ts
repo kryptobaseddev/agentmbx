@@ -55,7 +55,7 @@ import { configuredRetention, prune, retentionDays } from "./retention.ts";
 import { exportIdentity, identityInitialized, importIdentity } from "./identity-backup.ts";
 import { formatUnboundStart, listIdentityStatus } from "./identity-status.ts";
 import { REBINDING_CLIS, withCliIdentity, withHookIdentity, type CliIdentitySelection } from "./cli-identity.ts";
-import { acceptSessionClearance, buildSessionClearance, declaredOriginWarning, readSessionTaint, refuseAgentOrigin, taintSendWarning, type SessionTaint } from "./session-taint.ts";
+import { acceptSessionClearance, buildSessionClearance, declaredOriginWarning, readSessionTaint, refuseAgentOrigin, taintSendWarning, UNEVIDENCED_EXTERNAL, type SessionTaint } from "./session-taint.ts";
 import { runProbe, storeProbeIO } from "./probe.ts";
 import { leadGrantsSummary, leadGrantsView, makeLeadGrants, storeLeadGrants, withLeadGrants } from "./lead-grants.ts";
 import { resolveProject } from "./project-key.ts";
@@ -799,7 +799,8 @@ async function run(argv: string[]) {
       // declares this body first-hand. --origin agent does not send while the record is live.
       const send = (from: string, unverified = false, taint: SessionTaint | null = null, scope?: SendProvenanceScope) => {
         if (originArg === "agent" && taint) die(refuseAgentOrigin(taint));
-        const declared = originArg === "external";
+        // T738: outside content needs evidence (a declared outside payload); a bare --origin external is agent mail.
+        const declared = originArg === "external" && (payload === "firsthand-outside" || payload === "derived-outside");
         const reply = str("reply-to") ? node.read(str("reply-to")!, from.split("@")[0]) : undefined;
         // T649: a long subject is truncated (with a warning), not refused
         const fit = fitSubject(str("subject") ?? (reply ? (reply.subject.startsWith("Re: ") ? reply.subject : `Re: ${reply.subject}`) : die("--subject is required")));
@@ -808,13 +809,14 @@ async function run(argv: string[]) {
           subject: fit.subject,
           body, kind: (str("kind") ?? "message") as Envelope["kind"], reply_to: reply?.id ?? null, thread: reply?.thread,
           needs_reply: !!o["needs-reply"], urgent: !!o.urgent, ...(str("on-behalf-of") ? { onBehalfOf: str("on-behalf-of") } : {}), refs: (o.ref as string[] | undefined) ?? [], unverifiedSender: unverified,
-          ...(declared || taint ? { origin: "external" as const } : originArg ? { origin: originArg } : {}),
+          ...(declared || taint ? { origin: "external" as const } : originArg === "agent" ? { origin: originArg } : {}),
           ...(!declared && taint ? { external_since: new Date(taint.root).toISOString() } : {}) }, undefined, undefined, undefined, scope);
         if (fit.warning) sent.warnings.unshift(fit.warning);
+        if (originArg === "external" && !declared) sent.warnings.push(UNEVIDENCED_EXTERNAL);
         return sent;
       };
       const noteOrigin = (sent: ReturnType<MbxNode["send"]>, taint: SessionTaint | null) => {
-        if (originArg === "external") sent.warnings.push(declaredOriginWarning(taint));
+        if (originArg === "external" && (payload === "firsthand-outside" || payload === "derived-outside")) sent.warnings.push(declaredOriginWarning(taint));
         else if (taint) sent.warnings.push(taintSendWarning(taint));
         return sent;
       };

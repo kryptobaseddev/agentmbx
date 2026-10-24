@@ -84,7 +84,7 @@ test("CLI send inherits a live session taint and refuses --origin agent (T345)",
   assert.match(refused.stderr, /--origin agent refused/);
   assert.equal(node.search("refused-agent").length, 0);
 
-  const declared = send("--subject", "declared", "-m", "outside", "--origin", "external");
+  const declared = send("--subject", "declared", "-m", "outside", "--origin", "external", "--payload", "firsthand-outside");
   assert.equal(declared.status, 0, declared.stderr);
   const declaredEnv = JSON.parse(node.message(JSON.parse(declared.stdout).id)!.envelope);
   assert.equal(declaredEnv.meta.origin, "external");

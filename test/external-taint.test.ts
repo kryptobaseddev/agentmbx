@@ -190,7 +190,11 @@ test("fresh outside content still taints; an owner prompt and origin agent never
   assert.equal(overridden.e.meta.origin, "external");
   assert.ok(overridden.warnings.some((x) => x.startsWith("origin \"agent\" overridden: sent with origin external because this session read outside content")), JSON.stringify(overridden.warnings));
 
-  const declared = await w.send("bob", ["ada"], { origin: "external" });
+  // T738: a bare origin "external" names no outside source: it goes out as agent mail and fences nobody.
+  const bare = await w.send("bob", ["ada"], { origin: "external" });
+  assert.notEqual(bare.e.meta.origin, "external");
+  assert.ok(bare.warnings.some((x) => x.startsWith("origin \"external\" was not applied: no outside source was declared")), JSON.stringify(bare.warnings));
+  const declared = await w.send("bob", ["ada"], { origin: "external", payload: "firsthand-outside" });
   assert.equal(declared.e.meta.external_source, "declared");
   assert.ok(declared.warnings.some((x) => x.startsWith("sent with origin external, as you declared")), JSON.stringify(declared.warnings));
 
