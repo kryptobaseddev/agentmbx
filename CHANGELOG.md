@@ -3,6 +3,7 @@
 ## Unreleased
 
 ## 0.5.53 (2026-10-24)
+- **Setup moves the last two Node-specific entries to the launcher (T728).** A Grok `[mcp_servers.mbx]` section with a multi-line `args` array (as Grok writes it), or one another Node's install wrote, is now rewritten to the launcher instead of being left alone. A Claude plugin marketplace that points at another agentmbx install, for example a Node version that will be removed, is re-pointed at this install, and doctor warns until it is.
 
 - **`agentmbx send --idempotency-key <k>` sends once per sender and key (T735).** A repeat prints the original message id (with `duplicate: true` under `--json`) and sends nothing, matching `mbx_send`'s `idempotency_key`. Non-interactive senders, such as CLEO's planned doctor-digest watcher, can retry safely.
 
