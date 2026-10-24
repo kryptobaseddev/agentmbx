@@ -566,14 +566,15 @@ function grokMcp(cmd) {
     const sectionText = () => `[mcp_servers.mbx]\n${lineText("command", wantCommand)}args = ${argsText}\nenabled = true\n${timeoutLine}`;
     const sectionArgs = (body) => {
         const a = /^[ \t]*args[ \t]*=[ \t]*(\[[^\n]*\])/m.exec(body)?.[1];
-        if (!a)
-            return null;
-        try {
-            return JSON.parse(a);
+        if (a) {
+            try {
+                return JSON.parse(a);
+            }
+            catch { /* not JSON-shaped: TOML below */ }
         }
-        catch {
-            return null;
-        }
+        // T728: a multi-line array (as grok itself writes it) is read through the TOML parser.
+        const t = tryParseToml(body.replace(/^\[[^\n]*\]\r?\n/, ""));
+        return t && Array.isArray(t.args) ? t.args : null;
     };
     // T533: grok keeps command and args in separate fields; [another node, this install's entry] in
     // those fields is ours. `current` additionally requires the node binary to exist.
@@ -582,8 +583,16 @@ function grokMcp(cmd) {
         return Array.isArray(args) && typeof args[0] === "string" && args[1] === "mcp" && namesInstalledEntry(args[0]);
     };
     const entryCurrent = (body) => {
+        if (launcherCommand(cmd))
+            return false; // T728: with the launcher, a node + entry section is drift to rewrite
         const command = grokCommandValue(body);
         return command !== null && existsSync(command) && entryNamesInstall(body);
+    };
+    /** T728: [any node, any agentmbx install's entry script] running `mcp` is ours, whichever Node or install wrote it. */
+    const nodeEntryForm = (body) => {
+        const command = grokCommandValue(body), args = sectionArgs(body);
+        return command !== null && Array.isArray(args) && args.length === 2 && args[1] === "mcp" && typeof args[0] === "string"
+            && runsAgentmbx(shJoin([command, args[0]]));
     };
     const ours = (body) => grokCommandValue(body) === wantCommand && body.includes(`args = ${wantArgs}`); // exact match (review med 5)
     // T532: ours in any older form too — a single-binary command (mise shim, bare, absolute) running
@@ -623,13 +632,13 @@ function grokMcp(cmd) {
                     // Ours in any older form (shim/bare single binary, or [node, this install's entry] with a
                     // missing node — T533): replace in place. Anything else is another tool's mbx — never
                     // overwritten (review med 5: agentmbx-fork is not ours).
-                    const oursOlder = command !== null && (/(^|\/)agentmbx$/.test(command) || entryNamesInstall(body));
+                    const oursOlder = command !== null && (/(^|\/)agentmbx$/.test(command) || entryNamesInstall(body) || (launcherCommand(cmd) && nodeEntryForm(body)));
                     if (!oursOlder)
                         return cur;
                     // rewrite ONLY our command/args lines — the user's other keys in the section stay
                     body = body
                         .replace(/(^|\r?\n)[ \t]*command[ \t]*=[^\n]*(\r?\n)/, (_, p1, p2) => `${p1}command = ${JSON.stringify(wantCommand)}${p2}`)
-                        .replace(/(^|\r?\n)[ \t]*args[ \t]*=[^\n]*(\r?\n)/, (_, p1, p2) => `${p1}args = ${wantArgs}${p2}`);
+                        .replace(/(^|\r?\n)[ \t]*args[ \t]*=[ \t]*\[[^\]]*\][^\n]*(\r?\n)/, (_, p1, p2) => `${p1}args = ${wantArgs}${p2}`);
                 }
                 const nextBody = withTimeout(body);
                 if (nextBody === st.body)

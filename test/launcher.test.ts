@@ -101,3 +101,23 @@ test("T728 setup writes the launcher into configs and rewrites a node + script e
   runSetup(ctx, { mode: "install", stamp: "T1", only: ["kimi"] });
   assert.deepEqual(JSON.parse(readFileSync(join(home, ".kimi-code/mcp.json"), "utf8")).mcpServers.mbx, { command: launcherPath(home), args: ["mcp"] });
 });
+
+test("T728 a grok MCP section another Node's install wrote is rewritten to the launcher", (t) => {
+  const home = tmp(t, "mbx-t728-grok-");
+  mkdirSync(join(home, ".grok"), { recursive: true });
+  writeFileSync(join(home, ".grok/config.toml"), `[mcp_servers.mbx]
+command = "/x/mise/installs/node/24.21.0/bin/node"
+args = [
+    "/x/mise/installs/node/24.21.0/lib/node_modules/agentmbx/bin/agentmbx.js",
+    "mcp",
+]
+enabled = true
+startup_timeout_sec = 30
+`);
+  installLauncher({ node: process.execPath, entry: resolve("bin/agentmbx.js") }, home);
+  runSetup({ home, cmd: resolveCommand(home), which: () => null, useClis: false }, { mode: "install", stamp: "T1", only: ["grok"] });
+  const text = readFileSync(join(home, ".grok/config.toml"), "utf8");
+  assert.match(text, new RegExp(`command = "${launcherPath(home).replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")}"`));
+  assert.doesNotMatch(text, /mise\/installs/);
+  assert.match(text, /enabled = true/, "the user's other keys in the section stay");
+});
