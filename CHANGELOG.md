@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.54 (2026-10-24)
+
 - **"Outside content" now needs evidence (T738, phase 1).** Agents often marked ordinary coordination with each other as `origin: "external"`. Every reader of such a message was then fenced to read-only for an hour, and their replies spread the fence through whole teams. Now `origin: "external"` applies only when the sender also declares an outside payload: `payload: "firsthand-outside"` (it fetched a web page, issue, PR comment or email itself) or `"derived-outside"`. Without one, the message goes out as agent mail and the sender gets a warning explaining why. Mail between the owner's agents is agent content in every project. The fence for real outside content is unchanged. Phase 2 will narrow that fence to the messages that actually derive from outside content.
 
 - **First-class Antigravity (agy) harness support across setup, doctor, MCP, hooks, statusline, and wake (T725).**
