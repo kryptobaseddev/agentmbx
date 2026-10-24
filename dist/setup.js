@@ -2765,10 +2765,11 @@ export function detect(ctx) {
     };
     const hermesCfg = existsSync(join(h, ".hermes/config.yaml"));
     const agyOnPath = ctx.which("agy");
-    const agyDir = existsSync(join(h, ".gemini"));
+    // ~/.gemini alone is Gemini CLI's; only Antigravity's own data directories mean agy is installed.
+    const agyDir = existsSync(join(h, ".gemini/antigravity-cli")) || existsSync(join(h, ".gemini/antigravity"));
     return [d("claude", "claude", ".claude"), d("codex", "codex", ".codex"), d("opencode", "opencode", ".config/opencode"), d("kimi", "kimi", ".kimi-code"), d("grok", "grok", ".grok"),
         { cli: "hermes", found: hermesCfg, why: hermesCfg ? "~/.hermes/config.yaml exists" : ctx.which("hermes") || existsSync(join(h, ".hermes")) ? "no ~/.hermes/config.yaml yet" : "not found" },
-        { cli: "agy", found: !!agyOnPath || agyDir, why: agyOnPath ? "agy on PATH" : agyDir ? "~/.gemini exists" : "not found" }];
+        { cli: "agy", found: !!agyOnPath || agyDir, why: agyOnPath ? "agy on PATH" : agyDir ? "~/.gemini/antigravity data exists" : "not found" }];
 }
 export const opencodeConfig = (home) => {
     const dir = join(home, ".config/opencode");

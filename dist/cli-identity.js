@@ -193,7 +193,7 @@ function withIdentity(node, selection, descriptors, operation) {
         // Shared provider transports serve many sessions. A lone control is not this session unless --session named it or agy's environment proved it.
         if (!selection.session && descriptor.cli === "opencode")
             throw refused("opencode serves many sessions: specify --cli and --session");
-        if (!selection.session && descriptor.cli === "agy" && !descriptor.lease_session_id.startsWith("mcp-")) {
+        if (!selection.session && descriptor.cli === "agy") {
             if (!envAgySid)
                 throw refused("agy serves many sessions: specify --cli and --session");
             if (descriptor.session_id !== envAgySid || descriptor.lease_session_id !== envAgySid)

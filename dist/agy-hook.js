@@ -18,11 +18,11 @@ export function agyHookInput(raw) {
 /**
  * Antigravity Stop fires on normal turn completion (`NO_TOOL_CALL`) as well as error, cancellation and budget
  * limits (`ERROR`, `USER_CANCELED`, `MAX_INVOCATIONS`, `MAX_FORCED_INVOCATIONS`, `MAX_TOKEN_BUDGET_EXCEEDED`,
- * `TERMINAL_STEP_TYPE`, `TERMINAL_CUSTOM_HOOK`, `INJECTED_RESPONSE`). Only `NO_TOOL_CALL` (or an omitted reason)
- * may continue the turn.
+ * `TERMINAL_STEP_TYPE`, `TERMINAL_CUSTOM_HOOK`, `INJECTED_RESPONSE`). Only an explicit `NO_TOOL_CALL` may continue
+ * the turn: protojson omits an enum default, so a missing reason may be UNSPECIFIED.
  */
 export function agyStopEligible(input) {
-    return input.terminationReason === undefined || input.terminationReason === "NO_TOOL_CALL";
+    return input.terminationReason === "NO_TOOL_CALL";
 }
 /**
  * What Antigravity reads back from a hook on stdout:

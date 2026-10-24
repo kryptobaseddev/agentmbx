@@ -357,7 +357,7 @@ export function detectHost(ppid = process.ppid) {
     // and ngrok is not grok.
     : /^grok$/i.test(comm) ? "grok"
     : /codex/i.test(args) ? "codex" : /opencode/i.test(args) ? "opencode" : /kimi/i.test(args) ? "kimi" : /hermes/i.test(args) ? "hermes"
-    : /^agy$/i.test(comm) || /antigravity/i.test(comm) || /antigravity/i.test(args) ? "agy"
+    : /^agy$/i.test(comm) ? "agy"
     : "unknown");
   const harnessProvider = cli === "opencode" ? opencodeProviderPid(ppid) : null;
   if (harnessProvider) ppid = harnessProvider;
@@ -941,6 +941,7 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
   };
   /** Claim `name` for this session; on failure the session stays unbound and keeps `name` pending. Never another name. */
   const resume = (state: State, name: string, o: { explicit?: boolean; launch?: boolean } = {}): boolean => {
+    if (subagentMayNotClaim(state, name, !!o.explicit)) return false;
     const before = { agent: state.agent, leaseToken: state.leaseToken, coUse: state.coUse };
     state.agent = name; state.leaseToken = undefined; state.coUse = undefined;
     try {
@@ -976,14 +977,21 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
       { session_id: string; pid_start: string | null; updated_at: string }[]).filter(r => node.sameSession(env.ppid, r, { proof: true }));
     return [...new Set(rows.map(r => r.session_id))];
   };
+  const isSubagent = (state: State) => !!state.rootSessionId && state.rootSessionId !== state.sessionId;
+  /** The mailbox the root conversation of this subagent holds now, or null. */
+  const rootLeaseName = (state: State): string | null => (node.store.db.prepare("SELECT name FROM identity_leases WHERE cli=? AND session_id=? AND released_at IS NULL")
+    .get(env.cli, state.rootSessionId!) as { name: string } | undefined)?.name ?? null;
+  /** A subagent may act as its root's mailbox only by co-using the root's live lease, never by claiming it. */
+  const subagentMayNotClaim = (state: State, name: string, explicit: boolean): boolean => {
+    if (!isSubagent(state) || name !== node.store.get(`name:${env.cli}:${state.rootSessionId}`) || rootLeaseName(state) === name) return false;
+    if (explicit) throw Object.assign(new Error(`identity ${name} belongs to this subagent's root conversation, which does not hold it now; a subagent co-uses its root's mailbox only while the root holds it`), { code: "IDENTITY_IN_USE" });
+    return true;
+  };
   /** The identity this session held before: by its provider session id, or by the session its own hooks reported. */
   const rememberedName = (state: State): string | null => {
-    if (state.rootSessionId) {
-      const rootLease = node.store.db.prepare("SELECT name FROM identity_leases WHERE cli=? AND session_id=? AND released_at IS NULL").get(env.cli, state.rootSessionId) as { name: string } | undefined;
-      if (rootLease?.name) return rootLease.name;
-      const rootName = node.store.get(`name:${env.cli}:${state.rootSessionId}`);
-      if (rootName) return rootName;
-    }
+    // A subagent only ever co-uses the mailbox its root conversation holds right now; it never resumes the root's
+    // remembered name by itself, which would claim the root's mailbox for the subagent.
+    if (isSubagent(state)) return rootLeaseName(state);
     if (!state.sessionId.startsWith("mcp-")) return node.store.get(`name:${env.cli}:${state.sessionId}`) ?? null;
     // A provisional id (terminal Kimi, a Claude session file not written yet): the provider's own hooks know the real
     // session of this parent process, from a verified hook binding (exactly one) or a session hint. Hosted processes
@@ -1028,6 +1036,7 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
         Object.assign(state, { agent: "", leaseToken: undefined, coUse: undefined, released: true, pending: undefined, pendingReason: undefined });
         return;
       }
+      if (isSubagent(state)) { Object.assign(state, { agent: "", leaseToken: undefined, coUse: undefined, pending: undefined, pendingReason: undefined }); return; }
       // T439: the session's live server released, lost or handed off the lease this sibling co-used. Fail closed: this call
       // does not act as the identity. The name stays pending and is re-evaluated (co-use, claim or wait) on the next call.
       Object.assign(state, { agent: "", leaseToken: undefined, coUse: undefined, pending: name,
@@ -1094,7 +1103,8 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
     const namespaced = meta?.["ai.opencode/sessionID"], documented = meta?.sessionID;
     if (env.cli === "opencode" && namespaced !== undefined && documented !== undefined && namespaced !== documented)
       throw new Error("Conflicting OpenCode sessionID metadata");
-    const agySid = env.cli === "agy" ? (meta?.["antigravity.google/conversation_id"] ?? (process.env.ANTIGRAVITY_CONVERSATION_ID ? process.env.ANTIGRAVITY_CONVERSATION_ID : undefined)) : undefined;
+    // Only the per-call metadata names the conversation: the shared MCP process's own environment is every conversation's.
+    const agySid = env.cli === "agy" ? meta?.["antigravity.google/conversation_id"] : undefined;
     // Codex threadId is the resumable thread. Its sessionId is a distinct execution ID.
     const sid = env.cli === "codex" ? meta?.threadId : env.cli === "agy" ? agySid : namespaced !== undefined ? namespaced : documented;
     if (sid === undefined) {
@@ -1489,6 +1499,7 @@ async function configureMcp(server: McpServer, node: MbxNode, startupClosed: () 
         });
       } catch (error) { if ((error as { code?: string }).code !== "IDENTITY_LEASE_LOST") throw error; }
     }
+    subagentMayNotClaim(state, target, true);
     const next: State = { ...state, agent: target, leaseToken: undefined, coUse: undefined, released: false, pending: undefined, pendingReason: undefined, lostTo: undefined, parent: null };
     let result: ReturnType<typeof handoff>;
     try {

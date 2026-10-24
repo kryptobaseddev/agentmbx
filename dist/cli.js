@@ -2019,7 +2019,7 @@ async function hook(node, event, cli) {
             }
             // This session's own activity keeps a shared-process conversation's identity from looking abandoned (R4).
             try {
-                node.store.set(activityKey(agent), JSON.stringify({ at: Date.now(), shared: ["codex", "opencode"].includes(cli) || (cli === "kimi" && kimiMultiHost(process.ppid)) }));
+                node.store.set(activityKey(agent), JSON.stringify({ at: Date.now(), shared: ["codex", "opencode", "agy"].includes(cli) || (cli === "kimi" && kimiMultiHost(process.ppid)) }));
             }
             catch { /* advisory */ }
             if (ocEntry && sid && ["session-start", "prompt", "post-tool"].includes(event) && node.store.get(ocEntry) === "created") {
@@ -2372,7 +2372,7 @@ async function hook(node, event, cli) {
         } })();
         const link = multi && !linked ? bindInstruction(issueBindTicket(node.store, { cli, session_id: sid, cwd, parent_pid: process.ppid })) : null;
         // A dedicated provider process tells its mbx server which session it is, so a resumed session gets its identity back.
-        if (!multi && !["codex", "opencode"].includes(cli))
+        if (!multi && !["codex", "opencode", "agy"].includes(cli))
             try {
                 recordSessionHint(node.store, cli, process.ppid, inspectLeaseProcess(process.ppid).start, sid);
             }

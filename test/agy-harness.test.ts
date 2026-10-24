@@ -39,9 +39,9 @@ test("agyHookInput correctly maps conversationId and workspacePaths onto shared 
   assert.equal(preserved.cwd, "/custom/cwd");
 });
 
-test("agyStopEligible allows NO_TOOL_CALL and undefined, rejecting cancellation and error stops", () => {
-  assert.equal(agyStopEligible({}), true);
-  assert.equal(agyStopEligible({ terminationReason: undefined }), true);
+test("agyStopEligible allows only an explicit NO_TOOL_CALL, rejecting a missing reason, cancellation and error stops", () => {
+  assert.equal(agyStopEligible({}), false, "protojson omits an enum default: a missing reason may be UNSPECIFIED");
+  assert.equal(agyStopEligible({ terminationReason: undefined }), false);
   assert.equal(agyStopEligible({ terminationReason: "NO_TOOL_CALL" }), true);
 
   assert.equal(agyStopEligible({ terminationReason: "ERROR" }), false);
