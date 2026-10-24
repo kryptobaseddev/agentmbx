@@ -393,3 +393,18 @@ test("T542: a failed update is an error naming the version still loaded", () => 
     assert.match(step.note ?? "", /left 0\.5\.19/);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
+
+test("T728: a marketplace on another agentmbx install (a removed Node's node_modules) is re-pointed at this install", () => {
+  const home = mkdtempSync(join(tmpdir(), "t728-stale-"));
+  try {
+    fixture(home);
+    const markets = join(home, ".claude/plugins/known_marketplaces.json");
+    const stale = "/nonexistent/mise/installs/node/24.21.0/lib/node_modules/agentmbx";
+    writeFileSync(markets, readFileSync(markets, "utf8").replace(`"cloudflare": {`, `"agentmbx": { "source": { "source": "directory", "path": "${stale}" }, "installLocation": "${stale}", "lastUpdated": "x" },\n  "cloudflare": {`));
+    const { run, calls } = runner(home);
+    const step = claudePluginStep(home, "install", false, run);
+    assert.equal(step.action, "added", JSON.stringify(step));
+    assert.deepEqual(calls.map((c) => c.slice(0, 3)), [["plugin", "marketplace", "remove"], ["plugin", "marketplace", "add"], ["plugin", "install", CLAUDE_PLUGIN_ID]]);
+    assert.doesNotMatch(readFileSync(markets, "utf8"), /mise\/installs/);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
