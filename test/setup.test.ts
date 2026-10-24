@@ -301,7 +301,8 @@ test("T541: OpenCode timeout is {startup,catalog}; a number is rewritten in plac
 // agentmbx entry script — never the mise shim — and doctor fails the row when that command cannot
 // resolve agentmbx or resolves a different version than this install.
 test("T504: resolveCommand is the absolute node binary plus the resolved entry script", () => {
-  const cmd = resolveCommand();
+  // A home with no T728 launcher: the developer's real home may have one, and then every config runs it instead.
+  const cmd = resolveCommand(mkdtempSync(join(tmpdir(), "mbx-t504-")));
   assert.equal(cmd.length, 2, "not the single shim/binary form");
   assert.equal(cmd[0], process.execPath, "the actual node binary running setup");
   assert.ok(isAbsolute(cmd[0]));

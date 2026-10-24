@@ -252,7 +252,8 @@ export function claudePluginStep(home, mode, dryRun, runner, root = packageRoot(
     const snapshots = new Map(FILES(home).map((f) => [f.path, readText(f.path)]));
     const calls = mode === "install"
         ? [
-            ...(state.kind === "stale" ? [["plugin", "marketplace", "remove", CLAUDE_MARKETPLACE]] : []),
+            // --json: without a terminal, a bare `marketplace remove` exits non-zero on this Claude Code (2026-10-24)
+            ...(state.kind === "stale" ? [["plugin", "marketplace", "remove", CLAUDE_MARKETPLACE, "--json"]] : []),
             ...(state.kind === "partial" && marketplaceSlot(snapshots.get(join(home, ".claude", "plugins", "known_marketplaces.json")) ?? null, root) === "ours"
                 ? []
                 : [["plugin", "marketplace", "add", root, "--scope", "user"]]),
