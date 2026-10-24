@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **`agentmbx send --idempotency-key <k>` sends once per sender and key (T735).** A repeat prints the original message id (with `duplicate: true` under `--json`) and sends nothing, matching `mbx_send`'s `idempotency_key`. Non-interactive senders, such as CLEO's planned doctor-digest watcher, can retry safely.
+
 - **Every harness config and the background service run one stable agentmbx launcher (T728).** `agentmbx setup` wrote the absolute path of whichever Node ran it into every harness config and the daemon's service, for example `~/.local/share/mise/installs/node/24.21.0/bin/node` plus that Node's copy of the package. Upgrading Node, switching from mise to Homebrew, or uninstalling a Node version therefore broke every agent's mbx at once. Setup now installs `~/.local/share/agentmbx/bin/agentmbx` (macOS and Linux) and writes that one path everywhere. The launcher records the install it runs: the standalone binary, or a node and the entry script, with a Homebrew node recorded by its unversioned symlink rather than the Cellar path. If those are gone, it uses the first `node` on PATH and the package installed beside it. If nothing is found, it exits 127 and says to reinstall and run setup. Existing node-plus-script entries are rewritten to the launcher on the next `agentmbx setup`. The daemon repoints a launcher whose install has disappeared when it starts, and `agentmbx doctor` reports the launcher and its target. Windows keeps the direct command for now.
 
 ## 0.5.52 (2026-10-21)

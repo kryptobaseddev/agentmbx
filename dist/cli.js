@@ -76,7 +76,7 @@ Start here
   agentmbx claude [claude args…]   start Claude Code with the mbx channel, so the idle session wakes when mail arrives
 
 Messages
-  agentmbx send --as <agent> --to <a,b,role:x,*,owner> --subject "…" [-m "body" | --body-file f | stdin]
+  agentmbx send --as <agent> --to <a,b,role:x,*,owner> --subject "…" [-m "body" | --body-file f | stdin] [--idempotency-key k] [--json]
            [--kind message|request|reply|status|decision|alert|task] [--reply-to <id>] [--needs-reply] [--urgent] [--on-behalf-of <name>] [--origin agent|external] [--ref path]… [--new-mailbox]
            [--context <disclosed-thread-id>] [--payload agent|firsthand-outside|derived-outside] [--source <exact-message-id>]…
            Payload inputs stay attached when refs/thread/origin change; context selection does not prove isolation or clear the writer fence.
@@ -386,7 +386,7 @@ async function run(argv) {
     const { values: o, positionals: pos } = parseArgs({ args: rest, allowPositionals: true, strict: cmd !== "hook" && cmd !== "mcp", options: {
             help: { type: "boolean", short: "h" }, force: { type: "boolean" },
             as: { type: "string" }, to: { type: "string" }, subject: { type: "string" }, m: { type: "string", short: "m" },
-            "body-file": { type: "string" }, kind: { type: "string" }, origin: { type: "string" }, schema: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" }, urgent: { type: "boolean" }, "on-behalf-of": { type: "string" }, "new-mailbox": { type: "boolean" },
+            "body-file": { type: "string" }, "idempotency-key": { type: "string" }, kind: { type: "string" }, origin: { type: "string" }, schema: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" }, urgent: { type: "boolean" }, "on-behalf-of": { type: "string" }, "new-mailbox": { type: "boolean" },
             ref: { type: "string", multiple: true }, all: { type: "boolean" }, json: { type: "boolean" }, note: { type: "string" },
             context: { type: "string" }, payload: { type: "string" }, source: { type: "string", multiple: true },
             mailbox: { type: "string" }, limit: { type: "string" }, host: { type: "string" }, port: { type: "string" }, cli: { type: "string" }, session: { type: "string" }, caps: { type: "string" },
@@ -992,28 +992,55 @@ async function run(argv) {
                     sent.warnings.push(taintSendWarning(taint));
                 return sent;
             };
+            // T735: the same sender and key send once; a repeat answers with the original message (as mbx_send idempotency_key does).
+            const idemKey = str("idempotency-key");
+            if (idemKey !== undefined && (!idemKey || idemKey.length > 100))
+                die("--idempotency-key must be 1-100 characters");
+            const idemOf = (sender) => `idem:${sender.split("@")[0]}:${idemKey}`;
+            const duplicateOf = (sender) => {
+                const prev = idemKey ? node.store.get(idemOf(sender)) : undefined;
+                if (prev)
+                    throw Object.assign(new Error(`already sent as ${prev} (same idempotency key)`), { code: "IDEMPOTENT_DUPLICATE", id: prev });
+            };
+            const printDuplicate = (id) => {
+                const row = node.store.db.prepare("SELECT thread FROM messages WHERE id=?").get(id);
+                process.stderr.write(`warning: already sent as ${id} (same idempotency key); nothing new was sent\n`);
+                if (o.json)
+                    return console.log(JSON.stringify({ id, thread: row?.thread ?? null, ref: `mbx:${id}@${node.host}`, duplicate: true, recipients: [], warnings: ["duplicate: same idempotency key"] }));
+                return console.log(id);
+            };
+            const remember = (sender, sent) => { if (idemKey)
+                node.store.set(idemOf(sender), sent.envelope.id); return sent; };
             let entered = false, r;
             try {
                 r = withCliIdentity(node, { as: str("as") ?? (process.env.MBX_AGENT || undefined), cli: str("cli"), session: str("session") }, (me, descriptor) => {
                     entered = true;
+                    duplicateOf(me);
                     const taint = readSessionTaint(node.store, descriptor.cli, descriptor.session_id);
-                    return noteOrigin(send(me, false, taint, { cli: descriptor.cli, session_id: descriptor.session_id,
-                        context: str("context"), payload, sources: o.source }), taint);
+                    return remember(me, noteOrigin(send(me, false, taint, { cli: descriptor.cli, session_id: descriptor.session_id,
+                        context: str("context"), payload, sources: o.source }), taint));
                 });
             }
             catch (error) {
+                const dup = error;
+                if (dup.code === "IDEMPOTENT_DUPLICATE" && dup.id)
+                    return printDuplicate(dup.id);
                 // Never replay a failed operation or downgrade a reply / explicitly selected session.
                 if (entered || str("reply-to") || str("cli") || str("session") || str("context") || payload !== undefined || o.source
                     || error.code !== "IDENTITY_NO_CALLER_LEASE")
                     throw error;
                 const sender = as();
+                const prior = idemKey ? node.store.get(idemOf(sender)) : undefined;
+                if (prior)
+                    return printDuplicate(prior);
                 r = node.store.tx(() => {
                     const name = sender.split("@")[0];
                     if (node.store.db.prepare("SELECT 1 FROM identity_leases WHERE name=? AND released_at IS NULL").get(name))
                         throw Object.assign(new Error("this sender name is leased; use its owning session or explicitly recover the identity"), { code: "IDENTITY_LEASE_REQUIRED" });
                     if (!node.agents().some(a => a.name === name && a.host === node.host))
                         node.registerAgent(name, { cli: "cli" });
-                    return noteOrigin(send(sender, true, null), null);
+                    duplicateOf(sender);
+                    return remember(sender, noteOrigin(send(sender, true, null), null));
                 });
                 r.warnings.push("unverified-sender: no current identity lease; recipients must not treat the claimed name as delegated authority");
             }
