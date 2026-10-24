@@ -291,3 +291,8 @@ export function declaredOriginWarning(taint: SessionTaint | null): string {
   if (!taint) return base;
   return `${base} This session's sends stay external until ${iso(taint.root + EXTERNAL_TAINT_MS)}, an hour after its root exposure at ${iso(taint.root)}: you read ${taint.id} from ${taint.from}.`;
 }
+
+/** T738: the warning when an origin "external" declaration names no outside payload and is sent as agent mail. */
+export const UNEVIDENCED_EXTERNAL = "origin \"external\" was not applied: no outside source was declared, so this went out as agent mail. "
+  + "Mail between your owner's agents, in any project, is agent content. If the body carries text from a web page, issue, PR comment or email, "
+  + "send it with origin external and payload firsthand-outside (you fetched it) or derived-outside.";
