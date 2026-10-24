@@ -1,7 +1,7 @@
 {
   "name": "agentmbx",
   "version": "0.5.53",
-  "description": "AgentMBX: signed messages between AI coding agents (Claude, Codex, Kimi, OpenCode, Hermes) on one machine and across a LAN, with wake-up adapters and an owner-authority master agent.",
+  "description": "AgentMBX: signed messages between AI coding agents (Claude, Codex, Kimi, OpenCode, Hermes, Antigravity) on one machine and across a LAN, with wake-up adapters and an owner-authority master agent.",
   "type": "module",
   "bin": {
     "agentmbx": "bin/agentmbx.js"
@@ -51,6 +51,8 @@
     "opencode",
     "kimi",
     "hermes",
+    "antigravity",
+    "agy",
     "agent-messaging",
     "multi-agent"
   ],

@@ -28,30 +28,33 @@ export function withCliIdentity<T>(node: MbxNode, selection: CliIdentitySelectio
  *  of the same process and the same MCP holder (T460: Hermes TUI/CLI). A multi-session host is not one of them. */
 export const REBINDING_CLIS: readonly string[] = ["claude", "hermes"];
 
-/** A live OpenCode control under this serve whose lease still matches. A dead pid or a stale generation is not live. */
-function opencodeHolderLive(node: MbxNode, descriptor: IdentityControlDescriptor): boolean {
+/** CLIs where one provider MCP transport multiplexes multiple conversations per process. */
+export const sharedConversationCli = (cli: string): boolean => cli === "opencode" || cli === "agy";
+
+/** A live shared-conversation control (OpenCode or Antigravity) under this provider whose lease still matches. A dead pid or a stale generation is not live. */
+function sharedHolderLive(node: MbxNode, descriptor: IdentityControlDescriptor): boolean {
   const evidence = inspectLeaseProcess(descriptor.mcp_pid);
   return descriptor.parent_pid === process.ppid && evidence.alive === true && matches(descriptor, rowFor(node, descriptor.agent));
 }
 
-/** The exact ses_ row, when it still belongs to a live MCP child of this serve. */
-function liveOpencode(node: MbxNode, session: string): IdentityControlDescriptor | null {
-  if (node.store.get(identityControlKey("opencode", session)) === undefined) return null;
-  const current = findIdentityControl(node.store, "opencode", session);
-  return opencodeHolderLive(node, current) ? current : null;
+/** The exact session row, when it still belongs to a live MCP child of this provider process. */
+function liveSharedConversation(node: MbxNode, cli: string, session: string): IdentityControlDescriptor | null {
+  if (node.store.get(identityControlKey(cli, session)) === undefined) return null;
+  const current = findIdentityControl(node.store, cli, session);
+  return sharedHolderLive(node, current) ? current : null;
 }
 
 /**
- * Publish this ses_ id onto the one live MCP that already holds the agent named by `name:opencode:<sid>`.
+ * Publish this session id onto the one live MCP that already holds the agent named by `name:<cli>:<sid>`.
  * Missing name, no live holder, or two holders: return null. Never pick "the one control under this parent".
  */
-function restoreOpencode(node: MbxNode, session: string): IdentityControlDescriptor | null {
-  const named = node.store.get(`name:opencode:${session}`);
+function restoreSharedConversation(node: MbxNode, cli: string, session: string): IdentityControlDescriptor | null {
+  const named = node.store.get(`name:${cli}:${session}`);
   if (!named) return null;
   const holders = new Map<string, IdentityControlDescriptor>();
   for (const descriptor of listIdentityControls(node.store)) {
-    if (descriptor.cli !== "opencode" || descriptor.agent !== named || descriptor.session_id === session) continue;
-    if (!opencodeHolderLive(node, descriptor)) continue;
+    if (descriptor.cli !== cli || descriptor.agent !== named || descriptor.session_id === session) continue;
+    if (!sharedHolderLive(node, descriptor)) continue;
     // T723: a lease held for another real conversation is that conversation's, not this one's. Borrowing it would mark
     // the holder active on this session's every prompt and point owner takeover and CLI claims at the holder.
     if (descriptor.lease_session_id !== session && !descriptor.lease_session_id.startsWith("mcp-")) continue;
@@ -61,13 +64,28 @@ function restoreOpencode(node: MbxNode, session: string): IdentityControlDescrip
   if (holders.size !== 1) return null;
   const holder = [...holders.values()][0];
   if (!holder) return null;
-  if (node.store.get(identityControlKey("opencode", session)) !== undefined) {
-    const current = findIdentityControl(node.store, "opencode", session);
-    if (opencodeHolderLive(node, current) && current.agent !== named) return null;
+  if (node.store.get(identityControlKey(cli, session)) !== undefined) {
+    const current = findIdentityControl(node.store, cli, session);
+    if (sharedHolderLive(node, current) && current.agent !== named) return null;
   }
   const alias: IdentityControlDescriptor = { ...holder, session_id: session };
   publishIdentityControl(node.store, alias);
   return alias;
+}
+
+/** A live OpenCode control under this serve whose lease still matches. Deprecated: use sharedHolderLive. */
+function opencodeHolderLive(node: MbxNode, descriptor: IdentityControlDescriptor): boolean {
+  return sharedHolderLive(node, descriptor);
+}
+
+/** The exact ses_ row, when it still belongs to a live MCP child of this serve. Deprecated: use liveSharedConversation. */
+function liveOpencode(node: MbxNode, session: string): IdentityControlDescriptor | null {
+  return liveSharedConversation(node, "opencode", session);
+}
+
+/** Deprecated: use restoreSharedConversation. */
+function restoreOpencode(node: MbxNode, session: string): IdentityControlDescriptor | null {
+  return restoreSharedConversation(node, "opencode", session);
 }
 
 /** The one live provisional grok control of this provider. Its lease is still `mcp-*` and held.
@@ -94,9 +112,9 @@ export function withHookIdentity<T>(node: MbxNode, cli: string, session: string 
   let descriptors: IdentityControlDescriptor[], bootstrap = false;
   const rebinds = REBINDING_CLIS.includes(cli);
   const rebindClaude = allowBootstrap && rebinds && !node.store.db.prepare("SELECT 1 FROM sessions WHERE cli=? AND session_id=?").get(cli, session);
-  if (cli === "opencode") {
-    // The parent set is ambiguous on a shared serve. Restore only the named agent's one live holder.
-    const live = liveOpencode(node, session) ?? restoreOpencode(node, session);
+  if (sharedConversationCli(cli)) {
+    // The parent set is ambiguous on a shared provider transport. Restore only the named agent's one live holder.
+    const live = liveSharedConversation(node, cli, session) ?? restoreSharedConversation(node, cli, session);
     if (!live) throw refused("hook session has no exact current MCP binding");
     descriptors = [live];
   } else if (node.store.get(identityControlKey(cli, session)) !== undefined && !rebindClaude) descriptors = [findIdentityControl(node.store, cli, session)];
@@ -146,6 +164,16 @@ function withIdentity<T>(node: MbxNode, selection: CliIdentitySelection, descrip
       else if (proof.state === "unknown") unknown++;
     }
     // --as must not pick a different hosted session merely because it shares a provider parent.
+    // Disambiguate agy callers when ANTIGRAVITY_CONVERSATION_ID is set in the verified caller environment.
+    const envAgySid = process.env.ANTIGRAVITY_CONVERSATION_ID?.trim();
+    if (!selection.session && candidates.size > 1 && envAgySid) {
+      const agyMatch = [...candidates.entries()].filter(([, c]) =>
+        c.descriptor.cli === "agy" && c.descriptor.session_id === envAgySid && c.descriptor.lease_session_id === envAgySid);
+      if (agyMatch.length === 1) {
+        candidates.clear();
+        candidates.set(agyMatch[0][0], agyMatch[0][1]);
+      }
+    }
     if (candidates.size > 1) throw refused("ambiguous provider sessions: specify --cli and --session");
     // Unknown evidence is not "no lease" (T340): it may be this caller's holder, or a second one that makes a lone
     // candidate ambiguous. Retry it; only definite refusals report at once.
@@ -153,8 +181,13 @@ function withIdentity<T>(node: MbxNode, selection: CliIdentitySelection, descrip
     if (!candidates.size) throw Object.assign(refused("no current identity lease belongs to this caller. Run mailbox commands inside the provider session that holds the lease (your agent session, through its mbx tools); inspect holders with `agentmbx identity list`. The owner can replace a live holder with `agentmbx identity takeover <name> --force --cli <provider> --session <id>`"),
       { code: "IDENTITY_NO_CALLER_LEASE" });
     const { descriptor, token } = [...candidates.values()][0];
-    // OpenCode shells share the serve. A lone control is still not this session unless --session named it.
+    // Shared provider transports serve many sessions. A lone control is not this session unless --session named it or agy's environment proved it.
     if (!selection.session && descriptor.cli === "opencode") throw refused("opencode serves many sessions: specify --cli and --session");
+    if (!selection.session && descriptor.cli === "agy") {
+      if (!envAgySid) throw refused("agy serves many sessions: specify --cli and --session");
+      if (descriptor.session_id !== envAgySid || descriptor.lease_session_id !== envAgySid)
+        throw Object.assign(refused("calling conversation does not match the active agy session lease; specify --cli and --session"), { code: "IDENTITY_NO_CALLER_LEASE" });
+    }
     const [name, host, extra] = selection.as?.split("@") ?? [descriptor.agent];
     if (name !== descriptor.agent || (host !== undefined && host !== node.host) || extra !== undefined)
       throw refused(`this session holds ${descriptor.agent}@${node.host}, not the requested identity`);

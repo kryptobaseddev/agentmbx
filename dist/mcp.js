@@ -23,6 +23,8 @@ import { reviveMailbox } from "./identity-cleanup.js";
 import { AUTO_NAME_RE, crossHostKey, linkedKey, noteProject, projectOf, registeredIdentity, registerIdentity, renameRegistration, ROLE_RE, sessionHint, UNSPECIFIED_ROLE } from "./registry.js";
 import { applyIdentityTakeover } from "./identity-takeover.js";
 import { opencodeProviderPid } from "./opencode-provider.js";
+import { sharedConversationCli } from "./cli-identity.js";
+import { AGY_WATCHER_INSTRUCTION, AGY_WATCHER_REMINDER } from "./agy-hook.js";
 import { formatUnboundStart, listIdentityStatus } from "./identity-status.js";
 import { consumeIdentityControl, identityControlAliases, identityControlKey, identityGeneration, inspectIdentityControlCaller, pendingIdentityControls, publishIdentityControl, removeIdentityControl } from "./identity-control.js";
 import { alive, defaultHome, didWarning, formatFor, LIVE_AGENT_MS, messageReadView, MbxNode, summaryLine, trustLabel } from "./node.js";
@@ -333,6 +335,8 @@ export function selfWatchInstruction(opts) {
         return WATCHER_INSTRUCTION;
     if (opts.cli === "hermes" && raw === undefined)
         return HERMES_WATCHER_INSTRUCTION;
+    if (opts.cli === "agy" && raw === undefined)
+        return AGY_WATCHER_INSTRUCTION;
     if (!opts.delegated && raw === undefined)
         return null;
     const min = raw === undefined ? 15 : Number(raw);
@@ -392,7 +396,9 @@ export function detectHost(ppid = process.ppid) {
         // because `grok "fix the claude hook"` and `--cwd …/kimi-tools` would otherwise misclassify;
         // and ngrok is not grok.
         : /^grok$/i.test(comm) ? "grok"
-            : /codex/i.test(args) ? "codex" : /opencode/i.test(args) ? "opencode" : /kimi/i.test(args) ? "kimi" : /hermes/i.test(args) ? "hermes" : "unknown");
+            : /codex/i.test(args) ? "codex" : /opencode/i.test(args) ? "opencode" : /kimi/i.test(args) ? "kimi" : /hermes/i.test(args) ? "hermes"
+                : /^agy$/i.test(comm) ? "agy"
+                    : "unknown");
     const harnessProvider = cli === "opencode" ? opencodeProviderPid(ppid) : null;
     if (harnessProvider)
         ppid = harnessProvider;
@@ -679,7 +685,7 @@ async function configureMcp(server, node, startupClosed) {
     const current = () => requests.getStore() ?? base;
     const bound = (state) => !!state.leaseToken && !state.released;
     // A conversation of a shared provider process: its quiet lease may be claimed by another conversation (identity-availability.ts).
-    const sharedState = (state) => hosted || ((env.cli === "codex" || env.cli === "opencode") && state !== base);
+    const sharedState = (state) => hosted || ((env.cli === "codex" || sharedConversationCli(env.cli)) && state !== base);
     const legacyConflicts = new Set();
     const ambiguousLegacy = new Set();
     // Read the binding and its child generation in one SQLite snapshot, before bindSession can clean either up.
@@ -746,9 +752,9 @@ async function configureMcp(server, node, startupClosed) {
             return;
         const ownKey = fingerprint(state.key.publicKey);
         for (const sid of new Set(controlSessionIds(state))) {
-            // T723: an OpenCode conversation's state answers only for itself. An alias of another real conversation (one an older
+            // T723: an OpenCode or agy conversation's state answers only for itself. An alias of another real conversation (one an older
             // hook borrowed) is withdrawn, so that conversation's own state, the owner's takeover and its claims reach it again.
-            if (env.cli === "opencode" && sid !== state.sessionId && !state.sessionId.startsWith("mcp-")) {
+            if (sharedConversationCli(env.cli) && sid !== state.sessionId && !state.sessionId.startsWith("mcp-")) {
                 const k = identityControlKey(env.cli, sid);
                 try {
                     if (JSON.parse(node.store.get(k) ?? "null")?.control_key === ownKey)
@@ -901,11 +907,12 @@ async function configureMcp(server, node, startupClosed) {
             // refused: identity-availability.ts gates its coUse answer on session_id equality, so the cross-session claim falls
             // through below to the ordinary "held by live <session>" refusal. Same-process is not a license to hand one
             // session's identity to another (T308 AC2).
-            if (prior.holder_pid === process.pid && prior.holder_start === holderStart() && prior.cli === env.cli && prior.session_id === state.sessionId)
+            if (prior.holder_pid === process.pid && prior.holder_start === holderStart() && prior.cli === env.cli
+                && (prior.session_id === state.sessionId || (state.rootSessionId !== undefined && prior.session_id === state.rootSessionId)))
                 throw Object.assign(new Error(`identity ${agent} is co-used: held by this process (pid ${process.pid}) for another context of this same session; a sibling MCP client of this session co-uses it`), { code: "IDENTITY_CO_USE", coUse: { agent, token: prior.token } });
             const recordedEvidence = recorded ? leases.processEvidence(recorded.pid) : null;
             const a = identityAvailability({ lease: prior, evidence: leases.processEvidence(prior.holder_pid), activity: parseActivity(node.store.get(activityKey(agent))),
-                now: Date.now(), caller: { cli: env.cli, sessionId: state.sessionId, providerPid: env.ppid,
+                now: Date.now(), caller: { cli: env.cli, sessionId: state.sessionId, rootSessionId: state.rootSessionId, providerPid: env.ppid,
                     ...holderProviderView(procTable(), prior.holder_pid, env.ppid, recorded, recordedEvidence, !!env.harnessProvider) } });
             if (a.takeover === "same-session" || (explicit && a.takeover === "idle-conversation")) {
                 leases.release(agent, prior.token);
@@ -1083,6 +1090,8 @@ async function configureMcp(server, node, startupClosed) {
     };
     /** Claim `name` for this session; on failure the session stays unbound and keeps `name` pending. Never another name. */
     const resume = (state, name, o = {}) => {
+        if (subagentMayNotClaim(state, name, !!o.explicit))
+            return false;
         const before = { agent: state.agent, leaseToken: state.leaseToken, coUse: state.coUse };
         state.agent = name;
         state.leaseToken = undefined;
@@ -1128,13 +1137,29 @@ async function configureMcp(server, node, startupClosed) {
     const hookBoundRealSessions = (state) => {
         if (state !== base || hosted)
             return null;
-        if (env.cli === "opencode")
+        if (sharedConversationCli(env.cli))
             return null;
         const rows = node.store.db.prepare("SELECT session_id,pid_start,updated_at FROM sessions WHERE cli=? AND pid=? AND session_id NOT GLOB 'mcp-*'").all(env.cli, env.ppid).filter(r => node.sameSession(env.ppid, r, { proof: true }));
         return [...new Set(rows.map(r => r.session_id))];
     };
+    const isSubagent = (state) => !!state.rootSessionId && state.rootSessionId !== state.sessionId;
+    /** The mailbox the root conversation of this subagent holds now, or null. */
+    const rootLeaseName = (state) => node.store.db.prepare("SELECT name FROM identity_leases WHERE cli=? AND session_id=? AND released_at IS NULL")
+        .get(env.cli, state.rootSessionId)?.name ?? null;
+    /** A subagent may act as its root's mailbox only by co-using the root's live lease, never by claiming it. */
+    const subagentMayNotClaim = (state, name, explicit) => {
+        if (!isSubagent(state) || name !== node.store.get(`name:${env.cli}:${state.rootSessionId}`) || rootLeaseName(state) === name)
+            return false;
+        if (explicit)
+            throw Object.assign(new Error(`identity ${name} belongs to this subagent's root conversation, which does not hold it now; a subagent co-uses its root's mailbox only while the root holds it`), { code: "IDENTITY_IN_USE" });
+        return true;
+    };
     /** The identity this session held before: by its provider session id, or by the session its own hooks reported. */
     const rememberedName = (state) => {
+        // A subagent only ever co-uses the mailbox its root conversation holds right now; it never resumes the root's
+        // remembered name by itself, which would claim the root's mailbox for the subagent.
+        if (isSubagent(state))
+            return rootLeaseName(state);
         if (!state.sessionId.startsWith("mcp-"))
             return node.store.get(`name:${env.cli}:${state.sessionId}`) ?? null;
         // A provisional id (terminal Kimi, a Claude session file not written yet): the provider's own hooks know the real
@@ -1143,7 +1168,7 @@ async function configureMcp(server, node, startupClosed) {
         const real = hookBoundRealSessions(state);
         if (real === null)
             return null;
-        const hint = real.length === 1 ? real[0] : real.length || env.cli === "codex" || env.cli === "opencode" ? null
+        const hint = real.length === 1 ? real[0] : real.length || env.cli === "codex" || sharedConversationCli(env.cli) ? null
             : sessionHint(node.store, env.cli, env.ppid, leases.processEvidence(env.ppid).start);
         if (!hint)
             return null;
@@ -1191,6 +1216,10 @@ async function configureMcp(server, node, startupClosed) {
                 && leases.processEvidence(row.holder_pid).alive === true;
             if (explicitRelease) {
                 Object.assign(state, { agent: "", leaseToken: undefined, coUse: undefined, released: true, pending: undefined, pendingReason: undefined });
+                return;
+            }
+            if (isSubagent(state)) {
+                Object.assign(state, { agent: "", leaseToken: undefined, coUse: undefined, pending: undefined, pendingReason: undefined });
                 return;
             }
             // T439: the session's live server released, lost or handed off the lease this sibling co-used. Fail closed: this call
@@ -1276,23 +1305,27 @@ async function configureMcp(server, node, startupClosed) {
         catch { /* best effort */ }
     }
     const contextFor = (extra) => {
-        if (env.cli !== "opencode" && env.cli !== "codex")
+        if (env.cli !== "opencode" && env.cli !== "codex" && env.cli !== "agy")
             return base;
         const meta = extra?._meta;
         // OpenCode 2.0.15 uses the namespaced key; current docs also describe sessionID.
         const namespaced = meta?.["ai.opencode/sessionID"], documented = meta?.sessionID;
         if (env.cli === "opencode" && namespaced !== undefined && documented !== undefined && namespaced !== documented)
             throw new Error("Conflicting OpenCode sessionID metadata");
+        // Only the per-call metadata names the conversation: the shared MCP process's own environment is every conversation's.
+        const agySid = env.cli === "agy" ? meta?.["antigravity.google/conversation_id"] : undefined;
         // Codex threadId is the resumable thread. Its sessionId is a distinct execution ID.
-        const sid = env.cli === "codex" ? meta?.threadId : namespaced !== undefined ? namespaced : documented;
+        const sid = env.cli === "codex" ? meta?.threadId : env.cli === "agy" ? agySid : namespaced !== undefined ? namespaced : documented;
         if (sid === undefined) {
             if (env.cli === "opencode")
                 throw Object.assign(new Error('OpenCode session metadata is required; this transport may serve multiple conversations. '
                     + 'Pass _meta {"ai.opencode/sessionID":"<ses_id>"} (or {"sessionID":"<ses_id>"}). '
                     + 'If Code Mode omits it, use native tools (mcp.servers.mbx.codemode=false) or upgrade OpenCode to 2.0.26 or newer.'), { code: "OPENCODE_SESSION_REQUIRED" });
+            if (env.cli === "agy")
+                throw Object.assign(new Error('Antigravity conversation metadata is required; this transport may serve multiple conversations. Pass _meta {"antigravity.google/conversation_id":"<uuid>"}.'), { code: "AGY_CONVERSATION_REQUIRED" });
             return base;
         }
-        const valid = env.cli === "codex" ? /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i : /^ses_[a-zA-Z0-9]{1,128}$/;
+        const valid = env.cli === "codex" || env.cli === "agy" ? /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i : /^ses_[a-zA-Z0-9]{1,128}$/;
         if (typeof sid !== "string" || !valid.test(sid))
             throw new Error(`Invalid ${env.cli} session identity metadata`);
         if (env.cli === "codex" && !codexHomes.has(sid)) {
@@ -1302,14 +1335,19 @@ async function configureMcp(server, node, startupClosed) {
             }
             catch { /* retried on the next process */ }
         }
+        const rootSid = env.cli === "agy" && typeof meta?.["antigravity.google/root_conversation_id"] === "string" && valid.test(meta["antigravity.google/root_conversation_id"])
+            ? meta["antigravity.google/root_conversation_id"] : undefined;
         // A hook-resumed base already represents this exact conversation; a second State would use a different key.
-        if (sid === base.sessionId)
+        if (sid === base.sessionId) {
+            if (rootSid && !base.rootSessionId)
+                base.rootSessionId = rootSid;
             return base;
+        }
         let state = states.get(sid);
         if (!state) {
             const priorRelease = detached?.sessions.find(s => s.sessionId === sid);
             if (priorRelease) {
-                state = { agent: priorRelease.agent, sessionId: sid, key: generateKeyPair(), parent: null, released: true };
+                state = { agent: priorRelease.agent, sessionId: sid, key: generateKeyPair(), parent: null, released: true, ...(rootSid ? { rootSessionId: rootSid } : {}) };
                 prepareState(state, undefined, () => publishControl(state));
                 restoreSessionTaint(state);
                 states.set(sid, state);
@@ -1317,17 +1355,23 @@ async function configureMcp(server, node, startupClosed) {
             }
             // A service process and transport serve many sessions: each resumes only its own remembered identity, never the
             // transport's or another thread's. Metadata grants no authority; the lease does.
-            state = { agent: "", sessionId: sid, key: generateKeyPair(), parent: null };
-            const remembered = node.store.get(`name:${env.cli}:${sid}`);
+            state = { agent: "", sessionId: sid, key: generateKeyPair(), parent: null, ...(rootSid ? { rootSessionId: rootSid } : {}) };
+            const remembered = node.store.get(`name:${env.cli}:${sid}`) ?? (rootSid ? rememberedName(state) : null);
             const s = state;
             if (remembered && !legacyConflicts.has(remembered) && !node.store.get(`identity-conflict:${remembered}`))
                 resume(s, remembered);
             if (!bound(s))
                 prepareState(s, undefined, () => publishControl(s));
             const raced = states.get(sid); // a concurrent first call may have registered its state first
-            if (raced)
+            if (raced) {
+                if (rootSid && !raced.rootSessionId)
+                    raced.rootSessionId = rootSid;
                 return raced;
+            }
             states.set(sid, state);
+        }
+        else if (rootSid && !state.rootSessionId) {
+            state.rootSessionId = rootSid;
         }
         return state;
     };
@@ -1394,7 +1438,7 @@ async function configureMcp(server, node, startupClosed) {
     const sessionNotes = (state, tool) => {
         if (!bound(state))
             return "";
-        const shared = env.cli === "codex" || env.cli === "opencode";
+        const shared = env.cli === "codex" || sharedConversationCli(env.cli);
         const covered = leadGrantCovering(node, state.agent);
         const sid = state.sessionId;
         const parts = [];
@@ -1724,6 +1768,7 @@ async function configureMcp(server, node, startupClosed) {
                     throw error;
             }
         }
+        subagentMayNotClaim(state, target, true);
         const next = { ...state, agent: target, leaseToken: undefined, coUse: undefined, released: false, pending: undefined, pendingReason: undefined, lostTo: undefined, parent: null };
         let result;
         try {

@@ -83,6 +83,8 @@ export const GROK_NO_PUSH = "the session has no push path: Grok has no idle-sess
  *  have: a finished `terminal(background=true, notify=true)` process starts the next turn. Keeps the `no push:` prefix the
  *  receipts and tests key on. */
 export const HERMES_NO_PUSH = "no push: Hermes has no idle-session inject. Run `agentmbx watch` with terminal(background=true, notify=true): its exit starts your next turn (start it again after each wake). Without it, new mail shows on your user's next prompt";
+/** T725: Antigravity has no idle-session inject. A background `agentmbx watch` run via run_command completes and wakes the turn. */
+export const AGY_NO_PUSH = "no push: Antigravity has no idle-session inject. Run `agentmbx watch` with run_command: its exit wakes your next turn via a system notification. Without it, new mail shows on your user's next prompt";
 /** Adapter boundary (T067): node core never imports kimi-web; the adapter registers the real check in wake-check. */
 const sessionWakeable = (x) => !!x.channel || ((WAKEABLE.has(x.cli) || (x.cli === "kimi" && kimiHostedCheck(x.pid))) && !x.session_id.startsWith("mcp-"));
 export const defaultHome = () => process.env.MBX_HOME || join(homedir(), ".local", "share", "agentmbx");
@@ -490,6 +492,8 @@ export class MbxNode {
             return GROK_NO_PUSH;
         if (ss.length > 0 && ss.every((x) => x.cli === "hermes"))
             return HERMES_NO_PUSH;
+        if (ss.length > 0 && ss.every((x) => x.cli === "agy"))
+            return AGY_NO_PUSH;
         return "no push: new mail shows on your user's next prompt, or when your mbx watcher or [mbx-watch] self-check runs";
     }
     sessionsFor(agent) {
