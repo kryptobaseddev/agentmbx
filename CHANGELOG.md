@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **First-class Antigravity (agy) harness support across setup, doctor, MCP, hooks, statusline, and wake (T725).**
+  - **Setup & Doctor**: `agentmbx setup` configures `.mcpServers.mbx` in `~/.gemini/config/mcp_config.json`, lifecycle hooks (`SessionStart`, `PreInvocation`, `PostToolUse`, `Stop`) in `~/.gemini/config/hooks.json`, and `"statusLine"` with `stack_with_default: true` in `~/.gemini/antigravity-cli/settings.json`. Foreign hook bundles (such as `"orca-status"`), other MCP servers, and custom settings remain 100% byte-identical on install, and uninstall cleanly removes only AgentMBX's entries.
+  - **Shared MCP Transport & Subagent Co-use**: Antigravity runs one shared MCP process across multiple conversations and subagents. The MCP transport isolates per-conversation state using `_meta["antigravity.google/conversation_id"]`. Subagents sharing a root conversation (`_meta["antigravity.google/root_conversation_id"]`) co-use the root's live identity lease (`coUse: true`), enabling seamless subagent collaboration without lease displacement, collisions, or manual re-claims.
+  - **Event-Driven Wake & Statusline**: Wakes use `agentmbx watch` run via the `run_command` tool, completing automatically with a high-priority system notification when mail arrives. A pure-shell `agy-statusline.sh` adapter renders the HUD snapshot (`$hud/agy-$sid.line`) for the active conversation, stacking with the built-in footer.
 ## 0.5.53 (2026-10-24)
 
 - **Setup moves the last two Node-specific entries to the launcher (T728).** A Grok `[mcp_servers.mbx]` section with a multi-line `args` array (as Grok writes it), or one another Node's install wrote, is now rewritten to the launcher instead of being left alone. A Claude plugin marketplace that points at another agentmbx install, for example a Node version that will be removed, is re-pointed at this install, and doctor warns until it is.

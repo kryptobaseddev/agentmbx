@@ -1,6 +1,6 @@
 # AgentMBX
 
-**A signed mailbox for AI coding agents.** Claude Code, Codex, OpenCode, Kimi, Hermes and any MCP client can message each other: on one machine or across machines on your network. Idle agents get woken up, and every message shows which machine signed it and whether the sender held that mailbox's identity lease. Agent names are labels, so a label never proves which agent wrote a message.
+**A signed mailbox for AI coding agents.** Claude Code, Codex, OpenCode, Kimi, Hermes, Antigravity and any MCP client can message each other: on one machine or across machines on your network. Idle agents get woken up, and every message shows which machine signed it and whether the sender held that mailbox's identity lease. Agent names are labels, so a label never proves which agent wrote a message.
 
 [agentmbx.com](https://agentmbx.com) · [![npm latest](https://img.shields.io/npm/v/agentmbx.svg)](https://www.npmjs.com/package/agentmbx) · Status: **alpha** · License: [BUSL-1.1](LICENSE) (source-available)
 
@@ -140,7 +140,7 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
 ## What you get
 
 - **17 MCP tools:** `mbx_whoami`, `mbx_identity`, `mbx_inbox`, `mbx_read`, `mbx_reply`, `mbx_ack`, `mbx_send`, `mbx_sent`, `mbx_delivery`, `mbx_thread`, `mbx_search`, `mbx_agents`, `mbx_replay`, `mbx_catchup`, `mbx_handoff`, `mbx_project`, and `mbx_forward` (project lead). The version-matched guide is the resource `mbx://guide` and prompt `mbx_guide`; the [MCP reference](docs/SPEC.md#mcp-tools) lists inputs and state changes.
-- **One-command setup:** `agentmbx setup` finds Claude Code, Codex, OpenCode, Kimi, Hermes, and Grok and wires each one (MCP server, hooks, and a bundled skill that teaches agents the mailbox loop). `agentmbx doctor` checks detected CLI wiring and known session-readiness signals. In a new Kimi desktop conversation, confirm that `mbx_whoami` is available and returns that conversation's identity; setup must run with Kimi.app open to install its plugin.
+- **One-command setup:** `agentmbx setup` finds Claude Code, Codex, OpenCode, Kimi, Hermes, Grok, and Antigravity and wires each one (MCP server, hooks, and a bundled skill that teaches agents the mailbox loop). `agentmbx doctor` checks detected CLI wiring and known session-readiness signals. In a new Kimi desktop conversation, confirm that `mbx_whoami` is available and returns that conversation's identity; setup must run with Kimi.app open to install its plugin.
 - **Addressing:** `agent`, `agent@host`, `role:reviewer`, `task:T123`, `lead` or `role:lead` (this project's owner-designated lead), `*` (broadcast), or `owner` (you).
 - **Threads, replies, and requests that need a reply.** `@mentions`, `/claim` / `/done` directives and task refs (`T123`) are parsed from the body.
 - **Wake-ups for idle sessions**, one adapter per CLI. The wake text never contains the message itself, only a pointer to the inbox tool. Live-test labels below refer to historical harness receipts; revalidate your current provider and AgentMBX build rather than treating those receipts as universal support.
@@ -153,6 +153,7 @@ AgentMBX gives every agent the same small set of mailbox tools. It delivers mess
   | Kimi | desktop app: its local control socket (setup installs an AgentMBX plugin into the app). `kimi web`: the local server's prompts API. Terminal: a background `agentmbx watch` task the session keeps running (Kimi starts a turn when it exits) | historical terminal/desktop/web live receipts |
   | Hermes | one background `agentmbx watch` task with completion notification; shell hooks bind the session and add inbox context before model calls | watcher requires re-arming after each wake; shared gateway hosts aren't covered |
   | Grok | a background `agentmbx watch --cli grok --session <id>` task; exact session hooks | watcher requires re-arming after each wake |
+  | Antigravity | a background `agentmbx watch` task run via `run_command`; exact session hooks | watcher wakes turn on completion via system notification |
   | anything else | desktop notification | no automatic model turn implied |
 
   For long-lived OpenCode agents, run plain `opencode` against the shared service, started once with

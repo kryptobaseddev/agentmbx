@@ -681,7 +681,7 @@ export function statuslineChecks(ctx: SetupCtx, cli: string): Check[] {  if (cli
   // not installed (the doctor loop only asks for detected CLIs; a direct call should stay quiet too).
   if (cli === "hermes" && existsSync(hermesConfigPath(ctx.home)))
     return [{ level: "info", label: "hermes: no status line feature in Hermes (agentmbx-hermes verified live, 2026-10-10); nothing to verify" }];
-  if (cli !== "claude" && cli !== "kimi" && cli !== "grok") return [];
+  if (cli !== "claude" && cli !== "kimi" && cli !== "grok" && cli !== "agy") return [];
   const out: Check[] = [];
   const where = edits(ctx, cli).find((e) => e.kind === "statusline")?.path.replace(ctx.home, "~") ?? "-";
   const fix = `agentmbx setup --only ${cli}`;
@@ -696,7 +696,7 @@ export function statuslineChecks(ctx: SetupCtx, cli: string): Check[] {  if (cli
     else if (configured !== null && !statuslineCurrent(ctx.home, cli, ctx.cmd, configured))
       out.push({ level: "warn", label: `${cli}: status line uses an older AgentMBX form (${configured})`, fix });
     else out.push({ level: "ok", label: `${cli}: status line wired (${where})${cli === "claude"
-      ? "; the command composes with Claude's built-in items" : " — the command replaces the footer; other keys do not render"}` });
+      ? "; the command composes with Claude's built-in items" : cli === "agy" ? "; the command composes with the built-in items" : " — the command replaces the footer; other keys do not render"}` });
   } else if (state === "foreign") {
     const embedded = !!configured && ((configured.includes("agentmbx") && configured.includes("statusline"))
       || configured.includes(join(skillDest(ctx.home), "scripts")));

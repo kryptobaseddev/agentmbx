@@ -17,7 +17,7 @@ import { version } from "./version.js";
 import { activeLauncher } from "./launcher.js";
 import { opencodeSidebarPackageJson, opencodeSidebarSchemaSource, opencodeSidebarServerSource, opencodeSidebarSource, OPENCODE_SIDEBAR_MARKER } from "./opencode-sidebar.js";
 import { authHelperPath, canPrompt, createKeychainOwner, ownerInfo } from "./owner.js";
-export const CLIS = ["claude", "codex", "opencode", "kimi", "hermes", "grok"];
+export const CLIS = ["claude", "codex", "opencode", "kimi", "hermes", "grok", "agy"];
 // T502: the explicit MCP startup timeout setup writes. Measured cold starts sit close to the harness
 // defaults (OpenCode connects in ~2.2s against a 5000ms default; Claude's p99 is ~4.3s), so every
 // harness whose config format has a real startup-timeout field gets at least this much, written
@@ -206,6 +206,9 @@ export function hookNamesInstalledEntry(command, sub, cli, cmd) {
     const t = shellTokens(command.slice(0, -tail.length));
     return !!t && t.length === 2 && nodeMeetsEnginesFloor(t[0]) && scriptNamesThisInstall(t[1]);
 }
+export const agyMcpConfigPath = (home) => join(home, ".gemini/config/mcp_config.json");
+export const agyHooksConfigPath = (home) => join(home, ".gemini/config/hooks.json");
+export const agySettingsPath = (home) => join(home, ".gemini/antigravity-cli/settings.json");
 // T347: setup wires one status line per CLI — never overwrites a user's existing one. A foreign
 // status line is left alone and reported (runSetup adds a manual row with the snippet); uninstall
 // removes only what setup wrote. "Ours" is an EXACT match against a command setup itself writes
@@ -232,6 +235,9 @@ export function statuslineCurrent(home, cli, cmd, command) {
     const grokScript = join(skillDest(home), "scripts", "grok-statusline.sh");
     if (cli === "grok" && existsSync(grokScript))
         return command === `sh ${shJoin([grokScript])}`;
+    const agyScript = join(skillDest(home), "scripts", "agy-statusline.sh");
+    if (cli === "agy" && existsSync(agyScript))
+        return command === `sh ${shJoin([agyScript])}`;
     if (statuslineForms(home, cli, cmd).has(command))
         return true;
     const tail = ` statusline ${cli}`;
@@ -250,6 +256,13 @@ export const statuslineState = (home, cli, cmd) => {
     try {
         if (cli === "claude") {
             const cur = read(join(home, ".claude/settings.json"));
+            if (cur === null)
+                return "absent";
+            const command = parseObj(cur).statusLine?.command;
+            return command === undefined ? "absent" : isOurStatusline(home, cli, cmd, command) ? "ours" : "foreign";
+        }
+        if (cli === "agy") {
+            const cur = read(agySettingsPath(home));
             if (cur === null)
                 return "absent";
             const command = parseObj(cur).statusLine?.command;
@@ -323,6 +336,8 @@ export const statuslineConfiguredCommand = (home, cli) => {
     try {
         if (cli === "claude")
             return parseObj(read(join(home, ".claude/settings.json"))).statusLine?.command ?? null;
+        if (cli === "agy")
+            return parseObj(read(agySettingsPath(home))).statusLine?.command ?? null;
         if (cli === "grok") {
             const dir = (home === homedir() && process.env.GROK_HOME) || join(home, ".grok");
             const cur = read(join(dir, "config.toml"));
@@ -342,6 +357,72 @@ export const statuslineConfiguredCommand = (home, cli) => {
         return null;
     }
 };
+function agyStatusLine(home, cmd) {
+    const want = () => statuslineCommand(home, "agy", cmd);
+    return {
+        install: (cur) => {
+            const obj = parseObj(cur);
+            const existing = obj.statusLine;
+            if (existing && !isOurStatusline(home, "agy", cmd, existing.command))
+                return cur; // foreign: reported, never overwritten
+            if (existing?.type === "command" && existing.command === want() && existing.stack_with_default === true)
+                return cur;
+            obj.statusLine = { ...existing, type: "command", command: want(), stack_with_default: true };
+            return jsonOut(obj, cur);
+        },
+        uninstall: (cur) => {
+            if (cur === null)
+                return cur;
+            const obj = parseObj(cur);
+            const existing = obj.statusLine;
+            if (!isOurStatusline(home, "agy", cmd, existing?.command))
+                return cur;
+            delete obj.statusLine;
+            return jsonOut(obj, cur);
+        },
+    };
+}
+function agyHooks(home, cmd) {
+    const want = () => ({
+        SessionStart: [{ type: "command", command: shJoin([...cmd, "hook", "session-start", "--cli", "agy"]), timeout: 10 }],
+        PreInvocation: [{ type: "command", command: shJoin([...cmd, "hook", "prompt", "--cli", "agy"]), timeout: 10 }],
+        PostToolUse: [{ matcher: "*", hooks: [{ type: "command", command: shJoin([...cmd, "hook", "post-tool", "--cli", "agy"]), timeout: 10 }] }],
+        Stop: [{ type: "command", command: shJoin([...cmd, "hook", "stop", "--cli", "agy"]), timeout: 10 }],
+    });
+    return {
+        install: (cur) => {
+            const obj = parseObj(cur);
+            obj.agentmbx = want();
+            return jsonOut(obj, cur);
+        },
+        uninstall: (cur) => {
+            if (cur === null)
+                return cur;
+            const obj = parseObj(cur);
+            if (!obj.agentmbx)
+                return cur;
+            delete obj.agentmbx;
+            return jsonOut(obj, cur);
+        },
+    };
+}
+function agyHooksStatus(cur, home, cmd) {
+    if (cur === null)
+        return "absent";
+    const obj = parseObj(cur);
+    const ambx = obj.agentmbx;
+    if (!ambx)
+        return "absent";
+    const ss = Array.isArray(ambx.SessionStart) && ambx.SessionStart[0]?.command;
+    const pi = Array.isArray(ambx.PreInvocation) && ambx.PreInvocation[0]?.command;
+    const ptu = Array.isArray(ambx.PostToolUse) && (ambx.PostToolUse[0]?.hooks?.[0])?.command;
+    const st = Array.isArray(ambx.Stop) && ambx.Stop[0]?.command;
+    const wantSS = shJoin([...cmd, "hook", "session-start", "--cli", "agy"]);
+    const wantPI = shJoin([...cmd, "hook", "prompt", "--cli", "agy"]);
+    const wantPTU = shJoin([...cmd, "hook", "post-tool", "--cli", "agy"]);
+    const wantST = shJoin([...cmd, "hook", "stop", "--cli", "agy"]);
+    return ss === wantSS && pi === wantPI && ptu === wantPTU && st === wantST ? "current" : "stale";
+}
 function claudeStatusLine(home, cmd) {
     const want = () => statuslineCommand(home, "claude", cmd);
     return {
@@ -760,6 +841,19 @@ export function mcpConfiguredCmd(home, cli) {
                     return null;
                 const e = hermesMcpParse(cur);
                 return e && e.command !== null ? [e.command, ...(e.args ?? [])] : null;
+            }
+            if (cli === "agy") {
+                const cur = read(agyMcpConfigPath(home));
+                if (cur === null)
+                    return null;
+                let obj;
+                try {
+                    obj = JSON.parse(cur);
+                }
+                catch {
+                    return null;
+                }
+                return entryArgv(obj?.mcpServers ? obj.mcpServers.mbx : null);
             }
         }
         catch {
@@ -2679,8 +2773,12 @@ export function detect(ctx) {
         return { cli, found: !!onPath || existsSync(join(h, dir)), why: onPath ? `${bin} on PATH` : existsSync(join(h, dir)) ? `~/${dir} exists` : "not found" };
     };
     const hermesCfg = existsSync(join(h, ".hermes/config.yaml"));
+    const agyOnPath = ctx.which("agy");
+    // ~/.gemini alone is Gemini CLI's; only Antigravity's own data directories mean agy is installed.
+    const agyDir = existsSync(join(h, ".gemini/antigravity-cli")) || existsSync(join(h, ".gemini/antigravity"));
     return [d("claude", "claude", ".claude"), d("codex", "codex", ".codex"), d("opencode", "opencode", ".config/opencode"), d("kimi", "kimi", ".kimi-code"), d("grok", "grok", ".grok"),
-        { cli: "hermes", found: hermesCfg, why: hermesCfg ? "~/.hermes/config.yaml exists" : ctx.which("hermes") || existsSync(join(h, ".hermes")) ? "no ~/.hermes/config.yaml yet" : "not found" }];
+        { cli: "hermes", found: hermesCfg, why: hermesCfg ? "~/.hermes/config.yaml exists" : ctx.which("hermes") || existsSync(join(h, ".hermes")) ? "no ~/.hermes/config.yaml yet" : "not found" },
+        { cli: "agy", found: !!agyOnPath || agyDir, why: agyOnPath ? "agy on PATH" : agyDir ? "~/.gemini/antigravity data exists" : "not found" }];
 }
 export const opencodeConfig = (home) => {
     const dir = join(home, ".config/opencode");
@@ -2801,6 +2899,16 @@ export function edits(ctx, cli) {
                 { cli, kind: "consent", item: "shell-hooks-allowlist.json approvals", path: hermesAllowlistPath(home), mode: 0o600, ...ap },
             ];
         }
+        case "agy": {
+            const entry = { command: cmd[0], args: mcpArgs };
+            const srv = jsonServer("mcpServers", entry, (e) => (e.command === cmd[0] && same(e.args ?? [], mcpArgs)) || mcpNodeScriptCurrent(e), true);
+            return [
+                { cli, kind: "mcp", item: "mcpServers.mbx", path: agyMcpConfigPath(home), ...srv },
+                { cli, kind: "hooks", item: "lifecycle hooks", path: agyHooksConfigPath(home), ...agyHooks(home, cmd),
+                    isWired: (cur) => agyHooksStatus(cur, home, cmd) === "current" },
+                { cli, kind: "statusline", item: "statusLine (MBX segment)", path: agySettingsPath(home), ...agyStatusLine(home, cmd) },
+            ];
+        }
     }
 }
 /** Is this edit already in its installed state? (Used by doctor.) */
@@ -2839,6 +2947,7 @@ const skillLinks = (home) => {
         { cli: "opencode", dir: join(home, ".config/opencode/skills") },
         { cli: "kimi", dir: fromEnv("KIMI_CODE_HOME", ".kimi-code") },
         { cli: "grok", dir: fromEnv("GROK_HOME", ".grok") },
+        { cli: "agy", dir: join(home, ".gemini/config/skills") },
     ];
     return candidates.filter((c) => existsSync(c.dir)).map((c) => ({ cli: c.cli, path: join(c.dir, "agentmbx") }));
 };
@@ -3046,13 +3155,15 @@ export function runSetup(ctx, o) {
         if (d.cli === "hermes" && o.mode === "install" && rows.some((r) => r.cli === "hermes" && r.item.startsWith("hooks") && (r.action === "added" || r.action === "updated")))
             rows.push({ cli: "hermes", item: "note", path: "-", action: "manual", note: "Hermes reads hooks when a session starts: they apply to sessions started after this" });
         // T347: a user's own status line is never overwritten — report it and print the snippet instead.
-        if (o.mode === "install" && (d.cli === "claude" || d.cli === "kimi" || d.cli === "grok") && statuslineState(ctx.home, d.cli, ctx.cmd) === "foreign")
+        if (o.mode === "install" && (d.cli === "claude" || d.cli === "kimi" || d.cli === "grok" || d.cli === "agy") && statuslineState(ctx.home, d.cli, ctx.cmd) === "foreign")
             rows.push({ cli: d.cli, item: "statusLine", path: "-", action: "manual",
                 note: `an existing status line was left alone; add the MBX segment yourself: ${d.cli === "claude"
                     ? `"statusLine": { "type": "command", "command": ${JSON.stringify(statuslineCommand(ctx.home, "claude", ctx.cmd))} }`
-                    : d.cli === "grok"
-                        ? `[ui.status_line]\ntype = "command"\ncommand = ${JSON.stringify(statuslineCommand(ctx.home, "grok", ctx.cmd))}`
-                        : `[status_line]\ncommand = ${JSON.stringify(statuslineCommand(ctx.home, "kimi", ctx.cmd))}`}` });
+                    : d.cli === "agy"
+                        ? `"statusLine": { "type": "command", "command": ${JSON.stringify(statuslineCommand(ctx.home, "agy", ctx.cmd))}, "stack_with_default": true }`
+                        : d.cli === "grok"
+                            ? `[ui.status_line]\ntype = "command"\ncommand = ${JSON.stringify(statuslineCommand(ctx.home, "grok", ctx.cmd))}`
+                            : `[status_line]\ncommand = ${JSON.stringify(statuslineCommand(ctx.home, "kimi", ctx.cmd))}`}` });
     }
     if (skillRows)
         rows.push(...skillRows);
@@ -3094,6 +3205,7 @@ export const MANUAL_HINTS = {
     kimi: "add {\"mcpServers\":{\"mbx\":{\"command\":\"agentmbx\",\"args\":[\"mcp\"]}}} to ~/.kimi-code/mcp.json",
     grok: "grok mcp add mbx --scope user -- agentmbx mcp",
     hermes: "add mcp_servers: { mbx: { command: agentmbx, args: [mcp] } } to ~/.hermes/config.yaml",
+    agy: "add {\"mcpServers\":{\"mbx\":{\"command\":\"agentmbx\",\"args\":[\"mcp\"]}}} to ~/.gemini/config/mcp_config.json",
 };
 /**
  * The owner step of `agentmbx setup`. An agent may run it: with the macOS Keychain helper, creating the key only needs the

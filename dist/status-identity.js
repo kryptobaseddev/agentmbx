@@ -3,6 +3,7 @@
 // bindings (one live holder under that pid), else unbound. It never guesses from a directory or a shared default name,
 // because in a folder used by several agents that name belongs to whoever registered it first (owner report 2026-10-02).
 import { fingerprint } from "./crypto.js";
+import { sharedConversationCli } from "./cli-identity.js";
 import { claudeSessionId } from "./proc.js";
 export function resolveStatusIdentity(node, cli, o = {}) {
     const db = node.store.db;
@@ -11,8 +12,8 @@ export function resolveStatusIdentity(node, cli, o = {}) {
         const row = db.prepare("SELECT agent,session_key FROM sessions WHERE cli=? AND session_id=?").get(cli, sid);
         if (row) {
             const lease = db.prepare("SELECT cli,session_id,key_fp FROM identity_leases WHERE name=? AND released_at IS NULL").get(row.agent);
-            // T723: on a shared OpenCode serve, a conversation whose mailbox another conversation took keeps its binding row.
-            if (cli === "opencode" && lease && (lease.cli !== cli || lease.session_id !== sid) && row.session_key && fingerprint(row.session_key) !== lease.key_fp)
+            // T723: on a shared provider transport (OpenCode/Antigravity), a conversation whose mailbox another conversation took keeps its binding row.
+            if (sharedConversationCli(cli) && lease && (lease.cli !== cli || lease.session_id !== sid) && row.session_key && fingerprint(row.session_key) !== lease.key_fp)
                 return { name: null, state: "unbound", resolved_by: null, lost_to: { name: row.agent, cli: lease.cli, session: lease.session_id } };
             return { name: row.agent, state: "bound", resolved_by: "session_id" };
         }
