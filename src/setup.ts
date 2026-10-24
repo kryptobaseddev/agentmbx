@@ -17,6 +17,7 @@ import { parse as parseToml } from "smol-toml";
 import { fingerprint } from "./crypto.ts";
 import { claudePluginStep, execCli, type CliRunner } from "./claude-plugin.ts";
 import { version } from "./version.ts";
+import { activeLauncher } from "./launcher.ts";
 import { opencodeSidebarPackageJson, opencodeSidebarSchemaSource, opencodeSidebarServerSource, opencodeSidebarSource, OPENCODE_SIDEBAR_MARKER } from "./opencode-sidebar.ts";
 import { authHelperPath, canPrompt, createKeychainOwner, ownerInfo } from "./owner.ts";
 
@@ -180,7 +181,11 @@ export function runsAgentmbx(bin: string): boolean {
  *  when the script is this install (realpath and package version) and the node exists and meets
  *  the engines floor. A missing or too-old node, or a script that resolves elsewhere, stays stale
  *  and is rewritten in place by the writers. */
-export function mcpNodeScriptCurrent(entry: { command?: unknown; args?: unknown }): boolean {
+/** T728: the command setup writes is the agentmbx launcher (one token: <home>/.local/share/agentmbx/bin/agentmbx). */
+const launcherCommand = (cmd?: string[]): boolean => cmd?.length === 1 && /\/\.local\/share\/agentmbx\/bin\/agentmbx$/.test(cmd[0]);
+
+export function mcpNodeScriptCurrent(entry: { command?: unknown; args?: unknown }, cmd?: string[]): boolean {
+  if (launcherCommand(cmd)) return false; // T728: with the launcher, a node + script entry is drift to rewrite
   if (typeof entry.command !== "string" || !Array.isArray(entry.args)) return false;
   const [script, ...rest] = entry.args as unknown[];
   return rest.length === 1 && rest[0] === "mcp" && typeof script === "string"
@@ -190,7 +195,8 @@ export function mcpNodeScriptCurrent(entry: { command?: unknown; args?: unknown 
 /** T533/T654: the hooks twin of mcpNodeScriptCurrent. [another node, this install's entry] is
  *  current when that node meets the engines floor, so setup leaves the bytes alone. A missing or
  *  too-old node, or a script that resolves elsewhere, is rewritten. */
-export function hookNamesInstalledEntry(command: string, sub: string, cli: string): boolean {
+export function hookNamesInstalledEntry(command: string, sub: string, cli: string, cmd?: string[]): boolean {
+  if (launcherCommand(cmd)) return false; // T728: with the launcher, a node + script hook is drift to rewrite
   const tail = ` hook ${sub} --cli ${cli}`;
   if (!command.endsWith(tail)) return false;
   const t = shellTokens(command.slice(0, -tail.length));
@@ -872,7 +878,7 @@ function grokHooks(cmd: string[]) {
         const want = hookCommand(cmd, sub, "grok");
         const ours = oursIn(next, event, sub);
         if (!ours.length) { missing.push(tableText(event, want)); continue; }
-        if (ours[0].command !== want && ours[0].command !== null && !hookNamesInstalledEntry(ours[0].command, sub, "grok")) {
+        if (ours[0].command !== want && ours[0].command !== null && !hookNamesInstalledEntry(ours[0].command, sub, "grok", cmd)) {
           // T532: `\\[\s\S]` so a line-ending-backslash-folded command is replaced whole — the
           // canonical single line in, the folded continuation bytes gone.
           const body = next.slice(ours[0].start, ours[0].end)
@@ -955,7 +961,8 @@ export function currentHookNode(command: string, cli: string, home: string): str
   }
   return null;
 }
-function hookCommandCurrent(command: string, sub: string, cli: string, home?: string): boolean {
+function hookCommandCurrent(command: string, sub: string, cli: string, home?: string, cmd?: string[]): boolean {
+  if (launcherCommand(cmd)) return false;
   if (hookNamesInstalledEntry(command, sub, cli)) return true;
   return sub === "post-tool" && cli === "claude" && !!home && posttoolFastPathCurrent(command, home);
 }
@@ -979,6 +986,8 @@ export function isSea(): boolean {
  *  not used: a mise upgrade or node pin rewrites or removes the shim and breaks every harness at once,
  *  while node + script stays valid as long as the install directory does. */
 export function resolveCommand(home = homedir(), which = defaultWhich): string[] {
+  const launcher = activeLauncher(home); // T728: setup installs it first; every config then runs it
+  if (launcher) return [launcher];
   if (isSea()) return [process.execPath];
   return [process.execPath, realpathSync(fileURLToPath(new URL("../bin/agentmbx.js", import.meta.url)))];
 }
@@ -1022,7 +1031,7 @@ function jsonHooks(events: [string, string][], cli: string, cmd: string[], comma
       if (!ours.length) { groups.push({ hooks: [{ type: "command", command: want, timeout: 10 }] }); changed = true; continue; }
       // T533/T654: [another node that meets the engines floor, this install's entry] is current,
       // including Claude's post-tool sh wrapper. Never rewritten to this shell's node path.
-      if (ours[0].command !== want && !hookCommandCurrent(ours[0].command ?? "", sub, cli, home)) { ours[0].command = want; changed = true; }
+      if (ours[0].command !== want && !hookCommandCurrent(ours[0].command ?? "", sub, cli, home, cmd)) { ours[0].command = want; changed = true; }
       if (ours.length > 1) { // duplicates from earlier runs: keep the first
         for (const g of groups) g.hooks = (g.hooks ?? []).filter((h) => h === ours[0] || !isOurHook(h.command ?? "", sub, cli, cmd));
         hooks[ev] = groups.filter((g) => (g.hooks ?? []).length); changed = true;
@@ -1113,7 +1122,7 @@ function codexServer(cmd: string[]) {
       const t = tryParseToml(cur);
       if (!t) return false;
       const e = (t.mcp_servers as Record<string, unknown> | undefined)?.mbx as { command?: unknown; args?: unknown } | undefined;
-      return !!e && (e.command === cmd[0] && JSON.stringify(e.args ?? []) === JSON.stringify(mcpArgs) || mcpNodeScriptCurrent(e));
+      return !!e && (e.command === cmd[0] && JSON.stringify(e.args ?? []) === JSON.stringify(mcpArgs) || mcpNodeScriptCurrent(e, cmd));
     },
     install: (cur: string | null) => {
       const lines = (cur ?? "").split("\n");
@@ -1122,7 +1131,7 @@ function codexServer(cmd: string[]) {
       // T533: wired by another shell's node + this install's entry, node still there: leave the bytes alone.
       const t = tryParseToml(cur ?? "");
       const e = t ? (t.mcp_servers as Record<string, unknown> | undefined)?.mbx as { command?: unknown; args?: unknown } | undefined : undefined;
-      if (e && mcpNodeScriptCurrent(e)) return cur;
+      if (e && mcpNodeScriptCurrent(e, cmd)) return cur;
       // main table body only (sub-tables such as [mcp_servers.mbx.env] are kept)
       let mainEnd = r[0] + 1;
       while (mainEnd < r[1] && !lines[mainEnd].trim().startsWith("[")) mainEnd++;
@@ -1901,7 +1910,7 @@ function opencodeServer(cmd: string[]) {
   };
   const commandCurrent = (command: unknown): boolean => Array.isArray(command) && (
     JSON.stringify(command) === JSON.stringify(desired.command) ||
-    mcpNodeScriptCurrent({ command: command[0], args: command.slice(1) })
+    mcpNodeScriptCurrent({ command: command[0], args: command.slice(1) }, cmd)
   );
   return {
     // T502 back-compat: an entry an older setup wrote (no timeout, or a numeric one) is still
@@ -1916,7 +1925,7 @@ function opencodeServer(cmd: string[]) {
         if (!v || typeof v !== "object") return false;
         if (v.type === "local" && JSON.stringify(v.command ?? null) === JSON.stringify(desired.command)) return true;
         // T533: [another node, this install's entry, "mcp"] under any spelling of the node path.
-        return Array.isArray(v.command) && mcpNodeScriptCurrent({ command: v.command[0], args: v.command.slice(1) });
+        return Array.isArray(v.command) && mcpNodeScriptCurrent({ command: v.command[0], args: v.command.slice(1) }, cmd);
       } catch { return false; }
     },
     install: (cur: string | null) => {
@@ -2003,7 +2012,7 @@ function hermesServer(cmd: string[]) {
     isWired: (cur: string | null) => {
       if (cur === null) return false;
       const e = hermesMcpParse(cur);
-      return !!e && (e.command === cmd[0] && JSON.stringify(e.args ?? []) === JSON.stringify(mcpArgs) || mcpNodeScriptCurrent({ command: e.command, args: e.args }));
+      return !!e && (e.command === cmd[0] && JSON.stringify(e.args ?? []) === JSON.stringify(mcpArgs) || mcpNodeScriptCurrent({ command: e.command, args: e.args }, cmd));
     },
     install: (cur: string | null) => {
       if (cur === null) return null;
@@ -2012,7 +2021,7 @@ function hermesServer(cmd: string[]) {
       // T533: wired by another shell's node + this install's entry, node still there: leave the bytes alone.
       if (r.mbx >= 0) {
         const e = hermesMcpParse(cur);
-        if (e && mcpNodeScriptCurrent({ command: e.command, args: e.args })) return cur;
+        if (e && mcpNodeScriptCurrent({ command: e.command, args: e.args }, cmd)) return cur;
       }
       const want = body(r.ind);
       if (r.mbx >= 0) {
@@ -2290,7 +2299,7 @@ function hermesHooks(cmd: string[]) {
         // T526: a folded scalar is replaced across its whole line span — the canonical single line in,
         // the continuation lines gone — never leaving a truncated sibling of ours.
         // T533: [another existing node, this install's entry] is current — never rewritten to this shell's node path.
-        if (mine[0].command !== wanted && !hookNamesInstalledEntry(mine[0].command!, sub, "hermes")) {
+        if (mine[0].command !== wanted && !hookNamesInstalledEntry(mine[0].command!, sub, "hermes", cmd)) {
           const it = mine[0];
           const line = out[it.commandLine].replace(/(command:[ \t]*).*/, (_m, p1: string) => p1 + JSON.stringify(wanted));
           out.splice(it.commandLine, it.commandEndLine - it.commandLine + 1, line);
@@ -2390,7 +2399,7 @@ export function hermesConsent(ctx: SetupCtx): { state: "approved" | "auto" | "mi
     if (!entry || typeof entry !== "object") return false;
     const command = (entry as { command?: unknown }).command;
     return (entry as { event?: unknown }).event === w.event && typeof command === "string"
-      && (command === w.command || hookNamesInstalledEntry(command, w.sub, "hermes"));
+      && (command === w.command || hookNamesInstalledEntry(command, w.sub, "hermes", ctx.cmd));
   };
   const missing = wanted.filter((w) => !approvals.some((entry) => matches(entry, w))).map((w) => w.event);
   return { state: missing.length ? "missing" : "approved", missing };
@@ -2424,7 +2433,7 @@ export function edits(ctx: SetupCtx, cli: CliId): Edit[] {
   switch (cli) {
     case "claude": {
       const entry = { type: "stdio", command: cmd[0], args: mcpArgs, env: {} };
-      const srv = jsonServer("mcpServers", entry, (e) => (e.command === cmd[0] && same(e.args ?? [], mcpArgs)) || mcpNodeScriptCurrent(e));
+      const srv = jsonServer("mcpServers", entry, (e) => (e.command === cmd[0] && same(e.args ?? [], mcpArgs)) || mcpNodeScriptCurrent(e, cmd));
       return [
         { cli, kind: "mcp", item: "MCP server mbx (user scope)", path: join(home, ".claude.json"), ...srv,
           viaCli: (c, mode, cur) => {
@@ -2482,7 +2491,7 @@ export function edits(ctx: SetupCtx, cli: CliId): Edit[] {
       ];
     case "kimi": {
       const kimi = (home === homedir() && process.env.KIMI_CODE_HOME) || join(home, ".kimi-code");
-      const srv = jsonServer("mcpServers", { command: cmd[0], args: mcpArgs }, (e) => (e.command === cmd[0] && same(e.args ?? [], mcpArgs)) || mcpNodeScriptCurrent(e), true);
+      const srv = jsonServer("mcpServers", { command: cmd[0], args: mcpArgs }, (e) => (e.command === cmd[0] && same(e.args ?? [], mcpArgs)) || mcpNodeScriptCurrent(e, cmd), true);
       return [
         { cli, kind: "mcp", item: "mcpServers.mbx", path: join(kimi, "mcp.json"), ...srv },
         { cli, kind: "hooks", item: "[[hooks]] SessionStart + UserPromptSubmit + PermissionRequest + Stop", path: join(kimi, "config.toml"), ...kimiHooks(cmd) },
