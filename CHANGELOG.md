@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **The daemon's PATH puts system Node ahead of version-manager shims (T729).** The launchd job listed `~/.local/share/mise/shims` before `/opt/homebrew/bin`, so anything the daemon started through `env node` could still run mise's Node. Homebrew and system directories now come first, and mise shims come last, so tools installed only under mise still resolve. Without the launcher, the service falls back to Homebrew's Node instead of a mise shim. Run `agentmbx daemon install` (or `agentmbx setup`) to rewrite the plist.
+
 ## 0.5.54 (2026-10-24)
 
 - **"Outside content" now needs evidence (T738, phase 1).** Agents often marked ordinary coordination with each other as `origin: "external"`. Every reader of such a message was then fenced to read-only for an hour, and their replies spread the fence through whole teams. Now `origin: "external"` applies only when the sender also declares an outside payload: `payload: "firsthand-outside"` (it fetched a web page, issue, PR comment or email itself) or `"derived-outside"`. Without one, the message goes out as agent mail and the sender gets a warning explaining why. Mail between the owner's agents is agent content in every project. The fence for real outside content is unchanged. Phase 2 will narrow that fence to the messages that actually derive from outside content.

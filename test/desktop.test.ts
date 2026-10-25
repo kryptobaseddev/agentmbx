@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { cpSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { APP_BUNDLE_ID, appSourceCandidates, findAppSource, installAppBundle, installedAppPath, launchdPlist, serviceLabel, systemdUnit } from "../src/service.ts";
+import { APP_BUNDLE_ID, appSourceCandidates, findAppSource, installAppBundle, installedAppPath, launchdPlist, serviceLabel, servicePathEnv, systemdUnit } from "../src/service.ts";
 import { desktopCommands, inboxCommand, macNotifierPath } from "../src/wake.ts";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "mbx-desktop-"));
@@ -88,4 +88,10 @@ test("notifier selection: AgentMBX.app first, osascript fallback, notify-send on
 
 test("inbox command quotes every part for the shell", () => {
   assert.equal(inboxCommand("planner", "/opt/my node", "/pkg/it's.js"), `'/opt/my node' '/pkg/it'\\''s.js' inbox --as 'planner'`);
+});
+
+test("T729: the daemon PATH puts system Node ahead of version-manager shims", () => {
+  const dirs = servicePathEnv("/Users/u").split(":");
+  const shims = dirs.indexOf("/Users/u/.local/share/mise/shims");
+  assert.ok(shims > dirs.indexOf("/opt/homebrew/bin") && shims > dirs.indexOf("/usr/local/bin") && shims > dirs.indexOf("/usr/bin"));
 });
