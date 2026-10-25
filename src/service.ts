@@ -8,7 +8,7 @@ import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { activeLauncher } from "./launcher.ts";
+import { activeLauncher, stableNodePath } from "./launcher.ts";
 
 export const APP_BUNDLE_ID = "com.agentmbx.app";
 export const APP_NAME = "AgentMBX.app";
@@ -85,10 +85,10 @@ export function systemdUnit(o: { nodeBin: string; bin: string; mbxHome: string }
   return `[Unit]\nDescription=AgentMBX daemon\n\n[Service]\nEnvironment=MBX_HOME=${o.mbxHome}\nExecStart=${[o.nodeBin, o.bin, "daemon"].filter(Boolean).join(" ")}\nRestart=always\n\n[Install]\nWantedBy=default.target\n`;
 }
 
-/** A stable node path (mise/asdf/volta shims survive Node upgrades) over the versioned execPath. */
-export function stableNode(home = homedir()): string {
-  const shims = [join(home, ".local/share/mise/shims/node"), join(home, ".asdf/shims/node"), join(home, ".volta/bin/node")];
-  return shims.find((p) => existsSync(p)) ?? process.execPath;
+/** The daemon's PATH (T729): system Node first, so anything it spawns via `env node` never resolves a
+ *  version manager's Node; mise shims stay last so CLIs installed only there still resolve for wakes. */
+export function servicePathEnv(home = homedir()): string {
+  return [join(home, ".local/bin"), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", join(home, ".opencode/bin"), join(home, ".local/share/mise/shims")].join(":");
 }
 
 export function installService(mbxHome: string): void {
@@ -101,15 +101,14 @@ export function installService(mbxHome: string): void {
   // T728: the service runs the agentmbx launcher, so a Node upgrade or reinstall never leaves it pointing at a deleted path.
   const launcher = activeLauncher();
   const bin = launcher || sea ? "" : realpathSync(process.argv[1]);
-  const nodeBin = launcher ?? (sea ? realpathSync(process.execPath) : stableNode());
+  const nodeBin = launcher ?? (sea ? realpathSync(process.execPath) : stableNodePath());
   const home = homedir();
   if (process.platform === "darwin") {
     const label = serviceLabel();
     const app = installAppBundle();
     const plist = join(home, "Library/LaunchAgents", `${label}.plist`);
     mkdirSync(dirname(plist), { recursive: true });
-    const path = [join(home, ".local/bin"), join(home, ".local/share/mise/shims"), join(home, ".opencode/bin"), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"].join(":");
-    writeFileSync(plist, launchdPlist({ label, nodeBin, bin, mbxHome, path, app }));
+    writeFileSync(plist, launchdPlist({ label, nodeBin, bin, mbxHome, path: servicePathEnv(home), app }));
     const target = `gui/${process.getuid!()}`;
     try { execFileSync("launchctl", ["bootout", `${target}/${label}`], { stdio: "ignore" }); } catch { /* not loaded */ }
     // bootout returns before the old job is gone; bootstrapping too early fails with "5: Input/output error"
