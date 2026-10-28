@@ -2545,7 +2545,7 @@ async function watch(node, selection) {
                 const box = isSlotName(mailbox) ? projectMailboxBySlot(node.store, mailbox) : undefined, subject = box ? agent : mailbox;
                 if (wakeMutedUntil(node, subject))
                     continue; // muted: the mail stays delivered and unread
-                const rows = node.store.db.prepare(`SELECT m.*, d.note AS delivery_note FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND (d.state='delivered' OR (d.state='notified' AND d.note='desktop')) ORDER BY m.ts`).all(mailbox);
+                const rows = node.store.db.prepare(`SELECT m.*, d.note AS delivery_note FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND (d.state='delivered' OR (d.state='notified' AND d.note IN ('desktop','stalled'))) ORDER BY m.ts`).all(mailbox);
                 if (!rows.length)
                     continue;
                 const wanted = rows.filter(r => node.wantsWake(subject, r) && hasWakeAuthority(node, subject, r));
@@ -2564,8 +2564,8 @@ async function watch(node, selection) {
                 }
                 for (const r of rows) {
                     node.setDelivery(r.id, mailbox, "notified");
-                    if (r.delivery_note === "desktop")
-                        node.store.db.prepare("UPDATE deliveries SET note=NULL, updated_at=? WHERE msg_id=? AND agent=? AND state='notified' AND note='desktop'").run(new Date().toISOString(), r.id, mailbox);
+                    if (r.delivery_note === "desktop" || r.delivery_note === "stalled")
+                        node.store.db.prepare("UPDATE deliveries SET note=NULL, updated_at=? WHERE msg_id=? AND agent=? AND state='notified' AND note IN ('desktop','stalled')").run(new Date().toISOString(), r.id, mailbox);
                 }
                 if (wanted.length) {
                     // Admitted only for the conversation that can observe this exit. A matching mcp-* lease

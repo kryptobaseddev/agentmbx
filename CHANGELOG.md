@@ -6,6 +6,11 @@
   - Reading mail never fences your session. Only an envelope whose provenance can't be checked (malformed) still does.
   - "External" stays on the one message whose sender declared outside content (`payload: firsthand-outside` or `derived-outside`). Its recipients may only read it; their own sends are unaffected.
   - Inherited-external mail from older senders gets normal policy.
+- **Stuck mail is reported as stuck (T755, T756).** When no session wake reached an agent and the desktop notice also failed, the mail used to be marked "notified (owner desktop notice only)", even though nobody had been told. AgentMBX's macOS notifications have been switched off since 2026-10-03, so every such wake looked successful. Now:
+  - the mail is marked **stalled**, and sender receipts say so;
+  - the notifier's error is logged as its own `wake.notice_failed` audit row;
+  - for a stalled request, task, decision or alert, the agent's project lead gets one alert (at most every 30 minutes per agent), listing ids and senders only, never content.
+  Stalled mail is still picked up when the agent's session binds or its watcher runs. Desktop notices stay off by the owner's choice.
 
 - **The daemon's PATH puts system Node ahead of version-manager shims (T729).** The launchd job listed `~/.local/share/mise/shims` before `/opt/homebrew/bin`, so anything the daemon started through `env node` could still run mise's Node. Homebrew and system directories now come first, and mise shims come last, so tools installed only under mise still resolve. Without the launcher, the service falls back to Homebrew's Node instead of a mise shim. Run `agentmbx daemon install` (or `agentmbx setup`) to rewrite the plist.
 

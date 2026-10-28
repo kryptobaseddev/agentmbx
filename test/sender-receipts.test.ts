@@ -53,8 +53,8 @@ test("T376: mbx_sent reports desktop fallback after a rejected Codex binding", a
   const result = await boss("mbx_sent");
   const receipt = (result.structuredContent as unknown as Page).messages.find(m => m.id === sent.id)!.recipients[0];
   assert.equal(receipt.state, "notified");
-  assert.equal(receipt.note, "desktop");
-  assert.match(result.content[0].text, /owner desktop notice only/);
+  assert.equal(receipt.note, "stalled");
+  assert.match(result.content[0].text, /stalled \(no session or notice reached it/);
   assert.doesNotMatch(result.content[0].text, /woken now/);
 });
 
