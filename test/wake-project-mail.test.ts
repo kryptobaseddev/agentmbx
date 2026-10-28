@@ -136,7 +136,7 @@ test("T557: when the desktop-notice limit is reached the lead's personal mail is
   const out = await dispatchWakes(f.n);
   assert.match(String((out[0]?.result as { error?: string } | undefined)?.error ?? ""), /notice skipped/);
   assert.equal(f.audits("wake.notice_skipped"), 1);
-  assert.deepEqual(f.rowOf(personal.id, "agentmbx-lead"), { state: "notified", note: "desktop" });
+  assert.deepEqual(f.rowOf(personal.id, "agentmbx-lead"), { state: "notified", note: "stalled" });
   assert.deepEqual(f.rowOf(project.id, SLOT), { state: "delivered", note: null }, "project mail is never marked desktop, limit or not");
 });
 
@@ -266,7 +266,7 @@ test("T557: the lead's personal mail still falls back to a desktop mark when it 
   f.designate("agentmbx-lead");
   const personal = f.send(["agentmbx-lead"], { subject: "mine" }), project = f.send(["agentmbx"]);
   await dispatchWakes(f.n);
-  assert.deepEqual(f.rowOf(personal.id, "agentmbx-lead"), { state: "notified", note: "desktop" }, "unchanged behaviour for personal mail");
+  assert.deepEqual(f.rowOf(personal.id, "agentmbx-lead"), { state: "notified", note: "stalled" }, "personal mail no notice reached is stalled");
   assert.deepEqual(f.rowOf(project.id, SLOT), { state: "delivered", note: null }, "project mail is never marked desktop");
 });
 

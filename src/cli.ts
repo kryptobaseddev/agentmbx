@@ -2100,7 +2100,7 @@ async function watch(node: MbxNode, selection: CliIdentitySelection) {
         // already-notified row (COALESCE keeps it, and notified is not an earlier rank).
         type WatchRow = Parameters<MbxNode["wantsWake"]>[1] & { delivery_note: string | null };
         const rows = node.store.db.prepare(
-          `SELECT m.*, d.note AS delivery_note FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND (d.state='delivered' OR (d.state='notified' AND d.note='desktop')) ORDER BY m.ts`
+          `SELECT m.*, d.note AS delivery_note FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=? AND (d.state='delivered' OR (d.state='notified' AND d.note IN ('desktop','stalled'))) ORDER BY m.ts`
         ).all(mailbox) as unknown as WatchRow[];
         if (!rows.length) continue;
         const wanted = rows.filter(r => node.wantsWake(subject, r) && hasWakeAuthority(node, subject, r));
@@ -2116,8 +2116,8 @@ async function watch(node: MbxNode, selection: CliIdentitySelection) {
         }
         for (const r of rows) {
           node.setDelivery(r.id, mailbox, "notified");
-          if (r.delivery_note === "desktop") node.store.db.prepare(
-            "UPDATE deliveries SET note=NULL, updated_at=? WHERE msg_id=? AND agent=? AND state='notified' AND note='desktop'"
+          if (r.delivery_note === "desktop" || r.delivery_note === "stalled") node.store.db.prepare(
+            "UPDATE deliveries SET note=NULL, updated_at=? WHERE msg_id=? AND agent=? AND state='notified' AND note IN ('desktop','stalled')"
           ).run(new Date().toISOString(), r.id, mailbox);
         }
         if (wanted.length) {

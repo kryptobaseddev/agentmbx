@@ -41,8 +41,8 @@ for (const defect of ["generation", "parent"] as const) test(`T376: rejected con
   assert.equal(existsSync(log), false);
   const delivered = sentPage(n, "sender").messages.find(m => m.id === sent.envelope.id)!.recipients[0];
   assert.equal(delivered.state, "notified");
-  assert.equal(delivered.note, "desktop");
-  assert.match(receiptLine(delivered), /owner desktop notice only/);
+  assert.equal(delivered.note, "stalled");
+  assert.match(receiptLine(delivered), /stalled \(no session or notice reached it/);
   assert.equal(n.unreadCount("worker"), 1);
 });
 
@@ -216,7 +216,7 @@ test("an MCP-only opencode binding never wakes a guessed session from its direct
   assert.equal((await dispatchWakes(n))[0].result.ok, false);
   assert.deepEqual(stub.calls, [], "no session was resolved or woken by directory");
   const d = n.store.db.prepare("SELECT state, note FROM deliveries WHERE agent='worker'").get() as { state: string; note: string | null };
-  assert.equal(d.note, "desktop", "notice fallback keeps the mail re-wakeable once the exact session binds");
+  assert.equal(d.note, "stalled", "a failed notice is stalled and keeps the mail re-wakeable once the exact session binds");
 });
 
 test("the directory fallback is a no-op when the service knows no session there", async (t) => {
@@ -233,5 +233,21 @@ test("the directory fallback is a no-op when the service knows no session there"
   await dispatchWakes(n);
   assert.deepEqual(stub.calls, [], "no synthetic submitted when the directory has no session");
   const d = n.store.db.prepare("SELECT state, note FROM deliveries WHERE agent='worker'").get() as { state: string; note: string | null };
-  assert.equal(d.note, "desktop", "designed fallback: desktop notice keeps the mail re-wakeable");
+  assert.equal(d.note, "stalled", "a failed notice is stalled and keeps the mail re-wakeable");
+});
+
+test("T755/T756: a failed desktop notice is audited and the mail is marked stalled, not desktop", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-wake-stalled-")), n = new MbxNode(home, { host: "alpha" });
+  const old = process.env.MBX_NO_DESKTOP;
+  process.env.MBX_NO_DESKTOP = "1";
+  t.after(() => { if (old === undefined) delete process.env.MBX_NO_DESKTOP; else process.env.MBX_NO_DESKTOP = old;
+    n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  bindWakeLease(n, { agent: "worker", cli: "kimi", session_id: "session_terminal", pid: process.pid }); // a terminal Kimi: no push target
+  sendLeased(n, { from: "sender", to: ["worker"], subject: "help", body: "please look", kind: "request" });
+  await dispatchWakes(n);
+  const d = n.store.db.prepare("SELECT state, note FROM deliveries WHERE agent='worker'").get() as { state: string; note: string | null };
+  assert.deepEqual({ ...d }, { state: "notified", note: "stalled" });
+  const failed = n.store.db.prepare("SELECT detail FROM audit WHERE event='wake.notice_failed'").get() as { detail: string } | undefined;
+  assert.ok(failed, "the notifier failure is its own audit row");
+  assert.equal(JSON.parse(failed.detail).error, "disabled");
 });

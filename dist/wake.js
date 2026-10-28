@@ -19,6 +19,7 @@ import { isSlotName } from "./project-slot.js";
 import { markSkewNoted, wakeSkewNote } from "./connector-skew.js";
 import { codexFailureClass, enqueueCodexQueue, reconcileCodexQueue } from "./codex-queue.js";
 import { identityGeneration } from "./identity-control.js";
+import { activeLead } from "./lead-record.js";
 const run = promisify(execFile);
 const attemptId = () => ulid();
 const receipt = (strength, r = {}) => ({ strength, nativeId: null, sessionId: null, nativeStatus: null, providerVersion: null, ...r });
@@ -528,6 +529,35 @@ export async function notifyDesktop(n) {
     }
     return last;
 }
+/** T756: stalled work mail alerts the stuck agent's project lead (desktop notices stay off by owner decision 2026-10-28).
+ *  Request/task/decision/alert only, at most once per agent per STALL_ALERT_MS, never for the lead's own mail or system
+ *  mail. Ids and senders only, never content. Returns the lead it alerted, or null. */
+export const STALL_ALERT_MS = 30 * 60_000;
+export function alertLeadOfStall(node, agent, rows, now = Date.now()) {
+    const work = rows.filter(r => ["request", "task", "decision", "alert"].includes(r.kind) && !r.from_addr.startsWith("mbx@"));
+    if (!work.length)
+        return null;
+    const key = `stall-alert:${agent}`, last = Date.parse(node.store.get(key) ?? "");
+    if (Number.isFinite(last) && now - last < STALL_ALERT_MS)
+        return null;
+    const project = node.store.db.prepare("SELECT project FROM identity_projects WHERE name=? ORDER BY last_seen DESC LIMIT 1").get(agent)?.project;
+    const lead = project ? activeLead(node, project, new Date(now)) : null;
+    if (!lead || lead.host !== node.host || lead.agent === agent)
+        return null;
+    node.store.set(key, new Date(now).toISOString());
+    const list = work.slice(0, 10).map(r => `${r.id} (${r.kind} from ${r.from_addr})`).join(", ");
+    try {
+        node.send({ from: "mbx", to: [lead.agent], kind: "alert", subject: `Stalled mail: ${agent} cannot be woken`.slice(0, 200),
+            body: `${agent} has ${work.length} unread work message(s) that no session wake reached: ${list}. Its session is idle or has no push path, `
+                + `so the mail waits for its next prompt. Ask the owner to prompt ${agent}, or reassign the work.` });
+    }
+    catch {
+        node.store.db.prepare("DELETE FROM kv WHERE k=?").run(key);
+        return null;
+    }
+    node.store.audit("wake.stall_alert", { agent, lead: lead.agent, count: work.length });
+    return lead.agent;
+}
 // ---- wake reconciliation and pressure (T179) -------------------------------------------------------------
 /** An `unknown` attempt is held this long before its mail may be woken once more (still within WAKE_LIMITS). */
 export const UNKNOWN_HOLD_MS = 10 * 60_000;
@@ -829,15 +859,24 @@ export async function dispatchWakes(node, now = Date.now()) {
                 out.push({ agent, result: { ok: false, via: "lease", error: "wake identity not verified and notice skipped; delivery retained for a later pass" } });
                 continue;
             }
-            node.store.tx(() => ownRows.forEach(r => node.setDelivery(r.id, r.agent, "notified", "desktop")));
+            node.store.tx(() => ownRows.forEach(r => node.setDelivery(r.id, r.agent, "notified", "stalled")));
             node.store.audit("wake.notice_skipped", { agent, count: wanted.length });
+            alertLeadOfStall(node, agent, wanted.filter(r => !isSlotName(r.agent)));
             out.push({ agent, result: { ok: false, via: "desktop", error: "notice skipped (unknown agent or notice rate limit)" } });
             continue;
         }
         if (!result.ok)
-            result = await notifyDesktop({ subtitle: agent, body: wakeTextFor(node, agent, ownWanted) + policyBrief(node.store.db, agent, node.host), openCmd: inboxCommand(agent) }).then((r) => { desktop = r.ok; return r.ok ? r : result; });
-        // mail that only reached the desktop gets another wake when a wakeable session binds (node.bindSession)
-        const finish = () => (desktop || !result.ok ? ownRows : rows).forEach(r => node.setDelivery(r.id, r.agent, "notified", desktop || !result.ok ? "desktop" : null));
+            result = await notifyDesktop({ subtitle: agent, body: wakeTextFor(node, agent, ownWanted) + policyBrief(node.store.db, agent, node.host), openCmd: inboxCommand(agent) }).then((r) => {
+                desktop = r.ok;
+                // T755: a failed notice is its own audited error, not hidden behind the adapter's result.
+                if (!r.ok)
+                    node.store.audit("wake.notice_failed", { agent, via: r.via, error: r.error ?? null });
+                return r.ok ? r : result;
+            });
+        // T756: mail no session or notice reached is "stalled", not "desktop"; both get another wake when a wakeable session
+        // binds (node.bindSession) or a watcher picks them up.
+        const note = desktop ? "desktop" : !result.ok ? "stalled" : null;
+        const finish = () => (note ? ownRows : rows).forEach(r => node.setDelivery(r.id, r.agent, "notified", note));
         try {
             if (submitted && result.ok && !desktop)
                 submitted.run(finish, false);
@@ -848,7 +887,9 @@ export async function dispatchWakes(node, now = Date.now()) {
             out.push({ agent, result: { ok: false, via: "lease", error: "wake completed after ownership changed; delivery retained" } });
             continue;
         }
-        node.store.audit("wake", { agent, via: result.via, ok: result.ok, count: wanted.length });
+        node.store.audit("wake", { agent, via: result.via, ok: result.ok, count: wanted.length, ...(note === "stalled" ? { stalled: true } : {}) });
+        if (note === "stalled")
+            alertLeadOfStall(node, agent, ownWanted);
         out.push({ agent, result });
     }
     return out;
