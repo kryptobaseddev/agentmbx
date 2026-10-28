@@ -308,7 +308,7 @@ export function taintSendWarning(taint) {
 }
 /** A sender that passed `--origin external` declares the body first-hand, even when a taint is also live. */
 export function declaredOriginWarning(taint) {
-    const base = "sent with origin external, as you declared: recipients may only read it under owner policy (no edit or outward), and reading it makes their own sends external for 1 h. Recipients acting on this message may not use outward-reversible, nor may a session tainted by reading it.";
+    const base = "sent with origin external, as you declared: recipients may only read it under owner policy (no edit or outward); their own sends are not affected. Recipients acting on this message may not use outward-reversible, nor may a session tainted by reading it.";
     if (!taint)
         return base;
     return `${base} This session's sends stay external until ${iso(taint.root + EXTERNAL_TAINT_MS)}, an hour after its root exposure at ${iso(taint.root)}: you read ${taint.id} from ${taint.from}.`;
