@@ -131,6 +131,6 @@ test("T659: no poller means no wake attempt, and the ordinary notice path applie
   const out = await dispatchWakes(n);
   assert.equal(out[0]?.result.ok, false);
   assert.equal(attempts(n), 0, "no wake may be attempted without a live serve");
-  assert.deepEqual({ ...delivery(n, sent.envelope.id) }, { state: "notified", note: "desktop" }, "the agent's mail is not consumed: it stays unread for the next pass or rebind");
+  assert.deepEqual({ ...delivery(n, sent.envelope.id) }, { state: "notified", note: "stalled" }, "the agent's mail is not consumed: it stays unread for the next pass or rebind");
   assert.equal(n.unreadCount("worker"), 1);
 });

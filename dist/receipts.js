@@ -224,7 +224,8 @@ export function deliveryReceipts(node, m, now = Date.now()) {
 }
 /** One line per recipient, for thread views. */
 // "notified" with note "desktop" means only the owner saw a desktop notice: no agent session was told.
-export const receiptLine = (r) => `  → ${r.address}: ${r.state === "notified" && r.note === "desktop" ? "notified (owner desktop notice only)" : r.state}${r.updated_at ? ` ${r.updated_at.slice(0, 19)}Z` : ""}`
+// Note "stalled" (T756) means nothing reached anyone: no session wake and no desktop notice.
+export const receiptLine = (r) => `  → ${r.address}: ${r.state === "notified" && r.note === "desktop" ? "notified (owner desktop notice only)" : r.state === "notified" && r.note === "stalled" ? "stalled (no session or notice reached it; it is read on the next prompt)" : r.state}${r.updated_at ? ` ${r.updated_at.slice(0, 19)}Z` : ""}`
     + `${r.wake ? ` · ${r.wake}` : ""}`
     + `${r.did ? ` · did: ${r.did}` : ""}${r.note ? ` · note: ${r.note}` : ""}${r.outbox ? ` · attempts ${r.outbox.attempts}${r.outbox.last_error_code ? ` (${r.outbox.last_error_code})` : ""}` : ""} · ${r.liveness}`;
 const DELIVERY_RANKS = new Set(["queued", "delivered", "notified", "read", "acked"]);
