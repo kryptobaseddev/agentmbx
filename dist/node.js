@@ -316,7 +316,7 @@ export class MbxNode {
                 }
             }
             if (sessionWakeable({ ...s, session_id: id, channel }))
-                db.prepare("UPDATE deliveries SET state='delivered', note=NULL WHERE agent=? AND state='notified' AND note='desktop'").run(agent);
+                db.prepare("UPDATE deliveries SET state='delivered', note=NULL WHERE agent=? AND state='notified' AND note IN ('desktop','stalled')").run(agent);
             return agent;
         });
         // T342/T341: a claude or opencode bind can change the session→agent mapping the post-tool hook resolves,
