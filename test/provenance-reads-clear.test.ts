@@ -72,7 +72,7 @@ test("quarantine is a labelled bounded derived read; full opening separately rec
   f.node.observeRead(row, f.scope.cli, f.scope.session_id, "full", NOW + 30);
   const full = readSessionExposure(f.node.store, "alpha", f.scope.cli, f.scope.session_id, NOW + 30).record!;
   assert.equal(full.roots[0].raw_at, NOW + 30); assert.equal(full.roots[0].source.since, e.ts);
-  assert.equal(readSessionTaint(f.node.store, f.scope.cli, f.scope.session_id, NOW + 30)!.root, NOW + 30);
+  assert.equal(readSessionTaint(f.node.store, f.scope.cli, f.scope.session_id, NOW + 30), null, "T754: declared outside mail fences the message, not the reader");
 });
 test("quarantine inherits old source time without declassification or a renewed derived root", t => {
   const f = fixture(t), e = f.raw("old outside text", NOW - EXTERNAL_TAINT_MS * 2), row = f.node.read(e.id);
@@ -83,18 +83,24 @@ test("quarantine inherits old source time without declassification or a renewed 
 });
 for (const kind of ["agent", "unknown", undefined] as const) test(`rootless ${kind ?? "legacy"} quarantine keeps its first receipt after expiry`, t => {
   const f = fixture(t), row = f.status(kind), later = NOW + EXTERNAL_TAINT_MS + 1;
+  const receipt = (id: string, cli = f.scope.cli, session = f.scope.session_id) => f.node.store.get(`session-summary:${canonical([cli, session, id])}`);
   f.node.observeRead(row, f.scope.cli, f.scope.session_id, "quarantine", NOW);
-  assert.equal(readSessionTaint(f.node.store, f.scope.cli, f.scope.session_id, NOW)!.root, NOW);
+  assert.equal(receipt(row.id), JSON.stringify(NOW));
+  // T754: summaries of the owner's own agent mail never write the v1 fence; the first-summary receipt is still kept.
+  assert.equal(readSessionTaint(f.node.store, f.scope.cli, f.scope.session_id, NOW), null);
   f.node.observeRead(row, f.scope.cli, f.scope.session_id, "quarantine", later);
-  assert.equal(readSessionTaint(f.node.store, f.scope.cli, f.scope.session_id, later), null, "repeated summary is not a new source");
+  assert.equal(receipt(row.id), JSON.stringify(NOW), "repeated summary is not a new source");
   assert.equal(readSessionExposure(f.node.store, "alpha", f.scope.cli, f.scope.session_id, later).record!.unknown, true);
   assert.equal(messageReadView(f.node, row, "reader", "quarantine", later).policy.classes.every(c => c === "read"), true);
   f.node.observeRead(row, f.scope.cli, "another-session", "quarantine", later);
-  assert.equal(readSessionTaint(f.node.store, f.scope.cli, "another-session", later)!.root, later, "receipts are conversation-scoped");
+  assert.equal(receipt(row.id, f.scope.cli, "another-session"), JSON.stringify(later), "receipts are conversation-scoped");
   f.node.observeRead(row, "codex", f.scope.session_id, "quarantine", later);
-  assert.equal(readSessionTaint(f.node.store, "codex", f.scope.session_id, later)!.root, later, "providers do not share receipts");
-  f.node.observeRead(f.status(kind), f.scope.cli, f.scope.session_id, "quarantine", later);
-  assert.equal(readSessionTaint(f.node.store, f.scope.cli, f.scope.session_id, later)!.root, later, "a distinct unknown summary still cautions");
+  assert.equal(receipt(row.id, "codex"), JSON.stringify(later), "providers do not share receipts");
+  const next = f.status(kind);
+  f.node.observeRead(next, f.scope.cli, f.scope.session_id, "quarantine", later);
+  assert.equal(receipt(next.id), JSON.stringify(later), "a distinct unknown summary is its own disclosure");
+  for (const [cli, session] of [[f.scope.cli, f.scope.session_id], [f.scope.cli, "another-session"], ["codex", f.scope.session_id]])
+    assert.equal(readSessionTaint(f.node.store, cli, session, later), null);
 });
 test("rootless summary adopts its existing live fence and rejects corrupt first-summary receipts", t => {
   const f = fixture(t), row = f.status("unknown"), key = `session-summary:${canonical([f.scope.cli, f.scope.session_id, row.id])}`;
@@ -117,7 +123,8 @@ test("v1 repeated raw reads A/B/A keep each first local disclosure inside the ho
   f.node.observeRead(row(a), f.scope.cli, f.scope.session_id, "full", NOW);
   f.node.observeRead(row(b), f.scope.cli, f.scope.session_id, "full", NOW + 10);
   f.node.observeRead(row(a), f.scope.cli, f.scope.session_id, "full", NOW + 20);
-  assert.equal(readSessionTaint(f.node.store, f.scope.cli, f.scope.session_id, NOW + 20)!.root, NOW + 10);
+  assert.deepEqual(JSON.parse(f.node.store.get(`session-firsthand:${canonical([f.scope.cli, f.scope.session_id])}`)!), [[a.id, NOW], [b.id, NOW + 10]], "the A re-read keeps its first disclosure");
+  assert.equal(readSessionTaint(f.node.store, f.scope.cli, f.scope.session_id, NOW + 20), null, "T754: declared outside mail does not fence the reader");
 });
 test("corrupt or ambiguous legacy first-read receipts cannot establish disclosure time", t => {
   const f = fixture(t), e = f.raw(); delete e.meta.provenance;
@@ -133,7 +140,7 @@ test("reading a prior own outside message records disclosure in this conversatio
   const signed = signEnvelope(e, "alpha", f.node.key.publicKey, f.node.key.privateKey), row = { ...f.node.read(e.id), from_addr: e.from, envelope: JSON.stringify(signed) };
   f.node.observeRead(row, f.scope.cli, f.scope.session_id, "full", NOW);
   assert.equal(readSessionExposure(f.node.store, "alpha", f.scope.cli, f.scope.session_id, NOW).record!.roots[0].raw_at, NOW);
-  assert.equal(readSessionTaint(f.node.store, f.scope.cli, f.scope.session_id, NOW)!.root, NOW);
+  assert.equal(readSessionTaint(f.node.store, f.scope.cli, f.scope.session_id, NOW), null, "T754: v2 disclosure only; no v1 fence");
 });
 test("pinned current and retired host keys validate mixed-key parent ancestry; unknown keys stay unknown", t => {
   const f = fixture(t), retired = f.node.key; f.node.rotateKeys(); const first = f.raw();
@@ -189,7 +196,7 @@ test("a reply is a new raw disclosure with the original source and first-read hi
   f.node.observeRead(row, f.scope.cli, f.scope.session_id, "full", NOW + 10, true);
   const root = readSessionExposure(f.node.store, "alpha", f.scope.cli, f.scope.session_id, NOW + 10).record!.roots[0];
   assert.equal(root.first_raw_at, NOW); assert.equal(root.raw_at, NOW + 10); assert.equal(root.source.since, row.ts);
-  assert.equal(readSessionTaint(f.node.store, f.scope.cli, f.scope.session_id, NOW + 10)!.root, NOW + 10);
+  assert.equal(readSessionTaint(f.node.store, f.scope.cli, f.scope.session_id, NOW + 10), null, "T754: a reply to declared outside mail does not fence the reader");
   assert.equal(currentSessionClearance(f.node.store, f.scope, NOW + 10), null);
 });
 test("unknown/corrupt/missing histories and signed record collisions are refused", t => {
@@ -274,7 +281,16 @@ test("CLI/MCP read and thread modes obey leases and share exposure/legacy send f
   assert.equal(f.node.store.db.prepare("SELECT state FROM deliveries WHERE msg_id=? AND agent='reader'").get(e.id)!.state, "acked");
   assert.equal(cli("full").status, 0);
   const raw = readSessionExposure(f.node.store, "alpha", "claude", sid).record!; assert.ok(raw.roots[0].raw_at! > first.roots[0].derived_at!);
+  assert.equal(readSessionTaint(f.node.store, "claude", sid), null, "T754: a full read of declared outside mail does not fence the reader");
+  // A CLI read of unknown-provenance mail fences this conversation's next MCP send too.
+  const bad = buildEnvelope({ from: "mallory@alpha", to: ["reader"], subject: "odd", body: "data" });
+  const malformed = signEnvelope({ ...bad, meta: { ...bad.meta, origin: "external", external_since: "yesterday" } } as Envelope, "alpha", f.node.key.publicKey, f.node.key.privateKey);
+  f.node.store.insertMessage(malformed, "local", "local", null); f.node.store.addDelivery(malformed.id, "reader");
+  const exposed = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "read", malformed.id, "--as", "reader", "--cli", "claude", "--session", sid, "--mode", "full"], { encoding: "utf8", timeout: 20_000,
+    env: { ...process.env, MBX_HOME: f.home, AGENTMBX_DEV: "1", MBX_NO_DESKTOP: "1" } });
+  assert.equal(exposed.status, 0, exposed.stderr);
   const live = readSessionTaint(f.node.store, "claude", sid)!;
+  assert.equal(live.how, "malformed");
   assert.equal(((await call("mbx_whoami", {})).structuredContent as { external: { tainted: boolean } }).external.tainted, true);
   f.node.registerAgent("recipient");
   await call("mbx_send", { to: ["recipient"], subject: "parity", body: "fresh prose" });

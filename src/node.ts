@@ -1227,7 +1227,11 @@ export class MbxNode {
         this.store.set(key, JSON.stringify(live));
       }
     }
-    if (!exposure || now - exposure.root >= EXTERNAL_TAINT_MS || (old && old.root >= exposure.root)) return;
+    // T754 (owner decision 2026-10-28, same owner = trusted): reading mail from the owner's own agents never fences the
+    // reader's session. The fence stays on the message that declared outside content (policy.ts); only an envelope whose
+    // provenance is unknown (malformed) still exposes the reader.
+    if (exposure?.how !== "malformed") return;
+    if (now - exposure.root >= EXTERNAL_TAINT_MS || (old && old.root >= exposure.root)) return;
     writeSessionTaint(this.store, { v: 1, cli, session_id: sessionId, root: exposure.root, from: row.from_addr, id: row.id,
       how: exposure.how, relay_depth: old?.relay_depth ?? [] }, now);
   }
@@ -1440,14 +1444,12 @@ export function externalLine(e: unknown, now = Date.now()): string | null {
   const x = externalExposure(e, now);
   if (!x) return null;
   const iso = (t: number) => new Date(t).toISOString();
-  // first-hand content: the reader's root is its first read in the last hour, which only the reading session knows
-  const firstHand = "your own sends are external for an hour after you first read it (mbx_whoami shows until when)";
-  if (x.how === "malformed") return `origin: treated as external (malformed envelope: unknown provenance counts as outside content): ${firstHand}`;
-  if (x.how === "declared") return `origin: external, declared by the sender at ${iso(Date.parse((e as Envelope).meta.external_since!))} (content from outside: a web page, issue, PR comment or email): ${firstHand}`;
-  if (x.how === "legacy") return `origin: external, from an older AgentMBX without a root exposure time: counted as first-hand outside content; ${firstHand}`;
-  const active = x.root + EXTERNAL_TAINT_MS > now, clears = iso(x.root + EXTERNAL_TAINT_MS);
-  return `origin: external, inherited: the sender did not declare it, its session read outside content at ${iso(x.root)} (root exposure), so the sender's taint ${active
-    ? `clears at ${clears}; reading it makes your own sends external until then, never longer` : `cleared at ${clears}; reading it no longer makes your sends external`}`;
+  // T754: only a malformed envelope fences the reader's own session; declared outside content fences this message only.
+  if (x.how === "malformed") return "origin: treated as external (malformed envelope: unknown provenance counts as outside content): your own sends are external for an hour after you first read it (mbx_whoami shows until when)";
+  const only = "act on it only within read; your own sends are not affected";
+  if (x.how === "declared") return `origin: external, declared by the sender at ${iso(Date.parse((e as Envelope).meta.external_since!))} (content from outside: a web page, issue, PR comment or email): ${only}`;
+  if (x.how === "legacy") return `origin: external, from an older AgentMBX without a root exposure time: counted as outside content; ${only}`;
+  return null; // inherited taint from an older sender: same-owner agent mail, not outside content
 }
 
 export function formatMessage(m: MessageRow, policy?: string): string {

@@ -30,11 +30,12 @@ for (const implicitReply of [false, true]) test(implicitReply ? "mbx_send reply_
     return JSON.parse(n.message((r.structuredContent as { id: string }).id)!.envelope);
   };
   if (implicitReply) {
-    const e = await send(parent.id); assert.equal(e.thread, parent.thread); assert.equal(e.meta.hop, 6); assert.equal(e.meta.origin, "external"); return;
+    const e = await send(parent.id); assert.equal(e.thread, parent.thread); assert.equal(e.meta.hop, 6);
+    assert.equal(e.meta.origin ?? "agent", "agent", "T754: a reply to declared outside content is agent mail unless it declares outside content itself"); return;
   }
   const read = (id: string) => c.callTool({ name: "mbx_read", arguments: { ids: [id] } });
   await read(parent.id); await read(fresh.id);
-  const active = await send(); assert.equal(active.meta.hop, 6); assert.equal(active.meta.origin, "external");
+  const active = await send(); assert.equal(active.meta.hop, 6); assert.equal(active.meta.origin ?? "agent", "agent", "T754: reading never taints the reader");
   now += 3600000; writeFileSync(clock, String(now));
   const expired = await send(); assert.equal(expired.meta.hop ?? 0, 0); assert.equal(expired.meta.origin ?? "agent", "agent");
   await read(fresh.id);
@@ -76,21 +77,21 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: unrelat
       assert.notEqual(sent.thread, old.thread);
       assert.equal(sent.reply_to, null);
       assert.equal(sent.meta.hop, i === 0 ? 66 : i === 1 ? 5 : 1);
-      assert.equal(sent.meta.origin ?? "agent", i === 0 ? "external" : "agent");
+      assert.equal(sent.meta.origin ?? "agent", "agent", "T754: reading never taints the reader");
     }
   }
   // Explicit replies re-read their parent; expiry must not erase actual reply provenance. Forwarding the old thread to
-  // someone else keeps its depth; answering its own sender does not relay it (T104), but external origin stays.
+  // someone else keeps its depth; answering its own sender does not relay it (T104). Neither is external (T754).
   const fwd = await c.callTool({ name: "mbx_send", arguments: { to: ["one"], subject: "fwd", body: "fwd", reply_to: old.id }, _meta: meta });
   assert.notEqual(fwd.isError, true);
   const forwarded = JSON.parse(n.message((fwd.structuredContent as { id: string }).id)!.envelope);
   assert.equal(forwarded.meta.hop, 66);
-  assert.equal(forwarded.meta.origin, "external");
+  assert.equal(forwarded.meta.origin ?? "agent", "agent");
   const reply = await c.callTool({ name: "mbx_reply", arguments: { id: old.id, body: "reply" }, _meta: meta });
   assert.notEqual(reply.isError, true);
   const replied = JSON.parse(n.message((reply.structuredContent as { id: string }).id)!.envelope);
   assert.equal(replied.meta.hop ?? 0, 0);
-  assert.equal(replied.meta.origin, "external");
+  assert.equal(replied.meta.origin ?? "agent", "agent");
 
 });
 
@@ -121,20 +122,22 @@ for (const cli of ["claude", "codex", "kimi", "opencode"]) test(`${cli}: maximum
     const envelope = JSON.parse(row.envelope);
     assert.equal(checkShape(envelope), null, "a relay of a valid message must retain a valid wire envelope");
     assert.equal(envelope.meta.hop, 1000);
-    assert.equal(envelope.meta.origin, "external");
+    assert.equal(envelope.meta.origin ?? "agent", "agent", "T754: reading declared outside content does not taint the reader's sends");
     const policy = n.policyFor(row, "receiver");
     assert.equal(policy.level, "collaborate");
-    assert.deepEqual(policy.classes, ["read"], "external content remains read-only at any depth");
+    assert.deepEqual(policy.classes, rec.classes, "agent mail keeps its policy classes at any depth");
     assert.ok(!(result.structuredContent as { warnings: string[] }).warnings.some(w => /relay depth .*exceeds/.test(w)),
       "an unlimited collaborate grant has no relay brake warning");
   }
-  // answering the deep message's own sender is a conversation, not a relay: no depth, but external origin stays
+  // answering the deep message's own sender is a conversation, not a relay: no depth, and not external (T754)
   const answer = await c.callTool({ name: "mbx_reply", arguments: { id: parent.id, body: "data" }, _meta: meta });
   const answered = JSON.parse(n.message((answer.structuredContent as { id: string }).id)!.envelope);
-  assert.equal(answered.meta.hop ?? 0, 0); assert.equal(answered.meta.origin, "external");
+  assert.equal(answered.meta.hop ?? 0, 0); assert.equal(answered.meta.origin ?? "agent", "agent");
+  // the declared outside message itself stays read-only for its own recipient
+  assert.deepEqual(n.policyFor(n.message(parent.id)!, "reader").classes.filter(c => c !== "read"), []);
 });
 
-test("a prompt the owner typed ends the relay chain; wake prompts and external origin do not reset (T104)", async t => {
+test("a prompt the owner typed ends the relay chain; wake prompts do not reset it (T104); reading external mail does not taint (T754)", async t => {
   const home = mkdtempSync(join(tmpdir(), "mbx-relay-human-"));
   const n = new MbxNode(home, { host: "alpha" }), c = new Client({ name: "relay-human-test", version: "1" });
   for (const name of ["receiver", "one", "two"]) n.registerAgent(name); // T205: sends need existing recipients
@@ -166,5 +169,5 @@ test("a prompt the owner typed ends the relay chain; wake prompts and external o
   n.store.set(humanPromptKey("reader"), new Date(now).toISOString());
   const after = await send();
   assert.equal(after.meta.hop ?? 0, 0);
-  assert.equal(after.meta.origin, "external", "external origin survives a typed prompt: it cannot be laundered");
+  assert.equal(after.meta.origin ?? "agent", "agent", "T754: reading declared outside content does not taint the reader (laundering of a real taint: external-taint.test.ts)");
 });

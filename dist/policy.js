@@ -286,12 +286,17 @@ export function killSwitchSince(db, iat, ownerFp) {
     return false;
 }
 const ORDER = (l) => LEVELS.indexOf(l);
+/** T754: only a sender's own declaration of outside content fences a message; inherited taint from older senders does not. */
+function declaredExternal(meta) {
+    const m = meta;
+    return m?.origin === "external" && m.external_source !== "inherited";
+}
 function leadSegment(o) {
     const src = o.lead;
     if (!src)
         return undefined;
     let classes = src.classes.filter((c) => CLASSES.includes(c));
-    if (o.envelope?.meta?.origin === "external")
+    if (declaredExternal(o.envelope?.meta))
         classes = classes.filter((c) => c === "read");
     if (!classes.length)
         return undefined;
@@ -331,7 +336,7 @@ export function effectivePolicy(db, o) {
     }
     let grants = ps.map((p) => ({ id: p.id, level: p.level, classes: [...p.classes], projects: p.projects ?? [], exp: p.exp }));
     const e = o.envelope, meta = (e?.meta ?? {});
-    if (meta.origin === "external") {
+    if (declaredExternal(meta)) {
         grants = grants.map((g) => ({ ...g, classes: g.classes.filter((c) => c === "read") }));
         notes.push("content from outside (origin: external): read only");
     }

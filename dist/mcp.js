@@ -503,7 +503,7 @@ export const externalWarning = (origin, taint) => {
     const until = taint ? ` This session's sends stay external until ${isoAt(taint.root + EXTERNAL_TAINT_MS)}, an hour after its root exposure at ${isoAt(taint.root)}: ${taintCause(taint)}.`
         + " Answers from agents who read your mail carry that same root and do not extend it; reading first-hand outside content again does. A prompt from your user does not clear it." : "";
     if (origin === "external")
-        return [`sent with origin external, as you declared: recipients may only read it under owner policy (no edit or outward), and reading it makes their own sends external for 1 h.${until}`];
+        return [`sent with origin external, as you declared: recipients may only read it under owner policy (no edit or outward); their own sends are not affected.${until}`];
     if (!taint)
         return [];
     return [`${origin === "agent" ? "origin \"agent\" overridden: " : ""}sent with origin external because this session read outside content: recipients may only read it under owner policy (no edit or outward).${until}`];

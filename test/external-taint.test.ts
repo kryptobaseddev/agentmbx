@@ -13,7 +13,11 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { buildEnvelope, checkShape, EXTERNAL_TAINT_MS, externalExposure, signEnvelope, type Envelope } from "../src/envelope.ts";
 import { externalLine, MbxNode } from "../src/node.ts";
-import { readSessionTaint, sessionUntainted, taintKey } from "../src/session-taint.ts";
+import { readSessionTaint, sessionUntainted, taintKey, writeSessionTaint } from "../src/session-taint.ts";
+import { canonical, signData } from "../src/crypto.ts";
+import { createOwnerKey, unlockOwnerKey } from "../src/owner.ts";
+import { acceptSigned, makePolicy } from "../src/policy.ts";
+import { sendLeased } from "./helpers/leased-send.ts";
 import { humanPromptKey } from "../src/wake.ts";
 
 const MIN = 60_000;
@@ -85,6 +89,17 @@ async function world(t: { after: (fn: () => Promise<void>) => void }, names: str
     whoami: async (who: string) => (await call(who, "mbx_whoami", {})).out.external as Record<string, unknown>,
     /** A stored message as it arrived, without the current sender code (old or malformed envelopes). */
     insert(e: Envelope, to: string) { const s = signEnvelope(e, "alpha", n.key.publicKey, n.key.privateKey); n.store.insertMessage(s, "local", "local", null); n.store.addDelivery(s.id, to); return s; },
+    /** Mail with unknown provenance (a malformed external_since): the one read that still exposes its reader (T754). */
+    malformed(to: string, from = "mallory@alpha") {
+      const bad = buildEnvelope({ from, to: [to], subject: "odd", body: "data" }, new Date(now));
+      return this.insert({ ...bad, meta: { ...bad.meta, origin: "external", external_since: "yesterday" } } as Envelope, to);
+    },
+    /** The provider session an MCP mailbox is bound to. */
+    session(agent: string) {
+      const row = n.store.db.prepare("SELECT session_id FROM sessions WHERE agent=?").get(agent) as { session_id: string } | undefined;
+      assert.ok(row, `${agent}'s session is bound`);
+      return row.session_id;
+    },
   };
 }
 
@@ -95,55 +110,75 @@ test("rootless quarantine re-reads cannot renew MCP sends after the first summar
     e.meta.sender_verification = "leased";
     return w.insert(e, "ada");
   };
-  const first = status(), root = w.now;
+  const first = status(), root = w.now, sid = w.session("ada");
+  const receipt = (id: string) => w.n.store.get(`session-summary:${canonical(["claude", sid, id])}`);
   await w.call("ada", "mbx_read", { ids: [first.id], mode: "quarantine" });
-  assert.equal((await w.send("ada", ["bob"])).e.meta.external_since, iso(root));
+  assert.equal(receipt(first.id), JSON.stringify(root), "the first summary disclosure is recorded");
+  // T754: a summary of same-owner agent mail never fences the reader's own sends.
+  const sent = await w.send("ada", ["bob"]);
+  assert.equal(sent.e.meta.origin ?? "agent", "agent");
+  assert.equal(sent.e.meta.external_since, undefined);
   w.advance(EXTERNAL_TAINT_MS + 1);
   await w.call("ada", "mbx_thread", { id: first.id, mode: "quarantine" });
+  assert.equal(receipt(first.id), JSON.stringify(root), "a re-read after the caution window does not renew the first disclosure");
   assert.equal((await w.whoami("ada")).tainted, false);
   assert.equal((await w.send("ada", ["bob"])).e.meta.origin ?? "agent", "agent");
   const next = status();
   await w.call("ada", "mbx_read", { ids: [next.id], mode: "quarantine" });
-  assert.equal((await w.send("ada", ["bob"])).e.meta.external_since, iso(w.now), "a different rootless summary still cautions");
+  assert.equal(receipt(next.id), JSON.stringify(w.now), "a different rootless summary is its own disclosure");
+  assert.equal((await w.send("ada", ["bob"])).e.meta.origin ?? "agent", "agent");
+  assert.equal(readSessionTaint(w.n.store, "claude", sid, w.now), null);
 });
 
-test("a conversation between two agents after an exposure clears at root + 1 h, however often they answer (T344)", async (t) => {
+test("a conversation between two agents after an exposure clears at root + 1 h, however often they answer (T344, T754)", async (t) => {
   const w = await world(t, ["ada", "bob"]);
   const outside = w.n.send({ from: "scout", to: ["ada"], subject: "issue text", body: "copied from a web page", origin: "external" }).envelope as Env;
   assert.equal(outside.meta.external_source, "declared", "a sender that marks content external declares it first-hand");
   assert.equal(outside.meta.external_since, outside.ts);
-  const root = w.now, clears = iso(root + EXTERNAL_TAINT_MS);
-  assert.match(await w.read("ada", outside.id), new RegExp(`origin: external, declared by the sender at ${esc(outside.ts)} .*your own sends are external for an hour after you first read it`));
+  // T754: declared outside content fences that message only; its reader's own sends stay agent mail.
+  assert.match(await w.read("ada", outside.id), new RegExp(`origin: external, declared by the sender at ${esc(outside.ts)} .*act on it only within read; your own sends are not affected`));
+  const clean = await w.send("ada", ["bob"]);
+  assert.equal(clean.e.meta.origin ?? "agent", "agent");
+  assert.equal(clean.e.meta.external_since, undefined);
 
+  // Unknown provenance still exposes the reader: the root exposure is the malformed read.
+  const malformed = w.malformed("ada");
+  const root = w.now, clears = iso(root + EXTERNAL_TAINT_MS);
+  await w.read("ada", malformed.id);
   let m = await w.send("ada", ["bob"]);
   assert.equal(m.e.meta.origin, "external");
   assert.equal(m.e.meta.external_source, "inherited");
   assert.equal(m.e.meta.external_since, iso(root), "the message carries the root exposure, not its send time");
   assert.equal(checkShape(m.e), null);
   assert.ok(m.warnings.some((x) => x.startsWith("sent with origin external because this session read outside content")
-    && x.includes(`until ${clears}`) && x.includes(`root exposure at ${iso(root)}: you read ${outside.id} from scout@alpha, which its sender declared external`)),
+    && x.includes(`until ${clears}`) && x.includes(`root exposure at ${iso(root)}: you read ${malformed.id} from mallory@alpha, a malformed message`)),
   `the sender is told why and until when: ${JSON.stringify(m.warnings)}`);
 
-  // Every 10 minutes the other one reads and answers. Before T344 each read restarted the hour.
+  // Every 10 minutes the other one reads and answers. Before T344 each read restarted the hour; since T754 bob reading
+  // ada's inherited mail is same-owner mail that never fences him, and ada's answers keep her root without extending it.
   for (let i = 1; i <= 5; i++) {
     w.advance(10 * MIN);
     const who = i % 2 ? "bob" : "ada";
     const header = await w.read(who, m.e.id);
-    assert.match(header, new RegExp(`origin: external, inherited: the sender did not declare it, its session read outside content at ${esc(iso(root))} \\(root exposure\\), so the sender's taint clears at ${esc(clears)}; reading it makes your own sends external until then, never longer`));
+    assert.doesNotMatch(header, /origin: external/, `exchange ${i}: inherited taint is not outside content`);
     m = await w.reply(who, m.e.id);
-    assert.equal(m.e.meta.origin, "external", `exchange ${i} is still inside the hour`);
-    assert.equal(m.e.meta.external_since, iso(root), `exchange ${i} keeps the root`);
-    assert.ok(m.warnings.some((x) => x.includes(`until ${clears}`)), `exchange ${i} warns`);
+    if (who === "ada") {
+      assert.equal(m.e.meta.origin, "external", `exchange ${i} is still inside ada's hour`);
+      assert.equal(m.e.meta.external_since, iso(root), `exchange ${i} keeps the root`);
+      assert.ok(m.warnings.some((x) => x.includes(`until ${clears}`)), `exchange ${i} warns`);
+    } else {
+      assert.equal(m.e.meta.origin ?? "agent", "agent", `exchange ${i}: reading ada's mail does not taint bob`);
+      assert.equal(m.e.meta.external_since, undefined);
+    }
   }
-  for (const who of ["ada", "bob"]) {
-    const ext = await w.whoami(who);
-    assert.equal(ext.tainted, true);
-    assert.equal(ext.root_exposure, iso(root));
-    assert.equal(ext.clears_at, clears);
-  }
+  const ext = await w.whoami("ada");
+  assert.equal(ext.tainted, true);
+  assert.equal(ext.root_exposure, iso(root));
+  assert.equal(ext.clears_at, clears);
+  assert.deepEqual(await w.whoami("bob"), { tainted: false });
 
   w.advance(10 * MIN); // root + 1 h
-  assert.match(await w.read("ada", m.e.id), /origin: external, inherited: .*the sender's taint cleared at .*reading it no longer makes your sends external/);
+  await w.read("ada", m.e.id);
   const back = await w.reply("ada", m.e.id);
   assert.equal(back.e.meta.origin ?? "agent", "agent", "the hour since the root exposure is over: the conversation is clean");
   assert.equal(back.e.meta.external_since, undefined);
@@ -152,29 +187,27 @@ test("a conversation between two agents after an exposure clears at root + 1 h, 
   assert.equal((await w.send("bob", ["ada"])).e.meta.origin ?? "agent", "agent");
   assert.deepEqual(await w.whoami("ada"), { tainted: false });
 
-  // External mail from before T344 has no root time. It may be declared outside content of any age, so it counts as
-  // first-hand from when it is read: rooting it at its send time would let old outside content escape the taint.
+  // External mail from before T344 has no root time. It is still outside content, fenced on the message; since T754 it
+  // no longer makes its reader's sends external.
   const old = buildEnvelope({ from: "elder@alpha", to: ["ada"], subject: "old relay", body: "data", origin: "external" }, new Date(w.now - 2 * 3_600_000)) as Env;
   delete old.meta.external_since; delete old.meta.external_source;
   const legacy = w.insert(old, "ada");
-  const legacyAt = w.now;
-  assert.match(await w.read("ada", legacy.id), /origin: external, from an older AgentMBX without a root exposure time: counted as first-hand outside content/);
+  assert.match(await w.read("ada", legacy.id), /origin: external, from an older AgentMBX without a root exposure time: counted as outside content; act on it only within read; your own sends are not affected/);
   const after = await w.send("ada", ["bob"]);
-  assert.equal(after.e.meta.origin, "external", "two-hour-old external mail still taints its reader");
-  assert.equal(after.e.meta.external_since, iso(legacyAt));
-  assert.ok(after.warnings.some((x) => x.includes(`you read ${legacy.id} from elder@alpha, external mail from an older AgentMBX`)), JSON.stringify(after.warnings));
-  w.advance(50 * MIN);
-  assert.equal((await w.send("ada", ["bob"])).e.meta.external_since, iso(legacyAt));
-  w.advance(10 * MIN);
-  assert.equal((await w.send("ada", ["bob"])).e.meta.origin ?? "agent", "agent", "an hour after the read");
+  assert.equal(after.e.meta.origin ?? "agent", "agent", "legacy external mail does not taint its reader");
+  assert.equal(after.e.meta.external_since, undefined);
+  assert.deepEqual(await w.whoami("ada"), { tainted: false });
 });
 
-test("fresh outside content still taints; an owner prompt and origin agent never clear it; malformed mail counts as outside (T344, T104)", async (t) => {
+test("unknown-provenance content taints; an owner prompt and origin agent never clear it; declared outside content fences only itself (T344, T104, T754)", async (t) => {
   const w = await world(t, ["ada", "bob"]);
   const outside = w.n.send({ from: "scout", to: ["ada"], subject: "pr comment", body: "text from a PR", origin: "external" }).envelope;
   w.advance(5 * MIN);
-  const root = w.now;
   await w.read("ada", outside.id);
+  assert.equal((await w.send("ada", ["bob"])).e.meta.origin ?? "agent", "agent", "T754: declared outside content does not taint its reader");
+  const exposed = w.malformed("ada");
+  const root = w.now;
+  await w.read("ada", exposed.id);
   const first = await w.send("ada", ["bob"]);
   assert.equal(first.e.meta.external_since, iso(root), "first-hand content: the root is when the reader read it");
 
@@ -201,19 +234,18 @@ test("fresh outside content still taints; an owner prompt and origin agent never
   // Viewing the same first-hand message again within the hour (mbx_thread every turn, mbx_read again) keeps its first
   // read as the root. Answering it is a new exposure at reply time, and so is viewing it after the hour.
   w.advance(20 * MIN);
-  assert.match(await w.thread("ada", outside.id), /origin: external, declared by the sender/);
-  await w.read("ada", outside.id);
+  assert.match(await w.thread("ada", exposed.id), /origin: treated as external \(malformed envelope/);
+  await w.read("ada", exposed.id);
   assert.equal((await w.send("ada", ["bob"])).e.meta.external_since, iso(root), "re-reads within the hour keep the first read as the root");
   const replyAt = w.now;
-  assert.equal((await w.reply("ada", outside.id)).e.meta.external_since, iso(replyAt), "a reply to declared content roots at reply time");
+  assert.equal((await w.reply("ada", exposed.id)).e.meta.external_since, iso(replyAt), "a reply to first-hand content roots at reply time");
   assert.equal((await w.send("ada", ["bob"])).e.meta.external_since, iso(replyAt));
   w.advance(45 * MIN); // past the first read + 1 h, still inside the reply's hour
-  await w.thread("ada", outside.id);
+  await w.thread("ada", exposed.id);
   assert.equal((await w.send("ada", ["bob"])).e.meta.external_since, iso(w.now), "after the hour, viewing it again is a new exposure");
 
   // Malformed mail cannot erase unknown provenance: it is first-hand outside content.
-  const bad = buildEnvelope({ from: "mallory@alpha", to: ["bob"], subject: "odd", body: "data" });
-  const malformed = w.insert({ ...bad, meta: { ...bad.meta, origin: "external", external_since: "yesterday" } } as Envelope, "bob");
+  const malformed = w.malformed("bob");
   assert.equal(checkShape(malformed), "bad external_since");
   w.advance(MIN);
   const readAt = w.now;
@@ -275,7 +307,7 @@ test("paired hosts carry external_since signed and reject a malformed one (T344,
   const stored = JSON.parse(b.message(good.id)!.envelope) as Env;
   assert.equal(stored.meta.external_since, root);
   assert.equal(stored.meta.external_source, "inherited");
-  assert.match(externalLine(stored)!, new RegExp(`inherited: .*read outside content at ${esc(root)}`));
+  assert.equal(externalLine(stored), null, "T754: an inherited root from another of the owner's agents is not outside content");
   // The root is signed: changing it in transit breaks the host signature.
   const tampered = { ...good, id: buildEnvelope({ from: "x@alpha", to: ["y"], subject: "s", body: "b" }).id, meta: { ...good.meta, external_since: iso(Date.now() - 3 * 3_600_000) } };
   assert.equal(b.receive(tampered, "alpha"), "rejected:bad signature");
@@ -286,11 +318,11 @@ test("paired hosts carry external_since signed and reject a malformed one (T344,
 
 test("release and claim keep the external taint, its root and its hop history (T346)", async (t) => {
   const w = await world(t, ["ada", "bob"]);
-  const outside = w.n.send({ from: "scout", to: ["ada"], subject: "issue text", body: "copied from a web page", origin: "external" }).envelope as Env;
-  const root = w.now;
-  await w.read("ada", outside.id);
-  const row = w.n.store.db.prepare("SELECT session_id FROM sessions WHERE agent=?").get("ada") as { session_id: string } | undefined;
-  assert.ok(row, "the reader session is bound");
+  const root = w.now, row = { session_id: w.session("ada") };
+  // T754: reads of declared outside mail no longer taint; seed the live exposure (as a malformed read would leave it).
+  writeSessionTaint(w.n.store, { v: 1, cli: "claude", session_id: row.session_id, root, from: "scout@alpha", id: "message_outside", how: "malformed",
+    relay_depth: [{ hop: 0, from: "scout@alpha", at: root }] }, root);
+  const outside = { id: "message_outside" };
   const stored = readSessionTaint(w.n.store, "claude", row.session_id, w.now);
   assert.equal(stored?.root, root);
   assert.equal(stored?.id, outside.id);
@@ -322,4 +354,67 @@ test("release and claim keep the external taint, its root and its hop history (T
   const cleared = await w.send("ada", ["bob"]);
   assert.equal(cleared.e.meta.origin ?? "agent", "agent", "an hour after the original root the conversation is clean");
   assert.equal(cleared.e.meta.external_since, undefined);
+});
+
+// T754 (owner decision 2026-10-28, same owner = trusted): outside content declared by one of the owner's agents fences
+// that message for its recipient; it no longer makes the reader's own sends external. Unknown provenance still does.
+test("T754: reading declared firsthand-outside mail from another agent leaves the reader's sends agent mail", async (t) => {
+  const w = await world(t, ["ada", "bob"]);
+  const declared = await w.send("bob", ["ada"], { origin: "external", payload: "firsthand-outside" });
+  assert.equal(declared.e.meta.origin, "external");
+  assert.equal(declared.e.meta.external_source, "declared");
+  assert.ok(declared.warnings.some((x) => x.includes("their own sends are not affected")), JSON.stringify(declared.warnings));
+  assert.match(await w.read("ada", declared.e.id), /origin: external, declared by the sender .*your own sends are not affected/);
+  const next = await w.send("ada", ["bob"]);
+  assert.notEqual(next.e.meta.origin, "external");
+  assert.equal(next.e.meta.external_since, undefined);
+  assert.equal(next.warnings.filter((x) => /origin external/.test(x)).length, 0, JSON.stringify(next.warnings));
+  assert.equal(readSessionTaint(w.n.store, "claude", w.session("ada"), w.now), null);
+  assert.deepEqual(await w.whoami("ada"), { tainted: false });
+  const answer = await w.reply("ada", declared.e.id);
+  assert.notEqual(answer.e.meta.origin, "external", "answering declared outside content does not taint either");
+  assert.equal(readSessionTaint(w.n.store, "claude", w.session("ada"), w.now), null);
+});
+
+test("T754: a declared external message is read-only for its recipient; inherited-external mail gets the normal classes", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-taint-policy-"));
+  createOwnerKey(home, "correct horse battery staple");
+  const n = new MbxNode(home, { host: "alpha" }), kp = unlockOwnerKey(home, "correct horse battery staple");
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  const policy = makePolicy({ level: "collaborate", agents: ["api"], hosts: ["alpha"], from: ["local"], ownerPub: kp.publicKey });
+  assert.equal(acceptSigned(n.store.db, { rec: policy, sig: signData(kp.privateKey, canonical(policy)) }, "alpha"), null);
+  const send = (extra: { origin?: "external"; external_since?: string }) =>
+    n.message(sendLeased(n, { from: "web", to: ["api"], subject: "s", body: "data", kind: "request", ...extra }).envelope.id)!;
+  const declared = send({ origin: "external" });
+  assert.equal((JSON.parse(declared.envelope) as Env).meta.external_source, "declared");
+  const fenced = n.policyFor(declared, "api");
+  assert.deepEqual(fenced.classes, ["read"]);
+  assert.match(fenced.notes[0], /origin: external/);
+  const inherited = send({ origin: "external", external_since: iso(Date.now() - 10 * MIN) });
+  assert.equal((JSON.parse(inherited.envelope) as Env).meta.external_source, "inherited");
+  const normal = n.policyFor(inherited, "api");
+  assert.equal(normal.level, "collaborate");
+  assert.deepEqual(normal.classes, ["read", "edit", "outward-reversible"]);
+  assert.equal(normal.notes.some((x) => /origin: external/.test(x)), false);
+});
+
+test("T754: a malformed envelope still taints its reader's session; declared and inherited mail do not", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-taint-malformed-")), n = new MbxNode(home, { host: "alpha" });
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true }); });
+  const now = Date.now();
+  const deliver = (e: Envelope) => { const s = signEnvelope(e, "alpha", n.key.publicKey, n.key.privateKey); n.store.insertMessage(s, "local", "local", null); n.store.addDelivery(s.id, "ada"); return n.message(s.id)!; };
+  const declared = deliver(buildEnvelope({ from: "scout@alpha", to: ["ada"], subject: "s", body: "web page", origin: "external" }, new Date(now)));
+  const inherited = deliver(buildEnvelope({ from: "bob@alpha", to: ["ada"], subject: "s", body: "answer", origin: "external", external_since: iso(now - 5 * MIN) }, new Date(now)));
+  n.observeRead(declared, "codex", "s1", "full", now);
+  n.observeRead(inherited, "codex", "s1", "full", now);
+  assert.equal(readSessionTaint(n.store, "codex", "s1", now), null);
+  const bad = buildEnvelope({ from: "mallory@alpha", to: ["ada"], subject: "odd", body: "data" }, new Date(now));
+  const malformed = deliver({ ...bad, meta: { ...bad.meta, origin: "external", external_since: "yesterday" } } as Envelope);
+  n.observeRead(malformed, "codex", "s1", "full", now);
+  const taint = readSessionTaint(n.store, "codex", "s1", now);
+  assert.equal(taint?.how, "malformed");
+  assert.equal(taint?.id, malformed.id);
+  assert.equal(taint?.root, now);
+  assert.equal(sessionUntainted(n.store, "codex", "s1", now), false);
+  assert.equal(sessionUntainted(n.store, "codex", "s1", now + EXTERNAL_TAINT_MS), true, "it clears an hour after the read");
 });

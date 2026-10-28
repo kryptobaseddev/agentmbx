@@ -294,11 +294,17 @@ export interface Effective { level: Level; classes: PolicyClass[]; ids: string[]
 
 const ORDER = (l: Level) => LEVELS.indexOf(l);
 
+/** T754: only a sender's own declaration of outside content fences a message; inherited taint from older senders does not. */
+function declaredExternal(meta: unknown): boolean {
+  const m = meta as { origin?: string; external_source?: string } | undefined;
+  return m?.origin === "external" && m.external_source !== "inherited";
+}
+
 function leadSegment(o: { lead?: { classes: readonly string[]; project: string; record: string; grant: string; exp: string; lead: string } | null; envelope?: Envelope }): LeadSegment | undefined {
   const src = o.lead;
   if (!src) return undefined;
   let classes = src.classes.filter((c): c is PolicyClass => (CLASSES as readonly string[]).includes(c));
-  if ((o.envelope?.meta as { origin?: string } | undefined)?.origin === "external") classes = classes.filter((c) => c === "read");
+  if (declaredExternal(o.envelope?.meta)) classes = classes.filter((c) => c === "read");
   if (!classes.length) return undefined;
   return { classes, project: src.project, record: src.record, grant: src.grant, exp: src.exp, lead: src.lead };
 }
@@ -333,7 +339,7 @@ export function effectivePolicy(db: DatabaseSync, o: { agent: string; host: stri
   }
   let grants: Grant[] = ps.map((p) => ({ id: p.id, level: p.level, classes: [...p.classes], projects: p.projects ?? [], exp: p.exp }));
   const e = o.envelope, meta = (e?.meta ?? {}) as { origin?: string; hop?: number };
-  if (meta.origin === "external") { grants = grants.map((g) => ({ ...g, classes: g.classes.filter((c) => c === "read") })); notes.push("content from outside (origin: external): read only"); }
+  if (declaredExternal(meta)) { grants = grants.map((g) => ({ ...g, classes: g.classes.filter((c) => c === "read") })); notes.push("content from outside (origin: external): read only"); }
   const originalLevel = grants.reduce((a, g) => ORDER(g.level) > ORDER(a) ? g.level : a, "ask" as Level);
   // Keep each grant's scope intact. Only ask retains a finite relay allowance.
   const hop = meta.hop ?? 0, over = new Set<Level>();

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Mail between your own agents is trusted (T754, owner decision 2026-10-28).** Before, reading any message marked external fenced the reader's whole session for an hour: every send became external, and recipients could only read it. The fence then spread through replies across teams. In the 7 days before this change, 57% of all mail carried the label, and 92% of that was inherited, with no outside content involved. Now:
+  - Reading mail never fences your session. Only an envelope whose provenance can't be checked (malformed) still does.
+  - "External" stays on the one message whose sender declared outside content (`payload: firsthand-outside` or `derived-outside`). Its recipients may only read it; their own sends are unaffected.
+  - Inherited-external mail from older senders gets normal policy.
 - **One Touch ID covers routine owner requests for 8 hours (T760, owner decision 2026-10-28).** The owner-signing helper used to ask for Touch ID or your password on every signature. On 2026-10-28, five mailbox forwards cost five prompts in 26 seconds.
   - **What the session covers:** after one approval, these sign without a prompt for 8 hours on that Mac: identity forwards, project lead records and their revocation, read/edit policies, and session clearances.
   - **What always prompts:** YOLO, permissions or outward policies, revocations, devices, members, takeovers and owner sends.
