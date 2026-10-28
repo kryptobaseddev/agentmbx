@@ -39,7 +39,10 @@ else if (cmd === "sign") {
   if (process.env.FAKE_AUTH_MODE === "cancel") { console.error("agentmbx-auth: not approved (Canceled by user.)"); process.exit(6); }
   const priv = process.env.FAKE_AUTH_MODE === "wrongkey" ? generateKeyPair().privateKey : key.privateKey;
   console.log(signData(priv, readFileSync(file)));
-} else process.exit(2);
+} else if (cmd === "session-status") console.log(existsSync(dir + "/session") ? readFileSync(dir + "/session", "utf8") : "none");
+else if (cmd === "session-start") { writeFileSync(dir + "/session", "1893456000"); console.log("1893456000"); }
+else if (cmd === "session-end") { if (existsSync(dir + "/session")) writeFileSync(dir + "/session", "none"); console.log("ended"); }
+else process.exit(2);
 `);
   chmodSync(path, 0o755);
   const calls = () => existsSync(join(dir, "calls.jsonl"))
@@ -345,4 +348,38 @@ test("real helper: lead, lead revocation and identity forward prompts (T208, T20
     host_fp: "dc4f-6c32-79f1-6a05", from: "orbit-mcp-0123456789abcdef", to: "orbit-lead", unread: 3, issued_at: Date.parse(iat), expires_at: Date.parse(hours(1)) };
   assert.match(ok(forward), /^Forward 3 unread message\(s\) from orbit-mcp-0123456789abcdef@macbook to orbit-lead@macbook \(host key dc4f-6c32-79f1-6a05\); orbit-mcp-0123456789abcdef routes to orbit-lead from now on\. Approval expires /);
   assert.equal(summary(canonical({ ...forward, to: "x‮evil" })).code, 5);
+});
+
+// ---- T760 owner session ------------------------------------------------------------------------------------------
+test("T760 real helper: only routine payloads may sign under an owner session", { skip }, () => {
+  const routine = (payload: unknown) => {
+    const f = join(tmp("mbx-routine-"), "p.json");
+    writeFileSync(f, canonical(payload));
+    return execFileSync(REAL!, ["routine", f], { encoding: "utf8" }).trim();
+  };
+  assert.equal(routine({ v: 1, type: "identity-forward", from: "a", to: "b", host: "h", host_fp: "f", unread: 0, expires_at: 1 }), "routine");
+  assert.equal(routine({ v: 1, type: "lead", agent: "a", host: "h", project: "/p", owner_fp: "x", iat, exp: hours(1) }), "routine");
+  assert.equal(routine({ v: 1, type: "policy", level: "collaborate", classes: ["read", "edit"], iat, exp: hours(1) }), "routine");
+  assert.equal(routine({ v: 1, type: "policy", level: "collaborate", classes: ["read", "outward"], iat, exp: hours(1) }), "prompt", "outward always asks");
+  assert.equal(routine({ v: 1, type: "policy", level: "yolo", classes: ["read"], iat, exp: hours(1) }), "prompt", "YOLO always asks");
+  assert.equal(routine({ v: 1, type: "policy", level: "collaborate", classes: ["permissions"], iat, exp: hours(1) }), "prompt");
+  for (const type of ["device", "member", "revocation", "identity-takeover"]) assert.equal(routine({ v: 1, type }), "prompt", type);
+  assert.equal(routine({ v: 3, authority: { owner_fp: "x" }, subject: "s", to: ["a"] }), "prompt", "owner send always asks");
+});
+
+test("T760: owner session start/status/end go through the Keychain helper and are audited", async () => {
+  const fake = fakeHelper(), h = tmp();
+  await createKeychainOwner(h, fake.path);
+  const env = { MBX_HOME: h, MBX_AUTH_HELPER: fake.path };
+  assert.match((await cli(env, ["owner", "session", "status"])).out, /no owner session/);
+  const started = JSON.parse((await cli(env, ["owner", "session", "start", "--json"])).out) as { until: string };
+  assert.equal(started.until, new Date(1893456000 * 1000).toISOString());
+  assert.match((await cli(env, ["owner", "session", "status"])).out, /active until 2030-01-01/);
+  assert.match((await cli(env, ["owner", "session", "end"])).out, /ended/);
+  assert.deepEqual(fake.calls().map((c) => c.args[0]).filter((c) => c.startsWith("session-")), ["session-status", "session-start", "session-status", "session-end"]);
+  const n = new MbxNode(h);
+  try {
+    const events = (n.store.db.prepare("SELECT event FROM audit WHERE event LIKE 'owner.session_%' ORDER BY rowid").all() as { event: string }[]).map((r) => r.event);
+    assert.deepEqual(events, ["owner.session_status", "owner.session_start", "owner.session_status", "owner.session_end"]);
+  } finally { n.close(); }
 });

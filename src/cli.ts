@@ -34,7 +34,7 @@ import { DEFAULT_PORT, defaultHome, didWarning, formatFor, messageReadView, MbxN
 import { sessionStartLeadAudit } from "./lead-grants.ts";
 import { storedPolicies, activePolicies, dueReminders, policyBrief, issueSigned, makeDevice, CLASSES, delegationNote, hasClass, LEVELS, makePolicy, makeRevocation, parseTtl, parsePolicyTtl, policyUnexpired, policySummary,
   type Level, type PolicyClass, type PolicyRecord, type Revocation } from "./policy.ts";
-import { authHelperPath, createKeychainOwner, createOwnerKey, defaultOwnerBackend, ownerInfo, ownerSignCanonical, sessionClearanceSummary, readPassphraseFromTTY, type OwnerBackend } from "./owner.ts";
+import { authHelperPath, createKeychainOwner, createOwnerKey, defaultOwnerBackend, ownerInfo, ownerSession, ownerSignCanonical, sessionClearanceSummary, readPassphraseFromTTY, type OwnerBackend } from "./owner.ts";
 import { periodicUpdateCheck, updateAvailable, updateCommand } from "./update.ts";
 import { installKind, version } from "./version.ts";
 import { installService, serviceLabel, uninstallService } from "./service.ts";
@@ -148,6 +148,7 @@ Owner (each signature needs you: a Touch ID / password prompt on macOS with Agen
   agentmbx owner grant <agent> [--session <fingerprint>] [--caps ${CAPS.join(",")}] [--ttl 12h]
   agentmbx owner revoke <grant-id>
   agentmbx owner clear|attest --cli <provider> --session <id> --project <dir> --reason "…" [--ttl 15m]
+  agentmbx owner session start|end|status        one Touch ID unlocks routine owner requests for 8h (T760)
                   sign the current session-wide exposure snapshot, at most 1 hour; no future roots or new action class
   agentmbx owner revoke-clearance <id>             revoke one signed session clearance
   agentmbx owner send --to <agents> --subject "…" -m "…" [--kind task] [--needs-reply]   one message signed by you (OWNER)
@@ -1343,6 +1344,19 @@ async function lead(node: MbxNode, pos: string[], str: (k: string) => string | u
 
 async function owner(node: MbxNode, pos: string[], str: (k: string) => string | undefined, o: Record<string, unknown>) {
   const sub = pos[0];
+  if (sub === "session") {
+    // T760: one approval unlocks routine owner requests for 8 hours on this Mac; high-risk requests always prompt.
+    const arg = pos[1] ?? "status";
+    if (arg !== "start" && arg !== "end" && arg !== "status") return die("usage: agentmbx owner session start|end|status");
+    const action: "start" | "end" | "status" = arg;
+    if (ownerInfo(node.home)?.backend !== "keychain") die("owner sessions are for the macOS Keychain owner key; the passphrase backend always asks");
+    const { until } = await ownerSession(action);
+    node.store.audit(`owner.session_${action}`, { until });
+    if (o.json) return console.log(JSON.stringify({ action, until }));
+    return console.log(action === "end" ? "owner session ended: routine requests prompt again"
+      : until ? `owner session active until ${until}: forwards, project lead records, read/edit policies and clearances sign without a prompt; everything else still asks`
+      : "no owner session: the next routine request prompts once and starts one");
+  }
   if (sub === "clear" || sub === "attest") {
     const cli = str("cli") ?? die("owner clear/attest requires --cli"), session_id = str("session") ?? die("owner clear/attest requires --session");
     const projects = o.project as string[] | undefined;

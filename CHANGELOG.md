@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **One Touch ID covers routine owner requests for 8 hours (T760, owner decision 2026-10-28).** The owner-signing helper used to ask for Touch ID or your password on every signature. On 2026-10-28, five mailbox forwards cost five prompts in 26 seconds.
+  - **What the session covers:** after one approval, these sign without a prompt for 8 hours on that Mac: identity forwards, project lead records and their revocation, read/edit policies, and session clearances.
+  - **What always prompts:** YOLO, permissions or outward policies, revocations, devices, members, takeovers and owner sends.
+  - **How it is protected:** the session record lives in the Keychain and is signed with the owner key, so another process cannot forge one.
+  - **Commands:** `agentmbx owner session start|end|status`. Every start, end and status check is audited.
+  - **Install:** rebuild AgentMBX.app (`scripts/build-macos-app.sh`, then `agentmbx daemon install`) to get the new helper.
+
 - **The daemon's PATH puts system Node ahead of version-manager shims (T729).** The launchd job listed `~/.local/share/mise/shims` before `/opt/homebrew/bin`, so anything the daemon started through `env node` could still run mise's Node. Homebrew and system directories now come first, and mise shims come last, so tools installed only under mise still resolve. Without the launcher, the service falls back to Homebrew's Node instead of a mise shim. Run `agentmbx daemon install` (or `agentmbx setup`) to rewrite the plist.
 
 ## 0.5.54 (2026-10-24)
