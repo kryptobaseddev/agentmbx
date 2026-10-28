@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.55 (2026-10-28)
+
 - **Mail between your own agents is trusted (T754, owner decision 2026-10-28).** Before, reading any message marked external fenced the reader's whole session for an hour: every send became external, and recipients could only read it. The fence then spread through replies across teams. In the 7 days before this change, 57% of all mail carried the label, and 92% of that was inherited, with no outside content involved. Now:
   - Reading mail never fences your session. Only an envelope whose provenance can't be checked (malformed) still does.
   - "External" stays on the one message whose sender declared outside content (`payload: firsthand-outside` or `derived-outside`). Its recipients may only read it; their own sends are unaffected.
@@ -17,7 +19,6 @@
   - the notifier's error is logged as its own `wake.notice_failed` audit row;
   - for a stalled request, task, decision or alert, the agent's project lead gets one alert (at most every 30 minutes per agent), listing ids and senders only, never content.
   Stalled mail is still picked up when the agent's session binds or its watcher runs. Desktop notices stay off by the owner's choice.
-
 - **The daemon's PATH puts system Node ahead of version-manager shims (T729).** The launchd job listed `~/.local/share/mise/shims` before `/opt/homebrew/bin`, so anything the daemon started through `env node` could still run mise's Node. Homebrew and system directories now come first, and mise shims come last, so tools installed only under mise still resolve. Without the launcher, the service falls back to Homebrew's Node instead of a mise shim. Run `agentmbx daemon install` (or `agentmbx setup`) to rewrite the plist.
 
 ## 0.5.54 (2026-10-24)
