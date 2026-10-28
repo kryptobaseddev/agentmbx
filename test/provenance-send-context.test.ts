@@ -102,7 +102,9 @@ function database(t: { after(fn: () => void): void }) {
     e.meta.provenance = built.record;
     return { ...built, e: signEnvelope(e, "alpha", node.key.publicKey, node.key.privateKey) };
   });
-  return { home, node, now, scope, input, prepare, leases, lease };
+  // T754: reading declared outside mail no longer writes the v1 writer fence; tests of the fence itself seed it directly.
+  const fence = (source: Envelope, root = now + 1) => writeSessionTaint(node.store, { v: 1, ...scope, root, from: source.from, id: source.id, how: "declared", relay_depth: [] }, root);
+  return { home, node, now, scope, input, prepare, leases, lease, fence };
 }
 
 test("S3 metadata does not select task inputs; full reads survive relabelled status/new-thread sends", t => {
@@ -120,6 +122,7 @@ test("S3 metadata does not select task inputs; full reads survive relabelled sta
 test("S3 independently selected observed status keeps the writer fence and cannot erase reply inputs", t => {
   const f = database(t), raw = f.input("firsthand-outside"), clean = f.input("agent");
   f.node.observeRead(f.node.read(raw.id, "reader"), f.scope.cli, f.scope.session_id, "full", f.now + 1);
+  f.fence(raw);
   f.node.observeRead(f.node.read(clean.id, "reader"), f.scope.cli, f.scope.session_id, "full", f.now + 2);
   assert.equal(f.prepare().record.kind, "derived-outside", "reading an unrelated status did not reset the active task");
   assert.equal(f.prepare({ context: clean.thread }).record.kind, "agent");
@@ -169,6 +172,7 @@ test("S3 corrupt retained context and missing active pointers remain unknown wit
 test("S3 scoped sends sign known roots and expose the same immutable timing as reader views", t => {
   const f = database(t), raw = f.input("firsthand-outside");
   f.node.observeRead(f.node.read(raw.id, "reader"), f.scope.cli, f.scope.session_id, "full", f.now + 1);
+  f.fence(raw);
   const sent = f.leases.withHeld("reader", f.lease.token, () => f.node.send({ from: "reader", to: ["writer"], subject: "own report", body: "pass", kind: "status", origin: "agent" }, undefined, undefined, undefined, f.scope));
   assert.equal(sent.provenance!.payload.kind, "derived-outside");
   assert.equal(sent.envelope.meta.origin, "external"); assert.equal(sent.provenance!.writer_fence.state, "active");
@@ -185,6 +189,7 @@ test("S3 scoped sends sign known roots and expose the same immutable timing as r
 test("S3 independent payload remains conservatively external while its writer is fenced", t => {
   const f = database(t), raw = f.input("firsthand-outside"), clean = f.input("agent");
   for (const e of [raw, clean]) f.node.observeRead(f.node.read(e.id, "reader"), f.scope.cli, f.scope.session_id, "full", f.now + 1);
+  f.fence(raw);
   const sent = f.leases.withHeld("reader", f.lease.token, () => f.node.send({ from: "reader", to: ["writer"], subject: "test counts", body: "12 pass", origin: "agent" }, undefined, undefined, undefined, { ...f.scope, context: clean.thread, payload: "agent" }));
   assert.equal(sent.provenance!.payload.kind, "agent"); assert.deepEqual(sent.provenance!.payload.roots, []);
   assert.equal(sent.envelope.meta.origin, "external"); assert.equal(sent.provenance!.writer_fence.state, "active");
@@ -228,6 +233,7 @@ test("S3 upgrade restores S2 roots before a new clean read or send can drop thei
 test("S3 an unsupported raw declaration remains unknown on later relabelled sends", t => {
   const f = database(t), raw = f.input("firsthand-outside");
   f.node.observeRead(f.node.read(raw.id, "reader"), f.scope.cli, f.scope.session_id, "full", f.now + 1);
+  f.fence(raw);
   assert.equal(f.prepare({ payload: "firsthand-outside" }).record.kind, "unknown");
   assert.equal(f.prepare({ payload: "agent" }).record.kind, "unknown");
   const sent = f.leases.withHeld("reader", f.lease.token, () => f.node.send({ from: "reader", to: ["writer"], subject: "new outside source", body: "fresh raw text", origin: "external" }, undefined, undefined, undefined, f.scope));
@@ -316,20 +322,21 @@ for (const provider of ["claude", "codex"]) test(`S3 ${provider} CLI/MCP public 
   await f.call("mbx_thread", { id: clean.id });
   const who = await f.call("mbx_whoami") as { provenance: PublicStatus };
   assert.equal(who.provenance.payload.kind, "derived-outside");
-  assert.equal(who.provenance.writer_fence.state, "active");
+  assert.equal(who.provenance.writer_fence.state, "clear", "T754: reading declared outside mail does not fence the reader");
   assert.equal(who.provenance.payload.roots[0].since, raw.ts);
   const cliWho = f.cli("whoami", ["--json"]); assert.equal(cliWho.status, 0, cliWho.stderr);
   assert.deepEqual(JSON.parse(cliWho.stdout).provenance.payload.roots.map((r: { message_id: string }) => r.message_id), [raw.id]);
   const args = { to: ["recipient"], subject: "independent counts", body: "19 passed", kind: "status", context: clean.thread, payload: "agent", sources: [] };
   const mcp = await f.call("mbx_send", args) as PublicSend;
-  assert.equal(mcp.provenance.payload.kind, "agent"); assert.equal(mcp.provenance.writer_fence.state, "active");
-  assert.equal(mcp.provenance.legacy_projection.external, true); assert.equal(mcp.provenance.context_id, clean.thread);
+  assert.equal(mcp.provenance.payload.kind, "agent"); assert.equal(mcp.provenance.writer_fence.state, "clear");
+  assert.equal(mcp.provenance.legacy_projection.external, false); assert.equal(mcp.provenance.context_id, clean.thread);
   const cli = f.cli("send", ["--to", "recipient", "--subject", "CLI counts", "-m", "19 passed", "--kind", "status", "--context", clean.thread, "--payload", "agent", "--json"]);
   assert.equal(cli.status, 0, cli.stderr);
   const sent = JSON.parse(cli.stdout) as PublicSend;
   assert.deepEqual(sent.provenance.payload, mcp.provenance.payload);
+  assert.equal(sent.provenance.writer_fence.state, mcp.provenance.writer_fence.state);
   assert.equal(sent.provenance.writer_fence.message_id, mcp.provenance.writer_fence.message_id);
-  assert.equal(sent.provenance.legacy_projection.external, true);
+  assert.equal(sent.provenance.legacy_projection.external, false);
   const derived = await f.call("mbx_send", { ...args, sources: [raw.id] }) as PublicSend;
   assert.equal(derived.provenance.payload.kind, "derived-outside"); assert.match(derived.warnings.join(" "), /overridden/);
   const cliDerived = f.cli("send", ["--to", "recipient", "--subject", "known inputs", "-m", "analysis", "--context", clean.thread, "--source", raw.id, "--payload", "agent", "--json"]);
@@ -337,7 +344,7 @@ for (const provider of ["claude", "codex"]) test(`S3 ${provider} CLI/MCP public 
   assert.deepEqual(JSON.parse(cliDerived.stdout).provenance.payload.roots.map((r: { message_id: string }) => r.message_id), [raw.id]);
   const metadata = f.cli("read", [derived.id, "--mode", "metadata"]);
   assert.equal(metadata.status, 0, metadata.stderr);
-  assert.equal(JSON.parse(metadata.stdout).lineage.writer_fence.state, "active");
+  assert.equal(JSON.parse(metadata.stdout).lineage.writer_fence.state, "clear");
   for (const options of [["--context", "0".repeat(26)], ["--source", "0".repeat(26)], ["--payload", "bogus"]]) {
     const denied = f.cli("send", ["--to", "recipient", "--subject", "denied", "-m", "x", ...options, "--json"]);
     assert.notEqual(denied.status, 0);
@@ -396,11 +403,11 @@ for (const history of ["mbx_replay", "mbx_catchup", "CLI replay"]) test(`S3 ${hi
   const status = (await f.call("mbx_whoami") as { provenance: PublicStatus }).provenance;
   assert.equal(status.payload.kind, "derived-outside"); assert.deepEqual(status.payload.roots.map(r => r.message_id), [raw.id]);
   const sent = await f.call("mbx_send", { to: ["recipient"], subject: "after history", body: "summary", kind: "status", origin: "agent" }) as PublicSend;
-  assert.equal(sent.provenance.payload.kind, "derived-outside"); assert.equal(sent.provenance.legacy_projection.external, true);
+  assert.equal(sent.provenance.payload.kind, "derived-outside"); assert.equal(sent.provenance.legacy_projection.external, false, "T754: history disclosure keeps v2 lineage, no v1 fence");
   for (const e of [large, raw]) assert.equal(f.node.store.db.prepare("SELECT state FROM deliveries WHERE agent='reader' AND msg_id=?").get(e.id)!.state, "delivered");
 });
 
-test("S3 one hundred public MCP exchanges retain immutable roots under the existing live v1 fence", async t => {
+test("S3 one hundred public MCP exchanges retain immutable roots under the existing live v1 fence (T754: recipients keep their policy)", async t => {
   const f = await publicHarness(t), raw = f.input("firsthand-outside", "old source", Date.now() - EXTERNAL_TAINT_MS - 1000);
   const owner = generateKeyPair();
   writeFileSync(join(f.home, "owner.json"), JSON.stringify({ v: 1, backend: "keychain", public_key: owner.publicKey }), { mode: 0o600 });
@@ -410,13 +417,17 @@ test("S3 one hundred public MCP exchanges retain immutable roots under the exist
   const agent = f.input("agent");
   assert.ok(f.node.policyFor(f.node.read(agent.id, "reader"), "recipient").classes.includes("outward"), "the fixture grants actual action classes to clean local agent content");
   await f.call("mbx_read", { ids: [raw.id] });
+  // T754: the read no longer writes the v1 fence; seed the live one this test runs under.
+  writeSessionTaint(f.node.store, { v: 1, cli: "claude", session_id: f.sid, root: Date.now(), from: raw.from, id: raw.id, how: "declared", relay_depth: [] });
   for (let i = 0; i < 100; i++) {
     const sent = await f.call("mbx_send", { to: ["recipient"], subject: "counts " + i, body: "status", kind: "status", origin: "agent", refs: [] }) as PublicSend;
     assert.equal(sent.provenance.payload.kind, "derived-outside");
     assert.deepEqual(sent.provenance.payload.roots.map(({ message_id, since, remaining_ms }) => ({ message_id, since, remaining_ms })),
       [{ message_id: raw.id, since: raw.ts, remaining_ms: 0 }]);
     const row = f.node.read(sent.id, "reader");
-    assert.deepEqual(f.node.policyFor(row, "recipient").classes, ["read"], "the existing live v1 writer fence still downgrades an action policy");
+    const meta = (JSON.parse(row.envelope) as Envelope).meta;
+    assert.equal(meta.origin, "external"); assert.equal(meta.external_source, "inherited", "the live v1 writer fence still marks the send");
+    assert.deepEqual(f.node.policyFor(row, "recipient").classes, rec.classes, "T754: inherited taint from the owner's own agent does not downgrade the recipient");
     await f.call("mbx_read", { ids: [sent.id] });
   }
 });
@@ -450,7 +461,7 @@ test("S3 project ledger records authorized lead-only bodies and excludes withhel
   assert.throws(() => f.node.read(raw.id, "reader"), /no message/, "ledger visibility did not create a personal mailbox grant");
   const sent = await f.call("mbx_send", { to: ["recipient"], subject: "ledger analysis", body: "summary" }) as PublicSend;
   assert.deepEqual(sent.provenance.payload.roots.map(r => r.message_id), [raw.id]);
-  assert.equal(sent.provenance.legacy_projection.external, true);
+  assert.equal(sent.provenance.legacy_projection.external, false, "T754: ledger disclosure keeps v2 lineage, no v1 fence");
 });
 
 test("S3 retained roots survive writer expiry without activating origin, policy or owner-authority changes", t => {

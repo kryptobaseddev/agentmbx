@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { MbxNode } from "../src/node.ts";
-import { readSessionTaint } from "../src/session-taint.ts";
+import { readSessionTaint, writeSessionTaint } from "../src/session-taint.ts";
 import { identityAvailability, SHARED_IDLE_MS, type LeaseActivity } from "../src/identity-availability.ts";
 import type { IdentityLease, ProcessEvidence } from "../src/identity-leases.ts";
 
@@ -153,11 +153,16 @@ test("a co-using sibling sends with the holder's conversation taint (T346)", asy
   const { node, call, pair } = fixture(t, "opencode");
   const { holder, sibling } = await pair("sib-taint");
   node.registerAgent("peer", { role: "peer" });
-  const outside = node.send({ from: "scout", to: ["sib-taint"], subject: "page", body: "copied from a web page", origin: "external" }).envelope;
-  assert.notEqual((await call(holder, "mbx_read", { ids: [outside.id] })).isError, true, "holder reads the outside mail");
+  // T754: reading declared outside mail no longer taints; seed the conversation's live exposure (as a malformed read leaves it).
+  const outside = { id: "message_outside" }, root = Date.now();
+  writeSessionTaint(node.store, { v: 1, cli: "opencode", session_id: SESSIONS.opencode.sessionID, root, from: "scout@alpha", id: outside.id, how: "malformed",
+    relay_depth: [{ hop: 0, from: "scout@alpha", at: root }] }, root);
+  const mail = node.send({ from: "scout", to: ["sib-taint"], subject: "page", body: "agent mail" }).envelope;
+  assert.notEqual((await call(holder, "mbx_read", { ids: [mail.id] })).isError, true, "holder reads in the tainted conversation");
   const stored = readSessionTaint(node.store, "opencode", SESSIONS.opencode.sessionID);
-  assert.ok(stored, "the holder persisted taint:<cli>:<session_id>");
+  assert.ok(stored, "the holder kept taint:<cli>:<session_id>");
   assert.equal(stored.id, outside.id);
+  assert.equal(stored.root, root);
   assert.equal(stored.from, "scout@alpha");
   assert.ok(stored.relay_depth.some((h) => h.from === "scout@alpha" && h.hop === 0));
 

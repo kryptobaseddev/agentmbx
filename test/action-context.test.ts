@@ -9,7 +9,7 @@ import { buildEnvelope, createContentProvenance, signEnvelope, type Envelope } f
 import { IdentityLeases, inspectLeaseProcess } from "../src/identity-leases.ts";
 import { makeLead, storeLead } from "../src/lead-record.ts";
 import { MbxNode } from "../src/node.ts";
-import { readSessionExposure } from "../src/session-taint.ts";
+import { readSessionExposure, writeSessionTaint } from "../src/session-taint.ts";
 import { decidePermission } from "../src/permission.ts";
 
 function fixture(t: TestContext, leadRequest = false) {
@@ -177,6 +177,8 @@ for (const mutation of ["new-lead-context", "new-lead-root", "lead-lease", "repl
 test("S4 valid observation receipts never relax the existing real permission fence", async t => {
   const f = fixture(t), rec = f.boundary.challenge(f.b, f.adapter.id, f.worker.token);
   assert.equal(f.boundary.consume(f.sign(rec), f.b, f.worker.token).ok, true);
+  // T754: reading declared outside mail no longer fences the reader; seed the live v1 fence this test is about.
+  writeSessionTaint(f.node.store, { v: 1, cli: "codex", session_id: "worker", root: Date.now(), from: "source@alpha", id: "outside-source", how: "declared", relay_depth: [] });
   const result = await decidePermission({ session_id: "worker", tool_name: "Bash", tool_input: { command: "git push origin HEAD:task/fixture" }, cwd: f.b.project },
     "codex", () => ({ ok: true }), { node: f.node, pid: process.pid, preflight: async () => true });
   assert.equal(result.allow, false);

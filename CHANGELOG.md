@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Mail between your own agents is trusted (T754, owner decision 2026-10-28).** Before, reading any message marked external fenced the reader's whole session for an hour: every send became external, and recipients could only read it. The fence then spread through replies across teams. In the 7 days before this change, 57% of all mail carried the label, and 92% of that was inherited, with no outside content involved. Now:
+  - Reading mail never fences your session. Only an envelope whose provenance can't be checked (malformed) still does.
+  - "External" stays on the one message whose sender declared outside content (`payload: firsthand-outside` or `derived-outside`). Its recipients may only read it; their own sends are unaffected.
+  - Inherited-external mail from older senders gets normal policy.
+
 - **The daemon's PATH puts system Node ahead of version-manager shims (T729).** The launchd job listed `~/.local/share/mise/shims` before `/opt/homebrew/bin`, so anything the daemon started through `env node` could still run mise's Node. Homebrew and system directories now come first, and mise shims come last, so tools installed only under mise still resolve. Without the launcher, the service falls back to Homebrew's Node instead of a mise shim. Run `agentmbx daemon install` (or `agentmbx setup`) to rewrite the plist.
 
 ## 0.5.54 (2026-10-24)

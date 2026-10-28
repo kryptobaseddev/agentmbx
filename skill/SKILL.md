@@ -304,6 +304,7 @@ Hard rules:
   `payload: "firsthand-outside"` (you fetched it) or `"derived-outside"`: receivers then only get `read` for it.
   Mail between your owner's agents, in any project, is never outside content: leave `origin` unset. A bare
   `origin: "external"` with no outside payload is sent as agent mail, with a warning (T738).
+  Reading external mail fences only that message (read only); your own later sends stay agent mail (T754).
 - When you acted on a request, ack it with `did: "<one line>"`: at most 200 characters, the action first (for example "Replied with test results; deployment HELD"). It goes to your owner's audit log; longer text is cut and marked truncated. Put the detail in your thread reply.
   The sender sees your `did` and ack note in its receipts, also when it is on another host.
 

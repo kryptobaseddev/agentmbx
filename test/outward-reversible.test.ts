@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { canonical, signData } from "../src/crypto.ts";
-import type { Envelope } from "../src/envelope.ts";
+import { buildEnvelope, signEnvelope, type Envelope } from "../src/envelope.ts";
 import { MbxNode } from "../src/node.ts";
 import { createOwnerKey, unlockOwnerKey } from "../src/owner.ts";
 import { acceptSigned, activePolicies, delegationNote, effectivePolicy, hasClass, makePolicy, makeRevocation, policyLine, type AnyRecord } from "../src/policy.ts";
@@ -100,7 +100,7 @@ test("T498 AC1: expiry, revocation and sender restrictions still constrain the n
   assert.deepEqual(forSender("lead").classes, []);
 });
 
-test("T498 AC4: reading external content makes real MCP sends inherited external and strips reversible authority", async (t) => {
+test("T498 AC4 (T754): a tainted session's real MCP sends are inherited external; declared mail stays read-only, reading either never strips the reader", async (t) => {
   const clients: Client[] = [];
   const { n, home, sign, ownerPub } = owner(t, clients);
   assert.equal(acceptSigned(n.store.db, sign(makePolicy({ level: "yolo", agents: ["*"], hosts: ["alpha"], ownerPub })), "alpha"), null);
@@ -122,21 +122,32 @@ test("T498 AC4: reading external content makes real MCP sends inherited external
   };
   const clean = await send(lead, "worker");
   assert.equal(n.policyFor(clean, "worker").classes.includes("outward-reversible"), true);
-  const outside = n.send({ from: "scout", to: ["planner"], subject: "outside", body: "external issue text", origin: "external" }).envelope;
+  const outside = sendLeased(n, { from: "scout", to: ["planner"], subject: "outside", body: "external issue text", origin: "external" }).envelope;
+  assert.deepEqual(n.policyFor(n.message(outside.id)!, "planner").classes, ["read"], "declared outside mail stays read-only for its recipient, even under YOLO");
   await call(lead, "mbx_read", { ids: [outside.id] });
+  const after = await send(lead, "worker");
+  assert.notEqual((JSON.parse(after.envelope) as Envelope).meta.origin, "external", "T754: reading declared outside mail does not taint the reader");
+  assert.equal(n.policyFor(after, "worker").classes.includes("outward-reversible"), true);
+  // Unknown provenance still taints the reader's session.
+  const bad = buildEnvelope({ from: "mallory@alpha", to: ["planner"], subject: "odd", body: "data" });
+  const malformed = signEnvelope({ ...bad, meta: { ...bad.meta, origin: "external", external_since: "yesterday" } } as Envelope, "alpha", n.key.publicKey, n.key.privateKey);
+  n.store.insertMessage(malformed, "local", "local", null); n.store.addDelivery(malformed.id, "planner");
+  await call(lead, "mbx_read", { ids: [malformed.id] });
   const inherited = await send(lead, "worker");
   const envelope = JSON.parse(inherited.envelope) as Envelope;
   assert.equal(envelope.meta.origin, "external");
   assert.equal(envelope.meta.external_source, "inherited");
-  assert.deepEqual(n.policyFor(inherited, "worker").classes, ["read"], "even YOLO loses outward-reversible");
+  assert.equal(n.policyFor(inherited, "worker").classes.includes("outward-reversible"), true, "T754: inherited taint from the owner's own agent keeps normal authority");
   await call(worker, "mbx_read", { ids: [inherited.id] });
   const next = await send(worker, "planner");
   const nextEnvelope = JSON.parse(next.envelope) as Envelope;
-  assert.equal(nextEnvelope.meta.external_since, envelope.meta.external_since, "the root does not restart when inherited");
-  assert.deepEqual(n.policyFor(next, "planner").classes, ["read"]);
+  assert.notEqual(nextEnvelope.meta.origin, "external", "T754: reading inherited mail does not taint the reader");
+  assert.equal(nextEnvelope.meta.external_since, undefined);
+  assert.equal(n.policyFor(next, "planner").classes.includes("outward-reversible"), true);
   const external = (await call(lead, "mbx_whoami", {})).external as Record<string, unknown>;
   assert.equal(external.tainted, true);
-  const taint: SessionTaint = { v: 1, cli: "claude", session_id: "test", root: Date.parse(envelope.meta.external_since!), from: outside.from, id: outside.id, how: "declared", relay_depth: [] };
+  assert.equal(((await call(worker, "mbx_whoami", {})).external as Record<string, unknown>).tainted, false);
+  const taint: SessionTaint = { v: 1, cli: "claude", session_id: "test", root: Date.parse(envelope.meta.external_since!), from: malformed.from, id: malformed.id, how: "malformed", relay_depth: [] };
   assert.match(taintSendWarning(taint), /tainted session.*may use outward-reversible/);
   assert.match(declaredOriginWarning(null), /may not use outward-reversible/);
 });
