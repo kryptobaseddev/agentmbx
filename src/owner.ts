@@ -130,14 +130,26 @@ async function keychainSign(home: string, pub: string, canonicalJson: string, su
   try {
     const file = join(dir, "payload.json");
     writeFileSync(file, canonicalJson, { mode: 0o600 });
-    process.stderr.write(`${summary}\nApprove the Touch ID / password prompt to sign this (the prompt describes the same request).\n`);
+    process.stderr.write(`${summary}\nIf a Touch ID / password prompt appears, approve it to sign this (the prompt describes the same request).\n`);
     const r = await runAuthHelper(helper, ["sign", file]);
     if (r.code !== 0) throw helperError("owner signature not made", r);
+    // T760: the helper reports a signature made under, or a session started by, the owner session; pass it on.
+    for (const line of r.stderr.split("\n")) if (/^agentmbx-auth: (signed under|owner session started)/.test(line)) process.stderr.write(`${line}\n`);
     const sig = r.stdout.trim();
     if (!verifyData(pub, canonicalJson, sig))
       throw new Error(`the Keychain helper's signature does not verify against owner key ${fingerprint(pub)} (${ownerJsonPath(home)}); run: agentmbx doctor`);
     return sig;
   } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+/** T760: the Keychain helper's owner session. start prompts once; end and status never prompt. Keychain backend only. */
+export async function ownerSession(action: "start" | "end" | "status"): Promise<{ until: string | null }> {
+  const helper = authHelperPath();
+  if (!helper) throw new Error("owner sessions need AgentMBX.app's agentmbx-auth helper (macOS Keychain owner key)");
+  const r = await runAuthHelper(helper, [`session-${action}`]);
+  if (r.code !== 0) throw helperError(`owner session ${action} failed`, r);
+  const out = r.stdout.trim();
+  return { until: /^\d+$/.test(out) ? new Date(Number(out) * 1000).toISOString() : null };
 }
 
 // ---- file backend -----------------------------------------------------------------------------------------------

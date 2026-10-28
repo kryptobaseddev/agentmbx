@@ -9,6 +9,16 @@
 //   agentmbx-auth delete            prompt, then delete the key (owner reset)
 //   agentmbx-auth check             exit 0 if a Touch ID / password prompt can be shown in this session, 9 if not (SSH)
 //   agentmbx-auth selftest <file>   sign <file> with a throwaway in-memory key; prints {"pub","sig"} (tests; never the owner key)
+//   agentmbx-auth session-start     prompt once, then routine requests sign without a prompt for 8 hours (T760)
+//   agentmbx-auth session-end       end the owner session now (no prompt)
+//   agentmbx-auth session-status    print the session's expiry (epoch seconds) or "none" (no prompt)
+//   agentmbx-auth routine <file>    print "routine" or "prompt": whether a live session covers this payload (no prompt)
+//
+// Owner session (T760, owner decision 2026-10-28): after one approval, ROUTINE requests (identity forward, project lead
+// record or revocation, a read/edit policy, a session clearance) sign without a prompt until it expires. Everything else
+// (YOLO, permissions or outward policies, revocations, devices, members, takeovers, unknown types) always prompts. The
+// session record is a second Keychain item whose content is signed by the owner key itself, so a record another
+// process wrote cannot open a session: an unreadable, unsigned or expired record is simply no session.
 //
 // The Keychain item (generic password, service "com.agentmbx.owner", account "owner") is created by this binary, so its
 // access list trusts only this binary: any other process that asks for it gets a Keychain dialog. The public key is kept
@@ -24,6 +34,8 @@ import Security
 
 let service = "com.agentmbx.owner"
 let account = "owner"
+let sessionService = "com.agentmbx.owner-session"
+let sessionSeconds: Double = 8 * 3600
 
 enum Code: Int32 { case ok = 0, error = 1, usage = 2, noKey = 3, exists = 4, refused = 5, cancelled = 6, keychain = 7, wrongKey = 8, noGUI = 9 }
 
@@ -345,6 +357,53 @@ func privateKey() -> Curve25519.Signing.PrivateKey {
   return key
 }
 
+// ---- owner session (T760) ---------------------------------------------------------------------------------------
+/** Routine requests may sign under a live owner session; anything not listed here always prompts. */
+func isRoutine(_ o: [String: Any]) -> Bool {
+  switch o["type"] as? String {
+  case "identity-forward", "lead", "lead-revoke", "session-clearance": return true
+  case "policy":
+    let level = (o["level"] as? String ?? "").lowercased(), classes = strs(o["classes"])
+    return level != "yolo" && !classes.isEmpty && classes.allSatisfy { ["read", "edit"].contains($0) }
+  default: return false
+  }
+}
+
+func sessionQuery() -> [String: Any] {
+  [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: sessionService, kSecAttrAccount as String: account]
+}
+func sessionMessage(_ pub: Data, _ exp: Int) -> Data { "agentmbx-owner-session/v1:\(pub.base64EncodedString()):\(exp)".data(using: .utf8)! }
+
+/** The live session's expiry for this owner key, or nil: missing, unreadable, malformed, unsigned or expired is no session. */
+func liveSession(_ pub: Data) -> Int? {
+  var q = sessionQuery()
+  q[kSecReturnData as String] = true
+  q[kSecMatchLimit as String] = kSecMatchLimitOne
+  var out: CFTypeRef?
+  guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let raw = out as? Data,
+    let o = try? JSONSerialization.jsonObject(with: raw) as? [String: Any],
+    let exp = o["exp"] as? Int, let sigB64 = o["sig"] as? String, let sig = Data(base64Encoded: sigB64),
+    let key = try? Curve25519.Signing.PublicKey(rawRepresentation: pub),
+    key.isValidSignature(sig, for: sessionMessage(pub, exp)),
+    Double(exp) > Date().timeIntervalSince1970, Double(exp) <= Date().timeIntervalSince1970 + sessionSeconds + 60 else { return nil }
+  return exp
+}
+
+/** Start (or extend) the session after an approval. Best effort: a failure leaves the next request prompting, never wider. */
+func startSession(_ key: Curve25519.Signing.PrivateKey) -> Int? {
+  let pub = key.publicKey.rawRepresentation, exp = Int(Date().timeIntervalSince1970 + sessionSeconds)
+  guard let sig = try? key.signature(for: sessionMessage(pub, exp)),
+    let data = try? JSONSerialization.data(withJSONObject: ["v": 1, "exp": exp, "sig": sig.base64EncodedString()]) else { return nil }
+  SecItemDelete(sessionQuery() as CFDictionary)
+  var add = sessionQuery()
+  add[kSecValueData as String] = data
+  add[kSecAttrLabel as String] = "AgentMBX owner session"
+  add[kSecAttrComment as String] = "Routine AgentMBX owner requests sign without a prompt until this expires. Delete it to end the session."
+  return SecItemAdd(add as CFDictionary, nil) == errSecSuccess ? exp : nil
+}
+
+func isoSeconds(_ t: Int) -> String { ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: Double(t))) }
+
 // ---- commands ---------------------------------------------------------------------------------------------------
 let argv = Array(CommandLine.arguments.dropFirst())
 let cmd = argv.first ?? ""
@@ -394,11 +453,45 @@ case "sign":
   if let claimed = claimedOwner(obj), claimed != fingerprint(pub) {
     die("refused: the payload names owner key \(clean(claimed, 40)), but this Keychain holds \(fingerprint(pub))", .wrongKey)
   }
-  approve(text)
+  let routine = isRoutine(obj)
+  if routine, let exp = liveSession(pub) {
+    // stderr line the CLI audits; stdout stays the bare signature
+    FileHandle.standardError.write("agentmbx-auth: signed under the owner session (until \(isoSeconds(exp)))\n".data(using: .utf8)!)
+  } else {
+    approve(routine ? "\(text)\n\nThis also unlocks routine AgentMBX owner requests for 8 hours." : text)
+  }
   let key = privateKey()
   guard key.publicKey.rawRepresentation == pub else { die("Keychain item \(service) is inconsistent (public key mismatch)", .keychain) }
   guard let sig = try? key.signature(for: data) else { die("signing failed", .error) }
+  if routine, liveSession(pub) == nil, let exp = startSession(key) {
+    FileHandle.standardError.write("agentmbx-auth: owner session started (until \(isoSeconds(exp)))\n".data(using: .utf8)!)
+  }
   print(sig.base64EncodedString())
+
+case "routine":
+  // would `sign` accept this payload under a live owner session? No prompt, no Keychain access (tests, previews)
+  let (_, obj) = loadPayload(fileArg())
+  print(isRoutine(obj) ? "routine" : "prompt")
+
+case "session-start":
+  guard argv.count == 1 else { die("usage: agentmbx-auth session-start", .usage) }
+  guard let pub = storedPublicKey() else { die("no owner key in the Keychain", .noKey) }
+  approve("unlock routine AgentMBX owner requests (forward, project lead, read/edit policy, clearance) for 8 hours on this Mac")
+  let key = privateKey()
+  guard key.publicKey.rawRepresentation == pub else { die("Keychain item \(service) is inconsistent (public key mismatch)", .keychain) }
+  guard let exp = startSession(key) else { die("could not store the owner session", .keychain) }
+  print(exp)
+
+case "session-end":
+  guard argv.count == 1 else { die("usage: agentmbx-auth session-end", .usage) }
+  let st = SecItemDelete(sessionQuery() as CFDictionary)
+  guard st == errSecSuccess || st == errSecItemNotFound else { keychainDie(st) }
+  print("ended")
+
+case "session-status":
+  guard argv.count == 1 else { die("usage: agentmbx-auth session-status", .usage) }
+  guard let pub = storedPublicKey() else { die("no owner key in the Keychain", .noKey) }
+  print(liveSession(pub).map(String.init) ?? "none")
 
 case "delete":
   guard argv.count == 1 else { die("usage: agentmbx-auth delete", .usage) }
@@ -415,5 +508,5 @@ case "selftest":
   print("{\"pub\":\"\(key.publicKey.rawRepresentation.base64EncodedString())\",\"sig\":\"\(sig.base64EncodedString())\"}")
 
 default:
-  die("usage: agentmbx-auth pubkey | init | sign <file> | summary <file> | check | delete", .usage)
+  die("usage: agentmbx-auth pubkey | init | sign <file> | summary <file> | check | delete | session-start | session-end | session-status", .usage)
 }

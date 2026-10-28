@@ -6,6 +6,12 @@
   - Reading mail never fences your session. Only an envelope whose provenance can't be checked (malformed) still does.
   - "External" stays on the one message whose sender declared outside content (`payload: firsthand-outside` or `derived-outside`). Its recipients may only read it; their own sends are unaffected.
   - Inherited-external mail from older senders gets normal policy.
+- **One Touch ID covers routine owner requests for 8 hours (T760, owner decision 2026-10-28).** The owner-signing helper used to ask for Touch ID or your password on every signature. On 2026-10-28, five mailbox forwards cost five prompts in 26 seconds.
+  - **What the session covers:** after one approval, these sign without a prompt for 8 hours on that Mac: identity forwards, project lead records and their revocation, read/edit policies, and session clearances.
+  - **What always prompts:** YOLO, permissions or outward policies, revocations, devices, members, takeovers and owner sends.
+  - **How it is protected:** the session record lives in the Keychain and is signed with the owner key, so another process cannot forge one.
+  - **Commands:** `agentmbx owner session start|end|status`. Every start, end and status check is audited.
+  - **Install:** rebuild AgentMBX.app (`scripts/build-macos-app.sh`, then `agentmbx daemon install`) to get the new helper.
 - **Stuck mail is reported as stuck (T755, T756).** When no session wake reached an agent and the desktop notice also failed, the mail used to be marked "notified (owner desktop notice only)", even though nobody had been told. AgentMBX's macOS notifications have been switched off since 2026-10-03, so every such wake looked successful. Now:
   - the mail is marked **stalled**, and sender receipts say so;
   - the notifier's error is logged as its own `wake.notice_failed` audit row;
