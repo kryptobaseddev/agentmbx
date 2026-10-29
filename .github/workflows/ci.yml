@@ -3,10 +3,17 @@ name: ci
 on:
   push:
     branches: [main]
+    paths-ignore: ["docs/**", "*.md", ".cleo/**"]
   pull_request:
+    paths-ignore: ["docs/**", "*.md", ".cleo/**"]
 
 permissions:
   contents: read
+
+# A newer push to the same PR cancels its superseded run; main pushes always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -16,6 +23,7 @@ jobs:
         # T013: pull requests run Linux only; macOS runs on main pushes and on release tags (release.yml).
         os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["macos-14", "ubuntu-24.04"]') }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
