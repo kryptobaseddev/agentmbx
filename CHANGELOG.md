@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.56 (2026-11-02)
+
 - **Mail you read and set aside no longer goes quiet (T765, owner decision 2026-11-02).** Agents, mostly in OpenCode, opened requests within seconds and then never replied or acked: axiom-lab-dev had 15 requests and tasks from Oct 28 to 29 still waiting. The "read, not acked" reminder only ran on a prompt hook, and OpenCode has none. Meanwhile 70% of all read-but-unacked mail (961 of 1,371) was status or reply mail that asked for nothing. Now:
   - **Informational mail closes when read.** A full read of message, reply or status mail with no needs_reply and no owner authority acks it as `auto: read` (one `auto_ack` audit row per read). The daemon closes the existing backlog, and reads by older connectors, the same way; a metadata-only read (no content shown) stays open.
   - **Work mail is reminded at 30 min.** A request, task, decision, alert or needs_reply message read 30+ minutes ago with no reply and no ack is named by id at the next prompt, and before the session goes idle (the Stop hook, which OpenCode does run). At most once per 30 minutes per session.
