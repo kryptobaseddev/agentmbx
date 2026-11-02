@@ -24,11 +24,11 @@ function seeded(t: { after: (fn: () => void) => void }, cli: string, fresh: numb
   n.bindSession({ agent: "drum", cli, session_id: `${cli}-sess`, pid: process.pid, session_key: "k" });
   claim(n, "drum", `${cli}-sess`, cli);
   const ids: string[] = [];
-  for (let i = 0; i < fresh + read + 1; i++) ids.push(n.send({ from: "boss", to: ["drum"], subject: `m${i}`, body: "b", needs_reply: i === 0 }).envelope.id);
+  for (let i = 0; i < fresh + read + 1; i++) ids.push(n.send({ from: "boss", to: ["drum"], subject: `m${i}`, body: "b", kind: "request", needs_reply: i === 0 }).envelope.id); // T765: work mail stays read-but-unacked
   n.markRead(ids.slice(0, read).map((id) => ({ id })), "drum"); // the first `read` messages: read, never acked
   n.ack(ids[ids.length - 1], "drum"); // one handled message
   // T308 AC2: another identity's new and read mail never reaches drum's counts
-  const other = [n.send({ from: "boss", to: ["other"], subject: "x", body: "b" }).envelope.id, n.send({ from: "boss", to: ["other"], subject: "y", body: "b" }).envelope.id];
+  const other = [n.send({ from: "boss", to: ["other"], subject: "x", body: "b", kind: "request" }).envelope.id, n.send({ from: "boss", to: ["other"], subject: "y", body: "b", kind: "request" }).envelope.id];
   n.markRead([{ id: other[0] }], "other");
   writeHud(n);
   const v1 = JSON.parse(readFileSync(hudSessionPath(h, cli, `${cli}-sess`), "utf8")) as HudStatus;

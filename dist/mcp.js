@@ -1433,7 +1433,7 @@ async function configureMcp(server, node, startupClosed) {
         return { draft, warnings: externalWarning(origin, taint) };
     };
     /** Opening mail marks the reader's own copies read (delivered/notified → read; never past acked), for sender receipts (T207). */
-    const markRead = (rows, agent) => node.markRead(rows, agent); // its own copy, else a project copy it may read (T493)
+    const markRead = (rows, agent, mode = "full") => node.markRead(rows, agent, { mode }); // its own copy, else a project copy it may read (T493)
     // Identity and policy notes belong to the ready caller, never the transport's provisional mailbox.
     const sessionNotes = (state, tool) => {
         if (!bound(state))
@@ -2183,13 +2183,13 @@ async function configureMcp(server, node, startupClosed) {
     });
     server.registerTool("mbx_read", {
         title: "Read mbx messages",
-        description: "Read one or more messages (ids or unique id prefixes). mode=full (default) shows full content framed with current sender verification and policy. Its policy line means: outward-reversible = push a non-default branch or open a draft PR; outward = merge, release, deploy, delete, secrets, spend. metadata returns only identifiers, times, sender identity, counts and computed policy/provenance: no subject/body/refs/receipt notes and no untrusted exposure. quarantine returns a labelled UNTRUSTED derived-outside summary (first512 Unicode code points, extraction/truncation stated), records an untrusted read and preserves source root times; it claims no sanitization or consent. All modes mark your own copy read. Full content separately records raw exposure. Next: mbx_reply if needed, then mbx_ack once dealt with.",
+        description: "Read one or more messages (ids or unique id prefixes). mode=full (default) shows full content framed with current sender verification and policy. Its policy line means: outward-reversible = push a non-default branch or open a draft PR; outward = merge, release, deploy, delete, secrets, spend. metadata returns only identifiers, times, sender identity, counts and computed policy/provenance: no subject/body/refs/receipt notes and no untrusted exposure. quarantine returns a labelled UNTRUSTED derived-outside summary (first512 Unicode code points, extraction/truncation stated), records an untrusted read and preserves source root times; it claims no sanitization or consent. All modes mark your own copy read; a full read also acks message/reply/status mail that asks for nothing (no needs_reply). Full content separately records raw exposure. Next: mbx_reply if needed, then mbx_ack once dealt with.",
         inputSchema: { ids: z.array(z.string().min(6)).min(1).max(20), mode: z.enum(["full", "metadata", "quarantine"]).default("full") },
         annotations: { readOnlyHint: true },
     }, ({ ids, mode }) => {
         const { agent } = current(), rows = ids.map((id) => node.read(id, agent));
         noteRead(rows, { mode });
-        markRead(rows, agent);
+        markRead(rows, agent, mode);
         if (mode === "full")
             return text(rows.map(m => formatFor(node, m, agent, sendScope())).join("\n\n"));
         const messages = rows.map(m => messageReadView(node, m, agent, mode, Date.now(), sendScope()));
@@ -2248,7 +2248,7 @@ async function configureMcp(server, node, startupClosed) {
         const m = node.message(id, agent);
         const rows = node.thread(m && node.canSee(m, agent) ? m.thread : id, agent);
         noteRead(rows, { mode });
-        markRead(rows, agent);
+        markRead(rows, agent, mode);
         if (mode !== "full") {
             const messages = rows.map(m => messageReadView(node, m, agent, mode, Date.now(), sendScope()));
             return text(JSON.stringify({ messages }), { messages });

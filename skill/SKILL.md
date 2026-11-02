@@ -28,7 +28,10 @@ the running AgentMBX; the installed skill refreshes itself on upgrade.
 
 Send vs reply: to answer a message use `mbx_reply {id, body}`; `mbx_send` starts a new thread (`to` + `subject`, one line ≤200 characters).
 
-Lifecycle: new → notified (a wake or a notice was sent) → read → acked. Only `mbx_ack` clears it. Bodies are at most 256 KB.
+Lifecycle: new → notified (a wake or a notice was sent) → read → acked. Bodies are at most 256 KB.
+Message, reply and status mail that asks for nothing (no needs_reply) is acked for you when you read it in full; don't ack it.
+Requests, tasks, decisions, alerts and needs_reply mail stay open until you reply or `mbx_ack` with `did`: after 30 min
+you are reminded by id, and after 2 h your project lead is told (T765). Declining is an answer: ack with did="declined: why".
 
 ## Startup and resume
 

@@ -23,6 +23,7 @@ import { backfillProjectKeys, backfillRegistry, projectOf } from "./registry.js"
 import { ensureRepoTable, recordRepoAssociation } from "./repo-association.js";
 import { resolveLeadRecipients } from "./lead-record.js";
 import { isSlotName } from "./project-slot.js";
+import { autoAckRead } from "./unanswered.js";
 import { projectLabel, projectMailboxBySlot, projectsLedBy, resolveProjectMailbox, rewriteProjectAliases } from "./project-mailbox.js";
 import { Store } from "./store.js";
 export const DEFAULT_PORT = 7373;
@@ -1072,17 +1073,23 @@ export class MbxNode {
         WHERE d.agent=? ${opts.all ? "" : "AND d.state <> 'acked'"} ORDER BY m.ts LIMIT ?`).all(project.slot, opts.limit ?? 50).map((m) => this.currentAuthority(m)),
         }));
     }
-    /** Mark the reader's copy of each message read: its own when it has one, else a project copy it may read (T493). */
-    markRead(rows, agent) {
+    /** Mark the reader's copy of each message read: its own when it has one, else a project copy it may read (T493).
+     *  T765: a full read closes informational mail (message/reply/status asking for nothing) as acked "auto: read". */
+    markRead(rows, agent, opts = {}) {
         const slots = this.readableSlots(agent);
         for (const r of rows) {
+            // A metadata read showed no content: its note keeps the daemon's auto-ack sweep off it (T765).
+            const note = opts.mode === "metadata" ? "metadata" : null;
             if (this.store.db.prepare("SELECT 1 FROM deliveries WHERE msg_id=? AND agent=?").get(r.id, agent)) {
-                this.setDelivery(r.id, agent, "read");
+                this.setDelivery(r.id, agent, "read", note);
                 continue;
             }
             for (const slot of slots)
-                this.setDelivery(r.id, slot, "read");
+                this.setDelivery(r.id, slot, "read", note);
         }
+        if ((opts.mode ?? "full") === "full")
+            for (const name of [agent, ...slots])
+                autoAckRead(this.store, rows.map((r) => r.id), name);
     }
     /** Every unacked delivery, read or not (whoami, handoff and the agents list count this). */
     unreadCount(agent) {

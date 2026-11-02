@@ -29,7 +29,7 @@ for (const cli of ["codex", "opencode"]) test(`${cli} a newer process of the sam
   await previous.connect(transport());
   assert.notEqual((await call(previous, "mbx_whoami", { name: "circle", role: "reviewer" })).isError, true);
   const holder = node.store.db.prepare("SELECT token,holder_pid FROM identity_leases WHERE name='circle'").get()!;
-  const mail = node.send({ from: "sender", to: ["circle"], subject: "pending", body: "preserved" }).envelope.id;
+  const mail = node.send({ from: "sender", to: ["circle"], subject: "pending", body: "preserved", kind: "request" }).envelope.id; // T765: work mail stays unacked after mbx_read
   restarted = true;
   await replacement.connect(transport());
   // Another conversation that (wrongly) remembers the same identity stays unbound and pending: the live holder keeps it.

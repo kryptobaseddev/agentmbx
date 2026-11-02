@@ -83,7 +83,7 @@ const refused = async (c: Client, name: string, args: Record<string, unknown>) =
 test("T493 AC2: the live lead sees the project mailbox as a labelled inbox section, and one ack clears it", async (t) => {
   const w = world(t);
   w.designate("agentmbx-lead");
-  const m1 = w.send(["agentmbx"]), m2 = w.send(["agentmbx"], { kind: "request", needs_reply: true });
+  const m1 = w.send(["agentmbx"], { kind: "task" }), m2 = w.send(["agentmbx"], { kind: "request", needs_reply: true });
   const personal = w.withNode((n) => n.send({ from: "agentmbx-builder", to: ["agentmbx-lead"], subject: "personal note", body: "only for the lead persona", kind: "message", project: w.projA }).envelope.id);
   const slot = slotFor(CLEO_ID);
 

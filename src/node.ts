@@ -26,6 +26,7 @@ import { backfillProjectKeys, backfillRegistry, projectOf } from "./registry.ts"
 import { ensureRepoTable, recordRepoAssociation } from "./repo-association.ts";
 import { resolveLeadRecipients } from "./lead-record.ts";
 import { isSlotName } from "./project-slot.ts";
+import { autoAckRead } from "./unanswered.ts";
 import { projectLabel, projectMailboxBySlot, projectsLedBy, resolveProjectMailbox, rewriteProjectAliases, type ProjectMailbox } from "./project-mailbox.ts";
 import { Store, type DeliveryState, type MessageRow } from "./store.ts";
 
@@ -961,13 +962,17 @@ export class MbxNode {
     }));
   }
 
-  /** Mark the reader's copy of each message read: its own when it has one, else a project copy it may read (T493). */
-  markRead(rows: { id: string }[], agent: string) {
+  /** Mark the reader's copy of each message read: its own when it has one, else a project copy it may read (T493).
+   *  T765: a full read closes informational mail (message/reply/status asking for nothing) as acked "auto: read". */
+  markRead(rows: { id: string }[], agent: string, opts: { mode?: "full" | "metadata" | "quarantine" } = {}) {
     const slots = this.readableSlots(agent);
     for (const r of rows) {
-      if (this.store.db.prepare("SELECT 1 FROM deliveries WHERE msg_id=? AND agent=?").get(r.id, agent)) { this.setDelivery(r.id, agent, "read"); continue; }
-      for (const slot of slots) this.setDelivery(r.id, slot, "read");
+      // A metadata read showed no content: its note keeps the daemon's auto-ack sweep off it (T765).
+      const note = opts.mode === "metadata" ? "metadata" : null;
+      if (this.store.db.prepare("SELECT 1 FROM deliveries WHERE msg_id=? AND agent=?").get(r.id, agent)) { this.setDelivery(r.id, agent, "read", note); continue; }
+      for (const slot of slots) this.setDelivery(r.id, slot, "read", note);
     }
+    if ((opts.mode ?? "full") === "full") for (const name of [agent, ...slots]) autoAckRead(this.store, rows.map((r) => r.id), name);
   }
 
   /** Every unacked delivery, read or not (whoami, handoff and the agents list count this). */
