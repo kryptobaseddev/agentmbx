@@ -1,9 +1,13 @@
 name: ci
 
 on:
+  # Owner decision 2026-11-02: a merge of a PR that already passed is not re-tested on main. Main runs only when a
+  # workflow file changes (a PR that edits the pinned workflow is attested by main's run), or by hand. macOS and the
+  # other release platforms run the full suite on every release tag (release.yml).
   push:
     branches: [main]
-    paths-ignore: ["docs/**", "*.md", ".cleo/**"]
+    paths: [".github/workflows/**"]
+  workflow_dispatch:
   pull_request:
     paths-ignore: ["docs/**", "*.md", ".cleo/**"]
 
@@ -16,14 +20,17 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  test:
+  # T767: the suite is split into 4 shards that run in parallel (about 26 min serial per platform).
+  shard:
+    name: shard ${{ matrix.os }} ${{ matrix.shard }}/4
     strategy:
       fail-fast: false
       matrix:
-        # T013: pull requests run Linux only; macOS runs on main pushes and on release tags (release.yml).
+        # T013: pull requests run Linux only; macOS runs on main runs (workflow changes, manual) and on release tags (release.yml).
         os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["macos-14", "ubuntu-24.04"]') }}
+        shard: [1, 2, 3, 4]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -31,11 +38,29 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - run: npm test
-      - run: npx tsc --noEmit
+      - run: sh scripts/test-shard.sh
+        env:
+          SHARD: ${{ matrix.shard }}/4
+      - if: matrix.shard == 1
+        run: npx tsc --noEmit
       - name: Committed dist/ matches src/
+        if: matrix.shard == 1
         run: npm run check-dist
       - name: Single executable builds and runs
+        if: matrix.shard == 1
         run: |
           node scripts/build-sea.mjs
           node scripts/smoke-sea.mjs "build/agentmbx-$(node -p 'process.platform + "-" + process.arch')"
+
+  # The required check (.cleo/project-context.json pins "test (ubuntu-24.04)"): green only when every shard passed.
+  test:
+    name: test (${{ matrix.os }})
+    needs: shard
+    if: always()
+    strategy:
+      matrix:
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["macos-14", "ubuntu-24.04"]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: test "${{ needs.shard.result }}" = success
