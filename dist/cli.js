@@ -28,6 +28,7 @@ import { readStdin, stdinIsTTY } from "./stdin.js";
 import { runStatuslineSuggest } from "./statusline-suggest.js";
 import { assertKnownRecipients, offlineWarnings, recipientReceipts } from "./receipts.js";
 import { escalateUnheldMail, retirePhantoms, returnNeverClaimed } from "./stranded.js";
+import { sweepUnanswered, unansweredReminder } from "./unanswered.js";
 import { activeLead, leadSummary, makeLead, makeLeadRevocation, projectLeadLine, projectLeadView, revokeLead, storeLead } from "./project-ledger.js";
 import { leadHistory } from "./lead-record.js";
 import { DEFAULT_PORT, defaultHome, didWarning, formatFor, messageReadView, MbxNode, summaryLine, trustLabel, WAKE_KINDS } from "./node.js";
@@ -900,6 +901,7 @@ async function run(argv) {
                 case "read": {
                     const row = node.read(pos[0] ?? die("read <id>"), me), readMode = mode;
                     node.observeRead(row, descriptor.cli, descriptor.session_id, readMode);
+                    node.markRead([row], me, { mode: readMode }); // T765: the CLI fallback reads like mbx_read
                     const scope = { cli: descriptor.cli, session_id: descriptor.session_id };
                     const view = readMode === "full" ? null : messageReadView(node, row, me, readMode, Date.now(), scope);
                     return console.log(view ? JSON.stringify(view) : formatFor(node, row, me, scope));
@@ -1347,6 +1349,9 @@ If the codes differ, do not approve: someone is in the middle.`);
             }
             catch { /* db busy: next minute */ } try {
                 escalateUnheldMail(node, Date.now(), (subtitle, body) => void notifyDesktop({ subtitle, body }));
+            }
+            catch { /* db busy: next minute */ } try {
+                sweepUnanswered(node);
             }
             catch { /* db busy: next minute */ } }, 60_000);
             void refreshDirectory(node);
@@ -2196,6 +2201,10 @@ async function hook(node, event, cli) {
                         if (readIds.length)
                             lines.push(`[mbx] ${readAckLine(readIds.length)}`);
                     }
+                    // T765: work mail read 30+ min ago with no reply or ack is named by id (shares its throttle with the Stop reminder).
+                    const due = unansweredReminder(node, agent, `${cli}:${sid ?? process.ppid}`);
+                    if (due)
+                        lines.push(due);
                 }
                 // T189: on_session_start output is dropped and a resume does not fire it, so the first bound turn of each entry (a new
                 // conversation, --resume, /new, /resume, a compression's new id) carries the bounded resume notice (T184 spec R5-R9).
@@ -2273,6 +2282,24 @@ async function hook(node, event, cli) {
                     return selfWatchInstruction({ delegated: !!delegationNote(node.store.db, agent, node.host), cli });
                 };
                 if (!fresh.length) {
+                    // T765: before going idle, name work mail read 30+ min ago with no reply or ack. OpenCode has no prompt hook,
+                    // so this Stop is where its agents hear about it. Bounded by the reminder's own throttle and allowContinue.
+                    const due = unansweredReminder(node, agent, `${cli}:${sid ?? process.ppid}`);
+                    if (due && node.allowContinue(agent, null)) {
+                        if (cli === "kimi") {
+                            process.stderr.write(`${due}\n`);
+                            process.exitCode = 2;
+                            return;
+                        }
+                        if (cli === "agy") {
+                            const out = agyHookOutput("Stop", due);
+                            if (out)
+                                console.log(out);
+                            return;
+                        }
+                        console.log(JSON.stringify({ decision: "block", reason: due }));
+                        return;
+                    }
                     if (cli === "grok" && input.stopHookActive !== true && !liveWatcher(node, agent) && !grokWatchArmed(input, sid)) {
                         console.log(JSON.stringify({ decision: "block", reason: grokWatchReminder(sid) }));
                         return;

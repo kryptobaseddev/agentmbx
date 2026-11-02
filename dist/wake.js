@@ -19,7 +19,7 @@ import { isSlotName } from "./project-slot.js";
 import { markSkewNoted, wakeSkewNote } from "./connector-skew.js";
 import { codexFailureClass, enqueueCodexQueue, reconcileCodexQueue } from "./codex-queue.js";
 import { identityGeneration } from "./identity-control.js";
-import { activeLead } from "./lead-record.js";
+import { leadToAlert } from "./unanswered.js";
 const run = promisify(execFile);
 const attemptId = () => ulid();
 const receipt = (strength, r = {}) => ({ strength, nativeId: null, sessionId: null, nativeStatus: null, providerVersion: null, ...r });
@@ -540,14 +540,13 @@ export function alertLeadOfStall(node, agent, rows, now = Date.now()) {
     const key = `stall-alert:${agent}`, last = Date.parse(node.store.get(key) ?? "");
     if (Number.isFinite(last) && now - last < STALL_ALERT_MS)
         return null;
-    const project = node.store.db.prepare("SELECT project FROM identity_projects WHERE name=? ORDER BY last_seen DESC LIMIT 1").get(agent)?.project;
-    const lead = project ? activeLead(node, project, new Date(now)) : null;
-    if (!lead || lead.host !== node.host || lead.agent === agent)
+    const lead = leadToAlert(node, agent, now);
+    if (!lead)
         return null;
     node.store.set(key, new Date(now).toISOString());
     const list = work.slice(0, 10).map(r => `${r.id} (${r.kind} from ${r.from_addr})`).join(", ");
     try {
-        node.send({ from: "mbx", to: [lead.agent], kind: "alert", subject: `Stalled mail: ${agent} cannot be woken`.slice(0, 200),
+        node.send({ from: "mbx", to: [lead], kind: "alert", subject: `Stalled mail: ${agent} cannot be woken`.slice(0, 200),
             body: `${agent} has ${work.length} unread work message(s) that no session wake reached: ${list}. Its session is idle or has no push path, `
                 + `so the mail waits for its next prompt. Ask the owner to prompt ${agent}, or reassign the work.` });
     }
@@ -555,8 +554,8 @@ export function alertLeadOfStall(node, agent, rows, now = Date.now()) {
         node.store.db.prepare("DELETE FROM kv WHERE k=?").run(key);
         return null;
     }
-    node.store.audit("wake.stall_alert", { agent, lead: lead.agent, count: work.length });
-    return lead.agent;
+    node.store.audit("wake.stall_alert", { agent, lead, count: work.length });
+    return lead;
 }
 // ---- wake reconciliation and pressure (T179) -------------------------------------------------------------
 /** An `unknown` attempt is held this long before its mail may be woken once more (still within WAKE_LIMITS). */
