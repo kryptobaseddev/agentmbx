@@ -1,9 +1,13 @@
 name: ci
 
 on:
+  # Owner decision 2026-11-02: a merge of a PR that already passed is not re-tested on main. Main runs only when a
+  # workflow file changes (a PR that edits the pinned workflow is attested by main's run), or by hand. macOS and the
+  # other release platforms run the full suite on every release tag (release.yml).
   push:
     branches: [main]
-    paths-ignore: ["docs/**", "*.md", ".cleo/**"]
+    paths: [".github/workflows/**"]
+  workflow_dispatch:
   pull_request:
     paths-ignore: ["docs/**", "*.md", ".cleo/**"]
 
@@ -20,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # T013: pull requests run Linux only; macOS runs on main pushes and on release tags (release.yml).
+        # T013: pull requests run Linux only; macOS runs on main runs (workflow changes, manual) and on release tags (release.yml).
         os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["macos-14", "ubuntu-24.04"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
