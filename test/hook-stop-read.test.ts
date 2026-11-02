@@ -137,3 +137,29 @@ for (const [cli, sid] of Object.entries(DIGEST_CLIS)) test(`T584 ${cli}: MBX_STO
     blocks("1", `${kind} still continues`);
   }
 });
+
+// T765: a request read 30+ min ago with no reply or ack continues the Stop once per window. OpenCode has no prompt hook,
+// so this is where its agents hear about mail they opened and set aside.
+for (const cli of ["opencode", "claude"]) test(`T765 ${cli}: stop names work mail read 30+ min ago and not answered, once per window`, { timeout: 120_000 }, (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mbx-t765-stop-"));
+  createOwnerKey(home, "test-only-passphrase");
+  const n = new MbxNode(home, { host: "alpha" }), owner = unlockOwnerKey(home, "test-only-passphrase");
+  t.after(() => { n.close(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }); });
+  const [sid] = SIDS[cli]!;
+  bindWakeLease(n, { agent: "worker", cli, session_id: sid, pid: process.pid });
+  const rec = makePolicy({ level: "autonomous", agents: ["worker"], hosts: ["alpha"], ownerPub: owner.publicKey });
+  assert.equal(acceptSigned(n.store.db, { rec, sig: signData(owner.privateKey, canonical(rec)) }, "alpha"), null);
+  const stop = (): string => {
+    const env: NodeJS.ProcessEnv = { ...process.env, MBX_HOME: home, AGENTMBX_DEV: "1", MBX_AGENT: "unrelated" };
+    const r = spawnSync(process.execPath, [resolve("bin/agentmbx.js"), "hook", "stop", "--cli", cli], {
+      input: JSON.stringify({ session_id: sid, cwd: process.cwd() }), encoding: "utf8", timeout: 30_000, env });
+    return r.stdout + r.stderr;
+  };
+  const id = sendLeased(n, { from: "boss", to: ["worker"], subject: "set aside", body: "b", kind: "request" }).envelope.id;
+  n.setDelivery(id, "worker", "read");
+  assert.doesNotMatch(stop(), /no reply or ack/, "read just now: not due");
+  n.store.db.prepare("UPDATE deliveries SET updated_at=? WHERE msg_id=?").run(new Date(Date.now() - 31 * 60_000).toISOString(), id);
+  const out = stop();
+  assert.match(out, /no reply or ack/); assert.match(out, new RegExp(id));
+  assert.doesNotMatch(stop(), /no reply or ack/, "once per window per session");
+});

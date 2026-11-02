@@ -43,7 +43,7 @@ test("MCP and scoped CLI thread/reply paths resolve only visible prefixes", asyn
   }
   const denied = spawnSync(process.execPath, [bin, "send", "--as", "reader", "--to", "receiver", "--reply-to", prefix, "-m", "reply"], { env, encoding: "utf8" });
   assert.equal(denied.status, 3); assert.ok(hidden.every(id => !denied.stderr.includes(id)));
-  const own = n.send({ from: "sender", to: ["reader"], subject: "visible", body: "visible-body" }).envelope.id;
+  const own = n.send({ from: "sender", to: ["reader"], subject: "visible", body: "visible-body", kind: "request" }).envelope.id; // T765: a work kind stays unacked after the read
   assert.ok(own.startsWith(prefix));
   const thread = await call("mbx_thread", { id: prefix }); assert.notEqual(thread.isError, true); assert.match(JSON.stringify(thread), /visible-body/);
   const cli = spawnSync(process.execPath, [bin, "thread", prefix, "--as", "reader"], { env, encoding: "utf8" });

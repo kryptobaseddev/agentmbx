@@ -338,7 +338,7 @@ test("T493: reading and acknowledging a project copy takes the lead's lease scop
   assert.equal(state(personalOnly.envelope.id, "agentmbx-lead"), "delivered");
 
   // A message that reached both: reading marks the personal copy first and leaves the project copy alone; ack likewise.
-  const both = w.n.send(w.draft(["agentmbx", "agentmbx-lead"]));
+  const both = w.n.send({ ...w.draft(["agentmbx", "agentmbx-lead"]), kind: "request" }); // T765: a work kind stays read until acked
   asLead(() => w.n.markRead([{ id: both.envelope.id }], "agentmbx-lead"));
   assert.equal(state(both.envelope.id, "agentmbx-lead"), "read"); assert.equal(state(both.envelope.id, mailbox.slot), "delivered");
   asLead(() => w.n.ack(both.envelope.id, "agentmbx-lead"));
@@ -454,6 +454,7 @@ const RATCHET: Record<string, { max: number; category: Category; why: string }> 
   "src/store.ts": { max: 3, category: "schema", why: "triggers and the legacy visibility backfill" },
   "src/stranded.ts": { max: 3, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "established-name gated; a slot is recognised, not claimed" },
   "src/sync-daemon.ts": { max: 2, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "cloud read model" },
+  "src/unanswered.ts": { max: 4, category: "enumerator (excludes project slots, asserted in the enumeration contract)", why: "T765: the 2 h sweep lists agents with notSlot(); the auto-ack writer, the per-agent unanswered query and the alert note update work on one named mailbox or one message" },
   "src/wake.ts": { max: 8, category: "slot-aware (maps a project slot to its lead; test/wake-project-mail.test.ts)", why: "the dispatcher keys a slot row to the project's current lead (T557) and operates on the row's own mailbox; reconcile works per (message, mailbox) pair; T679 keepCodexNotice reads one row by (msg_id, agent) to decide whether an owned Codex queue notice is still due; T667 noteWatchReported/requeueWatchReported read and requeue one row by (msg_id, agent), never enumerate names" },
 };
 

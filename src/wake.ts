@@ -21,7 +21,7 @@ import { isSlotName } from "./project-slot.ts";
 import { markSkewNoted, wakeSkewNote } from "./connector-skew.ts";
 import { codexFailureClass, enqueueCodexQueue, reconcileCodexQueue, type CodexPending, type CodexQueueContext } from "./codex-queue.ts";
 import { identityGeneration } from "./identity-control.ts";
-import { activeLead } from "./lead-record.ts";
+import { leadToAlert } from "./unanswered.ts";
 
 const run = promisify(execFile);
 /** `ok` is true only for an admitted wake or a shown notice. Provider adapters also report the typed `outcome` (T178,
@@ -472,18 +472,17 @@ export function alertLeadOfStall(node: MbxNode, agent: string, rows: PendingRow[
   if (!work.length) return null;
   const key = `stall-alert:${agent}`, last = Date.parse(node.store.get(key) ?? "");
   if (Number.isFinite(last) && now - last < STALL_ALERT_MS) return null;
-  const project = (node.store.db.prepare("SELECT project FROM identity_projects WHERE name=? ORDER BY last_seen DESC LIMIT 1").get(agent) as { project: string } | undefined)?.project;
-  const lead = project ? activeLead(node, project, new Date(now)) : null;
-  if (!lead || lead.host !== node.host || lead.agent === agent) return null;
+  const lead = leadToAlert(node, agent, now);
+  if (!lead) return null;
   node.store.set(key, new Date(now).toISOString());
   const list = work.slice(0, 10).map(r => `${r.id} (${r.kind} from ${r.from_addr})`).join(", ");
   try {
-    node.send({ from: "mbx", to: [lead.agent], kind: "alert", subject: `Stalled mail: ${agent} cannot be woken`.slice(0, 200),
+    node.send({ from: "mbx", to: [lead], kind: "alert", subject: `Stalled mail: ${agent} cannot be woken`.slice(0, 200),
       body: `${agent} has ${work.length} unread work message(s) that no session wake reached: ${list}. Its session is idle or has no push path, `
         + `so the mail waits for its next prompt. Ask the owner to prompt ${agent}, or reassign the work.` });
   } catch { node.store.db.prepare("DELETE FROM kv WHERE k=?").run(key); return null; }
-  node.store.audit("wake.stall_alert", { agent, lead: lead.agent, count: work.length });
-  return lead.agent;
+  node.store.audit("wake.stall_alert", { agent, lead, count: work.length });
+  return lead;
 }
 
 // ---- wake reconciliation and pressure (T179) -------------------------------------------------------------

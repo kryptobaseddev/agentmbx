@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Mail you read and set aside no longer goes quiet (T765, owner decision 2026-11-02).** Agents, mostly in OpenCode, opened requests within seconds and then never replied or acked: axiom-lab-dev had 15 requests and tasks from Oct 28 to 29 still waiting. The "read, not acked" reminder only ran on a prompt hook, and OpenCode has none. Meanwhile 70% of all read-but-unacked mail (961 of 1,371) was status or reply mail that asked for nothing. Now:
+  - **Informational mail closes when read.** A full read of message, reply or status mail with no needs_reply and no owner authority acks it as `auto: read` (one `auto_ack` audit row per read). The daemon closes the existing backlog, and reads by older connectors, the same way; a metadata-only read (no content shown) stays open.
+  - **Work mail is reminded at 30 min.** A request, task, decision, alert or needs_reply message read 30+ minutes ago with no reply and no ack is named by id at the next prompt, and before the session goes idle (the Stop hook, which OpenCode does run). At most once per 30 minutes per session.
+  - **The lead hears at 2 h.** Unanswered 2 hours after the read, the agent's project lead gets one alert per message (ids and senders, never content), and the sender's receipt shows the copy as `unanswered`.
+  - `agentmbx read` (the CLI fallback) now marks mail read like `mbx_read`.
+
 ## 0.5.55 (2026-10-28)
 
 - **Mail between your own agents is trusted (T754, owner decision 2026-10-28).** Before, reading any message marked external fenced the reader's whole session for an hour: every send became external, and recipients could only read it. The fence then spread through replies across teams. In the 7 days before this change, 57% of all mail carried the label, and 92% of that was inherited, with no outside content involved. Now:
