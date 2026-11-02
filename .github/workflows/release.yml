@@ -9,7 +9,33 @@ permissions:
   contents: read
 
 jobs:
+  # T767: the full suite on every release platform, split into 4 parallel shards per platform.
+  test:
+    name: test ${{ matrix.os }} ${{ matrix.shard }}/4
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [macos-14, macos-15-intel, ubuntu-24.04, ubuntu-24.04-arm]
+        shard: [1, 2, 3, 4]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Tag matches package.json version
+        run: |
+          want="v$(node -p 'require("./package.json").version')"
+          [ "$want" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match package.json ($want)"; exit 1; }
+      - run: npm ci
+      - run: sh scripts/test-shard.sh
+        env:
+          SHARD: ${{ matrix.shard }}/4
+
   build:
+    needs: test
     name: build ${{ matrix.platform }}
     strategy:
       fail-fast: true
@@ -33,7 +59,6 @@ jobs:
           want="v$(node -p 'require("./package.json").version')"
           [ "$want" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match package.json ($want)"; exit 1; }
       - run: npm ci
-      - run: npm test
       - run: npx tsc --noEmit
       - name: Build single executable
         run: node scripts/build-sea.mjs

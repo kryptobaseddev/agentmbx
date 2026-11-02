@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Faster CI and releases (T766, T767, owner decisions 2026-11-02).** The suite (about 26 minutes per platform, run one test at a time) now runs as 4 parallel shards per platform, in pull requests and on release tags. Pushes to main run CI only when a workflow file changes or when started by hand, so a merge of a PR that already passed is not tested again. The required check `test (ubuntu-24.04)` keeps its name and turns green only when every shard passed.
+
 ## 0.5.56 (2026-11-02)
 
 - **Mail you read and set aside no longer goes quiet (T765, owner decision 2026-11-02).** Agents, mostly in OpenCode, opened requests within seconds and then never replied or acked: axiom-lab-dev had 15 requests and tasks from Oct 28 to 29 still waiting. The "read, not acked" reminder only ran on a prompt hook, and OpenCode has none. Meanwhile 70% of all read-but-unacked mail (961 of 1,371) was status or reply mail that asked for nothing. Now:
