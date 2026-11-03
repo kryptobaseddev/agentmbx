@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.58 (2026-11-03)
+
+- **`agentmbx send --to a --to b` delivers to everyone (T769).** A repeated `--to` kept only the last value: the send exited 0, printed one delivery and silently dropped the other recipients. axiom-lead lost five owner-priority tasks this way on 2026-11-02. Every `--to` now counts, alone or mixed with comma lists.
+
 ## 0.5.57 (2026-11-02)
 
 - **Unanswered mail reaches someone even without a project lead (T768, owner decision 2026-11-02).** The 2-hour alert from 0.5.56 went only to a project lead, and most projects have none, so it told nobody. Now, when an agent has no other lead (its project has none, or it is the lead), each sender gets one alert naming only its own unanswered messages. A backlog longer than 20 messages is reported across sweeps, and each message is named exactly once (0.5.56 named only the first 10 of each alert).

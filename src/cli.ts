@@ -350,7 +350,7 @@ async function run(argv: string[]) {
   if (cmd === "claude") return launchClaude(rest); // every argument belongs to Claude Code: parse nothing here
   const { values: o, positionals: pos } = parseArgs({ args: rest, allowPositionals: true, strict: cmd !== "hook" && cmd !== "mcp", options: {
     help: { type: "boolean", short: "h" }, force: { type: "boolean" },
-    as: { type: "string" }, to: { type: "string" }, subject: { type: "string" }, m: { type: "string", short: "m" },
+    as: { type: "string" }, to: { type: "string", multiple: true }, subject: { type: "string" }, m: { type: "string", short: "m" },
     "body-file": { type: "string" }, "idempotency-key": { type: "string" }, kind: { type: "string" }, origin: { type: "string" }, schema: { type: "string" }, "reply-to": { type: "string" }, "needs-reply": { type: "boolean" }, urgent: { type: "boolean" }, "on-behalf-of": { type: "string" }, "new-mailbox": { type: "boolean" },
     ref: { type: "string", multiple: true }, all: { type: "boolean" }, json: { type: "boolean" }, note: { type: "string" },
     context: { type: "string" }, payload: { type: "string" }, source: { type: "string", multiple: true },
@@ -364,6 +364,9 @@ async function run(argv: string[]) {
     deadline: { type: "string" }, "require-idle-wake": { type: "boolean" }, "exclude": { type: "string" }, plan: { type: "boolean" },
     "base-url": { type: "string" }, "no-browser": { type: "boolean" } } });
   if (o.help) return console.log(commandHelp(cmd));
+  // T769: a repeated --to used to keep only the last value (exit 0, other recipients silently dropped). Every --to
+  // counts: they join into the documented comma list that the rest of the CLI reads.
+  if (Array.isArray(o.to)) (o as Record<string, unknown>).to = (o.to as string[]).join(",");
   const str = (k: string) => (typeof (o as Record<string, unknown>)[k] === "string" ? (o as Record<string, unknown>)[k] as string : undefined);
 
   if (cmd === "mcp") return runMcp();
