@@ -21,11 +21,12 @@ export function autoAckRead(store, ids, agent, now = Date.now()) {
         store.audit("auto_ack", { ...(agent ? { agent } : {}), count: n, why: "auto: read (informational mail)" });
     return n;
 }
-/** Work mail `agent` read at least `age` ago (within the lookback), still unacked and with no reply from it. Newest first. */
-export function unansweredMail(node, agent, age, now = Date.now()) {
+/** Work mail `agent` read at least `age` ago (within the lookback), still unacked and with no reply from it. Newest first,
+ *  at most 20; `unreported` leaves out copies already reported, so a longer backlog is reported 20 at a time. */
+export function unansweredMail(node, agent, age, now = Date.now(), o = {}) {
     return node.store.db.prepare(`SELECT m.id id, m.kind kind, m.from_addr "from", d.updated_at read_at, d.note note
     FROM deliveries d JOIN messages m ON m.id=d.msg_id
-    WHERE d.agent=? AND d.state='read' AND d.updated_at<=? AND d.updated_at>=? AND m.from_addr NOT LIKE 'mbx@%' AND ${WORK}
+    WHERE d.agent=? AND d.state='read' ${o.unreported ? "AND coalesce(d.note,'')<>'unanswered'" : ""} AND d.updated_at<=? AND d.updated_at>=? AND m.from_addr NOT LIKE 'mbx@%' AND ${WORK}
       AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.reply_to=m.id AND r.from_addr=?)
     ORDER BY d.updated_at DESC LIMIT 20`).all(agent, iso(now - age), iso(now - LOOKBACK_MS), `${agent}@${node.host}`);
 }
@@ -47,7 +48,8 @@ export function leadToAlert(node, agent, now = Date.now()) {
     const lead = project ? activeLead(node, project, new Date(now)) : null;
     return lead && lead.host === node.host && lead.agent !== agent ? lead.agent : null;
 }
-/** Daemon sweep: close informational mail already read, then alert each lead once per message unanswered 2 h after read.
+/** Daemon sweep: close informational mail already read, then report each message unanswered 2 h after read, once: to
+ *  the project lead, or (no lead) to its sender.
  *  The alerted copies carry note 'unanswered', which the sender's receipts show. Returns the agents reported. */
 export function sweepUnanswered(node, now = Date.now()) {
     autoAckRead(node.store, undefined, undefined, now);
@@ -57,22 +59,37 @@ export function sweepUnanswered(node, now = Date.now()) {
         .map((r) => r.agent);
     const out = [];
     for (const agent of agents) {
-        const due = unansweredMail(node, agent, ALERT_AFTER_MS, now).filter((u) => u.note !== "unanswered");
-        const lead = due.length ? leadToAlert(node, agent, now) : null;
-        if (!lead)
+        const due = unansweredMail(node, agent, ALERT_AFTER_MS, now, { unreported: true });
+        if (!due.length)
             continue;
-        const list = due.slice(0, 10).map((u) => `${u.id} (${u.kind} from ${u.from})`).join(", ");
-        try {
-            node.send({ from: "mbx", to: [lead], kind: "alert", subject: `Unanswered mail: ${agent} read work and did not reply or ack`.slice(0, 200),
-                body: `${agent} read ${due.length} work message(s) over 2 h ago and has neither replied nor acked them: ${list}${due.length > 10 ? ", …" : ""}. `
-                    + `Check on ${agent} (it may have moved on mid-task), or reassign the work.` });
+        // T768 (owner decision 2026-11-02): with no other lead to tell (no project lead, or the agent is the lead), each
+        // sender hears about its own requests instead: they asked, so they are the ones waiting.
+        const lead = leadToAlert(node, agent, now);
+        const groups = lead ? [{ to: lead, rows: due }]
+            : [...Map.groupBy(due.filter((u) => u.from !== `${agent}@${node.host}` && !u.from.startsWith("owner@")), (u) => u.from)]
+                .map(([to, rows]) => ({ to, rows }));
+        const told = [];
+        for (const g of groups) {
+            // Every message it marks reported is named (at most 20 per sweep), so none is reported without its id.
+            const list = g.rows.map((u) => `${u.id} (${u.kind}${lead ? ` from ${u.from}` : ""})`).join(", ");
+            try {
+                node.send({ from: "mbx", to: [g.to], kind: "alert", subject: `Unanswered mail: ${agent} read work and did not reply or ack`.slice(0, 200),
+                    body: lead
+                        ? `${agent} read ${g.rows.length} work message(s) over 2 h ago and has neither replied nor acked them: ${list}. `
+                            + `Check on ${agent} (it may have moved on mid-task), or reassign the work.`
+                        : `${agent} read ${g.rows.length} of your work message(s) over 2 h ago and has neither replied nor acked them: ${list}. `
+                            + `Its project has no lead to tell. Follow up with ${agent}, or send the work to another agent.` });
+                told.push(g.to);
+            }
+            catch { /* that recipient is retried on the next sweep */ }
         }
-        catch {
+        const done = new Set(told);
+        const marked = lead ? (told.length ? due : []) : due.filter((u) => done.has(u.from) || u.from === `${agent}@${node.host}` || u.from.startsWith("owner@"));
+        if (!marked.length)
             continue;
-        }
-        node.store.tx(() => { for (const u of due)
+        node.store.tx(() => { for (const u of marked)
             node.store.db.prepare("UPDATE deliveries SET note='unanswered' WHERE msg_id=? AND agent=? AND state='read'").run(u.id, agent); });
-        node.store.audit("unanswered.alert", { agent, lead, count: due.length });
+        node.store.audit("unanswered.alert", { agent, ...(lead ? { lead } : { senders: told }), count: marked.length });
         out.push(agent);
     }
     return out;

@@ -84,10 +84,31 @@ test("T765: the sweep closes informational backlog and alerts the lead once per 
   assert.equal(alerts().length, 1);
 });
 
-test("T765: the lead's own unanswered mail alerts no one", (t) => {
+test("T768: with no other lead to tell, each sender hears about its own unanswered requests, once", (t) => {
   const { n, alerts } = world(t);
-  const id = n.send({ from: "boss", to: ["alpha-lead"], subject: "s", body: "b", kind: "request" }).envelope.id;
-  n.setDelivery(id, "alpha-lead", "read");
-  assert.deepEqual(sweepUnanswered(n, Date.now() + ALERT_AFTER_MS + 1), []);
-  assert.equal(alerts().filter((a) => a.subject.startsWith("Unanswered")).length, 0);
+  // alpha-lead is its project's lead: there is no one above it, so the senders are told.
+  const a = n.send({ from: "boss", to: ["alpha-lead"], subject: "secret-subject", body: "secret-body", kind: "request" }).envelope.id;
+  const b = n.send({ from: "peer", to: ["alpha-lead"], subject: "s", body: "b", kind: "task" }).envelope.id;
+  for (const id of [a, b]) n.setDelivery(id, "alpha-lead", "read");
+  const later = Date.now() + ALERT_AFTER_MS + 1;
+  assert.deepEqual(sweepUnanswered(n, later), ["alpha-lead"]);
+  const to = (who: string) => (n.store.db.prepare("SELECT m.envelope FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.agent=?").all(who) as { envelope: string }[])
+    .map((r) => JSON.parse(r.envelope) as { kind: string; subject: string; body: string }).filter((e) => e.subject.startsWith("Unanswered"));
+  const [toBoss] = to("boss"), [toPeer] = to("peer");
+  assert.match(toBoss.body, new RegExp(a)); assert.doesNotMatch(toBoss.body, new RegExp(b), "a sender sees only its own requests");
+  assert.match(toPeer.body, new RegExp(b));
+  assert.ok(!toBoss.body.includes("secret"));
+  assert.equal(alerts().filter((e) => e.subject.startsWith("Unanswered")).length, 0, "the lead is not told about itself");
+  assert.deepEqual(sweepUnanswered(n, later + 60_000), [], "once per message");
+});
+
+test("T768: a backlog longer than one alert is reported 20 at a time, never repeating a message", (t) => {
+  const { n, send, alerts } = world(t);
+  const ids = Array.from({ length: 25 }, () => send("request"));
+  for (const id of ids) n.setDelivery(id, "alpha-worker", "read");
+  const later = Date.now() + ALERT_AFTER_MS + 1;
+  sweepUnanswered(n, later); sweepUnanswered(n, later + 60_000); sweepUnanswered(n, later + 120_000);
+  const bodies = alerts().filter((a) => a.subject.startsWith("Unanswered")).map((a) => a.body);
+  assert.equal(bodies.length, 2);
+  for (const id of ids) assert.equal(bodies.filter((b) => b.includes(id)).length, 1, `${id} reported exactly once`);
 });
