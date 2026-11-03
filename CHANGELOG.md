@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+## 0.5.57 (2026-11-02)
+
+- **Unanswered mail reaches someone even without a project lead (T768, owner decision 2026-11-02).** The 2-hour alert from 0.5.56 went only to a project lead, and most projects have none, so it told nobody. Now, when an agent has no other lead (its project has none, or it is the lead), each sender gets one alert naming only its own unanswered messages. A backlog longer than 20 messages is reported across sweeps, and each message is named exactly once (0.5.56 named only the first 10 of each alert).
 - **Faster CI and releases (T766, T767, owner decisions 2026-11-02).** The suite (about 26 minutes per platform, run one test at a time) now runs as 4 parallel shards per platform, in pull requests and on release tags. Pushes to main run CI only when a workflow file changes or when started by hand, so a merge of a PR that already passed is not tested again. The required check `test (ubuntu-24.04)` keeps its name and turns green only when every shard passed.
 
 ## 0.5.56 (2026-11-02)
